@@ -41,9 +41,10 @@ def load_batches(args, batch_count):
     )
 
 
-def train_step(model, optimizer, batch):
+def train_step(model, optimizer, batch, cuda_graphs):
     optimizer.zero_grad(set_to_none=True)
-    torch.compiler.cudagraph_mark_step_begin()
+    if cuda_graphs:
+        torch.compiler.cudagraph_mark_step_begin()
     loss = model(input_ids=batch, labels=batch, use_cache=False).loss
     loss.backward()
     optimizer.step()
@@ -58,7 +59,13 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=200, help="timed steps per round")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=50)
-    parser.add_argument("--eager", action="store_true", help="diagnose model or capture without compiling")
+    compile_mode = parser.add_mutually_exclusive_group()
+    compile_mode.add_argument(
+        "--eager", action="store_true", help="diagnose model or capture without compiling"
+    )
+    compile_mode.add_argument(
+        "--cuda-graphs", action="store_true", help="enable CUDA graphs on a compatible GPU and PyTorch build"
+    )
     args = parser.parse_args()
     if min(args.batch_size, args.rounds) < 1 or args.seq_len < 2 or args.seq_len > 4096:
         parser.error("batch size and rounds must be positive and sequence length must be 2–4096")
@@ -72,7 +79,8 @@ def main() -> None:
 
     args.out.mkdir(parents=True)
     capture_path = args.out / "granite.jsonl"
-    print(f"{torch.__version__} on {torch.cuda.get_device_name()} | {MODEL}", flush=True)
+    mode = "eager" if args.eager else f"Inductor, CUDA graphs {'on' if args.cuda_graphs else 'off'}"
+    print(f"{torch.__version__} on {torch.cuda.get_device_name()} | {MODEL} | {mode}", flush=True)
     batches = load_batches(args, args.warmup + args.steps)
     models = [
         AutoModelForCausalLM.from_pretrained(
@@ -96,13 +104,20 @@ def main() -> None:
         models[1], run_id="granite", routers=routers, every=FLUSH_EVERY,
         sink=tensorlens.JsonlSink(capture_path),
     ):
+        # The grouped_mm fallback can copy expert offsets to CPU. On the RTX PRO
+        # 6000 with PyTorch 2.14.1+cu130 this fails during CUDA graph recording.
         runners = models if args.eager else [
-            torch.compile(model, backend="inductor", mode="reduce-overhead", fullgraph=True)
+            torch.compile(
+                model,
+                backend="inductor",
+                fullgraph=True,
+                options={"triton.cudagraphs": args.cuda_graphs},
+            )
             for model in models
         ]
         for index in range(2):
             for batch in batches[: args.warmup]:
-                loss = train_step(runners[index], optimizers[index], batch)
+                loss = train_step(runners[index], optimizers[index], batch, args.cuda_graphs)
             if not math.isfinite(loss.item()):
                 raise RuntimeError(f"Non-finite warmup loss in run {index}")
 
@@ -112,7 +127,7 @@ def main() -> None:
                 torch.cuda.synchronize()
                 start = time.perf_counter()
                 for batch in batches[args.warmup :]:
-                    loss = train_step(runners[index], optimizers[index], batch)
+                    loss = train_step(runners[index], optimizers[index], batch, args.cuda_graphs)
                 torch.cuda.synchronize()
                 elapsed = (time.perf_counter() - start) * 1000 / args.steps
                 times[index].append(elapsed)
@@ -135,6 +150,7 @@ def main() -> None:
     print(f"Verified {expected_steps} recorded steps across {len(routers)} routers: {capture_path}")
     if not args.eager:
         print(f"1% overhead target: {'PASS' if overhead < 1 else 'FAIL'}")
+    if args.cuda_graphs:
         skips = counters["inductor"]["cudagraph_skips"]
         if skips:
             print(f"CUDA graph skips: {skips}. See TORCH_LOGS=cudagraphs for the reason.")
