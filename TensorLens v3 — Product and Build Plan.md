@@ -30,7 +30,7 @@ Start with stock Rerun and reuse the MoE recording and blueprint from the bake-o
 
 | Piece | Build or borrow | Implementation | Note |
 | --- | --- | --- | --- |
-| Capture SDK | Build | Python | One line to add. Tags the tensor stream with the active MLflow run first; W&B as a later target |
+| Capture SDK | Build | Python | One line to add. Tags the tensor stream with the MLflow run first; W&B as a later target |
 | Ingest server and detectors | Build | Rust | Receives Arrow data, stores Parquet, checks for known failure patterns |
 | Evidence and Rerun export | Build | Viewer-neutral JSON, `.rrd`, Rerun blueprint | Export the incident summary, status heatmap, expert-load table, and training-step timeline. Reuse the bake-off's Python exporter as the starting point |
 | Incident view | Conditional | Rust (`re_viewer`, egui) | Prototype one custom view inside Rerun if trials show that layer selection and table sorting materially improve diagnosis |
@@ -45,24 +45,30 @@ Postponed from v2: your own VLM agent loop, the agent-written layout blueprints,
 
 Inside the compiled graph, hooks compute only cheap statistics of fixed size. Copies to the CPU, Arrow encoding and anything bigger happen outside the compiled step.
 
-**Setup for the user:** `pip install` and `tensorlens.init(model)`, with the team's MLflow configuration left unchanged. `init` reads the active MLflow run (`mlflow.active_run()`) and the step, and tags the tensor stream with them, as the W&B route below does.
+**Setup for the user:** `pip install` and `tensorlens.init(model)`, with the team's MLflow configuration left unchanged. `init` tags the tensor stream with the tracker's run ID, and the SDK records its own global step with every batch.
+
+- **Run ID.** Take an explicit `run_id=` first, then `MLFLOW_RUN_ID` or `mlflow.active_run()`. `active_run()` is thread-local and is `None` whenever a run was created through `MlflowClient`. PyTorch Lightning's `MLFlowLogger` works that way and only creates the run on rank 0 (`@rank_zero_experiment`), so offer a Lightning callback that reads `trainer.logger.run_id` on rank 0 and broadcasts it to the other ranks.
+- **Step.** An MLflow run has no current step; the step is passed with each `log_metric` call. Count optimizer steps with `torch.optim.optimizer.register_optimizer_step_post_hook` (so `init(model)` needs no optimizer argument), or take `step=` from the caller or from `trainer.global_step` in the callback. The hook count misses steps that mixed precision skips; see the rules below.
 
 Do not ship a tracking-store plugin with its own URI scheme (`tensorlens+https://…`). MLflow selects the plugin by scheme, but its proxied artifact store (`mlflow-artifacts:`) accepts only `http` and `https` tracking URIs, so `log_artifact` would fail for teams that use it. The model registry would also need its own plugin.
 
 **Rules**
 
-- Register forward hooks **before** `torch.compile` and never change them afterwards.
-- Hook bodies compute mean, std, absolute max and zero fraction per layer, and write into GPU buffers allocated once. No histograms, `.cpu()`, numpy or I/O inside a hook.
-- No backward hooks. Read `p.grad` norms after `backward()` with `torch._foreach_norm`. It is a private API (`clip_grad_norm_` uses it), so test it on each supported PyTorch release and fall back to `torch.linalg.vector_norm` per tensor.
-- Fixed shapes only: `histc` with fixed bins and `scatter_add_` into `zeros(n_experts)` are fine; `bincount` and `nonzero` are not.
-- After each step, copy the hook buffers into row `step % N` of a GPU ring buffer, outside the graph. A step counter used inside the compiled region would force a recompile on every step.
+- Register forward hooks **before** `torch.compile` and never change them afterwards. With default settings, hooks added to a module that had none when it was compiled are silently ignored (`skip_nnmodule_hook_guards`). On a module that already had hooks, Dynamo guards the hook dictionary, so adding, removing or replacing one triggers a recompile.
+- Hook bodies compute mean, std, absolute max and zero fraction per layer, and write into GPU buffers allocated once and marked with `torch._dynamo.mark_static_address`. No histograms, `.cpu()`, numpy or I/O inside a hook. With gradient accumulation or activation checkpointing, a hook runs more than once per optimizer step and keeps the last forward pass's values.
+- No backward hooks. Read `p.grad` norms in an optimizer step pre-hook (`register_optimizer_step_pre_hook`, before `step()` or `zero_grad()`) with `torch._foreach_norm(..., dtype=torch.float32)`. Group gradients by `(device, dtype)` first, as `clip_grad_norm_` does, or a mixed-dtype list falls back to the slow per-tensor path; unwrap `DTensor`s with `.to_local()`. `_foreach_norm` is a private API, so test it on each supported PyTorch release and fall back to `torch.linalg.vector_norm` per tensor.
+- The global optimizer hooks have two blind spots:
+  - **Every optimizer.** They fire for every optimizer in the process, including ones for other models, so keep only the parameters of the model passed to `init`.
+  - **Overflow steps.** With mixed precision, `GradScaler.step` skips `optimizer.step()` when gradients overflow, so neither hook fires. Those are the steps that matter most, and a step counter built on the post-hook falls behind the trainer's. Record skipped steps from the scaler's `found_inf` or from the training loop, and prefer the caller's or Lightning's step over the hook count when one is available.
+- The pre-hook runs after any gradient clipping the user does, so it records clipped norms, which hide gradient explosions. Label Tier 0 gradient norms as post-clipping, or read them before clipping through the Lightning callback (`on_before_optimizer_step` runs before Lightning clips) or an explicit `tensorlens.record_grads()` call.
+- Fixed shapes only inside compiled hooks: `scatter_add_` into `zeros(n_experts)` is fine; `bincount` and `nonzero` have data-dependent output shapes and are not.
+- After each optimizer step, copy the hook buffers into row `step % N` of a GPU ring buffer, outside the graph. A step counter used inside the compiled region would force a recompile on every step.
 - Every N steps, after `optimizer.step()`, move the ring buffer to the CPU with one `.cpu()` call. A worker thread builds the Arrow batch and sends it over Arrow Flight.
 - Add pinned buffers and a side CUDA stream only if the overhead gate shows a stall.
-- Histograms and attention come from a probe pass: every M steps, one fixed batch through the wrapped model under `no_grad` and `torch.compiler.set_stance("force_eager")` (PyTorch 2.6+). That runs the same FSDP- or TP-wrapped model without the compiler. On older PyTorch the fallback is `model._orig_mod`, which is untested with sharded parameters.
+- Histograms and attention come from a probe pass: every M steps, one fixed batch through the wrapped model under `no_grad` and `torch.compiler.set_stance("force_eager")` (PyTorch 2.6+). That runs the same FSDP- or TP-wrapped model without the compiler. On older PyTorch the fallback is `model._orig_mod`, which only unwraps an outer `torch.compile(model)`; it does not bypass blocks compiled one by one, as is common with FSDP2's `fully_shard`, and it is untested with sharded parameters. `no_grad` does not stop dropout, batch-norm updates or router noise, so snapshot each submodule's `training` flag, call `model.eval()` for the probe, and restore the saved flags afterwards (a blanket `model.train()` would unfreeze submodules kept in `eval()` and trip Dynamo's `training` guards). On CUDA, `torch.histc` rejects `bf16` and `fp16` tensors, syncs with the CPU when `min == max`, and errors under `torch.use_deterministic_algorithms(True)`, so cast probe activations to `float32` and pass explicit `min < max` bounds. To capture attention maps on the probed layers, temporarily interpose `F.scaled_dot_product_attention` during the probe so it computes explicit `softmax(QKᵀ)` instead of calling the fused kernel.
 - Run the probe after the ring-buffer copy, because the hooks fire during the probe too and overwrite the step's statistics.
 - With plain data parallelism, rank 0 reports the Tier 0 statistics. With pipeline or tensor parallelism, every rank that owns layers reports its own, or layers on other ranks go unseen.
-- CI gate: `TORCH_LOGS="graph_breaks,recompiles"` must show zero breaks with the SDK on. With `mode="reduce-overhead"`, the log must also not contain "skipping cudagraphs due to mutated inputs". The hooks' in-place writes into preallocated buffers are input mutations, which can silently turn CUDA graphs off while breaks and recompiles stay at zero.
-- Hooks changed after compiling are ignored, not recompiled: `torch._dynamo.config.skip_nnmodule_hook_guards` defaults to `True`, so the compiled graph keeps the hooks it saw first.
+- CI gate: `TORCH_LOGS="graph_breaks,recompiles,cudagraphs"` must show zero breaks and recompiles with the SDK on. With `mode="reduce-overhead"`, the log must also not contain "skipping cudagraphs due to mutated inputs". A hook's in-place write into a preallocated buffer is an input mutation unless the buffer is a module buffer or marked with `torch._dynamo.mark_static_address` (with `cudagraph_trees` enabled), which can otherwise turn CUDA graphs off while breaks and recompiles stay at zero. The skip is logged as a warning, so it prints without `cudagraphs`; adding it also shows the non-warning CUDA-graph messages.
 
 **Data tiers**
 
@@ -83,10 +89,12 @@ Support W&B from inside the customer's own training script. Hold off on anything
 
 | Route | What it does | Risk |
 | --- | --- | --- |
-| Read the active run in the script | `tensorlens.init(model)` reads `wandb.run.id` and the step when a run is active, and tags the tensor stream with them | Low. It uses the MIT-licensed client on the customer's machine and touches no W&B server |
-| Wrap `wandb.log` | Keeps TensorLens steps aligned with the steps W&B records | Low, but it leans on client behaviour that can change between releases |
+| Read the active run in the script | `tensorlens.init(model)` reads `wandb.run.id` once when a run is active and tags the tensor stream with it | Low. It uses the MIT-licensed client on the customer's machine and touches no W&B server |
+| Wrap `wandb.log` | Keeps TensorLens steps aligned with the steps W&B records | Low, but it leans on client behaviour that can change between releases. Handle `commit=False`, explicit `step=`, and step metrics set with `define_metric` |
 | Viewer reads W&B history with the customer's key, on their machine | Pulls scalars into the viewer next to the tensor views | Needs legal review. The terms restrict accessing the service to build a competing product |
 | Your hosted service holds the customer's W&B key | Your cloud pulls their W&B data | Highest. The terms also restrict sharing access credentials with a third party |
+
+Do not read `wandb.run.step` per training step. It waits on a round trip to the W&B background process, with a 30-second timeout, and raises an error in `mode="shared"` runs. It is also W&B's own log counter, not the training step: PyTorch Lightning's `WandbLogger` records the step as a `trainer/global_step` metric. Use the SDK's own global step and record the W&B step only as metadata.
 
 The W&B Python client is MIT-licensed. The W&B server is proprietary, and its free local licence is for personal projects only, so never bundle it. If TensorLens ever ships a default metadata server, use MLflow, whose client and server are both Apache 2.0. The terms were read through a third-party summary, not the original text.
 
@@ -109,15 +117,52 @@ It runs outside the compiled step and needs no hooks. The evidence it hands to t
 # Every N steps, after optimizer.step(), outside the compiled step. Not yet run.
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
+
+F64 = torch.float64
+CHUNK = 1 << 24  # elements per float64 chunk: at most 128 MB extra memory
+
+
+def _sum_f64(p):
+    # p.sum(dtype=float64) on a bf16 tensor copies the whole tensor to float64 first.
+    flat = p.reshape(-1)
+    return torch.stack([c.sum(dtype=F64) for c in flat.split(CHUNK)]).sum()
+
+
+def _norms_f64(tensors):
+    # _foreach_norm's fused CUDA kernel requires each call's list to share one
+    # device and dtype, and be contiguous; mixed dtypes fall back to per-tensor
+    # vector_norm, which copies bf16 tensors to float64 first.
+    norms = [None] * len(tensors)
+    groups = {}
+    for i, p in enumerate(tensors):
+        if p.is_cuda and p.is_contiguous() and p.numel() > 0:
+            groups.setdefault((p.device, p.dtype), []).append((i, p))
+        else:
+            flat = p.reshape(-1)
+            norms[i] = torch.linalg.vector_norm(
+                torch.stack([torch.linalg.vector_norm(c, dtype=F64) for c in flat.split(CHUNK)])
+            )
+    for group in groups.values():
+        idxs, ts = zip(*group)
+        for i, n in zip(idxs, torch._foreach_norm(ts, 2, dtype=F64)):
+            norms[i] = n
+    return torch.stack(norms)
+
 
 @torch.no_grad()
-def replica_spread(params, group=None):
-    # params: tensors meant to be identical on every rank in `group`
-    f64 = torch.float64
-    fp = torch.stack([
-        torch.stack([torch.linalg.vector_norm(p, dtype=f64), p.sum(dtype=f64)])
-        for p in params
-    ])                                          # [n_params, 2]: norm, sum
+def replica_spread(params, group):
+    # params: tensors meant to be identical on every rank in `group`.
+    # group: the replication group. Pass dist.group.WORLD only for plain DDP;
+    # under tensor, pipeline or hybrid-FSDP parallelism WORLD compares the wrong ranks.
+    if group is None:
+        raise ValueError("pass the replication process group explicitly")
+    local = [p.to_local() if isinstance(p, DTensor) else p for p in params]
+    if not local:
+        raise ValueError("no replicated parameters to check")
+    norms = _norms_f64(local)
+    sums = torch.stack([_sum_f64(p) for p in local])
+    fp = torch.stack([norms, sums], dim=1)      # [n_params, 2]
     out = [torch.empty_like(fp) for _ in range(dist.get_world_size(group))]
     dist.all_gather(out, fp, group=group)       # 16 bytes per tensor per rank
     allfp = torch.stack(out)                    # [ranks, n_params, 2]
@@ -126,7 +171,9 @@ def replica_spread(params, group=None):
     return spread / scale[:, None]              # [n_params, 2]
 ```
 
-The sum is there because a norm cannot see a sign flip: `[1, -1]` and `[1, 1]` have the same norm and different sums. For fp32 weights, `torch._foreach_norm(params)` is a faster way to get the norms. Keep the float64 path for bf16 and fp16 weights, where a norm in the weight's own precision is too coarse to show small drift. In at least one code path, `vector_norm(p, dtype=torch.float64)` converts the whole tensor to float64 first, so a large bf16 tensor briefly needs four times its own memory. Process large tensors in chunks if that matters; the cost is unmeasured.
+The sum is there because a norm cannot see a sign flip: `[1, -1]` and `[1, 1]` have the same norm and different sums. Both fingerprints are float64, because a norm or sum in bf16 or fp16 is too coarse to show small drift.
+
+On CUDA, `torch._foreach_norm(ts, 2, dtype=torch.float64)` reads bf16 and fp16 tensors directly in one fused kernel per `(device, dtype)` group; an ungrouped list with mixed dtypes (such as bf16 weights and fp32 LayerNorm weights) silently falls back to `vector_norm` per tensor. `vector_norm(p, dtype=torch.float64)` and `p.sum(dtype=torch.float64)` convert the whole tensor to float64 first, which briefly needs four times a bf16 tensor's memory, so sums and any non-fast-path norms are taken in chunks. `_foreach_norm` is private, as noted in the capture rules. The run time and memory cost are unmeasured.
 
 **Where it applies**
 
@@ -134,7 +181,7 @@ The sum is there because a norm cannot see a sign flip: `[1, -1]` and `[1, 1]` h
 | --- | --- | --- |
 | DDP (data parallel) | Every parameter | Each rank holds a full copy, and the copies should stay in sync |
 | Tensor parallelism | Only weights replicated across ranks, such as LayerNorm | The user or an integration has to say which ones; this is the BLOOM case |
-| Hybrid FSDP (sharded inside a node, replicated across nodes) | Each rank's local shard, compared across the replication group | Pass that process group as `group`. How to reach the local shard depends on the FSDP version and is untested |
+| Hybrid FSDP (sharded inside a node, replicated across nodes) | Each rank's local shard, compared across the replication group | Pass that process group as `group`. FSDP2 and tensor-parallel parameters are `DTensor`s, so take `.to_local()` before fingerprinting, as the code does. FSDP1's flat parameters need another route. Both are untested |
 | Fully sharded (FSDP full shard, ZeRO-3) | Nothing | Each rank holds a different shard, so there are no copies to compare |
 
 **Limits**
@@ -150,7 +197,13 @@ Use stock Rerun 0.43.2 for the first release. Pin the exporter SDK and Viewer to
 
 Use Rerun's headless Viewer for per-view PNGs and `rerun viewer-mcp` for screenshots and the widget tree. Give the agent the JSON evidence for the numbers. When exporting a screenshot for a requested run and step, record the actual sample step alongside the PNG and JSON. A view can show the most recent sample at or before the cursor. Verify software rendering in the target Linux environment.
 
-If the trials show that sorting and a table that follows layer selection materially improve verification, first check what Rerun's built-in table options can cover. Spend up to one week prototyping any remaining interactions in a single Rust `ViewClass`. Register it in a pinned Rerun app using the upstream `custom_view` example. Check that selection and scrubbing stay synchronized and that the same view can render headlessly. The example starts a windowed viewer with `re_viewer::run_native_app`; the headless path is `re_viewer::run_headless_app`, which the example does not use, so try that first. Estimate the upgrade work before committing to it. Rune remains an option if a separate TensorLens app becomes necessary.
+If the trials show that sorting and a table that follows layer selection materially improve verification, a custom view is needed. In 0.43.2 the built-in dataframe view cannot sort. Rerun's sortable table widget is reachable only through `ViewerClient.send_table`, which opens a separate table page outside the recording and its blueprint, not beside the heatmap.
+
+Spend up to one week prototyping those interactions in a single Rust `ViewClass`. Register it in a pinned Rerun app using the upstream `custom_view` example. Check that selection and scrubbing stay synchronized and that the same view can render headlessly.
+
+- **Headless.** The example starts a windowed viewer with `re_viewer::run_native_app`, whose closure returns `Result<Box<dyn eframe::App>, _>`. `re_viewer::run_headless_app` takes a closure returning concrete `re_viewer::App` directly, plus an optional window size, and needs no main-thread token, so share a `create_app(cc) -> re_viewer::App` helper between the two branches as the `rerun` CLI does.
+- **Command line.** The example has none of the stock `rerun` flags (`--headless`, `--window-size`, `.rrd` loading), so the prototype has to add the ones it needs.
+- **Agent access.** `rerun viewer-mcp` runs as its own process and connects to a viewer's control port. The example's gRPC server serves that port, so the stock MCP server should drive the custom app as well; check it in the spike. Estimate the upgrade work before committing to it. Rune remains an option if a separate TensorLens app becomes necessary.
 
 ## Roadmap
 
