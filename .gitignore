@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Graphify: a separate clone with its own repository, and its generated output
+/graphify/
+/graphify-out/

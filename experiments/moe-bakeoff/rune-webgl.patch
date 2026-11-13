@@ -1,0 +1,17 @@
+diff --git a/crates/rune/src/render.rs b/crates/rune/src/render.rs
+--- a/crates/rune/src/render.rs
++++ b/crates/rune/src/render.rs
+@@ -600,3 +600,4 @@ impl Gpu {
+     /// One instance per set of backends for the whole process: a new one per device was a new
+     /// DXGI factory and adapter list each time a window or overlay made a device (hex#1268).
++    #[cfg(not(target_arch = "wasm32"))]
+     fn wgpu_instance_on(backends: wgpu::Backends) -> wgpu::Instance {
+@@ -610,3 +611,8 @@ impl Gpu {
+ 
++    #[cfg(target_arch = "wasm32")]
++    fn wgpu_instance_on(backends: wgpu::Backends) -> wgpu::Instance {
++        Self::new_wgpu_instance(backends)
++    }
++
+     fn new_wgpu_instance(backends: wgpu::Backends) -> wgpu::Instance {
+         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
