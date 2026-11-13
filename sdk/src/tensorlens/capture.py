@@ -74,11 +74,14 @@ def _stats_hook(buf: torch.Tensor, row: int) -> Callable[..., None]:
         if x is None or x.numel() == 0:
             return
         x = x.detach().float()
-        buf[row, 0] = x.mean()
-        buf[row, 1] = x.std() if x.numel() > 1 else 0.0
-        buf[row, 2] = x.abs().amax()
-        buf[row, 3] = (x == 0).float().mean()
-        buf[row, _SEEN] = 1.0
+        if x.numel() > 1:
+            std, mean = torch.std_mean(x)
+        else:
+            mean = x.mean()
+            std = torch.zeros_like(mean)
+        buf[row] = torch.stack(
+            (mean, std, x.abs().amax(), (x == 0).float().mean(), torch.ones_like(mean))
+        )
 
     return hook
 
@@ -202,7 +205,10 @@ class Session:
             name: torch.zeros(every, *counts.shape, dtype=torch.int64, device=self.device)
             for name, counts in self._counts.items()
         }
-        for buf in (self._act, *self._counts.values()):
+        self._counts_list = list(self._counts.values())
+        self._ring_counts_list = list(self._ring_counts.values())
+        self._grad_idx_cache: dict[tuple[int, ...], torch.Tensor] = {}
+        for buf in (self._act, *self._counts_list):
             _mark_static(buf)
 
         self._handles = [
@@ -259,24 +265,40 @@ class Session:
         With `auto_step` this runs just before `optimizer.step()`, which is after any
         gradient clipping. Call it yourself before clipping to record unclipped norms.
         """
+        n_params = len(self._params)
+        if self._grads_recorded:
+            self._grad.zero_()
+        if n_params == 0:
+            self._grads_recorded = True
+            return
+
         groups: dict[tuple[torch.device, torch.dtype], list[tuple[int, torch.Tensor]]] = {}
         for index, param in enumerate(self._params):
             grad = param.grad
             if grad is None:
                 continue
-            grad = unwrap_local(grad)
+            if type(grad) is not torch.Tensor:
+                grad = unwrap_local(grad)
             if grad.is_sparse:
                 grad = grad.coalesce().values()
             if grad.numel() == 0:
                 continue
             groups.setdefault((grad.device, grad.dtype), []).append((index, grad))
-        self._grad.zero_()
+
         for (_, dtype), items in groups.items():
-            indices = [index for index, _ in items]
             grads = [grad for _, grad in items]
             norms = _foreach_norm(grads, torch.float32 if dtype in _LOW_PRECISION else None)
-            self._grad[indices, 0] = torch.stack(norms).to(self._grad)
-            self._grad[indices, 1] = 1.0
+            stacked = torch.stack(norms).to(self._grad)
+            if len(items) == n_params:
+                self._grad[:, 0].copy_(stacked)
+                self._grad[:, 1].fill_(1.0)
+            else:
+                key = tuple(index for index, _ in items)
+                idx = self._grad_idx_cache.get(key)
+                if idx is None:
+                    idx = torch.tensor(key, dtype=torch.int64, device=self._grad.device)
+                    self._grad_idx_cache[key] = idx
+                self._grad.index_copy_(0, idx, torch.stack((stacked, torch.ones_like(stacked)), dim=1))
         self._grads_recorded = True
 
     def _ensure_spread_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -327,17 +349,17 @@ class Session:
         if not self._spread_recorded and self._replica_group is not None and self._params:
             self.record_replica_spread(self._replica_group)
         row = len(self._steps)
-        self._ring_act[row].copy_(self._act)
-        self._ring_grad[row].copy_(self._grad)
+        torch._foreach_copy_((self._ring_act[row], self._ring_grad[row]), (self._act, self._grad))
+        torch._foreach_zero_((self._act, self._grad))
         if self._spread_recorded and self._spread is not None and self._ring_spread is not None:
             self._ring_spread[row].copy_(self._spread)
             self._spread.zero_()
         self._ring_spread_seen.append(self._spread_recorded)
-        for name, counts in self._counts.items():
-            self._ring_counts[name][row].copy_(counts)
-            counts.zero_()
-        self._act.zero_()
-        self._grad.zero_()
+        if self._counts_list:
+            torch._foreach_copy_(
+                [ring[row] for ring in self._ring_counts_list], self._counts_list
+            )
+            torch._foreach_zero_(self._counts_list)
         self._grads_recorded = False
         self._spread_recorded = False
         current = self._next_step if step is None else step
@@ -489,13 +511,15 @@ def _router_stats(counts: list[int]) -> dict[str, Any]:
     }
 
 
-def _foreach_norm(tensors: list[torch.Tensor], dtype: torch.dtype | None) -> list[torch.Tensor]:
+def _foreach_norm(
+    tensors: list[torch.Tensor], dtype: torch.dtype | None
+) -> tuple[torch.Tensor, ...] | list[torch.Tensor]:
     # `torch._foreach_norm` is private (clip_grad_norm_ uses it). One list must share a
     # device and dtype and be contiguous to stay on the fused path.
     foreach = getattr(torch, "_foreach_norm", None)
-    if foreach is not None and all(t.is_contiguous() and t.numel() > 0 for t in tensors):
+    if foreach is not None:
         try:
-            return list(foreach(tensors, 2, dtype=dtype))
+            return foreach(tensors, 2, dtype=dtype)
         except (RuntimeError, TypeError):
             pass
     return [torch.linalg.vector_norm(t, 2, dtype=dtype) for t in tensors]
