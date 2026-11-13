@@ -100,7 +100,9 @@ def main() -> None:
     times = [[], []]
     counters = torch._dynamo.utils.counters
     counters.clear()
-    with tensorlens.init(
+    # Both models share forward code. Guard their hooks so the capture run
+    # cannot reuse the baseline graph, which has no TensorLens hooks.
+    with torch._dynamo.config.patch(skip_nnmodule_hook_guards=False), tensorlens.init(
         models[1], run_id="granite", routers=routers, every=FLUSH_EVERY,
         sink=tensorlens.JsonlSink(capture_path),
     ):
@@ -141,8 +143,13 @@ def main() -> None:
         raise RuntimeError("Capture did not record the expected optimizer steps")
     for record in records:
         for name in routers:
-            if sum(record["moe"][name]) != expected_assignments:
-                raise RuntimeError(f"Wrong assignment total for {name} at step {record['step']}")
+            counts = record["moe"][name]
+            total = sum(counts)
+            if total != expected_assignments:
+                raise RuntimeError(
+                    f"{name} at step {record['step']}: expected {expected_assignments} "
+                    f"assignments, got {total} ({counts})"
+                )
 
     off, on = map(statistics.median, times)
     overhead = 100 * (on / off - 1)

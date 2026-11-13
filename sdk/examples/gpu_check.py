@@ -160,7 +160,11 @@ def measure_overhead(args: argparse.Namespace, device: torch.device) -> None:
             )
         return compile_model(model, args), torch.optim.SGD(model.parameters(), lr=1e-4), session
 
-    with tempfile.TemporaryDirectory() as tmp:
+    # Both models share forward code but only one has capture hooks.
+    with (
+        torch._dynamo.config.patch(skip_nnmodule_hook_guards=False),
+        tempfile.TemporaryDirectory() as tmp,
+    ):
         torch._dynamo.reset()
         base, base_opt, _ = build(capture=False)
         on, on_opt, session = build(capture=True)
@@ -182,6 +186,20 @@ def measure_overhead(args: argparse.Namespace, device: torch.device) -> None:
         watched = len(session.layer_names)
         session.close()
 
+        records = tensorlens.load_records(Path(tmp) / "overhead.jsonl")
+        expected_steps = args.warmup + args.rounds * args.block_steps
+        if [record["step"] for record in records] != list(range(expected_steps)):
+            raise RuntimeError("Overhead run did not record the expected optimizer steps")
+        router_names = [f"blocks.{i}.router" for i in range(args.blocks)]
+        for record in records:
+            for name in router_names:
+                counts = record["moe"][name]
+                if sum(counts) != args.batch:
+                    raise RuntimeError(
+                        f"Overhead run {name} at step {record['step']}: "
+                        f"expected {args.batch} assignments, got {sum(counts)} ({counts})"
+                    )
+
     off, on_time = statistics.median(times["off"]), statistics.median(times["on"])
     print(
         f"overhead model: dim={args.dim} blocks={args.blocks} batch={args.batch}, "
@@ -192,6 +210,7 @@ def measure_overhead(args: argparse.Namespace, device: torch.device) -> None:
     print(f"  overhead:    {(on_time - off) * 1e6:+.1f} us/step, {(on_time / off - 1) * 100:+.2f}%")
     spread = (max(times["off"]) - min(times["off"])) / off * 100
     print(f"  noise:       capture-off blocks vary by {spread:.2f}% of the median")
+    print(f"Verified routing assignment totals across {expected_steps} recorded steps")
 
 
 def main() -> None:
