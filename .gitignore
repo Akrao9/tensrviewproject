@@ -9,3 +9,8 @@ __pycache__/
 # Graphify: a separate clone with its own repository, and its generated output
 /graphify/
 /graphify-out/
+
+# TensorLens capture output and test caches
+tensorlens-out/
+.pytest_cache/
+*.egg-info/
