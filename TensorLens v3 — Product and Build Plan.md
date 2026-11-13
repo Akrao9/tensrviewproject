@@ -10,9 +10,12 @@ TensorLens owns the capture SDK, detectors, and the evidence they produce. Stock
 
 - **Who it is for:** teams training large models on their own clusters with MLflow or W&B. Start with RL, robotics and mixture-of-experts teams, whose important signals are not loss curves.
 - **The pitch:** add one line to your PyTorch script and see inside a failing run (activations, attention, MoE routing), with evidence an agent can read.
-- **Against trackers:** MLflow and W&B show scalar curves. This shows what happens inside the layers.
-- **Against debugging agents:** free add-ons for coding agents read logs and loss curves. This gives those agents a picture and the numbers behind it.
-- **Against CoreWeave ARIA:** ARIA lives inside W&B on CoreWeave. This works with whichever tracker, agent and cloud the team already has.
+- **Against trackers:** MLflow and W&B show scalar curves, and their MCP servers let coding agents query those runs. This shows what happens inside the layers.
+- **Against CoreWeave ARIA:** ARIA is an agent inside W&B that analyses experiments, proposes next runs and launches them with approval (public preview June 2026). It reasons over what W&B logged, mostly scalars, and is tied to W&B and CoreWeave. This captures layer internals and works with whichever tracker, agent and cloud the team already has.
+- **Against Trainy Pluto:** Pluto is a Neptune replacement built for responsiveness with many runs, and its experimental MCP server lets an agent read per-layer panels in one call. It displays what the user logs; no capture SDK or failure detectors turned up. This captures the internals cheaply under `torch.compile` and FSDP and detects known failures.
+- **Against debugging agents:** free add-ons and research agents such as RunSleuth read logs, loss curves and gradient norms. None found inspects activations, attention or MoE routing. This gives those agents a picture and the numbers behind it.
+
+**The gap.** A search on Nov 13, 2026 found no product that captures layer internals (activations, attention, MoE routing, cross-GPU drift) and hands an agent the evidence to explain a failure. Public requests for such a tool were not found either, so demand is unproven; the closest signal is that CoreWeave and Trainy are both building agent access to training runs.
 
 **Why now.** OpenAI bought Neptune, whose product logged thousands of per-layer metrics to debug unstable runs, and the hosted service shut down in March 2026. Teams that relied on it said the hard requirement was a tool that stays responsive with thousands of runs and heavy logging.
 
@@ -211,7 +214,49 @@ Twelve weeks in five phases. Each phase ends in a gate, and the next phase start
 
 &#91;embedded content: 12-week roadmap · 5 phases, 5 gates\]
 
-Gate 0 uses design-partner interviews to test willingness to pay for monitoring. If it fails, rethink the product before building the SDK. The Gate 1 viewer trial has three arms: stock Rerun with the bake-off blueprint, the Rune incident prototype, and the JSON evidence alone. Give the two viewer arms the same detector summary, status colors, and default expert table. Time how long engineers and agents take to verify claims that require inspecting the evidence. Track correctness and agent tool calls. Use the results to decide whether to prototype a custom view. If a later gate fails, spend up to one extra week, then cut scope. The gate numbers are targets, not measurements.
+The embedded roadmap diagram predates this version; the steps below are the current roadmap. There are no customer interviews: the author is the first user, and TensorLens is validated on the author's own training runs, then through a free public release. Gates 1 and 2 restate criteria from elsewhere in this plan. The Gate 0, 3 and 4 criteria and the split into weeks are proposals. The one exception to the gate order is the SDK skeleton, which starts alongside the Gate 1 trial because the trial does not depend on it. If any gate after Gate 0 fails, spend up to one extra week, then cut scope. The gate numbers are targets, not measurements.
+
+### Week 1: set up the dogfood runs (Gate 0)
+
+1. Pick one or two real training jobs you run yourself, ideally an MoE model, multi-GPU, with `torch.compile`. These are the dogfood runs for every later gate.
+2. Write down the failures you have hit before, or expect to hit, on those jobs: what went wrong, how long it took to notice, and what would have caught it sooner. These become the seeded failures and the answer key.
+3. Record your own tracker (MLflow or W&B) and multi-GPU setup. That settles two open decisions below for v1.
+4. Re-check the competitors named under Product (ARIA, Pluto, tracker MCP servers) for per-layer capture or detectors launched since Nov 13, 2026.
+5. **Gate 0:** the dogfood runs are chosen, they can be instrumented, and the failure list holds at least one case that loss curves alone would not explain. If a competitor already covers that case, narrow or rethink before writing SDK code.
+
+### Weeks 2–3: is a custom view needed? (Gate 1)
+
+6. Generate unseen synthetic fixtures with the bake-off's `generate.py`, using different incident steps, layers and experts.
+7. Pre-register timed questions that neither default screen answers, balanced between Rune's layer selection and Rerun's timeline.
+8. Run three arms: stock Rerun with the bake-off blueprint, the Rune incident prototype, and the JSON evidence alone. Give the two viewer arms the same detector summary, status colors and default expert table. Counterbalance the order for engineers, and use fresh sessions with the same model and prompt for agents.
+9. **Gate 1:** compare median time to a correct answer at matched accuracy, and agent tool calls. A 2× reduction from the custom interactions schedules the one-week custom view spike in weeks 8–10; otherwise stay on stock Rerun.
+10. In parallel, start the SDK skeleton: `init`, run ID and step handling, the Lightning callback, and the optimizer hooks, including steps that mixed precision skips.
+
+### Weeks 4–7: capture and detect on a real run (Gate 2)
+
+11. Tier 0 capture: hook statistics into static buffers, the GPU ring buffer, one `.cpu()` copy every N steps, and Arrow Flight to ingest.
+12. Tier 1 capture: the MoE load table and the cross-GPU fingerprints.
+13. CI gate: zero graph breaks, zero recompiles, and no CUDA-graph skips under `reduce-overhead`.
+14. Ingest server in Rust: Arrow in, Parquet out.
+15. The first two detectors, MoE routing imbalance and cross-GPU drift, each writing the viewer-neutral JSON evidence.
+16. The Tier 2 probe pass for histograms and attention; Tier 3 replay if time allows.
+17. **Gate 2:** overhead under 1% on a dogfood run, a clean CI gate, and every seeded failure caught, including a cross-GPU drift case and a sign-flip case.
+
+### Weeks 8–10: evidence for engineers and agents (Gate 3)
+
+18. Turn the bake-off exporter into the product exporter: JSON from real runs to `.rrd` plus the blueprint.
+19. Agent access: Rerun headless screenshots, `rerun viewer-mcp`, and the JSON, with the actual sample step recorded next to each PNG.
+20. Verify software rendering in your Linux training environment.
+21. The MLflow importer, only with three or more engineers.
+22. The one-week custom view spike, only if Gate 1 called for it: headless rendering, MCP access, and an estimate of the upgrade cost.
+23. **Gate 3 (proposed):** on seeded failures, an agent with TensorLens evidence finds the right cause more often than an agent with tracker data alone, and TensorLens has caught and explained at least one real problem on a dogfood run.
+
+### Weeks 11–12: public release (Gate 4)
+
+24. Release the SDK, detectors and exporter free under Apache 2.0 / MIT, with the MoE bake-off as a runnable demo.
+25. Track outside use: installs, issues, and teams running it on their own clusters. Ask those teams whether they would pay for hosted monitoring.
+26. Measure storage, rendering and model-call cost per monitored run on the dogfood runs.
+27. **Gate 4 (proposed):** outside teams run TensorLens on real jobs and report problems it caught. Decide on the hosted tier and its price only after that, against the measured cost.
 
 ## Free and paid
 
@@ -229,7 +274,8 @@ The biggest risk is commercial, not technical: teams may value the tool and stil
 
 | Risk | Effect | Mitigation |
 | --- | --- | --- |
-| Nobody pays for monitoring | No revenue | Five design-partner interviews before more code. Ask what last cost them a week of GPU time and what would have caught it |
+| Nobody pays for monitoring | No revenue | No interviews are planned, so dogfooding proves usefulness, not willingness to pay. Release free first, and ask the outside teams who adopt it whether they would pay before building the hosted tier |
+| ARIA or Pluto adds layer capture and detectors | The gap closes, and the hosted tier competes with W&B or Trainy | Re-check both at Gate 0 and before the release; stay tracker- and cloud-neutral; lead with MoE, attention, cross-GPU drift and `torch.compile` support |
 | Trackers add per-layer views | The wedge narrows | Stay tracker-neutral; lead with MoE, attention and torch.compile support that they lack |
 | Rerun's extension interfaces change | A custom incident view may need regular updates | Pin the Viewer and SDK, test recording read-back on upgrades, and budget maintenance if the custom view ships |
 | Hooks stall training or break `torch.compile` | Users switch the SDK off | Overhead gate under 1%; CI with compile on; zero graph breaks |
@@ -249,12 +295,13 @@ The synthetic MoE bake-off verified recording read-back and headless rendering. 
 - The training overhead, and whether the hook's in-place write compiles without graph breaks.
 - Whether a coding agent with TensorLens evidence and Rerun screenshots finds the right cause more often than one with tracker data alone.
 - The data sizes in the tier table.
-- No existing tool that combines Rerun with MLflow or training debugging turned up in a search. That does not prove none exists.
+- Whether anyone besides the author wants this. A search on Nov 13, 2026 found no product that captures layer internals and explains failures, and no public requests for one. That does not prove none exists or that demand is absent.
 
 **Decisions that are yours**
 
 - [ ] Product name; "TensorLens" is a placeholder.
-- [ ] Team size against 12 weeks. With fewer than three engineers, move the MLflow importer and the paid pilot after launch.
+- [ ] Team size against 12 weeks. With fewer than three engineers, move the MLflow importer after launch.
+- [ ] Who explains failures. v1 hands the evidence to the user's own coding agent. A built-in explainer, as ARIA has, is the agent loop postponed from v2 and would add scope.
 - [ ] Whether W&B is the next tracker target after MLflow.
 - [ ] Multi-GPU runs: which rank reports activations. Rank 0 is enough for plain data parallelism, and with pipeline or tensor parallelism every rank that owns layers reports; every rank still shares its small parameter fingerprints for the cross-GPU detector.
 - [ ] Price, after the cost per monitored run is modelled.
@@ -265,6 +312,13 @@ The synthetic MoE bake-off verified recording read-back and headless rendering. 
 - [ZenML: Neptune shutdown and migration](https://www.zenml.io/blog/neptune-to-zenml)
 - [Trainy: What Neptune got right](https://www.trainy.ai/blog/what-neptune-got-right)
 - [CoreWeave blog: Introducing ARIA](https://www.coreweave.com/blog/introducing-coreweave-aria-ai-research-and-iteration-agent)
+- [SiliconANGLE: CoreWeave debuts ARIA (June 29, 2026)](https://siliconangle.com/2026/06/29/coreweave-debuts-aria-agent-automate-ai-research-weights-biases/)
+- [Trainy Pluto](https://www.trainy.ai/pluto)
+- [Trainy Pluto MCP server](https://docs.trainy.ai/pluto/mcp)
+- [W&B MCP server](https://docs.wandb.ai/platform/mcp-server)
+- [MLflow MCP server](https://mlflow.org/docs/latest/genai/mcp/)
+- [RunSleuth: LLM agent for PyTorch training-failure diagnosis](https://github.com/Kaiden118/RunSleuth-Evidence-Grounded-ML-Training-Failure-Diagnosis-and-Repair-Verification)
+- [Mechanism-driven monitors for LLM training instability](https://arxiv.org/html/2606.28116)
 - [AMD: Agentic diagnosis for LLM training at scale](https://rocm.blogs.amd.com/software-tools-optimization/maxtext-slurm-agentic-diagnosis/README.html)
 - [Rerun terms: MIT / Apache 2.0 licensing](https://rerun.io/terms)
 - [Rerun Rust viewer extensions](https://rerun.io/docs/howto/visualization/extend-ui)
