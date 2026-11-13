@@ -40,7 +40,7 @@ Each optimizer step becomes one JSON line in `tensorlens-out/<run_id>.rank<rank>
 
 ## What is not built or not verified
 
-- **Nothing has run on a GPU.** The Inductor backend, `mode="reduce-overhead"` and the CUDA-graph skip check are untested on CUDA hardware, and the training overhead is unmeasured. The buffers do work on Apple's MPS device, and AOTAutograd's `static_input_indices` check is verified on CPU.
+- **GPU coverage is one toy run.** On 13 Nov 2026 a 16-step toy MoE run passed on an RTX PRO 6000 (PyTorch 2.14.1+cu130, Inductor with CUDA graphs): both graphs were CUDA-graphable with the hook buffers as inputs, router counts were exact, and the seeded collapse was detected. That run used an ad-hoc script, not `examples/gpu_check.py`, which has only run on CPU with `aot_eager`. Training overhead is still unmeasured, and no real model, mixed precision or multi-GPU job has run.
 - **Arrow Flight and the Rust ingest server.** Records go to a JSON Lines file, and Python detectors/exporters turn that file into `evidence.json` and `.rrd`.
 - **The probe pass** for histograms and attention (Tier 2) and replay (Tier 3).
 - **Multi-rank reporting.** Every rank writes its own file.
@@ -70,3 +70,11 @@ cd sdk
 ../.venv/bin/python -m pytest
 ../.venv/bin/python examples/toy_moe.py --rerun
 ```
+
+On a CUDA machine, run the GPU check. It fails on any graph break, recompile or CUDA-graph skip, and then reports the time per step with and without capture:
+
+```sh
+python examples/gpu_check.py --dim 1024 --blocks 8 --batch 4096
+```
+
+Set the sizes close to the real job, because a small model makes the fixed per-step cost look large.
