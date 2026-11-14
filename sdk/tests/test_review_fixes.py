@@ -153,3 +153,37 @@ def test_old_probe_records_keep_their_entropy_curve_on_export(tmp_path, monkeypa
     monkeypatch.setattr(rr, "log", lambda p, *a, **kw: (logged.append((p, a)), real(p, *a, **kw)))
     tensorlens.export_rerun(tensorlens.build_evidence(records), tmp_path / "o.rrd", records=records)
     assert any(p == "/probe/entropy/blocks.0" for p, _ in logged)
+
+
+def test_warns_when_only_another_optimizer_steps():
+    # DeepSpeed ZeRO and Megatron step copies of the weights: the stepping optimizer
+    # holds none of the model's parameters, so automatic counting would record nothing.
+    model = nn.Linear(4, 1)
+    copy = nn.Parameter(torch.zeros(5))
+    optimizer = torch.optim.SGD([copy], lr=0.1)
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(model, sink=sink, capture="full")
+    with pytest.warns(RuntimeWarning, match="auto_step=False") as caught:
+        for _ in range(25):
+            model(torch.randn(2, 4)).sum().backward()
+            copy.grad = torch.ones(5)
+            optimizer.step()
+    session.close()
+    assert len(caught) == 1 and sink.records == []
+
+
+def test_no_warning_when_the_models_optimizer_steps_too():
+    import warnings
+
+    model = nn.Linear(4, 1)
+    other = torch.optim.SGD([nn.Parameter(torch.zeros(5, requires_grad=True))], lr=0.1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    session = tensorlens.init(model, sink=tensorlens.MemorySink(), capture="full")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for _ in range(25):
+            model(torch.randn(2, 4)).sum().backward()
+            optimizer.step()
+            other.param_groups[0]["params"][0].grad = torch.ones(5)
+            other.step()
+    session.close()

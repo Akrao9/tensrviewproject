@@ -161,6 +161,31 @@ Call `tensorlens.init` before `accelerator.prepare` if Accelerate compiles the m
 
 Clipping depends on the Accelerate version. Up to 1.15.0, `accelerator.clip_grad_norm_` calls `torch.nn.utils.clip_grad_norm_` and is recorded with nothing more to do. The development version (1.16.0.dev0) computes the norm another way and is not recorded; there, pass on the value it returns: `session.record_grad_norm(accelerator.clip_grad_norm_(model.parameters(), max_norm))`. Do not do that on 1.15.0, or the norm is counted twice.
 
+### DeepSpeed
+
+With ZeRO stage 1 or 2, DeepSpeed's optimizer steps flattened float32 copies of the weights, so automatic step counting sees no step on the model and records nothing. TensorLens warns after 10 such steps. Count steps yourself:
+
+```python
+engine, optimizer, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config=config)
+session = tensorlens.init(engine.module, routers=routers, auto_step=False, start_step=engine.global_steps)
+...
+loss = engine(batch)
+engine.backward(loss)
+engine.step()
+if engine.is_gradient_accumulation_boundary():  # after step(): the update just happened
+    norm = engine.get_global_grad_norm()
+    if norm is not None:
+        session.record_grad_norm(norm)
+    session.log({"train/loss": loss.detach()})
+    session.step(step=engine.global_steps - 1)
+```
+
+- **Without ZeRO (stage 0)** the default `tensorlens.init(engine.module)` counts steps and reads per-layer gradient norms. DeepSpeed clips with its own function there, so `clip_grad_norm` is not recorded.
+- **Per-layer gradient norms and weight checks** are not recorded in the recipe above; `clip_grad_norm` carries DeepSpeed's global norm, which the gradient-spike detector uses.
+- **Skipped steps.** `engine.was_step_applied()` is false after an overflow; the recipe still counts the step, but does not mark it `step_skipped`.
+
+Run on CPU, one process, with DeepSpeed 0.20.1 at stages 0, 1 and 2, without gradient accumulation or mixed precision. Not run: stage 3, fp16 or bf16, several ranks, a GPU. The accumulation-boundary line follows DeepSpeed's source and was not run.
+
 ### Ray, or several processes outside one process group
 
 Pass the same `run_id=` to every process from the driver, and give each process its own file:

@@ -72,6 +72,8 @@ jobs:
           pip install -e ".[dev,lightning,huggingface,rerun]"
       - name: Tests
         run: pytest -ra
+      - name: Trainer callback acceptance script, toy model
+        run: python examples/trainer_check.py --toy --backend aot_eager --steps 150 --seed-step 100 --probe-every 50 --out "$RUNNER_TEMP/trainer-check"
 
   gpu:
     # GitHub's free runners have no GPU, so this runs only when started by hand, on a

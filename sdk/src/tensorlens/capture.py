@@ -50,6 +50,7 @@ SCHEMA_VERSION = 1
 PROBE_EVERY = 1000
 # Blocks of `every` steps waiting for the writer thread before training waits for it.
 WRITER_QUEUE = 8
+FOREIGN_STEPS_WARNING = 10  # optimizer steps on other parameters before warning that none was counted
 # Settings per capture mode. Router load is the always-on signal; layer statistics and
 # gradient and weight norms are a debugging mode, as in Composer's ActivationMonitor,
 # wandb.watch and Lightning's grad_norm.
@@ -403,6 +404,7 @@ class Session:
         self._clip = torch.zeros((), **f32)
         self._ring_clip = torch.zeros(every, **f32)
         self._clip_recorded = False
+        self._foreign_steps = 0
         self._clip_calls = 0  # lets an outer wrapper see that an inner one already recorded
         self._ring_clip_seen: list[bool] = []
         self._ring_spread: torch.Tensor | None = None
@@ -504,8 +506,28 @@ class Session:
         # The every-th, 2*every-th, ... step, counting from 1 (as Lightning and wandb do).
         return every > 0 and (self._steps_committed + 1) % every == 0
 
+    def _note_foreign_step(self) -> None:
+        # DeepSpeed's ZeRO optimizers and Megatron's mixed-precision optimizer step copies
+        # of the weights, so the optimizer that steps holds none of the model's
+        # parameters and no step would ever be counted. Say so instead of writing nothing.
+        if self._lead is not None or self._foreign_steps < 0:
+            return
+        self._foreign_steps += 1
+        if self._foreign_steps == FOREIGN_STEPS_WARNING:
+            self._foreign_steps = -1  # warn once
+            warnings.warn(
+                f"TensorLens has recorded no steps: {FOREIGN_STEPS_WARNING} optimizer steps ran, none on this "
+                "model's parameters. If your framework steps copies of the weights (DeepSpeed ZeRO, "
+                "Megatron-LM), pass auto_step=False and call session.step() after each update.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     def _before_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
-        if self._closed or not self._owns(optimizer):
+        if self._closed:
+            return
+        if not self._owns(optimizer):
+            self._note_foreign_step()
             return
         # PyTorch wraps each optimizer class's own `step` with the global hooks, so an
         # optimizer that subclasses another and calls `super().step()` fires them again,
