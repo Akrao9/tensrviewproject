@@ -347,7 +347,7 @@ The synthetic MoE bake-off verified recording read-back and headless rendering. 
 
 **Decisions that are yours**
 
-- [ ] Product name; "TensorLens" is a placeholder. Checked Nov 14, 2026: the PyPI name `tensorlens` is taken by an unrelated package (0.0.3, April 2025), so `pip install tensorlens` installs someone else's code, and the SDK cannot be published under its current package name. GitHub also has `idoatad/TensorLens`, the code for an ACL 2026 paper on transformer attention analysis.
+- [ ] Product name; "TensorLens" is a placeholder. Checked Nov 14, 2026: the PyPI name `tensorlens` is taken by an unrelated package (0.0.3, April 2025), so `pip install tensorlens` installs someone else's code, and the SDK cannot be published under its current package name. GitHub also has `idoatad/TensorLens`, the code for an ACL 2026 paper on transformer attention analysis (arXiv 2601.17958; static analysis of a frozen model, not training monitoring), plus `gmkrxb/tensorlens` (a VS Code extension for tensor files) and `HAYDARKILIC/tensorlens` (LLM and loss-landscape visualization). Pick the new name before the public release (Gate 4) and check it on PyPI and GitHub first.
 - [ ] Team size against 12 weeks. With fewer than three engineers, move the MLflow importer after launch.
 - [ ] Who explains failures. v1 hands the evidence to the user's own coding agent. A built-in explainer, as ARIA has, is the agent loop postponed from v2 and would add scope.
 - [ ] Whether W&B is the next tracker target after MLflow.
