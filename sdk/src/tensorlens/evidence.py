@@ -55,6 +55,11 @@ ACT_DEAD_RISE = 0.25  # zero fraction above its baseline, as a recent median
 # A parameter is reported as not updating once its weights are exactly unchanged on this
 # many weight checks in a row while it has a gradient. Checks run every 50 steps by default.
 STALL_STEPS = 3
+# Loss scaling (first guesses): GradScaler skips a few steps in a row at the start while it
+# halves its initial 65,536 scale, so only a longer run of skips, or a scale below 1 (the
+# gradients overflow even unscaled), is reported.
+SCALE_SKIP_RUN = 10
+SCALE_FLOOR = 1.0
 MISSING_COLOR = (48, 54, 64)
 DEAD_COLOR = (236, 84, 99)
 OVERLOADED_COLOR = (255, 190, 94)
@@ -251,6 +256,8 @@ def detect_grad_spikes(
     # the per-parameter norms are read after clipping, so a clipped spike stays flat there.
     key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
     for record in sorted(records, key=lambda r: r["step"]):
+        if record.get("step_skipped"):
+            continue  # a loss-scaler overflow step: its gradients are Inf or NaN by design
         total = _finite(record.get(key))
         if total is None:
             continue
@@ -426,6 +433,34 @@ def detect_activation_anomalies(records: list[dict[str, Any]]) -> list[dict[str,
     return list(found.values())
 
 
+def detect_loss_scale_trouble(
+    records: list[dict[str, Any]], *, run: int = SCALE_SKIP_RUN, floor: float = SCALE_FLOOR
+) -> dict[str, Any] | None:
+    """Return the first step where mixed-precision loss scaling is in trouble, or None:
+    `run` or more optimizer steps in a row skipped by the scaler, or the loss scale below
+    `floor`. Needs `step_skipped` and `grad_scale`, recorded with `init(..., scaler=)`."""
+    streak, skipped, total, first = 0, 0, 0, None
+    for record in sorted(records, key=lambda r: r["step"]):
+        if "step_skipped" not in record:
+            continue
+        total += 1
+        skipped += bool(record["step_skipped"])
+        streak = streak + 1 if record["step_skipped"] else 0
+        scale = _finite(record.get("grad_scale"))
+        if first is None and (streak >= run or (scale is not None and scale < floor)):
+            first = {
+                "kind": "loss_scale_trouble",
+                "step": int(record["step"]),
+                "consecutive_skips": streak,
+                "grad_scale": scale,
+                "reason": "skips" if streak >= run else "scale",
+            }
+    if first is not None:
+        first["skipped_steps"] = skipped
+        first["recorded_steps"] = total
+    return first
+
+
 def detect_repeated_steps(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Return step numbers recorded more than once, as after a resume without `start_step`."""
     seen: dict[tuple[Any, int], int] = {}
@@ -467,21 +502,27 @@ def _diversity_from_counts(counts: list[int], n_experts: int) -> float:
 
 
 def detect_non_finite(records: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Return the first step where a layer statistic or gradient norm is NaN or Inf."""
+    """Return the first step where a layer statistic or gradient norm is NaN or Inf.
+
+    On steps a loss scaler skipped (`step_skipped`), Inf or NaN gradients are what the
+    scaler expects and handles, so only activations are checked there; the skips
+    themselves are counted in `detect_loss_scale_trouble`.
+    """
     for record in records:
         bad_layers = [
             name
             for name, stats in record.get("layers", {}).items()
             if any(_is_non_finite(v) for v in stats.values())
         ]
+        skipped = bool(record.get("step_skipped"))
         bad_grads = [
             name
-            for name, norm in record.get("grad_norms", {}).items()
+            for name, norm in ({} if skipped else record.get("grad_norms", {})).items()
             if _is_non_finite(norm)
         ]
-        if _is_non_finite(record.get("grad_norm")) and not bad_grads:
+        if not skipped and _is_non_finite(record.get("grad_norm")) and not bad_grads:
             bad_grads.append("<total>")
-        if _is_non_finite(record.get("clip_grad_norm")):
+        if not skipped and _is_non_finite(record.get("clip_grad_norm")):
             bad_grads.append("<total before clipping>")
         if bad_layers or bad_grads:
             return {
@@ -637,7 +678,7 @@ def build_evidence(
     starved_hit = detect_starved_experts(samples)
     if starved_hit is not None:
         incidents.append(starved_hit)
-    for detector in (detect_grad_spikes, detect_stalled_weights, detect_repeated_steps):
+    for detector in (detect_grad_spikes, detect_stalled_weights, detect_repeated_steps, detect_loss_scale_trouble):
         hit = detector(records)
         if hit is not None:
             incidents.append(hit)
@@ -845,6 +886,16 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         return (
             f"Repeated step numbers from step {incident['step']}: {incident['repeated']} steps"
             " recorded more than once; pass start_step= to tensorlens.init when resuming"
+        )
+    if kind == "loss_scale_trouble":
+        why = (
+            f"{incident['consecutive_skips']} optimizer steps in a row skipped on Inf or NaN gradients"
+            if incident["reason"] == "skips"
+            else f"loss scale fell to {incident['grad_scale']:g}"
+        )
+        return (
+            f"Loss scaling in trouble at step {incident['step']}: {why}; "
+            f"{incident['skipped_steps']} of {incident['recorded_steps']} steps skipped in all"
         )
     if kind == "non_finite":
         parts = [*incident.get("layers", ()), *incident.get("gradients", ())]
@@ -1077,6 +1128,13 @@ def export_rerun(
             if record.get("lr"):
                 rr.log("/training/lr", rr.Scalars(float(record["lr"][0])))
                 training_paths["/training/lr"] = "Learning rate"
+            scale = _finite(record.get("grad_scale"))
+            if scale is not None:
+                rr.log("/training/grad_scale", rr.Scalars(scale))
+                training_paths["/training/grad_scale"] = "Loss scale"
+            if "step_skipped" in record:
+                rr.log("/training/step_skipped", rr.Scalars(float(bool(record["step_skipped"]))))
+                training_paths["/training/step_skipped"] = "Step skipped by the loss scaler"
             for name, val in (record.get("scalars") or {}).items():
                 value = _finite(val)
                 if value is not None:

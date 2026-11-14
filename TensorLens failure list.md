@@ -17,7 +17,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 | 7 | Attention logit growth and entropy collapse | Late | Captured by probe pass (`max_logit`, `entropy_share`, 64×64 map); no detector yet | Medium |
 | 8 | Activation outliers, especially with FP8 | Late | Detected in full capture (5× spike in `abs_max`/`std`, 3× drift in `abs_max/std`, dead outputs) | Medium |
 | 9 | NaN or Inf | Yes, eventually | Detected (activations, gradients, `clip_grad_norm`, and replica weights) | Medium |
-| 10 | Mixed-precision loss scale collapse and skipped steps | Sometimes | Not captured (`auto_step=False` counts iterations; `GradScaler` state not read) | Medium |
+| 10 | Mixed-precision loss scale collapse and skipped steps | Sometimes | Detected with `init(..., scaler=)`: `step_skipped` and `grad_scale` per step; 10 skips in a row or a scale below 1 | Medium |
 | 11 | MoE token dropping | No | Not captured | Medium |
 | 12 | Embedding or other weight norms shrinking or growing | No | Recorded every 50 steps in float64; no slow-drift detector yet | Low |
 | 13 | Silent compiler or framework bugs | No, or slow convergence | Not captured | Low |
@@ -118,7 +118,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** The loss scale and the count of skipped steps.
 
-**TensorLens today.** Not captured. Skipped steps also break the automatic step count, as the SDK README warns.
+**TensorLens today.** Detected when the run passes its scaler, `init(..., scaler=scaler)` (Nov 14, 2026): each record carries `step_skipped` and `grad_scale`, skipped steps are counted, and `loss_scale_trouble` reports 10 or more skips in a row or a loss scale below 1. Thresholds are first guesses, and it has not run on a real fp16 job.
 
 ### 11. MoE token dropping
 
@@ -169,7 +169,7 @@ Remaining priorities in order of value for effort:
 
 1. **Run the cross-GPU detector on two CUDA GPUs over NCCL** (`sdk/examples/replica_check.py`, entries 1 and 2).
 2. **Run the dense-model outlier and probe benchmark on a GPU** (`sdk/examples/dense_outlier_check.py`, entries 7 and 8) and add attention-entropy / logit-growth detector rules once real failure traces are collected.
-3. **Record `GradScaler` skipped steps and scale factor** if mixed-precision fp16 runs are in scope (entry 10).
+3. ~~Record `GradScaler` skipped steps and scale factor~~ (entry 10): done Nov 14, 2026; check the thresholds on a real fp16 run.
 
 TrainCheck (OSDI '25) already catches entries 1 and 4 by checking invariants, such as "replicated weights match" and "`step()` changes the parameters". It is the closest prior work for these two entries and should be added to the competitor check.
 

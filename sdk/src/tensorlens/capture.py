@@ -315,6 +315,7 @@ class Session:
         replica_every: int = WEIGHT_EVERY,
         probe: Any = None,
         probe_every: int = PROBE_EVERY,
+        scaler: Any = None,
     ) -> None:
         if hasattr(model, "_orig_mod"):
             raise ValueError("call tensorlens.init(model) before torch.compile(model)")
@@ -430,6 +431,8 @@ class Session:
         self._ring_ts: list[float] = []
         self._pending_lr: list[float] | None = None
         self._ring_scalars: list[dict[str, Any]] = []
+        self._ring_amp: list[dict[str, Any]] = []
+        self._pending_amp: dict[str, Any] = {}
         self._pending_scalars: dict[str, Any] = {}
         self._ring_probe: list[dict[str, Any] | None] = []
         self._next_step = start_step
@@ -455,6 +458,14 @@ class Session:
         self._clip_watched = clip_norm
         if clip_norm:
             _watch_clipping(self)
+
+        self._scaler = scaler if scaler is not None and scaler.is_enabled() else None
+        # With a GradScaler, `scaler.update()` runs once per iteration whether or not the
+        # optimizer stepped, so it ends the TensorLens step; optimizer hooks still read
+        # gradients. Without it, a step the scaler skipped would never be counted.
+        self._commit_on_update = self._scaler is not None and auto_step
+        if self._scaler is not None:
+            self._watch_scaler(self._scaler)
 
         self._optimizer_handles = []
         if auto_step:
@@ -527,7 +538,41 @@ class Session:
         if self._grads_after_step and not self._grads_recorded and self._should_record_grads():
             self.record_grads()
         self._pending_lr = _learning_rates(optimizer)
-        self._commit(None)
+        if not self._commit_on_update:
+            self._commit(None)
+
+    def _watch_scaler(self, scaler: Any) -> None:
+        original = scaler.update
+
+        def update(*args: Any, **kwargs: Any) -> Any:
+            if not self._closed:
+                self._record_scaler(scaler)
+            out = original(*args, **kwargs)
+            if self._commit_on_update and not self._closed:
+                if self._pending_lr is None and self._lead is not None and self._lead() is not None:
+                    self._pending_lr = _learning_rates(self._lead())
+                self._commit(None)
+            return out
+
+        scaler.update = update  # an instance attribute; `close()` removes it
+        self._scaler_original = original
+
+    def _record_scaler(self, scaler: Any) -> None:
+        # Read before `update()` resets them: whether any optimizer's gradients had an Inf
+        # or NaN this iteration (the scaler then skipped its step), and the scale used.
+        # Both stay tensors on the device until the next flush, so no sync is added.
+        scale = getattr(scaler, "_scale", None)
+        if scale is None:
+            return
+        found = [
+            f for state in scaler._per_optimizer_states.values()
+            for f in state["found_inf_per_device"].values()
+        ]
+        skipped = (
+            torch.stack([f.to(scale.device).reshape(()) for f in found]).sum() > 0
+            if found else torch.ones((), dtype=torch.bool, device=scale.device)
+        )
+        self._pending_amp = {"step_skipped": skipped.float(), "grad_scale": scale.detach().clone()}
 
     @torch.no_grad()
     def record_grads(self) -> None:
@@ -767,6 +812,8 @@ class Session:
         self._ring_ts.append(time.time())  # when the step ended, Unix seconds
         self._pending_lr = None
         self._ring_scalars.append(self._pending_scalars)
+        self._ring_amp.append(self._pending_amp)
+        self._pending_amp = {}
         self._pending_scalars = {}
         self._next_step = current + 1
         self._steps_committed += 1
@@ -801,6 +848,7 @@ class Session:
             self._ring_lr = []
             self._ring_ts = []
             self._ring_scalars = []
+            self._ring_amp = []
             self._ring_probe = []
             self._ring_grad_seen = []
             self._ring_weight_seen = []
@@ -839,6 +887,8 @@ class Session:
         weight_seen = self._ring_weight_seen
         spread_seen = self._ring_spread_seen
         scalars = _scalars_to_cpu(self._ring_scalars)
+        amps = _scalars_to_cpu(self._ring_amp)
+        self._ring_amp = []
         probes = self._ring_probe
         steps, lrs, stamps = self._steps, self._ring_lr, self._ring_ts
         self._ring_ts = []
@@ -852,7 +902,7 @@ class Session:
         self._ring_spread_seen = []
         block = (
             steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
-            spread_seen, scalars, probes, stamps,
+            spread_seen, scalars, probes, stamps, amps,
         )
         try:
             self._queue.put_nowait(block)
@@ -877,6 +927,8 @@ class Session:
         for handle in self._optimizer_handles:
             handle.remove()
         _unwatch_clipping(self)
+        if self._scaler is not None and "update" in vars(self._scaler):
+            del self._scaler.update
         try:
             self.flush()
         finally:
@@ -925,6 +977,7 @@ class Session:
         scalars: list[dict[str, Any]] | None = None,
         probes: list[dict[str, Any] | None] | None = None,
         stamps: list[float] | None = None,
+        amps: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
         split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
@@ -983,6 +1036,9 @@ class Session:
                 record["clip_grad_norm"] = math.sqrt(float(clips[i]))
             if lrs[i] is not None:
                 record["lr"] = lrs[i]
+            if amps is not None and amps[i]:
+                record["step_skipped"] = bool(amps[i]["step_skipped"])
+                record["grad_scale"] = amps[i]["grad_scale"]
             if scalars is not None and scalars[i]:
                 record["scalars"] = scalars[i]
             if probes is not None and probes[i] is not None:
@@ -1089,6 +1145,7 @@ def init(
     replica_every: int = WEIGHT_EVERY,
     probe: Any = None,
     probe_every: int = PROBE_EVERY,
+    scaler: Any = None,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -1130,6 +1187,10 @@ def init(
             right after the step's statistics are recorded, and restores each module's
             training flag and the random number generator state afterwards.
         probe_every: steps between probe passes (default 1000).
+        scaler: the run's `torch.amp.GradScaler`. Each record then says whether the scaler
+            skipped the optimizer step on Inf or NaN gradients (`step_skipped`) and the loss
+            scale used (`grad_scale`), and with `auto_step` the step ends at
+            `scaler.update()`, so skipped steps are counted too.
         start_step: the first step number. Pass the step you resume from, so a resumed
             run does not repeat step numbers already written.
         clip_norm: record the total gradient norm that `torch.nn.utils.clip_grad_norm_`
@@ -1165,4 +1226,5 @@ def init(
         replica_every=replica_every,
         probe=probe,
         probe_every=probe_every,
+        scaler=scaler,
     )

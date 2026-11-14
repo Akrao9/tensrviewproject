@@ -90,7 +90,7 @@ for batch in loader:
 session.close()
 ```
 
-- **Mixed precision with `torch.amp.GradScaler`:** the scaler skips `optimizer.step()` when gradients overflow, so count steps yourself: `init(..., auto_step=False)` and call `session.step(lr=optimizer.param_groups[0]["lr"])` once per iteration.
+- **Mixed precision with `torch.amp.GradScaler`:** pass it, `init(..., scaler=scaler)`. Steps the scaler skips on overflow are then still counted, each record says whether the step was skipped and which loss scale was used, and the summary reports a run of skips or a collapsing loss scale.
 - **Logging the loss and other scalars:** `session.log` takes the values your tracker logs, as numbers or one-element tensors, and attaches them to the step in progress. Call it before `optimizer.step()`; afterwards, the value lands on the next step. Log the unscaled loss, not `scaler.scale(loss)`. With gradient accumulation, log the step's mean once, since a name logged twice keeps the last value.
 - **Histograms and attention:** pass `probe=` a fixed batch, for example `probe={"input_ids": fixed_batch}`, to run it through the model every 1,000 steps (`probe_every=`) for activation histograms per block and attention statistics per layer. It runs without the compiler and without gradients, so expect a pause of about one forward pass each time; on a model that does not use `scaled_dot_product_attention`, only histograms are recorded.
 - **Two optimizers on one model**, such as Muon and AdamW: steps count training iterations, not optimizer steps. Nothing to change.
