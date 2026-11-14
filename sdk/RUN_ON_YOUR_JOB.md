@@ -132,6 +132,24 @@ session.step(step=iteration, lr=optimizer.param_groups[0]["lr"])
 
 This follows Megatron's `train_step` in `megatron/training/training.py`; it has not been run.
 
+### Hugging Face Trainer and Accelerate
+
+There is no adapter yet; a `TrainerCallback` is the next one planned. Until then, two things are known from reading the Transformers and Accelerate sources (5.24.0.dev0 and 1.16.0.dev0), neither run:
+
+- **Clipping is not recorded.** In that Accelerate version `accelerator.clip_grad_norm_` computes the norm with `torch.nn.utils.get_total_norm` and no longer calls `torch.nn.utils.clip_grad_norm_`, so TensorLens does not see it. Pass the value it returns yourself: `session.record_grad_norm(accelerator.clip_grad_norm_(model.parameters(), max_norm))`. `Trainer` clips through the same function and gives callbacks no access to the result.
+- **Call `tensorlens.init` before `accelerator.prepare`** if Accelerate compiles the model, since `init` refuses a model that is already compiled. With mixed precision, pass `scaler=accelerator.scaler`.
+
+### Ray, or several processes outside one process group
+
+Pass the same `run_id=` to every process from the driver, and give each process its own file:
+
+```python
+sink = tensorlens.JsonlSink(f"tensorlens-out/{run_id}.{role}{index}.jsonl")
+session = tensorlens.init(model, run_id=run_id, sink=sink)
+```
+
+Without `sink=`, the file name uses the rank from `torch.distributed`, and processes that share no process group are all rank 0, so with a shared folder they would append to the same file. If only one learner trains the model, running TensorLens there alone avoids the problem.
+
 ### Several GPUs
 
 Every rank writes its own file, `tensorlens-out/<run_id>.rank<rank>.jsonl`. With `replica_group=`, give every rank the same step numbers (the same `start_step`, or the same `step=` to `session.step`): the drift check is a collective scheduled from the step number, and ranks that disagree would wait on each other. Start with rank 0 only if that is simpler. The cross-GPU drift check (`replica_group=`, every 50 steps by default, `replica_every=` to change it) has passed only on two CPU processes. Under tensor parallelism, pass `replica_params=` so only weights that are identical across the group, such as LayerNorm, are compared. Files are written by a background thread, so training does not wait on the filesystem; with many ranks on a shared filesystem such as NFS or Lustre, you can write to node-local disk instead with `sink=tensorlens.JsonlSink(path)`.
