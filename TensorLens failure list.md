@@ -64,7 +64,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** The size of each parameter's update per step, or its ratio to the weight's size.
 
-**TensorLens today.** Detected. Each parameter's float64 norm after the optimizer step is compared with the previous record, and a parameter with a non-zero gradient that is exactly unchanged on 3 recorded steps in a row is reported. Tested on a toy model with two parameters left out of the optimizer. A first version using float32 norms gave 147 false reports out of 218 parameters on Granite in bf16, because a float32 norm misses few-element bf16 changes. It also reports bf16 weights too large for their updates to register, such as RMSNorm weights near 1.0 under a 1e-5 learning rate. That is a real failure too: pure-bf16 training without float32 master weights loses those updates. The float64 version has not run on a GPU yet.
+**TensorLens today.** Detected. Each parameter's float64 norm after the optimizer step is compared with the previous check (every 50 steps by default), and a parameter with a non-zero gradient that is exactly unchanged on 3 checks in a row is reported. Tested on a toy model with two parameters left out of the optimizer. A first version using float32 norms gave 147 false reports out of 218 parameters on Granite in bf16, because a float32 norm misses few-element bf16 changes. It also reports bf16 weights too large for their updates to register, such as RMSNorm weights near 1.0 under a 1e-5 learning rate. That is a real failure too: pure-bf16 training without float32 master weights loses those updates. On the RTX PRO 6000 Granite run it reported exactly the 49 bf16 RMSNorm weights and nothing else.
 
 ### 5. Loss spikes from gradient outliers
 

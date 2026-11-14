@@ -42,7 +42,7 @@ SPIKE_FACTOR = 5.0
 SPIKE_WINDOW = 50
 SPIKE_MIN_HISTORY = 10
 # A parameter is reported as not updating once its weights are exactly unchanged on this
-# many recorded steps in a row while it has a gradient.
+# many weight checks in a row while it has a gradient. Checks run every 50 steps by default.
 STALL_STEPS = 3
 MISSING_COLOR = (48, 54, 64)
 DEAD_COLOR = (236, 84, 99)
@@ -283,8 +283,8 @@ def detect_stalled_weights(
     """Return the first step where parameters with a gradient stopped changing, or None.
 
     Uses `weights_unchanged`, which the capture sets when a parameter's float64 norm is
-    exactly what it was at the previous record. A parameter is reported once that holds on
-    `steps` records in a row while its gradient is finite and non-zero, for example because
+    exactly what it was at the previous weight check. A parameter is reported once that
+    holds on `steps` checks in a row while its gradient is finite and non-zero, for example because
     it was left out of the optimizer. Steps with a non-finite gradient norm are skipped,
     because mixed-precision loss scaling skips those optimizer steps on purpose. Captures
     without `weights_unchanged` (older files, or Apple MPS) are not checked: a float32 norm
@@ -694,7 +694,7 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         return (
             f"Weights not updating from step {incident['step']}: {incident['stalled']} of"
             f" {incident['with_gradients']} parameters with gradients were exactly unchanged for"
-            f" {incident['consecutive']} recorded steps in a row ({names}{f', and {extra} more' if extra > 0 else ''});"
+            f" {incident['consecutive']} weight checks in a row ({names}{f', and {extra} more' if extra > 0 else ''});"
             f" {incident['stalled_steps']} step{'s' if incident['stalled_steps'] != 1 else ''} affected"
         )
     if kind == "repeated_steps":

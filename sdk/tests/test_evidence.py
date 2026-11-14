@@ -438,7 +438,7 @@ def test_stalled_weights_detector_and_skipped_steps():
 
 def test_parameter_left_out_of_the_optimizer_is_reported(toy_moe):
     sink = tensorlens.MemorySink()
-    session = tensorlens.init(toy_moe, sink=sink, every=2, routers={"router": 4})
+    session = tensorlens.init(toy_moe, sink=sink, every=2, weights=1, routers={"router": 4})
     opt = torch.optim.SGD(
         [p for n, p in toy_moe.named_parameters() if not n.startswith("out.")], lr=0.1
     )

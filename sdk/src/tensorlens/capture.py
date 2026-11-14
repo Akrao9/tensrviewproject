@@ -34,6 +34,11 @@ from .tracker import RunInfo, resolve_run
 STATS = ("mean", "std", "abs_max", "zero_frac")
 _SEEN = len(STATS)  # last column: 1.0 when the hook ran this step
 _LOW_PRECISION = (torch.float16, torch.bfloat16)
+# Steps between weight checks when `weights=True`. A check reads every weight once, which
+# no per-step method can make cheap (about 1.5 ms for Granite's 2.6 GB of bf16 weights on
+# an RTX PRO 6000), so it is sampled, as wandb.watch (every 1,000 batches) and TrainCheck
+# (`sampling_interval`) also do.
+WEIGHT_EVERY = 50
 
 LayerFilter = Callable[[str, nn.Module], bool]
 
@@ -175,7 +180,7 @@ class Session:
         layers: LayerFilter | Sequence[str] | None,
         routers: Mapping[str, Router | int] | None,
         grads: bool | int = True,
-        weights: bool = True,
+        weights: bool | int = True,
         auto_step: bool,
         replica_group: Any = None,
         start_step: int = 0,
@@ -193,7 +198,14 @@ class Session:
         self.run = run
         self.every = every
         self.grad_every = grad_every
-        self.weights = weights
+        if isinstance(weights, bool):
+            weight_every = WEIGHT_EVERY if weights else 0
+        elif isinstance(weights, int) and weights >= 0:
+            weight_every = weights
+        else:
+            raise ValueError("weights must be a bool or a non-negative integer")
+        self.weight_every = weight_every
+        self.weights = weight_every > 0
         self.auto_step = auto_step
         self._sink = sink
         self._replica_group = replica_group
@@ -239,6 +251,7 @@ class Session:
         self._ring_act = torch.zeros(every, n_layers, _SEEN + 1, **f32)
         self._ring_grad = torch.zeros(every, *self._grad.shape, **f32)
         self._ring_grad_seen: list[bool] = []
+        self._ring_weight_seen: list[bool] = []
         self._ring_spread: torch.Tensor | None = None
         self._ring_spread_seen: list[bool] = []
         if replica_group is not None and n_params > 0:
@@ -298,7 +311,15 @@ class Session:
         return owned
 
     def _should_record_grads(self) -> bool:
-        return self.grad_every > 0 and (self._steps_committed + 1) % self.grad_every == 0
+        # Weight checks need the step's gradient norms, so they also turn gradients on.
+        return self._cadence(self.grad_every) or self._should_check_weights()
+
+    def _should_check_weights(self) -> bool:
+        return self._cadence(self.weight_every)
+
+    def _cadence(self, every: int) -> bool:
+        # The every-th, 2*every-th, ... step, counting from 1 (as Lightning and wandb do).
+        return every > 0 and (self._steps_committed + 1) % every == 0
 
     def _before_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
         if (
@@ -448,7 +469,8 @@ class Session:
     def _commit(self, step: int | None) -> None:
         if not self._spread_recorded and self._replica_group is not None and self._params:
             self.record_replica_spread(self._replica_group)
-        if self._grads_recorded and self.weights and self._params:
+        weights_checked = self._grads_recorded and self._should_check_weights() and bool(self._params)
+        if weights_checked:
             self._record_weights()
         row = len(self._steps)
         has_act = self._act.numel() > 0
@@ -462,6 +484,7 @@ class Session:
             self._ring_grad[row].copy_(self._grad)
             self._grad.zero_()
         self._ring_grad_seen.append(self._grads_recorded)
+        self._ring_weight_seen.append(weights_checked)
         if self._spread_recorded and self._spread is not None and self._ring_spread is not None:
             self._ring_spread[row].copy_(self._spread)
             self._spread.zero_()
@@ -488,6 +511,7 @@ class Session:
             self._steps = []
             self._ring_lr = []
             self._ring_grad_seen = []
+            self._ring_weight_seen = []
             self._ring_spread_seen = []
             self._raise_worker_error()
         n = len(self._steps)
@@ -517,13 +541,15 @@ class Session:
             else None
         )
         grad_seen = self._ring_grad_seen
+        weight_seen = self._ring_weight_seen
         spread_seen = self._ring_spread_seen
         steps, lrs = self._steps, self._ring_lr
         self._steps = []
         self._ring_lr = []
         self._ring_grad_seen = []
+        self._ring_weight_seen = []
         self._ring_spread_seen = []
-        self._queue.put((steps, lrs, floats, counts, spreads, grad_seen, spread_seen))
+        self._queue.put((steps, lrs, floats, counts, spreads, grad_seen, weight_seen, spread_seen))
 
     def close(self) -> None:
         """Flush what is left and stop the writer. Forward hooks stay on the model, because
@@ -574,6 +600,7 @@ class Session:
         counts: torch.Tensor | None,
         spreads: torch.Tensor | None,
         grad_seen: list[bool],
+        weight_seen: list[bool],
         spread_seen: list[bool],
     ) -> list[dict[str, Any]]:
         n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
@@ -619,7 +646,7 @@ class Session:
                 "grad_norm": math.sqrt(sum(v * v for v in grad_norms.values())) if grad_norms else None,
                 "grad_norms": grad_norms,
             }
-            if self.weights and grad is not None and grad_seen[i]:
+            if grad is not None and weight_seen[i]:
                 record["weight_norms"] = {
                     name: row[2] for name, row in zip(self.param_names, grad[i])
                 }
@@ -707,7 +734,7 @@ def init(
     layers: LayerFilter | Sequence[str] | None = None,
     routers: Mapping[str, Router | int] | None = None,
     grads: bool | int = True,
-    weights: bool = True,
+    weights: bool | int = True,
     auto_step: bool = True,
     replica_group: Any = None,
     start_step: int = 0,
@@ -724,9 +751,11 @@ def init(
         routers: MoE router module names mapped to their expert count or a `Router`.
         grads: True to record gradient norms every step, False or 0 to disable automatic
             gradient norm capture, or a positive integer N to record every Nth captured step.
-        weights: record each parameter's norm after the optimizer step, on the same steps
-            as gradient norms, so the detectors can tell when a step left the weights
-            unchanged. Costs one more read of the weights on those steps.
+        weights: check each parameter's norm after the optimizer step every N steps
+            (True: every 50; an integer: every N; False or 0: never), so the detectors can
+            tell when weights stopped changing. A check reads every weight once and also
+            records that step's gradient norms; a parameter is reported after 3 checks in
+            a row find it exactly unchanged.
         auto_step: count optimizer steps with PyTorch's global optimizer hooks. Pass False
             and call `session.step()` yourself when using `torch.amp.GradScaler`.
         replica_group: optional replication `ProcessGroup` (or precomputed spread tensor)

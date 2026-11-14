@@ -303,13 +303,13 @@ def test_gradient_gating_and_router_only_capture(toy_moe, monkeypatch):
 
     monkeypatch.setattr(cap, "_foreach_norm", spy_foreach_norm)
 
-    # grads=3 gates gradient norm computation before running _foreach_norm: one call for
-    # the gradients and one for the weights on each of the two recorded steps
+    # grads=3 gates gradient norm computation before running _foreach_norm. The default
+    # weight check (every 50 steps) does not run in 6 steps.
     sink = tensorlens.MemorySink()
     with tensorlens.init(toy_moe, sink=sink, every=2, grads=3, routers={"router": 4}):
         train(toy_moe, 6)
-    assert norm_calls == 4
-    assert ["weight_norms" in r for r in sink.records] == [False, False, True, False, False, True]
+    assert norm_calls == 2
+    assert not any("weight_norms" in r for r in sink.records)
     assert [r["grad_norm"] is not None for r in sink.records] == [
         False,
         False,
@@ -384,7 +384,7 @@ def test_weight_norms_learning_rate_start_step_and_top_k(toy_moe):
     opt = torch.optim.SGD(toy_moe.parameters(), lr=0.1)
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=1, gamma=0.5)
     session = tensorlens.init(
-        toy_moe, sink=sink, every=2, start_step=100,
+        toy_moe, sink=sink, every=2, start_step=100, weights=1,
         routers={"router": tensorlens.Router(4, top_k=1)},
     )
     for _ in range(3):
@@ -410,3 +410,18 @@ def test_weights_false_and_manual_step_learning_rate(toy_moe):
     session.close()
     assert "weight_norms" not in sink.records[0]
     assert sink.records[0]["lr"] == [3e-4]
+
+
+def test_weight_check_cadence_turns_on_gradients_for_its_steps(toy_moe):
+    sink = tensorlens.MemorySink()
+    with tensorlens.init(toy_moe, sink=sink, every=3, grads=False, weights=2):
+        train(toy_moe, 6)
+    # Checks on the 2nd, 4th and 6th steps, each with that step's gradient norms; the first
+    # check has nothing to compare with.
+    assert ["weight_norms" in r for r in sink.records] == [False, True, False, True, False, True]
+    assert [r["grad_norm"] is not None for r in sink.records] == [False, True, False, True, False, True]
+    assert ["weights_unchanged" in r for r in sink.records] == [False, False, False, True, False, True]
+    with tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), weights=False) as off:
+        assert off.weight_every == 0
+    with pytest.raises(ValueError):
+        tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), weights=-1)
