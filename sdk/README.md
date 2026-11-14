@@ -108,6 +108,21 @@ Colab, NVIDIA A100-SXM4-80GB, PyTorch `2.14.1+cu130`, Inductor with CUDA graphs 
 - **Detection.** The router-only capture found the collapse at step 450 in layer 12, with experts 1–8 overloaded and 9–32 dead, and 20 starved experts. This run recorded `moe_top_k`, so the top-k rule ran without `--top-k`. The recording opened in the stock Rerun viewer with the current colors and legend.
 - **Full capture (`granite.jsonl`)** recorded weight norms for all 218 parameters, the learning rate and `moe_top_k` on all 650 steps. Gradient spikes were flagged at steps 136, 141 and 645, at 5.2× the recent median, just over the threshold, starting in RMSNorm weights (`model.layers.6.input_layernorm.weight` at 26× its own median). That is not yet known to be a real problem. This capture predates the float64 weight check, so it is not checked for stalled weights; it is the run that showed the float32 check's 147 false reports.
 
+## RTX PRO 6000 run with the float64 weight check
+
+Colab, RTX PRO 6000 Blackwell Server Edition, PyTorch `2.14.1+cu130`, Inductor with CUDA graphs off, commit `fb4c2b7`, `--collapse-layer 12`.
+
+| Comparison | Reference median | Measured median | Added time |
+| --- | ---: | ---: | ---: |
+| Activations and routers → plus gradient and float64 weight norms | 67.977 ms/step | 73.503 ms/step | +5.527 ms/step (+8.13%) |
+| Capture off → router-only | 65.582 ms/step | 65.598 ms/step | +0.015 ms/step (+0.02%) |
+
+- **The stalled-weight check reported the 49 RMSNorm weights and nothing else.** All 24 `input_layernorm`, all 24 `post_attention_layernorm` and the final `norm` were exactly unchanged on 3 or more recorded steps in a row, from step 3; no other parameter was ever exactly unchanged. This is the pure-bf16 stagnation described above, and the expected result.
+- **The float64 weight norms are expensive on this GPU.** Gradient norms alone cost +2.60% (+1.79 ms) here at `5d38288`; with float64 weight norms the same arm costs +8.13% (+5.53 ms), so the weight check adds roughly 3.7 ms per recorded step. This GPU runs float64 arithmetic far slower than float32; the A100, with fast float64, paid less. The check needs a cheaper exact test before it can stay on by default.
+- **Router-only capture** was within noise of capture off: paired rounds −0.50, +0.46 and −0.004 ms. With the earlier +0.78% on this GPU and +1.06–1.33% on the A100, the 1% target holds here and not on the A100.
+- **Gradient spikes at steps 141 and 645**, starting in `model.layers.11.self_attn.k_proj.weight` (22× its median). The A100 run flagged 136, 141 and 645. The same steps on two GPUs point to the data at those steps, since both runs read the same batches in the same order.
+- **The collapse** was found at step 450 in layer 12 with the same 20 starved experts.
+
 ## Two-GPU replica drift validation
 
 **Pending.** The two-process CPU/Gloo check passed. The Colab runtime exposed one NVIDIA RTX PRO 6000, so the CUDA/NCCL check was skipped.
