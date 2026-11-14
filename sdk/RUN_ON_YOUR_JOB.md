@@ -93,6 +93,7 @@ session.close()
 - **Mixed precision with `torch.amp.GradScaler`:** the scaler skips `optimizer.step()` when gradients overflow, so count steps yourself: `init(..., auto_step=False)` and call `session.step(lr=optimizer.param_groups[0]["lr"])` once per iteration.
 - **Logging the loss and other scalars:** `session.log` takes the values your tracker logs, as numbers or one-element tensors, and attaches them to the step in progress. Call it before `optimizer.step()`; afterwards, the value lands on the next step. Log the unscaled loss, not `scaler.scale(loss)`. With gradient accumulation, log the step's mean once, since a name logged twice keeps the last value.
 - **Histograms and attention:** pass `probe=` a fixed batch, for example `probe={"input_ids": fixed_batch}`, to run it through the model every 1,000 steps (`probe_every=`) for activation histograms per block and attention statistics per layer. It runs without the compiler and without gradients, so expect a pause of about one forward pass each time; on a model that does not use `scaled_dot_product_attention`, only histograms are recorded.
+- **Two optimizers on one model**, such as Muon and AdamW: steps count training iterations, not optimizer steps. Nothing to change.
 - **Resuming from a checkpoint:** pass `start_step=` the step you resume from, or step numbers start at 0 again.
 - **`from torch.nn.utils import clip_grad_norm_` at the top of your script** binds the function before `init` wraps it. Either call `torch.nn.utils.clip_grad_norm_`, or pass the returned norm yourself: `session.record_grad_norm(norm)`.
 
@@ -134,7 +135,7 @@ This follows Megatron's `train_step` in `megatron/training/training.py`; it has 
 
 ### Several GPUs
 
-Every rank writes its own file, `tensorlens-out/<run_id>.rank<rank>.jsonl`. Start with rank 0 only if that is simpler. The cross-GPU drift check (`replica_group=`, every 50 steps by default, `replica_every=` to change it) has passed only on two CPU processes. Files are written by a background thread, so training does not wait on the filesystem; with many ranks on a shared filesystem such as NFS or Lustre, you can write to node-local disk instead with `sink=tensorlens.JsonlSink(path)`.
+Every rank writes its own file, `tensorlens-out/<run_id>.rank<rank>.jsonl`. With `replica_group=`, give every rank the same step numbers (the same `start_step`, or the same `step=` to `session.step`): the drift check is a collective scheduled from the step number, and ranks that disagree would wait on each other. Start with rank 0 only if that is simpler. The cross-GPU drift check (`replica_group=`, every 50 steps by default, `replica_every=` to change it) has passed only on two CPU processes. Files are written by a background thread, so training does not wait on the filesystem; with many ranks on a shared filesystem such as NFS or Lustre, you can write to node-local disk instead with `sink=tensorlens.JsonlSink(path)`.
 
 ## 5. After the run
 

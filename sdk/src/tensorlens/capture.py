@@ -44,6 +44,8 @@ _LOW_PRECISION = (torch.float16, torch.bfloat16)
 WEIGHT_EVERY = 50
 # Probe passes are rare, like wandb.watch's histograms (every 1,000 batches by default).
 PROBE_EVERY = 1000
+# Blocks of `every` steps waiting for the writer thread before training waits for it.
+WRITER_QUEUE = 8
 # Settings per capture mode. Router load is the always-on signal; layer statistics and
 # gradient and weight norms are a debugging mode, as in Composer's ActivationMonitor,
 # wandb.watch and Lightning's grad_norm.
@@ -405,9 +407,18 @@ class Session:
         self._grads_recorded = False
         self._spread_recorded = False
         self._owned: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+        self._stepped: weakref.WeakSet[Any] = weakref.WeakSet()
+        self._multi_optimizer = False
+        self._fresh = True
+        self._step_depth = 0
+        self._last_signature: tuple[Any, ...] = ()
         self._closed = False
         self._error: BaseException | None = None
-        self._queue: queue.Queue[Any] = queue.Queue()
+        # Bounded, as TensorBoard's SummaryWriter is (`max_queue=10`): if the sink falls
+        # behind, for example on a stalled network filesystem, training waits for it
+        # instead of holding every unwritten step in memory. No step is dropped.
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=WRITER_QUEUE)
+        self._warned_backpressure = False
         self._worker = threading.Thread(target=self._drain, name="tensorlens-writer", daemon=True)
         self._worker.start()
 
@@ -445,19 +456,46 @@ class Session:
         # The every-th, 2*every-th, ... step, counting from 1 (as Lightning and wandb do).
         return every > 0 and (self._steps_committed + 1) % every == 0
 
+    def _grad_signature(self) -> tuple[Any, ...]:
+        # A new backward pass replaces a gradient (`zero_grad(set_to_none=True)`) or
+        # changes it in place (accumulation, `zero_grad()`), which bumps its version.
+        return tuple(None if p.grad is None else (id(p.grad), p.grad._version) for p in self._params)
+
     def _before_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
-        if (
-            not self._closed
-            and self._owns(optimizer)
-            and not self._grads_recorded
-            and self._should_record_grads()
-        ):
+        if self._closed or not self._owns(optimizer):
+            return
+        # PyTorch wraps each optimizer class's own `step` with the global hooks, so an
+        # optimizer that subclasses another and calls `super().step()` fires them twice,
+        # nested. Only the outermost call counts.
+        self._step_depth += 1
+        if self._step_depth > 1:
+            return
+        # One TensorLens step per training iteration. With several optimizers on one
+        # model (for example Muon for matrices and AdamW for the rest), an optimizer step
+        # starts a new iteration only if gradients changed since the previous optimizer
+        # step; the others in the same iteration add no step and record nothing twice.
+        if self._multi_optimizer:
+            self._fresh = self._grad_signature() != self._last_signature
+        elif self._stepped and optimizer not in self._stepped:
+            self._multi_optimizer = True  # a second optimizer, in the iteration just counted
+            self._fresh = False
+        else:
+            self._fresh = True
+        self._stepped.add(optimizer)
+        if self._fresh and not self._grads_recorded and self._should_record_grads():
             self.record_grads()
 
     def _after_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
-        if not self._closed and self._owns(optimizer):
+        if self._closed or not self._owns(optimizer):
+            return
+        self._step_depth = max(0, self._step_depth - 1)
+        if self._step_depth > 0:
+            return
+        if self._fresh:
             self._pending_lr = _learning_rates(optimizer)
             self._commit(None)
+        if self._multi_optimizer:
+            self._last_signature = self._grad_signature()
 
     @torch.no_grad()
     def record_grads(self) -> None:
@@ -644,14 +682,19 @@ class Session:
 
     @torch.no_grad()
     def _commit(self, step: int | None) -> None:
+        current = self._next_step if step is None else step
         if (
             not self._spread_recorded
             and self._replica_group is not None
             and self._params
-            and self._cadence(self.replica_every)
+            and (current + 1) % self.replica_every == 0
         ):
             # Like Megatron's check_weight_hash_across_dp_replicas_interval: a float64 pass
-            # over every weight plus an all_gather is too costly for every step.
+            # over every weight plus an all_gather is too costly for every step. The
+            # all_gather is a collective, so every rank must call it on the same steps:
+            # it is scheduled from the step number, which the ranks share, not from each
+            # rank's own count of recorded steps, which can differ (a rank that started
+            # its session later, or skipped a step), and would leave the others waiting.
             self.record_replica_spread(self._replica_group)
         weights_checked = self._grads_recorded and self._should_check_weights() and bool(self._params)
         if weights_checked:
@@ -686,7 +729,6 @@ class Session:
         self._grads_recorded = False
         self._spread_recorded = False
         probe_due = self._cadence_probe()
-        current = self._next_step if step is None else step
         self._steps.append(current)
         self._ring_probe.append(None)
         self._ring_lr.append(self._pending_lr)
@@ -772,12 +814,23 @@ class Session:
         self._ring_weight_seen = []
         self._ring_clip_seen = []
         self._ring_spread_seen = []
-        self._queue.put(
-            (
-                steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
-                spread_seen, scalars, probes,
-            )
+        block = (
+            steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
+            spread_seen, scalars, probes,
         )
+        try:
+            self._queue.put_nowait(block)
+        except queue.Full:
+            if not self._warned_backpressure:
+                self._warned_backpressure = True
+                warnings.warn(
+                    f"TensorLens's writer is {WRITER_QUEUE * self.every} steps behind; training "
+                    "now waits for it. The sink is slower than training, for example a stalled "
+                    "network filesystem; pass sink=tensorlens.JsonlSink(path) on local disk.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            self._queue.put(block)
 
     def close(self) -> None:
         """Flush what is left and stop the writer. Forward hooks stay on the model, because

@@ -627,3 +627,99 @@ def test_cached_clip_wrapper_still_works_after_the_last_session_closes():
     model(torch.ones(1, 4)).sum().backward()
     assert float(cached(model.parameters(), 1.0)) > 0
     assert torch.nn.utils.clip_grad_norm_ is not cached  # the original is back in place
+
+
+class _TwoPart(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.matrix = nn.Linear(4, 4, bias=False)
+        self.router = nn.Linear(4, 2)
+        self.head = nn.Linear(4, 1)
+
+    def forward(self, x):
+        return self.head(self.matrix(x) * self.router(x).softmax(-1).sum(-1, keepdim=True))
+
+
+@pytest.mark.parametrize("set_to_none", [True, False])
+def test_two_optimizers_count_one_step_per_iteration(set_to_none):
+    model = _TwoPart()
+    matrices = [model.matrix.weight]
+    rest = [p for p in model.parameters() if p is not model.matrix.weight]
+
+    class MuonLike(torch.optim.SGD):
+        def step(self, closure=None):
+            for group in self.param_groups:
+                for p in group["params"]:
+                    p.grad.mul_(0.5)  # changes its own gradients in place, as Muon does
+            return super().step(closure)
+
+    opts = [MuonLike(matrices, lr=0.1), torch.optim.AdamW(rest, lr=0.01)]
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(model, sink=sink, every=2, routers={"router": 2}, capture="full")
+    for _ in range(4):
+        for opt in opts:
+            opt.zero_grad(set_to_none=set_to_none)
+        for _ in range(2):  # gradient accumulation
+            model(torch.ones(3, 4)).sum().backward()
+        for opt in opts:
+            opt.step()
+    session.close()
+
+    assert [r["step"] for r in sink.records] == [0, 1, 2, 3]
+    assert all(sum(r["moe"]["router"]) == 2 * 3 for r in sink.records)  # no empty steps
+    assert all(set(r["grad_norms"]) == {n for n, _ in model.named_parameters()} for r in sink.records)
+
+
+def test_drift_check_follows_the_step_number_not_the_rank_local_count(monkeypatch):
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "get_world_size", lambda g=None: 2)
+    monkeypatch.setattr(dist, "all_gather", lambda out, t, group=None: [o.copy_(t) for o in out])
+    model = nn.Linear(2, 2)
+    sink = tensorlens.MemorySink()
+    # This rank's session started at step 4, as after a resume or a late start: the check
+    # still runs on steps 5 and 8, where every other rank with replica_every=3 runs it.
+    session = tensorlens.init(
+        model, sink=sink, auto_step=False, replica_group=object(), replica_every=3, start_step=4
+    )
+    for _ in range(6):
+        session.step()
+    session.close()
+    assert [r["step"] for r in sink.records if "replica_spread" in r] == [5, 8]
+
+
+def test_a_slow_sink_makes_training_wait_instead_of_growing_memory(monkeypatch):
+    import threading
+    import warnings
+
+    from tensorlens import capture
+
+    monkeypatch.setattr(capture, "WRITER_QUEUE", 2)
+    release = threading.Event()
+
+    class SlowSink(tensorlens.MemorySink):
+        def write(self, records):
+            release.wait(10)
+            super().write(records)
+
+    sink = SlowSink()
+    session = tensorlens.init(nn.Linear(2, 2), sink=sink, every=1, auto_step=False)
+    caught = []
+
+    def train():
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            for _ in range(6):
+                session.step()
+        caught.extend(seen)
+
+    worker = threading.Thread(target=train)
+    worker.start()
+    worker.join(0.5)
+    assert worker.is_alive()  # waiting on the full queue: one block in the sink, two queued
+    assert session._queue.qsize() <= 2
+    release.set()
+    worker.join(10)
+    session.close()
+    assert [r["step"] for r in sink.records] == list(range(6))  # nothing dropped
+    assert any("behind" in str(w.message) for w in caught)
