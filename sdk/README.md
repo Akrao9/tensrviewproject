@@ -40,11 +40,41 @@ Each optimizer step becomes one JSON line in `tensorlens-out/<run_id>.rank<rank>
 
 ## What is not built or not verified
 
-- **GPU coverage is one toy run.** On 13 Nov 2026 a 16-step toy MoE run passed on an RTX PRO 6000 (PyTorch 2.14.1+cu130, Inductor with CUDA graphs): both graphs were CUDA-graphable with the hook buffers as inputs, router counts were exact, and the seeded collapse was detected. That run used an ad-hoc script, not `examples/gpu_check.py`, which has only run on CPU with `aot_eager`. Training overhead is still unmeasured, and no real model, mixed precision or multi-GPU job has run.
 - **Arrow Flight and the Rust ingest server.** Records go to a JSON Lines file, and Python detectors/exporters turn that file into `evidence.json` and `.rrd`.
 - **The probe pass** for histograms and attention (Tier 2) and replay (Tier 3).
 - **Multi-rank reporting.** Every rank writes its own file.
 - **A PyTorch Lightning callback.** Until then, pass `run_id=` yourself when the run was created through `MlflowClient`.
+
+## Granite MoE GPU benchmark
+
+The Colab run of [the Granite benchmark](examples/moe_dogfood.py) at commit `5d38288` used `ibm-granite/granite-3.0-1b-a400m-base` on WikiText-2 with BF16 weights, PyTorch `2.14.1+cu130`, and one NVIDIA RTX PRO 6000 Blackwell Server Edition. It ran with Inductor and CUDA graphs disabled. Each comparison used 50 warmup steps and three timed rounds of 200 steps per configuration.
+
+| Reference configuration | Measured configuration | Reference median | Measured median | Added time |
+| --- | --- | ---: | ---: | ---: |
+| Activations and routers | Activations, routers, and gradient norms | 68.746 ms/step | 70.534 ms/step | +1.789 ms/step (+2.60%) |
+| Capture off | Router-only (`layers=(), grads=False`) | 64.886 ms/step | 65.394 ms/step | +0.507 ms/step (+0.78%) |
+
+The first row measures the incremental cost of gradient norms with activation and router capture already enabled. Comparing across stages estimates about **+5.95%** for activations and routers and **+8.70%** for full capture against capture off. A direct full-capture comparison with capture off under the same benchmark conditions remains pending.
+
+Router-only capture passed the **under 1%** target on this run. Its three paired round differences were **+0.427, +0.510, and +0.469 ms/step** (**+0.66%, +0.79%, and +0.72%**, calculated from the rounded log times). Repeatability across sessions remains unverified. The benchmark verified the expected assignment totals across 650 recorded steps and all 24 routers in each capture configuration. The one hook-related recompile shown in the log occurred during warmup for the router-only model.
+
+The full-capture `granite.jsonl` exported to `granite.evidence.json` and `granite.rrd`, with no routing or numerical incidents reported. The pending end-to-end check is to seed a collapse in one Granite layer, export the router-only recording, and verify the onset step, layer, and affected experts.
+
+## Two-GPU replica drift validation
+
+**Pending.** The two-process CPU/Gloo check passed. The Colab runtime exposed one NVIDIA RTX PRO 6000, so the CUDA/NCCL check was skipped.
+
+To resume, use a single machine with two visible NVIDIA GPUs and a CUDA-enabled PyTorch build. Run from the repository root. The check generates its own data and needs no Colab artifacts.
+
+```sh
+set -e
+cd sdk
+python -c 'import torch; assert torch.cuda.device_count() >= 2, "Two visible CUDA GPUs are required"'
+python -m pip install -e .
+python -m torch.distributed.run --standalone --nproc-per-node=2 examples/replica_check.py
+```
+
+Mark this complete when both NCCL ranks report `PASS`. Each rank checks healthy replicas at steps 0 and 2, injected drift at step 1, and a sign flip at step 3.
 
 ## Things to know
 
