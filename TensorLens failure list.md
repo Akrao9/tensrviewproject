@@ -104,7 +104,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** A fourth-moment (kurtosis) statistic per layer, which is as cheap as the statistics TensorLens already computes.
 
-**TensorLens today.** Partly: per-layer absolute maximum and standard deviation. Adding kurtosis is a small change.
+**TensorLens today.** Detected in full capture, relative to each module's own history: a sudden jump in the largest value or spread (5× the recent median), and drift of the outlier ratio `abs_max / std` or of the spread (3× from the module's early level). Healthy Granite raises nothing, although its middle blocks already carry outliers 740–840 times the standard deviation. Kurtosis is not captured; `abs_max / std` tracks the same outliers without a second pass over each output.
 
 ### 9. NaN or Inf
 

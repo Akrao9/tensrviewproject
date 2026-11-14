@@ -3,8 +3,9 @@
 The evidence dictionary uses the same schema as `experiments/moe-bakeoff`, so the stock
 Rerun blueprint, `verify_rerun.py` and the Rune inspector can all read it directly, while
 adding `incidents` for MoE routing imbalance, chronically starved experts, gradient
-spikes, weights left unchanged by the optimizer, repeated step numbers, non-finite
-activations/gradients and cross-GPU parameter drift.
+spikes, weights left unchanged by the optimizer, repeated step numbers, activation
+spikes, drift and dead outputs, non-finite activations/gradients and cross-GPU
+parameter drift.
 """
 
 from __future__ import annotations
@@ -41,6 +42,16 @@ OVERLOAD_MIN_HISTORY = 10
 SPIKE_FACTOR = 5.0
 SPIKE_WINDOW = 50
 SPIKE_MIN_HISTORY = 10
+# Activation detectors compare each watched module with its own history, because trained
+# LLMs carry large outliers by design: on healthy Granite the largest value in middle
+# blocks was 740-840 times the standard deviation. Healthy Granite (650 steps, 24 blocks)
+# peaked at 2.2x for one-step jumps and 1.27x for drift, so these leave a wide margin.
+ACT_SPIKE_FACTOR = 5.0  # abs_max or std vs the median of the previous ACT_WINDOW records
+ACT_WINDOW = 50
+ACT_MIN_HISTORY = 10
+ACT_DRIFT_FACTOR = 3.0  # recent median of std or abs_max/std vs the first ACT_WINDOW records
+ACT_RECENT = 10
+ACT_DEAD_RISE = 0.25  # zero fraction above its baseline, as a recent median
 # A parameter is reported as not updating once its weights are exactly unchanged on this
 # many weight checks in a row while it has a gradient. Checks run every 50 steps by default.
 STALL_STEPS = 3
@@ -329,6 +340,73 @@ def detect_stalled_weights(
     return first
 
 
+def detect_activation_anomalies(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Activation spikes, drift and dead outputs, each judged against the module's history.
+
+    - `activation_spike`: `abs_max` or `std` at least ACT_SPIKE_FACTOR times its median
+      over the previous ACT_WINDOW records.
+    - `activation_drift`: the median of the last ACT_RECENT records of `std`, or of the
+      outlier ratio `abs_max / std`, moved ACT_DRIFT_FACTOR times above or below its
+      median over the module's first ACT_WINDOW records.
+    - `dead_activations`: the recent median `zero_frac` rose ACT_DEAD_RISE above its
+      baseline, as when units stop firing.
+
+    Returns at most one incident per kind: the first step it happened, the modules
+    affected at that step, and how many steps were affected in all.
+    """
+    history: dict[str, list[tuple[float, float, float]]] = {}
+    found: dict[str, dict[str, Any]] = {}
+    counts: dict[str, int] = {}
+
+    def report(kind: str, step: int, hits: list[dict[str, Any]]) -> None:
+        if not hits:
+            return
+        counts[kind] = counts.get(kind, 0) + 1
+        if kind not in found:
+            found[kind] = {"kind": kind, "step": step, "modules": hits[:20], "affected": len(hits)}
+
+    for record in sorted(records, key=lambda r: r["step"]):
+        step = int(record["step"])
+        spikes, drifts, dead = [], [], []
+        for name, stats in record.get("layers", {}).items():
+            std, amax, zfrac = (_finite(stats.get(k)) for k in ("std", "abs_max", "zero_frac"))
+            if std is None or amax is None or zfrac is None:
+                continue
+            past = history.setdefault(name, [])
+            if len(past) >= ACT_MIN_HISTORY:
+                recent = past[-ACT_WINDOW:]
+                for key, value, base in (
+                    ("abs_max", amax, _median([p[1] for p in recent])),
+                    ("std", std, _median([p[0] for p in recent])),
+                ):
+                    if base > 0 and value >= ACT_SPIKE_FACTOR * base:
+                        spikes.append({"module": name, "stat": key, "value": value,
+                                       "baseline": base, "ratio": value / base})
+                        break
+            past.append((std, amax, zfrac))
+            if len(past) >= ACT_WINDOW + ACT_RECENT:
+                first, last = past[:ACT_WINDOW], past[-ACT_RECENT:]
+                outlier = lambda rows: _median([a / s for s, a, _ in rows if s > 0] or [0.0])
+                for key, base, now in (
+                    ("std", _median([p[0] for p in first]), _median([p[0] for p in last])),
+                    ("abs_max/std", outlier(first), outlier(last)),
+                ):
+                    if base > 0 and now > 0 and max(now / base, base / now) >= ACT_DRIFT_FACTOR:
+                        drifts.append({"module": name, "stat": key, "baseline": base,
+                                       "recent": now, "ratio": now / base})
+                        break
+                base_zero = _median([p[2] for p in first])
+                now_zero = _median([p[2] for p in last])
+                if now_zero - base_zero >= ACT_DEAD_RISE:
+                    dead.append({"module": name, "baseline": base_zero, "recent": now_zero})
+        report("activation_spike", step, sorted(spikes, key=lambda h: -h["ratio"]))
+        report("activation_drift", step, drifts)
+        report("dead_activations", step, dead)
+    for kind, incident in found.items():
+        incident["affected_steps"] = counts[kind]
+    return list(found.values())
+
+
 def detect_repeated_steps(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Return step numbers recorded more than once, as after a resume without `start_step`."""
     seen: dict[tuple[Any, int], int] = {}
@@ -532,6 +610,7 @@ def build_evidence(
         hit = detector(records)
         if hit is not None:
             incidents.append(hit)
+    incidents.extend(detect_activation_anomalies(records))
     non_finite_hit = detect_non_finite(records)
     if non_finite_hit is not None:
         incidents.append(non_finite_hit)
@@ -701,6 +780,29 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             f" {incident['with_gradients']} parameters with gradients were exactly unchanged for"
             f" {incident['consecutive']} weight checks in a row ({names}{f', and {extra} more' if extra > 0 else ''});"
             f" {incident['stalled_steps']} step{'s' if incident['stalled_steps'] != 1 else ''} affected"
+        )
+    if kind == "activation_spike":
+        top = incident["modules"][0]
+        return (
+            f"Activation spike at step {incident['step']} in {top['module']}: {top['stat']}"
+            f" {top['ratio']:.0f}× its recent median"
+            + (f", and {incident['affected'] - 1} more modules" if incident["affected"] > 1 else "")
+            + f"; {incident['affected_steps']} step{'s' if incident['affected_steps'] != 1 else ''} affected"
+        )
+    if kind == "activation_drift":
+        top = incident["modules"][0]
+        direction = "grew" if top["ratio"] > 1 else "shrank"
+        return (
+            f"Activation drift from step {incident['step']} in {top['module']}: {top['stat']}"
+            f" {direction} to {top['ratio']:.2g}× its early level"
+            + (f", and {incident['affected'] - 1} more modules" if incident["affected"] > 1 else "")
+        )
+    if kind == "dead_activations":
+        top = incident["modules"][0]
+        return (
+            f"Outputs going dead from step {incident['step']} in {top['module']}: zero fraction"
+            f" {top['baseline']:.0%} → {top['recent']:.0%}"
+            + (f", and {incident['affected'] - 1} more modules" if incident["affected"] > 1 else "")
         )
     if kind == "repeated_steps":
         return (

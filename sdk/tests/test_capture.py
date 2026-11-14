@@ -557,3 +557,23 @@ def test_lightning_gradient_clipping_is_recorded(toy_moe):
     opt.step()
     session.close()
     assert sink.records[0]["clip_grad_norm"] == pytest.approx(expected.item(), rel=1e-6)
+
+
+def test_activation_spike_is_found_through_real_capture():
+    torch.manual_seed(0)
+    model = _Stack(dim=16)
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(model, sink=sink, every=10)
+    opt = torch.optim.SGD(model.parameters(), lr=1e-4)
+    for step in range(80):
+        if step == 70:
+            with torch.no_grad():
+                model.layers[1].mlp.weight.mul_(50.0)  # the planted failure
+        opt.zero_grad()
+        model(torch.randn(32, 16)).pow(2).mean().backward()
+        opt.step()
+    session.close()
+    hits = {h["kind"]: h for h in tensorlens.detect_activation_anomalies(sink.records)}
+    spike = hits["activation_spike"]
+    assert spike["step"] == 70
+    assert spike["modules"][0]["module"] in ("layers.1", "layers.2")

@@ -479,3 +479,55 @@ def test_repeated_steps_after_resume_and_start_step(toy_moe):
     run(sink)
     run(sink, start_step=3)
     assert tensorlens.detect_repeated_steps(sink.records) is None
+
+
+def _act_records(steps=120, spike=None, drift_from=None, dead_from=None):
+    # Four blocks with healthy noise; block 1 carries massive outliers from the start,
+    # as trained LLMs do, which must not be reported by itself.
+    records = []
+    for step in range(steps):
+        wobble = 1.0 + 0.05 * ((step * 7) % 5 - 2) / 2
+        layers = {}
+        for b in range(4):
+            std = (2.6 if b == 1 else 0.5) * wobble
+            amax = (800.0 if b == 1 else 10.0) * std
+            zero = 0.1 if b == 3 else 0.0
+            if spike == (step, b):
+                amax *= 20
+            if drift_from is not None and b == 2 and step >= drift_from:
+                std *= 1.03 ** (step - drift_from)
+                amax = 10.0 * std
+            if dead_from is not None and b == 3 and step >= dead_from:
+                zero = 0.6
+            layers[f"blocks.{b}"] = {"mean": 0.0, "std": std, "abs_max": amax, "zero_frac": zero}
+        records.append({"run_id": "act", "step": step, "layers": layers})
+    return records
+
+
+def test_activation_detectors_on_planted_failures():
+    assert tensorlens.detect_activation_anomalies(_act_records()) == []
+
+    hits = tensorlens.detect_activation_anomalies(_act_records(spike=(70, 0)))
+    assert [(h["kind"], h["step"], h["modules"][0]["module"]) for h in hits] == [
+        ("activation_spike", 70, "blocks.0")
+    ]
+
+    drift = tensorlens.detect_activation_anomalies(_act_records(drift_from=60))
+    hit = next(h for h in drift if h["kind"] == "activation_drift")
+    assert hit["modules"][0]["module"] == "blocks.2" and hit["modules"][0]["ratio"] >= 3
+    assert 60 < hit["step"] < 120
+
+    dead = tensorlens.detect_activation_anomalies(_act_records(dead_from=80))
+    hit = next(h for h in dead if h["kind"] == "dead_activations")
+    assert (hit["modules"][0]["module"], hit["step"]) == ("blocks.3", 85)
+
+    evidence = tensorlens.build_evidence(_act_records(spike=(70, 0), dead_from=80))
+    summary = tensorlens.incident_summary(evidence)
+    assert "Activation spike at step 70 in blocks.0: abs_max 19× its recent median; 1 step affected" in summary
+    assert "Outputs going dead from step 85 in blocks.3: zero fraction 10% → 60%" in summary
+
+
+def test_activation_detectors_skip_non_finite_values():
+    records = _act_records(steps=30)
+    records[20]["layers"]["blocks.0"]["abs_max"] = "nan"
+    assert tensorlens.detect_activation_anomalies(records) == []
