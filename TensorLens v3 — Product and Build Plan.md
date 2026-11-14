@@ -233,7 +233,7 @@ Work ran ahead of the gate order: the SDK, detectors and exporter were built bef
 | 14, ingest server | Not started |
 | 15, detectors | Done in Python. MoE imbalance (top-k aware), starved experts, weights not updating, gradient spikes, repeated steps, non-finite values and cross-GPU drift. On Granite: the seeded layer 12 collapse found at the right step, layer and experts on three GPU runs; 20 experts starved since pretraining; the 49 bf16 RMSNorm weights reported as not updating and no other parameter; gradient spikes at steps 141 and 645 on both GPUs |
 | 16, probe pass | Not started |
-| 17, Gate 2 | Partly. Router-only capture passes 1% on the RTX PRO 6000 (+0.78% and +0.02% on two runs) and fails on the A100 (+1.06% to +1.33% per round). Full capture was about +6% for activations of every leaf module and about +8% more for gradient and float64 weight norms on every step; the block default and the 50-step weight check are meant to cut that, and Stage 3 of the benchmark measures full capture against capture off directly. Not yet run. Seeded drift and sign-flip cases pass only on CPU |
+| 17, Gate 2 | Partly. Router-only capture passes 1% on the RTX PRO 6000 (+0.78% and +0.02% on two runs) and fails on the A100 (+1.06% to +1.33% per round). Full capture with the new defaults (24 block hooks, gradient norms every step, weights every 50 steps) measured +4.15% against capture off on the RTX PRO 6000: about 0.36 ms routers, 0.85 ms block activations and 1.5 ms gradient norms. Blocks cut activation cost about 4.5 times; full capture still misses 1%. Seeded drift and sign-flip cases pass only on CPU |
 | 18, product exporter | Done early; the Granite recordings were checked in the stock Rerun viewer |
 | 19–27 | Not started |
 
@@ -245,7 +245,7 @@ Findings along the way:
 
 Open gaps:
 
-- **Full-capture overhead.** Run Stage 3 to see whether the block default and the 50-step weight check bring full capture under 1%. If not, sample activations or make router-only the default.
+- **Full-capture overhead.** Stage 3 measured +4.15%. Gradient norms on every step are the largest part (1.5 ms); sampling them every 50 steps, as Lightning's `log_every_n_steps` and wandb.watch do, would leave about 1.2 ms (about 2%) but would also hide single-step gradient spikes. Activation hooks inside the compiled graph cannot be sampled without recompiles.
 - **A100 router-only overhead.** About 2 ms per step against 0.5 ms on the RTX PRO 6000 for the same hooks; possibly host-side launch overhead. Not investigated.
 - **Untuned thresholds.** The spike factor (5×), diversity drop (0.6), starved ratio (10% of an even share) and stall count (3 checks) rest on one model's data and synthetic cases.
 - **Gate order.** Write the author's own failures and run on one of the author's jobs before adding more detectors, so detectors are tuned to real failures rather than seeded ones.

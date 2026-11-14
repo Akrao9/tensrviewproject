@@ -123,6 +123,21 @@ Colab, RTX PRO 6000 Blackwell Server Edition, PyTorch `2.14.1+cu130`, Inductor w
 - **Gradient spikes at steps 141 and 645**, starting in `model.layers.11.self_attn.k_proj.weight` (22× its median). The A100 run flagged 136, 141 and 645. The same steps on two GPUs point to the data at those steps, since both runs read the same batches in the same order.
 - **The collapse** was found at step 450 in layer 12 with the same 20 starved experts.
 
+## RTX PRO 6000 run with block-level capture (Stage 3)
+
+Colab, RTX PRO 6000 Blackwell Server Edition, PyTorch `2.14.1+cu130`, Inductor with CUDA graphs off, commit `344a1e2`, no seeded collapse.
+
+| Comparison | Reference median | Measured median | Added time |
+| --- | ---: | ---: | ---: |
+| Block activations and routers → plus gradient norms every step (weights every 50) | 66.168 ms/step | 67.659 ms/step | +1.491 ms/step (+2.25%) |
+| Capture off → router-only | 65.646 ms/step | 66.003 ms/step | +0.357 ms/step (+0.54%) |
+| Capture off → full capture with defaults | 64.967 ms/step | 67.663 ms/step | +2.697 ms/step (+4.15%) |
+
+- **Full capture with defaults costs +4.15%, over the 1% target.** All three paired rounds agree: +2.60, +2.74 and +2.69 ms. From the three stages, the parts are roughly 0.36 ms for routers, 0.85 ms for the 24 block activation hooks and 1.5 ms for gradient norms on every step. Activation capture of every leaf module cost about 3.9 ms on this GPU before, so blocks cut it about 4.5 times; gradient norms are now the largest part.
+- **Router-only passed again** at +0.54% (paired rounds −0.32, +0.36, +0.34 ms).
+- **The 50-step weight check is cheap**: Stage 1's gradient arm cost +1.49 ms, about what gradient norms alone cost before float64 weight norms were added (+1.79 ms at `5d38288`).
+- **Detectors on `granite-full.jsonl`**: 24 block statistics per record and weight checks at steps 49, 99, …, 649. No MoE incident, as expected without a seeded collapse; the same 20 starved experts. 28 parameters were reported as not updating from step 199, all of them RMSNorm weights; with 50 steps between checks, some RMSNorm weights change in a few near-zero elements and are no longer exactly unchanged. Gradient spikes at steps 136 and one more, again starting in `model.layers.6.input_layernorm.weight`.
+
 ## Two-GPU replica drift validation
 
 **Pending.** The two-process CPU/Gloo check passed. The Colab runtime exposed one NVIDIA RTX PRO 6000, so the CUDA/NCCL check was skipped.
