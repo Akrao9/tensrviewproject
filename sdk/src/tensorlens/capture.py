@@ -17,6 +17,7 @@ import numbers
 import queue
 import sys
 import threading
+import time
 import warnings
 import weakref
 from dataclasses import dataclass
@@ -43,6 +44,8 @@ _LOW_PRECISION = (torch.float16, torch.bfloat16)
 # an RTX PRO 6000), so it is sampled, as wandb.watch (every 1,000 batches) and TrainCheck
 # (`sampling_interval`) also do.
 WEIGHT_EVERY = 50
+# Version of the step-record format; readers treat records without it as version 0.
+SCHEMA_VERSION = 1
 # Probe passes are rare, like wandb.watch's histograms (every 1,000 batches by default).
 PROBE_EVERY = 1000
 # Blocks of `every` steps waiting for the writer thread before training waits for it.
@@ -424,6 +427,7 @@ class Session:
 
         self._steps: list[int] = []
         self._ring_lr: list[list[float] | None] = []
+        self._ring_ts: list[float] = []
         self._pending_lr: list[float] | None = None
         self._ring_scalars: list[dict[str, Any]] = []
         self._pending_scalars: dict[str, Any] = {}
@@ -760,6 +764,7 @@ class Session:
         self._steps.append(current)
         self._ring_probe.append(None)
         self._ring_lr.append(self._pending_lr)
+        self._ring_ts.append(time.time())  # when the step ended, Unix seconds
         self._pending_lr = None
         self._ring_scalars.append(self._pending_scalars)
         self._pending_scalars = {}
@@ -794,6 +799,7 @@ class Session:
         if self._error is not None:
             self._steps = []
             self._ring_lr = []
+            self._ring_ts = []
             self._ring_scalars = []
             self._ring_probe = []
             self._ring_grad_seen = []
@@ -834,7 +840,8 @@ class Session:
         spread_seen = self._ring_spread_seen
         scalars = _scalars_to_cpu(self._ring_scalars)
         probes = self._ring_probe
-        steps, lrs = self._steps, self._ring_lr
+        steps, lrs, stamps = self._steps, self._ring_lr, self._ring_ts
+        self._ring_ts = []
         self._steps = []
         self._ring_lr = []
         self._ring_scalars = []
@@ -845,7 +852,7 @@ class Session:
         self._ring_spread_seen = []
         block = (
             steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
-            spread_seen, scalars, probes,
+            spread_seen, scalars, probes, stamps,
         )
         try:
             self._queue.put_nowait(block)
@@ -917,6 +924,7 @@ class Session:
         spread_seen: list[bool],
         scalars: list[dict[str, Any]] | None = None,
         probes: list[dict[str, Any] | None] | None = None,
+        stamps: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
         split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
@@ -946,9 +954,11 @@ class Session:
                 else {}
             )
             record: dict[str, Any] = {
+                "schema_version": SCHEMA_VERSION,
                 "run_id": self.run.run_id,
                 "rank": self.run.rank,
                 "step": step,
+                "ts": stamps[i] if stamps is not None else None,
                 "layers": (
                     {
                         name: dict(zip(STATS, row[:_SEEN]))

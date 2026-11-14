@@ -723,3 +723,22 @@ def test_a_slow_sink_makes_training_wait_instead_of_growing_memory(monkeypatch):
     session.close()
     assert [r["step"] for r in sink.records] == list(range(6))  # nothing dropped
     assert any("behind" in str(w.message) for w in caught)
+
+
+def test_every_record_carries_schema_version_and_timestamp(tmp_path):
+    import time
+
+    model = nn.Linear(2, 2)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    path = tmp_path / "run.jsonl"
+    before = time.time()
+    session = tensorlens.init(model, sink=tensorlens.JsonlSink(path), every=2)
+    for _ in range(3):
+        model(torch.ones(1, 2)).sum().backward()
+        opt.step()
+    session.close()
+    records = tensorlens.load_records(path)
+    assert [r["schema_version"] for r in records] == [1, 1, 1]
+    stamps = [r["ts"] for r in records]
+    assert all(isinstance(t, float) for t in stamps)
+    assert before <= stamps[0] <= stamps[1] <= stamps[2] <= time.time()
