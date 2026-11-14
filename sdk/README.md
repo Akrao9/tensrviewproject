@@ -175,7 +175,25 @@ python examples/profile_overhead.py --out runs/profile-a100
 
 Add `--capture full` to profile full capture, and `--trace` for a Chrome trace of each arm (open it at `chrome://tracing` or ui.perfetto.dev; it can be large). The same command on the RTX PRO 6000 gives the comparison. `--toy` checks the script on CPU without downloads.
 
-## Two-GPU replica drift validation
+## Dense model with a seeded activation outlier
+
+**Pending a GPU run.** Everything so far ran on Granite, an MoE model. [`examples/dense_outlier_check.py`](examples/dense_outlier_check.py) checks the dense-model path: it trains SmolLM2-360M (Llama architecture, grouped-query attention) on WikiText-2 with capture off and with full capture plus the probe, in alternating 50-step chunks, and from step 250 scales two hidden channels of the middle block by 100, a seeded massive activation. It reports:
+
+- full-capture overhead on a dense model, timed per step with CUDA events, and what a flush step and a probe step add, with the probe's average cost at every 100 steps and at the default 1,000;
+- `PASS` if the first activation spike is at step 250 and includes the seeded block;
+- the seeded block's probe histogram before and after, with a PNG of both on one shared axis, and the attention of the next block, the first to read the outlier;
+- graph breaks, and a Rerun recording.
+
+In Colab, from the repository root:
+
+```sh
+cd sdk
+python -m pip install -e '.[rerun]' transformers huggingface_hub pyarrow matplotlib
+python examples/dense_outlier_check.py --out runs/dense-outlier
+```
+
+On CPU with a tiny random Llama (`--toy --backend aot_eager`, PyTorch 2.10, transformers 5.5.4) it found the spike at step 250 in the seeded block, the probe's largest value in that block grew 77× between the probes before and after, and there were no graph breaks. CPU timings say nothing about a GPU.
+
 
 **Pending.** The two-process CPU/Gloo check passed. The Colab runtime exposed one NVIDIA RTX PRO 6000, so the CUDA/NCCL check was skipped.
 
@@ -222,6 +240,7 @@ The Rerun export adds a Probe tab: the largest attention logit and `entropy_shar
 - **Several optimizers on one model** (for example Muon for matrices and AdamW for the rest) count as one step per training iteration: an optimizer step starts a new TensorLens step only if gradients changed since the previous optimizer step, so the others in the same iteration add no step and do not record gradient norms twice. Lightning's `global_step` counts every optimizer step instead; to match it, pass `auto_step=False` and call `session.step(step=trainer.global_step)`. Optimizers that subclass another and call `super().step()` fire PyTorch's step hooks twice, nested; only the outer call counts.
 - **The cross-GPU drift check is a collective**, so every rank must run it on the same steps or the others wait until the process group times out. It runs where `(step + 1) % replica_every == 0`, from the step number, so the ranks must agree on step numbers: the same `start_step`, or the same `step=` passed to `session.step`.
 - **The writer queue is bounded** at 8 blocks of `every` steps, as TensorBoard's `SummaryWriter` bounds its queue (`max_queue=10`). If the sink falls behind, for example on a stalled network filesystem, training waits for it with a one-time `RuntimeWarning` rather than holding unwritten steps in memory; no step is dropped.
+- **Register your own forward hooks before `tensorlens.init`.** On PyTorch 2.10 with a Hugging Face Llama, a hook registered with `prepend=True` on a block TensorLens also hooks crashes `torch.compile` while it builds guards (`IndexError: tuple index out of range`), with or without `skip_nnmodule_hook_guards`. The same hook registered normally, or prepended on a block TensorLens does not hook, works. Not checked on PyTorch 2.14.
 - **Hooks stay on the model after `close()`**, because removing a hook from a compiled module triggers a recompile.
 - **Full-capture cost.** Each watched module adds a few small kernels per step. Granite's measured ~6% for activation capture was with every leaf module (171); blocks are the default now (`--layers all` in the benchmark for the old selection). Full capture with defaults measured +4.15% against capture off on the RTX PRO 6000 (Stage 3 above).
 
