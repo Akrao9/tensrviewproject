@@ -44,6 +44,7 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 | Step counting through PyTorch's global optimizer hooks, limited to this model's optimizer | Built, tested |
 | Gradient norms grouped by device and dtype (`torch._foreach_norm`, with `DTensor.to_local()` and fallback) | Built, tested |
 | MoE expert load (a compare-and-sum per router, accumulated on the device) and router entropy / diversity (`moe_stats`) | Built, tested |
+| Hugging Face `Trainer` callback (`tensorlens.huggingface.TensorLensCallback`): run ID from the tracker on the main process broadcast to every rank, steps from `state.global_step`, and the loss and pre-clipping gradient norm per optimizer step, taken by wrapping `Accelerator.backward` and `Accelerator.clip_grad_norm_` while a session is open. Works with `torch_compile=True` | CPU tests on one process with Transformers 5.23.0 / Accelerate 1.15.0 and their development versions. Not run on a GPU, on several ranks, with mixed precision, or with TRL |
 | PyTorch Lightning callback (`tensorlens.lightning.TensorLensCallback`): run ID from the trainer's logger broadcast from rank 0, steps from `trainer.global_step`, the back-propagated loss per optimizer step, and the `16-mixed` scaler | Built, tested on CPU with Lightning 2.6.5 on one process and two (`ddp_spawn`) |
 | Probe pass (`probe=`): activation histograms per block and attention logit, entropy and maps per layer, on a fixed batch every `probe_every` steps | Built, tested on CPU, under `torch.compile` with no graph breaks or recompiles, and on a small randomly initialized Hugging Face Granite MoE; not run on a GPU |
 | Logged scalars (`session.log`) attached to incidents and plotted in Rerun | Built, tested on CPU and Apple MPS; not run on a GPU |
@@ -267,7 +268,7 @@ cd sdk
 ../.venv/bin/python examples/toy_moe.py --rerun
 ```
 
-CI ([ci.yml](../.github/workflows/ci.yml)) runs the tests on every push and pull request, on Python 3.11 and 3.12 with PyTorch 2.6, 2.10 and 2.14 (CPU builds), and once more with the Lightning and Rerun extras installed. It also runs `gpu_check.py --skip-overhead`, which on CPU uses the `aot_eager` backend. The real GPU gate is a separate job, started by hand from the Actions tab with `gpu` ticked; it needs a self-hosted runner with a CUDA build of PyTorch, and none is registered yet.
+CI ([ci.yml](../.github/workflows/ci.yml)) runs the tests on every push and pull request, on Python 3.11 and 3.12 with PyTorch 2.6, 2.10 and 2.14 (CPU builds), and once more with the Lightning, Hugging Face and Rerun extras installed. It also runs `gpu_check.py --skip-overhead`, which on CPU uses the `aot_eager` backend. The real GPU gate is a separate job, started by hand from the Actions tab with `gpu` ticked; it needs a self-hosted runner with a CUDA build of PyTorch, and none is registered yet.
 
 On a CUDA machine, run the GPU check. It fails on any graph break, recompile or CUDA-graph skip, and then reports the time per step with and without capture:
 

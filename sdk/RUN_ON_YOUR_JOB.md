@@ -132,12 +132,34 @@ session.step(step=iteration, lr=optimizer.param_groups[0]["lr"])
 
 This follows Megatron's `train_step` in `megatron/training/training.py`; it has not been run.
 
-### Hugging Face Trainer and Accelerate
+### Hugging Face Trainer (and TRL)
 
-There is no adapter yet; a `TrainerCallback` is the next one planned. Until then, two things are known from reading the Transformers and Accelerate sources (5.24.0.dev0 and 1.16.0.dev0), neither run:
+Add the callback; it starts TensorLens when training starts and stops it when training ends:
 
-- **Clipping is not recorded.** In that Accelerate version `accelerator.clip_grad_norm_` computes the norm with `torch.nn.utils.get_total_norm` and no longer calls `torch.nn.utils.clip_grad_norm_`, so TensorLens does not see it. Pass the value it returns yourself: `session.record_grad_norm(accelerator.clip_grad_norm_(model.parameters(), max_norm))`. `Trainer` clips through the same function and gives callbacks no access to the result.
-- **Call `tensorlens.init` before `accelerator.prepare`** if Accelerate compiles the model, since `init` refuses a model that is already compiled. With mixed precision, pass `scaler=accelerator.scaler`.
+```python
+from tensorlens.huggingface import TensorLensCallback
+
+trainer = Trainer(model=model, args=args, train_dataset=data, callbacks=[TensorLensCallback(capture="full")])
+```
+
+Install with `pip install 'tensorlens[huggingface]'`. `SFTTrainer` and the other TRL trainers subclass `Trainer` and take the same callback, but none has been run with it.
+
+- **Run ID.** `Trainer` starts the W&B or MLflow run on the main process only; the callback reads it there and broadcasts it to the other ranks.
+- **Steps** are counted from optimizer steps, like `global_step`, and start at `state.global_step`, so a resumed run continues the numbering.
+- **Loss** is logged as `train/loss` for each optimizer step: the loss `Trainer` back-propagates, summed over `gradient_accumulation_steps` microbatches, which is their mean. `loss_name=None` turns it off. The interval averages `Trainer` logs every `logging_steps`, and evaluation metrics, are not recorded.
+- **Clipping.** The norm before clipping is recorded as `clip_grad_norm`, including with `max_grad_norm=0`, where `Trainer` still computes it.
+- **Mixed precision.** Accelerate's `GradScaler`, when it has one, is passed in, so skipped steps are counted and marked. Not run: it needs a GPU.
+- **`torch_compile=True`** works: the compiled forward is traced on its first call, after the callback has added its hooks.
+- **A failed run.** `Trainer` has no event for an exception. If `trainer.train()` raises, call `callback.close()` to write what was captured.
+- Other keyword arguments go to `tensorlens.init`, for example `routers=` or `probe=`.
+
+Tested on CPU, one process, with Transformers 5.23.0 and Accelerate 1.15.0, and with their development versions (5.24.0.dev0, 1.16.0.dev0). Not tested: several ranks, FSDP, DeepSpeed, `nn.DataParallel` (several GPUs in one process), and a GPU.
+
+### Hugging Face Accelerate, in your own loop
+
+Call `tensorlens.init` before `accelerator.prepare` if Accelerate compiles the model, since `init` refuses a model that is already compiled. With mixed precision, pass `scaler=accelerator.scaler`.
+
+Clipping depends on the Accelerate version. Up to 1.15.0, `accelerator.clip_grad_norm_` calls `torch.nn.utils.clip_grad_norm_` and is recorded with nothing more to do. The development version (1.16.0.dev0) computes the norm another way and is not recorded; there, pass on the value it returns: `session.record_grad_norm(accelerator.clip_grad_norm_(model.parameters(), max_norm))`. Do not do that on 1.15.0, or the norm is counted twice.
 
 ### Ray, or several processes outside one process group
 

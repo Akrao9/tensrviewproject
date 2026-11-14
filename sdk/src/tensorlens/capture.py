@@ -403,6 +403,7 @@ class Session:
         self._clip = torch.zeros((), **f32)
         self._ring_clip = torch.zeros(every, **f32)
         self._clip_recorded = False
+        self._clip_calls = 0  # lets an outer wrapper see that an inner one already recorded
         self._ring_clip_seen: list[bool] = []
         self._ring_spread: torch.Tensor | None = None
         self._ring_spread_seen: list[bool] = []
@@ -682,6 +683,7 @@ class Session:
         else:
             self._clip.add_(float(norm) ** 2)
         self._clip_recorded = True
+        self._clip_calls += 1
 
     def log(self, values: Mapping[str, Any] | None = None, **named: Any) -> None:
         """Record scalars such as the loss for the step in progress, without a GPU sync.

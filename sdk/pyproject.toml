@@ -15,6 +15,7 @@ dependencies = ["torch>=2.6"]
 dev = ["pytest"]
 rerun = ["numpy", "rerun-sdk==0.43.2"]
 lightning = ["lightning>=2.4"]
+huggingface = ["transformers>=4.46", "accelerate>=1.0"]
 
 [project.scripts]
 tensorlens = "tensorlens.evidence:main"

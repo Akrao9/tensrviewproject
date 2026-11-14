@@ -43,24 +43,36 @@ def resolve_run(run_id: str | None = None) -> RunInfo:
     rank = _rank()
     if run_id:
         return RunInfo(run_id, "explicit", rank)
+    found = tracker_run_id()
+    if found is not None:
+        return RunInfo(found[0], found[1], rank)
+    shared = _launcher_run_id()
+    if shared is not None:
+        return RunInfo(shared, "launcher", rank)
+    return RunInfo(_shared_generated_id(), "generated", rank)
+
+
+def tracker_run_id() -> tuple[str, str] | None:
+    """The tracker run this process can see, as (run ID, source), with no collective call.
+
+    A tracker's run often exists on rank 0 only, so a caller with several ranks should
+    read it there and broadcast it.
+    """
     env = os.environ.get("MLFLOW_RUN_ID")
     if env:
-        return RunInfo(env, "env", rank)
+        return env, "env"
     mlflow = sys.modules.get("mlflow")
     if mlflow is not None:
         active = mlflow.active_run()
         if active is not None:
-            return RunInfo(active.info.run_id, "mlflow", rank)
+            return active.info.run_id, "mlflow"
     wandb = sys.modules.get("wandb")
     run = getattr(wandb, "run", None)
     if run is not None:
         # Read the ID once. Never read `wandb.run.step`: it is a round trip to the W&B
         # background process and raises in shared-mode runs.
-        return RunInfo(run.id, "wandb", rank)
-    shared = _launcher_run_id()
-    if shared is not None:
-        return RunInfo(shared, "launcher", rank)
-    return RunInfo(_shared_generated_id(), "generated", rank)
+        return run.id, "wandb"
+    return None
 
 
 def _launcher_run_id() -> str | None:
