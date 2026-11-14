@@ -220,28 +220,35 @@ The embedded roadmap diagram predates this version; the steps below are the curr
 
 ### Progress so far
 
-Work ran ahead of the gate order: the SDK, detectors and exporter were built before Gate 0 and Gate 1. Details and raw numbers are in the [SDK README](sdk/README.md).
+Work ran ahead of the gate order: the SDK, detectors and exporter were built before Gate 0 and Gate 1. Details and raw numbers are in the [SDK README](sdk/README.md); the [failure list](TensorLens%20failure%20list.md) records what each detector covers. State as of commit `344a1e2`.
 
 | Steps | State |
 | --- | --- |
-| 1–5, Gate 0 | Partly. The working dogfood run is IBM Granite 3.0 1B-A400M (MoE, 24 routers of 32 experts, top-8) trained on WikiText-2 on one RTX PRO 6000 in Colab. It is a benchmark rather than one of the author's own jobs. A researched [failure list](TensorLens%20failure%20list.md) of 15 public failure types exists; the author's own failures, tracker choice and multi-GPU setup are not written down, and the competitor re-check is not done (add TrainCheck to it) |
+| 1–5, Gate 0 | Partly. The working dogfood run is IBM Granite 3.0 1B-A400M (MoE, 24 routers of 32 experts, top-8) trained on WikiText-2 in Colab, on one RTX PRO 6000 or one A100. It is a benchmark rather than one of the author's own jobs. A researched failure list of 15 public failure types exists; the author's own failures, tracker choice and multi-GPU setup are not written down, and the competitor re-check is not done (add TrainCheck to it) |
 | 6–9, Gate 1 | Not started |
-| 10, SDK skeleton | Done except the Lightning callback |
-| 11, Tier 0 capture | Done except Arrow Flight; records go to JSON Lines |
-| 12, Tier 1 capture | MoE load done and checked on Granite. Cross-GPU fingerprints pass two CPU processes; the two-GPU NCCL run is pending |
-| 13, CI gate | Partly. No graph breaks or recompiles and no CUDA-graph skips on a toy MoE with Inductor and CUDA graphs. Granite runs with CUDA graphs off, because its `grouped_mm` expert path fails during CUDA-graph recording, so `reduce-overhead` is unverified on a real model. Not wired into CI |
+| 10, SDK skeleton | Done except the Lightning callback. `init(start_step=)` continues step numbers after a resume, and each step records the learning rate |
+| 11, Tier 0 capture | Done except Arrow Flight; records go to JSON Lines. Activations are captured once per repeated block by default (24 decoder layers for Granite instead of 171 leaf modules; `layers="all"` keeps every leaf). Weight norms are checked in float64 every 50 steps (`weights=N`) |
+| 12, Tier 1 capture | MoE load done and checked on Granite, with each router's top-k recorded. Cross-GPU fingerprints pass two CPU processes; the two-GPU NCCL run is pending |
+| 13, CI gate | Partly. No graph breaks and no CUDA-graph skips on a toy MoE with Inductor and CUDA graphs. Granite runs with CUDA graphs off, because its `grouped_mm` expert path fails during CUDA-graph recording, so `reduce-overhead` is unverified on a real model. Granite shows one expected recompile per benchmark model with different hooks. Not wired into CI |
 | 14, ingest server | Not started |
-| 15, detectors | Done in Python, plus a non-finite detector. A collapse seeded in Granite layer 12 was found at the right step, layer and experts |
+| 15, detectors | Done in Python. MoE imbalance (top-k aware), starved experts, weights not updating, gradient spikes, repeated steps, non-finite values and cross-GPU drift. On Granite: the seeded layer 12 collapse found at the right step, layer and experts on three GPU runs; 20 experts starved since pretraining; the 49 bf16 RMSNorm weights reported as not updating and no other parameter; gradient spikes at steps 141 and 645 on both GPUs |
 | 16, probe pass | Not started |
-| 17, Gate 2 | Partly. Router-only capture added +0.78% on Granite (paired rounds +0.66% to +0.79%), inside the 1% target. Full capture is over it: about +6% for activations and routers and +9% with gradient norms, estimated across two benchmark stages rather than measured directly. Seeded drift and sign-flip cases pass only on CPU |
-| 18, product exporter | Done early; the Granite recording was checked in the stock Rerun viewer |
+| 17, Gate 2 | Partly. Router-only capture passes 1% on the RTX PRO 6000 (+0.78% and +0.02% on two runs) and fails on the A100 (+1.06% to +1.33% per round). Full capture was about +6% for activations of every leaf module and about +8% more for gradient and float64 weight norms on every step; the block default and the 50-step weight check are meant to cut that, and Stage 3 of the benchmark measures full capture against capture off directly. Not yet run. Seeded drift and sign-flip cases pass only on CPU |
+| 18, product exporter | Done early; the Granite recordings were checked in the stock Rerun viewer |
 | 19–27 | Not started |
 
-Open gaps found along the way:
+Findings along the way:
 
-- **Top-k overload.** The 35% overload threshold cannot be reached by a top-k router with k > 2. A lower threshold applies only once dead experts are flagged, so a router that sends every token to the same experts without leaving any dead is not reported.
-- **Full-capture overhead.** Either cut it towards 1% (sample activations and gradient norms every N steps, or watch fewer layers) or make router-only the default and full capture opt-in. Measure full capture against capture off directly first.
-- **Gate order.** Write the failure list and pick the tracker before adding more detectors, so detectors are tuned to real failures rather than to seeded ones.
+- **Fixed per-step thresholds failed on real data.** Healthy Granite has experts picked by 85–100% of tokens, and with two documents per batch single experts jump to over half the tokens for one step. Top-k overload therefore requires the router's diversity to drop below 0.6 of its recent median (healthy minimum 0.82; the seeded collapse 0.29). Experts nearly unused for hundreds of steps needed a windowed check, since one empty step is noise.
+- **float32 norms cannot show whether bf16 weights changed.** A first stalled-weight check reported 147 of 218 parameters falsely; float64 norms fixed it but cost about 3.7 ms per step on the RTX PRO 6000. Reading the weights alone costs about 1.5 ms, so the check is sampled, as wandb.watch (1,000 batches) and TrainCheck (`sampling_interval`) do.
+- **Pure-bf16 training freezes norm weights.** In the Granite benchmark's setup (bf16 weights, AdamW, lr 1e-5, no float32 master weights) all 49 RMSNorm weights never change: their bf16 step size near 1.0 is about 0.008. TensorLens now reports this.
+
+Open gaps:
+
+- **Full-capture overhead.** Run Stage 3 to see whether the block default and the 50-step weight check bring full capture under 1%. If not, sample activations or make router-only the default.
+- **A100 router-only overhead.** About 2 ms per step against 0.5 ms on the RTX PRO 6000 for the same hooks; possibly host-side launch overhead. Not investigated.
+- **Untuned thresholds.** The spike factor (5×), diversity drop (0.6), starved ratio (10% of an even share) and stall count (3 checks) rest on one model's data and synthetic cases.
+- **Gate order.** Write the author's own failures and run on one of the author's jobs before adding more detectors, so detectors are tuned to real failures rather than seeded ones.
 
 ### Week 1: set up the dogfood runs (Gate 0)
 
@@ -313,13 +320,14 @@ The biggest risk is commercial, not technical: teams may value the tool and stil
 
 ## Unproven and open decisions
 
-The synthetic MoE bake-off verified recording read-back and headless rendering. Capture now runs on a real MoE model (Granite) on one GPU, with router-only overhead measured under 1% and a seeded collapse detected. Multi-GPU capture, full-capture overhead measured directly, and diagnosis times remain unmeasured.
+The synthetic MoE bake-off verified recording read-back and headless rendering. Capture now runs on a real MoE model (Granite) on an RTX PRO 6000 and an A100, with router-only overhead under 1% on the first and over it on the second, a seeded collapse detected, and seven detectors checked on Granite or synthetic data. Multi-GPU capture, full-capture overhead with the new defaults, real failures on the author's own jobs, and diagnosis times remain unmeasured.
 
 **Unproven**
 
 - Whether sorting and layer selection improve diagnosis enough to justify a custom Rerun view.
 - Whether the stock Rerun viewer stays smooth on a real 5,000-metric MLflow run.
-- Whether full capture (activations, routers and gradient norms) can get under 1%. Router-only capture already does on Granite; full capture is about 9%.
+- Whether full capture can get under 1% with block-level activations and a 50-step weight check. Router-only capture does on the RTX PRO 6000 and not on the A100; full capture was about 9% with every leaf module and per-step weight norms.
+- Whether the detector thresholds hold on models other than Granite.
 - Whether the hooks keep CUDA graphs on real models. They do on a toy MoE; Granite needs CUDA graphs off for reasons unrelated to TensorLens.
 - The cross-GPU drift tolerance of 1e-6 on real multi-GPU runs.
 - Whether a coding agent with TensorLens evidence and Rerun screenshots finds the right cause more often than one with tracker data alone.
@@ -334,7 +342,7 @@ The synthetic MoE bake-off verified recording read-back and headless rendering. 
 - [ ] Whether W&B is the next tracker target after MLflow.
 - [ ] Multi-GPU runs: which rank reports activations. Rank 0 is enough for plain data parallelism, and with pipeline or tensor parallelism every rank that owns layers reports; every rank still shares its small parameter fingerprints for the cross-GPU detector.
 - [ ] Price, after the cost per monitored run is modelled.
-- [ ] Default capture level: router-only (inside 1% today) or full capture (about 9% today).
+- [ ] Default capture level: router-only or full capture, after Stage 3 measures full capture with the new defaults.
 - [ ] Whether detectors stay in Python after the Rust ingest server exists.
 
 ## Sources
