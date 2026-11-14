@@ -39,6 +39,13 @@ _LOW_PRECISION = (torch.float16, torch.bfloat16)
 # an RTX PRO 6000), so it is sampled, as wandb.watch (every 1,000 batches) and TrainCheck
 # (`sampling_interval`) also do.
 WEIGHT_EVERY = 50
+# Settings per capture mode. Router load is the always-on signal; layer statistics and
+# gradient and weight norms are a debugging mode, as in Composer's ActivationMonitor,
+# wandb.watch and Lightning's grad_norm.
+CAPTURE_MODES: dict[str, dict[str, Any]] = {
+    "routers": {"layers": (), "grads": False, "weights": False},
+    "full": {"layers": "blocks", "grads": True, "weights": True},
+}
 
 LayerFilter = Callable[[str, nn.Module], bool]
 
@@ -761,10 +768,11 @@ def init(
     run_id: str | None = None,
     every: int = 50,
     sink: Sink | None = None,
+    capture: str | None = None,
     layers: LayerFilter | Sequence[str] | str | None = None,
     routers: Mapping[str, Router | int] | None = None,
-    grads: bool | int = True,
-    weights: bool | int = True,
+    grads: bool | int | None = None,
+    weights: bool | int | None = None,
     auto_step: bool = True,
     replica_group: Any = None,
     start_step: int = 0,
@@ -775,8 +783,14 @@ def init(
         run_id: the tracker's run ID. Defaults to MLFLOW_RUN_ID, the active MLflow run or
             the active W&B run, in that order.
         every: steps kept on the device between transfers to the CPU.
+        capture: `"routers"` records MoE router load only: cheap enough to leave on
+            (+0.02% to +0.78% on Granite on an RTX PRO 6000). `"full"` adds block
+            activation statistics, gradient norms every step and a weight check every 50
+            steps, for debugging (+4.15% on the same run). Defaults to `"routers"` when
+            `routers` are given and `"full"` otherwise. `layers`, `grads` and `weights`
+            override the mode's settings.
         sink: where records go. Defaults to a JSON Lines file under `tensorlens-out/`.
-        layers: which modules' outputs to summarize. Default `"blocks"`: each repeated
+        layers: which modules' outputs to summarize. In full capture, `"blocks"`: each repeated
             block, such as each transformer layer, or every leaf module with parameters if
             the model has no repeated blocks. `"all"`: every leaf module with parameters,
             which costs several times more. Or module names, or a `(name, module) -> bool`
@@ -796,6 +810,15 @@ def init(
         start_step: the first step number. Pass the step you resume from, so a resumed
             run does not repeat step numbers already written.
     """
+    mode = capture if capture is not None else ("routers" if routers else "full")
+    if mode not in CAPTURE_MODES:
+        raise ValueError(f"capture must be one of {sorted(CAPTURE_MODES)}, got {capture!r}")
+    if mode == "routers" and not routers:
+        raise ValueError('capture="routers" needs routers=; use capture="full" for a dense model')
+    defaults = CAPTURE_MODES[mode]
+    layers = defaults["layers"] if layers is None else layers
+    grads = defaults["grads"] if grads is None else grads
+    weights = defaults["weights"] if weights is None else weights
     run = resolve_run(run_id)
     if sink is None:
         name = run.run_id or "run"

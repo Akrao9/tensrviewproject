@@ -7,6 +7,7 @@ import tensorlens
 
 model.to(device)
 session = tensorlens.init(model, routers={"blocks.3.router": 128})  # before torch.compile
+# Router load only, cheap enough to leave on. For debugging, add capture="full".
 model = torch.compile(model)
 
 for batch in loader:
@@ -18,7 +19,9 @@ for batch in loader:
 session.close()
 ```
 
-Each optimizer step becomes one JSON line in `tensorlens-out/<run_id>.rank<rank>.jsonl`:
+Each optimizer step becomes one JSON line in `tensorlens-out/<run_id>.rank<rank>.jsonl`.
+
+There are two capture modes. `capture="routers"`, the default when `routers` are given, records only MoE router load (`moe`, `moe_stats`, `moe_top_k`) and the learning rate: this is the always-on mode. `capture="full"`, the default for models without routers, adds block activation statistics, gradient norms on every step and a weight check every 50 steps: this is the debugging mode. `layers`, `grads` and `weights` override either mode. See [Capture-mode decision](#capture-mode-decision) for the measurements behind it.
 
 - **`layers`**: mean, standard deviation, absolute maximum and zero fraction of each watched module's output. By default the watched modules are the model's repeated blocks, such as each transformer decoder layer: the largest `ModuleList` of composite modules of one class, the unit PyTorch's FSDP `transformer_auto_wrap_policy` wraps. A model without such a list falls back to every leaf module with parameters, which `layers="all"` also selects; for Granite that is 171 modules against 24 blocks.
 - **`grad_norms`** and **`grad_norm`**: the L2 norm of each parameter's gradient and their total.
@@ -137,6 +140,19 @@ Colab, RTX PRO 6000 Blackwell Server Edition, PyTorch `2.14.1+cu130`, Inductor w
 - **Router-only passed again** at +0.54% (paired rounds −0.32, +0.36, +0.34 ms).
 - **The 50-step weight check is cheap**: Stage 1's gradient arm cost +1.49 ms, about what gradient norms alone cost before float64 weight norms were added (+1.79 ms at `5d38288`).
 - **Detectors on `granite-full.jsonl`**: 24 block statistics per record and weight checks at steps 49, 99, …, 649. No MoE incident, as expected without a seeded collapse; the same 20 starved experts. 28 parameters were reported as not updating from step 199, all of them RMSNorm weights; with 50 steps between checks, some RMSNorm weights change in a few near-zero elements and are no longer exactly unchanged. Gradient spikes at steps 136 and one more, again starting in `model.layers.6.input_layernorm.weight`.
+
+## Capture-mode decision
+
+Decided on Nov 13, 2026, after Stage 3: **router-only capture is the default for MoE models, and full capture is an opt-in debugging mode.**
+
+- **Measured cost on Granite, RTX PRO 6000:** router-only +0.02% to +0.78% across three runs; full capture with block defaults +4.15%, of which about 1.5 ms is gradient norms on every step and 0.85 ms block activation statistics. On the A100, router-only was +1.06% to +1.33%.
+- **Why not sample gradient norms to bring full capture down:** it would still be about 2%, because the block statistics run inside the compiled graph on every step and cannot be sampled without extra compiled variants; and most gradient spikes last one step, so sampling would miss them.
+- **What comparable tools do:** detailed per-layer monitoring is sampled or opt-in. Composer's `ActivationMonitor` runs every N batches and warns that it adds overhead; wandb.watch defaults to every 1,000 batches and its docs say logging every step can significantly slow training; Lightning documents per-layer `grad_norm` as a debugging step. Always-on profilers aim for about 1% or less.
+- **Why routers are the right always-on signal for MoE models:** a 2026 paper on preemptive detection of training instability argues that loss, gradient norms and weight norms are late indicators and proposes router-level monitors such as routing entropy, which router-only capture records.
+- **What router-only gives up by default:** layer statistics, gradient spikes, stalled weights and non-finite gradient detection. Turn on `capture="full"` while investigating.
+- **Possible follow-up:** training loops that clip gradients already compute the total gradient norm on every step with `clip_grad_norm_`; reusing that value would give cheap per-step spike detection in router-only mode.
+
+Sources: [Composer ActivationMonitor](https://mosaicml-composer.readthedocs-hosted.com/en/stable/_modules/composer/callbacks/activation_monitor.html), [wandb.watch](https://docs.wandb.ai/support/models/articles/how-do-i-log-gradients-and-model-weights-with-wandb-watch), [Pixie continuous profiling overhead](https://blog.px.dev/cpu-profiling-3), [Grafana continuous profiling costs](https://grafana.com/blog/continuous-profiling-in-production-a-real-world-example-to-measure-benefits-and-costs), [Mechanism-driven monitors for LLM training instability](https://arxiv.org/pdf/2606.28116), Lightning's `docs/source-pytorch/debug/debugging_intermediate.rst`.
 
 ## Two-GPU replica drift validation
 

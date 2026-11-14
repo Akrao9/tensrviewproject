@@ -154,6 +154,7 @@ def measure_overhead(args: argparse.Namespace, device: torch.device) -> None:
             session = tensorlens.init(
                 model,
                 run_id="gpu-check-overhead",
+                capture="full",
                 every=args.every,
                 sink=tensorlens.JsonlSink(Path(tmp) / "overhead.jsonl"),  # real file writes
                 routers=routers(model),

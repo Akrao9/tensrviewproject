@@ -267,9 +267,9 @@ def main() -> None:
         ("full (grads off)", "full (grads on)"),
         (
             # A weight check records that step's gradient norms, so this arm turns it off.
-            {"run_id": "granite-no-grads", "grads": False, "weights": False,
+            {"run_id": "granite-no-grads", "capture": "full", "grads": False, "weights": False,
              "layers": args.layers, "sink": tensorlens.JsonlSink(no_grads_path)},
-            {"run_id": "granite", "grads": True, "layers": args.layers,
+            {"run_id": "granite", "capture": "full", "layers": args.layers,
              "sink": tensorlens.JsonlSink(capture_path)},
         ),
     )
@@ -312,9 +312,7 @@ def main() -> None:
             None,
             {
                 "run_id": "granite-router-only",
-                "layers": (),
-                "grads": False,
-                "weights": False,
+                "capture": "routers",
                 "sink": tensorlens.JsonlSink(router_only_path),
             },
         ),
@@ -345,7 +343,8 @@ def main() -> None:
         args,
         batches,
         ("capture off", "full capture"),
-        (None, {"run_id": "granite-full", "layers": args.layers, "sink": tensorlens.JsonlSink(full_path)}),
+        (None, {"run_id": "granite-full", "capture": "full", "layers": args.layers,
+                   "sink": tensorlens.JsonlSink(full_path)}),
     )
     verify_capture(
         full_path,

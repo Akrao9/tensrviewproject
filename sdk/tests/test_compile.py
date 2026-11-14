@@ -10,7 +10,7 @@ import tensorlens
 @pytest.mark.parametrize("backend", ["eager", "aot_eager"])
 def test_hooks_cause_no_graph_breaks_or_recompiles(toy_moe, backend):
     sink = tensorlens.MemorySink()
-    session = tensorlens.init(toy_moe, sink=sink, every=3, routers={"router": 4})
+    session = tensorlens.init(toy_moe, sink=sink, every=3, capture="full", routers={"router": 4})
     compiled = torch.compile(toy_moe, backend=backend)
     opt = torch.optim.SGD(toy_moe.parameters(), lr=0.01)
 
@@ -35,7 +35,9 @@ def test_compiled_statistics_equal_eager_statistics(toy_moe):
         torch.manual_seed(0)
         model = type(toy_moe)()
         sink = tensorlens.MemorySink()
-        session = tensorlens.init(model, sink=sink, every=1, routers={"router": 4}, auto_step=False)
+        session = tensorlens.init(
+            model, sink=sink, every=1, capture="full", routers={"router": 4}, auto_step=False
+        )
         runner = torch.compile(model, backend="aot_eager") if compile_it else model
         runner(x).sum().backward()
         session.step()
@@ -60,7 +62,9 @@ def test_hook_buffers_are_marked_static_for_cudagraph_trees(toy_moe):
         captured.append((set(meta.mutated_inp_runtime_indices), set(meta.static_input_indices)))
         return make_boxed_func(gm.forward)
 
-    session = tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), every=2, routers={"router": 4})
+    session = tensorlens.init(
+        toy_moe, sink=tensorlens.MemorySink(), every=2, capture="full", routers={"router": 4}
+    )
     compiled = torch.compile(toy_moe, backend=aot_autograd(fw_compiler=fw_compiler))
     compiled(torch.randn(16, 8)).sum().backward()
     session.close()

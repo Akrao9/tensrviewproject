@@ -233,7 +233,7 @@ Work ran ahead of the gate order: the SDK, detectors and exporter were built bef
 | 14, ingest server | Not started |
 | 15, detectors | Done in Python. MoE imbalance (top-k aware), starved experts, weights not updating, gradient spikes, repeated steps, non-finite values and cross-GPU drift. On Granite: the seeded layer 12 collapse found at the right step, layer and experts on three GPU runs; 20 experts starved since pretraining; the 49 bf16 RMSNorm weights reported as not updating and no other parameter; gradient spikes at steps 141 and 645 on both GPUs |
 | 16, probe pass | Not started |
-| 17, Gate 2 | Partly. Router-only capture passes 1% on the RTX PRO 6000 (+0.78% and +0.02% on two runs) and fails on the A100 (+1.06% to +1.33% per round). Full capture with the new defaults (24 block hooks, gradient norms every step, weights every 50 steps) measured +4.15% against capture off on the RTX PRO 6000: about 0.36 ms routers, 0.85 ms block activations and 1.5 ms gradient norms. Blocks cut activation cost about 4.5 times; full capture still misses 1%. Seeded drift and sign-flip cases pass only on CPU |
+| 17, Gate 2 | Partly. Router-only capture passes 1% on the RTX PRO 6000 (+0.78% and +0.02% on two runs) and fails on the A100 (+1.06% to +1.33% per round). Full capture with the new defaults (24 block hooks, gradient norms every step, weights every 50 steps) measured +4.15% against capture off on the RTX PRO 6000: about 0.36 ms routers, 0.85 ms block activations and 1.5 ms gradient norms. Blocks cut activation cost about 4.5 times; full capture still misses 1%, so it became an opt-in debugging mode and router-only the default for MoE models. Seeded drift and sign-flip cases pass only on CPU |
 | 18, product exporter | Done early; the Granite recordings were checked in the stock Rerun viewer |
 | 19–27 | Not started |
 
@@ -312,7 +312,7 @@ The biggest risk is commercial, not technical: teams may value the tool and stil
 | ARIA or Pluto adds layer capture and detectors | The gap closes, and the hosted tier competes with W&B or Trainy | Re-check both at Gate 0 and before the release; stay tracker- and cloud-neutral; lead with MoE, attention, cross-GPU drift and `torch.compile` support |
 | Trackers add per-layer views | The wedge narrows | Stay tracker-neutral; lead with MoE, attention and torch.compile support that they lack |
 | Rerun's extension interfaces change | A custom incident view may need regular updates | Pin the Viewer and SDK, test recording read-back on upgrades, and budget maintenance if the custom view ships |
-| Hooks stall training or break `torch.compile` | Users switch the SDK off | Overhead gate under 1%; CI with compile on; zero graph breaks. Router-only capture meets the gate on Granite; full capture does not yet |
+| Hooks stall training or break `torch.compile` | Users switch the SDK off | Overhead gate under 1%; CI with compile on; zero graph breaks. Router-only capture, the default, meets the gate on the RTX PRO 6000 but not the A100; full capture (+4.15%) is opt-in for debugging |
 | Agents misread the pictures | Wrong diagnoses, lost trust | Numbers travel as JSON; key values shown as text in the summary and table views beside each chart; score on seeded failures |
 | Coding-agent clients handle tool images differently | The picture does not reach the model or the user | Test saved PNGs with the target agent clients and supply the same evidence in JSON |
 | Tensor data leaves the cluster | Enterprise deals fall through | Self-hosted ingest; an option to send statistics only |
@@ -342,7 +342,7 @@ The synthetic MoE bake-off verified recording read-back and headless rendering. 
 - [ ] Whether W&B is the next tracker target after MLflow.
 - [ ] Multi-GPU runs: which rank reports activations. Rank 0 is enough for plain data parallelism, and with pipeline or tensor parallelism every rank that owns layers reports; every rank still shares its small parameter fingerprints for the cross-GPU detector.
 - [ ] Price, after the cost per monitored run is modelled.
-- [ ] Default capture level: router-only or full capture, after Stage 3 measures full capture with the new defaults.
+- [x] Default capture level: decided Nov 13, 2026. Router-only is the always-on default for MoE models (+0.02% to +0.78% on the RTX PRO 6000; over 1% on the A100), and full capture (+4.15%) is an opt-in debugging mode, `capture="full"`. Rationale and sources in the SDK README's capture-mode decision.
 - [ ] Whether detectors stay in Python after the Rust ingest server exists.
 
 ## Sources

@@ -488,3 +488,22 @@ def test_block_statistics_match_and_compile_cleanly():
     got = sink.records[-1]["layers"]["layers.2"]
     for key, value in expected.items():
         assert got[key] == pytest.approx(value, rel=1e-5)
+
+
+def test_capture_modes(toy_moe):
+    # MoE models default to router-only capture; dense models to full capture.
+    with tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), routers={"router": 4}) as s:
+        assert (s.layer_names, s.grad_every, s.weight_every) == ([], 0, 0)
+    with tensorlens.init(_Stack(), sink=tensorlens.MemorySink()) as s:
+        assert (s.layer_names, s.grad_every, s.weight_every) == (
+            ["layers.0", "layers.1", "layers.2"], 1, 50
+        )
+    with tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), capture="full", routers={"router": 4}) as s:
+        assert s.grad_every == 1 and s.weight_every == 50 and s.layer_names
+    # Explicit settings override the mode.
+    with tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), routers={"router": 4}, grads=10) as s:
+        assert (s.layer_names, s.grad_every) == ([], 10)
+    with pytest.raises(ValueError):
+        tensorlens.init(_Stack(), sink=tensorlens.MemorySink(), capture="routers")
+    with pytest.raises(ValueError):
+        tensorlens.init(_Stack(), sink=tensorlens.MemorySink(), capture="everything")
