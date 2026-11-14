@@ -19,6 +19,8 @@ for batch in loader:
 session.close()
 ```
 
+To add TensorLens to your own training job, follow [Run TensorLens on your own job](RUN_ON_YOUR_JOB.md).
+
 Each optimizer step becomes one JSON line in `tensorlens-out/<run_id>.rank<rank>.jsonl`.
 
 There are two capture modes. `capture="routers"`, the default when `routers` are given, records only MoE router load (`moe`, `moe_stats`, `moe_top_k`) and the learning rate: this is the always-on mode. `capture="full"`, the default for models without routers, adds block activation statistics, gradient norms on every step and a weight check every 50 steps: this is the debugging mode. `layers`, `grads` and `weights` override either mode. See [Capture-mode decision](#capture-mode-decision) for the measurements behind it.
