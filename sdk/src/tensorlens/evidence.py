@@ -2,7 +2,8 @@
 
 The evidence dictionary uses the same schema as `experiments/moe-bakeoff`, so the stock
 Rerun blueprint, `verify_rerun.py` and the Rune inspector can all read it directly, while
-adding `incidents` for MoE routing imbalance, chronically starved experts, non-finite
+adding `incidents` for MoE routing imbalance, chronically starved experts, gradient
+spikes, weights left unchanged by the optimizer, repeated step numbers, non-finite
 activations/gradients and cross-GPU parameter drift.
 """
 
@@ -24,6 +25,22 @@ STARVE_RATIO = 0.1
 # Skip the check until an even share would have received this many assignments in the
 # window, so that small routers and short runs are not judged on noise.
 STARVE_MIN_EXPECTED = 100
+# Top-k routers (k >= 3): no expert can take more than 1/k of the assignments, and in
+# trained models some experts are picked by nearly every token, while with small batches
+# single experts often jump to most tokens for one step. So a fixed share threshold either
+# never fires or fires on healthy layers. Instead the router's diversity must fall below
+# DIVERSITY_DROP times its median over the previous STARVE_WINDOW samples; the overloaded
+# experts are then those whose fraction of tokens rose by at least OVERLOAD_JUMP over
+# their average in that window. On a healthy Granite run the lowest diversity ratio seen
+# was 0.82; the seeded collapse fell to 0.29.
+DIVERSITY_DROP = 0.6
+OVERLOAD_JUMP = 0.25
+OVERLOAD_MIN_HISTORY = 10
+# A gradient-norm spike is a step whose total norm is at least SPIKE_FACTOR times the
+# median of the previous SPIKE_WINDOW recorded steps (once SPIKE_MIN_HISTORY are known).
+SPIKE_FACTOR = 5.0
+SPIKE_WINDOW = 50
+SPIKE_MIN_HISTORY = 10
 MISSING_COLOR = (48, 54, 64)
 DEAD_COLOR = (236, 84, 99)
 OVERLOADED_COLOR = (255, 190, 94)
@@ -134,6 +151,190 @@ def detect_starved_experts(samples: list[dict[str, Any]]) -> dict[str, Any] | No
     return {"kind": "starved_experts", "step": min(e["step"] for e in experts), "experts": experts}
 
 
+def _router_top_k(
+    records: list[dict[str, Any]], routers: list[str], override: int | Mapping[str, int] | None
+) -> dict[str, int]:
+    found: dict[str, int] = {}
+    for record in records:
+        for name, k in record.get("moe_top_k", {}).items():
+            found[name] = int(k)
+    if isinstance(override, int):
+        found = {name: override for name in routers}
+    elif override is not None:
+        found.update({name: int(k) for name, k in override.items()})
+    return {name: found.get(name, 1) for name in routers}
+
+
+def _jump_overloaded(
+    counts: list[int], k: int, diversity: float, window: list[tuple[list[int], int, float]]
+) -> list[int]:
+    """In a router whose diversity just dropped, the experts that took the extra tokens."""
+    if len(window) < OVERLOAD_MIN_HISTORY:
+        return []
+    if diversity >= DIVERSITY_DROP * _median([d for _, _, d in window]):
+        return []
+    tokens = sum(counts) / k
+    base_tokens = sum(total for _, total, _ in window) / k
+    if tokens <= 0 or base_tokens <= 0:
+        return []
+    overloaded = []
+    for expert, count in enumerate(counts, 1):
+        base = sum(c[expert - 1] for c, _, _ in window if expert - 1 < len(c)) / base_tokens
+        if count / tokens - base >= OVERLOAD_JUMP:
+            overloaded.append(expert)
+    return overloaded
+
+
+def _finite(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else None
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def detect_grad_spikes(
+    records: list[dict[str, Any]],
+    *,
+    factor: float = SPIKE_FACTOR,
+    window: int = SPIKE_WINDOW,
+    min_history: int = SPIKE_MIN_HISTORY,
+) -> dict[str, Any] | None:
+    """Return the first gradient-norm spike and the parameters that spiked most, or None.
+
+    Each parameter's norm is compared with its own median over the same window, so the
+    report names where the spike is, not only that the total jumped. `rising_since` is
+    the first step in the window at which that parameter was already above half the
+    spike factor, which points at where a spike started when it builds over several steps.
+    """
+    totals: list[float] = []
+    per_param: dict[str, list[tuple[int, float]]] = {}
+    spikes: list[dict[str, Any]] = []
+    for record in sorted(records, key=lambda r: r["step"]):
+        total = _finite(record.get("grad_norm"))
+        if total is None:
+            continue
+        step = int(record["step"])
+        if len(totals) >= min_history:
+            baseline = _median(totals[-window:])
+            if baseline > 0 and total >= factor * baseline:
+                spikes.append(
+                    {
+                        "step": step,
+                        "grad_norm": total,
+                        "baseline": baseline,
+                        "ratio": total / baseline,
+                        "parameters": _spiking_parameters(record, per_param, factor, window),
+                    }
+                )
+        totals.append(total)
+        for name, value in record.get("grad_norms", {}).items():
+            norm = _finite(value)
+            if norm is not None:
+                per_param.setdefault(name, []).append((step, norm))
+    if not spikes:
+        return None
+    first = spikes[0]
+    return {
+        "kind": "grad_spike",
+        **first,
+        "spike_count": len(spikes),
+        "spike_steps": [spike["step"] for spike in spikes[:20]],
+    }
+
+
+def _spiking_parameters(
+    record: dict[str, Any],
+    per_param: dict[str, list[tuple[int, float]]],
+    factor: float,
+    window: int,
+) -> list[dict[str, Any]]:
+    found = []
+    for name, value in record.get("grad_norms", {}).items():
+        norm = _finite(value)
+        past = per_param.get(name, [])[-window:]
+        if norm is None or len(past) < 2:
+            continue
+        baseline = _median([v for _, v in past])
+        if baseline <= 0 or norm < factor * baseline:
+            continue
+        rising = int(record["step"])
+        for past_step, past_norm in reversed(past):
+            if past_norm >= 0.5 * factor * baseline:
+                rising = past_step
+            else:
+                break
+        found.append(
+            {"name": name, "grad_norm": norm, "baseline": baseline,
+             "ratio": norm / baseline, "rising_since": rising}
+        )
+    found.sort(key=lambda p: (p["rising_since"], -p["ratio"]))
+    return found[:10]
+
+
+def detect_stalled_weights(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the first step where parameters with a non-zero gradient did not change.
+
+    Uses the weight norms recorded after each optimizer step: if a parameter's norm is
+    exactly the same as at its previous record while its gradient was finite and non-zero,
+    the optimizer did not update it. Steps with a non-finite gradient are skipped, because
+    mixed-precision loss scaling skips those optimizer steps on purpose.
+    """
+    previous: dict[str, float] = {}
+    first: dict[str, Any] | None = None
+    stalled_steps = 0
+    for record in sorted(records, key=lambda r: r["step"]):
+        weights = record.get("weight_norms")
+        if not weights:
+            continue
+        grads = record.get("grad_norms", {})
+        skip = _finite(record.get("grad_norm")) is None and record.get("grad_norm") is not None
+        stalled = []
+        for name, value in weights.items():
+            norm = _finite(value)
+            grad = _finite(grads.get(name))
+            if (
+                not skip
+                and norm is not None
+                and name in previous
+                and grad is not None
+                and grad > 0
+                and norm == previous[name]
+            ):
+                stalled.append(name)
+            if norm is not None:
+                previous[name] = norm
+        if stalled:
+            stalled_steps += 1
+            if first is None:
+                with_grads = sum(1 for v in grads.values() if (_finite(v) or 0) > 0)
+                first = {
+                    "kind": "stalled_weights",
+                    "step": int(record["step"]),
+                    "parameters": stalled[:20],
+                    "stalled": len(stalled),
+                    "with_gradients": with_grads,
+                }
+    if first is not None:
+        first["stalled_steps"] = stalled_steps
+    return first
+
+
+def detect_repeated_steps(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return step numbers recorded more than once, as after a resume without `start_step`."""
+    seen: dict[tuple[Any, int], int] = {}
+    for record in records:
+        key = (record.get("rank"), int(record["step"]))
+        seen[key] = seen.get(key, 0) + 1
+    repeated = sorted(step for (_, step), n in seen.items() if n > 1)
+    if not repeated:
+        return None
+    return {"kind": "repeated_steps", "step": repeated[0], "repeated": len(repeated),
+            "steps": repeated[:20]}
+
+
 def load_records(source: str | Path | Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Read captured step records from a `.jsonl` file path or an iterable of dicts."""
     if isinstance(source, (str, Path)):
@@ -216,12 +417,19 @@ def build_evidence(
     drift_tolerance: float = DRIFT_TOLERANCE,
     starve_window: int = STARVE_WINDOW,
     starve_ratio: float = STARVE_RATIO,
+    top_k: int | Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
-    """Build viewer-neutral detector evidence from captured step records."""
+    """Build viewer-neutral detector evidence from captured step records.
+
+    `top_k` overrides the experts-per-token recorded as `moe_top_k`, for captures made
+    before it was recorded: one value for every router, or a value per router name.
+    """
     records = load_records(source)
     router_sizes = _router_sizes(records)
     routers = list(router_sizes)
     expert_count = max(router_sizes.values(), default=0)
+    router_top_k = _router_top_k(records, routers, top_k)
+    history: dict[str, list[tuple[list[int], int, float]]] = {name: [] for name in routers}
 
     samples: list[dict[str, Any]] = []
     for record in sorted(records, key=lambda r: r["step"]):
@@ -249,8 +457,16 @@ def build_evidence(
                     if router_name in moe_stats and "diversity" in moe_stats[router_name]
                     else _diversity_from_counts(counts, n_experts)
                 )
-                threshold = effective_overload_threshold(n_experts, tokens, overload_threshold)
-                overloaded = [i for i, share in enumerate(shares, 1) if share > threshold]
+                k = router_top_k.get(router_name, 1)
+                if k >= 3:
+                    overloaded = _jump_overloaded(counts, k, diversity, history[router_name])
+                    rule: dict[str, Any] = {
+                        "rule": "diversity_drop", "drop": DIVERSITY_DROP, "jump": OVERLOAD_JUMP
+                    }
+                else:
+                    threshold = effective_overload_threshold(n_experts, tokens, overload_threshold)
+                    overloaded = [i for i, share in enumerate(shares, 1) if share > threshold]
+                    rule = {"rule": "share", "threshold": threshold}
                 zero_experts = [i for i, c in enumerate(counts, 1) if c == 0]
                 dead = (
                     zero_experts
@@ -266,6 +482,11 @@ def build_evidence(
                     overloaded = [
                         i for i, share in enumerate(shares, 1) if share > collapse_threshold
                     ]
+                    rule = {"rule": "collapse", "threshold": collapse_threshold}
+                window = history[router_name]
+                window.append((counts, tokens, diversity))
+                if len(window) > starve_window:
+                    window.pop(0)
             sample: dict[str, Any] = {
                 "step": step,
                 "layer": layer_idx,
@@ -278,6 +499,8 @@ def build_evidence(
             }
             if missing:
                 sample["missing"] = True
+            else:
+                sample["overload_rule"] = rule
             samples.append(sample)
 
     incidents: list[dict[str, Any]] = []
@@ -298,6 +521,10 @@ def build_evidence(
     starved_hit = detect_starved_experts(samples)
     if starved_hit is not None:
         incidents.append(starved_hit)
+    for detector in (detect_grad_spikes, detect_stalled_weights, detect_repeated_steps):
+        hit = detector(records)
+        if hit is not None:
+            incidents.append(hit)
     non_finite_hit = detect_non_finite(records)
     if non_finite_hit is not None:
         incidents.append(non_finite_hit)
@@ -313,6 +540,7 @@ def build_evidence(
         "expert_count": expert_count,
         "router_names": routers,
         "overload_threshold": overload_threshold,
+        "top_k": router_top_k,
         "starve_window": starve_window,
         "starve_ratio": starve_ratio,
         "incidents": incidents,
@@ -441,36 +669,81 @@ def _legend(evidence: Mapping[str, Any]) -> str:
     )
 
 
+def _describe(incident: Mapping[str, Any]) -> str | None:
+    kind = incident["kind"]
+    if kind == "grad_spike":
+        where = ""
+        if incident["parameters"]:
+            top = incident["parameters"][0]
+            where = (
+                f", first in {top['name']} ({top['ratio']:.0f}× its median"
+                + (f", rising since step {top['rising_since']}" if top["rising_since"] != incident["step"] else "")
+                + ")"
+            )
+        more = incident["spike_count"] - 1
+        return (
+            f"Gradient spike at step {incident['step']}: norm {incident['grad_norm']:.3g},"
+            f" {incident['ratio']:.0f}× the median of recent steps{where}"
+            + (f"; {more} more spike{'s' if more > 1 else ''}" if more > 0 else "")
+        )
+    if kind == "stalled_weights":
+        names = ", ".join(incident["parameters"][:3])
+        extra = incident["stalled"] - min(3, incident["stalled"])
+        return (
+            f"Weights not updating from step {incident['step']}: {incident['stalled']} of"
+            f" {incident['with_gradients']} parameters with gradients were unchanged by the"
+            f" optimizer step ({names}{f', and {extra} more' if extra > 0 else ''});"
+            f" {incident['stalled_steps']} step{'s' if incident['stalled_steps'] != 1 else ''} affected"
+        )
+    if kind == "repeated_steps":
+        return (
+            f"Repeated step numbers from step {incident['step']}: {incident['repeated']} steps"
+            " recorded more than once; pass start_step= to tensorlens.init when resuming"
+        )
+    if kind == "non_finite":
+        parts = [*incident.get("layers", ()), *incident.get("gradients", ())]
+        return f"NaN or Inf at step {incident['step']} in {', '.join(parts[:5])}"
+    if kind == "replica_drift":
+        return (
+            f"Replicas diverged at step {incident['step']} in"
+            f" {len(incident['parameters'])} parameters (tolerance {incident['tolerance']:g})"
+        )
+    return None
+
+
 def incident_summary(evidence: Mapping[str, Any]) -> str:
     """Human- and agent-readable summary matching the bake-off's text document format."""
-    summary = _incident_summary(evidence)
+    lines: list[str] = []
+    moe = first_incident(evidence)
+    if moe is not None:
+        lines += _moe_lines(evidence, moe)
     starved = _starved_line(evidence)
-    return summary if starved is None else summary.replace("\nHeatmap:", f"\n{starved}\nHeatmap:", 1)
+    if starved is not None:
+        lines.append(starved)
+    for incident in evidence.get("incidents", ()):
+        if incident["kind"] not in ("moe_imbalance", "starved_experts"):
+            text = _describe(incident)
+            lines.append(text or f"Incident at step {incident['step']}: {incident['kind']}")
+    if not lines:
+        return "No routing or numerical incidents detected."
+    if evidence.get("layer_count"):
+        lines.append(_legend(evidence))
+    return "\n".join(lines)
 
 
-def _incident_summary(evidence: Mapping[str, Any]) -> str:
-    incident = first_incident(evidence)
-    if incident is not None:
-        tokens = incident["routed_tokens"] or 1
-        overloaded = ", ".join(
-            f"Expert {expert} ({_percent(incident['counts'][expert - 1] / tokens)})"
-            for expert in incident["overloaded"]
-        )
-        dead = ", ".join(f"{expert:02}" for expert in incident["dead"])
-        diversity = float(incident.get("diversity") or 0.0)
-        return (
-            f"First sampled bad step {incident['step']}  ·  Layer {incident['layer']:02}"
-            f"  ·  Diversity {diversity:.2f}\n"
-            f"Overloaded: {overloaded or 'none'}  ·  Dead experts: {dead or 'none'}\n"
-            + _legend(evidence)
-        )
-    other = [i for i in evidence.get("incidents", ()) if i["kind"] != "starved_experts"]
-    if other:
-        first = other[0]
-        return f"Incident at step {first['step']}: {first['kind']}\n{_legend(evidence)}"
-    if _starved_line(evidence) is not None:
-        return f"No routing collapse or numerical incidents detected.\n{_legend(evidence)}"
-    return "No routing or numerical incidents detected."
+def _moe_lines(evidence: Mapping[str, Any], incident: Mapping[str, Any]) -> list[str]:
+    tokens = incident["routed_tokens"] or 1
+    overloaded = ", ".join(
+        f"Expert {expert} ({_percent(incident['counts'][expert - 1] / tokens)})"
+        for expert in incident["overloaded"]
+    )
+    dead = ", ".join(f"{expert:02}" for expert in incident["dead"])
+    diversity = float(incident.get("diversity") or 0.0)
+    return [
+        f"First sampled bad step {incident['step']}  ·  Layer {incident['layer']:02}"
+        f"  ·  Diversity {diversity:.2f}",
+        f"Overloaded: {overloaded or 'none'}  ·  Dead experts: {dead or 'none'}",
+    ]
 
 
 def routing_colors(sample: Mapping[str, Any], expert_count: int | None = None):
@@ -627,6 +900,11 @@ def export_rerun(
             grad_norm = record.get("grad_norm")
             if isinstance(grad_norm, (int, float)) and math.isfinite(grad_norm):
                 rr.log("/training/grad_norm", rr.Scalars(float(grad_norm)))
+            weights = [v for v in record.get("weight_norms", {}).values() if _finite(v) is not None]
+            if weights:
+                rr.log("/training/weight_norm", rr.Scalars(math.sqrt(sum(v * v for v in weights))))
+            if record.get("lr"):
+                rr.log("/training/lr", rr.Scalars(float(record["lr"][0])))
             for layer_name, stats in record.get("layers", {}).items():
                 for key, val in stats.items():
                     if isinstance(val, (int, float)) and math.isfinite(val):
@@ -652,10 +930,17 @@ def main() -> None:
         default=OVERLOAD_THRESHOLD,
         help="expert share threshold for overload detection (default: 0.35)",
     )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        help="experts chosen per token, for captures made before moe_top_k was recorded",
+    )
     args = parser.parse_args()
 
     records = load_records(args.input)
-    evidence = build_evidence(records, overload_threshold=args.overload_threshold)
+    evidence = build_evidence(
+        records, overload_threshold=args.overload_threshold, top_k=args.top_k
+    )
     out_json = args.output or args.input.with_suffix(".evidence.json")
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(evidence, separators=(",", ":")) + "\n", encoding="utf-8")

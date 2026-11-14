@@ -22,7 +22,9 @@ Each optimizer step becomes one JSON line in `tensorlens-out/<run_id>.rank<rank>
 
 - **`layers`**: mean, standard deviation, absolute maximum and zero fraction of each watched layer's output.
 - **`grad_norms`** and **`grad_norm`**: the L2 norm of each parameter's gradient and their total.
-- **`moe`** and **`moe_stats`**: tokens routed to each expert, plus router entropy, diversity (`exp(H)/N`), and dead-expert count/fraction, for every router you name (works whether the router outputs integer indices or floating-point logits with `Router(n_experts, top_k=...)`).
+- **`weight_norms`**: the L2 norm of each parameter after the optimizer step, on the steps that record gradient norms (`weights=False` turns it off).
+- **`lr`**: each parameter group's learning rate after the step.
+- **`moe`**, **`moe_stats`** and **`moe_top_k`**: tokens routed to each expert, plus router entropy, diversity (`exp(H)/N`), and dead-expert count/fraction, for every router you name (works whether the router outputs integer indices or floating-point logits with `Router(n_experts, top_k=...)`). Set `top_k` for top-k routers; the detectors need it.
 
 ## What is built
 
@@ -34,7 +36,7 @@ Each optimizer step becomes one JSON line in `tensorlens-out/<run_id>.rank<rank>
 | Gradient norms grouped by device and dtype (`torch._foreach_norm`, with `DTensor.to_local()` and fallback) | Built, tested |
 | MoE expert load (`scatter_add_`) and router entropy / diversity (`moe_stats`) | Built, tested |
 | Cross-GPU parameter fingerprints and replica spread (`parameter_fingerprints`, `replica_spread`) | Built, unit-tested on drift and sign-flip cases |
-| Detectors and Rerun exporter (`build_evidence`, `export_rerun`, `python -m tensorlens`) | Built, tested on MoE collapse, starved experts, NaN/Inf, and replica drift |
+| Detectors and Rerun exporter (`build_evidence`, `export_rerun`, `python -m tensorlens`) | Built, tested on MoE collapse (top-k aware), starved experts, gradient spikes, weights not updating, repeated steps, NaN/Inf, and replica drift |
 | Run ID from `run_id=`, `MLFLOW_RUN_ID`, the active MLflow run or the active W&B run | Built, tested with stand-in tracker modules |
 | No graph breaks and no recompiles under `torch.compile` | Tested with `eager`, `aot_eager`, and AOTAutograd static-input checks on CPU; on CUDA with Inductor and CUDA graphs on a toy MoE, and with Inductor and CUDA graphs off on Granite |
 
@@ -44,7 +46,7 @@ Each optimizer step becomes one JSON line in `tensorlens-out/<run_id>.rank<rank>
 - **The probe pass** for histograms and attention (Tier 2) and replay (Tier 3).
 - **Multi-rank reporting.** Every rank writes its own file.
 - **A PyTorch Lightning callback.** Until then, pass `run_id=` yourself when the run was created through `MlflowClient`.
-- **Top-k aware overload detection.** An expert counts as overloaded above 35% of assignments, which a top-k router cannot reach when k > 2 (at most 12.5% for Granite's top-8). A lower threshold applies only once dead experts are flagged, so a router that sends every token to the same expert without leaving any expert dead is not reported. The evidence file also still states `overload_threshold: 0.35` when that lower threshold was used.
+- **Detector thresholds are untuned.** The gradient-spike factor (5× the median of the last 50 recorded steps), the top-k diversity drop (0.6 of its recent median), the starved-expert ratio and the stalled-weight check have been checked on synthetic cases and, for the MoE rules, on one Granite capture. Weight norms, learning rates and the spike and stalled-weight detectors have not run on a GPU.
 - **CUDA graphs on Granite.** Its `grouped_mm` expert path fails during CUDA-graph recording on PyTorch 2.14.1+cu130, so `mode="reduce-overhead"` is verified only on the toy model.
 
 ## Granite MoE GPU benchmark
@@ -82,6 +84,16 @@ That export showed 1,303 zero-token cells across 650 steps, mostly from a few ex
 
 On the Granite capture it flags 20 experts in 15 layers, from 0.018% to 0.312% of assignments; 14 are flagged at step 49, the first full window. The 10% ratio is a starting point: about a third of those sit just under it, so a lower ratio would list only the most extreme few. The collapse result is unchanged.
 
+## Detectors added for the failure list
+
+From the [failure list](../TensorLens%20failure%20list.md), entries 3–6 and 12:
+
+- **Top-k overload.** For routers with `top_k` of 3 or more, the 35% share threshold cannot fire (no expert can exceed 1/k), and a fixed lower threshold does not work either: on the healthy Granite capture some experts are picked by 85–100% of tokens in layers 2, 3, 6, 9 and 14, and with two documents per batch single experts often jump to over half the tokens for one step. A rule based on jumps in each expert's own share flagged 656 healthy samples. The rule used instead requires the router's diversity to fall below 0.6 of its median over the previous 50 samples (healthy Granite never went below 0.82; the seeded collapse fell to 0.29), and then flags the experts whose fraction of tokens rose by at least 25 points. On the Granite capture with `--top-k 8` it flags only layer 12 from step 450. Each sample records the rule and threshold it used. Use `python -m tensorlens --top-k 8` for captures made before `moe_top_k` was recorded.
+- **Weights not updating.** `weight_norms` are compared with the previous record. A parameter with a finite non-zero gradient whose norm did not change at all was not updated by the optimizer, for example because it was left out of the optimizer. Steps with a non-finite gradient norm are skipped, since mixed-precision loss scaling skips those on purpose. One read of the weights per recorded step, no copy.
+- **Gradient spikes.** A step whose total gradient norm is at least 5× the median of the previous 50 recorded steps. The report ranks parameters by their own spike and names the one that started rising first.
+- **Repeated steps.** Step numbers written twice by the same rank, as after a resume without `start_step`.
+- **Learning rate** is recorded per step and logged to the Rerun recording with the total weight norm.
+
 ## Two-GPU replica drift validation
 
 **Pending.** The two-process CPU/Gloo check passed. The Colab runtime exposed one NVIDIA RTX PRO 6000, so the CUDA/NCCL check was skipped.
@@ -100,7 +112,8 @@ Mark this complete when both NCCL ranks report `PASS`. Each rank checks healthy 
 
 ## Things to know
 
-- **Mixed precision.** `torch.amp.GradScaler` skips `optimizer.step()` when gradients overflow, so the automatic step count misses those steps. Pass `auto_step=False` and call `session.step()` once per iteration.
+- **Mixed precision.** `torch.amp.GradScaler` skips `optimizer.step()` when gradients overflow, so the automatic step count misses those steps. Pass `auto_step=False` and call `session.step(lr=...)` once per iteration.
+- **Resuming.** Pass `start_step=` the step you resume from. Otherwise step numbers start at 0 again, and the evidence reports them as repeated steps.
 - **Clipping.** Gradient norms are read just before `optimizer.step()`, which is after clipping. Call `session.record_grads()` before you clip to record the unclipped norms.
 - **Gradient accumulation.** A hook runs on every forward pass; the record keeps the last one before the optimizer step.
 - **Non-finite values** are written as the strings `"nan"`, `"inf"` and `"-inf"`, so the file stays standard JSON.

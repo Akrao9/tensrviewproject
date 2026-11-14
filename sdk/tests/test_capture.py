@@ -303,11 +303,13 @@ def test_gradient_gating_and_router_only_capture(toy_moe, monkeypatch):
 
     monkeypatch.setattr(cap, "_foreach_norm", spy_foreach_norm)
 
-    # grads=3 gates gradient norm computation before running _foreach_norm
+    # grads=3 gates gradient norm computation before running _foreach_norm: one call for
+    # the gradients and one for the weights on each of the two recorded steps
     sink = tensorlens.MemorySink()
     with tensorlens.init(toy_moe, sink=sink, every=2, grads=3, routers={"router": 4}):
         train(toy_moe, 6)
-    assert norm_calls == 2
+    assert norm_calls == 4
+    assert ["weight_norms" in r for r in sink.records] == [False, False, True, False, False, True]
     assert [r["grad_norm"] is not None for r in sink.records] == [
         False,
         False,
@@ -375,3 +377,36 @@ def test_manual_gradient_capture_preserves_automatic_cadence():
             session.step()
 
     assert [record["grad_norm"] for record in sink.records] == [1.0, None, 1.0, None]
+
+
+def test_weight_norms_learning_rate_start_step_and_top_k(toy_moe):
+    sink = tensorlens.MemorySink()
+    opt = torch.optim.SGD(toy_moe.parameters(), lr=0.1)
+    sched = torch.optim.lr_scheduler.StepLR(opt, step_size=1, gamma=0.5)
+    session = tensorlens.init(
+        toy_moe, sink=sink, every=2, start_step=100,
+        routers={"router": tensorlens.Router(4, top_k=1)},
+    )
+    for _ in range(3):
+        opt.zero_grad()
+        toy_moe(torch.randn(16, 8)).sum().backward()
+        opt.step()
+        sched.step()
+    session.close()
+
+    assert [r["step"] for r in sink.records] == [100, 101, 102]
+    assert [r["lr"] for r in sink.records] == [[0.1], [0.05], [0.025]]
+    assert all(r["moe_top_k"] == {"router": 1} for r in sink.records)
+    last = sink.records[-1]["weight_norms"]
+    for name, param in toy_moe.named_parameters():
+        assert last[name] == pytest.approx(param.detach().norm().item(), rel=1e-5)
+
+
+def test_weights_false_and_manual_step_learning_rate(toy_moe):
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(toy_moe, sink=sink, every=1, weights=False, auto_step=False)
+    toy_moe(torch.randn(16, 8)).sum().backward()
+    session.step(lr=3e-4)
+    session.close()
+    assert "weight_norms" not in sink.records[0]
+    assert sink.records[0]["lr"] == [3e-4]

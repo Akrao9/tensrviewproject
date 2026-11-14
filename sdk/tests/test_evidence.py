@@ -359,3 +359,110 @@ def test_small_routers_and_short_runs_are_not_judged_on_noise():
     ]
     ev = tensorlens.build_evidence(records)
     assert all(i["kind"] != "starved_experts" for i in ev["incidents"])
+
+
+def _topk_records(steps=40, shift_at=30):
+    # 32 experts, top-8, 1024 tokens (8192 assignments) per step. Expert 1 is picked by
+    # every token throughout, as some Granite experts are, and expert 20 jumps to 90% of
+    # tokens for single steps, as small batches make some experts do. At `shift_at`,
+    # experts 9-15 take nearly every token while every other expert keeps a few.
+    records = []
+    for step in range(steps):
+        counts = [1024] + [231] * 31
+        if step % 7 == 3:
+            counts[19] = 922
+        if step >= shift_at:
+            counts = [1024] + [8] * 31
+            for e in range(9, 16):
+                counts[e - 1] = 1000
+        counts[1] += 8192 - sum(counts)
+        records.append({"run_id": "topk", "step": step, "moe": {"r": counts}, "moe_top_k": {"r": 8}})
+    return records
+
+
+def test_top_k_jump_flags_concentration_without_dead_experts():
+    evidence = tensorlens.build_evidence(_topk_records())
+    assert evidence["top_k"] == {"r": 8}
+    hit = tensorlens.first_incident(evidence)
+    assert (hit["step"], hit["overloaded"], hit["dead"]) == (30, list(range(9, 16)), [])
+    assert hit["overload_rule"]["rule"] == "diversity_drop"
+    # The always-on expert 1 and the one-step jumps of expert 20 are never flagged.
+    assert all(not {1, 20} & set(s["overloaded"]) for s in evidence["samples"])
+
+    # Without k the old share threshold (unreachable at 12.5%) misses it.
+    assert tensorlens.first_incident(tensorlens.build_evidence(_topk_records(), top_k=1)) is None
+
+
+def _grad_records(norms):
+    return [
+        {"run_id": "g", "step": step, "grad_norm": (a * a + b * b) ** 0.5,
+         "grad_norms": {"a": a, "b": b}}
+        for step, (a, b) in enumerate(norms)
+    ]
+
+
+def test_grad_spike_names_the_parameter_where_it_started():
+    norms = [(1.0, 0.1 + 0.01 * (s % 3)) for s in range(30)] + [(1.0, 4.0), (1.2, 30.0), (1.0, 0.1)]
+    evidence = tensorlens.build_evidence(_grad_records(norms))
+    hit = next(i for i in evidence["incidents"] if i["kind"] == "grad_spike")
+    assert hit["step"] == 31 and hit["spike_count"] == 1
+    top = hit["parameters"][0]
+    assert top["name"] == "b" and top["rising_since"] == 30
+    assert "Gradient spike at step 31" in tensorlens.incident_summary(evidence)
+    assert "first in b" in tensorlens.incident_summary(evidence)
+
+    quiet = [(1.0 + 0.05 * (s % 4), 0.5) for s in range(60)]
+    assert tensorlens.detect_grad_spikes(_grad_records(quiet)) is None
+
+
+def test_stalled_weights_detector_and_skipped_steps():
+    records = []
+    for step in range(6):
+        records.append({
+            "run_id": "w", "step": step, "grad_norm": 1.0,
+            "grad_norms": {"moving": 1.0, "frozen": 0.5, "no_grad": 0.0},
+            "weight_norms": {"moving": 10.0 + step, "frozen": 3.0, "no_grad": 2.0},
+        })
+    records[3]["grad_norm"] = "inf"  # a skipped mixed-precision step is not a stall
+    hit = tensorlens.detect_stalled_weights(records)
+    assert hit["step"] == 1 and hit["parameters"] == ["frozen"]
+    assert hit["stalled"] == 1 and hit["with_gradients"] == 2 and hit["stalled_steps"] == 4
+
+
+def test_parameter_left_out_of_the_optimizer_is_reported(toy_moe):
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(toy_moe, sink=sink, every=2, routers={"router": 4})
+    opt = torch.optim.SGD(
+        [p for n, p in toy_moe.named_parameters() if not n.startswith("out.")], lr=0.1
+    )
+    for _ in range(3):
+        opt.zero_grad()
+        toy_moe(torch.randn(16, 8)).sum().backward()
+        opt.step()
+    session.close()
+    hit = tensorlens.detect_stalled_weights(sink.records)
+    assert hit is not None and hit["step"] == 1
+    assert sorted(hit["parameters"]) == ["out.bias", "out.weight"]
+
+
+def test_repeated_steps_after_resume_and_start_step(toy_moe):
+    def run(sink, **kwargs):
+        session = tensorlens.init(toy_moe, sink=sink, every=1, routers={"router": 4}, **kwargs)
+        opt = torch.optim.SGD(toy_moe.parameters(), lr=0.01)
+        for _ in range(3):
+            opt.zero_grad()
+            toy_moe(torch.randn(16, 8)).sum().backward()
+            opt.step()
+        session.close()
+
+    sink = tensorlens.MemorySink()
+    run(sink)
+    run(sink)  # resumed without start_step
+    hit = tensorlens.detect_repeated_steps(sink.records)
+    assert hit["steps"] == [0, 1, 2]
+    assert "pass start_step=" in tensorlens.incident_summary(tensorlens.build_evidence(sink.records))
+
+    sink = tensorlens.MemorySink()
+    run(sink)
+    run(sink, start_step=3)
+    assert tensorlens.detect_repeated_steps(sink.records) is None

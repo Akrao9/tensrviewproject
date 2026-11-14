@@ -54,7 +54,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Expert counts per router per step, which TensorLens already records.
 
-**TensorLens today.** Detected. A collapse seeded in Granite layer 12 was found at the right step, layer and experts. Experts starved over a 50-step window are also flagged: on Granite, 20 experts that came starved from pretraining, which per-step checks never report. Gap: the 35% overload threshold cannot be reached by a top-k router with k above 2, so a router stuck on the same experts with none fully dead is not reported.
+**TensorLens today.** Detected. A collapse seeded in Granite layer 12 was found at the right step, layer and experts. Experts starved over a 50-step window are also flagged: on Granite, 20 experts that came starved from pretraining, which per-step checks never report. Gap: the 35% overload threshold cannot be reached by a top-k router with k above 2, which was the gap until the top-k rule: for routers with k of 3 or more, a drop in the router's diversity below 0.6 of its recent median now flags the experts that took the extra tokens, without needing dead experts. On the healthy Granite capture it raises no false alarms.
 
 ### 4. Weights not updating at all
 
@@ -64,7 +64,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** The size of each parameter's update per step, or its ratio to the weight's size.
 
-**TensorLens today.** Not captured. TensorLens records gradient norms, which look normal in this failure. Recording the update norm in the existing optimizer post-hook would catch it cheaply.
+**TensorLens today.** Detected. Each parameter's norm after the optimizer step is recorded, and a parameter with a non-zero gradient whose norm did not change is reported, with the first step and the parameters. Tested on a toy model with two parameters left out of the optimizer; not yet run on a GPU.
 
 ### 5. Loss spikes from gradient outliers
 
@@ -74,7 +74,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Per-parameter gradient norms, to show which layer the spike started in, and update norms.
 
-**TensorLens today.** Per-parameter gradient norms are captured, but there is no spike detector and no view that points at the first layer to spike.
+**TensorLens today.** Detected. A step at 5× the median of the last 50 recorded steps is a spike; the report ranks parameters by their own spike and names the one that started rising first. Tested on synthetic records only; the factor is untuned.
 
 ### 6. Bad state after resuming from a checkpoint
 
@@ -84,7 +84,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Learning rate, global step and data position recorded per step, and a check that they continue across a restart.
 
-**TensorLens today.** Not captured, and TensorLens has its own version of this bug: its automatic step counter starts at 0 in every session, so a resumed run writes step numbers that repeat earlier ones. `init` needs a starting step, or the step should come from the trainer.
+**TensorLens today.** Partly. `init(start_step=...)` continues the step numbers on resume, repeated step numbers are reported, and each step's learning rate is recorded. A check that the learning rate continues smoothly across a restart is not built.
 
 ### 7. Attention logit growth and entropy collapse
 
@@ -134,7 +134,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Per-parameter weight norms, which the optimizer hooks already have access to.
 
-**TensorLens today.** Not captured. Cheap to add with the update norm from entry 4.
+**TensorLens today.** Recorded: weight norms per parameter after each recorded step, and the total in the Rerun recording. No detector for slow norm drift yet.
 
 ### 13. Silent compiler or framework bugs
 

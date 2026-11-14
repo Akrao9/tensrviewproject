@@ -64,7 +64,7 @@ def build_pair():
         for _ in range(2)
     ]
     routers = {
-        name: tensorlens.Router(module.num_experts, indices=lambda out: out[2])
+        name: tensorlens.Router(module.num_experts, top_k=module.top_k, indices=lambda out: out[2])
         for name, module in models[1].named_modules()
         if isinstance(module, GraniteMoeTopKRouter)
     }

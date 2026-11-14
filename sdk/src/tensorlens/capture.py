@@ -1,4 +1,5 @@
-"""Tier 0 and Tier 1 capture: per-layer activation statistics, gradient norms and MoE load.
+"""Tier 0 and Tier 1 capture: per-layer activation statistics, gradient and weight norms,
+learning rates and MoE load.
 
 Rules this module follows (see the Capture SDK section of the v3 plan):
 
@@ -49,6 +50,9 @@ class Router:
     n_experts: int
     top_k: int = 1
     indices: Callable[[Any], torch.Tensor] | None = None
+    # `top_k` is also written into every record as `moe_top_k`, because the detectors
+    # need it to judge expert shares: in a top-8 router no expert can exceed 1/8 of the
+    # assignments. Set it when `indices` returns top-k indices.
 
 
 def _first_tensor(output: Any, *, integer: bool) -> torch.Tensor | None:
@@ -171,8 +175,10 @@ class Session:
         layers: LayerFilter | Sequence[str] | None,
         routers: Mapping[str, Router | int] | None,
         grads: bool | int = True,
+        weights: bool = True,
         auto_step: bool,
         replica_group: Any = None,
+        start_step: int = 0,
     ) -> None:
         if hasattr(model, "_orig_mod"):
             raise ValueError("call tensorlens.init(model) before torch.compile(model)")
@@ -187,6 +193,7 @@ class Session:
         self.run = run
         self.every = every
         self.grad_every = grad_every
+        self.weights = weights
         self.auto_step = auto_step
         self._sink = sink
         self._replica_group = replica_group
@@ -212,7 +219,7 @@ class Session:
         f32 = {"dtype": torch.float32, "device": self.device}
         self._act = torch.zeros(n_layers, _SEEN + 1, **f32)
         self._stat_idx = torch.arange(_SEEN + 1, dtype=torch.int64, device=self.device)
-        self._grad = torch.zeros(n_params, 2, **f32)  # norm, seen
+        self._grad = torch.zeros(n_params, 3, **f32)  # gradient norm, seen, weight norm
         self._spread: torch.Tensor | None = None
         self._counts = {
             name: torch.zeros(spec.n_experts, dtype=torch.int64, device=self.device)
@@ -251,7 +258,9 @@ class Session:
         ]
 
         self._steps: list[int] = []
-        self._next_step = 0
+        self._ring_lr: list[list[float] | None] = []
+        self._pending_lr: list[float] | None = None
+        self._next_step = start_step
         self._steps_committed = 0
         self._grads_recorded = False
         self._spread_recorded = False
@@ -295,6 +304,7 @@ class Session:
 
     def _after_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
         if not self._closed and self._owns(optimizer):
+            self._pending_lr = _learning_rates(optimizer)
             self._commit(None)
 
     @torch.no_grad()
@@ -332,13 +342,41 @@ class Session:
                 self._grad[:, 0].copy_(stacked)
                 self._grad[:, 1].fill_(1.0)
             else:
-                key = tuple(index for index, _ in items)
-                idx = self._grad_idx_cache.get(key)
-                if idx is None:
-                    idx = torch.tensor(key, dtype=torch.int64, device=self._grad.device)
-                    self._grad_idx_cache[key] = idx
-                self._grad.index_copy_(0, idx, torch.stack((stacked, torch.ones_like(stacked)), dim=1))
+                idx = self._index(tuple(index for index, _ in items))
+                self._grad[:, :2].index_copy_(
+                    0, idx, torch.stack((stacked, torch.ones_like(stacked)), dim=1)
+                )
         self._grads_recorded = True
+
+    def _index(self, key: tuple[int, ...]) -> torch.Tensor:
+        idx = self._grad_idx_cache.get(key)
+        if idx is None:
+            idx = torch.tensor(key, dtype=torch.int64, device=self._grad.device)
+            self._grad_idx_cache[key] = idx
+        return idx
+
+    @torch.no_grad()
+    def _record_weights(self) -> None:
+        # The norm of each parameter after the optimizer step, on the steps that record
+        # gradient norms. Comparing it with the previous record shows whether the step
+        # changed the weights at all; one read of the weights, no copy of them.
+        groups: dict[tuple[torch.device, torch.dtype], list[tuple[int, torch.Tensor]]] = {}
+        for index, param in enumerate(self._params):
+            data = param.detach()
+            if type(data) is not torch.Tensor:
+                data = unwrap_local(data)
+            if data.numel() == 0:
+                continue
+            groups.setdefault((data.device, data.dtype), []).append((index, data))
+        for (_, dtype), items in groups.items():
+            norms = _foreach_norm(
+                [data for _, data in items], torch.float32 if dtype in _LOW_PRECISION else None
+            )
+            stacked = torch.stack(norms).to(self._grad)
+            if len(items) == len(self._params):
+                self._grad[:, 2].copy_(stacked)
+            else:
+                self._grad[:, 2].index_copy_(0, self._index(tuple(i for i, _ in items)), stacked)
 
     def _ensure_spread_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._spread is None or self._ring_spread is None:
@@ -371,22 +409,27 @@ class Session:
         spread_buf.copy_(spread)
         self._spread_recorded = True
 
-    def step(self, step: int | None = None) -> None:
+    def step(self, step: int | None = None, lr: float | Sequence[float] | None = None) -> None:
         """Mark the end of one optimizer step. Only for `auto_step=False`.
 
         Use this when the optimizer hooks would miscount, for example with
-        `torch.amp.GradScaler`, which skips `optimizer.step()` on overflow.
+        `torch.amp.GradScaler`, which skips `optimizer.step()` on overflow. Pass `lr` (one
+        value per parameter group, or a single value) to record the learning rate.
         """
         if self.auto_step:
             raise RuntimeError("step() is called automatically; pass auto_step=False to call it yourself")
         if not self._grads_recorded and self._should_record_grads():
             self.record_grads()
+        if lr is not None:
+            self._pending_lr = [float(lr)] if isinstance(lr, (int, float)) else [float(v) for v in lr]
         self._commit(step)
 
     @torch.no_grad()
     def _commit(self, step: int | None) -> None:
         if not self._spread_recorded and self._replica_group is not None and self._params:
             self.record_replica_spread(self._replica_group)
+        if self._grads_recorded and self.weights and self._params:
+            self._record_weights()
         row = len(self._steps)
         has_act = self._act.numel() > 0
         if has_act and self._grads_recorded:
@@ -412,6 +455,8 @@ class Session:
         self._spread_recorded = False
         current = self._next_step if step is None else step
         self._steps.append(current)
+        self._ring_lr.append(self._pending_lr)
+        self._pending_lr = None
         self._next_step = current + 1
         self._steps_committed += 1
         if len(self._steps) == self.every:
@@ -421,6 +466,7 @@ class Session:
         """Move the ring to the CPU and queue it for the sink."""
         if self._error is not None:
             self._steps = []
+            self._ring_lr = []
             self._ring_grad_seen = []
             self._ring_spread_seen = []
             self._raise_worker_error()
@@ -452,11 +498,12 @@ class Session:
         )
         grad_seen = self._ring_grad_seen
         spread_seen = self._ring_spread_seen
-        steps = self._steps
+        steps, lrs = self._steps, self._ring_lr
         self._steps = []
+        self._ring_lr = []
         self._ring_grad_seen = []
         self._ring_spread_seen = []
-        self._queue.put((steps, floats, counts, spreads, grad_seen, spread_seen))
+        self._queue.put((steps, lrs, floats, counts, spreads, grad_seen, spread_seen))
 
     def close(self) -> None:
         """Flush what is left and stop the writer. Forward hooks stay on the model, because
@@ -502,6 +549,7 @@ class Session:
     def _decode(
         self,
         steps: list[int],
+        lrs: list[list[float] | None],
         floats: torch.Tensor | None,
         counts: torch.Tensor | None,
         spreads: torch.Tensor | None,
@@ -516,7 +564,7 @@ class Session:
             else None
         )
         grad = (
-            floats[split:].reshape(n, n_params, 2).tolist()
+            floats[split:].reshape(n, n_params, 3).tolist()
             if any(grad_seen) and n_params > 0 and floats is not None
             else None
         )
@@ -531,7 +579,7 @@ class Session:
         records = []
         for i, step in enumerate(steps):
             grad_norms = (
-                {name: norm for name, (norm, seen) in zip(self.param_names, grad[i]) if seen}
+                {name: norm for name, (norm, seen, _) in zip(self.param_names, grad[i]) if seen}
                 if grad is not None and grad_seen[i]
                 else {}
             )
@@ -551,6 +599,12 @@ class Session:
                 "grad_norm": math.sqrt(sum(v * v for v in grad_norms.values())) if grad_norms else None,
                 "grad_norms": grad_norms,
             }
+            if self.weights and grad is not None and grad_seen[i]:
+                record["weight_norms"] = {
+                    name: row[2] for name, row in zip(self.param_names, grad[i])
+                }
+            if lrs[i] is not None:
+                record["lr"] = lrs[i]
             if spread_rows is not None and spread_seen[i]:
                 record["replica_spread"] = {
                     name: [float(norm_s), float(sum_s)]
@@ -559,6 +613,7 @@ class Session:
             if moe:
                 step_moe = {name: rows[i] for name, rows in moe.items()}
                 record["moe"] = step_moe
+                record["moe_top_k"] = {name: spec.top_k for name, spec in self._routers.items()}
                 record["moe_stats"] = {
                     name: _router_stats(row_counts) for name, row_counts in step_moe.items()
                 }
@@ -589,6 +644,22 @@ def _router_stats(counts: list[int]) -> dict[str, Any]:
     }
 
 
+def _learning_rates(optimizer: Any) -> list[float] | None:
+    # A tensor learning rate on the GPU (capturable optimizers) would need a device sync
+    # to read, so it is left out rather than stalling the step.
+    rates = []
+    for group in optimizer.param_groups:
+        lr = group.get("lr")
+        if isinstance(lr, torch.Tensor):
+            if lr.device.type != "cpu":
+                return None
+            lr = lr.item()
+        if lr is None:
+            return None
+        rates.append(float(lr))
+    return rates
+
+
 def _foreach_norm(
     tensors: list[torch.Tensor], dtype: torch.dtype | None
 ) -> tuple[torch.Tensor, ...] | list[torch.Tensor]:
@@ -612,8 +683,10 @@ def init(
     layers: LayerFilter | Sequence[str] | None = None,
     routers: Mapping[str, Router | int] | None = None,
     grads: bool | int = True,
+    weights: bool = True,
     auto_step: bool = True,
     replica_group: Any = None,
+    start_step: int = 0,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -627,10 +700,15 @@ def init(
         routers: MoE router module names mapped to their expert count or a `Router`.
         grads: True to record gradient norms every step, False or 0 to disable automatic
             gradient norm capture, or a positive integer N to record every Nth captured step.
+        weights: record each parameter's norm after the optimizer step, on the same steps
+            as gradient norms, so the detectors can tell when a step left the weights
+            unchanged. Costs one more read of the weights on those steps.
         auto_step: count optimizer steps with PyTorch's global optimizer hooks. Pass False
             and call `session.step()` yourself when using `torch.amp.GradScaler`.
         replica_group: optional replication `ProcessGroup` (or precomputed spread tensor)
             for cross-GPU parameter drift checks.
+        start_step: the first step number. Pass the step you resume from, so a resumed
+            run does not repeat step numbers already written.
     """
     run = resolve_run(run_id)
     if sink is None:
@@ -644,6 +722,8 @@ def init(
         layers=layers,
         routers=routers,
         grads=grads,
+        weights=weights,
         auto_step=auto_step,
         replica_group=replica_group,
+        start_step=start_step,
     )
