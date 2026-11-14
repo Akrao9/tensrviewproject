@@ -160,6 +160,20 @@ Decided on Nov 13, 2026, after Stage 3: **router-only capture is the default for
 
 Sources: [Composer ActivationMonitor](https://mosaicml-composer.readthedocs-hosted.com/en/stable/_modules/composer/callbacks/activation_monitor.html), [wandb.watch](https://docs.wandb.ai/support/models/articles/how-do-i-log-gradients-and-model-weights-with-wandb-watch), [Pixie continuous profiling overhead](https://blog.px.dev/cpu-profiling-3), [Grafana continuous profiling costs](https://grafana.com/blog/continuous-profiling-in-production-a-real-world-example-to-measure-benefits-and-costs), [Mechanism-driven monitors for LLM training instability](https://arxiv.org/pdf/2606.28116), Lightning's `docs/source-pytorch/debug/debugging_intermediate.rst`.
 
+## Where the A100 router-only overhead goes
+
+**Pending a GPU run.** Router-only capture added about 2 ms per step on the A100 against 0.36–0.51 ms on the RTX PRO 6000 for the same hooks. A100 steps also take about 149 ms against 65 ms, although the model is small for either GPU, so both runs may be limited by the CPU launching kernels rather than by the GPU. Granite's `grouped_mm` expert path also copies expert offsets to the CPU, which syncs the CPU with the GPU and stops the CPU from running ahead; if that happens on every layer, every added launch adds to the step time.
+
+[`examples/profile_overhead.py`](examples/profile_overhead.py) measures this. It times capture off and router-only like the benchmark, then profiles one 50-step window of each with `torch.profiler` and reports, per step, GPU busy and idle time, kernels, kernel launches, CPU syncs and the time spent waiting in them, the kernels capture added, and whether the added time is GPU work or host time. In Colab on the A100, from the repository root:
+
+```sh
+cd sdk
+python -m pip install -e '.[rerun]' transformers huggingface_hub pyarrow
+python examples/profile_overhead.py --out runs/profile-a100
+```
+
+Add `--capture full` to profile full capture, and `--trace` for a Chrome trace of each arm (open it at `chrome://tracing` or ui.perfetto.dev; it can be large). The same command on the RTX PRO 6000 gives the comparison. `--toy` checks the script on CPU without downloads.
+
 ## Two-GPU replica drift validation
 
 **Pending.** The two-process CPU/Gloo check passed. The Colab runtime exposed one NVIDIA RTX PRO 6000, so the CUDA/NCCL check was skipped.
