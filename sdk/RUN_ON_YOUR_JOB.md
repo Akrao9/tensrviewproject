@@ -135,7 +135,7 @@ This follows Megatron's `train_step` in `megatron/training/training.py`; it has 
 
 ### Several GPUs
 
-Every rank writes its own file, `tensorlens-out/<run_id>.rank<rank>.jsonl`. With `replica_group=`, give every rank the same step numbers (the same `start_step`, or the same `step=` to `session.step`): the drift check is a collective scheduled from the step number, and ranks that disagree would wait on each other. Start with rank 0 only if that is simpler. The cross-GPU drift check (`replica_group=`, every 50 steps by default, `replica_every=` to change it) has passed only on two CPU processes. Files are written by a background thread, so training does not wait on the filesystem; with many ranks on a shared filesystem such as NFS or Lustre, you can write to node-local disk instead with `sink=tensorlens.JsonlSink(path)`.
+Every rank writes its own file, `tensorlens-out/<run_id>.rank<rank>.jsonl`. With `replica_group=`, give every rank the same step numbers (the same `start_step`, or the same `step=` to `session.step`): the drift check is a collective scheduled from the step number, and ranks that disagree would wait on each other. Start with rank 0 only if that is simpler. The cross-GPU drift check (`replica_group=`, every 50 steps by default, `replica_every=` to change it) has passed only on two CPU processes. Under tensor parallelism, pass `replica_params=` so only weights that are identical across the group, such as LayerNorm, are compared. Files are written by a background thread, so training does not wait on the filesystem; with many ranks on a shared filesystem such as NFS or Lustre, you can write to node-local disk instead with `sink=tensorlens.JsonlSink(path)`.
 
 ## 5. After the run
 

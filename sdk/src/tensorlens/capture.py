@@ -316,6 +316,7 @@ class Session:
         probe: Any = None,
         probe_every: int = PROBE_EVERY,
         scaler: Any = None,
+        replica_params: Any = None,
     ) -> None:
         if hasattr(model, "_orig_mod"):
             raise ValueError("call tensorlens.init(model) before torch.compile(model)")
@@ -354,6 +355,11 @@ class Session:
         self._params = [p for _, p in params]
         self._param_ids = {id(p) for p in self._params}
         self.param_names = [name for name, _ in params]
+        # The parameters the cross-GPU drift check compares: every trainable parameter by
+        # default (data parallelism), or only the replicated ones under tensor parallelism.
+        replicas = _select_replica_params(params, replica_params)
+        self._replica_params = [p for _, p in replicas]
+        self.replica_names = [name for name, _ in replicas]
         self.device = self._params[0].device if self._params else torch.device("cpu")
 
         selected = _select_layers(model, layers)
@@ -400,7 +406,7 @@ class Session:
         self._ring_clip_seen: list[bool] = []
         self._ring_spread: torch.Tensor | None = None
         self._ring_spread_seen: list[bool] = []
-        if replica_group is not None and n_params > 0:
+        if replica_group is not None and self._replica_params:
             self._ensure_spread_buffers()
         self._ring_counts = {
             name: torch.zeros(every, *counts.shape, dtype=torch.int64, device=self.device)
@@ -715,7 +721,7 @@ class Session:
         if self._spread is None or self._ring_spread is None:
             # Apple MPS rejects float64 allocations; keep float64 replica buffers on CPU there.
             spread_device = torch.device("cpu") if self.device.type == "mps" else self.device
-            n_params = len(self._params)
+            n_params = len(self._replica_params)
             self._spread = torch.zeros(n_params, 2, dtype=torch.float64, device=spread_device)
             self._ring_spread = torch.zeros(
                 self.every, n_params, 2, dtype=torch.float64, device=spread_device
@@ -729,7 +735,7 @@ class Session:
         Pass a replication `ProcessGroup` (or rely on `replica_group` passed to `init`), or
         pass a precomputed `[n_params, 2]` tensor from `spread_from_fingerprints`.
         """
-        if not self._params:
+        if not self._replica_params:
             return
         target = self._replica_group if group_or_spread is None else group_or_spread
         if target is None:
@@ -738,7 +744,7 @@ class Session:
         if isinstance(target, torch.Tensor):
             spread = target.to(spread_buf)
         else:
-            spread = replica_spread(self._params, target).to(spread_buf)
+            spread = replica_spread(self._replica_params, target).to(spread_buf)
         spread_buf.copy_(spread)
         self._spread_recorded = True
 
@@ -763,7 +769,7 @@ class Session:
         if (
             not self._spread_recorded
             and self._replica_group is not None
-            and self._params
+            and self._replica_params
             and (current + 1) % self.replica_every == 0
         ):
             # Like Megatron's check_weight_hash_across_dp_replicas_interval: a float64 pass
@@ -991,7 +997,9 @@ class Session:
             if any(grad_seen) and n_params > 0 and floats is not None
             else None
         )
-        spread_rows = spreads.reshape(n, n_params, 2).tolist() if spreads is not None else None
+        spread_rows = (
+            spreads.reshape(n, len(self.replica_names), 2).tolist() if spreads is not None else None
+        )
         moe: dict[str, list[list[int]]] = {}
         offset = 0
         for name, spec in self._routers.items():
@@ -1046,7 +1054,7 @@ class Session:
             if spread_rows is not None and spread_seen[i]:
                 record["replica_spread"] = {
                     name: [float(norm_s), float(sum_s)]
-                    for name, (norm_s, sum_s) in zip(self.param_names, spread_rows[i])
+                    for name, (norm_s, sum_s) in zip(self.replica_names, spread_rows[i])
                 }
             if moe:
                 step_moe = {name: rows[i] for name, rows in moe.items()}
@@ -1072,6 +1080,27 @@ def _scalars_to_cpu(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for (i, name, _), value in zip(entries, values):
             out[i][name] = value
     return out
+
+
+def _select_replica_params(
+    params: list[tuple[str, torch.Tensor]], selection: Any
+) -> list[tuple[str, torch.Tensor]]:
+    """`None`: every trainable parameter. A callable: those for which `fn(name, param)` is
+    true. Otherwise an iterable of parameters or parameter names."""
+    if selection is None:
+        return list(params)
+    if callable(selection):
+        return [(name, p) for name, p in params if selection(name, p)]
+    wanted = list(selection)
+    names = {name for name in wanted if isinstance(name, str)}
+    ids = {id(p) for p in wanted if isinstance(p, torch.Tensor)}
+    if len(names) + len(ids) != len(wanted):
+        raise TypeError("replica_params must be a callable, or parameters or parameter names")
+    chosen = [(name, p) for name, p in params if name in names or id(p) in ids]
+    missing = names - {name for name, _ in chosen}
+    if missing or len(ids) != sum(1 for _, p in chosen if id(p) in ids):
+        raise ValueError(f"replica_params names no trainable parameter of this model: {sorted(missing) or 'a tensor'}")
+    return chosen
 
 
 def _router_stats(counts: list[int]) -> dict[str, Any]:
@@ -1146,6 +1175,7 @@ def init(
     probe: Any = None,
     probe_every: int = PROBE_EVERY,
     scaler: Any = None,
+    replica_params: Any = None,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -1191,6 +1221,13 @@ def init(
             skipped the optimizer step on Inf or NaN gradients (`step_skipped`) and the loss
             scale used (`grad_scale`), and with `auto_step` the step ends at
             `scaler.update()`, so skipped steps are counted too.
+        replica_params: which parameters the cross-GPU drift check compares across
+            `replica_group`: every trainable parameter by default, as under data
+            parallelism. Under tensor parallelism only some weights, such as LayerNorm, are
+            the same on every rank of the group; pass a `(name, param) -> bool` filter, or
+            the parameters or their names. With Megatron, which marks sharded weights with
+            `tensor_model_parallel`, that is
+            `lambda name, p: not getattr(p, "tensor_model_parallel", False)`.
         start_step: the first step number. Pass the step you resume from, so a resumed
             run does not repeat step numbers already written.
         clip_norm: record the total gradient norm that `torch.nn.utils.clip_grad_norm_`
@@ -1227,4 +1264,5 @@ def init(
         probe=probe,
         probe_every=probe_every,
         scaler=scaler,
+        replica_params=replica_params,
     )

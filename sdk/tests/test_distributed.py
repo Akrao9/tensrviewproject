@@ -33,3 +33,52 @@ def test_replica_spread_requires_explicit_group():
         tensorlens.replica_spread([torch.ones(2)], None)
     with pytest.raises(ValueError, match="no replicated parameters"):
         tensorlens.parameter_fingerprints([])
+
+
+def test_replica_params_compares_only_replicated_weights(monkeypatch):
+    """Tensor parallelism: each rank holds a different shard of the linear weight, and only
+    the norm weight is replicated. Comparing every weight would report false drift."""
+    import torch.distributed as dist
+    from torch import nn
+
+    class Block(nn.Module):
+        def __init__(self, shard):
+            super().__init__()
+            self.norm = nn.LayerNorm(4)
+            self.proj = nn.Linear(4, 4, bias=False)
+            with torch.no_grad():
+                self.proj.weight.fill_(shard)  # a different shard on each rank
+            self.proj.weight.tensor_model_parallel = True  # as Megatron marks sharded weights
+
+    rank0, rank1 = Block(1.0), Block(2.0)
+    monkeypatch.setattr(dist, "get_world_size", lambda g=None: 2)
+
+    def gather(out, fp, group=None):
+        out[0].copy_(fp)
+        names = [n for n, _ in rank0.named_parameters() if n.startswith("norm")]
+        out[1].copy_(tensorlens.parameter_fingerprints(p for n, p in rank1.named_parameters() if n in names))
+
+    monkeypatch.setattr(dist, "all_gather", gather)
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(
+        rank0, sink=sink, auto_step=False, replica_group=object(), replica_every=1,
+        replica_params=lambda name, p: not getattr(p, "tensor_model_parallel", False),
+    )
+    session.step()
+    session.close()
+    assert set(sink.records[0]["replica_spread"]) == {"norm.weight", "norm.bias"}
+    assert tensorlens.detect_replica_drift(sink.records) is None
+
+
+def test_replica_params_accepts_names_or_parameters_and_rejects_unknown_names():
+    from torch import nn
+
+    model = nn.Sequential(nn.Linear(2, 2), nn.LayerNorm(2))
+    by_name = tensorlens.init(model, sink=tensorlens.MemorySink(), replica_params=["1.weight"])
+    assert by_name.replica_names == ["1.weight"]
+    by_name.close()
+    by_param = tensorlens.init(model, sink=tensorlens.MemorySink(), replica_params=list(model[1].parameters()))
+    assert by_param.replica_names == ["1.weight", "1.bias"]
+    by_param.close()
+    with pytest.raises(ValueError, match="no trainable parameter"):
+        tensorlens.init(model, sink=tensorlens.MemorySink(), replica_params=["2.weight"])
