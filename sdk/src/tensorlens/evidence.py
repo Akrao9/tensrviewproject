@@ -732,7 +732,7 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
             text = _describe(incident)
             lines.append(text or f"Incident at step {incident['step']}: {incident['kind']}")
     if not lines:
-        return "No routing or numerical incidents detected."
+        return "No incidents detected."
     if evidence.get("layer_count"):
         lines.append(_legend(evidence))
     return "\n".join(lines)
@@ -806,34 +806,6 @@ def export_rerun(
 
     rr.init("tensorlens", recording_id=run_id)
     rr.save(out_path)
-    rr.send_blueprint(
-        rrb.Blueprint(
-            rrb.Vertical(
-                rrb.TextDocumentView(origin="/incident/summary", name="MoE routing imbalance"),
-                rrb.Horizontal(
-                    rrb.Tabs(
-                        rrb.Spatial2DView(
-                            origin="/routing/status", name="Routing status by layer and expert"
-                        ),
-                        rrb.TensorView(origin="/routing/share", name="Raw routing share"),
-                        active_tab=0,
-                    ),
-                    rrb.Vertical(
-                        rrb.TextDocumentView(
-                            origin="/incident/expert_load",
-                            name=f"Layer {incident_layer:02} expert load",
-                        ),
-                        rrb.TimeSeriesView(
-                            origin="/routing/layers", name="Router diversity by layer"
-                        ),
-                        row_shares=[3, 2],
-                    ),
-                ),
-                row_shares=[1, 4],
-            ),
-            collapse_panels=True,
-        )
-    )
     rr.log("/incident/summary", rr.TextDocument(incident_summary(evidence)), static=True)
 
     all_samples = list(evidence.get("samples", ()))
@@ -845,7 +817,24 @@ def export_rerun(
     )
     by_key = {(int(sample["step"]), int(sample["layer"])): sample for sample in all_samples}
 
+    tabs = []
     if steps and layer_count > 0 and expert_count > 0:
+        tabs.append(
+            rrb.Horizontal(
+                rrb.Tabs(
+                    rrb.Spatial2DView(origin="/routing/status", name="Routing status by layer and expert"),
+                    rrb.TensorView(origin="/routing/share", name="Raw routing share"),
+                ),
+                rrb.Vertical(
+                    rrb.TextDocumentView(
+                        origin="/incident/expert_load", name=f"Layer {incident_layer:02} expert load"
+                    ),
+                    rrb.TimeSeriesView(origin="/routing/layers", name="Router diversity by layer"),
+                    row_shares=[3, 2],
+                ),
+                name="MoE routing",
+            )
+        )
         for step in steps[1:]:
             rr.set_time("training_step", sequence=step)
             rr.log(
@@ -901,21 +890,52 @@ def export_rerun(
                         rr.Scalars(float(diversity)),
                     )
 
+    activation_paths: dict[str, set[str]] = {}
+    training_paths: dict[str, str] = {}
     if records is not None:
         for record in records:
             rr.set_time("training_step", sequence=int(record["step"]))
             grad_norm = record.get("grad_norm")
             if isinstance(grad_norm, (int, float)) and math.isfinite(grad_norm):
                 rr.log("/training/grad_norm", rr.Scalars(float(grad_norm)))
+                training_paths["/training/grad_norm"] = "Gradient norm"
+            clip_norm = _finite(record.get("clip_grad_norm"))
+            if clip_norm is not None:
+                rr.log("/training/clip_grad_norm", rr.Scalars(clip_norm))
+                training_paths["/training/clip_grad_norm"] = "Pre-clipping gradient norm"
             weights = [v for v in record.get("weight_norms", {}).values() if _finite(v) is not None]
             if weights:
                 rr.log("/training/weight_norm", rr.Scalars(math.sqrt(sum(v * v for v in weights))))
+                training_paths["/training/weight_norm"] = "Weight norm"
             if record.get("lr"):
                 rr.log("/training/lr", rr.Scalars(float(record["lr"][0])))
+                training_paths["/training/lr"] = "Learning rate"
             for layer_name, stats in record.get("layers", {}).items():
                 for key, val in stats.items():
                     if isinstance(val, (int, float)) and math.isfinite(val):
-                        rr.log(f"/layers/{layer_name}/{key}", rr.Scalars(float(val)))
+                        entity = f"/layers/{layer_name}/{key}"
+                        rr.log(entity, rr.Scalars(float(val)))
+                        activation_paths.setdefault(key, set()).add(entity)
+
+    if activation_paths:
+        labels = {
+            "abs_max": "Peak magnitude", "mean": "Mean", "std": "Standard deviation",
+            "zero_frac": "Zero fraction",
+        }
+        activation_views = [
+            rrb.TimeSeriesView(origin="/layers", contents=sorted(paths), name=labels.get(key, key))
+            for key, paths in sorted(activation_paths.items(), key=lambda item: item[0] != "abs_max")
+        ]
+        tabs.append(rrb.Tabs(*activation_views, name="Activations"))
+    if training_paths:
+        tabs.append(rrb.Tabs(*(
+            rrb.TimeSeriesView(origin=entity, name=name)
+            for entity, name in sorted(training_paths.items())
+        ), name="Optimizer"))
+
+    summary = rrb.TextDocumentView(origin="/incident/summary", name="Training incidents")
+    layout = rrb.Vertical(summary, rrb.Tabs(*tabs), row_shares=[1, 4]) if tabs else summary
+    rr.send_blueprint(rrb.Blueprint(layout, collapse_panels=True))
 
     rr.disconnect()
     return out_path

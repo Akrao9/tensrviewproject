@@ -96,7 +96,9 @@ def _stats_hook(buf: torch.Tensor, stat_idx: torch.Tensor, row: int) -> Callable
         else:
             mean = xf.reshape(())
             std = torch.zeros_like(mean)
-        amax = xf.abs().amax()
+        # Retain the largest magnitude across forwards until the optimizer step.
+        # maximum propagates NaN, so a later clean microbatch cannot hide it.
+        amax = torch.maximum(xf.abs().amax(), buf[row, 2])
         zfrac = (x == 0).float().mean()
         buf[row] = torch.where(
             stat_idx == 0,
