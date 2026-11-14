@@ -114,8 +114,11 @@ def _attention_stats(
         q, k = q.unsqueeze(1), k.unsqueeze(1)
         if attn_mask is not None and attn_mask.ndim == 3:
             attn_mask = attn_mask.unsqueeze(1)
-    batch, heads, rows, dim = q.shape
+    heads, rows, dim = q.shape[1:]
     keys = k.shape[-2]
+    # SDPA broadcasts the batch dimension (Hugging Face passes key and value with batch 1
+    # in some paths), so count the batch the scores actually have.
+    batch = max(q.shape[0], k.shape[0])
     if k.shape[-3] != heads:
         # Grouped-query attention: SDPA's `enable_gqa` shares each key head across
         # several query heads, so repeat the keys to the query's head count.

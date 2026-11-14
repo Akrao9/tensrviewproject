@@ -1,0 +1,155 @@
+"""Reproductions of review findings from Nov 14, 2026, each fixed."""
+
+import math
+
+import pytest
+import torch
+from torch import nn
+from torch.utils.checkpoint import checkpoint
+
+import tensorlens
+from tensorlens import probe as probe_mod
+
+
+class _Routed(nn.Module):
+    def __init__(self, use_reentrant):
+        super().__init__()
+        self.inner = nn.Linear(8, 8)
+        self.router = nn.Linear(8, 4)
+        self.use_reentrant = use_reentrant
+
+    def _block(self, x):
+        h = self.inner(x)
+        weights = self.router(h).softmax(-1).topk(2, dim=-1).values.sum(-1, keepdim=True)
+        return h * weights
+
+    def forward(self, x):
+        return checkpoint(self._block, x, use_reentrant=self.use_reentrant)
+
+
+@pytest.mark.parametrize("use_reentrant", [True, False])
+def test_activation_checkpointing_does_not_double_count_routing(use_reentrant):
+    model = _Routed(use_reentrant)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(model, sink=sink, routers={"router": tensorlens.Router(4, top_k=2)})
+    x = torch.randn(16, 8, requires_grad=use_reentrant)
+    model(x).sum().backward()
+    opt.step()
+    session.close()
+    assert sum(sink.records[0]["moe"]["router"]) == 16 * 2
+
+
+def _two_part():
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 1))
+    return model, [torch.optim.SGD(model[0].parameters(), lr=0.1), torch.optim.AdamW(model[1].parameters())]
+
+
+def test_optimizers_that_clear_their_own_gradients_still_count_one_step_per_iteration():
+    model, opts = _two_part()
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(model, sink=sink, capture="full", every=2)
+    for _ in range(4):
+        model(torch.ones(2, 4)).sum().backward()
+        for opt in opts:
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+    session.close()
+    assert [r["step"] for r in sink.records] == [0, 1, 2, 3]
+    assert all(len(r["grad_norms"]) == 4 for r in sink.records)  # both optimizers' parameters
+
+
+def test_a_step_that_raised_does_not_stop_later_steps_from_counting():
+    model = nn.Linear(4, 1)
+
+    class Flaky(torch.optim.SGD):
+        calls = 0
+
+        def step(self, closure=None):
+            Flaky.calls += 1
+            if Flaky.calls == 1:
+                raise RuntimeError("transient")
+            return super().step(closure)
+
+    opt = Flaky(model.parameters(), lr=0.1)
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(model, sink=sink)
+    model(torch.ones(1, 4)).sum().backward()
+    with pytest.raises(RuntimeError, match="transient"):
+        opt.step()
+    for _ in range(2):
+        opt.step()
+    session.close()
+    assert [r["step"] for r in sink.records] == [0, 1]
+
+
+@pytest.mark.parametrize("kwargs", [{"layers": ()}, {}])
+def test_probe_on_a_model_without_capture_buffers(kwargs):
+    model = nn.Linear(4, 2)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(model, sink=sink, probe=torch.ones(1, 4), probe_every=1, capture="full", **kwargs)
+    model(torch.ones(1, 4)).sum().backward()
+    opt.step()
+    session.close()
+    assert "error" not in sink.records[0]["probe"]
+
+
+def test_closure_steps_record_gradients_after_the_closure_runs():
+    model = nn.Linear(4, 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(model, sink=sink, capture="full")
+
+    def closure():
+        opt.zero_grad()
+        loss = model(torch.ones(2, 4)).sum()
+        loss.backward()
+        return loss
+
+    for _ in range(2):
+        opt.step(closure)
+    session.close()
+    assert all(r["grad_norm"] and r["grad_norm"] > 0 for r in sink.records)
+    assert len(sink.records) == 2
+
+
+def test_replica_with_nan_weights_is_reported():
+    spreads = [{"run_id": "r", "step": 0, "replica_spread": {"w": [0.0, 0.0]}},
+               {"run_id": "r", "step": 1, "replica_spread": {"w": ["nan", "nan"]}}]
+    hit = tensorlens.detect_replica_drift(spreads)
+    assert hit["step"] == 1 and hit["parameters"]["w"]["non_finite"]
+    evidence = tensorlens.build_evidence(spreads)
+    assert "NaN or Inf weights" in tensorlens.incident_summary(evidence)
+
+
+def test_clipped_spike_is_found_from_the_pre_clipping_norm_and_clip_inf_is_non_finite():
+    records = [
+        {"run_id": "c", "step": s, "grad_norm": 1.0, "grad_norms": {"w": 1.0},
+         "clip_grad_norm": 30.0 if s == 20 else 3.0}
+        for s in range(25)
+    ]
+    hit = tensorlens.detect_grad_spikes(records)
+    assert hit is not None and hit["step"] == 20 and hit["ratio"] == pytest.approx(10.0)
+    records[22]["clip_grad_norm"] = "inf"
+    bad = tensorlens.detect_non_finite(records)
+    assert bad["step"] == 22 and "<total before clipping>" in bad["gradients"]
+
+
+def test_probe_counts_rows_over_a_broadcast_batch():
+    q, k = torch.randn(1, 2, 3, 4), torch.randn(3, 2, 3, 4)
+    stats = probe_mod._attention_stats(q, k, None, False, None, map_size=3)
+    assert stats["rows"] == 3 * 2 * 3
+
+
+def test_old_probe_records_keep_their_entropy_curve_on_export(tmp_path, monkeypatch):
+    rr = pytest.importorskip("rerun")
+    old = {"histograms": {}, "attention": {"blocks.0": {
+        "max_logit": [1.0], "entropy": [math.log(4) / 2], "max_entropy": math.log(4),
+        "query_len": 4, "key_len": 4, "map": [[0.25] * 4] * 4}}}
+    records = [{"run_id": "o", "step": 0, "probe": old}]
+    logged = []
+    real = rr.log
+    monkeypatch.setattr(rr, "log", lambda p, *a, **kw: (logged.append((p, a)), real(p, *a, **kw)))
+    tensorlens.export_rerun(tensorlens.build_evidence(records), tmp_path / "o.rrd", records=records)
+    assert any(p == "/probe/entropy/blocks.0" for p, _ in logged)

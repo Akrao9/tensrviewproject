@@ -238,19 +238,20 @@ def detect_grad_spikes(
 
     Each parameter's norm is compared with its own median over the same window, so the
     report names where the spike is, not only that the total jumped. Without per-parameter
-    norms (router-only capture), the total comes from `clip_grad_norm` and no parameter
-    is named. `rising_since` is
+    norms (router-only capture) no parameter is named. The total is the pre-clipping
+    `clip_grad_norm` whenever the run clips, since per-parameter norms are read after
+    clipping, and `grad_norm` otherwise. `rising_since` is
     the first step in the window at which that parameter was already above half the
     spike factor, which points at where a spike started when it builds over several steps.
     """
     totals: list[float] = []
     per_param: dict[str, list[tuple[int, float]]] = {}
     spikes: list[dict[str, Any]] = []
+    # One series for the whole run. When the run clips, the pre-clipping norm is used:
+    # the per-parameter norms are read after clipping, so a clipped spike stays flat there.
+    key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
     for record in sorted(records, key=lambda r: r["step"]):
-        # Per-parameter norms when captured, else the norm gradient clipping reported.
-        total = _finite(record.get("grad_norm"))
-        if total is None:
-            total = _finite(record.get("clip_grad_norm"))
+        total = _finite(record.get(key))
         if total is None:
             continue
         step = int(record["step"])
@@ -480,6 +481,8 @@ def detect_non_finite(records: list[dict[str, Any]]) -> dict[str, Any] | None:
         ]
         if _is_non_finite(record.get("grad_norm")) and not bad_grads:
             bad_grads.append("<total>")
+        if _is_non_finite(record.get("clip_grad_norm")):
+            bad_grads.append("<total before clipping>")
         if bad_layers or bad_grads:
             return {
                 "kind": "non_finite",
@@ -493,16 +496,26 @@ def detect_non_finite(records: list[dict[str, Any]]) -> dict[str, Any] | None:
 def detect_replica_drift(
     records: list[dict[str, Any]], *, tolerance: float = DRIFT_TOLERANCE
 ) -> dict[str, Any] | None:
-    """Return the first step where cross-GPU parameter spread exceeds `tolerance`."""
+    """Return the first step where cross-GPU parameter spread exceeds `tolerance` or is
+    not finite (a NaN or Inf weight on some replica).
+
+    Norm and sum fingerprints are a screening check: they miss changes that keep both,
+    such as two elements swapping places. Megatron's `check_param_hashes_across_dp_replicas`
+    compares hashes for exact equality.
+    """
     for record in records:
         spreads = record.get("replica_spread")
         if not spreads:
             continue
-        diverged = {
-            name: {"norm_spread": float(vals[0]), "sum_spread": float(vals[1])}
-            for name, vals in spreads.items()
-            if max(float(vals[0]), float(vals[1])) > tolerance
-        }
+        diverged = {}
+        for name, vals in spreads.items():
+            norm_s, sum_s = float(vals[0]), float(vals[1])
+            if not (math.isfinite(norm_s) and math.isfinite(sum_s)):
+                # A NaN or Inf weight on any replica makes the spread non-finite, which
+                # compares as no drift; report it instead.
+                diverged[name] = {"norm_spread": norm_s, "sum_spread": sum_s, "non_finite": True}
+            elif max(norm_s, sum_s) > tolerance:
+                diverged[name] = {"norm_spread": norm_s, "sum_spread": sum_s}
         if diverged:
             return {
                 "kind": "replica_drift",
@@ -837,10 +850,12 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         parts = [*incident.get("layers", ()), *incident.get("gradients", ())]
         return f"NaN or Inf at step {incident['step']} in {', '.join(parts[:5])}"
     if kind == "replica_drift":
-        return (
+        bad = sum(1 for v in incident["parameters"].values() if v.get("non_finite"))
+        text = (
             f"Replicas diverged at step {incident['step']} in"
             f" {len(incident['parameters'])} parameters (tolerance {incident['tolerance']:g})"
         )
+        return text + (f", {bad} with NaN or Inf weights on some replica" if bad else "")
     return None
 
 
@@ -1148,6 +1163,10 @@ def _log_probe(
             rr.log(f"/probe/max_logit/{part}", rr.Scalars(max(logits)))
             series = True
         shares = [v for v in (_finite(x) for x in att.get("entropy_share", [])) if v is not None]
+        if not shares and _finite(att.get("max_entropy")):
+            # Probe records from before `entropy_share`: entropy over the log of all keys.
+            top = float(att["max_entropy"])
+            shares = [v / top for v in (_finite(x) for x in att.get("entropy", [])) if v is not None]
         if shares:
             rr.log(f"/probe/entropy/{part}", rr.Scalars(sum(shares) / len(shares)))
             series = True

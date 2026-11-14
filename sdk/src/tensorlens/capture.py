@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import numbers
 import queue
+import sys
 import threading
 import warnings
 import weakref
@@ -93,6 +94,8 @@ def _first_tensor(output: Any, *, integer: bool) -> torch.Tensor | None:
 
 def _stats_hook(buf: torch.Tensor, stat_idx: torch.Tensor, row: int) -> Callable[..., None]:
     def hook(module: nn.Module, args: Any, output: Any) -> None:
+        if _recomputing():
+            return
         x = _first_tensor(output, integer=False)
         if x is None or x.numel() == 0:
             return
@@ -128,6 +131,8 @@ def _router_hook(
     counts: torch.Tensor, expert_ids: torch.Tensor, spec: Router
 ) -> Callable[..., None]:
     def hook(module: nn.Module, args: Any, output: Any) -> None:
+        if _recomputing():
+            return
         if spec.indices is not None:
             idx = spec.indices(output)
         else:
@@ -135,6 +140,9 @@ def _router_hook(
             if idx is None:
                 logits = _first_tensor(output, integer=False)
                 if logits is not None and logits.ndim >= 1 and logits.shape[-1] == spec.n_experts:
+                    # Detached, so the hook saves nothing for backward: non-reentrant
+                    # checkpointing checks that recomputation saves the same tensors.
+                    logits = logits.detach()
                     idx = (
                         logits.argmax(dim=-1)
                         if spec.top_k <= 1
@@ -215,6 +223,24 @@ def _select_layers(
 
 _clip_sessions: list["Session"] = []
 _clip_original: Callable[..., Any] | None = None
+
+
+def _on_stack(frame: Any, start: Any, limit: int = 64) -> bool:
+    while start is not None and limit > 0:
+        if start is frame:
+            return True
+        start, limit = start.f_back, limit - 1
+    return False
+
+
+def _recomputing() -> bool:
+    """True while activation checkpointing recomputes a forward pass during backward.
+
+    Recomputation runs eagerly inside the autograd engine (PyTorch disables Dynamo for
+    it), so a hook firing then would count the same tokens and activations twice. Under
+    compilation the check is skipped: a compiled forward is never a recomputation.
+    """
+    return not torch.compiler.is_compiling() and torch._C._current_graph_task_id() != -1
 
 
 def _clip_grad_norm_wrapper(parameters: Any, *args: Any, **kwargs: Any) -> Any:
@@ -407,11 +433,11 @@ class Session:
         self._grads_recorded = False
         self._spread_recorded = False
         self._owned: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
-        self._stepped: weakref.WeakSet[Any] = weakref.WeakSet()
-        self._multi_optimizer = False
-        self._fresh = True
+        self._lead: weakref.ref[Any] | None = None
+        self._leading = True
+        self._grads_after_step = False
         self._step_depth = 0
-        self._last_signature: tuple[Any, ...] = ()
+        self._outer_frame: Any = None
         self._closed = False
         self._error: BaseException | None = None
         # Bounded, as TensorBoard's SummaryWriter is (`max_queue=10`): if the sink falls
@@ -456,46 +482,48 @@ class Session:
         # The every-th, 2*every-th, ... step, counting from 1 (as Lightning and wandb do).
         return every > 0 and (self._steps_committed + 1) % every == 0
 
-    def _grad_signature(self) -> tuple[Any, ...]:
-        # A new backward pass replaces a gradient (`zero_grad(set_to_none=True)`) or
-        # changes it in place (accumulation, `zero_grad()`), which bumps its version.
-        return tuple(None if p.grad is None else (id(p.grad), p.grad._version) for p in self._params)
-
     def _before_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
         if self._closed or not self._owns(optimizer):
             return
         # PyTorch wraps each optimizer class's own `step` with the global hooks, so an
-        # optimizer that subclasses another and calls `super().step()` fires them twice,
-        # nested. Only the outermost call counts.
-        self._step_depth += 1
-        if self._step_depth > 1:
+        # optimizer that subclasses another and calls `super().step()` fires them again,
+        # nested inside the outer call. A call is nested only while the outer call's
+        # wrapper frame is still running; after an outer step raised, it is not, and the
+        # next call starts afresh instead of being ignored forever.
+        wrapper = sys._getframe(1)
+        if self._step_depth and _on_stack(self._outer_frame, wrapper.f_back):
+            self._step_depth += 1
             return
+        self._step_depth, self._outer_frame = 1, wrapper
         # One TensorLens step per training iteration. With several optimizers on one
-        # model (for example Muon for matrices and AdamW for the rest), an optimizer step
-        # starts a new iteration only if gradients changed since the previous optimizer
-        # step; the others in the same iteration add no step and record nothing twice.
-        if self._multi_optimizer:
-            self._fresh = self._grad_signature() != self._last_signature
-        elif self._stepped and optimizer not in self._stepped:
-            self._multi_optimizer = True  # a second optimizer, in the iteration just counted
-            self._fresh = False
-        else:
-            self._fresh = True
-        self._stepped.add(optimizer)
-        if self._fresh and not self._grads_recorded and self._should_record_grads():
+        # model, the first one that ever stepped leads: its steps end TensorLens steps,
+        # and the others' steps add none and record nothing twice. Gradients are read
+        # before the lead steps, after backward, so they include every optimizer's
+        # parameters.
+        lead = self._lead() if self._lead is not None else None
+        if lead is None:
+            self._lead, lead = weakref.ref(optimizer), optimizer
+        self._leading = optimizer is lead
+        # With `step(closure)`, the closure runs forward and backward inside the step, so
+        # gradients are read after it instead (Lightning steps this way).
+        closure = kwargs.get("closure", args[1] if len(args) > 1 else None)
+        self._grads_after_step = callable(closure)
+        if self._leading and not self._grads_after_step and not self._grads_recorded and self._should_record_grads():
             self.record_grads()
 
     def _after_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
         if self._closed or not self._owns(optimizer):
             return
-        self._step_depth = max(0, self._step_depth - 1)
-        if self._step_depth > 0:
+        if self._step_depth > 1:
+            self._step_depth -= 1
             return
-        if self._fresh:
-            self._pending_lr = _learning_rates(optimizer)
-            self._commit(None)
-        if self._multi_optimizer:
-            self._last_signature = self._grad_signature()
+        self._step_depth, self._outer_frame = 0, None
+        if not self._leading:
+            return
+        if self._grads_after_step and not self._grads_recorded and self._should_record_grads():
+            self.record_grads()
+        self._pending_lr = _learning_rates(optimizer)
+        self._commit(None)
 
     @torch.no_grad()
     def record_grads(self) -> None:
@@ -757,8 +785,9 @@ class Session:
             warnings.warn(f"TensorLens probe failed and was skipped: {error!r}", RuntimeWarning, stacklevel=3)
             return {"error": f"{type(error).__name__}: {error}"}
         finally:
-            buffers = [self._act, *self._counts_list]
-            torch._foreach_zero_([b for b in buffers if b.numel() > 0])
+            buffers = [b for b in (self._act, *self._counts_list) if b.numel() > 0]
+            if buffers:
+                torch._foreach_zero_(buffers)
 
     def flush(self) -> None:
         """Move the ring to the CPU and queue it for the sink."""
