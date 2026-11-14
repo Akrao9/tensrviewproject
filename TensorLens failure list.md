@@ -54,7 +54,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Expert counts per router per step, which TensorLens already records.
 
-**TensorLens today.** Detected. A collapse seeded in Granite layer 12 was found at the right step, layer and experts. Gap: the 35% overload threshold cannot be reached by a top-k router with k above 2, so a router stuck on the same experts with none fully dead is not reported.
+**TensorLens today.** Detected. A collapse seeded in Granite layer 12 was found at the right step, layer and experts. Experts starved over a 50-step window are also flagged: on Granite, 20 experts that came starved from pretraining, which per-step checks never report. Gap: the 35% overload threshold cannot be reached by a top-k router with k above 2, so a router stuck on the same experts with none fully dead is not reported.
 
 ### 4. Weights not updating at all
 

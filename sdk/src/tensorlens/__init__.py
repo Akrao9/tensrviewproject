@@ -12,10 +12,12 @@ from .distributed import parameter_fingerprints, replica_spread, spread_from_fin
 from .evidence import (
     DEAD_COLOR,
     IDLE_COLOR,
+    STARVED_COLOR,
     MISSING_COLOR,
     build_evidence,
     detect_non_finite,
     detect_replica_drift,
+    detect_starved_experts,
     effective_overload_threshold,
     expert_load_table,
     export_rerun,
@@ -30,6 +32,7 @@ from .tracker import RunInfo, resolve_run
 __all__ = [
     "DEAD_COLOR",
     "IDLE_COLOR",
+    "STARVED_COLOR",
     "JsonlSink",
     "MISSING_COLOR",
     "MemorySink",
@@ -40,6 +43,7 @@ __all__ = [
     "build_evidence",
     "detect_non_finite",
     "detect_replica_drift",
+    "detect_starved_experts",
     "effective_overload_threshold",
     "expert_load_table",
     "export_rerun",

@@ -17,3 +17,7 @@ tensorlens-out/
 
 # Rerun recordings exported from runs
 *.rrd
+
+# Captures and evidence copied in from runs
+/*.jsonl
+/*.evidence.json

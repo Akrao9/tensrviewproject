@@ -2,8 +2,8 @@
 
 The evidence dictionary uses the same schema as `experiments/moe-bakeoff`, so the stock
 Rerun blueprint, `verify_rerun.py` and the Rune inspector can all read it directly, while
-adding `incidents` for MoE routing imbalance, non-finite activations/gradients and
-cross-GPU parameter drift.
+adding `incidents` for MoE routing imbalance, chronically starved experts, non-finite
+activations/gradients and cross-GPU parameter drift.
 """
 
 from __future__ import annotations
@@ -16,11 +16,21 @@ from typing import Any, Iterable, Mapping
 
 OVERLOAD_THRESHOLD = 0.35
 DRIFT_TOLERANCE = 1e-6
+# An expert is starved when its share of a router's assignments, summed over the last
+# STARVE_WINDOW samples, stays below STARVE_RATIO of an even share. A single step with no
+# tokens is ordinary noise; hundreds of near-empty steps in a row are not.
+STARVE_WINDOW = 50
+STARVE_RATIO = 0.1
+# Skip the check until an even share would have received this many assignments in the
+# window, so that small routers and short runs are not judged on noise.
+STARVE_MIN_EXPECTED = 100
 MISSING_COLOR = (48, 54, 64)
 DEAD_COLOR = (236, 84, 99)
-# An expert with no tokens in this sample that the detector did not flag as dead,
-# for example a transient gap in a healthy layer. Darker than any active cell.
-IDLE_COLOR = (10, 14, 20)
+OVERLOADED_COLOR = (255, 190, 94)
+STARVED_COLOR = (170, 120, 240)
+# An expert with no tokens in this sample that no detector flagged, for example a
+# transient gap in a healthy layer.
+IDLE_COLOR = (150, 158, 170)
 
 
 def _is_non_finite(value: Any) -> bool:
@@ -65,6 +75,63 @@ def _dead_experts_significant(
     if expected_empty >= 0.01:
         return False
     return (dead_count / n_experts) >= 0.25 or diversity < 0.5
+
+
+def _mark_starved(samples: list[dict[str, Any]], window: int, ratio: float) -> None:
+    """Set `sample["starved"]` from each router's trailing window of `window` samples."""
+    by_layer: dict[int, list[dict[str, Any]]] = {}
+    for sample in samples:
+        sample["starved"] = []
+        by_layer.setdefault(sample["layer"], []).append(sample)
+    for seq in by_layer.values():
+        recent: list[dict[str, Any]] = []
+        sums: list[int] = []
+        tokens = 0
+        for sample in seq:  # in step order
+            if sample.get("missing") or sample["routed_tokens"] <= 0:
+                continue
+            counts = sample["counts"]
+            if len(sums) != len(counts):
+                recent, sums, tokens = [], [0] * len(counts), 0
+            recent.append(sample)
+            sums = [a + b for a, b in zip(sums, counts)]
+            tokens += sample["routed_tokens"]
+            if len(recent) > window:
+                old = recent.pop(0)
+                sums = [a - b for a, b in zip(sums, old["counts"])]
+                tokens -= old["routed_tokens"]
+            even = 1.0 / len(counts)
+            if len(recent) < window or tokens * even < STARVE_MIN_EXPECTED:
+                continue
+            dead = set(sample["dead"])
+            sample["starved"] = [
+                expert
+                for expert, total in enumerate(sums, 1)
+                if total / tokens < ratio * even and expert not in dead
+            ]
+            sample["starved_shares"] = {
+                str(expert): sums[expert - 1] / tokens for expert in sample["starved"]
+            }
+
+
+def detect_starved_experts(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return every starved expert with the first step it was flagged, or None."""
+    first: dict[tuple[int, int], dict[str, Any]] = {}
+    for sample in samples:
+        for expert in sample.get("starved", ()):
+            key = (sample["layer"], expert)
+            if key not in first:
+                first[key] = {
+                    "layer": sample["layer"],
+                    "router": sample.get("router"),
+                    "expert": expert,
+                    "step": sample["step"],
+                    "window_share": sample["starved_shares"][str(expert)],
+                }
+    if not first:
+        return None
+    experts = sorted(first.values(), key=lambda e: (e["window_share"], e["layer"], e["expert"]))
+    return {"kind": "starved_experts", "step": min(e["step"] for e in experts), "experts": experts}
 
 
 def load_records(source: str | Path | Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -147,6 +214,8 @@ def build_evidence(
     *,
     overload_threshold: float = OVERLOAD_THRESHOLD,
     drift_tolerance: float = DRIFT_TOLERANCE,
+    starve_window: int = STARVE_WINDOW,
+    starve_ratio: float = STARVE_RATIO,
 ) -> dict[str, Any]:
     """Build viewer-neutral detector evidence from captured step records."""
     records = load_records(source)
@@ -225,6 +294,10 @@ def build_evidence(
                 "dead": moe_hit["dead"],
             }
         )
+    _mark_starved(samples, starve_window, starve_ratio)
+    starved_hit = detect_starved_experts(samples)
+    if starved_hit is not None:
+        incidents.append(starved_hit)
     non_finite_hit = detect_non_finite(records)
     if non_finite_hit is not None:
         incidents.append(non_finite_hit)
@@ -240,6 +313,8 @@ def build_evidence(
         "expert_count": expert_count,
         "router_names": routers,
         "overload_threshold": overload_threshold,
+        "starve_window": starve_window,
+        "starve_ratio": starve_ratio,
         "incidents": incidents,
         "samples": samples,
     }
@@ -304,10 +379,14 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
         rows = []
         for expert, count in enumerate(sample["counts"], 1):
             share = count / tokens
-            if count == 0:
-                status = "Dead" if expert in sample.get("dead", ()) else "Idle"
+            if expert in sample.get("dead", ()):
+                status = "Dead"
             elif expert in sample.get("overloaded", ()):
                 status = "Overloaded"
+            elif expert in sample.get("starved", ()):
+                status = "Starved"
+            elif count == 0:
+                status = "Idle"
             else:
                 status = "Active"
             if base_tokens > 0 and expert - 1 < len(base_counts):
@@ -338,8 +417,38 @@ def _percent(share: float) -> str:
     return f"{pct:.0f}%" if abs(pct - round(pct)) < 0.05 else f"{pct:.1f}%"
 
 
+def _starved_line(evidence: Mapping[str, Any]) -> str | None:
+    hit = next((i for i in evidence.get("incidents", ()) if i["kind"] == "starved_experts"), None)
+    if hit is None:
+        return None
+    listed = hit["experts"][:8]
+    text = ", ".join(
+        f"Layer {e['layer']:02} expert {e['expert']} ({e['window_share'] * 100:.3f}%)" for e in listed
+    )
+    more = len(hit["experts"]) - len(listed)
+    window = evidence.get("starve_window", STARVE_WINDOW)
+    return (
+        f"Starved experts (share over {window} steps, from step {hit['step']}): {text}"
+        + (f", and {more} more" if more > 0 else "")
+    )
+
+
+def _legend(evidence: Mapping[str, Any]) -> str:
+    window = evidence.get("starve_window", STARVE_WINDOW)
+    return (
+        "Heatmap: blue = active, amber = overloaded, red = dead,"
+        f" violet = starved over {window} steps, gray = no tokens this step"
+    )
+
+
 def incident_summary(evidence: Mapping[str, Any]) -> str:
     """Human- and agent-readable summary matching the bake-off's text document format."""
+    summary = _incident_summary(evidence)
+    starved = _starved_line(evidence)
+    return summary if starved is None else summary.replace("\nHeatmap:", f"\n{starved}\nHeatmap:", 1)
+
+
+def _incident_summary(evidence: Mapping[str, Any]) -> str:
     incident = first_incident(evidence)
     if incident is not None:
         tokens = incident["routed_tokens"] or 1
@@ -353,13 +462,14 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
             f"First sampled bad step {incident['step']}  ·  Layer {incident['layer']:02}"
             f"  ·  Diversity {diversity:.2f}\n"
             f"Overloaded: {overloaded or 'none'}  ·  Dead experts: {dead or 'none'}\n"
-            "Heatmap: blue = active, amber = overloaded, red = dead,"
-            " black = no tokens but not flagged"
+            + _legend(evidence)
         )
-    other = evidence.get("incidents", ())
+    other = [i for i in evidence.get("incidents", ()) if i["kind"] != "starved_experts"]
     if other:
         first = other[0]
-        return f"Incident at step {first['step']}: {first['kind']}"
+        return f"Incident at step {first['step']}: {first['kind']}\n{_legend(evidence)}"
+    if _starved_line(evidence) is not None:
+        return f"No routing collapse or numerical incidents detected.\n{_legend(evidence)}"
     return "No routing or numerical incidents detected."
 
 
@@ -368,8 +478,8 @@ def routing_colors(sample: Mapping[str, Any], expert_count: int | None = None):
 
     Missing or skipped router samples (and padded columns when routers have mixed expert
     counts) render as neutral slate gray `MISSING_COLOR` instead of dead-expert red. Only
-    experts the detector listed in `sample["dead"]` are red; other zero-token experts are
-    `IDLE_COLOR`.
+    experts the detector listed in `sample["dead"]` are red. Experts starved over the
+    trailing window are `STARVED_COLOR`, and other zero-token experts are `IDLE_COLOR`.
     """
     counts = sample.get("counts", ())
     target = expert_count if expert_count is not None else len(counts)
@@ -380,11 +490,16 @@ def routing_colors(sample: Mapping[str, Any], expert_count: int | None = None):
         return
     overloaded = set(sample.get("overloaded", ()))
     dead = set(sample.get("dead", ()))
+    starved = set(sample.get("starved", ()))
     for expert, count in enumerate(counts, 1):
-        if count == 0:
-            yield DEAD_COLOR if expert in dead else IDLE_COLOR
+        if expert in dead:
+            yield DEAD_COLOR
         elif expert in overloaded:
-            yield (255, 190, 94)
+            yield OVERLOADED_COLOR
+        elif expert in starved:
+            yield STARVED_COLOR
+        elif count == 0:
+            yield IDLE_COLOR
         else:
             intensity = min(1.0, 100.0 * (count / tokens))
             yield (21 + int(15 * intensity), 44 + int(40 * intensity), 65 + int(54 * intensity))

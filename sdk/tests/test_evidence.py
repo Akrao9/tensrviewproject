@@ -300,3 +300,62 @@ def test_zero_token_expert_not_flagged_as_dead_is_idle_not_red():
     table = tensorlens.expert_load_table(evidence, 1, 1)
     assert "| #032 | 0.00% | -3.12 | Idle |" in table
     assert "Dead" not in table
+
+
+def _starving_records(steps=60, starve_from=0):
+    # 8 experts, 1024 assignments per step. Expert 8 gets 1 token every third step from
+    # `starve_from` on, far below its even share of 128; the others share the rest.
+    records = []
+    for step in range(steps):
+        last = (1 if step % 3 == 0 else 0) if step >= starve_from else 128
+        rest = 1024 - last
+        counts = [rest // 7 + (1 if i < rest % 7 else 0) for i in range(7)] + [last]
+        records.append({"run_id": "starve", "step": step, "moe": {"r": counts}})
+    return records
+
+
+def test_starved_expert_is_flagged_after_a_full_window():
+    evidence = tensorlens.build_evidence(_starving_records())
+    hit = next(i for i in evidence["incidents"] if i["kind"] == "starved_experts")
+    assert hit["step"] == 49  # first step with a full 50-step window
+    assert [(e["layer"], e["expert"]) for e in hit["experts"]] == [(1, 8)]
+    assert hit["experts"][0]["window_share"] == pytest.approx(17 / (50 * 1024))
+    assert tensorlens.first_incident(evidence) is None  # no single step looks bad
+
+    by_step = {s["step"]: s for s in evidence["samples"]}
+    assert by_step[48]["starved"] == []
+    assert by_step[59]["starved"] == [8]
+    colors = list(tensorlens.routing_colors(by_step[59]))
+    assert colors[-1] == tensorlens.STARVED_COLOR
+    assert "| Starved |" in tensorlens.expert_load_table(evidence, 59, 1)
+    summary = tensorlens.incident_summary(evidence)
+    assert "Starved experts (share over 50 steps, from step 49): Layer 01 expert 8 (0.033%)" in summary
+    assert "violet = starved over 50 steps" in summary
+
+
+def test_recently_starved_expert_waits_for_the_window_and_dead_wins():
+    # Healthy for 40 steps, then starved: the window average crosses 10% of an even share
+    # only once most of the window is starved.
+    evidence = tensorlens.build_evidence(_starving_records(steps=100, starve_from=40))
+    hit = next(i for i in evidence["incidents"] if i["kind"] == "starved_experts")
+    assert 80 < hit["step"] < 90
+
+    # A collapsed router's dead experts stay red, not violet.
+    collapsed = [
+        {"run_id": "c", "step": s, "moe": {"r": [1024] + [0] * 7 if s >= 10 else [128] * 8}}
+        for s in range(80)
+    ]
+    ev = tensorlens.build_evidence(collapsed)
+    last = ev["samples"][-1]
+    assert last["dead"] == list(range(2, 9)) and last["starved"] == []
+    assert all(i["kind"] != "starved_experts" for i in ev["incidents"])
+
+
+def test_small_routers_and_short_runs_are_not_judged_on_noise():
+    # 4 experts, 8 tokens per step: an even share gets 100 assignments only after 50 steps.
+    records = [
+        {"run_id": "tiny", "step": s, "moe": {"r": [3, 3, 2, 0] if s % 2 else [2, 2, 2, 2]}}
+        for s in range(40)
+    ]
+    ev = tensorlens.build_evidence(records)
+    assert all(i["kind"] != "starved_experts" for i in ev["incidents"])
