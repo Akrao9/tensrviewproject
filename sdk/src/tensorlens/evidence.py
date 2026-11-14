@@ -17,6 +17,10 @@ from typing import Any, Iterable, Mapping
 OVERLOAD_THRESHOLD = 0.35
 DRIFT_TOLERANCE = 1e-6
 MISSING_COLOR = (48, 54, 64)
+DEAD_COLOR = (236, 84, 99)
+# An expert with no tokens in this sample that the detector did not flag as dead,
+# for example a transient gap in a healthy layer. Darker than any active cell.
+IDLE_COLOR = (10, 14, 20)
 
 
 def _is_non_finite(value: Any) -> bool:
@@ -301,7 +305,7 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
         for expert, count in enumerate(sample["counts"], 1):
             share = count / tokens
             if count == 0:
-                status = "Dead"
+                status = "Dead" if expert in sample.get("dead", ()) else "Idle"
             elif expert in sample.get("overloaded", ()):
                 status = "Overloaded"
             else:
@@ -328,13 +332,19 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
     )
 
 
+def _percent(share: float) -> str:
+    """36% stays "36%", while 12.5% is not rounded to "12%"."""
+    pct = share * 100
+    return f"{pct:.0f}%" if abs(pct - round(pct)) < 0.05 else f"{pct:.1f}%"
+
+
 def incident_summary(evidence: Mapping[str, Any]) -> str:
     """Human- and agent-readable summary matching the bake-off's text document format."""
     incident = first_incident(evidence)
     if incident is not None:
         tokens = incident["routed_tokens"] or 1
         overloaded = ", ".join(
-            f"Expert {expert} ({incident['counts'][expert - 1] / tokens:.0%})"
+            f"Expert {expert} ({_percent(incident['counts'][expert - 1] / tokens)})"
             for expert in incident["overloaded"]
         )
         dead = ", ".join(f"{expert:02}" for expert in incident["dead"])
@@ -343,7 +353,8 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
             f"First sampled bad step {incident['step']}  ·  Layer {incident['layer']:02}"
             f"  ·  Diversity {diversity:.2f}\n"
             f"Overloaded: {overloaded or 'none'}  ·  Dead experts: {dead or 'none'}\n"
-            "Heatmap: blue = active, amber = overloaded, red = dead"
+            "Heatmap: blue = active, amber = overloaded, red = dead,"
+            " black = no tokens but not flagged"
         )
     other = evidence.get("incidents", ())
     if other:
@@ -356,7 +367,9 @@ def routing_colors(sample: Mapping[str, Any], expert_count: int | None = None):
     """RGB colors per expert matching the bake-off status heatmap.
 
     Missing or skipped router samples (and padded columns when routers have mixed expert
-    counts) render as neutral slate gray `MISSING_COLOR` instead of dead-expert red.
+    counts) render as neutral slate gray `MISSING_COLOR` instead of dead-expert red. Only
+    experts the detector listed in `sample["dead"]` are red; other zero-token experts are
+    `IDLE_COLOR`.
     """
     counts = sample.get("counts", ())
     target = expert_count if expert_count is not None else len(counts)
@@ -366,9 +379,10 @@ def routing_colors(sample: Mapping[str, Any], expert_count: int | None = None):
             yield MISSING_COLOR
         return
     overloaded = set(sample.get("overloaded", ()))
+    dead = set(sample.get("dead", ()))
     for expert, count in enumerate(counts, 1):
         if count == 0:
-            yield (236, 84, 99)
+            yield DEAD_COLOR if expert in dead else IDLE_COLOR
         elif expert in overloaded:
             yield (255, 190, 94)
         else:

@@ -157,6 +157,7 @@ def test_imbalance_rule_allows_balanced_two_expert_router_and_preserves_bakeoff(
     assert granite_hit["overloaded"] == list(range(1, 9))
     assert granite_hit["dead"] == list(range(9, 33))
     assert granite_hit["diversity"] == pytest.approx(0.25)
+    assert "Expert 1 (12.5%)" in tensorlens.incident_summary(granite_ev)
     granite_table = tensorlens.expert_load_table(granite_ev, 450, 1).splitlines()
     assert granite_table[4] == "| #001 | 12.50% | +9.38 | Overloaded |"
     assert granite_table[-1] == "| #032 | 0.00% | -3.12 | Dead |"
@@ -281,3 +282,21 @@ def test_export_rerun_writes_explicit_width_and_height_for_single_layer(tmp_path
         if len(col) and col[0].is_valid:
             fmt = col[0].as_py()[0]
             assert (fmt["width"], fmt["height"]) == (8, 1)
+
+
+def test_zero_token_expert_not_flagged_as_dead_is_idle_not_red():
+    # One of 32 experts gets no tokens in a healthy layer: the detector ignores it.
+    counts = [264] * 31 + [0]
+    evidence = tensorlens.build_evidence(
+        [{"run_id": "idle", "step": 0, "moe": {"r": [256] * 32}},
+         {"run_id": "idle", "step": 1, "moe": {"r": counts}}]
+    )
+    sample = evidence["samples"][1]
+    assert sample["dead"] == []
+    assert tensorlens.first_incident(evidence) is None
+    colors = list(tensorlens.routing_colors(sample))
+    assert colors[-1] == tensorlens.IDLE_COLOR
+    assert tensorlens.DEAD_COLOR not in colors
+    table = tensorlens.expert_load_table(evidence, 1, 1)
+    assert "| #032 | 0.00% | -3.12 | Idle |" in table
+    assert "Dead" not in table

@@ -10,6 +10,8 @@
 from .capture import Router, Session, init
 from .distributed import parameter_fingerprints, replica_spread, spread_from_fingerprints
 from .evidence import (
+    DEAD_COLOR,
+    IDLE_COLOR,
     MISSING_COLOR,
     build_evidence,
     detect_non_finite,
@@ -26,6 +28,8 @@ from .sink import JsonlSink, MemorySink, Sink
 from .tracker import RunInfo, resolve_run
 
 __all__ = [
+    "DEAD_COLOR",
+    "IDLE_COLOR",
     "JsonlSink",
     "MISSING_COLOR",
     "MemorySink",
