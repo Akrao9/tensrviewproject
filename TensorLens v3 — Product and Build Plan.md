@@ -21,93 +21,73 @@ TensorLens owns the capture SDK, detectors, and the evidence they produce. Stock
 
 ## How it works
 
-Capture signals inside the training script and detect failures on the ingest server. Export the evidence as JSON for agents and as a recording and blueprint for engineers to explore in Rerun.
+Capture signals inside the training script, write them to an append-only local file on each rank first, and optionally stream them from that file's byte offset over Arrow Flight to a self-hosted Rust ingest server that stores partitioned Parquet. Detectors run in Python on either the local files or the server's Parquet files while the run is in progress, exporting JSON evidence for coding agents and an `.rrd` recording and blueprint for engineers to explore in Rerun.
 
-&#91;embedded content: How it works · 7 parts, 8 flows\]
-
-Scalars keep going to the tracker the team already uses. Tensor summaries take their own path, so a slow tensor pipeline never blocks metric logging.
+Scalars keep going to the tracker the team already uses. Tensor summaries take their own path, so a slow tensor pipeline or network stall never blocks metric logging or drops training steps.
 
 ## Build and borrow
 
-Start with stock Rerun and reuse the MoE recording and blueprint from the bake-off. The first product work is capturing those signals from a real training run and generating the detector evidence.
+Start with stock Rerun and reuse the MoE recording and blueprint from the bake-off. Capture those signals from a real training run, stream them to the self-hosted ingest server for multi-node storage and live detection, and generate the detector evidence.
 
 | Piece | Build or borrow | Implementation | Note |
 | --- | --- | --- | --- |
-| Capture SDK | Build | Python | One line to add. Tags the tensor stream with the MLflow run first; W&B as a later target. Built in `sdk/`; writes JSON Lines until the ingest server exists |
-| Detectors | Build | Python for v1 | MoE routing imbalance, non-finite values and cross-GPU drift. Built in `sdk/src/tensorlens/evidence.py` and run on the JSON Lines files. Move to Rust only if the ingest server needs them in-process |
-| Ingest server | Build | Rust | Receives Arrow data and stores Parquet. Not started |
-| Evidence and Rerun export | Build | Viewer-neutral JSON, `.rrd`, Rerun blueprint | Export the incident summary, status heatmap, expert-load table, and training-step timeline. Built from the bake-off's exporter (`python -m tensorlens`) |
-| Incident view | Conditional | Rust (`re_viewer`, egui) | Prototype one custom view inside Rerun if trials show that layer selection and table sorting materially improve diagnosis |
-| MLflow importer | Build | Python (`mlflow`, `rerun-sdk`) | Writes runs logged without the SDK to `.rrd` with the same exporter, so they open in Rerun |
-| Viewer and screenshots | Borrow | Rerun (MIT / Apache 2.0) | Stock desktop viewer, built-in views, timeline, headless screenshots, and viewer MCP |
+| Capture SDK | Build | Python (`sdk/src/tensorlens/`) | One line to add (`tensorlens.init(model)`). Tags the tensor stream with the MLflow or W&B run ID and writes `tensorlens-out/<run_id>.rank<rank>.jsonl` through a bounded queue (`WRITER_QUEUE = 8`) |
+| Opt-in Flight sender | Build | Python (`sdk/src/tensorlens/flight.py`) | Activated by `endpoint=` or `TENSORLENS_ENDPOINT`. Tails the local `.jsonl` file from `<run_id>.rank<rank>.offset` and streams `RecordBatch`es over Arrow Flight `DoPut` |
+| Ingest server | Build | Rust (`server/`) | Single self-hosted binary (`tensorlens-server`). Receives Arrow Flight `DoPut`, deduplicates by `(run_id, rank, step)`, and flushes partitioned Parquet to S3, GCS, or local disk via `object_store` |
+| Detectors | Build | Python (`sdk/src/tensorlens/evidence.py`) | Ten incident kinds across MoE routing, weights, gradients, activations, step numbers, non-finite values, and cross-GPU drift. Runs on local `.jsonl` or live server Parquet (`python -m tensorlens --watch`). Port to Rust only if the 64-rank benchmark exceeds 250 ms per flush |
+| Evidence and Rerun export | Build | Viewer-neutral JSON (`schema_version: 1`), `.rrd`, Rerun blueprint | Exports the incident summary, status heatmap, expert-load table, probe tab, and training-step timeline (`python -m tensorlens`) |
+| Incident view | Conditional | Rust (`re_viewer`, egui) | Prototype one custom view inside Rerun only if Gate 1 shows a ≥2× reduction in diagnosis time or agent tool calls |
+| Viewer and screenshots | Borrow | Rerun 0.43.2 (MIT / Apache 2.0) | Stock desktop viewer, built-in views, timeline, headless screenshots, and `rerun viewer-mcp` |
 | Run metadata | Borrow | MLflow or W&B | Params, lineage, artifacts |
-| Diagnosis | Borrow | The team's own coding agent | Reads TensorLens JSON and inspects the recording through Rerun's viewer MCP |
+| Diagnosis | Borrow | The team's own coding agent | Reads TensorLens `evidence.json` and inspects the recording through Rerun's viewer MCP |
 
-Postponed from v2: your own VLM agent loop, the agent-written layout blueprints, live fixes to a running optimizer, and a browser client of your own.
+Postponed from v2 and v1: a built-in VLM agent loop, agent-written layout blueprints, live fixes to a running optimizer, a custom browser client, Tier 3 activation replay, and the MLflow scalar-only run importer (revisit the importer only if three or more engineers join the project).
 
 ## Capture SDK
 
-Inside the compiled graph, hooks compute only cheap statistics of fixed size. Copies to the CPU, Arrow encoding and anything bigger happen outside the compiled step.
+Inside the compiled graph, hooks compute only cheap statistics of fixed size. Copies to the CPU, JSONL writing, Arrow Flight encoding, and probe passes happen outside the compiled step.
 
-**Setup for the user:** `pip install` and `tensorlens.init(model)`, with the team's MLflow configuration left unchanged. `init` tags the tensor stream with the tracker's run ID, and the SDK records its own global step with every batch.
+**Setup:** `python -m pip install -e 'sdk[rerun]'` and `tensorlens.init(model)`, with the team's MLflow or W&B configuration left unchanged. `init` tags the tensor stream with the tracker's run ID, and the SDK records its own global step with every batch.
 
-- **Run ID.** Take an explicit `run_id=` first, then `MLFLOW_RUN_ID` or `mlflow.active_run()`. `active_run()` is thread-local and is `None` whenever a run was created through `MlflowClient`. PyTorch Lightning's `MLFlowLogger` works that way and only creates the run on rank 0 (`@rank_zero_experiment`), so offer a Lightning callback that reads `trainer.logger.run_id` on rank 0 and broadcasts it to the other ranks.
-- **Step.** An MLflow run has no current step; the step is passed with each `log_metric` call. Count optimizer steps with `register_optimizer_step_post_hook` (imported from `torch.optim.optimizer`, since `torch.optim` deletes the `optimizer` submodule attribute; that way `init(model)` needs no optimizer argument), or take `step=` from the caller or from `trainer.global_step` in the callback. The hook count misses steps that mixed precision skips; see the rules below.
+- **Run ID.** Takes an explicit `run_id=` first, then `MLFLOW_RUN_ID`, `mlflow.active_run()`, or `wandb.run.id`. Today, if none is set, `run_id` is `None` and records go to `tensorlens-out/run.rank<rank>.jsonl`, so separate runs in the same directory append to the same file; Step 10a generates a unique `run-<utc_YYYYMMDD_HHMMSS>-<hex6>` ID instead. Because `mlflow.active_run()` is thread-local and `None` when a run was created through `MlflowClient` (as PyTorch Lightning's `MLFlowLogger` does on rank 0 via `@rank_zero_experiment`), the planned Lightning callback (Step 10b, `sdk/src/tensorlens/lightning.py`, not built) will read `trainer.logger.run_id` on rank 0 and broadcast it to all ranks; until then, pass `run_id=self.logger.run_id`.
+- **Step.** An MLflow run has no current step; the step is passed with each `log_metric` call. By default (`auto_step=True`), TensorLens counts training iterations through `register_optimizer_step_post_hook` (imported from `torch.optim.optimizer`), or takes `step=` from `session.step(step=...)` / `trainer.global_step` when `auto_step=False`. With multiple optimizers on one model (such as Muon plus AdamW), the first optimizer to step becomes the lead optimizer and commits the iteration's step; other optimizers in the same iteration are deduplicated by parameter gradient `(id(p.grad), p.grad._version)` signatures (`sdk/src/tensorlens/capture.py`). When `torch.amp.GradScaler` skips `optimizer.step()` on gradient overflow, neither optimizer hook fires; use `auto_step=False` and call `session.step(lr=...)` once per iteration, or attach `scaler=` (planned in Step 10b) to record skipped overflow steps.
 
 Do not ship a tracking-store plugin with its own URI scheme (`tensorlens+https://…`). MLflow selects the plugin by scheme, but its proxied artifact store (`mlflow-artifacts:`) accepts only `http` and `https` tracking URIs, so `log_artifact` would fail for teams that use it. The model registry would also need its own plugin.
 
-**Rules**
+**Rules (matching `sdk/src/tensorlens/capture.py` and `probe.py` at `ffdbabd`)**
 
-- Register forward hooks **before** `torch.compile` and never change them afterwards. With default settings, hooks added to a module that had none when it was compiled are silently ignored (`skip_nnmodule_hook_guards`). On a module that already had hooks, Dynamo guards the hook dictionary, so adding, removing or replacing one triggers a recompile.
-- Hook bodies compute mean, std, absolute max and zero fraction per layer, and write into GPU buffers allocated once and marked with `torch._dynamo.mark_static_address`. No histograms, `.cpu()`, numpy or I/O inside a hook. With gradient accumulation or activation checkpointing, a hook runs more than once per optimizer step and keeps the last forward pass's values.
-- No backward hooks. Read `p.grad` norms in an optimizer step pre-hook (`register_optimizer_step_pre_hook`, before `step()` or `zero_grad()`) with `torch._foreach_norm(..., dtype=torch.float32)`. Group gradients by `(device, dtype)` first, as `clip_grad_norm_` does, or a mixed-dtype list falls back to the slow per-tensor path; unwrap `DTensor`s with `.to_local()`. `_foreach_norm` is a private API, so test it on each supported PyTorch release and fall back to `torch.linalg.vector_norm` per tensor.
-- The global optimizer hooks have two blind spots:
-  - **Every optimizer.** They fire for every optimizer in the process, including ones for other models, so keep only the parameters of the model passed to `init`.
-  - **Overflow steps.** With mixed precision, `GradScaler.step` skips `optimizer.step()` when gradients overflow, so neither hook fires. Those are the steps that matter most, and a step counter built on the post-hook falls behind the trainer's. Record skipped steps from the scaler's `found_inf` or from the training loop, and prefer the caller's or Lightning's step over the hook count when one is available.
-- The pre-hook runs after any gradient clipping the user does, so it records clipped norms, which hide gradient explosions. Label Tier 0 gradient norms as post-clipping, or read them before clipping through the Lightning callback (`on_before_optimizer_step` runs before Lightning clips) or an explicit `tensorlens.record_grads()` call.
-- Fixed shapes only inside compiled hooks: `scatter_add_` into `zeros(n_experts)` is fine; `bincount` and `nonzero` have data-dependent output shapes and are not.
-- After each optimizer step, copy the hook buffers into row `step % N` of a GPU ring buffer, outside the graph. A step counter used inside the compiled region would force a recompile on every step.
-- Every N steps, after `optimizer.step()`, move the float32 ring buffer to the CPU with one `.cpu()` call (plus a second `.cpu()` call for int64 MoE expert counts when routers are watched, since packing counts into float32 loses exactness above $2^{24}$ tokens). A worker thread builds the Arrow batch and sends it over Arrow Flight.
-- Add pinned buffers and a side CUDA stream only if the overhead gate shows a stall.
-- Histograms and attention come from a probe pass: every M steps, one fixed batch through the wrapped model under `no_grad` and `torch.compiler.set_stance("force_eager")` (PyTorch 2.6+). That runs the same FSDP- or TP-wrapped model without the compiler. On older PyTorch the fallback is `model._orig_mod`, which only unwraps an outer `torch.compile(model)`; it does not bypass blocks compiled one by one, as is common with FSDP2's `fully_shard`, and it is untested with sharded parameters. `no_grad` does not stop dropout, batch-norm updates or router noise, so snapshot each submodule's `training` flag, call `model.eval()` for the probe, and restore the saved flags afterwards (a blanket `model.train()` would unfreeze submodules kept in `eval()` and trip Dynamo's `training` guards). On CUDA, `torch.histc` rejects `bf16` and `fp16` tensors, syncs with the CPU when `min == max`, and errors under `torch.use_deterministic_algorithms(True)`, so cast probe activations to `float32` and pass explicit `min < max` bounds. To capture attention maps on the probed layers, temporarily interpose `F.scaled_dot_product_attention` during the probe so it computes explicit `softmax(QKᵀ)` instead of calling the fused kernel.
-- Run the probe after the ring-buffer copy, because the hooks fire during the probe too and overwrite the step's statistics.
-- Two cases the explicit-attention replacement must handle (noted Nov 14, 2026). Grouped-query attention: Hugging Face's SDPA path (`transformers/integrations/sdpa_attention.py`, 5.5.4) passes `enable_gqa=True` on CUDA when there is no attention mask, so `key` and `value` can have fewer heads than `query`; repeat them to the query's head count (`repeat_interleave` on the head dimension) before `QKᵀ`. FlashAttention 2: a model loaded with `attn_implementation="flash_attention_2"` never calls `F.scaled_dot_product_attention`, so interposing it captures nothing; for Hugging Face models, switching the probed model to the `eager` implementation, which returns attention weights itself, may be simpler than patching SDPA. Check both before building step 16.
-- With plain data parallelism, rank 0 reports the Tier 0 statistics. With pipeline or tensor parallelism, every rank that owns layers reports its own, or layers on other ranks go unseen.
-- CI gate: `TORCH_LOGS="graph_breaks,recompiles,cudagraphs"` must show zero breaks and recompiles with the SDK on. With `mode="reduce-overhead"`, the log must also not contain "skipping cudagraphs due to mutated inputs". A hook's in-place write into a preallocated buffer is an input mutation unless the buffer is a module buffer or marked with `torch._dynamo.mark_static_address` (with `cudagraph_trees` enabled), which can otherwise turn CUDA graphs off while breaks and recompiles stay at zero. The skip is logged as a warning, so it prints without `cudagraphs`; adding it also shows the non-warning CUDA-graph messages.
+- **Static compiled hooks.** Register forward hooks **before** `torch.compile` and keep them attached after `session.close()`. With default PyTorch settings, hooks added to a module that had none when compiled are silently ignored (`skip_nnmodule_hook_guards`); on a module that already had hooks, Dynamo guards the hook dictionary, so adding or removing a hook triggers a recompile. `init()` rejects an outer `torch.compile(model)` wrapper (`_orig_mod`).
+- **Fixed-shape on-device hook bodies.** Hook bodies compute mean, std, absolute max, and zero fraction per watched module (or router expert counts via compare-and-sum into an `int64` buffer) and write into preallocated on-device buffers marked with `torch._dynamo.mark_static_address`. No histograms, `.cpu()`, `bincount`, `nonzero`, numpy, or I/O run inside a compiled hook. Across microbatches (gradient accumulation), hooks keep the largest `abs_max`, sum router counts, and keep the last microbatch's `mean`, `std`, and `zero_frac`; recomputed forward passes during activation checkpointing backward are skipped.
+- **Gradient norms without backward hooks.** Read `p.grad` norms in `register_optimizer_step_pre_hook` (before the lead optimizer's `step()` or `zero_grad()`, or after `step(closure)` when a closure is used) with `torch._foreach_norm(..., dtype=torch.float32)`, grouped by `(device, dtype)` after unwrapping `DTensor.to_local()`, falling back to chunked `torch.linalg.vector_norm` when `_foreach_norm` is unavailable. Because the pre-hook runs after user gradient clipping, TensorLens also wraps `torch.nn.utils.clip_grad_norm_` while the session is open (and keeps the wrapper callable after `close()`) to record the pre-clipping total norm (`clip_grad_norm`) at zero extra cost; callers can also call `session.record_grad_norm(norm)` or `session.record_grads()` before manual clipping.
+- **Ring buffer and bounded writer queue.** On each step, outside the compiled graph, hook buffers copy into slot `_slot` of an on-device ring buffer of length `every` (`every=50` by default). Every `every` steps (and on `close()`), the float32 ring buffer, int64 router counts, clip-norm ring, replica-spread ring, and logged-scalar ring move to the CPU and are enqueued to a background writer thread with a bounded queue (`WRITER_QUEUE = 8` blocks of `every` steps). If the sink stalls, training blocks on `queue.put` with a one-time `RuntimeWarning` rather than growing host memory or dropping steps.
+- **Tier 2 probe pass (`probe=`, `probe_every=1000`).** Requires PyTorch 2.6+ (`torch.compiler.set_stance("force_eager")`). Runs after the step's ring-buffer copy and clears the capture hook buffers afterwards so probe activations never pollute training statistics. Snapshots and restores each submodule's `training` flag, turns off deterministic algorithms for `histc` / `index_add_`, and restores CPU/CUDA RNG states. Temporarily switches Hugging Face `flash_attention_2` and `flash_attention_3` modules to `sdpa` and wraps `F.scaled_dot_product_attention` so the fused kernel still produces the forward output while the wrapper recomputes `softmax(QKᵀ)` in query blocks of at most $2^{26}$ scores (256 MB), repeating `key` heads to match `query` heads under grouped-query attention (`enable_gqa`). Each query row's entropy is normalized by the log of that row's visible key count (`entropy_share`), excluding all-masked and non-finite rows. If a probe raises an exception, `probe.error` is recorded with a `RuntimeWarning` and the step record is preserved.
+- **Per-rank files.** Every rank writes its own file, `tensorlens-out/<run_id>.rank<rank>.jsonl`, reading the rank from `torch.distributed` or `RANK` / `LOCAL_RANK`.
+- **Compiler gate.** Verified in-process via Dynamo counters: [test_compile.py](sdk/tests/test_compile.py) and [test_probe.py](sdk/tests/test_probe.py) run on CPU with `error_on_recompile=True` and check `counters["graph_break"]` is empty; [gpu_check.py](sdk/examples/gpu_check.py) also checks `counters["inductor"]["cudagraph_skips"]` on CUDA, with `TORCH_LOGS="graph_breaks,recompiles,cudagraphs"` enabled for diagnostic logs.
 
 **Data tiers**
 
 | Tier | Data | Computed how | When | Approx. size |
 | --- | --- | --- | --- | --- |
-| 0 | Loss, grad norms, router entropy, per-layer activation mean, std, absolute max, zero fraction | Hooks inside the graph; `_foreach_norm` after backward | Computed every step, sent every N steps | \~1.3 KB per step for 80 layers |
-| 1 | MoE expert load table, dead-expert fraction, diversity exp(H)/N | `scatter_add_` on top-k indices, summed across data-parallel ranks | Every N steps | \~30 KB for 60 layers × 128 experts |
-| 1 | Cross-GPU spread: norm and sum per replicated parameter tensor | Per-rank float64 norm and sum, one `all_gather`, spread computed on rank 0 | Every N steps | 16 bytes per tensor per rank |
-| 2 | Activation histograms (64 bins) per layer | Probe pass, `histc` per layer | Every M steps | \~20 KB for 80 layers |
-| 2 | Attention maps, entropy and max logit for a few layers and heads | Probe pass with explicit softmax(QKᵀ); maps downsampled to 256×256 | Every M steps | \~0.5 MB per layer |
-| 3 | Full activations for the layers a detector flagged | Replay the flagged batch from a ring buffer of batch IDs and seeds | Only when a detector fires | MB to GB, written to Parquet |
+| 0 | Logged scalars (`session.log`), learning rate, `clip_grad_norm`, per-parameter `grad_norms`, per-block activation `mean`, `std`, `abs_max`, `zero_frac`, and 50-step float64 `weight_norms` / `weights_unchanged` | Forward hooks into static buffers; `_foreach_norm` in optimizer pre-hook | Computed every step (weights every 50), flushed to CPU every `every=50` steps | ~26 KB JSON per step on Granite full capture |
+| 1 | MoE expert load counts (`moe`), router entropy, diversity `exp(H)/N`, dead-expert fraction (`moe_stats`), and `moe_top_k` | On-device compare-and-sum per router in forward hook; entropy and diversity computed on CPU flush | Accumulated every step, flushed every `every=50` steps | ~4 KB JSON per step for 24 routers × 32 experts |
+| 1 | Cross-GPU spread (`replica_spread`): float64 L2 norm and sum per replicated parameter | Per-rank float64 norm and sum after `optimizer.step()`, one `all_gather` on `replica_group` | Every `replica_every=50` steps where `(step + 1) % replica_every == 0` | 16 bytes per parameter tensor per rank on the wire |
+| 2 | Activation histograms (64 bins) per repeated block; per-head attention `max_logit`, `entropy`, `entropy_share`, `masked_rows`, `invalid_rows`, and 64×64 pooled attention map | Eager probe pass (`force_eager`, `no_grad`) on a fixed batch | Every `probe_every=1000` steps | ~0.5–2 MB JSON per probe step on Granite (24 layers) |
+| 3 | Full activations for flagged layers (replay) | Postponed from v1 | — | — |
 
-As built on Nov 14, 2026, the capture differs from this table:
-
-- **Loss** is not captured on its own. Since Nov 14, 2026, `session.log({"train/loss": loss})` records it and any other scalar without a GPU sync; incidents carry the logged values at their step. Automatic capture by patching `Tensor.backward` was rejected: Megatron calls `torch.autograd.backward` directly, and under `GradScaler` it would see the scaled loss.
-- **Router counts** are accumulated on every step in the router hook, inside the compiled graph, with a compare-and-sum into an int64 buffer rather than `scatter_add_`, and copied every N steps. Entropy, diversity and dead experts are computed on the CPU when records are written. Counts are not summed across data-parallel ranks; each rank writes its own file.
-- **Activation statistics, per-parameter gradient norms and the 50-step float64 weight check** run only in full capture; router-only is the MoE default. Activations are per repeated block by default.
-- **Cross-GPU spread** runs every 50 steps by default (`replica_every=`), like Megatron's `check_weight_hash_across_dp_replicas_interval`, rather than once per N-step transfer. Until Nov 14, 2026 it ran on every step, a float64 norm and sum over every replicated parameter plus one `all_gather`; a float64 pass over Granite's weights costs about 3.7 ms on the RTX PRO 6000.
-- **Tier 2, the probe pass,** was built on Nov 14, 2026 (`probe=`, every 1,000 steps by default): histograms per repeated block rather than per layer, and attention logit and entropy for every head of every SDPA call, with maps averaged over heads and pooled to 64×64 rather than 256×256 for a few heads. Not run on a GPU, and no detector uses it yet. **Tier 3** (replay) is not built.
-
-Attention needs the probe because FlashAttention and SDPA never store the attention map. The probe uses a fixed batch, so it compares cleanly across steps but does not show the live batch; the Tier 3 replay covers that. Sizes are estimates.
+Attention requires the Tier 2 probe pass because FlashAttention and fused SDPA never materialize the attention matrix during training. The probe uses a fixed batch so distributions and attention maps compare cleanly across steps.
 
 ## W&B support
 
 Support W&B from inside the customer's own training script. Hold off on anything that uses a customer's W&B key until a lawyer has read W&B's terms.
 
-| Route | What it does | Risk |
+| Route | What it does | State and risk |
 | --- | --- | --- |
-| Read the active run in the script | `tensorlens.init(model)` reads `wandb.run.id` once when a run is active and tags the tensor stream with it | Low. It uses the MIT-licensed client on the customer's machine and touches no W&B server |
-| Wrap `wandb.log` | Keeps TensorLens steps aligned with the steps W&B records | Low, but it leans on client behaviour that can change between releases. Handle `commit=False`, explicit `step=`, and step metrics set with `define_metric` |
-| Viewer reads W&B history with the customer's key, on their machine | Pulls scalars into the viewer next to the tensor views | Needs legal review. The terms restrict accessing the service to build a competing product |
-| Your hosted service holds the customer's W&B key | Your cloud pulls their W&B data | Highest. The terms also restrict sharing access credentials with a third party |
+| Read the active run in the script | `tensorlens.init(model)` reads `wandb.run.id` once when a run is active (after `run_id=`, `MLFLOW_RUN_ID`, and `mlflow.active_run()`) and tags the tensor stream with it | **Built.** Low risk: uses the MIT-licensed client on the user's machine and touches no W&B server |
+| Wrap `wandb.log` | Keeps TensorLens steps aligned with the steps W&B records | **Not built.** Low legal risk, but leans on client internals (`commit=False`, explicit `step=`, `define_metric`) |
+| Viewer reads W&B history with the customer's key, on their machine | Pulls scalars into the viewer next to the tensor views | **Not built.** Needs legal review; terms restrict accessing the service to build a competing product |
+| Hosted service holds the customer's W&B key | Cloud service pulls their W&B data | **Not built.** Highest risk; terms also restrict sharing access credentials with a third party |
 
-Do not read `wandb.run.step` per training step. It waits on a round trip to the W&B background process, with a 30-second timeout, and raises an error in `mode="shared"` runs. It is also W&B's own log counter, not the training step: PyTorch Lightning's `WandbLogger` records the step as a `trainer/global_step` metric. Use the SDK's own global step and record the W&B step only as metadata.
+Do not read `wandb.run.step` per training step. It waits on a round trip to the W&B background process, with a 30-second timeout, and raises an error in `mode="shared"` runs. It is also W&B's own log counter, not the training step: PyTorch Lightning's `WandbLogger` records the step as a `trainer/global_step` metric. Use the SDK's own global step.
 
 The W&B Python client is MIT-licensed. The W&B server is proprietary, and its free local licence is for personal projects only, so never bundle it. If TensorLens ever ships a default metadata server, use MLflow, whose client and server are both Apache 2.0. The terms were read through a third-party summary, not the original text.
 
@@ -117,85 +97,24 @@ This detector checks that weights meant to be identical copies on several GPUs s
 
 **Why it is in the plan.** In the BLOOM-176B run, gradient clipping was applied on only one worker in each tensor-parallel group. LayerNorm weights that should have matched drifted apart while the loss curve looked healthy. It was found 13 days into the run, by a test that compared the weights across ranks, and the bug predated the run (TrainCheck's write-ups say ten or fifteen days). A separate study of faulty hardware found the same pattern: parameters on an unhealthy node drift while the loss stays close to normal.
 
-**How it works**
+**How it works (`sdk/src/tensorlens/distributed.py`)**
 
-1. Every N steps, after `optimizer.step()`, each rank computes two fingerprints per parameter tensor: its L2 norm and its sum, both in float64.
-2. The ranks that hold copies of the same weights share their fingerprints with one small `all_gather`.
-3. One rank in that group computes the spread across ranks for each tensor, relative to the tensor's norm, and sends it to the ingest server.
-4. The detector fires when either spread passes a tolerance. Start at 1e-6 and tune it on healthy runs.
+1. Every `replica_every` steps (`50` by default), where `(step + 1) % replica_every == 0` after `optimizer.step()`, each rank computes two fingerprints per parameter tensor: its L2 norm and its sum, both in float64. Scheduling from the shared step number rather than a rank-local call counter guarantees every rank enters the collective on the exact same step.
+2. The ranks that hold copies of the same weights share their `[n_params, 2]` fingerprints with one `dist.all_gather` on `replica_group` (16 bytes per parameter tensor per rank).
+3. Every rank in `replica_group` computes `max(norm_spread, sum_spread) / max(mean_norm, 1e-12)` per parameter and records it in its own step record as `replica_spread`; a NaN or Inf weight on any rank makes that parameter's spread non-finite.
+4. The detector (`sdk/src/tensorlens/evidence.py`) fires when `max(norm_spread, sum_spread)` normalized by the parameter's mean L2 norm across ranks exceeds `drift_tolerance` (`build_evidence(..., drift_tolerance=1e-6)` by default, one relative tolerance for both spread components) or is not finite; non-finite parameters carry `"non_finite": true` in the `replica_drift` incident.
 
-It runs outside the compiled step and needs no hooks. The evidence it hands to the agent and the viewer is a table of rank by layer spread, with the first step at which each layer diverged.
+It runs outside the compiled step and needs no hooks. See the implementation in [distributed.py](sdk/src/tensorlens/distributed.py) and the two-process test script in [replica_check.py](sdk/examples/replica_check.py), which also handle empty parameter shards, Apple MPS fallback (where float64 is unavailable), missing `_foreach_norm`, and non-finite weights.
 
-```python
-# Every N steps, after optimizer.step(), outside the compiled step.
-# Run on two CPU processes with Gloo (sdk/examples/replica_check.py); not yet on two GPUs.
-import torch
-import torch.distributed as dist
-from torch.distributed.tensor import DTensor
-
-F64 = torch.float64
-CHUNK = 1 << 24  # elements per float64 chunk: at most 128 MB extra memory
-
-
-def _sum_f64(p):
-    # p.sum(dtype=float64) on a bf16 tensor copies the whole tensor to float64 first.
-    flat = p.reshape(-1)
-    return torch.stack([c.sum(dtype=F64) for c in flat.split(CHUNK)]).sum()
-
-
-def _norms_f64(tensors):
-    # _foreach_norm's fused CUDA kernel requires each call's list to share one
-    # device and dtype, and be contiguous; mixed dtypes fall back to per-tensor
-    # vector_norm, which copies bf16 tensors to float64 first.
-    norms = [None] * len(tensors)
-    groups = {}
-    for i, p in enumerate(tensors):
-        if p.is_cuda and p.is_contiguous() and p.numel() > 0:
-            groups.setdefault((p.device, p.dtype), []).append((i, p))
-        else:
-            flat = p.reshape(-1)
-            norms[i] = torch.linalg.vector_norm(
-                torch.stack([torch.linalg.vector_norm(c, dtype=F64) for c in flat.split(CHUNK)])
-            )
-    for group in groups.values():
-        idxs, ts = zip(*group)
-        for i, n in zip(idxs, torch._foreach_norm(ts, 2, dtype=F64)):
-            norms[i] = n
-    return torch.stack(norms)
-
-
-@torch.no_grad()
-def replica_spread(params, group):
-    # params: tensors meant to be identical on every rank in `group`.
-    # group: the replication group. Pass dist.group.WORLD only for plain DDP;
-    # under tensor, pipeline or hybrid-FSDP parallelism WORLD compares the wrong ranks.
-    if group is None:
-        raise ValueError("pass the replication process group explicitly")
-    local = [p.to_local() if isinstance(p, DTensor) else p for p in params]
-    if not local:
-        raise ValueError("no replicated parameters to check")
-    norms = _norms_f64(local)
-    sums = torch.stack([_sum_f64(p) for p in local])
-    fp = torch.stack([norms, sums], dim=1)      # [n_params, 2]
-    out = [torch.empty_like(fp) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(out, fp, group=group)       # 16 bytes per tensor per rank
-    allfp = torch.stack(out)                    # [ranks, n_params, 2]
-    spread = allfp.max(0).values - allfp.min(0).values
-    scale = allfp[..., 0].mean(0).clamp_min(1e-12)   # mean norm per tensor
-    return spread / scale[:, None]              # [n_params, 2]
-```
-
-The sum is there because a norm cannot see a sign flip: `[1, -1]` and `[1, 1]` have the same norm and different sums. Both fingerprints are float64, because a norm or sum in bf16 or fp16 is too coarse to show small drift.
-
-On CUDA, `torch._foreach_norm(ts, 2, dtype=torch.float64)` reads bf16 and fp16 tensors directly in one fused kernel per `(device, dtype)` group; an ungrouped list with mixed dtypes (such as bf16 weights and fp32 LayerNorm weights) silently falls back to `vector_norm` per tensor. `vector_norm(p, dtype=torch.float64)` and `p.sum(dtype=torch.float64)` convert the whole tensor to float64 first, which briefly needs four times a bf16 tensor's memory, so sums and any non-fast-path norms are taken in chunks. `_foreach_norm` is private, as noted in the capture rules. The run time and memory cost are unmeasured.
+The sum is paired with the L2 norm because a norm cannot see a sign flip: `[1, -1]` and `[1, 1]` have the same norm and different sums. Both fingerprints are float64 because a norm or sum in bf16 or fp16 is too coarse to show small drift. On CUDA, `torch._foreach_norm(ts, 2, dtype=torch.float64)` reads bf16 and fp16 tensors directly in one fused kernel per `(device, dtype)` group; sums and non-fast-path norms split flat tensors into `1 << 24`-element chunks (at most 128 MB temporary float64 memory). A float64 norm pass over Granite's 2.6 GB of bf16 weights measured ~3.7 ms per check on the RTX PRO 6000 (~0.07 ms/step amortized at `replica_every=50`); the two-GPU `all_gather` cost over NCCL is not yet measured.
 
 **Where it applies**
 
 | Setup | What is checked | Note |
 | --- | --- | --- |
-| DDP (data parallel) | Every parameter | Each rank holds a full copy, and the copies should stay in sync |
-| Tensor parallelism | Only weights replicated across ranks, such as LayerNorm | The user or an integration has to say which ones; this is the BLOOM case |
-| Hybrid FSDP (sharded inside a node, replicated across nodes) | Each rank's local shard, compared across the replication group | Pass that process group as `group`. FSDP2 and tensor-parallel parameters are `DTensor`s, so take `.to_local()` before fingerprinting, as the code does. FSDP1's flat parameters need another route. Both are untested |
+| DDP (data parallel) | Every trainable parameter | Pass `replica_group=dist.group.WORLD`; each rank holds a full copy |
+| Tensor parallelism | Only weights replicated across TP ranks, such as LayerNorm | Requires adding `replica_params=` (an optional parameter list or name predicate) to `tensorlens.init()` in Step 12b; without it, `init()` fingerprints all trainable parameters |
+| Hybrid FSDP (sharded inside a node, replicated across nodes) | Each rank's local shard, compared across the inter-node replication group | Pass the replication process group as `replica_group=`. `distributed.py` unwraps FSDP2 `DTensor`s via `.to_local()`; FSDP1 flat parameters are not supported |
 | Fully sharded (FSDP full shard, ZeRO-3) | Nothing | Each rank holds a different shard, so there are no copies to compare |
 
 **Limits**
@@ -203,160 +122,234 @@ On CUDA, `torch._foreach_norm(ts, 2, dtype=torch.float64)` reads bf16 and fp16 t
 - A swap of two values inside a tensor changes neither the norm nor the sum. A weighted sum with fixed pseudo-random weights would catch it, for one extra pass over the tensor. Add a full hash at checkpoint time if that matters.
 - Buffers such as BatchNorm running statistics differ per rank by design and are left out.
 - It does not catch faults that hit every rank alike, slow nodes, or crashes.
-- The tolerance, the cost and the code are untested. Include a cross-GPU drift case and a sign-flip case in the seeded failures for Gate 2.
+- Verified on two CPU processes with Gloo ([replica_check.py](sdk/examples/replica_check.py)); the two-GPU NCCL run and the `1e-6` tolerance on healthy multi-GPU training are pending Gate 2.
+
+## Ingest server and local-first streaming
+
+Multi-node runs need a single store that collects every rank's stream and runs detectors before the job ends. The ingest pipeline combines three patterns from the reference codebases:
+
+- **Local log first and offset-based flow control (from W&B):** W&B writes every record to its local `.wandb` transaction log first and keeps at most 32 records in memory (`InMemorySize: 32`), collapsing any network backlog into a 24-byte file-offset range (`FlowControlBufferSavedChunk` in `wandb/core/internal/stream/flowcontrolbuffer.go`) and seeking back to `lastReadOffset` when a trailing record is incomplete (`ResetLastRead` in `wandb/core/internal/runsync/runreader.go`). By contrast, MLflow's `AsyncLoggingQueue` buffers in an unbounded Python `Queue()` with no disk log (`mlflow/utils/async_logging/async_logging_queue.py`), and Rerun's `re_grpc_client` drops queued messages if its 5-second flush times out (`re_grpc_client/src/write.rs`).
+- **Single-binary self-hosted Rust server with bounded byte quota (from Rerun):** Rerun ships an open-source Rust server (`re_server` on port `51234`, `re_grpc_server` on port `9876`) using `tonic`, `arrow`, `parquet`, `object_store`, `tcp_nodelay(true)`, `http2_adaptive_window(true)`, a Bearer token `Authenticator` interceptor (`re_auth`), and a byte-bounded input channel (`CHANNEL_SIZE_BYTES = 128 MiB` in `re_quota_channel`).
+- **Composite-key deduplication on retry (from W&B and MLflow):** W&B deduplicates `file_stream` retries by virtual line offset (`HistoryLineNum` in `filestreamstate.go`), and MLflow deduplicates `LogBatch` retries by upserting on `(run_uuid, key, step, timestamp)` (`sqlalchemy_store_upsert_utils.py`).
+
+### Specification
+
+1. **Local append-only file (`sdk/src/tensorlens/sink.py`):**
+   - The SDK always writes `tensorlens-out/<run_id>.rank<rank>.jsonl` first via the bounded 8-block `JsonlSink` queue (`WRITER_QUEUE = 8`). Each JSON line carries `"run_id"`, `"rank"`, `"step"` and the captured metrics; Step 10a adds `"schema_version": 1` and a `"ts"` timestamp, which records do not have yet.
+   - Local files use JSON Lines rather than Parquet because Parquet writes its footer only on close; a killed or preempted training process would leave an unreadable Parquet file.
+2. **Opt-in Flight sender (`sdk/src/tensorlens/flight.py`):**
+   - Enabled only when `endpoint=` or `TENSORLENS_ENDPOINT` (`grpc://host:port` or `grpcs://host:port`) is set; default local runs open zero sockets.
+   - A background daemon thread tails `tensorlens-out/<run_id>.rank<rank>.jsonl` from the byte offset saved in `tensorlens-out/<run_id>.rank<rank>.offset` (updated via atomic write-and-rename of `.offset.tmp` after each server `PutResult` ack).
+   - **Torn-line recovery:** only complete lines ending in `\n` that parse as JSON and match `run_id` are batched. If EOF is reached mid-line (or a crashed prior process left a truncated line before the next newline), the sender does not advance past the incomplete tail until `\n` arrives.
+   - **Batching and backoff:** sends a `pyarrow.RecordBatch` over Arrow Flight `DoPut` every **50 steps or 2 seconds** (whichever comes first, capped at **4 MiB** uncompressed). Holds at most one batch in RAM; on disconnect or `Status::resource_exhausted`, sleeps with full-jitter exponential backoff (`100 ms` base, `30 s` cap) and re-reads from the saved `.offset` on reconnect. On `session.close()`, flushes remaining complete lines with a 5-second timeout and prints the local `.jsonl` path if unacked bytes remain.
+3. **Arrow Flight `DoPut` contract and schema (`server/src/ingest.rs`):**
+   - Crate versions: `arrow-flight = "60.1.0"`, `arrow = "60.1.0"`, `parquet = "60.1.0"`, `object_store = "0.14.2"`, `tonic = "0.14"`, `tokio = "1"`.
+   - `FlightDescriptor`: path `["runs", "<run_id>", "rank=<rank>"]`.
+   - `FlightData.app_metadata`: UTF-8 JSON `{"schema_version": 1, "run_id": "<id>", "rank": 0, "min_step": 0, "max_step": 49, "end_byte_offset": 128450}`.
+   - **Arrow schema (one row per step):**
+     - Scalar/vector columns: `schema_version: Int32`, `run_id: Utf8`, `rank: Int32`, `step: Int64`, `ts: Float64`, `lr: List<Float64>`, `grad_norm: Float64` (nullable), `clip_grad_norm: Float64` (nullable), `weight_norm: Float64` (nullable), `weights_unchanged: List<Utf8>` (nullable), `replica_non_finite: List<Utf8>` (nullable).
+     - Map columns: `scalars: Map<Utf8, Float64>`, `grad_norms: Map<Utf8, Float64>`, `weight_norms: Map<Utf8, Float64>`, `moe_top_k: Map<Utf8, Int32>`, `moe_counts: Map<Utf8, List<Int64>>`, `replica_spread: Map<Utf8, List<Float64>>`.
+     - Canonical JSON-string columns for nested objects whose keys vary by model: `layers_json: Utf8` (nullable), `moe_stats_json: Utf8` (nullable), `probe_json: Utf8` (nullable). Storing these three nested structures as UTF-8 JSON strings inside Parquet preserves 100% lossless round-tripping back to the dict format `evidence.py` expects (`IM2`).
+4. **Deduplication, backpressure, auth, and Parquet layout (`server/src/storage.rs`):**
+   - **Watermark deduplication:** the server tracks `last_acked_step: HashMap<(String, i32), i64>`, initialized at startup by reading the `max(step)` row-group statistics from existing Parquet footers under `{store_root}/runs/{run_id}/rank={rank}/`. On each `DoPut` batch, rows with `step <= last_acked_step[(run_id, rank)]` are filtered out before buffering, making client retries idempotent.
+   - **Memory cap:** total buffered Arrow bytes across all open streams are bounded at **128 MiB**. When full, `DoPut` returns `tonic::Status::resource_exhausted("ingest buffer full")` so senders pause on their local `.jsonl` file.
+   - **Parquet flushing:** because S3 and GCS do not support in-place append, each `(run_id, rank)` buffer flushes an immutable Zstd-compressed Parquet part file every **500 steps or 10 seconds** (and on stream EOF or `SIGTERM`) via `object_store::ObjectStore::put` to:
+     `{store_root}/runs/{run_id}/rank={rank}/part-{min_step:08}-{max_step:08}.parquet`
+     and replies with `PutResult{app_metadata: end_byte_offset}` after the flush (or bounded buffer commit) succeeds.
+   - **Authentication and TLS:** `tensorlens-server --listen 127.0.0.1:50051 --store file:///var/lib/tensorlens` binds to loopback by default. Binding to a non-loopback address requires either `TENSORLENS_TOKEN` (checked by a `tonic` interceptor against `Authorization: Bearer <token>` in constant time) or `--allow-unauthenticated`, with optional TLS via `--tls-cert` and `--tls-key`.
+5. **Live detection and the Python-vs-Rust detector benchmark:**
+   - For v1, `python -m tensorlens --watch {store_root}/runs/{run_id}` polls newly written `part-*.parquet` (or local `.jsonl`) files every 2 seconds, reconstructs step dicts losslessly from the Parquet columns, and writes `{run_id}.evidence.json` (`schema_version: 1`) atomically via rename.
+   - **Benchmark protocol before porting detectors to Rust:** run a 64-rank, 1,000-step synthetic MoE stream (50-step flushes) and measure (a) Python `evidence.py` reading new Parquet parts via `pyarrow.parquet` vs. (b) an in-server Rust detector pass over incoming `RecordBatch`es. Keep detectors in Python unless the Python worker exceeds **250 ms** per 50-step flush across 64 ranks or **1 CPU core** steady-state.
 
 ## Viewer and agent evidence
 
-Use stock Rerun 0.43.2 for the first release. Pin the exporter SDK and Viewer together. The [MoE bake-off](experiments/moe-bakeoff/README.md) uses a blueprint and built-in views for the detector summary, status heatmap, per-expert load table, and diversity timeline. Keep the evidence schema independent of Rerun so engineers and agents can read the same numbers in JSON.
+Use stock Rerun 0.43.2 for the first release (`rerun-sdk==0.43.2` pinned in [sdk/pyproject.toml](sdk/pyproject.toml)). The [MoE bake-off](experiments/moe-bakeoff/README.md) and shipped exporter ([rerun_export.py](sdk/src/tensorlens/rerun_export.py)) use a blueprint and built-in views for the detector summary, status heatmap, per-expert load table, probe tab, logged scalars tab, and diversity timeline. Keep the evidence schema independent of Rerun so engineers and agents read the exact same numbers in JSON.
 
-Use Rerun's headless Viewer for per-view PNGs and `rerun viewer-mcp` for screenshots and the widget tree. Give the agent the JSON evidence for the numbers. When exporting a screenshot for a requested run and step, record the actual sample step alongside the PNG and JSON. A view can show the most recent sample at or before the cursor. Verify software rendering in the target Linux environment.
+- **Schemas and versioning (`sdk/src/tensorlens/evidence.py`, `capture.py`).** JSONL step records have no `schema_version` yet; Step 10a adds `"schema_version": 1`, and readers will treat records without it as version `0` (missing `moe_top_k` already defaults from `--top-k`). The exported `<input>.evidence.json` carries `"schema_version": 1`, `"run_id"`, `"layer_count"`, `"expert_count"`, `"router_names"`, `"overload_threshold"`, `"top_k"`, `"starve_window"`, `"starve_ratio"`, `"incidents"` (each with `kind` and `step`, kind-specific fields, and `scalars` when values were logged with `session.log`), and `"samples"` (one per router per step).
+- **Headless screenshots and sample-step sidecar.** Use Rerun's headless Viewer for per-view PNGs and `rerun viewer-mcp` for live screenshots and the widget tree. Because a timeline view displays the most recent sample at or before the cursor, exporting a screenshot for `<run_id>` at requested `<req_step>` writes `<out_dir>/<run_id>.step<req_step>.<view>.png` alongside `<out_dir>/<run_id>.step<req_step>.<view>.meta.json` containing `{"run_id": "<id>", "requested_step": <req_step>, "sample_step": <actual_step>, "view": "<view>", "rrd_path": "<path>"}`.
 
-If the trials show that sorting and a table that follows layer selection materially improve verification, a custom view is needed. In 0.43.2 the built-in dataframe view cannot sort. Rerun's sortable table widget is reachable only through `ViewerClient.send_table`, which opens a separate table page outside the recording and its blueprint, not beside the heatmap.
+If the Gate 1 trials show that sorting and a table that follows layer selection cut diagnosis time or agent tool calls by at least 2×, prototype a single custom Rust `ViewClass` in up to one week (`viewer/` crate, pinned to Rerun `0.43.2` tag `0.43.2` from `rerun-io/rerun` `examples/rust/custom_view`). In 0.43.2 the built-in dataframe view cannot sort, and `ViewerClient.send_table` opens a separate table page outside the recording blueprint.
 
-Spend up to one week prototyping those interactions in a single Rust `ViewClass`. Register it in a pinned Rerun app using the upstream `custom_view` example. Check that selection and scrubbing stay synchronized and that the same view can render headlessly.
-
-- **Headless.** The example starts a windowed viewer with `re_viewer::run_native_app`, whose closure returns `Result<Box<dyn eframe::App>, _>`. `re_viewer::run_headless_app` takes a closure returning concrete `re_viewer::App` directly, plus an optional window size, and needs no main-thread token, so share a `create_app(cc) -> re_viewer::App` helper between the two branches as the `rerun` CLI does.
-- **Command line.** The example has none of the stock `rerun` flags (`--headless`, `--window-size`, `.rrd` loading), so the prototype has to add the ones it needs.
-- **Agent access.** `rerun viewer-mcp` runs as its own process and connects to a viewer's control port. The example's gRPC server serves that port, so the stock MCP server should drive the custom app as well; check it in the spike. Estimate the upgrade work before committing to it. Rune remains an option if a separate TensorLens app becomes necessary.
+- **Headless.** Share a `create_app(cc) -> re_viewer::App` helper between `re_viewer::run_native_app` and `re_viewer::run_headless_app`.
+- **Command line.** Add `--headless`, `--window-size`, and `.rrd` path flags to the `viewer/` binary.
+- **Agent access.** Verify that `rerun viewer-mcp` connects to the custom app's gRPC control port and that upgrading across one minor Rerun release takes ≤2 engineer-days.
 
 ## Roadmap
 
-Twelve weeks in five phases. Each phase ends in a gate, and the next phase starts only once the gate passes.
-
-&#91;embedded content: 12-week roadmap · 5 phases, 5 gates\]
-
-The embedded roadmap diagram predates this version; the steps below are the current roadmap. There are no customer interviews: the author is the first user, and TensorLens is validated on the author's own training runs, then through a free public release. Gates 1 and 2 restate criteria from elsewhere in this plan. The Gate 0, 3 and 4 criteria and the split into weeks are proposals. The one exception to the gate order is the SDK skeleton, which starts alongside the Gate 1 trial because the trial does not depend on it. If any gate after Gate 0 fails, spend up to one extra week, then cut scope. The gate numbers are targets, not measurements.
+Twelve weeks in five phases starting Nov 13, 2026. There are no customer interviews: the author is the first user, and TensorLens is validated on the author's own training runs first, then through a free public release. Gate criteria are thresholds set before measuring and changed only at a gate review. If a gate fails after one extra week of work, follow the gate's cut order.
 
 ### Progress so far
 
-Work ran ahead of the gate order: the SDK, detectors and exporter were built before Gate 0 and Gate 1. Details and raw numbers are in the [SDK README](sdk/README.md); the [failure list](TensorLens%20failure%20list.md) records what each detector covers. State as of commit `9a5a39f` (Nov 14, 2026). To add TensorLens to a job, follow the [run-on-your-job guide](sdk/RUN_ON_YOUR_JOB.md).
+Work ran ahead of the phase order: the SDK, ten incident detector kinds, and the Rerun exporter were built before Gate 0 and Gate 1. Details and raw numbers are in the [SDK README](sdk/README.md); the [failure list](TensorLens%20failure%20list.md) records what each detector covers. State as of commit `ffdbabd` (Nov 14, 2026). To add TensorLens to a job, follow the [run-on-your-job guide](sdk/RUN_ON_YOUR_JOB.md).
 
-| Steps | State |
-| --- | --- |
-| 1–5, Gate 0 | Partly. The working dogfood run is IBM Granite 3.0 1B-A400M (MoE, 24 routers of 32 experts, top-8) trained on WikiText-2 in Colab, on one RTX PRO 6000 or one A100. It is a benchmark rather than one of the author's own jobs; the run-on-your-job guide is ready for that. A researched failure list of 15 public failure types exists; the author's own failures, tracker choice and multi-GPU setup are not written down, and the competitor re-check is not done (add TrainCheck to it) |
-| 6–9, Gate 1 | Not started |
-| 10, SDK skeleton | Done except the Lightning callback; the guide shows Lightning by hand (`init` in `on_fit_start`, tested on CPU with Lightning 2.6.5) and Megatron (manual steps, because its optimizer steps float32 copies of the weights). `init(start_step=)` continues step numbers after a resume, and each step records the learning rate. `capture="routers"` (router load only) is the default for MoE models and `capture="full"` the opt-in debugging mode |
-| 11, Tier 0 capture | Done except Arrow Flight; records go to JSON Lines. In full capture, activations are summarized once per repeated block (24 decoder layers for Granite instead of 171 leaf modules; `layers="all"` keeps every leaf), with the largest value kept across microbatches, and weight norms are checked in float64 every 50 steps. In any mode, the total gradient norm returned by `clip_grad_norm_` is recorded at no extra cost, including Lightning's `gradient_clip_val` |
-| 12, Tier 1 capture | MoE load done and checked on Granite, with each router's top-k recorded. Cross-GPU fingerprints pass two CPU processes and now run every 50 steps (`replica_every=`) instead of every step; the two-GPU NCCL run is pending |
-| 13, CI gate | Partly. No graph breaks and no CUDA-graph skips on a toy MoE with Inductor and CUDA graphs. Granite runs with CUDA graphs off, because its `grouped_mm` expert path fails during CUDA-graph recording, so `reduce-overhead` is unverified on a real model. Granite shows one expected recompile per benchmark model with different hooks. Not wired into CI |
-| 14, ingest server | Not started |
-| 15, detectors | Done in Python. MoE imbalance (top-k aware), starved experts, weights not updating, gradient spikes (also from the clipping norm in router-only mode), activation spikes, drift and dead outputs, repeated steps, non-finite values and cross-GPU drift. On Granite: the seeded layer 12 collapse found at the right step, layer and experts on three GPU runs; 20 experts starved since pretraining; the 49 bf16 RMSNorm weights reported as not updating and no other parameter; gradient spikes at steps 141 and 645 on both GPUs |
-| 16, probe pass | Tier 2 built Nov 14, 2026, and tested on CPU, under `torch.compile` with no graph breaks or recompiles, and on a small Hugging Face Granite MoE (grouped-query attention, FlashAttention switched to SDPA). Not run on a GPU; cost and record size not measured. Tier 3 replay not started |
-| 17, Gate 2 | Partly. Router-only capture passes 1% on the RTX PRO 6000 (+0.78% and +0.02% on two runs) and fails on the A100 (+1.06% to +1.33% per round). Full capture with the new defaults (24 block hooks, gradient norms every step, weights every 50 steps) measured +4.15% against capture off on the RTX PRO 6000: about 0.36 ms routers, 0.85 ms block activations and 1.5 ms gradient norms. Blocks cut activation cost about 4.5 times; full capture still misses 1%, so it became an opt-in debugging mode and router-only the default for MoE models. Seeded drift and sign-flip cases pass only on CPU |
-| 18, product exporter | Done early; the Granite recordings were checked in the stock Rerun viewer |
-| 19–27 | Not started |
+Status values are fixed to **Done**, **In progress**, **Not started**, or **Postponed**, with the remaining done criterion stated for each unfinished row.
+
+| Steps | Status | Unmet done criterion / notes |
+| --- | --- | --- |
+| 1–5, Gate 0 | **In progress** | Benchmark runs exist on IBM Granite 3.0 1B-A400M (`sdk/examples/moe_dogfood.py`) and SmolLM2-360M (`sdk/examples/dense_outlier_check.py`), plus 15 public failure types in [TensorLens failure list.md](TensorLens%20failure%20list.md); unmet: fill in the author's own failures table, record tracker/multi-GPU choice, and complete the competitor re-check including TrainCheck |
+| 6–9, Gate 1 | **Not started** | Unmet: update `experiments/moe-bakeoff/generate.py` to export through `tensorlens.build_evidence` and `export_rerun`, then run the timed agent/engineer comparison |
+| 10, SDK skeleton | **In progress** | `init`, run ID, multi-optimizer iteration counting (`88a20e7`), `start_step=`, `session.log`, and `clip_grad_norm_` wrapping are done; unmet: add the `TensorLensCallback` Lightning class (`sdk/src/tensorlens/lightning.py`) and `GradScaler` overflow step recording (`scaler=`) |
+| 11, Tier 0 capture | **In progress** | Static buffers, GPU ring buffer (`every=50`), bounded writer queue (`WRITER_QUEUE = 8` in `88a20e7`), block activation summaries, per-step gradient norms, and 50-step float64 weight checks are done; unmet: build the opt-in Arrow Flight sender (`sdk/src/tensorlens/flight.py`) |
+| 12, Tier 1 capture | **In progress** | MoE load (`moe`, `moe_stats`, `moe_top_k`) and 50-step cross-GPU fingerprints scheduled from `(step + 1) % replica_every == 0` (`88a20e7`) pass on two CPU processes; unmet: add `replica_params=` for tensor parallelism and pass `replica_check.py` on two CUDA GPUs over NCCL |
+| 13, CI gate | **In progress** | `gpu_check.py`, `test_compile.py`, and `test_probe.py` verify zero graph breaks, zero recompiles, and zero CUDA-graph skips on a toy MoE; unmet: add `.github/workflows/ci.yml` running the CPU test matrix (`torch` 2.6, 2.10, 2.14) and the GPU check |
+| 14, ingest server | **Not started** | Unmet: implement `server/` (`tensorlens-server`) with Arrow Flight `DoPut`, `(run_id, rank, step)` deduplication, 128 MiB memory quota, and Parquet part flushing via `object_store` |
+| 15, detectors | **Done** | Ten incident kinds ship in `sdk/src/tensorlens/evidence.py`: `moe_imbalance` (top-k aware), `starved_experts`, `stalled_weights`, `grad_spike`, `activation_spike`, `activation_drift`, `dead_activations`, `repeated_steps`, `non_finite`, and `replica_drift`. Verified on Granite single-GPU runs (RTX PRO 6000 and A100) and synthetic fixtures |
+| 16, probe pass | **In progress** | Tier 2 (`sdk/src/tensorlens/probe.py`, `9a5a39f` and `9c7d8eb`) is built and tested on CPU under `torch.compile`; unmet: measure GPU overhead and record size on Granite and SmolLM2 (`dense_outlier_check.py`). Tier 3 replay is **Postponed** |
+| 17, Gate 2 | **In progress** | `capture="routers"` passes ≤1% on the RTX PRO 6000 (+0.78%, +0.02%, +0.54%) and misses on the A100 (+1.06% to +1.33%); unmet: profile A100 with `profile_overhead.py`, pass the two-GPU NCCL `replica_check.py`, and pass every case in the seeded failure suite |
+| 18, product exporter | **Done** | `sdk/src/tensorlens/rerun_export.py` and `python -m tensorlens` export `.rrd` and blueprint; verified in the stock Rerun 0.43.2 viewer |
+| 19–27, Gates 3–4 | **Not started** | Unmet: headless screenshot sidecars, Linux `lavapipe` verification, agent diagnosis benchmark (Gate 3), and package rename + open-source release (Gate 4) |
 
 Findings along the way:
 
-- **Fixed per-step thresholds failed on real data.** Healthy Granite has experts picked by 85–100% of tokens, and with two documents per batch single experts jump to over half the tokens for one step. Top-k overload therefore requires the router's diversity to drop below 0.6 of its recent median (healthy minimum 0.82; the seeded collapse 0.29). Experts nearly unused for hundreds of steps needed a windowed check, since one empty step is noise.
-- **float32 norms cannot show whether bf16 weights changed.** A first stalled-weight check reported 147 of 218 parameters falsely; float64 norms fixed it but cost about 3.7 ms per step on the RTX PRO 6000. Reading the weights alone costs about 1.5 ms, so the check is sampled, as wandb.watch (1,000 batches) and TrainCheck (`sampling_interval`) do.
-- **Pure-bf16 training freezes norm weights.** In the Granite benchmark's setup (bf16 weights, AdamW, lr 1e-5, no float32 master weights) all 49 RMSNorm weights never change: their bf16 step size near 1.0 is about 0.008. TensorLens now reports this.
+- **Fixed per-step thresholds failed on real data.** Healthy Granite has experts picked by 85–100% of tokens, and with two documents per batch single experts jump to over half the tokens for one step. Top-k overload therefore requires the router's diversity to drop below 0.6 of its recent median (healthy minimum 0.82; the seeded collapse 0.29). Experts nearly unused for hundreds of steps needed a 50-step windowed check, since one empty step is noise.
+- **float32 norms cannot show whether bf16 weights changed.** A first stalled-weight check reported 147 of 218 parameters falsely; float64 norms fixed it but cost ~3.7 ms per check on the RTX PRO 6000. Reading the weights alone costs ~1.5 ms, so the check runs every 50 steps (`weights=50`), as `wandb.watch` (1,000 batches) and TrainCheck (`sampling_interval`) do.
+- **Pure-bf16 training freezes norm weights.** In the Granite benchmark's setup (bf16 weights, AdamW, lr 1e-5, no float32 master weights) all 49 RMSNorm weights never change: their bf16 step size near 1.0 is ~0.008. TensorLens reports this.
 
 Open gaps:
 
-- **Full-capture overhead.** Stage 3 measured +4.15%. Gradient norms on every step are the largest part (1.5 ms); sampling them every 50 steps, as Lightning's `log_every_n_steps` and wandb.watch do, would leave about 1.2 ms (about 2%) but would also hide single-step gradient spikes. Activation hooks inside the compiled graph cannot be sampled without recompiles.
-- **A100 router-only overhead.** About 2 ms per step against 0.5 ms on the RTX PRO 6000 for the same hooks; possibly host-side launch overhead, made worse if Granite's `grouped_mm` path syncs the CPU on every layer. `sdk/examples/profile_overhead.py` (Nov 14, 2026) splits the added time into GPU work, launches and sync waits; not yet run on a GPU.
-- **Headless rendering on Linux.** Headless screenshots have only been made on macOS. Training clusters run Linux, and Rerun's native viewer needs Vulkan, Metal or OpenGL. On a node or container without a GPU display driver, install a software Vulkan driver (lavapipe, in Ubuntu's `mesa-vulkan-drivers`, with the `libvulkan1` loader); Rerun's troubleshooting guide prefers it to software OpenGL (llvmpipe), which it warns crashes. Slim PyTorch images ship CUDA without either. Untested.
-- **Many ranks on a shared filesystem.** Each rank appends its own JSON Lines file from a background writer thread, so slow writes grow an in-memory queue rather than stall training until `close()`. Not measured with many ranks on NFS or Lustre; `sink=tensorlens.JsonlSink(path)` can point at node-local disk.
-- **Dense models.** Every GPU run so far is Granite (MoE). `sdk/examples/dense_outlier_check.py` (Nov 14, 2026) trains SmolLM2-360M with a seeded activation outlier and measures full-capture and probe cost on a dense model; checked on CPU only.
-- **Untuned thresholds.** The spike factor (5×), diversity drop (0.6), starved ratio (10% of an even share) and stall count (3 checks) rest on one model's data and synthetic cases.
-- **Gate order.** Write the author's own failures and run on one of the author's jobs before adding more detectors, so detectors are tuned to real failures rather than seeded ones.
+- **Full-capture overhead.** Block-level full capture (`Stage 3` in [sdk/README.md](sdk/README.md#rtx-pro-6000-run-with-block-level-capture-stage-3)) measured +4.15% on the RTX PRO 6000 (~0.36 ms routers, ~0.85 ms block activations, ~1.5 ms per-step gradient norms). *Blocks:* None (`capture="routers"` is the MoE default; `capture="full"` is opt-in for debugging). *Closed when:* optional `grads=N` step sampling is benchmarked against single-step spike recall.
+- **A100 router-only overhead.** ~1.98 ms/step (+1.06% to +1.33%) against ~0.36–0.51 ms/step on the RTX PRO 6000. *Blocks:* Gate 2 on A100. *Closed when:* [profile_overhead.py](sdk/examples/profile_overhead.py) runs on an A100 and either brings `capture="routers"` ≤1.0% or documents the hardware-specific host-sync ceiling.
+- **Headless rendering on Linux.** Headless screenshots have only been run on macOS. Rerun's native viewer on headless Linux requires Vulkan (`mesa-vulkan-drivers` `lavapipe` + `libvulkan1`). *Blocks:* Step 20 and Gate 3. *Closed when:* two consecutive headless exports in a Linux container produce byte-identical PNGs.
+- **Many ranks on a shared filesystem.** `WRITER_QUEUE = 8` (`88a20e7`) bounds memory by pausing training with a `RuntimeWarning` when disk writes stall. *Blocks:* Gate 2 multi-GPU run. *Closed when:* tested with ≥2 ranks writing local `.jsonl` and streaming to `tensorlens-server`.
+- **Dense models and probe GPU cost.** [dense_outlier_check.py](sdk/examples/dense_outlier_check.py) (SmolLM2-360M with a 100× seeded outlier at step 250) has only run on CPU. *Blocks:* Step 16 and Gate 2. *Closed when:* run on a CUDA GPU with `PASS` at step 250 and measured probe ms/step.
+- **Untuned thresholds.** The spike factor (5×), diversity drop (0.6), starved ratio (10% of an even share), and stall count (3 checks) rest on Granite and synthetic fixtures. *Blocks:* Gate 3. *Closed when:* evaluated on the author's own dogfood job without false alarms on healthy segments.
+
+### Ordered next actions
+
+1. **Complete Gate 0 (Steps 1–5):** fill in the author's own failures table in [TensorLens failure list.md](TensorLens%20failure%20list.md#your-own-failures), record the dogfood job's tracker and multi-GPU setup, and check ARIA, Pluto, tracker MCP servers, and TrainCheck.
+2. **Run pending single- and two-GPU checks (Steps 12, 16, 17):** run [replica_check.py](sdk/examples/replica_check.py) on 2 CUDA GPUs with NCCL, [profile_overhead.py](sdk/examples/profile_overhead.py) on A100, and [dense_outlier_check.py](sdk/examples/dense_outlier_check.py) on a CUDA GPU.
+3. **Finish SDK remaining items (Steps 10, 12, 13, 18):** add `schema_version: 1` and unique default `run_id` to records, `replica_params=` to `init()`, `scaler=` skipped-step recording, `TensorLensCallback` in `sdk/src/tensorlens/lightning.py`, and `.github/workflows/ci.yml`.
+4. **Build the Flight sender and Rust ingest server (Steps 11, 14):** implement `sdk/src/tensorlens/flight.py` and `server/` (`tensorlens-server`), pass the stall/resume, duplicate-batch, and torn-line tests, and run the 64-rank Python-vs-Rust detector benchmark.
+5. **Run Gate 1 (Steps 6–9) and Gate 3 (Steps 19–23):** unify `experiments/moe-bakeoff/generate.py` with `sdk/src/tensorlens/rerun_export.py`, verify Linux `lavapipe` headless screenshots, and score coding-agent diagnosis accuracy with and without TensorLens evidence.
+
+### File boundaries and test plan for remaining work
+
+| Step | Path | Action | One-line purpose | Required tests and assertions |
+| --- | --- | --- | --- | --- |
+| 6 | `experiments/moe-bakeoff/generate.py` | Modify | Replace duplicated `routing_colors` and 0.35 rule with calls to `tensorlens.build_evidence` and `export_rerun` | `sdk/tests/test_cli.py`: generated fixture `.rrd` and `.evidence.json` match `python -m tensorlens` output byte-for-byte on `incidents` and `moe` status counts |
+| 10a | `sdk/src/tensorlens/capture.py` | Modify | Add `"schema_version": 1` to every step record; generate unique `run-<utc>-<hex6>` when no run ID is found; add `scaler=` (`torch.amp.GradScaler`) hook to record `step_skipped: true` and `grad_scale` when `optimizer.step()` is skipped | `sdk/tests/test_capture.py`: (1) every record has `schema_version == 1`; (2) two `init()` calls without `run_id` write distinct files; (3) overflowing fp16 step under `GradScaler` increments step and writes `step_skipped is True` and finite `grad_scale` |
+| 10b | `sdk/src/tensorlens/lightning.py` | Create | `TensorLensCallback(L.Callback)` calling `tensorlens.init` in `on_fit_start`, broadcasting rank 0's `logger.run_id` via `strategy.broadcast`, calling `session.log` in `on_train_batch_end`, and closing in `on_fit_end` | `sdk/tests/test_lightning.py`: (1) 2-rank CPU `ddp_spawn` run broadcasts rank 0 `run_id` so both ranks write `<run_id>.rank{0,1}.jsonl`; (2) `trainer.global_step` matches recorded steps; (3) `gradient_clip_val=1.0` records pre-clip `clip_grad_norm` |
+| 11 | `sdk/src/tensorlens/flight.py` | Create | Background tailer reading `<run_id>.rank<rank>.jsonl` from `<run_id>.rank<rank>.offset` and streaming `RecordBatch`es via Arrow Flight `DoPut` when `endpoint=` / `TENSORLENS_ENDPOINT` is set | `sdk/tests/test_flight.py`: (1) partial trailing JSONL line without `\n` is not sent until completed; (2) stopping the server for 200 steps holds sender RAM growth <8 MiB and delivers all 200 steps in order upon restart; (3) `.offset` file matches file size after `close()` |
+| 12 | `sdk/src/tensorlens/capture.py`, `distributed.py` | Modify | Add `replica_params=` (optional iterable or name predicate) to `tensorlens.init` for tensor-parallel replicated weights | `sdk/tests/test_distributed.py`: passing `replica_params=lambda n, p: "norm" in n` fingerprints only matching parameters and ignores sharded linear weights |
+| 13 | `.github/workflows/ci.yml` | Create | GitHub Actions workflow running `pytest sdk/tests` across Python 3.11/3.12 and PyTorch 2.6, 2.10, 2.14 on `ubuntu-latest`, plus `gpu_check.py` on a CUDA runner | Workflow exits 0 on zero test failures, `graph_break == 0`, `error_on_recompile`, and `cudagraph_skips == 0` |
+| 14a | `server/Cargo.toml`, `server/src/main.rs` | Create | CLI entry point for `tensorlens-server` (`--listen`, `--store`, `--tls-cert`, `--tls-key`, `--allow-unauthenticated`, `TENSORLENS_TOKEN`) | `cargo test --manifest-path server/Cargo.toml`: non-loopback bind without token or `--allow-unauthenticated` exits with error; wrong Bearer token returns `Status::unauthenticated` |
+| 14b | `server/src/ingest.rs`, `server/src/storage.rs` | Create | Arrow Flight `DoPut` service, `(run_id, rank, step)` watermark deduplication, 128 MiB memory cap, and Zstd Parquet part writer via `object_store` | `server/tests/ingest_test.rs`: (1) resending steps 0–49 produces zero duplicate rows in written Parquet; (2) exceeding 128 MiB returns `RESOURCE_EXHAUSTED`; (3) `SIGTERM` flushes buffered rows to `part-*.parquet` before exit |
+| 15b | `sdk/src/tensorlens/__main__.py`, `evidence.py` | Modify | Support reading a directory of `part-*.parquet` files and `--watch` live polling mode | `sdk/tests/test_evidence.py`: `build_evidence` on Parquet parts produces identical `evidence.json` to the source `.jsonl` file (including `probe`, `scalars`, and `moe_stats`) |
+| 19 | `sdk/src/tensorlens/screenshots.py` | Create | Export headless view PNGs from `.rrd` and write `<run_id>.step<req_step>.<view>.meta.json` with `requested_step` and `sample_step` | `sdk/tests/test_screenshots.py`: requesting step 455 when samples exist at 450 and 500 writes `requested_step: 455, sample_step: 450` alongside a valid PNG header |
+| 22 | `viewer/Cargo.toml`, `viewer/src/main.rs` | Create (if Gate 1 passes) | Pinned Rerun `0.43.2` binary registering the custom sortable incident `ViewClass` with `--headless` and `viewer-mcp` support | `cargo test --manifest-path viewer/Cargo.toml`: headless render produces non-empty PNG and `viewer-mcp` lists the custom view |
+| 24 | `sdk/pyproject.toml`, `LICENSE-APACHE`, `LICENSE-MIT` | Modify / Create | Rename package from placeholder `tensorlens` to an available PyPI name, set dual `Apache-2.0 OR MIT` license, and build wheel/sdist with zero telemetry | `twine check dist/*` passes; `pip install dist/*.whl` in a clean venv imports and runs `toy_moe.py` with zero outbound network connections |
 
 ### Week 1: set up the dogfood runs (Gate 0)
 
-1. Pick one or two real training jobs you run yourself, ideally an MoE model, multi-GPU, with `torch.compile`. These are the dogfood runs for every later gate.
-2. Write down the failures you have hit before, or expect to hit, on those jobs: what went wrong, how long it took to notice, and what would have caught it sooner. These become the seeded failures and the answer key.
-3. Record your own tracker (MLflow or W&B) and multi-GPU setup. That settles two open decisions below for v1.
-4. Re-check the competitors named under Product (ARIA, Pluto, tracker MCP servers) for per-layer capture or detectors launched since Nov 13, 2026.
-5. **Gate 0:** the dogfood runs are chosen, they can be instrumented, and the failure list holds at least one case that loss curves alone would not explain. If a competitor already covers that case, narrow or rethink before writing SDK code.
+1. Pick one or two real training jobs run by the author, ideally an MoE model on multiple GPUs with `torch.compile`. These are the dogfood runs for every later gate.
+2. Fill in the author's own failures table in [TensorLens failure list.md](TensorLens%20failure%20list.md#your-own-failures): what went wrong, how long it took to notice, and what signal would have caught it sooner.
+3. Record the dogfood job's tracker (MLflow or W&B) and multi-GPU parallelism setup (DDP, FSDP2, TP, or Megatron).
+4. Re-check the competitors named under Product (CoreWeave ARIA, Trainy Pluto, W&B MCP, MLflow MCP, RunSleuth, and TrainCheck) for per-layer capture or detectors launched since Nov 13, 2026.
+5. **Gate 0 checklist (pass all four to proceed):**
+   - [ ] At least one real training script and command are recorded in the plan or `sdk/RUN_ON_YOUR_JOB.md` and run for ≥100 steps with `tensorlens.init(model)` producing a valid `.jsonl` file.
+   - [ ] The author's own failures table in `TensorLens failure list.md` contains ≥1 failure that scalar loss/grad-norm curves alone did not explain.
+   - [ ] The tracker and multi-GPU parallelism mode for the dogfood job are recorded under Decisions below.
+   - [ ] Competitor check table updated with Nov 2026 status for ARIA, Pluto, tracker MCPs, and TrainCheck.
+   - *Cut order if blocked:* if no multi-GPU MoE job is available immediately, run Gate 2 on the 2-GPU Granite benchmark plus the author's single-GPU dense/MoE job.
 
 ### Weeks 2–3: is a custom view needed? (Gate 1)
 
-6. Generate unseen synthetic fixtures with the bake-off's `generate.py`, using different incident steps, layers and experts.
-7. Pre-register timed questions that neither default screen answers, balanced between Rune's layer selection and Rerun's timeline.
-8. Run three arms: stock Rerun with the bake-off blueprint, the Rune incident prototype, and the JSON evidence alone. Give the two viewer arms the same detector summary, status colors and default expert table. Counterbalance the order for engineers, and use fresh sessions with the same model and prompt for agents.
-9. **Gate 1:** compare median time to a correct answer at matched accuracy, and agent tool calls. A 2× reduction from the custom interactions schedules the one-week custom view spike in weeks 8–10; otherwise stay on stock Rerun.
-10. In parallel, start the SDK skeleton: `init`, run ID and step handling, the Lightning callback, and the optimizer hooks, including steps that mixed precision skips.
+6. Generate 6 unseen synthetic MoE and dense fixtures using `experiments/moe-bakeoff/generate.py` wired through `tensorlens.build_evidence` and `export_rerun`, varying incident steps, layers, and experts.
+7. Pre-register 6 timed diagnosis questions (each requiring identifying the first failing step, layer, and failure kind/expert IDs) that neither default screen answers without interaction.
+8. Run three arms across all 6 fixtures using fresh coding-agent sessions (same model and system prompt, 3 trials per fixture per arm): (A) stock Rerun 0.43.2 with the bake-off blueprint + `evidence.json`, (B) the custom interactive prototype + `evidence.json`, and (C) `evidence.json` alone. Also time the author across counterbalanced fixtures on (A) vs. (B).
+9. **Gate 1 checklist:**
+   - [ ] Accuracy across the 6 fixtures is within ±5 percentage points between arms (or higher in Arm B).
+   - [ ] Arm B cuts median agent tool calls or median human time-to-correct-answer by **≥2.0×** relative to Arm A.
+   - *Decision rule:* if both boxes pass, schedule the one-week custom view spike (Step 22); otherwise **drop Step 22** and ship on stock Rerun 0.43.2.
+10. In parallel, complete Step 10a (`schema_version`, unique `run_id`, `GradScaler` skipped steps) and Step 10b (`TensorLensCallback`).
 
-### Weeks 4–7: capture and detect on a real run (Gate 2)
+### Weeks 4–7: capture, stream, and detect on a real run (Gate 2)
 
-11. Tier 0 capture: hook statistics into static buffers, the GPU ring buffer, one `.cpu()` copy every N steps, and Arrow Flight to ingest.
-12. Tier 1 capture: the MoE load table and the cross-GPU fingerprints.
-13. CI gate: zero graph breaks, zero recompiles, and no CUDA-graph skips under `reduce-overhead`.
-14. Ingest server in Rust: Arrow in, Parquet out.
-    - Transport notes (Nov 14, 2026, from a reviewed proposal to stream from RAM to a hosted ingest by default). Keep a local file as the record of truth, as W&B does: its core writes every record to a local transaction log first, and when the network falls behind it drops records from memory and re-reads them from that file later (`wandb/core/internal/stream/flowcontrol.go`), so nothing is lost and memory stays bounded. MLflow's async logging instead holds records in an unbounded in-memory queue (`mlflow/utils/async_logging/async_logging_queue.py`). Dropping batches when the network stalls would leave gaps the detectors misread (repeated or missing steps, spike medians), and the SDK cannot tell which batches matter because detectors run on the file afterwards. Streaming to a hosted endpoint by default also cuts against the risk row on tensor data leaving the cluster, so make it opt-in, with self-hosted ingest as the enterprise path. Size for planning: Granite full capture wrote about 26 KB of JSON per step (17 MB for 650 steps), before Parquet compression. Crate versions checked on crates.io the same day: `object_store` 0.14.2, `arrow-flight` and `parquet` 60.1.0. Agreed design: the SDK always writes the local file; an opt-in sender (`endpoint=` or an environment variable) tails it from a saved offset and streams to the ingest server over Arrow Flight, pausing when the network stalls and resuming from the offset, so it neither grows memory nor drops steps. The local file must be an append-only format that stays readable if the process dies, JSON Lines today or the Arrow IPC streaming format later, not Parquet: a Parquet file's metadata is in a footer written only on close, so a preempted pod would leave an unreadable file. Parquet belongs on the ingest side. The size saving from Arrow and compression is not measured.
-15. The first two detectors, MoE routing imbalance and cross-GPU drift, each writing the viewer-neutral JSON evidence.
-16. The Tier 2 probe pass for histograms and attention; Tier 3 replay if time allows.
-17. **Gate 2:** overhead under 1% on a dogfood run, a clean CI gate, and every seeded failure caught, including a cross-GPU drift case and a sign-flip case.
+11. Complete Tier 0 capture and the opt-in Arrow Flight sender (`sdk/src/tensorlens/flight.py`).
+12. Complete Tier 1 capture: add `replica_params=` and run `sdk/examples/replica_check.py` on two CUDA GPUs over NCCL.
+13. Wire the compiler gate (`gpu_check.py`, `test_compile.py`, `test_probe.py`) into `.github/workflows/ci.yml`. Note: in `moe_dogfood.py`, compiling two separate benchmark models with different hook sets in one process causes one expected Dynamo recompile when switching models; a single model with TensorLens attached must have **zero** recompiles after warmup.
+14. Build the Rust ingest server (`server/`, binary `tensorlens-server`) per the [Ingest server specification](#ingest-server-and-local-first-streaming) above, and run the 64-rank Python-vs-Rust detector benchmark.
+15. Verify all ten incident detector kinds in `sdk/src/tensorlens/evidence.py` on both `.jsonl` and server-written `part-*.parquet` inputs.
+16. Run the Tier 2 probe pass on a CUDA GPU via `sdk/examples/dense_outlier_check.py` and `sdk/examples/moe_dogfood.py --probe-every 1000`, recording per-probe ms and JSON/Parquet byte sizes.
+17. **Gate 2 checklist (pass all five to proceed):**
+    - [ ] **Overhead:** `capture="routers"` adds **≤1.0%** median ms/step against capture off across 3 paired 200-step rounds (50 warmup steps) on the dogfood GPU (verified on RTX PRO 6000 at +0.02% to +0.78%; A100 profiled and either ≤1.0% or documented host-sync bound).
+    - [ ] **Compiler gate:** `gpu_check.py` and `test_compile.py` report `0` graph breaks, `0` recompiles after warmup, and `0` CUDA-graph skips under `mode="reduce-overhead"`.
+    - [ ] **Seeded failures:** 100% of seeded cases caught within **±1 flush/check interval** on the seeded layer/parameter: Granite layer-12 routing collapse (`moe_dogfood.py --collapse-layer 12`), SmolLM2 block-8 100× outlier (`dense_outlier_check.py`), stalled weights, gradient spike, and 2-GPU NCCL weight drift + sign flip (`replica_check.py`).
+    - [ ] **Ingest reliability:** stopping `tensorlens-server` mid-run for 200 steps and restarting loses `0` steps, produces `0` duplicate steps in Parquet, and keeps sender memory growth `<8 MiB`.
+    - *Cut order if a criterion fails after one extra week:* if `capture="full"` or `probe=` exceeds budget, keep both opt-in; if the Python detector worker handles 64 ranks in ≤250 ms per flush, do not port detectors to Rust.
 
 ### Weeks 8–10: evidence for engineers and agents (Gate 3)
 
-18. Turn the bake-off exporter into the product exporter: JSON from real runs to `.rrd` plus the blueprint.
-19. Agent access: Rerun headless screenshots, `rerun viewer-mcp`, and the JSON, with the actual sample step recorded next to each PNG.
-20. Verify software rendering in your Linux training environment.
-21. The MLflow importer, only with three or more engineers.
-22. The one-week custom view spike, only if Gate 1 called for it: headless rendering, MCP access, and an estimate of the upgrade cost.
-23. **Gate 3 (proposed):** on seeded failures, an agent with TensorLens evidence finds the right cause more often than an agent with tracker data alone, and TensorLens has caught and explained at least one real problem on a dogfood run.
+18. Verify `python -m tensorlens` exporting both local `.jsonl` and server `part-*.parquet` runs to `.rrd` + blueprint.
+19. Build `sdk/src/tensorlens/screenshots.py` writing headless PNGs and `.meta.json` (`requested_step`, `sample_step`).
+20. Verify headless Linux rendering in an Ubuntu container with `mesa-vulkan-drivers` (`lavapipe`) and `libvulkan1`: two repeat renders of the same `.rrd` and step must produce byte-identical PNGs.
+21. *Postponed unless ≥3 engineers join:* MLflow scalar-only importer (`sdk/src/tensorlens/mlflow_import.py`).
+22. *Only if Gate 1 passed:* one-week custom `ViewClass` spike in `viewer/`.
+23. **Gate 3 checklist (pass both to proceed):**
+    - [ ] Across ≥8 seeded failure runs (covering MoE collapse, starved experts, frozen bf16 norms, gradient spike, activation outlier, and 2-GPU replica drift), a coding agent given TensorLens `evidence.json` + Rerun screenshots identifies the exact failing step, layer/parameter, and failure kind in **≥85%** of trials, beating the same agent given scalar loss + total grad-norm curves alone by **≥30 percentage points**.
+    - [ ] TensorLens has run on ≥1 of the author's real training jobs and either surfaced a real anomaly or completed ≥1,000 steps with zero false-positive incidents.
+    - *Cut order if blocked:* if headless PNGs do not improve agent accuracy over `evidence.json` alone, make screenshot generation optional for agents and keep Rerun for human inspection.
 
 ### Weeks 11–12: public release (Gate 4)
 
-24. Release the SDK, detectors and exporter free under Apache 2.0 / MIT, with the MoE bake-off as a runnable demo.
-25. Track outside use: installs, issues, and teams running it on their own clusters. Ask those teams whether they would pay for hosted monitoring.
-26. Measure storage, rendering and model-call cost per monitored run on the dogfood runs.
-27. **Gate 4 (proposed):** outside teams run TensorLens on real jobs and report problems it caught. Decide on the hosted tier and its price only after that, against the measured cost.
+24. Rename the Python package from placeholder `tensorlens` to an available PyPI/GitHub name, add `LICENSE-APACHE` and `LICENSE-MIT` (`Apache-2.0 OR MIT`), and publish the SDK, detectors, exporter, and `tensorlens-server` binary with the MoE bake-off as a self-contained demo (no external Rune checkout required). The open-source SDK and server include **zero outbound telemetry**.
+25. Track adoption through public signals that require no SDK phone-home: GitHub stars, issues, PRs, PyPI download stats, and direct conversations with users who open issues or discussions.
+26. Measure on the dogfood runs: (a) Parquet storage bytes per 1,000 steps per rank, (b) `tensorlens-server` CPU seconds and peak RSS per rank, and (c) headless screenshot render seconds per incident. (Diagnosis runs on the user's own coding agent, so TensorLens incurs zero LLM token cost.)
+27. **Gate 4 checklist:**
+    - [ ] Package and `tensorlens-server` install cleanly in a fresh environment and pass the smoke test suite.
+    - [ ] ≥3 outside engineers or teams run the SDK on their own jobs and report results via GitHub issues/discussions, with ≥2 expressing willingness to pay for managed multi-node ingest and alerting at a stated monthly price before any hosted control plane is built.
 
 ## Free and paid
 
-Everything that runs on the user's own machine is free. The paid tier is the hosted monitoring.
+Everything that runs on the user's own machine or cluster is free and open source. The paid tier, built only if Gate 4 passes, is managed multi-tenant hosting and alerting.
 
-- **Free (Apache 2.0 / MIT)** The capture SDK, detectors, and evidence exporter. Use the open-source Rerun viewer for inspection and screenshots.
-- **Paid, $250–500 per seat per month (unvalidated):** hosted tensor storage, round-the-clock monitoring, alerts to Slack or PagerDuty, and approved fixes delivered as pull requests.
-- **Self-hosted enterprise:** the same features inside the customer's own cloud account.
+- **Free (`Apache-2.0 OR MIT`):** the capture SDK, opt-in Flight sender, self-hosted `tensorlens-server`, detectors, and Rerun evidence exporter, with zero telemetry.
+- **Paid, \$250–500 per seat per month (unvalidated, post-Gate 4):** managed `tensorlens-server` cloud ingest, object-store retention, Slack/PagerDuty incident alerts, and automated PR drafts.
+- **Self-hosted enterprise:** managed deployment, SSO/RBAC, and SLA inside the customer's own cloud account.
 
-An SDK alone is hard to charge for, so the monitoring has to carry the revenue. Cost per monitored run (storage, rendering, any model calls) is not modelled yet and decides whether the price holds.
+Cost per monitored run (Parquet storage bytes, `tensorlens-server` CPU/RAM, and headless screenshot rendering; zero LLM calls since the customer's coding agent diagnoses incidents) is measured in Step 26 before setting price.
 
 ## Risks
 
-The biggest risk is commercial, not technical: teams may value the tool and still not pay for monitoring.
+The biggest risk is commercial, not technical: teams may value the tool and still not pay for hosted monitoring.
 
 | Risk | Effect | Mitigation |
 | --- | --- | --- |
-| Nobody pays for monitoring | No revenue | No interviews are planned, so dogfooding proves usefulness, not willingness to pay. Release free first, and ask the outside teams who adopt it whether they would pay before building the hosted tier |
-| ARIA or Pluto adds layer capture and detectors | The gap closes, and the hosted tier competes with W&B or Trainy | Re-check both at Gate 0 and before the release; stay tracker- and cloud-neutral; lead with MoE, attention, cross-GPU drift and `torch.compile` support |
-| Trackers add per-layer views | The wedge narrows | Stay tracker-neutral; lead with MoE, attention and torch.compile support that they lack |
-| Rerun's extension interfaces change | A custom incident view may need regular updates | Pin the Viewer and SDK, test recording read-back on upgrades, and budget maintenance if the custom view ships |
-| Hooks stall training or break `torch.compile` | Users switch the SDK off | Overhead gate under 1%; CI with compile on; zero graph breaks. Router-only capture, the default, meets the gate on the RTX PRO 6000 but not the A100; full capture (+4.15%) is opt-in for debugging |
-| Agents misread the pictures | Wrong diagnoses, lost trust | Numbers travel as JSON; key values shown as text in the summary and table views beside each chart; score on seeded failures |
-| Coding-agent clients handle tool images differently | The picture does not reach the model or the user | Test saved PNGs with the target agent clients and supply the same evidence in JSON |
-| Tensor data leaves the cluster | Enterprise deals fall through | Self-hosted ingest; an option to send statistics only |
-| W&B's terms restrict competing products and credential sharing | A W&B importer or hosted W&B sync breaches the customer's contract | Read only the active run inside the customer's script; legal review before anything that uses a customer's W&B key |
+| Nobody pays for hosted monitoring | No revenue | Release the SDK and self-hosted `tensorlens-server` free first; build a multi-tenant hosted cloud only if Gate 4 shows ≥2 outside teams willing to pay |
+| ARIA, Pluto, or TrainCheck adds compiled per-layer capture and MoE/attention detectors | The gap closes | Re-check all competitors at Gate 0 and before Gate 4; stay tracker- and cloud-neutral; lead with MoE, attention, cross-GPU drift, and zero-break `torch.compile` support |
+| Trackers add per-layer views | The wedge narrows | Stay tracker-neutral; lead with MoE, attention, and `torch.compile` capture that scalar trackers lack |
+| Rerun's extension interfaces change | A custom incident view needs maintenance | Pin `rerun-sdk==0.43.2`, gate the custom view on a ≥2× win in Gate 1, and budget ≤2 days per minor upgrade if shipped |
+| Hooks stall training or break `torch.compile` | Users switch the SDK off | Overhead gate ≤1% for default `capture="routers"`, CI gate with `error_on_recompile` and `graph_break == 0`, and bounded writer queue (`WRITER_QUEUE = 8`) |
+| Agents misread the pictures | Wrong diagnoses, lost trust | Every number travels in `evidence.json` (`schema_version: 1`); screenshots include `.meta.json` with `sample_step`; score on Gate 3 |
+| Coding-agent clients handle tool images differently | The picture does not reach the model or the user | Test saved PNGs with target agent clients and always supply `evidence.json` alongside |
+| Tensor data leaves the cluster | Enterprise deals fall through | Local `.jsonl` by default (zero network calls); opt-in Flight sender targets self-hosted `tensorlens-server` on the user's own cluster |
+| W&B's terms restrict competing products and credential sharing | A W&B importer or hosted W&B sync breaches the customer's contract | Read only `wandb.run.id` in-process; require legal review before anything touches a customer's W&B API key |
 
 ## Unproven and open decisions
 
-The synthetic MoE bake-off verified recording read-back and headless rendering. Capture now runs on a real MoE model (Granite) on an RTX PRO 6000 and an A100, with router-only overhead under 1% on the first and over it on the second, a seeded collapse detected, and seven detectors checked on Granite or synthetic data. Full capture with block defaults measured +4.15% on the RTX PRO 6000. Multi-GPU capture, capture on Linux clusters beyond Colab, real failures on the author's own jobs, and diagnosis times remain unmeasured.
+The synthetic MoE bake-off verified recording read-back and headless rendering. Capture now runs on a real MoE model (Granite) on single-GPU RTX PRO 6000 and A100 instances, with router-only overhead under 1% on the RTX PRO 6000 (+0.02% to +0.78%) and +1.06% to +1.33% on the A100, a seeded layer-12 collapse detected, and ten incident detector kinds implemented in `evidence.py` and checked on Granite or synthetic fixtures. Full capture with block defaults measured +4.15% on the RTX PRO 6000. Multi-GPU NCCL capture, Linux `lavapipe` rendering, the Rust ingest server, real failures on the author's own jobs, and coding-agent diagnosis accuracy remain unmeasured.
 
 **Unproven**
 
-- Whether sorting and layer selection improve diagnosis enough to justify a custom Rerun view.
-- Whether the stock Rerun viewer stays smooth on a real 5,000-metric MLflow run.
-- Whether full capture can get under 1% with block-level activations and a 50-step weight check. Router-only capture does on the RTX PRO 6000 and not on the A100; full capture measured +4.15% with block activations, per-step gradient norms and the 50-step weight check, down from about 9% with every leaf module and per-step weight norms.
-- Whether the detector thresholds hold on models other than Granite.
-- Whether the hooks keep CUDA graphs on real models. They do on a toy MoE; Granite needs CUDA graphs off for reasons unrelated to TensorLens.
-- The cross-GPU drift tolerance of 1e-6 on real multi-GPU runs.
-- Whether a coding agent with TensorLens evidence and Rerun screenshots finds the right cause more often than one with tracker data alone.
-- The data sizes in the tier table.
-- Whether anyone besides the author wants this. A search on Nov 13, 2026 found no product that captures layer internals and explains failures, and no public requests for one. That does not prove none exists or that demand is absent.
+- Whether sorting and layer selection cut diagnosis time or agent tool calls by ≥2× in Gate 1.
+- Whether `capture="routers"` on the A100 can be brought under 1% once profiled with `profile_overhead.py`, and whether `capture="full"` (+4.15%) needs optional gradient-norm step sampling.
+- Whether the detector thresholds (5× spike, 0.6 diversity drop, 10% starved share, 3 unchanged weight checks) hold on models other than Granite without false alarms.
+- Whether the hooks keep CUDA graphs on real models that support CUDA graphs (verified on the toy MoE; Granite's `grouped_mm` fails CUDA-graph capture even without TensorLens).
+- Whether the cross-GPU drift tolerance of `1e-6` holds on healthy multi-GPU NCCL runs without false positives from floating-point nondeterminism.
+- Whether a coding agent with TensorLens `evidence.json` and Rerun screenshots beats scalar-only tracker data by ≥30 percentage points in Gate 3.
+- Whether outside teams want and will pay for hosted monitoring (Gate 4).
 
-**Decisions that are yours**
+**Decisions**
 
-- [ ] Product name; "TensorLens" is a placeholder. Checked Nov 14, 2026: the PyPI name `tensorlens` is taken by an unrelated package (0.0.3, April 2025), so `pip install tensorlens` installs someone else's code, and the SDK cannot be published under its current package name. GitHub also has `idoatad/TensorLens`, the code for an ACL 2026 paper on transformer attention analysis (arXiv 2601.17958; static analysis of a frozen model, not training monitoring), plus `gmkrxb/tensorlens` (a VS Code extension for tensor files) and `HAYDARKILIC/tensorlens` (LLM and loss-landscape visualization). Pick the new name before the public release (Gate 4) and check it on PyPI and GitHub first.
-- [ ] Team size against 12 weeks. With fewer than three engineers, move the MLflow importer after launch.
-- [ ] Who explains failures. v1 hands the evidence to the user's own coding agent. A built-in explainer, as ARIA has, is the agent loop postponed from v2 and would add scope.
-- [ ] Whether W&B is the next tracker target after MLflow.
-- [ ] Multi-GPU runs: which rank reports activations. Rank 0 is enough for plain data parallelism, and with pipeline or tensor parallelism every rank that owns layers reports; every rank still shares its small parameter fingerprints for the cross-GPU detector.
-- [ ] Price, after the cost per monitored run is modelled.
-- [x] Default capture level: decided Nov 13, 2026. Router-only is the always-on default for MoE models (+0.02% to +0.78% on the RTX PRO 6000; over 1% on the A100), and full capture (+4.15%) is an opt-in debugging mode, `capture="full"`. Rationale and sources in the SDK README's capture-mode decision.
-- [ ] Whether detectors stay in Python after the Rust ingest server exists.
+- [ ] **Product and PyPI package name** ("TensorLens" is a placeholder; `tensorlens` is taken on PyPI and GitHub). Pick an available name before Gate 4.
+- [ ] **Author's dogfood job, tracker, and multi-GPU setup** (Gate 0).
+- [ ] **Price for the post-Gate 4 hosted tier**, after Step 26 measures storage and server cost per run.
+- [x] **Default capture level (decided Nov 13, 2026):** `capture="routers"` is the always-on default for MoE models, and `capture="full"` is an opt-in debugging mode.
+- [x] **Multi-GPU reporting (decided Nov 14, 2026):** every rank writes its own `tensorlens-out/<run_id>.rank<rank>.jsonl` and computes `replica_spread` on `replica_group` every `replica_every=50` steps where `(step + 1) % replica_every == 0`.
+- [x] **Ingest architecture and v1 server hosting (decided Nov 14, 2026):** the SDK always writes the local `.jsonl` file first; when `endpoint=` / `TENSORLENS_ENDPOINT` is set, an opt-in sender tails that file from `<run_id>.rank<rank>.offset` and streams over Arrow Flight `DoPut` to the open-source, self-hosted Rust `tensorlens-server` binary (`server/`), which deduplicates by `(run_id, rank, step)` and writes Zstd Parquet parts via `object_store`.
+- [x] **Where detectors run (decided Nov 14, 2026):** detectors run in Python (`sdk/src/tensorlens/evidence.py`) on local `.jsonl` or live server Parquet (`python -m tensorlens --watch`), and will only be ported into the Rust server if the 64-rank benchmark exceeds 250 ms per 50-step flush or 1 CPU core.
+- [x] **Who explains failures (decided Nov 14, 2026):** v1 hands `evidence.json` and Rerun screenshots to the team's own coding agent; a built-in VLM explainer is postponed.
+- [x] **Tier 3 activation replay and MLflow scalar importer (decided Nov 14, 2026):** both postponed from v1 (revisit the MLflow importer only if ≥3 engineers join).
 
 ## Sources
 

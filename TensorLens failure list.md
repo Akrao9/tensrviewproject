@@ -8,18 +8,18 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 | # | Failure | Loss curve shows it? | TensorLens today | Priority |
 | --- | --- | --- | --- | --- |
-| 1 | Replicated weights drift apart across GPUs | No | Built, two-GPU run pending | High |
+| 1 | Replicated weights drift apart across GPUs | No | Built (`replica_every=50`), two-GPU NCCL run pending | High |
 | 2 | Silent data corruption on a faulty GPU | Usually not | Same detector as 1 | High |
-| 3 | MoE routing collapse: dead or overloaded experts | No, or late | Detected; top-k gap | High |
-| 4 | Weights not updating at all | Flat or slow loss, cause unclear | Not captured | High |
-| 5 | Loss spikes from gradient outliers | Yes, but not the cause | Gradient norms captured; no spike detector | High |
-| 6 | Bad state after resuming from a checkpoint | A spike or a bend at resume | Not captured; step counter restarts at 0 | Medium |
-| 7 | Attention logit growth and entropy collapse | Late | Not captured; needs the probe pass | Medium |
-| 8 | Activation outliers, especially with FP8 | Late | Partly: absolute maximum and spread | Medium |
-| 9 | NaN or Inf | Yes, eventually | Detected | Medium |
-| 10 | Mixed-precision loss scale collapse and skipped steps | Sometimes | Not captured | Medium |
+| 3 | MoE routing collapse: dead or overloaded experts | No, or late | Detected (top-k diversity drop and 50-step starved window) | High |
+| 4 | Weights not updating at all | Flat or slow loss, cause unclear | Detected (50-step float64 weight check, 3 unchanged checks) | High |
+| 5 | Loss spikes from gradient outliers | Yes, but not the cause | Detected (5× 50-step median on `clip_grad_norm` or `grad_norm`) | High |
+| 6 | Bad state after resuming from a checkpoint | A spike or a bend at resume | Partly: `start_step=`, repeated-step detector, and per-step `lr` recorded | Medium |
+| 7 | Attention logit growth and entropy collapse | Late | Captured by probe pass (`max_logit`, `entropy_share`, 64×64 map); no detector yet | Medium |
+| 8 | Activation outliers, especially with FP8 | Late | Detected in full capture (5× spike in `abs_max`/`std`, 3× drift in `abs_max/std`, dead outputs) | Medium |
+| 9 | NaN or Inf | Yes, eventually | Detected (activations, gradients, `clip_grad_norm`, and replica weights) | Medium |
+| 10 | Mixed-precision loss scale collapse and skipped steps | Sometimes | Not captured (`auto_step=False` counts iterations; `GradScaler` state not read) | Medium |
 | 11 | MoE token dropping | No | Not captured | Medium |
-| 12 | Embedding or other weight norms shrinking or growing | No | Not captured | Low |
+| 12 | Embedding or other weight norms shrinking or growing | No | Recorded every 50 steps in float64; no slow-drift detector yet | Low |
 | 13 | Silent compiler or framework bugs | No, or slow convergence | Not captured | Low |
 | 14 | Data problems: repeated text, bad batches, repeated data | Spikes, or nothing | Out of scope | Low |
 | 15 | Hardware stops, hangs and slow GPUs | The job stops or slows | Out of scope | — |
@@ -94,7 +94,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Attention entropy and maximum logits per head. Query and key output norms are a cheap stand-in.
 
-**TensorLens today.** Not captured. The planned probe pass computes explicit attention on a fixed batch; until then, watching the query and key projections' absolute maximum is a partial signal.
+**TensorLens today.** Captured by the Tier 2 probe pass (`probe=`, `probe_every=1000`): for each `scaled_dot_product_attention` call, per-head `max_logit`, `entropy`, and `entropy_share` (each query row's entropy divided by the log of its visible key count, leaving out all-masked and non-finite rows), plus sample 0's 64×64 pooled attention map, plotted in Rerun's Probe tab. No detector threshold is set yet.
 
 ### 8. Activation outliers, especially with FP8
 
@@ -156,15 +156,20 @@ Meta logged 419 unexpected interruptions in 54 days of Llama 3 405B training, 58
 
 ## What this means for the detectors
 
-In order of value for effort:
+Built since Nov 13, 2026:
 
-1. **Run the cross-GPU detector on two GPUs** (entries 1 and 2). It is built and covers the two highest-cost silent failures.
-2. **Record weight norms and update norms** in the existing optimizer hooks (entries 4 and 12). One small change catches "weights not updating", which no current signal catches.
-3. **Fix the step counter on resume and record the learning rate** (entry 6).
-4. **Add a gradient-spike detector** that names the first layer to spike (entry 5), using data already captured.
-5. **Make the MoE detector top-k aware** (entry 3).
-6. **Add kurtosis to the layer statistics** (entry 8).
-7. **Attention entropy and a compiled-versus-eager check** come with the probe pass (entries 7 and 13).
+1. **Weight norms and stalled-weight detection** in float64 every 50 steps (`weights=50`, entries 4 and 12).
+2. **Step continuation (`start_step=`), repeated-step detection and per-step learning rate** (entry 6).
+3. **Gradient-spike detection** on `clip_grad_norm` or `grad_norm`, ranking parameters by their spike and naming the first to rise (entry 5).
+4. **Top-k MoE diversity-drop overload and 50-step starved-expert detection** (entry 3).
+5. **Activation spike, drift (`abs_max / std` and `std`) and dead-output detection** per repeated block in full capture (entry 8).
+6. **Tier 2 probe pass** for 64-bin activation histograms and per-head attention `max_logit`, `entropy_share` and 64×64 maps (entry 7).
+
+Remaining priorities in order of value for effort:
+
+1. **Run the cross-GPU detector on two CUDA GPUs over NCCL** (`sdk/examples/replica_check.py`, entries 1 and 2).
+2. **Run the dense-model outlier and probe benchmark on a GPU** (`sdk/examples/dense_outlier_check.py`, entries 7 and 8) and add attention-entropy / logit-growth detector rules once real failure traces are collected.
+3. **Record `GradScaler` skipped steps and scale factor** if mixed-precision fp16 runs are in scope (entry 10).
 
 TrainCheck (OSDI '25) already catches entries 1 and 4 by checking invariants, such as "replicated weights match" and "`step()` changes the parameters". It is the closest prior work for these two entries and should be added to the competitor check.
 
