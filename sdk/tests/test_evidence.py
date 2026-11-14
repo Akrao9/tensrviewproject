@@ -213,7 +213,7 @@ def test_missing_routing_data_and_mixed_expert_counts():
 def test_export_rerun_writes_explicit_width_and_height_for_single_layer(tmp_path, monkeypatch):
     import sys
     import types
-    import numpy as np
+    np = pytest.importorskip("numpy")  # the Rerun export needs it; the core SDK does not
 
     records = [
         {"run_id": "toy", "step": 0, "moe": {"router": [32] * 8}},

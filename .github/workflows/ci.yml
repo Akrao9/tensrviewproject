@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: Also run the GPU check (needs a self-hosted runner with the labels below)
+        type: boolean
+        default: false
+      gpu_runner:
+        description: Runner labels for the GPU check, as a JSON list
+        default: '["self-hosted", "gpu"]'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: sdk
+
+jobs:
+  cpu:
+    name: CPU, Python ${{ matrix.python }}, PyTorch ${{ matrix.torch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+        torch: ["2.6", "2.10", "2.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: sdk/pyproject.toml
+      - name: Install
+        run: |
+          pip install "torch==${{ matrix.torch }}.*" --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev]"
+          python -c "import torch; print(torch.__version__)"
+      - name: Tests
+        run: pytest -ra
+      - name: Compiler gate script, CPU fallback
+        # Without CUDA this runs on aot_eager: it checks graph breaks, recompiles, router
+        # counts and the detector, but not Inductor or CUDA graphs. The gpu job does those.
+        run: python examples/gpu_check.py --skip-overhead
+
+  extras:
+    # Lightning and Rerun are optional, so their tests are skipped in the matrix above.
+    name: CPU with Lightning and Rerun
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: sdk/pyproject.toml
+      - name: Install
+        run: |
+          pip install "torch==2.14.*" --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev,lightning,rerun]"
+      - name: Tests
+        run: pytest -ra
+
+  gpu:
+    # GitHub's free runners have no GPU, so this runs only when started by hand, on a
+    # self-hosted runner that already has a CUDA build of PyTorch. It is never started
+    # by a pull request, so outside code cannot reach the runner.
+    name: GPU compiler gate
+    if: github.event_name == 'workflow_dispatch' && inputs.gpu
+    runs-on: ${{ fromJSON(inputs.gpu_runner) }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install
+        run: |
+          python -c "import torch; assert torch.cuda.is_available(), 'this runner has no CUDA'; print(torch.__version__)"
+          pip install -e ".[dev]"
+      - name: Tests
+        run: pytest -ra
+      - name: Compiler gate, Inductor with CUDA graphs
+        env:
+          TORCH_LOGS: graph_breaks,recompiles,cudagraphs
+        run: python examples/gpu_check.py --skip-overhead

@@ -267,6 +267,8 @@ cd sdk
 ../.venv/bin/python examples/toy_moe.py --rerun
 ```
 
+CI ([ci.yml](../.github/workflows/ci.yml)) runs the tests on every push and pull request, on Python 3.11 and 3.12 with PyTorch 2.6, 2.10 and 2.14 (CPU builds), and once more with the Lightning and Rerun extras installed. It also runs `gpu_check.py --skip-overhead`, which on CPU uses the `aot_eager` backend. The real GPU gate is a separate job, started by hand from the Actions tab with `gpu` ticked; it needs a self-hosted runner with a CUDA build of PyTorch, and none is registered yet.
+
 On a CUDA machine, run the GPU check. It fails on any graph break, recompile or CUDA-graph skip, and then reports the time per step with and without capture:
 
 ```sh
