@@ -99,23 +99,22 @@ session.close()
 
 ### PyTorch Lightning
 
-There is no TensorLens callback yet. Start the session in `on_fit_start`, after Lightning has moved the model to its device:
+Add the callback; it starts TensorLens when fitting starts, after Lightning has moved the model to its device, and stops it when fitting ends or fails:
 
 ```python
-class MyModule(L.LightningModule):
-    def on_fit_start(self):
-        self.tensorlens = tensorlens.init(self, routers=routers, run_id=run_id)
+from tensorlens.lightning import TensorLensCallback
 
-    def on_fit_end(self):
-        self.tensorlens.close()
-
-    def training_step(self, batch, batch_idx):
-        loss = ...
-        self.tensorlens.log({"train/loss": loss})  # before Lightning's optimizer step
-        return loss
+trainer = L.Trainer(callbacks=[TensorLensCallback(routers=routers)], logger=MLFlowLogger(...))
 ```
 
-Steps are counted from the optimizer, and `Trainer(gradient_clip_val=...)` clipping is recorded. This was tested on CPU with Lightning 2.6.5. With `MLFlowLogger`, pass `run_id=self.logger.run_id`. Combining this with `torch.compile` under Lightning has not been tested.
+- **Run ID.** It reads the run from the trainer's logger (`MLFlowLogger.run_id`, or `WandbLogger`'s run) on rank 0 and broadcasts it to every rank, so you do not pass `run_id=`.
+- **Steps** are counted from optimizer steps, like Lightning's `global_step`, and start at `trainer.global_step`, so a resumed fit continues the numbering.
+- **Loss** is logged as `train/loss` for each optimizer step, summed over `accumulate_grad_batches` microbatches (which Lightning has already divided, so it is their mean). Change the name with `loss_name=`, or turn it off with `loss_name=None`.
+- **Mixed precision.** With `precision="16-mixed"`, the plugin's `GradScaler` is passed in, so skipped steps are counted and marked.
+- **Clipping.** `Trainer(gradient_clip_val=...)` is recorded as `clip_grad_norm`.
+- Other keyword arguments go to `tensorlens.init`, for example `capture="full"` or `probe=`.
+
+Tested on CPU with Lightning 2.6.5, on one process and on two with `strategy="ddp_spawn"`. Combining it with `torch.compile` under Lightning has not been tested.
 
 ### Megatron-LM
 

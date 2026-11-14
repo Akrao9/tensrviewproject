@@ -44,6 +44,7 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 | Step counting through PyTorch's global optimizer hooks, limited to this model's optimizer | Built, tested |
 | Gradient norms grouped by device and dtype (`torch._foreach_norm`, with `DTensor.to_local()` and fallback) | Built, tested |
 | MoE expert load (a compare-and-sum per router, accumulated on the device) and router entropy / diversity (`moe_stats`) | Built, tested |
+| PyTorch Lightning callback (`tensorlens.lightning.TensorLensCallback`): run ID from the trainer's logger broadcast from rank 0, steps from `trainer.global_step`, the back-propagated loss per optimizer step, and the `16-mixed` scaler | Built, tested on CPU with Lightning 2.6.5 on one process and two (`ddp_spawn`) |
 | Probe pass (`probe=`): activation histograms per block and attention logit, entropy and maps per layer, on a fixed batch every `probe_every` steps | Built, tested on CPU, under `torch.compile` with no graph breaks or recompiles, and on a small randomly initialized Hugging Face Granite MoE; not run on a GPU |
 | Logged scalars (`session.log`) attached to incidents and plotted in Rerun | Built, tested on CPU and Apple MPS; not run on a GPU |
 | Cross-GPU parameter fingerprints and replica spread (`parameter_fingerprints`, `replica_spread`) | Built, unit-tested on drift and sign-flip cases |
@@ -56,7 +57,6 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 - **Arrow Flight and the Rust ingest server.** Records go to a JSON Lines file, and Python detectors/exporters turn that file into `evidence.json` and `.rrd`.
 - **Replay** of a flagged batch (Tier 3). The probe pass (Tier 2) is built but has not run on a GPU.
 - **Multi-rank reporting.** Every rank writes its own file.
-- **A PyTorch Lightning callback.** Until then, pass `run_id=` yourself when the run was created through `MlflowClient`.
 - **Detector thresholds are untuned.** The gradient-spike factor (5× the median of the last 50 recorded steps), the top-k diversity drop (0.6 of its recent median), the starved-expert ratio and the stalled-weight check have been checked on synthetic cases and, for the MoE rules, on one Granite capture. Weight norms, learning rates and the spike and stalled-weight detectors have run on the Granite captures from the A100 and RTX PRO 6000 runs below, but not against a planted failure of their own kind on a GPU; the steps they flagged there are unconfirmed.
 - **CUDA graphs on Granite.** Its `grouped_mm` expert path fails during CUDA-graph recording on PyTorch 2.14.1+cu130, so `mode="reduce-overhead"` is verified only on the toy model.
 
