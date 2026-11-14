@@ -6,7 +6,7 @@ TensorLens lets ML engineers and their coding agents see inside a PyTorch traini
 
 ## Product
 
-TensorLens owns the capture SDK, detectors, and the evidence they produce. Stock Rerun displays that evidence, and the team's coding agent uses it to investigate incidents.
+TensorLens owns the capture SDK, detectors, the evidence they produce, and (decided Nov 14, 2026) its own Rust viewer app built on Rune. Until that app covers the needed views, stock Rerun displays the evidence, and the team's coding agent uses it to investigate incidents.
 
 - **Who it is for:** teams training large models on their own clusters with MLflow or W&B. Start with RL, robotics and mixture-of-experts teams, whose important signals are not loss curves.
 - **The pitch:** add one line to your PyTorch script and see inside a failing run (activations, attention, MoE routing), with evidence an agent can read.
@@ -36,10 +36,10 @@ Start with stock Rerun and reuse the MoE recording and blueprint from the bake-o
 | Ingest server | Build | Rust (`server/`) | Single self-hosted binary (`tensorlens-server`). Receives Arrow Flight `DoPut`, deduplicates by `(run_id, rank, step)`, and flushes partitioned Parquet to S3, GCS, or local disk via `object_store` |
 | Detectors | Build | Python (`sdk/src/tensorlens/evidence.py`) | Ten incident kinds across MoE routing, weights, gradients, activations, step numbers, non-finite values, and cross-GPU drift. Runs on local `.jsonl` or live server Parquet (`python -m tensorlens --watch`). Port to Rust only if the 64-rank benchmark exceeds 250 ms per flush |
 | Evidence and Rerun export | Build | Viewer-neutral JSON (`schema_version: 1`), `.rrd`, Rerun blueprint | Exports the incident summary, status heatmap, expert-load table, probe tab, and training-step timeline (`python -m tensorlens`) |
-| Incident view | Conditional | Rust (`re_viewer`, egui) | Prototype one custom view inside Rerun only if Gate 1 shows a ≥2× reduction in diagnosis time or agent tool calls |
-| Viewer and screenshots | Borrow | Rerun 0.43.2 (MIT / Apache 2.0) | Stock desktop viewer, built-in views, timeline, headless screenshots, and `rerun viewer-mcp` |
+| Viewer app | Build | Rust on Rune (wgpu, headless PNG and element-tree inspection) | TensorLens's own desktop and web app (decided Nov 14, 2026). Reads `evidence.json` and the JSONL/Parquet step data directly, not `.rrd`. Must match Rerun's step timeline, layer × expert heatmap, histograms and attention maps before it replaces Rerun. Not started |
+| Viewer and screenshots, interim | Borrow, temporary | Rerun 0.43.2 (MIT / Apache 2.0) | Stopgap until the Rune app covers the views above: stock desktop viewer, built-in views, timeline, headless screenshots, and `rerun viewer-mcp`. Keep `export_rerun` working until then |
 | Run metadata | Borrow | MLflow or W&B | Params, lineage, artifacts |
-| Diagnosis | Borrow | The team's own coding agent | Reads TensorLens `evidence.json` and inspects the recording through Rerun's viewer MCP |
+| Diagnosis | Borrow | The team's own coding agent | Reads TensorLens `evidence.json`; inspects the recording through Rerun's viewer MCP for now, and through the Rune app's headless PNGs and element tree once it exists |
 
 Postponed from v2 and v1: a built-in VLM agent loop, agent-written layout blueprints, live fixes to a running optimizer, a custom browser client, Tier 3 activation replay, and the MLflow scalar-only run importer (revisit the importer only if three or more engineers join the project).
 
@@ -147,7 +147,7 @@ Multi-node runs need a single store that collects every rank's stream and runs d
    - `FlightDescriptor`: path `["runs", "<run_id>", "rank=<rank>"]`.
    - `FlightData.app_metadata`: UTF-8 JSON `{"schema_version": 1, "run_id": "<id>", "rank": 0, "min_step": 0, "max_step": 49, "end_byte_offset": 128450}`.
    - **Arrow schema (one row per step):**
-     - Scalar/vector columns: `schema_version: Int32`, `run_id: Utf8`, `rank: Int32`, `step: Int64`, `ts: Float64`, `lr: List<Float64>`, `grad_norm: Float64` (nullable), `clip_grad_norm: Float64` (nullable), `weight_norm: Float64` (nullable), `weights_unchanged: List<Utf8>` (nullable), `replica_non_finite: List<Utf8>` (nullable).
+     - Scalar/vector columns: `schema_version: Int32`, `run_id: Utf8`, `rank: Int32`, `step: Int64`, `ts: Float64`, `lr: List<Float64>`, `grad_norm: Float64` (nullable), `clip_grad_norm: Float64` (nullable), `weight_norm: Float64` (nullable), `weights_unchanged: List<Utf8>` (nullable).
      - Map columns: `scalars: Map<Utf8, Float64>`, `grad_norms: Map<Utf8, Float64>`, `weight_norms: Map<Utf8, Float64>`, `moe_top_k: Map<Utf8, Int32>`, `moe_counts: Map<Utf8, List<Int64>>`, `replica_spread: Map<Utf8, List<Float64>>`.
      - Canonical JSON-string columns for nested objects whose keys vary by model: `layers_json: Utf8` (nullable), `moe_stats_json: Utf8` (nullable), `probe_json: Utf8` (nullable). Storing these three nested structures as UTF-8 JSON strings inside Parquet preserves 100% lossless round-tripping back to the dict format `evidence.py` expects (`IM2`).
 4. **Deduplication, backpressure, auth, and Parquet layout (`server/src/storage.rs`):**
@@ -163,16 +163,17 @@ Multi-node runs need a single store that collects every rank's stream and runs d
 
 ## Viewer and agent evidence
 
-Use stock Rerun 0.43.2 for the first release (`rerun-sdk==0.43.2` pinned in [sdk/pyproject.toml](sdk/pyproject.toml)). The [MoE bake-off](experiments/moe-bakeoff/README.md) and shipped exporter ([rerun_export.py](sdk/src/tensorlens/rerun_export.py)) use a blueprint and built-in views for the detector summary, status heatmap, per-expert load table, probe tab, logged scalars tab, and diversity timeline. Keep the evidence schema independent of Rerun so engineers and agents read the exact same numbers in JSON.
+Use stock Rerun 0.43.2 as the interim viewer, until TensorLens's own Rune app covers the views below (decided Nov 14, 2026: Rerun is temporary) (`rerun-sdk==0.43.2` pinned in [sdk/pyproject.toml](sdk/pyproject.toml)). The [MoE bake-off](experiments/moe-bakeoff/README.md) and shipped exporter (`export_rerun` in [evidence.py](sdk/src/tensorlens/evidence.py)) use a blueprint and built-in views for the detector summary, status heatmap, per-expert load table, probe tab, logged scalars tab, and diversity timeline. Keep the evidence schema independent of Rerun so engineers and agents read the exact same numbers in JSON.
 
 - **Schemas and versioning (`sdk/src/tensorlens/evidence.py`, `capture.py`).** JSONL step records have no `schema_version` yet; Step 10a adds `"schema_version": 1`, and readers will treat records without it as version `0` (missing `moe_top_k` already defaults from `--top-k`). The exported `<input>.evidence.json` carries `"schema_version": 1`, `"run_id"`, `"layer_count"`, `"expert_count"`, `"router_names"`, `"overload_threshold"`, `"top_k"`, `"starve_window"`, `"starve_ratio"`, `"incidents"` (each with `kind` and `step`, kind-specific fields, and `scalars` when values were logged with `session.log`), and `"samples"` (one per router per step).
 - **Headless screenshots and sample-step sidecar.** Use Rerun's headless Viewer for per-view PNGs and `rerun viewer-mcp` for live screenshots and the widget tree. Because a timeline view displays the most recent sample at or before the cursor, exporting a screenshot for `<run_id>` at requested `<req_step>` writes `<out_dir>/<run_id>.step<req_step>.<view>.png` alongside `<out_dir>/<run_id>.step<req_step>.<view>.meta.json` containing `{"run_id": "<id>", "requested_step": <req_step>, "sample_step": <actual_step>, "view": "<view>", "rrd_path": "<path>"}`.
 
-If the Gate 1 trials show that sorting and a table that follows layer selection cut diagnosis time or agent tool calls by at least 2×, prototype a single custom Rust `ViewClass` in up to one week (`viewer/` crate, pinned to Rerun `0.43.2` tag `0.43.2` from `rerun-io/rerun` `examples/rust/custom_view`). In 0.43.2 the built-in dataframe view cannot sort, and `ViewerClient.send_table` opens a separate table page outside the recording blueprint.
+**Own viewer app on Rune (decided Nov 14, 2026).** Rerun is temporary. TensorLens will ship its own Rust app built on Rune instead of a custom `ViewClass` inside Rerun. Rerun 0.43.2's built-in dataframe view cannot sort, and `ViewerClient.send_table` opens a separate table page outside the recording blueprint; a custom Rerun view would also tie the product to Rerun's extension interfaces.
 
-- **Headless.** Share a `create_app(cc) -> re_viewer::App` helper between `re_viewer::run_native_app` and `re_viewer::run_headless_app`.
-- **Command line.** Add `--headless`, `--window-size`, and `.rrd` path flags to the `viewer/` binary.
-- **Agent access.** Verify that `rerun viewer-mcp` connects to the custom app's gRPC control port and that upgrading across one minor Rerun release takes ≤2 engineer-days.
+- **Data.** The app reads `evidence.json` and the per-rank JSONL (and the ingest server's Parquet parts later) directly. `.rrd` stays an export for the interim Rerun viewer only, so capture and detectors do not change.
+- **Parity before replacing Rerun.** Step timeline with scrubbing, layer × expert status heatmap, sortable expert-load table that follows layer selection, time series, probe histograms and attention maps, and loading a full Granite run (650 steps, about 17 MB of JSON) smoothly.
+- **Agent access.** Rune apps render headless to PNG and expose their element tree, which replaces Rerun's headless viewer and `rerun viewer-mcp` for Step 19; keep the `requested_step` / `sample_step` sidecar.
+- **Headless on Linux.** Step 20's software-Vulkan check (`lavapipe`) applies to the Rune app; Rune renders through wgpu.
 
 ## Roadmap
 
@@ -196,7 +197,7 @@ Status values are fixed to **Done**, **In progress**, **Not started**, or **Post
 | 15, detectors | **Done** | Ten incident kinds ship in `sdk/src/tensorlens/evidence.py`: `moe_imbalance` (top-k aware), `starved_experts`, `stalled_weights`, `grad_spike`, `activation_spike`, `activation_drift`, `dead_activations`, `repeated_steps`, `non_finite`, and `replica_drift`. Verified on Granite single-GPU runs (RTX PRO 6000 and A100) and synthetic fixtures |
 | 16, probe pass | **In progress** | Tier 2 (`sdk/src/tensorlens/probe.py`, `9a5a39f` and `9c7d8eb`) is built and tested on CPU under `torch.compile`; unmet: measure GPU overhead and record size on Granite and SmolLM2 (`dense_outlier_check.py`). Tier 3 replay is **Postponed** |
 | 17, Gate 2 | **In progress** | `capture="routers"` passes ≤1% on the RTX PRO 6000 (+0.78%, +0.02%, +0.54%) and misses on the A100 (+1.06% to +1.33%); unmet: profile A100 with `profile_overhead.py`, pass the two-GPU NCCL `replica_check.py`, and pass every case in the seeded failure suite |
-| 18, product exporter | **Done** | `sdk/src/tensorlens/rerun_export.py` and `python -m tensorlens` export `.rrd` and blueprint; verified in the stock Rerun 0.43.2 viewer |
+| 18, product exporter | **Done** | `export_rerun` in [evidence.py](sdk/src/tensorlens/evidence.py) and `python -m tensorlens` export `.rrd` and blueprint; verified in the stock Rerun 0.43.2 viewer |
 | 19–27, Gates 3–4 | **Not started** | Unmet: headless screenshot sidecars, Linux `lavapipe` verification, agent diagnosis benchmark (Gate 3), and package rename + open-source release (Gate 4) |
 
 Findings along the way:
@@ -220,14 +221,14 @@ Open gaps:
 2. **Run pending single- and two-GPU checks (Steps 12, 16, 17):** run [replica_check.py](sdk/examples/replica_check.py) on 2 CUDA GPUs with NCCL, [profile_overhead.py](sdk/examples/profile_overhead.py) on A100, and [dense_outlier_check.py](sdk/examples/dense_outlier_check.py) on a CUDA GPU.
 3. **Finish SDK remaining items (Steps 10, 12, 13, 18):** add `schema_version: 1` and unique default `run_id` to records, `replica_params=` to `init()`, `scaler=` skipped-step recording, `TensorLensCallback` in `sdk/src/tensorlens/lightning.py`, and `.github/workflows/ci.yml`.
 4. **Build the Flight sender and Rust ingest server (Steps 11, 14):** implement `sdk/src/tensorlens/flight.py` and `server/` (`tensorlens-server`), pass the stall/resume, duplicate-batch, and torn-line tests, and run the 64-rank Python-vs-Rust detector benchmark.
-5. **Run Gate 1 (Steps 6–9) and Gate 3 (Steps 19–23):** unify `experiments/moe-bakeoff/generate.py` with `sdk/src/tensorlens/rerun_export.py`, verify Linux `lavapipe` headless screenshots, and score coding-agent diagnosis accuracy with and without TensorLens evidence.
+5. **Run Gate 1 (Steps 6–9) and Gate 3 (Steps 19–23):** unify `experiments/moe-bakeoff/generate.py` with `export_rerun` in `sdk/src/tensorlens/evidence.py`, verify Linux `lavapipe` headless screenshots, and score coding-agent diagnosis accuracy with and without TensorLens evidence.
 
 ### File boundaries and test plan for remaining work
 
 | Step | Path | Action | One-line purpose | Required tests and assertions |
 | --- | --- | --- | --- | --- |
-| 6 | `experiments/moe-bakeoff/generate.py` | Modify | Replace duplicated `routing_colors` and 0.35 rule with calls to `tensorlens.build_evidence` and `export_rerun` | `sdk/tests/test_cli.py`: generated fixture `.rrd` and `.evidence.json` match `python -m tensorlens` output byte-for-byte on `incidents` and `moe` status counts |
-| 10a | `sdk/src/tensorlens/capture.py` | Modify | Add `"schema_version": 1` to every step record; generate unique `run-<utc>-<hex6>` when no run ID is found; add `scaler=` (`torch.amp.GradScaler`) hook to record `step_skipped: true` and `grad_scale` when `optimizer.step()` is skipped | `sdk/tests/test_capture.py`: (1) every record has `schema_version == 1`; (2) two `init()` calls without `run_id` write distinct files; (3) overflowing fp16 step under `GradScaler` increments step and writes `step_skipped is True` and finite `grad_scale` |
+| 6 | `experiments/moe-bakeoff/generate.py` | Modify | Replace duplicated `routing_colors` and 0.35 rule with calls to `tensorlens.build_evidence` and `export_rerun` | `sdk/tests/test_cli.py`: generated fixture `.rrd` and `.evidence.json` match `python -m tensorlens` output byte-for-byte on `incidents` and `samples` status counts |
+| 10a | `sdk/src/tensorlens/capture.py` | Modify | Add `"schema_version": 1` and `"ts"` to every step record; generate unique `run-<utc>-<hex6>` when no run ID is found; add `scaler=` (`torch.amp.GradScaler`) hook to record `step_skipped: true` and `grad_scale` when `optimizer.step()` is skipped | `sdk/tests/test_capture.py`: (1) every record has `schema_version == 1` and float `ts`; (2) two `init()` calls without `run_id` write distinct files; (3) overflowing fp16 step under `GradScaler` increments step and writes `step_skipped is True` and finite `grad_scale` |
 | 10b | `sdk/src/tensorlens/lightning.py` | Create | `TensorLensCallback(L.Callback)` calling `tensorlens.init` in `on_fit_start`, broadcasting rank 0's `logger.run_id` via `strategy.broadcast`, calling `session.log` in `on_train_batch_end`, and closing in `on_fit_end` | `sdk/tests/test_lightning.py`: (1) 2-rank CPU `ddp_spawn` run broadcasts rank 0 `run_id` so both ranks write `<run_id>.rank{0,1}.jsonl`; (2) `trainer.global_step` matches recorded steps; (3) `gradient_clip_val=1.0` records pre-clip `clip_grad_norm` |
 | 11 | `sdk/src/tensorlens/flight.py` | Create | Background tailer reading `<run_id>.rank<rank>.jsonl` from `<run_id>.rank<rank>.offset` and streaming `RecordBatch`es via Arrow Flight `DoPut` when `endpoint=` / `TENSORLENS_ENDPOINT` is set | `sdk/tests/test_flight.py`: (1) partial trailing JSONL line without `\n` is not sent until completed; (2) stopping the server for 200 steps holds sender RAM growth <8 MiB and delivers all 200 steps in order upon restart; (3) `.offset` file matches file size after `close()` |
 | 12 | `sdk/src/tensorlens/capture.py`, `distributed.py` | Modify | Add `replica_params=` (optional iterable or name predicate) to `tensorlens.init` for tensor-parallel replicated weights | `sdk/tests/test_distributed.py`: passing `replica_params=lambda n, p: "norm" in n` fingerprints only matching parameters and ignores sharded linear weights |
@@ -236,7 +237,7 @@ Open gaps:
 | 14b | `server/src/ingest.rs`, `server/src/storage.rs` | Create | Arrow Flight `DoPut` service, `(run_id, rank, step)` watermark deduplication, 128 MiB memory cap, and Zstd Parquet part writer via `object_store` | `server/tests/ingest_test.rs`: (1) resending steps 0–49 produces zero duplicate rows in written Parquet; (2) exceeding 128 MiB returns `RESOURCE_EXHAUSTED`; (3) `SIGTERM` flushes buffered rows to `part-*.parquet` before exit |
 | 15b | `sdk/src/tensorlens/__main__.py`, `evidence.py` | Modify | Support reading a directory of `part-*.parquet` files and `--watch` live polling mode | `sdk/tests/test_evidence.py`: `build_evidence` on Parquet parts produces identical `evidence.json` to the source `.jsonl` file (including `probe`, `scalars`, and `moe_stats`) |
 | 19 | `sdk/src/tensorlens/screenshots.py` | Create | Export headless view PNGs from `.rrd` and write `<run_id>.step<req_step>.<view>.meta.json` with `requested_step` and `sample_step` | `sdk/tests/test_screenshots.py`: requesting step 455 when samples exist at 450 and 500 writes `requested_step: 455, sample_step: 450` alongside a valid PNG header |
-| 22 | `viewer/Cargo.toml`, `viewer/src/main.rs` | Create (if Gate 1 passes) | Pinned Rerun `0.43.2` binary registering the custom sortable incident `ViewClass` with `--headless` and `viewer-mcp` support | `cargo test --manifest-path viewer/Cargo.toml`: headless render produces non-empty PNG and `viewer-mcp` lists the custom view |
+| 22 | `viewer/Cargo.toml`, `viewer/src/main.rs` | Create | TensorLens's own Rune app reading `evidence.json` and JSONL step data, starting with the incident summary, layer × expert heatmap and sortable expert table | `cargo test --manifest-path viewer/Cargo.toml`: on a Granite capture, headless render produces a non-empty PNG and the element tree lists the first incident's step and layer |
 | 24 | `sdk/pyproject.toml`, `LICENSE-APACHE`, `LICENSE-MIT` | Modify / Create | Rename package from placeholder `tensorlens` to an available PyPI name, set dual `Apache-2.0 OR MIT` license, and build wheel/sdist with zero telemetry | `twine check dist/*` passes; `pip install dist/*.whl` in a clean venv imports and runs `toy_moe.py` with zero outbound network connections |
 
 ### Week 1: set up the dogfood runs (Gate 0)
@@ -252,15 +253,15 @@ Open gaps:
    - [ ] Competitor check table updated with Nov 2026 status for ARIA, Pluto, tracker MCPs, and TrainCheck.
    - *Cut order if blocked:* if no multi-GPU MoE job is available immediately, run Gate 2 on the 2-GPU Granite benchmark plus the author's single-GPU dense/MoE job.
 
-### Weeks 2–3: is a custom view needed? (Gate 1)
+### Weeks 2–3: what must the Rune app do first? (Gate 1)
 
 6. Generate 6 unseen synthetic MoE and dense fixtures using `experiments/moe-bakeoff/generate.py` wired through `tensorlens.build_evidence` and `export_rerun`, varying incident steps, layers, and experts.
 7. Pre-register 6 timed diagnosis questions (each requiring identifying the first failing step, layer, and failure kind/expert IDs) that neither default screen answers without interaction.
-8. Run three arms across all 6 fixtures using fresh coding-agent sessions (same model and system prompt, 3 trials per fixture per arm): (A) stock Rerun 0.43.2 with the bake-off blueprint + `evidence.json`, (B) the custom interactive prototype + `evidence.json`, and (C) `evidence.json` alone. Also time the author across counterbalanced fixtures on (A) vs. (B).
+8. Run three arms across all 6 fixtures using fresh coding-agent sessions (same model and system prompt, 3 trials per fixture per arm): (A) stock Rerun 0.43.2 with the bake-off blueprint + `evidence.json`, (B) the Rune app prototype + `evidence.json`, and (C) `evidence.json` alone. Also time the author across counterbalanced fixtures on (A) vs. (B).
 9. **Gate 1 checklist:**
    - [ ] Accuracy across the 6 fixtures is within ±5 percentage points between arms (or higher in Arm B).
    - [ ] Arm B cuts median agent tool calls or median human time-to-correct-answer by **≥2.0×** relative to Arm A.
-   - *Decision rule:* if both boxes pass, schedule the one-week custom view spike (Step 22); otherwise **drop Step 22** and ship on stock Rerun 0.43.2.
+   - *Decision rule (changed Nov 14, 2026):* the Rune app is built either way (Step 22). The trial decides its order of work: the interactions that cut time or tool calls most come first, and the release ships with Rerun as the viewer until the Rune app reaches parity.
 10. In parallel, complete Step 10a (`schema_version`, unique `run_id`, `GradScaler` skipped steps) and Step 10b (`TensorLensCallback`).
 
 ### Weeks 4–7: capture, stream, and detect on a real run (Gate 2)
@@ -284,7 +285,7 @@ Open gaps:
 19. Build `sdk/src/tensorlens/screenshots.py` writing headless PNGs and `.meta.json` (`requested_step`, `sample_step`).
 20. Verify headless Linux rendering in an Ubuntu container with `mesa-vulkan-drivers` (`lavapipe`) and `libvulkan1`: two repeat renders of the same `.rrd` and step must produce byte-identical PNGs.
 21. *Postponed unless ≥3 engineers join:* MLflow scalar-only importer (`sdk/src/tensorlens/mlflow_import.py`).
-22. *Only if Gate 1 passed:* one-week custom `ViewClass` spike in `viewer/`.
+22. Build TensorLens's own Rune app in `viewer/`, in the order Gate 1 set; Rerun stays the viewer until it reaches parity.
 23. **Gate 3 checklist (pass both to proceed):**
     - [ ] Across ≥8 seeded failure runs (covering MoE collapse, starved experts, frozen bf16 norms, gradient spike, activation outlier, and 2-GPU replica drift), a coding agent given TensorLens `evidence.json` + Rerun screenshots identifies the exact failing step, layer/parameter, and failure kind in **≥85%** of trials, beating the same agent given scalar loss + total grad-norm curves alone by **≥30 percentage points**.
     - [ ] TensorLens has run on ≥1 of the author's real training jobs and either surfaced a real anomaly or completed ≥1,000 steps with zero false-positive incidents.
@@ -318,7 +319,8 @@ The biggest risk is commercial, not technical: teams may value the tool and stil
 | Nobody pays for hosted monitoring | No revenue | Release the SDK and self-hosted `tensorlens-server` free first; build a multi-tenant hosted cloud only if Gate 4 shows ≥2 outside teams willing to pay |
 | ARIA, Pluto, or TrainCheck adds compiled per-layer capture and MoE/attention detectors | The gap closes | Re-check all competitors at Gate 0 and before Gate 4; stay tracker- and cloud-neutral; lead with MoE, attention, cross-GPU drift, and zero-break `torch.compile` support |
 | Trackers add per-layer views | The wedge narrows | Stay tracker-neutral; lead with MoE, attention, and `torch.compile` capture that scalar trackers lack |
-| Rerun's extension interfaces change | A custom incident view needs maintenance | Pin `rerun-sdk==0.43.2`, gate the custom view on a ≥2× win in Gate 1, and budget ≤2 days per minor upgrade if shipped |
+| Rerun's extension interfaces change | The interim export breaks | Pin `rerun-sdk==0.43.2`; only the `.rrd` exporter depends on Rerun |
+| The viewer depends on Rune, itself under heavy development | Rune's schedule delays the viewer, or a Rune change breaks it | Keep the Rerun export as a working fallback until parity; pin a Rune commit in `viewer/`; keep the app's input to `evidence.json` and JSONL so it can move to another renderer |
 | Hooks stall training or break `torch.compile` | Users switch the SDK off | Overhead gate ≤1% for default `capture="routers"`, CI gate with `error_on_recompile` and `graph_break == 0`, and bounded writer queue (`WRITER_QUEUE = 8`) |
 | Agents misread the pictures | Wrong diagnoses, lost trust | Every number travels in `evidence.json` (`schema_version: 1`); screenshots include `.meta.json` with `sample_step`; score on Gate 3 |
 | Coding-agent clients handle tool images differently | The picture does not reach the model or the user | Test saved PNGs with target agent clients and always supply `evidence.json` alongside |
@@ -331,7 +333,7 @@ The synthetic MoE bake-off verified recording read-back and headless rendering. 
 
 **Unproven**
 
-- Whether sorting and layer selection cut diagnosis time or agent tool calls by ≥2× in Gate 1.
+- Which Rune-app interactions (sorting, layer selection, linked table) cut diagnosis time or agent tool calls most in Gate 1.
 - Whether `capture="routers"` on the A100 can be brought under 1% once profiled with `profile_overhead.py`, and whether `capture="full"` (+4.15%) needs optional gradient-norm step sampling.
 - Whether the detector thresholds (5× spike, 0.6 diversity drop, 10% starved share, 3 unchanged weight checks) hold on models other than Granite without false alarms.
 - Whether the hooks keep CUDA graphs on real models that support CUDA graphs (verified on the toy MoE; Granite's `grouped_mm` fails CUDA-graph capture even without TensorLens).
@@ -344,6 +346,7 @@ The synthetic MoE bake-off verified recording read-back and headless rendering. 
 - [ ] **Product and PyPI package name** ("TensorLens" is a placeholder; `tensorlens` is taken on PyPI and GitHub). Pick an available name before Gate 4.
 - [ ] **Author's dogfood job, tracker, and multi-GPU setup** (Gate 0).
 - [ ] **Price for the post-Gate 4 hosted tier**, after Step 26 measures storage and server cost per run.
+- [x] **Viewer (decided Nov 14, 2026):** Rerun is temporary. TensorLens builds its own Rust viewer app on Rune that reads `evidence.json` and the JSONL/Parquet data directly; the `.rrd` export stays as the interim viewer until the app reaches parity. This replaces the earlier rule that a custom view was built only after a ≥2× win in Gate 1.
 - [x] **Default capture level (decided Nov 13, 2026):** `capture="routers"` is the always-on default for MoE models, and `capture="full"` is an opt-in debugging mode.
 - [x] **Multi-GPU reporting (decided Nov 14, 2026):** every rank writes its own `tensorlens-out/<run_id>.rank<rank>.jsonl` and computes `replica_spread` on `replica_group` every `replica_every=50` steps where `(step + 1) % replica_every == 0`.
 - [x] **Ingest architecture and v1 server hosting (decided Nov 14, 2026):** the SDK always writes the local `.jsonl` file first; when `endpoint=` / `TENSORLENS_ENDPOINT` is set, an opt-in sender tails that file from `<run_id>.rank<rank>.offset` and streams over Arrow Flight `DoPut` to the open-source, self-hosted Rust `tensorlens-server` binary (`server/`), which deduplicates by `(run_id, rank, step)` and writes Zstd Parquet parts via `object_store`.
