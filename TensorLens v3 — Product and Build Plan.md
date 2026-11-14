@@ -229,7 +229,7 @@ The embedded roadmap diagram predates this version; the steps below are the curr
 
 ### Progress so far
 
-Work ran ahead of the gate order: the SDK, detectors and exporter were built before Gate 0 and Gate 1. Details and raw numbers are in the [SDK README](sdk/README.md); the [failure list](TensorLens%20failure%20list.md) records what each detector covers. State as of commit `d78fa78`. To add TensorLens to a job, follow the [run-on-your-job guide](sdk/RUN_ON_YOUR_JOB.md).
+Work ran ahead of the gate order: the SDK, detectors and exporter were built before Gate 0 and Gate 1. Details and raw numbers are in the [SDK README](sdk/README.md); the [failure list](TensorLens%20failure%20list.md) records what each detector covers. State as of commit `9a5a39f` (Nov 14, 2026). To add TensorLens to a job, follow the [run-on-your-job guide](sdk/RUN_ON_YOUR_JOB.md).
 
 | Steps | State |
 | --- | --- |
@@ -237,7 +237,7 @@ Work ran ahead of the gate order: the SDK, detectors and exporter were built bef
 | 6–9, Gate 1 | Not started |
 | 10, SDK skeleton | Done except the Lightning callback; the guide shows Lightning by hand (`init` in `on_fit_start`, tested on CPU with Lightning 2.6.5) and Megatron (manual steps, because its optimizer steps float32 copies of the weights). `init(start_step=)` continues step numbers after a resume, and each step records the learning rate. `capture="routers"` (router load only) is the default for MoE models and `capture="full"` the opt-in debugging mode |
 | 11, Tier 0 capture | Done except Arrow Flight; records go to JSON Lines. In full capture, activations are summarized once per repeated block (24 decoder layers for Granite instead of 171 leaf modules; `layers="all"` keeps every leaf), with the largest value kept across microbatches, and weight norms are checked in float64 every 50 steps. In any mode, the total gradient norm returned by `clip_grad_norm_` is recorded at no extra cost, including Lightning's `gradient_clip_val` |
-| 12, Tier 1 capture | MoE load done and checked on Granite, with each router's top-k recorded. Cross-GPU fingerprints pass two CPU processes; the two-GPU NCCL run is pending |
+| 12, Tier 1 capture | MoE load done and checked on Granite, with each router's top-k recorded. Cross-GPU fingerprints pass two CPU processes and now run every 50 steps (`replica_every=`) instead of every step; the two-GPU NCCL run is pending |
 | 13, CI gate | Partly. No graph breaks and no CUDA-graph skips on a toy MoE with Inductor and CUDA graphs. Granite runs with CUDA graphs off, because its `grouped_mm` expert path fails during CUDA-graph recording, so `reduce-overhead` is unverified on a real model. Granite shows one expected recompile per benchmark model with different hooks. Not wired into CI |
 | 14, ingest server | Not started |
 | 15, detectors | Done in Python. MoE imbalance (top-k aware), starved experts, weights not updating, gradient spikes (also from the clipping norm in router-only mode), activation spikes, drift and dead outputs, repeated steps, non-finite values and cross-GPU drift. On Granite: the seeded layer 12 collapse found at the right step, layer and experts on three GPU runs; 20 experts starved since pretraining; the 49 bf16 RMSNorm weights reported as not updating and no other parameter; gradient spikes at steps 141 and 645 on both GPUs |
