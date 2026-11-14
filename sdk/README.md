@@ -52,7 +52,7 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 - **The probe pass** for histograms and attention (Tier 2) and replay (Tier 3).
 - **Multi-rank reporting.** Every rank writes its own file.
 - **A PyTorch Lightning callback.** Until then, pass `run_id=` yourself when the run was created through `MlflowClient`.
-- **Detector thresholds are untuned.** The gradient-spike factor (5× the median of the last 50 recorded steps), the top-k diversity drop (0.6 of its recent median), the starved-expert ratio and the stalled-weight check have been checked on synthetic cases and, for the MoE rules, on one Granite capture. Weight norms, learning rates and the spike and stalled-weight detectors have not run on a GPU.
+- **Detector thresholds are untuned.** The gradient-spike factor (5× the median of the last 50 recorded steps), the top-k diversity drop (0.6 of its recent median), the starved-expert ratio and the stalled-weight check have been checked on synthetic cases and, for the MoE rules, on one Granite capture. Weight norms, learning rates and the spike and stalled-weight detectors have run on the Granite captures from the A100 and RTX PRO 6000 runs below, but not against a planted failure of their own kind on a GPU; the steps they flagged there are unconfirmed.
 - **CUDA graphs on Granite.** Its `grouped_mm` expert path fails during CUDA-graph recording on PyTorch 2.14.1+cu130, so `mode="reduce-overhead"` is verified only on the toy model.
 
 ## Granite MoE GPU benchmark
@@ -125,7 +125,7 @@ Colab, RTX PRO 6000 Blackwell Server Edition, PyTorch `2.14.1+cu130`, Inductor w
 | Capture off → router-only | 65.582 ms/step | 65.598 ms/step | +0.015 ms/step (+0.02%) |
 
 - **The stalled-weight check reported the 49 RMSNorm weights and nothing else.** All 24 `input_layernorm`, all 24 `post_attention_layernorm` and the final `norm` were exactly unchanged on 3 or more recorded steps in a row, from step 3; no other parameter was ever exactly unchanged. This is the pure-bf16 stagnation described above, and the expected result.
-- **The float64 weight norms are expensive on this GPU.** Gradient norms alone cost +2.60% (+1.79 ms) here at `5d38288`; with float64 weight norms the same arm costs +8.13% (+5.53 ms), so the weight check adds roughly 3.7 ms per recorded step. This GPU runs float64 arithmetic far slower than float32; the A100, with fast float64, paid less. The check now runs every 50 steps by default instead of on every step that records gradient norms.
+- **The float64 weight norms are expensive on this GPU.** Gradient norms alone cost +2.60% (+1.79 ms) here at `5d38288`; with float64 weight norms the same arm costs +8.13% (+5.53 ms), so the weight check adds roughly 3.7 ms per recorded step. This GPU (GB202) runs float64 at 1/64 of its float32 rate, which likely explains the cost; the A100 runs float64 at half its float32 rate, but its run used float32 norms, so float64 there was not measured. The check now runs every 50 steps by default instead of on every step that records gradient norms.
 - **Router-only capture** was within noise of capture off: paired rounds −0.50, +0.46 and −0.004 ms. With the earlier +0.78% on this GPU and +1.06–1.33% on the A100, the 1% target holds here and not on the A100.
 - **Gradient spikes at steps 141 and 645**, starting in `model.layers.11.self_attn.k_proj.weight` (22× its median). The A100 run flagged 136, 141 and 645. The same steps on two GPUs point to the data at those steps, since both runs read the same batches in the same order.
 - **The collapse** was found at step 450 in layer 12 with the same 20 starved experts.
@@ -182,7 +182,7 @@ Mark this complete when both NCCL ranks report `PASS`. Each rank checks healthy 
 - **Gradient accumulation.** A hook runs on every forward pass; the record keeps the last one before the optimizer step.
 - **Non-finite values** are written as the strings `"nan"`, `"inf"` and `"-inf"`, so the file stays standard JSON.
 - **Hooks stay on the model after `close()`**, because removing a hook from a compiled module triggers a recompile.
-- **Full-capture cost.** Each watched module adds a few small kernels per step. Granite's measured ~6% for activation capture was with every leaf module (171); blocks are the default now, and the benchmark's Stage 3 measures full capture with defaults directly against capture off (`--layers all` for the old selection). Not yet run on a GPU.
+- **Full-capture cost.** Each watched module adds a few small kernels per step. Granite's measured ~6% for activation capture was with every leaf module (171); blocks are the default now (`--layers all` in the benchmark for the old selection). Full capture with defaults measured +4.15% against capture off on the RTX PRO 6000 (Stage 3 above).
 
 ## Develop
 
