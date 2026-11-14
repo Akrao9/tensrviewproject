@@ -10,7 +10,7 @@ From a clone of this repository, in the training job's Python environment:
 python -m pip install -e 'sdk[rerun]'
 ```
 
-Keep the job's own PyTorch build. TensorLens needs PyTorch 2.6 or later and has been run with 2.10 and 2.14.
+Do not run `pip install tensorlens`: that name on PyPI belongs to an unrelated package. Keep the job's own PyTorch build. TensorLens needs PyTorch 2.6 or later and has been run with 2.10 and 2.14.
 
 ## 2. Choose a capture mode
 

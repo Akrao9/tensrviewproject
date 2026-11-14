@@ -86,6 +86,14 @@ Do not ship a tracking-store plugin with its own URI scheme (`tensorlens+https:/
 | 2 | Attention maps, entropy and max logit for a few layers and heads | Probe pass with explicit softmax(QKᵀ); maps downsampled to 256×256 | Every M steps | \~0.5 MB per layer |
 | 3 | Full activations for the layers a detector flagged | Replay the flagged batch from a ring buffer of batch IDs and seeds | Only when a detector fires | MB to GB, written to Parquet |
 
+As built on Nov 14, 2026, the capture differs from this table:
+
+- **Loss** is not captured; the tracker already has it.
+- **Router counts** are accumulated on every step in the router hook, inside the compiled graph, with a compare-and-sum into an int64 buffer rather than `scatter_add_`, and copied every N steps. Entropy, diversity and dead experts are computed on the CPU when records are written. Counts are not summed across data-parallel ranks; each rank writes its own file.
+- **Activation statistics, per-parameter gradient norms and the 50-step float64 weight check** run only in full capture; router-only is the MoE default. Activations are per repeated block by default.
+- **Cross-GPU spread** is computed on every step when `replica_group` is set, not every N steps: a float64 norm and sum over every replicated parameter plus one `all_gather`. The weight check showed a float64 pass over Granite's weights costs about 3.7 ms on the RTX PRO 6000, so this needs the same 50-step cadence before a multi-GPU run.
+- **Tiers 2 and 3** (histograms, attention maps, replay) are not built.
+
 Attention needs the probe because FlashAttention and SDPA never store the attention map. The probe uses a fixed batch, so it compares cleanly across steps but does not show the live batch; the Tier 3 replay covers that. Sizes are estimates.
 
 ## W&B support
@@ -339,7 +347,7 @@ The synthetic MoE bake-off verified recording read-back and headless rendering. 
 
 **Decisions that are yours**
 
-- [ ] Product name; "TensorLens" is a placeholder.
+- [ ] Product name; "TensorLens" is a placeholder. Checked Nov 14, 2026: the PyPI name `tensorlens` is taken by an unrelated package (0.0.3, April 2025), so `pip install tensorlens` installs someone else's code, and the SDK cannot be published under its current package name. GitHub also has `idoatad/TensorLens`, the code for an ACL 2026 paper on transformer attention analysis.
 - [ ] Team size against 12 weeks. With fewer than three engineers, move the MLflow importer after launch.
 - [ ] Who explains failures. v1 hands the evidence to the user's own coding agent. A built-in explainer, as ARIA has, is the agent loop postponed from v2 and would add scope.
 - [ ] Whether W&B is the next tracker target after MLflow.
