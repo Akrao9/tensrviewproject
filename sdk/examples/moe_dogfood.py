@@ -74,15 +74,35 @@ def build_pair():
     return models, optimizers, routers
 
 
+def install_collapse(router):
+    enabled = torch.zeros((), dtype=torch.bool, device=router.weight.device)
+    top_k = router.top_k
+    forced_ids = torch.arange(top_k, device=enabled.device)
+
+    def inject(_module, _args, output):
+        logits, weights, indices = output
+        return (
+            logits,
+            torch.where(enabled, torch.full_like(weights, 1 / top_k), weights),
+            torch.where(enabled, forced_ids, indices),
+        )
+
+    handle = router.register_forward_hook(inject, prepend=True)
+    return enabled, handle
+
+
 def verify_capture(
     capture_path: Path,
     routers: dict[str, tensorlens.Router],
     expected_steps: int,
     expected_assignments: int,
+    collapse_step: int | None,
+    collapse_layer: int | None,
+    top_k: int,
     *,
     expect_grads: bool,
     expect_layers: bool,
-) -> None:
+) -> dict:
     records = tensorlens.load_records(capture_path)
     if [record["step"] for record in records] != list(range(expected_steps)):
         raise RuntimeError(f"{capture_path}: capture did not record the expected optimizer steps")
@@ -103,16 +123,55 @@ def verify_capture(
                     f"{name} at step {record['step']}: expected {expected_assignments} "
                     f"assignments, got {total} ({counts})"
                 )
+    evidence = tensorlens.build_evidence(records)
+    if collapse_step is None or collapse_layer is None:
+        return evidence
+    hit = tensorlens.first_incident(evidence)
+    router_names = list(routers)
+    collapse_router = router_names[collapse_layer - 1]
+    num_experts = routers[collapse_router].n_experts
+    expected_overloaded = list(range(1, top_k + 1))
+    expected_dead = list(range(top_k + 1, num_experts + 1))
+    expected_counts = [expected_assignments // top_k] * top_k + [0] * len(expected_dead)
+    for record in records:
+        if record["step"] >= collapse_step and record["moe"][collapse_router] != expected_counts:
+            raise RuntimeError(f"{capture_path}: incorrect forced routing at step {record['step']}")
+    if (
+        hit is None
+        or hit["step"] != collapse_step
+        or hit["layer"] != collapse_layer
+        or hit["router"] != collapse_router
+        or hit["overloaded"] != expected_overloaded
+        or hit["dead"] != expected_dead
+    ):
+        raise RuntimeError(
+            f"{capture_path}: expected collapse at step {collapse_step}, layer {collapse_layer} "
+            f"({collapse_router}) with overloaded={expected_overloaded} and dead={expected_dead}, "
+            f"got {hit}"
+        )
+    return evidence
 
 
 def run_comparison(
     args, batches, labels, init_kwargs_pair
-) -> tuple[float, float, dict[str, tensorlens.Router], int, int]:
+) -> tuple[float, float, dict[str, tensorlens.Router], int, int, int | None, int]:
     torch._dynamo.reset()
     models, optimizers, routers = build_pair()
-    expected_assignments = args.batch_size * args.seq_len * models[1].config.num_experts_per_tok
+    top_k = models[1].config.num_experts_per_tok
+    expected_assignments = args.batch_size * args.seq_len * top_k
+    collapse_step = None
     times = [[], []]
     with ExitStack() as stack:
+        collapse_flags = []
+        if args.collapse_layer is not None:
+            if not 1 <= args.collapse_layer <= len(routers):
+                raise ValueError(f"--collapse-layer must be between 1 and {len(routers)}")
+            collapse_router = list(routers)[args.collapse_layer - 1]
+            collapse_step = args.warmup + (args.rounds - 1) * args.steps
+            for model in models:
+                flag, handle = install_collapse(model.get_submodule(collapse_router))
+                collapse_flags.append(flag)
+                stack.callback(handle.remove)
         stack.enter_context(torch._dynamo.config.patch(skip_nnmodule_hook_guards=False))
         for model, kwargs in zip(models, init_kwargs_pair):
             if kwargs is not None:
@@ -138,6 +197,8 @@ def run_comparison(
         for round_index in range(args.rounds):
             order = (0, 1) if round_index % 2 == 0 else (1, 0)
             for index in order:
+                if collapse_flags and round_index == args.rounds - 1:
+                    collapse_flags[index].fill_(True)
                 torch.cuda.synchronize()
                 start = time.perf_counter()
                 for batch in batches[args.warmup :]:
@@ -154,7 +215,7 @@ def run_comparison(
     gc.collect()
     torch.cuda.empty_cache()
     t0, t1 = map(statistics.median, times)
-    return t0, t1, routers, expected_steps, expected_assignments
+    return t0, t1, routers, expected_steps, expected_assignments, collapse_step, top_k
 
 
 def main() -> None:
@@ -165,6 +226,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=200, help="timed steps per round")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=50)
+    parser.add_argument("--collapse-layer", type=int, help="inject a collapse into this 1-based MoE layer in the final round")
     compile_mode = parser.add_mutually_exclusive_group()
     compile_mode.add_argument(
         "--eager", action="store_true", help="diagnose model or capture without compiling"
@@ -188,9 +250,11 @@ def main() -> None:
     print(f"{torch.__version__} on {torch.cuda.get_device_name()} | {MODEL} | {mode}", flush=True)
     batches = load_batches(args, args.warmup + args.steps)
     counters = torch._dynamo.utils.counters
+    if args.collapse_layer is not None:
+        print(f"Collapse validation on layer {args.collapse_layer}. Timings include the fault hook.", flush=True)
 
     print("\n--- Stage 1: full capture (grads off) vs. full capture (grads on) ---", flush=True)
-    no_grads_ms, full_ms, routers, expected_steps, expected_assignments = run_comparison(
+    no_grads_ms, full_ms, routers, expected_steps, expected_assignments, collapse_step, top_k = run_comparison(
         args,
         batches,
         ("full (grads off)", "full (grads on)"),
@@ -200,10 +264,26 @@ def main() -> None:
         ),
     )
     verify_capture(
-        no_grads_path, routers, expected_steps, expected_assignments, expect_grads=False, expect_layers=True
+        no_grads_path,
+        routers,
+        expected_steps,
+        expected_assignments,
+        collapse_step,
+        args.collapse_layer,
+        top_k,
+        expect_grads=False,
+        expect_layers=True,
     )
     verify_capture(
-        capture_path, routers, expected_steps, expected_assignments, expect_grads=True, expect_layers=True
+        capture_path,
+        routers,
+        expected_steps,
+        expected_assignments,
+        collapse_step,
+        args.collapse_layer,
+        top_k,
+        expect_grads=True,
+        expect_layers=True,
     )
     grad_delta_ms = full_ms - no_grads_ms
     grad_delta_pct = 100 * (full_ms / no_grads_ms - 1)
@@ -214,7 +294,7 @@ def main() -> None:
     )
 
     print("\n--- Stage 2: baseline (capture off) vs. router-only ---", flush=True)
-    off_ms, router_ms, routers, expected_steps, expected_assignments = run_comparison(
+    off_ms, router_ms, routers, expected_steps, expected_assignments, collapse_step, top_k = run_comparison(
         args,
         batches,
         ("capture off", "router-only"),
@@ -228,8 +308,16 @@ def main() -> None:
             },
         ),
     )
-    verify_capture(
-        router_only_path, routers, expected_steps, expected_assignments, expect_grads=False, expect_layers=False
+    router_evidence = verify_capture(
+        router_only_path,
+        routers,
+        expected_steps,
+        expected_assignments,
+        collapse_step,
+        args.collapse_layer,
+        top_k,
+        expect_grads=False,
+        expect_layers=False,
     )
     router_delta_ms = router_ms - off_ms
     router_overhead = 100 * (router_ms / off_ms - 1)
@@ -238,8 +326,9 @@ def main() -> None:
         f"overhead {router_delta_ms:+.3f} ms/step ({router_overhead:+.2f}%)",
         flush=True,
     )
-    print(f"Verified {expected_steps} recorded steps across {len(routers)} routers: {capture_path}")
-    if not args.eager:
+    print(f"Verified {expected_steps} recorded steps across {len(routers)} routers: {router_only_path}")
+    print(tensorlens.incident_summary(router_evidence))
+    if not args.eager and args.collapse_layer is None:
         print(f"1% overhead target (router-only): {'PASS' if router_overhead < 1 else 'FAIL'}")
     if args.cuda_graphs:
         skips = counters["inductor"]["cudagraph_skips"]

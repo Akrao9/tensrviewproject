@@ -186,6 +186,13 @@ def build_evidence(
                     )
                     else []
                 )
+                if dead and not overloaded and n_experts > 1:
+                    mean_share = 1.0 / n_experts
+                    se_share = math.sqrt(mean_share * (1.0 - mean_share) / tokens)
+                    collapse_threshold = max(2.0 * mean_share, mean_share + 3.0 * se_share)
+                    overloaded = [
+                        i for i, share in enumerate(shares, 1) if share > collapse_threshold
+                    ]
             sample: dict[str, Any] = {
                 "step": step,
                 "layer": layer_idx,

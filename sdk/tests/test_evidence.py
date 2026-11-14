@@ -142,6 +142,25 @@ def test_imbalance_rule_allows_balanced_two_expert_router_and_preserves_bakeoff(
     assert healthy_ev["samples"][0]["dead"] == []
     assert tensorlens.first_incident(healthy_ev) is None
 
+    # Seeded collapse in a 32-expert top-8 Granite router onto experts 1..8 (12.50% each)
+    granite_collapsed = [1024] * 8 + [0] * 24
+    granite_ev = tensorlens.build_evidence(
+        [
+            {"run_id": "granite-router-only", "step": 449, "moe": {"layer-12": [256] * 32}},
+            {"run_id": "granite-router-only", "step": 450, "moe": {"layer-12": granite_collapsed}},
+        ]
+    )
+    granite_hit = tensorlens.first_incident(granite_ev)
+    assert granite_hit is not None
+    assert granite_hit["step"] == 450
+    assert granite_hit["layer"] == 1
+    assert granite_hit["overloaded"] == list(range(1, 9))
+    assert granite_hit["dead"] == list(range(9, 33))
+    assert granite_hit["diversity"] == pytest.approx(0.25)
+    granite_table = tensorlens.expert_load_table(granite_ev, 450, 1).splitlines()
+    assert granite_table[4] == "| #001 | 12.50% | +9.38 | Overloaded |"
+    assert granite_table[-1] == "| #032 | 0.00% | -3.12 | Dead |"
+
 
 def test_missing_routing_data_and_mixed_expert_counts():
     records = [
