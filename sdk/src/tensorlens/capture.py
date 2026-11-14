@@ -219,7 +219,14 @@ class Session:
         f32 = {"dtype": torch.float32, "device": self.device}
         self._act = torch.zeros(n_layers, _SEEN + 1, **f32)
         self._stat_idx = torch.arange(_SEEN + 1, dtype=torch.int64, device=self.device)
-        self._grad = torch.zeros(n_params, 3, **f32)  # gradient norm, seen, weight norm
+        # gradient norm, seen, weight norm, weight unchanged since the previous record
+        # (1 = exactly unchanged, 0 = changed, -1 = not known)
+        self._grad = torch.zeros(n_params, 4, **f32)
+        # Float64 weight norms of the previous record, to tell exactly whether a step changed
+        # each weight. A float32 norm misses the few-element changes typical of bf16 weights
+        # under small updates. Apple MPS has no float64, so there only float32 norms are kept.
+        self._exact_weights = self.device.type != "mps"
+        self._prev_weight: torch.Tensor | None = None
         self._spread: torch.Tensor | None = None
         self._counts = {
             name: torch.zeros(spec.n_experts, dtype=torch.int64, device=self.device)
@@ -358,8 +365,11 @@ class Session:
     @torch.no_grad()
     def _record_weights(self) -> None:
         # The norm of each parameter after the optimizer step, on the steps that record
-        # gradient norms. Comparing it with the previous record shows whether the step
-        # changed the weights at all; one read of the weights, no copy of them.
+        # gradient norms, and whether it is exactly what it was at the previous record.
+        # One read of the weights, no copy of them.
+        n_params = len(self._params)
+        dtype = torch.float64 if self._exact_weights else torch.float32
+        current = torch.zeros(n_params, dtype=dtype, device=self._grad.device)
         groups: dict[tuple[torch.device, torch.dtype], list[tuple[int, torch.Tensor]]] = {}
         for index, param in enumerate(self._params):
             data = param.detach()
@@ -368,15 +378,25 @@ class Session:
             if data.numel() == 0:
                 continue
             groups.setdefault((data.device, data.dtype), []).append((index, data))
-        for (_, dtype), items in groups.items():
-            norms = _foreach_norm(
-                [data for _, data in items], torch.float32 if dtype in _LOW_PRECISION else None
+        for (_, param_dtype), items in groups.items():
+            out = dtype if self._exact_weights else (
+                torch.float32 if param_dtype in _LOW_PRECISION else None
             )
-            stacked = torch.stack(norms).to(self._grad)
-            if len(items) == len(self._params):
-                self._grad[:, 2].copy_(stacked)
+            norms = torch.stack(_foreach_norm([data for _, data in items], out)).to(current)
+            if len(items) == n_params:
+                current.copy_(norms)
             else:
-                self._grad[:, 2].index_copy_(0, self._index(tuple(i for i, _ in items)), stacked)
+                current.index_copy_(0, self._index(tuple(i for i, _ in items)), norms)
+        self._grad[:, 2].copy_(current)
+        if not self._exact_weights or self._prev_weight is None:
+            self._grad[:, 3].fill_(-1.0)
+        else:
+            self._grad[:, 3].copy_(current == self._prev_weight)
+        if self._exact_weights:
+            if self._prev_weight is None:
+                self._prev_weight = current
+            else:
+                self._prev_weight.copy_(current)
 
     def _ensure_spread_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._spread is None or self._ring_spread is None:
@@ -564,7 +584,7 @@ class Session:
             else None
         )
         grad = (
-            floats[split:].reshape(n, n_params, 3).tolist()
+            floats[split:].reshape(n, n_params, 4).tolist()
             if any(grad_seen) and n_params > 0 and floats is not None
             else None
         )
@@ -579,7 +599,7 @@ class Session:
         records = []
         for i, step in enumerate(steps):
             grad_norms = (
-                {name: norm for name, (norm, seen, _) in zip(self.param_names, grad[i]) if seen}
+                {name: norm for name, (norm, seen, _, _) in zip(self.param_names, grad[i]) if seen}
                 if grad is not None and grad_seen[i]
                 else {}
             )
@@ -603,6 +623,10 @@ class Session:
                 record["weight_norms"] = {
                     name: row[2] for name, row in zip(self.param_names, grad[i])
                 }
+                if self.param_names and grad[i][0][3] >= 0:
+                    record["weights_unchanged"] = [
+                        name for name, row in zip(self.param_names, grad[i]) if row[3] > 0
+                    ]
             if lrs[i] is not None:
                 record["lr"] = lrs[i]
             if spread_rows is not None and spread_seen[i]:

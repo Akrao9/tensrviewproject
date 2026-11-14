@@ -41,6 +41,9 @@ OVERLOAD_MIN_HISTORY = 10
 SPIKE_FACTOR = 5.0
 SPIKE_WINDOW = 50
 SPIKE_MIN_HISTORY = 10
+# A parameter is reported as not updating once its weights are exactly unchanged on this
+# many recorded steps in a row while it has a gradient.
+STALL_STEPS = 3
 MISSING_COLOR = (48, 54, 64)
 DEAD_COLOR = (236, 84, 99)
 OVERLOADED_COLOR = (255, 190, 94)
@@ -274,48 +277,47 @@ def _spiking_parameters(
     return found[:10]
 
 
-def detect_stalled_weights(records: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Return the first step where parameters with a non-zero gradient did not change.
+def detect_stalled_weights(
+    records: list[dict[str, Any]], *, steps: int = STALL_STEPS
+) -> dict[str, Any] | None:
+    """Return the first step where parameters with a gradient stopped changing, or None.
 
-    Uses the weight norms recorded after each optimizer step: if a parameter's norm is
-    exactly the same as at its previous record while its gradient was finite and non-zero,
-    the optimizer did not update it. Steps with a non-finite gradient are skipped, because
-    mixed-precision loss scaling skips those optimizer steps on purpose.
+    Uses `weights_unchanged`, which the capture sets when a parameter's float64 norm is
+    exactly what it was at the previous record. A parameter is reported once that holds on
+    `steps` records in a row while its gradient is finite and non-zero, for example because
+    it was left out of the optimizer. Steps with a non-finite gradient norm are skipped,
+    because mixed-precision loss scaling skips those optimizer steps on purpose. Captures
+    without `weights_unchanged` (older files, or Apple MPS) are not checked: a float32 norm
+    stays the same while bf16 weights change by a few elements.
     """
-    previous: dict[str, float] = {}
+    streak: dict[str, int] = {}
     first: dict[str, Any] | None = None
     stalled_steps = 0
     for record in sorted(records, key=lambda r: r["step"]):
-        weights = record.get("weight_norms")
-        if not weights:
+        unchanged = record.get("weights_unchanged")
+        if unchanged is None:
+            continue
+        if _finite(record.get("grad_norm")) is None and record.get("grad_norm") is not None:
             continue
         grads = record.get("grad_norms", {})
-        skip = _finite(record.get("grad_norm")) is None and record.get("grad_norm") is not None
-        stalled = []
-        for name, value in weights.items():
-            norm = _finite(value)
-            grad = _finite(grads.get(name))
-            if (
-                not skip
-                and norm is not None
-                and name in previous
-                and grad is not None
-                and grad > 0
-                and norm == previous[name]
-            ):
-                stalled.append(name)
-            if norm is not None:
-                previous[name] = norm
+        unchanged_set = set(unchanged)
+        for name, value in grads.items():
+            grad = _finite(value)
+            if grad is not None and grad > 0 and name in unchanged_set:
+                streak[name] = streak.get(name, 0) + 1
+            else:
+                streak[name] = 0
+        stalled = [name for name, count in streak.items() if count >= steps]
         if stalled:
             stalled_steps += 1
             if first is None:
-                with_grads = sum(1 for v in grads.values() if (_finite(v) or 0) > 0)
                 first = {
                     "kind": "stalled_weights",
                     "step": int(record["step"]),
                     "parameters": stalled[:20],
                     "stalled": len(stalled),
-                    "with_gradients": with_grads,
+                    "with_gradients": sum(1 for v in grads.values() if (_finite(v) or 0) > 0),
+                    "consecutive": steps,
                 }
     if first is not None:
         first["stalled_steps"] = stalled_steps
@@ -691,8 +693,8 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         extra = incident["stalled"] - min(3, incident["stalled"])
         return (
             f"Weights not updating from step {incident['step']}: {incident['stalled']} of"
-            f" {incident['with_gradients']} parameters with gradients were unchanged by the"
-            f" optimizer step ({names}{f', and {extra} more' if extra > 0 else ''});"
+            f" {incident['with_gradients']} parameters with gradients were exactly unchanged for"
+            f" {incident['consecutive']} recorded steps in a row ({names}{f', and {extra} more' if extra > 0 else ''});"
             f" {incident['stalled_steps']} step{'s' if incident['stalled_steps'] != 1 else ''} affected"
         )
     if kind == "repeated_steps":

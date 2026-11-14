@@ -417,16 +417,23 @@ def test_grad_spike_names_the_parameter_where_it_started():
 
 def test_stalled_weights_detector_and_skipped_steps():
     records = []
-    for step in range(6):
+    for step in range(8):
         records.append({
             "run_id": "w", "step": step, "grad_norm": 1.0,
-            "grad_norms": {"moving": 1.0, "frozen": 0.5, "no_grad": 0.0},
-            "weight_norms": {"moving": 10.0 + step, "frozen": 3.0, "no_grad": 2.0},
+            "grad_norms": {"moving": 1.0, "frozen": 0.5, "no_grad": 0.0, "blip": 0.5},
+            "weight_norms": {"moving": 10.0 + step, "frozen": 3.0, "no_grad": 2.0, "blip": 1.0},
+            # "blip" is unchanged on two steps only, as a few-element bf16 update can be
+            "weights_unchanged": ["frozen", "no_grad"] + (["blip"] if step in (2, 3) else []),
         })
-    records[3]["grad_norm"] = "inf"  # a skipped mixed-precision step is not a stall
+    records[5]["grad_norm"] = "inf"  # a skipped mixed-precision step is not counted
     hit = tensorlens.detect_stalled_weights(records)
-    assert hit["step"] == 1 and hit["parameters"] == ["frozen"]
-    assert hit["stalled"] == 1 and hit["with_gradients"] == 2 and hit["stalled_steps"] == 4
+    assert hit["step"] == 2 and hit["parameters"] == ["frozen"]
+    assert hit["stalled"] == 1 and hit["with_gradients"] == 3 and hit["stalled_steps"] == 5
+
+    # Older captures without the exact flag are not judged on float32 norms.
+    for record in records:
+        del record["weights_unchanged"]
+    assert tensorlens.detect_stalled_weights(records) is None
 
 
 def test_parameter_left_out_of_the_optimizer_is_reported(toy_moe):
@@ -435,13 +442,19 @@ def test_parameter_left_out_of_the_optimizer_is_reported(toy_moe):
     opt = torch.optim.SGD(
         [p for n, p in toy_moe.named_parameters() if not n.startswith("out.")], lr=0.1
     )
-    for _ in range(3):
+    for _ in range(5):
         opt.zero_grad()
         toy_moe(torch.randn(16, 8)).sum().backward()
         opt.step()
     session.close()
+    assert "weights_unchanged" not in sink.records[0]  # nothing to compare with yet
+    # The router's projection gets no gradient through argmax, so it is unchanged too, but
+    # only parameters with a gradient are reported.
+    assert sorted(sink.records[1]["weights_unchanged"]) == [
+        "out.bias", "out.weight", "router.proj.bias", "router.proj.weight"
+    ]
     hit = tensorlens.detect_stalled_weights(sink.records)
-    assert hit is not None and hit["step"] == 1
+    assert hit is not None and hit["step"] == 3
     assert sorted(hit["parameters"]) == ["out.bias", "out.weight"]
 
 
