@@ -125,7 +125,7 @@ This follows Megatron's `train_step` in `megatron/training/training.py`; it has 
 
 ### Several GPUs
 
-Every rank writes its own file, `tensorlens-out/<run_id>.rank<rank>.jsonl`. Start with rank 0 only if that is simpler. The cross-GPU drift check (`replica_group=`) has passed only on two CPU processes.
+Every rank writes its own file, `tensorlens-out/<run_id>.rank<rank>.jsonl`. Start with rank 0 only if that is simpler. The cross-GPU drift check (`replica_group=`) has passed only on two CPU processes. Files are written by a background thread, so training does not wait on the filesystem; with many ranks on a shared filesystem such as NFS or Lustre, you can write to node-local disk instead with `sink=tensorlens.JsonlSink(path)`.
 
 ## 5. After the run
 
@@ -134,7 +134,7 @@ python -m tensorlens tensorlens-out/<run_id>.rank0.jsonl --rerun tensorlens-out/
 rerun tensorlens-out/<run_id>.rrd
 ```
 
-The first command prints a summary of what the detectors found and writes `<run_id>.rank0.evidence.json`; for top-k routers recorded before `moe_top_k` existed, add `--top-k <k>`. The second opens the recording in the Rerun viewer.
+The first command prints a summary of what the detectors found and writes `<run_id>.rank0.evidence.json`; for top-k routers recorded before `moe_top_k` existed, add `--top-k <k>`. The second opens the recording in the Rerun viewer. On a cluster, copy the `.rrd` to your laptop and open it there, or run `rerun --web-viewer <file>.rrd` on the node and forward its ports over SSH (the page is served on port 9090 by default). To render on a Linux node without a display driver, install a software Vulkan driver (`mesa-vulkan-drivers` on Ubuntu). Neither has been tested.
 
 What the summary can report:
 

@@ -248,6 +248,8 @@ Open gaps:
 
 - **Full-capture overhead.** Stage 3 measured +4.15%. Gradient norms on every step are the largest part (1.5 ms); sampling them every 50 steps, as Lightning's `log_every_n_steps` and wandb.watch do, would leave about 1.2 ms (about 2%) but would also hide single-step gradient spikes. Activation hooks inside the compiled graph cannot be sampled without recompiles.
 - **A100 router-only overhead.** About 2 ms per step against 0.5 ms on the RTX PRO 6000 for the same hooks; possibly host-side launch overhead. Not investigated.
+- **Headless rendering on Linux.** Headless screenshots have only been made on macOS. Training clusters run Linux, and Rerun's native viewer needs Vulkan, Metal or OpenGL. On a node or container without a GPU display driver, install a software Vulkan driver (lavapipe, in Ubuntu's `mesa-vulkan-drivers`, with the `libvulkan1` loader); Rerun's troubleshooting guide prefers it to software OpenGL (llvmpipe), which it warns crashes. Slim PyTorch images ship CUDA without either. Untested.
+- **Many ranks on a shared filesystem.** Each rank appends its own JSON Lines file from a background writer thread, so slow writes grow an in-memory queue rather than stall training until `close()`. Not measured with many ranks on NFS or Lustre; `sink=tensorlens.JsonlSink(path)` can point at node-local disk.
 - **Untuned thresholds.** The spike factor (5×), diversity drop (0.6), starved ratio (10% of an even share) and stall count (3 checks) rest on one model's data and synthetic cases.
 - **Gate order.** Write the author's own failures and run on one of the author's jobs before adding more detectors, so detectors are tuned to real failures rather than seeded ones.
 
@@ -321,13 +323,13 @@ The biggest risk is commercial, not technical: teams may value the tool and stil
 
 ## Unproven and open decisions
 
-The synthetic MoE bake-off verified recording read-back and headless rendering. Capture now runs on a real MoE model (Granite) on an RTX PRO 6000 and an A100, with router-only overhead under 1% on the first and over it on the second, a seeded collapse detected, and seven detectors checked on Granite or synthetic data. Multi-GPU capture, full-capture overhead with the new defaults, real failures on the author's own jobs, and diagnosis times remain unmeasured.
+The synthetic MoE bake-off verified recording read-back and headless rendering. Capture now runs on a real MoE model (Granite) on an RTX PRO 6000 and an A100, with router-only overhead under 1% on the first and over it on the second, a seeded collapse detected, and seven detectors checked on Granite or synthetic data. Full capture with block defaults measured +4.15% on the RTX PRO 6000. Multi-GPU capture, capture on Linux clusters beyond Colab, real failures on the author's own jobs, and diagnosis times remain unmeasured.
 
 **Unproven**
 
 - Whether sorting and layer selection improve diagnosis enough to justify a custom Rerun view.
 - Whether the stock Rerun viewer stays smooth on a real 5,000-metric MLflow run.
-- Whether full capture can get under 1% with block-level activations and a 50-step weight check. Router-only capture does on the RTX PRO 6000 and not on the A100; full capture was about 9% with every leaf module and per-step weight norms.
+- Whether full capture can get under 1% with block-level activations and a 50-step weight check. Router-only capture does on the RTX PRO 6000 and not on the A100; full capture measured +4.15% with block activations, per-step gradient norms and the 50-step weight check, down from about 9% with every leaf module and per-step weight norms.
 - Whether the detector thresholds hold on models other than Granite.
 - Whether the hooks keep CUDA graphs on real models. They do on a toy MoE; Granite needs CUDA graphs off for reasons unrelated to TensorLens.
 - The cross-GPU drift tolerance of 1e-6 on real multi-GPU runs.
