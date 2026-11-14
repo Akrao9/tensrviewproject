@@ -289,3 +289,89 @@ def test_session_setup_allocates_no_float64_buffers_by_default_and_keeps_mps_spr
     assert ring_spread.device.type == "cpu"
     session.close()
 
+
+def test_gradient_gating_and_router_only_capture(toy_moe, monkeypatch):
+    import tensorlens.capture as cap
+
+    norm_calls = 0
+    orig_foreach_norm = cap._foreach_norm
+
+    def spy_foreach_norm(*args, **kwargs):
+        nonlocal norm_calls
+        norm_calls += 1
+        return orig_foreach_norm(*args, **kwargs)
+
+    monkeypatch.setattr(cap, "_foreach_norm", spy_foreach_norm)
+
+    # grads=3 gates gradient norm computation before running _foreach_norm
+    sink = tensorlens.MemorySink()
+    with tensorlens.init(toy_moe, sink=sink, every=2, grads=3, routers={"router": 4}):
+        train(toy_moe, 6)
+    assert norm_calls == 2
+    assert [r["grad_norm"] is not None for r in sink.records] == [
+        False,
+        False,
+        True,
+        False,
+        False,
+        True,
+    ]
+
+    # Router-only (layers=(), grads=False) computes no layer or gradient reductions
+    norm_calls = 0
+    router_sink = tensorlens.MemorySink()
+    with tensorlens.init(
+        toy_moe, sink=router_sink, every=2, layers=(), grads=False, routers={"router": 4}
+    ):
+        train(toy_moe, 4)
+    assert norm_calls == 0
+    assert all(r["layers"] == {} and r["grad_norm"] is None for r in router_sink.records)
+    assert all(sum(r["moe"]["router"]) == 16 for r in router_sink.records)
+
+
+@pytest.mark.parametrize("layers, grads", [(None, False), ((), True)])
+def test_cpu_flush_owns_single_stats_buffer(layers, grads):
+    import threading
+
+    model = nn.Sequential(nn.Linear(1, 1, bias=False))
+    with torch.no_grad():
+        model[0].weight.fill_(1)
+    gate = threading.Event()
+    entered = threading.Event()
+    sink = tensorlens.MemorySink()
+    with tensorlens.init(model, sink=sink, layers=layers, grads=grads, every=1, auto_step=False) as session:
+        decode = session._decode
+
+        def gated_decode(*args):
+            entered.set()
+            gate.wait(timeout=5)
+            return decode(*args)
+
+        session._decode = gated_decode
+        try:
+            for sample in (1.0, 3.0):
+                model.zero_grad(set_to_none=True)
+                model(torch.tensor([[sample]])).sum().backward()
+                session.step()
+                assert entered.wait(timeout=5)
+        finally:
+            gate.set()
+
+    if grads:
+        assert [record["grad_norm"] for record in sink.records] == [1.0, 3.0]
+    else:
+        assert [record["layers"]["0"]["mean"] for record in sink.records] == [1.0, 3.0]
+
+
+def test_manual_gradient_capture_preserves_automatic_cadence():
+    model = nn.Linear(1, 1, bias=False)
+    sink = tensorlens.MemorySink()
+    with tensorlens.init(model, sink=sink, auto_step=False, grads=3) as session:
+        for i in range(4):
+            model.zero_grad(set_to_none=True)
+            model(torch.ones(1, 1)).sum().backward()
+            if i == 0:
+                session.record_grads()
+            session.step()
+
+    assert [record["grad_norm"] for record in sink.records] == [1.0, None, 1.0, None]

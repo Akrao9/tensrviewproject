@@ -32,7 +32,6 @@ from .tracker import RunInfo, resolve_run
 
 STATS = ("mean", "std", "abs_max", "zero_frac")
 _SEEN = len(STATS)  # last column: 1.0 when the hook ran this step
-_CHUNKS = 512  # single-stage reduction width on GPU; summarized in _commit()
 _LOW_PRECISION = (torch.float16, torch.bfloat16)
 
 LayerFilter = Callable[[str, nn.Module], bool]
@@ -72,57 +71,32 @@ def _first_tensor(output: Any, *, integer: bool) -> torch.Tensor | None:
 def _stats_hook(buf: torch.Tensor, stat_idx: torch.Tensor, row: int) -> Callable[..., None]:
     def hook(module: nn.Module, args: Any, output: Any) -> None:
         x = _first_tensor(output, integer=False)
-        if x is None:
-            return
-        n = x.numel()
-        if n == 0:
+        if x is None or x.numel() == 0:
             return
         x = x.detach()
-        if n >= _CHUNKS and n % _CHUNKS == 0 and x.is_contiguous():
-            xc = x.view(_CHUNKS, -1).float()
-            var, mean = torch.var_mean(xc, dim=1, correction=0)
-            amax = xc.abs().amax(dim=1)
-            zfrac = (xc == 0).float().mean(dim=1)
+        xf = x.float()
+        if x.numel() > 1:
+            std, mean = torch.std_mean(xf)
         else:
-            xf = x.float()
-            if n > 1:
-                var, mean = torch.var_mean(xf, correction=0)
-            else:
-                mean = xf.reshape(())
-                var = torch.zeros_like(mean)
-            amax = xf.abs().amax()
-            zfrac = (x == 0).float().mean()
+            mean = xf.reshape(())
+            std = torch.zeros_like(mean)
+        amax = xf.abs().amax()
+        zfrac = (x == 0).float().mean()
         buf[row] = torch.where(
             stat_idx == 0,
             mean,
             torch.where(
                 stat_idx == 1,
-                var,
+                std,
                 torch.where(
                     stat_idx == 2,
                     amax,
-                    torch.where(stat_idx == 3, zfrac, float(n)),
+                    torch.where(stat_idx == 3, zfrac, 1.0),
                 ),
             ),
         )
 
     return hook
-
-
-def _summarize_act(act: torch.Tensor, out: torch.Tensor) -> None:
-    if act.numel() == 0:
-        return
-    means = act[:, 0]
-    vars_ = act[:, 1]
-    mean = means.mean(dim=1)
-    pop_var = vars_.mean(dim=1) + (means - mean.unsqueeze(1)).square().mean(dim=1)
-    n = act[:, _SEEN, 0]
-    scale = torch.where(n > 1.0, n / (n - 1.0), torch.zeros_like(n))
-    out[:, 0] = mean
-    out[:, 1] = (pop_var * scale).sqrt()
-    out[:, 2] = act[:, 2].amax(dim=1)
-    out[:, 3] = act[:, 3].mean(dim=1)
-    out[:, _SEEN] = (n > 0.0).float()
 
 
 def _router_hook(
@@ -196,6 +170,7 @@ class Session:
         sink: Sink,
         layers: LayerFilter | Sequence[str] | None,
         routers: Mapping[str, Router | int] | None,
+        grads: bool | int = True,
         auto_step: bool,
         replica_group: Any = None,
     ) -> None:
@@ -203,8 +178,15 @@ class Session:
             raise ValueError("call tensorlens.init(model) before torch.compile(model)")
         if every < 1:
             raise ValueError("every must be at least 1")
+        if isinstance(grads, bool):
+            grad_every = 1 if grads else 0
+        elif isinstance(grads, int) and grads >= 0:
+            grad_every = grads
+        else:
+            raise ValueError("grads must be a bool or a non-negative integer")
         self.run = run
         self.every = every
+        self.grad_every = grad_every
         self.auto_step = auto_step
         self._sink = sink
         self._replica_group = replica_group
@@ -228,8 +210,8 @@ class Session:
 
         n_layers, n_params = len(self.layer_names), len(self._params)
         f32 = {"dtype": torch.float32, "device": self.device}
-        self._act = torch.zeros(n_layers, _SEEN + 1, _CHUNKS, **f32)
-        self._stat_idx = torch.arange(_SEEN + 1, dtype=torch.int64, device=self.device)[:, None]
+        self._act = torch.zeros(n_layers, _SEEN + 1, **f32)
+        self._stat_idx = torch.arange(_SEEN + 1, dtype=torch.int64, device=self.device)
         self._grad = torch.zeros(n_params, 2, **f32)  # norm, seen
         self._spread: torch.Tensor | None = None
         self._counts = {
@@ -242,6 +224,7 @@ class Session:
         }
         self._ring_act = torch.zeros(every, n_layers, _SEEN + 1, **f32)
         self._ring_grad = torch.zeros(every, *self._grad.shape, **f32)
+        self._ring_grad_seen: list[bool] = []
         self._ring_spread: torch.Tensor | None = None
         self._ring_spread_seen: list[bool] = []
         if replica_group is not None and n_params > 0:
@@ -269,6 +252,7 @@ class Session:
 
         self._steps: list[int] = []
         self._next_step = 0
+        self._steps_committed = 0
         self._grads_recorded = False
         self._spread_recorded = False
         self._owned: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
@@ -297,8 +281,16 @@ class Session:
             self._owned[optimizer] = owned
         return owned
 
+    def _should_record_grads(self) -> bool:
+        return self.grad_every > 0 and (self._steps_committed + 1) % self.grad_every == 0
+
     def _before_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
-        if not self._closed and self._owns(optimizer) and not self._grads_recorded:
+        if (
+            not self._closed
+            and self._owns(optimizer)
+            and not self._grads_recorded
+            and self._should_record_grads()
+        ):
             self.record_grads()
 
     def _after_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
@@ -387,7 +379,7 @@ class Session:
         """
         if self.auto_step:
             raise RuntimeError("step() is called automatically; pass auto_step=False to call it yourself")
-        if not self._grads_recorded:
+        if not self._grads_recorded and self._should_record_grads():
             self.record_grads()
         self._commit(step)
 
@@ -396,9 +388,17 @@ class Session:
         if not self._spread_recorded and self._replica_group is not None and self._params:
             self.record_replica_spread(self._replica_group)
         row = len(self._steps)
-        _summarize_act(self._act, self._ring_act[row])
-        self._ring_grad[row].copy_(self._grad)
-        torch._foreach_zero_((self._act, self._grad))
+        has_act = self._act.numel() > 0
+        if has_act and self._grads_recorded:
+            torch._foreach_copy_((self._ring_act[row], self._ring_grad[row]), (self._act, self._grad))
+            torch._foreach_zero_((self._act, self._grad))
+        elif has_act:
+            self._ring_act[row].copy_(self._act)
+            self._act.zero_()
+        elif self._grads_recorded:
+            self._ring_grad[row].copy_(self._grad)
+            self._grad.zero_()
+        self._ring_grad_seen.append(self._grads_recorded)
         if self._spread_recorded and self._spread is not None and self._ring_spread is not None:
             self._ring_spread[row].copy_(self._spread)
             self._spread.zero_()
@@ -413,6 +413,7 @@ class Session:
         current = self._next_step if step is None else step
         self._steps.append(current)
         self._next_step = current + 1
+        self._steps_committed += 1
         if len(self._steps) == self.every:
             self.flush()
 
@@ -420,13 +421,25 @@ class Session:
         """Move the ring to the CPU and queue it for the sink."""
         if self._error is not None:
             self._steps = []
+            self._ring_grad_seen = []
             self._ring_spread_seen = []
             self._raise_worker_error()
         n = len(self._steps)
         if n == 0:
             return
         # One transfer for the float statistics, one for the integer expert counts.
-        floats = torch.cat([self._ring_act[:n].reshape(-1), self._ring_grad[:n].reshape(-1)]).cpu()
+        has_act = self._act.numel() > 0
+        has_grads = any(self._ring_grad_seen) and self._grad.numel() > 0
+        if has_act and has_grads:
+            floats: torch.Tensor | None = torch.cat(
+                [self._ring_act[:n].reshape(-1), self._ring_grad[:n].reshape(-1)]
+            ).cpu()
+        elif has_act:
+            floats = _cpu_copy(self._ring_act[:n].reshape(-1))
+        elif has_grads:
+            floats = _cpu_copy(self._ring_grad[:n].reshape(-1))
+        else:
+            floats = None
         counts = (
             torch.cat([ring[:n].reshape(-1) for ring in self._ring_counts.values()]).cpu()
             if self._ring_counts
@@ -437,11 +450,13 @@ class Session:
             if self._ring_spread is not None and any(self._ring_spread_seen)
             else None
         )
+        grad_seen = self._ring_grad_seen
         spread_seen = self._ring_spread_seen
         steps = self._steps
         self._steps = []
+        self._ring_grad_seen = []
         self._ring_spread_seen = []
-        self._queue.put((steps, floats, counts, spreads, spread_seen))
+        self._queue.put((steps, floats, counts, spreads, grad_seen, spread_seen))
 
     def close(self) -> None:
         """Flush what is left and stop the writer. Forward hooks stay on the model, because
@@ -487,15 +502,24 @@ class Session:
     def _decode(
         self,
         steps: list[int],
-        floats: torch.Tensor,
+        floats: torch.Tensor | None,
         counts: torch.Tensor | None,
         spreads: torch.Tensor | None,
+        grad_seen: list[bool],
         spread_seen: list[bool],
     ) -> list[dict[str, Any]]:
         n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
-        split = n * n_layers * (_SEEN + 1)
-        act = floats[:split].reshape(n, n_layers, _SEEN + 1).tolist()
-        grad = floats[split:].reshape(n, n_params, 2).tolist()
+        split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
+        act = (
+            floats[:split].reshape(n, n_layers, _SEEN + 1).tolist()
+            if n_layers > 0 and floats is not None
+            else None
+        )
+        grad = (
+            floats[split:].reshape(n, n_params, 2).tolist()
+            if any(grad_seen) and n_params > 0 and floats is not None
+            else None
+        )
         spread_rows = spreads.reshape(n, n_params, 2).tolist() if spreads is not None else None
         moe: dict[str, list[list[int]]] = {}
         offset = 0
@@ -506,18 +530,24 @@ class Session:
 
         records = []
         for i, step in enumerate(steps):
-            grad_norms = {
-                name: norm for name, (norm, seen) in zip(self.param_names, grad[i]) if seen
-            }
+            grad_norms = (
+                {name: norm for name, (norm, seen) in zip(self.param_names, grad[i]) if seen}
+                if grad is not None and grad_seen[i]
+                else {}
+            )
             record: dict[str, Any] = {
                 "run_id": self.run.run_id,
                 "rank": self.run.rank,
                 "step": step,
-                "layers": {
-                    name: dict(zip(STATS, row[:_SEEN]))
-                    for name, row in zip(self.layer_names, act[i])
-                    if row[_SEEN]
-                },
+                "layers": (
+                    {
+                        name: dict(zip(STATS, row[:_SEEN]))
+                        for name, row in zip(self.layer_names, act[i])
+                        if row[_SEEN]
+                    }
+                    if act is not None
+                    else {}
+                ),
                 "grad_norm": math.sqrt(sum(v * v for v in grad_norms.values())) if grad_norms else None,
                 "grad_norms": grad_norms,
             }
@@ -581,6 +611,7 @@ def init(
     sink: Sink | None = None,
     layers: LayerFilter | Sequence[str] | None = None,
     routers: Mapping[str, Router | int] | None = None,
+    grads: bool | int = True,
     auto_step: bool = True,
     replica_group: Any = None,
 ) -> Session:
@@ -594,6 +625,8 @@ def init(
         layers: module names, or a `(name, module) -> bool` filter. Defaults to every leaf
             module that has parameters.
         routers: MoE router module names mapped to their expert count or a `Router`.
+        grads: True to record gradient norms every step, False or 0 to disable automatic
+            gradient norm capture, or a positive integer N to record every Nth captured step.
         auto_step: count optimizer steps with PyTorch's global optimizer hooks. Pass False
             and call `session.step()` yourself when using `torch.amp.GradScaler`.
         replica_group: optional replication `ProcessGroup` (or precomputed spread tensor)
@@ -610,6 +643,7 @@ def init(
         sink=sink,
         layers=layers,
         routers=routers,
+        grads=grads,
         auto_step=auto_step,
         replica_group=replica_group,
     )
