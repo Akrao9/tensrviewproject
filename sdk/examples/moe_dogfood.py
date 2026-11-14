@@ -173,9 +173,18 @@ def run_comparison(
                 collapse_flags.append(flag)
                 stack.callback(handle.remove)
         stack.enter_context(torch._dynamo.config.patch(skip_nnmodule_hook_guards=False))
+        probe_kwargs = {}
+        if args.probe_every:
+            fixed = batches[0]
+            probe_kwargs = {
+                "probe": lambda m: m(input_ids=fixed, use_cache=False),
+                "probe_every": args.probe_every,
+            }
         for model, kwargs in zip(models, init_kwargs_pair):
             if kwargs is not None:
-                stack.enter_context(tensorlens.init(model, routers=routers, every=FLUSH_EVERY, **kwargs))
+                stack.enter_context(
+                    tensorlens.init(model, routers=routers, every=FLUSH_EVERY, **probe_kwargs, **kwargs)
+                )
 
         # The grouped_mm fallback can copy expert offsets to CPU. On the RTX PRO
         # 6000 with PyTorch 2.14.1+cu130 this fails during CUDA graph recording.
@@ -231,6 +240,10 @@ def main() -> None:
         choices=("blocks", "all"),
         default="blocks",
         help="activation capture: one hook per decoder layer (default) or every leaf module",
+    )
+    parser.add_argument(
+        "--probe-every", type=int, default=0,
+        help="run the probe pass (histograms, attention) every N steps in the capture arms; 0 is off",
     )
     parser.add_argument("--collapse-layer", type=int, help="inject a collapse into this 1-based MoE layer in the final round")
     compile_mode = parser.add_mutually_exclusive_group()
@@ -367,6 +380,15 @@ def main() -> None:
     if not args.eager and args.collapse_layer is None:
         print(f"1% overhead target (router-only): {'PASS' if router_overhead < 1 else 'FAIL'}")
         print(f"1% overhead target (full capture): {'PASS' if full_overhead < 1 else 'FAIL'}")
+    if args.probe_every:
+        probes = [r["probe"] for r in tensorlens.load_records(full_path) if "probe" in r]
+        print(f"Probe passes in {full_path.name}: {len(probes)} (every {args.probe_every} steps)")
+        if probes:
+            last = probes[-1]["attention"]
+            print(f"Last probe: {len(probes[-1]['histograms'])} histograms, attention in {len(last)} layers")
+            for name, att in list(last.items())[:: max(1, len(last) // 4)]:
+                share = sum(att["entropy"]) / len(att["entropy"]) / att["max_entropy"]
+                print(f"  {name}: largest logit {max(att['max_logit']):.2f}, entropy {share:.2f} of maximum")
     if args.cuda_graphs:
         skips = counters["inductor"]["cudagraph_skips"]
         if skips:

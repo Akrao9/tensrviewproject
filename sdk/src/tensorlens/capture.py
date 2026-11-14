@@ -29,6 +29,7 @@ from torch.optim.optimizer import (
 )
 
 from .distributed import replica_spread, unwrap_local
+from .probe import ProbeState, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink
 from .tracker import RunInfo, resolve_run
 
@@ -40,6 +41,8 @@ _LOW_PRECISION = (torch.float16, torch.bfloat16)
 # an RTX PRO 6000), so it is sampled, as wandb.watch (every 1,000 batches) and TrainCheck
 # (`sampling_interval`) also do.
 WEIGHT_EVERY = 50
+# Probe passes are rare, like wandb.watch's histograms (every 1,000 batches by default).
+PROBE_EVERY = 1000
 # Settings per capture mode. Router load is the always-on signal; layer statistics and
 # gradient and weight norms are a debugging mode, as in Composer's ActivationMonitor,
 # wandb.watch and Lightning's grad_norm.
@@ -276,6 +279,8 @@ class Session:
         start_step: int = 0,
         clip_norm: bool = True,
         replica_every: int = WEIGHT_EVERY,
+        probe: Any = None,
+        probe_every: int = PROBE_EVERY,
     ) -> None:
         if hasattr(model, "_orig_mod"):
             raise ValueError("call tensorlens.init(model) before torch.compile(model)")
@@ -301,6 +306,11 @@ class Session:
         if isinstance(replica_every, bool) or not isinstance(replica_every, int) or replica_every < 1:
             raise ValueError("replica_every must be a positive integer")
         self.replica_every = replica_every
+        if isinstance(probe_every, bool) or not isinstance(probe_every, int) or probe_every < 1:
+            raise ValueError("probe_every must be a positive integer")
+        self.probe_every = probe_every
+        self._probe_fn = probe_callable(probe) if probe is not None else None
+        self._model = model
         self.auto_step = auto_step
         self._sink = sink
         self._replica_group = replica_group
@@ -377,12 +387,16 @@ class Session:
             )
             for name, spec in self._routers.items()
         ]
+        self._probe_state = ProbeState()
+        if self._probe_fn is not None:
+            self._handles += install_probe_hooks(_select_layers(model, "blocks"), self._probe_state)
 
         self._steps: list[int] = []
         self._ring_lr: list[list[float] | None] = []
         self._pending_lr: list[float] | None = None
         self._ring_scalars: list[dict[str, Any]] = []
         self._pending_scalars: dict[str, Any] = {}
+        self._ring_probe: list[dict[str, Any] | None] = []
         self._next_step = start_step
         self._steps_committed = 0
         self._grads_recorded = False
@@ -668,6 +682,7 @@ class Session:
             torch._foreach_zero_(self._counts_list)
         self._grads_recorded = False
         self._spread_recorded = False
+        self._ring_probe.append(self._probe() if self._cadence_probe() else None)
         current = self._next_step if step is None else step
         self._steps.append(current)
         self._ring_lr.append(self._pending_lr)
@@ -679,12 +694,26 @@ class Session:
         if len(self._steps) == self.every:
             self.flush()
 
+    def _cadence_probe(self) -> bool:
+        return self._probe_fn is not None and self._cadence(self.probe_every)
+
+    def _probe(self) -> dict[str, Any]:
+        # Runs after this step's statistics are in the ring; the capture hooks fire during
+        # the probe's forward pass too, so their buffers are cleared again afterwards.
+        devices = sorted({p.device for p in self._params}, key=str) or [self.device]
+        try:
+            return run_probe(self._model, self._probe_fn, self._probe_state, devices)
+        finally:
+            buffers = [self._act, *self._counts_list]
+            torch._foreach_zero_([b for b in buffers if b.numel() > 0])
+
     def flush(self) -> None:
         """Move the ring to the CPU and queue it for the sink."""
         if self._error is not None:
             self._steps = []
             self._ring_lr = []
             self._ring_scalars = []
+            self._ring_probe = []
             self._ring_grad_seen = []
             self._ring_weight_seen = []
             self._ring_clip_seen = []
@@ -722,10 +751,12 @@ class Session:
         weight_seen = self._ring_weight_seen
         spread_seen = self._ring_spread_seen
         scalars = _scalars_to_cpu(self._ring_scalars)
+        probes = self._ring_probe
         steps, lrs = self._steps, self._ring_lr
         self._steps = []
         self._ring_lr = []
         self._ring_scalars = []
+        self._ring_probe = []
         self._ring_grad_seen = []
         self._ring_weight_seen = []
         self._ring_clip_seen = []
@@ -733,7 +764,7 @@ class Session:
         self._queue.put(
             (
                 steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
-                spread_seen, scalars,
+                spread_seen, scalars, probes,
             )
         )
 
@@ -792,6 +823,7 @@ class Session:
         weight_seen: list[bool],
         spread_seen: list[bool],
         scalars: list[dict[str, Any]] | None = None,
+        probes: list[dict[str, Any] | None] | None = None,
     ) -> list[dict[str, Any]]:
         n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
         split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
@@ -850,6 +882,8 @@ class Session:
                 record["lr"] = lrs[i]
             if scalars is not None and scalars[i]:
                 record["scalars"] = scalars[i]
+            if probes is not None and probes[i] is not None:
+                record["probe"] = probes[i]
             if spread_rows is not None and spread_seen[i]:
                 record["replica_spread"] = {
                     name: [float(norm_s), float(sum_s)]
@@ -950,6 +984,8 @@ def init(
     start_step: int = 0,
     clip_norm: bool = True,
     replica_every: int = WEIGHT_EVERY,
+    probe: Any = None,
+    probe_every: int = PROBE_EVERY,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -984,6 +1020,13 @@ def init(
         replica_every: run the cross-GPU drift check every N steps (default 50). Each
             check reads every weight in float64 and gathers 16 bytes per parameter tensor
             from each rank. `session.record_replica_spread()` records one on demand.
+        probe: a fixed batch to run through the model every `probe_every` steps, for
+            activation histograms per block and attention statistics: a tensor (called as
+            `model(batch)`), a mapping of keyword inputs (`model(**batch)`), or a callable
+            `fn(model)`. It runs without the compiler, in eval mode and without gradients,
+            right after the step's statistics are recorded, and restores each module's
+            training flag and the random number generator state afterwards.
+        probe_every: steps between probe passes (default 1000).
         start_step: the first step number. Pass the step you resume from, so a resumed
             run does not repeat step numbers already written.
         clip_norm: record the total gradient norm that `torch.nn.utils.clip_grad_norm_`
@@ -1017,4 +1060,6 @@ def init(
         start_step=start_step,
         clip_norm=clip_norm,
         replica_every=replica_every,
+        probe=probe,
+        probe_every=probe_every,
     )

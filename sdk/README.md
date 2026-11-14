@@ -42,6 +42,7 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 | Step counting through PyTorch's global optimizer hooks, limited to this model's optimizer | Built, tested |
 | Gradient norms grouped by device and dtype (`torch._foreach_norm`, with `DTensor.to_local()` and fallback) | Built, tested |
 | MoE expert load (a compare-and-sum per router, accumulated on the device) and router entropy / diversity (`moe_stats`) | Built, tested |
+| Probe pass (`probe=`): activation histograms per block and attention logit, entropy and maps per layer, on a fixed batch every `probe_every` steps | Built, tested on CPU, under `torch.compile` with no graph breaks or recompiles, and on a small randomly initialized Hugging Face Granite MoE; not run on a GPU |
 | Logged scalars (`session.log`) attached to incidents and plotted in Rerun | Built, tested on CPU and Apple MPS; not run on a GPU |
 | Cross-GPU parameter fingerprints and replica spread (`parameter_fingerprints`, `replica_spread`) | Built, unit-tested on drift and sign-flip cases |
 | Detectors and Rerun exporter (`build_evidence`, `export_rerun`, `python -m tensorlens`) | Built, tested on MoE collapse (top-k aware), starved experts, gradient spikes, weights not updating, repeated steps, NaN/Inf, and replica drift |
@@ -51,7 +52,7 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 ## What is not built or not verified
 
 - **Arrow Flight and the Rust ingest server.** Records go to a JSON Lines file, and Python detectors/exporters turn that file into `evidence.json` and `.rrd`.
-- **The probe pass** for histograms and attention (Tier 2) and replay (Tier 3).
+- **Replay** of a flagged batch (Tier 3). The probe pass (Tier 2) is built but has not run on a GPU.
 - **Multi-rank reporting.** Every rank writes its own file.
 - **A PyTorch Lightning callback.** Until then, pass `run_id=` yourself when the run was created through `MlflowClient`.
 - **Detector thresholds are untuned.** The gradient-spike factor (5× the median of the last 50 recorded steps), the top-k diversity drop (0.6 of its recent median), the starved-expert ratio and the stalled-weight check have been checked on synthetic cases and, for the MoE rules, on one Granite capture. Weight norms, learning rates and the spike and stalled-weight detectors have run on the Granite captures from the A100 and RTX PRO 6000 runs below, but not against a planted failure of their own kind on a GPU; the steps they flagged there are unconfirmed.
@@ -191,6 +192,24 @@ python -m torch.distributed.run --standalone --nproc-per-node=2 examples/replica
 Mark this complete when both NCCL ranks report `PASS`. Each rank checks healthy replicas at steps 0 and 2, injected drift at step 1, and a sign flip at step 3.
 
 The check passes `replica_every=1`. In a training job the drift check runs every 50 steps by default (`replica_every=`), as Megatron's `check_weight_hash_across_dp_replicas_interval` does: each check reads every weight in float64 and gathers 16 bytes per parameter tensor from every rank, and a float64 pass over Granite's weights cost about 3.7 ms on the RTX PRO 6000. Until Nov 14, 2026 it ran on every step.
+
+## Probe pass
+
+`tensorlens.init(model, probe={"input_ids": fixed_batch}, probe_every=1000)` runs one fixed batch through the model every 1,000 steps (wandb.watch's default for histograms) and adds a `probe` field to that step's record:
+
+- **`histograms`**: a 64-bin histogram of each repeated block's output (`lo`, `hi`, `counts`, and `nonfinite` for NaN and Inf values left out).
+- **`attention`**: for each `scaled_dot_product_attention` call, named after the block it ran in, the largest pre-softmax logit and the mean attention entropy per head (with `max_entropy`, the entropy of uniform attention), and sample 0's attention map averaged over heads and pooled to at most 64 × 64 (keys summed and query rows averaged per bin, so each row still sums to 1).
+
+`probe` can be a tensor (`model(batch)`), a mapping of keyword inputs (`model(**batch)`), or a callable `fn(model)`. How it runs:
+
+- **After the step's statistics are recorded.** The capture hooks fire during the probe's forward pass too, so their buffers are cleared again afterwards; the probe never shows up in the step's activations or router counts.
+- **Without the compiler**, under `torch.compiler.set_stance("force_eager")`, in eval mode and without gradients. Each module's own training flag is restored afterwards (not `model.train()`, which would unfreeze submodules kept in eval mode), and the random number generator state is restored, so training sees the same random numbers as without the probe.
+- **No recompiles.** The probe's hooks are registered once at `init` and do nothing unless a probe is running, which only happens without the compiler. Adding and removing hooks around each probe would recompile the model.
+- **Attention is recomputed alongside the real call.** Fused attention kernels never store the attention map, so during the probe `torch.nn.functional.scaled_dot_product_attention` is wrapped: the original computes the output, and the wrapper recomputes `softmax(QKᵀ)` from the query and key a block of query rows at a time (at most 2^26 scores, 256 MB, per block). Grouped-query attention (`enable_gqa`, as Hugging Face uses on CUDA without a mask) repeats the key heads to the query's head count. Hugging Face models loaded with `attn_implementation="flash_attention_2"` or `"flash_attention_3"` never call SDPA, so the probe switches them to `"sdpa"` and back. Code that imported `scaled_dot_product_attention` by name before the probe, or uses another attention kernel, is not seen; the record then says `no scaled_dot_product_attention call seen`.
+- **Deterministic mode** is turned off during the probe, because `histc` and `index_add_` have no deterministic CUDA kernels; the probe's results do not feed training.
+- **Cost** is one eager forward pass plus the attention recomputation and one sync per histogram, every `probe_every` steps; not yet measured on a GPU. A Granite probe record should be on the order of 2 MB of JSON (24 maps of 64 × 64), also not measured. The Granite benchmark takes `--probe-every N`.
+
+The Rerun export adds a Probe tab: the largest attention logit and the entropy (as a share of its maximum) per layer over training, a histogram per block and an attention map per layer at each probe step. There is no detector on the probe data yet: thresholds for logit growth or entropy collapse need real failures first.
 
 ## Things to know
 

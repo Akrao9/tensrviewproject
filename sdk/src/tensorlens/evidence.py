@@ -1040,6 +1040,9 @@ def export_rerun(
     activation_paths: dict[str, set[str]] = {}
     training_paths: dict[str, str] = {}
     logged_paths: dict[str, str] = {}
+    probe_hist: dict[str, str] = {}
+    probe_maps: dict[str, str] = {}
+    probe_series = False
     if records is not None:
         for record in records:
             rr.set_time("training_step", sequence=int(record["step"]))
@@ -1065,6 +1068,9 @@ def export_rerun(
                     entity = f"/logged/{parts}"
                     rr.log(entity, rr.Scalars(value))
                     logged_paths[entity] = name
+            probe = record.get("probe")
+            if probe:
+                probe_series |= _log_probe(rr, probe, probe_hist, probe_maps)
             for layer_name, stats in record.get("layers", {}).items():
                 for key, val in stats.items():
                     if isinstance(val, (int, float)) and math.isfinite(val):
@@ -1087,6 +1093,16 @@ def export_rerun(
             rrb.TimeSeriesView(origin=entity, name=name)
             for entity, name in sorted(training_paths.items())
         ), name="Optimizer"))
+    if probe_series or probe_hist or probe_maps:
+        probe_views = []
+        if probe_series:
+            probe_views += [
+                rrb.TimeSeriesView(origin="/probe/max_logit", name="Largest attention logit"),
+                rrb.TimeSeriesView(origin="/probe/entropy", name="Attention entropy (share of maximum)"),
+            ]
+        probe_views += [rrb.BarChartView(origin=e, name=f"Histogram {n}") for e, n in probe_hist.items()]
+        probe_views += [rrb.TensorView(origin=e, name=f"Attention {n}") for e, n in probe_maps.items()]
+        tabs.append(rrb.Tabs(*probe_views, name="Probe"))
     if logged_paths:
         tabs.append(rrb.Tabs(*(
             rrb.TimeSeriesView(origin=entity, name=name)
@@ -1099,6 +1115,43 @@ def export_rerun(
 
     rr.disconnect()
     return out_path
+
+
+def _log_probe(rr: Any, probe: Mapping[str, Any], hist_paths: dict, map_paths: dict) -> bool:
+    """Log one probe pass: per-block histograms, attention maps, and per-layer attention
+    logit and entropy series. Returns whether any series was logged."""
+    import numpy as np
+
+    for layer, hist in probe.get("histograms", {}).items():
+        counts = hist.get("counts") or []
+        lo, hi = _finite(hist.get("lo")), _finite(hist.get("hi"))
+        if not counts or lo is None or hi is None:
+            continue
+        width = (hi - lo) / len(counts)
+        entity = f"/probe/histograms/{rr.escape_entity_path_part(layer)}"
+        rr.log(entity, rr.BarChart(
+            np.asarray(counts, dtype=np.float64),
+            abscissa=lo + width * (np.arange(len(counts)) + 0.5),
+            widths=np.full(len(counts), width, dtype=np.float32),
+        ))
+        hist_paths[entity] = layer
+    series = False
+    for layer, att in probe.get("attention", {}).items():
+        part = rr.escape_entity_path_part(layer)
+        logits = [v for v in (_finite(x) for x in att.get("max_logit", [])) if v is not None]
+        if logits:
+            rr.log(f"/probe/max_logit/{part}", rr.Scalars(max(logits)))
+            series = True
+        entropy = [v for v in (_finite(x) for x in att.get("entropy", [])) if v is not None]
+        top = _finite(att.get("max_entropy"))
+        if entropy and top:
+            rr.log(f"/probe/entropy/{part}", rr.Scalars(sum(entropy) / len(entropy) / top))
+            series = True
+        if att.get("map"):
+            entity = f"/probe/attention/{part}"
+            rr.log(entity, rr.Tensor(np.asarray(att["map"], dtype=np.float32), dim_names=("query", "key")))
+            map_paths[entity] = layer
+    return series
 
 
 def main() -> None:
