@@ -33,9 +33,10 @@ Start with stock Rerun and reuse the MoE recording and blueprint from the bake-o
 
 | Piece | Build or borrow | Implementation | Note |
 | --- | --- | --- | --- |
-| Capture SDK | Build | Python | One line to add. Tags the tensor stream with the MLflow run first; W&B as a later target |
-| Ingest server and detectors | Build | Rust | Receives Arrow data, stores Parquet, checks for known failure patterns |
-| Evidence and Rerun export | Build | Viewer-neutral JSON, `.rrd`, Rerun blueprint | Export the incident summary, status heatmap, expert-load table, and training-step timeline. Reuse the bake-off's Python exporter as the starting point |
+| Capture SDK | Build | Python | One line to add. Tags the tensor stream with the MLflow run first; W&B as a later target. Built in `sdk/`; writes JSON Lines until the ingest server exists |
+| Detectors | Build | Python for v1 | MoE routing imbalance, non-finite values and cross-GPU drift. Built in `sdk/src/tensorlens/evidence.py` and run on the JSON Lines files. Move to Rust only if the ingest server needs them in-process |
+| Ingest server | Build | Rust | Receives Arrow data and stores Parquet. Not started |
+| Evidence and Rerun export | Build | Viewer-neutral JSON, `.rrd`, Rerun blueprint | Export the incident summary, status heatmap, expert-load table, and training-step timeline. Built from the bake-off's exporter (`python -m tensorlens`) |
 | Incident view | Conditional | Rust (`re_viewer`, egui) | Prototype one custom view inside Rerun if trials show that layer selection and table sorting materially improve diagnosis |
 | MLflow importer | Build | Python (`mlflow`, `rerun-sdk`) | Writes runs logged without the SDK to `.rrd` with the same exporter, so they open in Rerun |
 | Viewer and screenshots | Borrow | Rerun (MIT / Apache 2.0) | Stock desktop viewer, built-in views, timeline, headless screenshots, and viewer MCP |
@@ -117,7 +118,8 @@ This detector checks that weights meant to be identical copies on several GPUs s
 It runs outside the compiled step and needs no hooks. The evidence it hands to the agent and the viewer is a table of rank by layer spread, with the first step at which each layer diverged.
 
 ```python
-# Every N steps, after optimizer.step(), outside the compiled step. Not yet run.
+# Every N steps, after optimizer.step(), outside the compiled step.
+# Run on two CPU processes with Gloo (sdk/examples/replica_check.py); not yet on two GPUs.
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
@@ -216,6 +218,31 @@ Twelve weeks in five phases. Each phase ends in a gate, and the next phase start
 
 The embedded roadmap diagram predates this version; the steps below are the current roadmap. There are no customer interviews: the author is the first user, and TensorLens is validated on the author's own training runs, then through a free public release. Gates 1 and 2 restate criteria from elsewhere in this plan. The Gate 0, 3 and 4 criteria and the split into weeks are proposals. The one exception to the gate order is the SDK skeleton, which starts alongside the Gate 1 trial because the trial does not depend on it. If any gate after Gate 0 fails, spend up to one extra week, then cut scope. The gate numbers are targets, not measurements.
 
+### Progress so far
+
+Work ran ahead of the gate order: the SDK, detectors and exporter were built before Gate 0 and Gate 1. Details and raw numbers are in the [SDK README](sdk/README.md).
+
+| Steps | State |
+| --- | --- |
+| 1–5, Gate 0 | Partly. The working dogfood run is IBM Granite 3.0 1B-A400M (MoE, 24 routers of 32 experts, top-8) trained on WikiText-2 on one RTX PRO 6000 in Colab. It is a benchmark rather than one of the author's own jobs. The failure list, tracker choice and multi-GPU setup are not written down, and the competitor re-check is not done |
+| 6–9, Gate 1 | Not started |
+| 10, SDK skeleton | Done except the Lightning callback |
+| 11, Tier 0 capture | Done except Arrow Flight; records go to JSON Lines |
+| 12, Tier 1 capture | MoE load done and checked on Granite. Cross-GPU fingerprints pass two CPU processes; the two-GPU NCCL run is pending |
+| 13, CI gate | Partly. No graph breaks or recompiles and no CUDA-graph skips on a toy MoE with Inductor and CUDA graphs. Granite runs with CUDA graphs off, because its `grouped_mm` expert path fails during CUDA-graph recording, so `reduce-overhead` is unverified on a real model. Not wired into CI |
+| 14, ingest server | Not started |
+| 15, detectors | Done in Python, plus a non-finite detector. A collapse seeded in Granite layer 12 was found at the right step, layer and experts |
+| 16, probe pass | Not started |
+| 17, Gate 2 | Partly. Router-only capture added +0.78% on Granite (paired rounds +0.66% to +0.79%), inside the 1% target. Full capture is over it: about +6% for activations and routers and +9% with gradient norms, estimated across two benchmark stages rather than measured directly. Seeded drift and sign-flip cases pass only on CPU |
+| 18, product exporter | Done early; the Granite recording was checked in the stock Rerun viewer |
+| 19–27 | Not started |
+
+Open gaps found along the way:
+
+- **Top-k overload.** The 35% overload threshold cannot be reached by a top-k router with k > 2. A lower threshold applies only once dead experts are flagged, so a router that sends every token to the same experts without leaving any dead is not reported.
+- **Full-capture overhead.** Either cut it towards 1% (sample activations and gradient norms every N steps, or watch fewer layers) or make router-only the default and full capture opt-in. Measure full capture against capture off directly first.
+- **Gate order.** Write the failure list and pick the tracker before adding more detectors, so detectors are tuned to real failures rather than to seeded ones.
+
 ### Week 1: set up the dogfood runs (Gate 0)
 
 1. Pick one or two real training jobs you run yourself, ideally an MoE model, multi-GPU, with `torch.compile`. These are the dogfood runs for every later gate.
@@ -278,7 +305,7 @@ The biggest risk is commercial, not technical: teams may value the tool and stil
 | ARIA or Pluto adds layer capture and detectors | The gap closes, and the hosted tier competes with W&B or Trainy | Re-check both at Gate 0 and before the release; stay tracker- and cloud-neutral; lead with MoE, attention, cross-GPU drift and `torch.compile` support |
 | Trackers add per-layer views | The wedge narrows | Stay tracker-neutral; lead with MoE, attention and torch.compile support that they lack |
 | Rerun's extension interfaces change | A custom incident view may need regular updates | Pin the Viewer and SDK, test recording read-back on upgrades, and budget maintenance if the custom view ships |
-| Hooks stall training or break `torch.compile` | Users switch the SDK off | Overhead gate under 1%; CI with compile on; zero graph breaks |
+| Hooks stall training or break `torch.compile` | Users switch the SDK off | Overhead gate under 1%; CI with compile on; zero graph breaks. Router-only capture meets the gate on Granite; full capture does not yet |
 | Agents misread the pictures | Wrong diagnoses, lost trust | Numbers travel as JSON; key values shown as text in the summary and table views beside each chart; score on seeded failures |
 | Coding-agent clients handle tool images differently | The picture does not reach the model or the user | Test saved PNGs with the target agent clients and supply the same evidence in JSON |
 | Tensor data leaves the cluster | Enterprise deals fall through | Self-hosted ingest; an option to send statistics only |
@@ -286,13 +313,15 @@ The biggest risk is commercial, not technical: teams may value the tool and stil
 
 ## Unproven and open decisions
 
-The synthetic MoE bake-off verified recording read-back and headless rendering. Real-run capture, training overhead, and diagnosis times remain unmeasured.
+The synthetic MoE bake-off verified recording read-back and headless rendering. Capture now runs on a real MoE model (Granite) on one GPU, with router-only overhead measured under 1% and a seeded collapse detected. Multi-GPU capture, full-capture overhead measured directly, and diagnosis times remain unmeasured.
 
 **Unproven**
 
 - Whether sorting and layer selection improve diagnosis enough to justify a custom Rerun view.
 - Whether the stock Rerun viewer stays smooth on a real 5,000-metric MLflow run.
-- The training overhead, and whether the hook's in-place write compiles without graph breaks.
+- Whether full capture (activations, routers and gradient norms) can get under 1%. Router-only capture already does on Granite; full capture is about 9%.
+- Whether the hooks keep CUDA graphs on real models. They do on a toy MoE; Granite needs CUDA graphs off for reasons unrelated to TensorLens.
+- The cross-GPU drift tolerance of 1e-6 on real multi-GPU runs.
 - Whether a coding agent with TensorLens evidence and Rerun screenshots finds the right cause more often than one with tracker data alone.
 - The data sizes in the tier table.
 - Whether anyone besides the author wants this. A search on Nov 13, 2026 found no product that captures layer internals and explains failures, and no public requests for one. That does not prove none exists or that demand is absent.
@@ -305,6 +334,8 @@ The synthetic MoE bake-off verified recording read-back and headless rendering. 
 - [ ] Whether W&B is the next tracker target after MLflow.
 - [ ] Multi-GPU runs: which rank reports activations. Rank 0 is enough for plain data parallelism, and with pipeline or tensor parallelism every rank that owns layers reports; every rank still shares its small parameter fingerprints for the cross-GPU detector.
 - [ ] Price, after the cost per monitored run is modelled.
+- [ ] Default capture level: router-only (inside 1% today) or full capture (about 9% today).
+- [ ] Whether detectors stay in Python after the Rust ingest server exists.
 
 ## Sources
 
