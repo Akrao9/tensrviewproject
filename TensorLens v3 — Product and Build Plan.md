@@ -88,7 +88,7 @@ Do not ship a tracking-store plugin with its own URI scheme (`tensorlens+https:/
 
 As built on Nov 14, 2026, the capture differs from this table:
 
-- **Loss** is not captured; the tracker already has it.
+- **Loss** is not captured on its own. Since Nov 14, 2026, `session.log({"train/loss": loss})` records it and any other scalar without a GPU sync; incidents carry the logged values at their step. Automatic capture by patching `Tensor.backward` was rejected: Megatron calls `torch.autograd.backward` directly, and under `GradScaler` it would see the scaled loss.
 - **Router counts** are accumulated on every step in the router hook, inside the compiled graph, with a compare-and-sum into an int64 buffer rather than `scatter_add_`, and copied every N steps. Entropy, diversity and dead experts are computed on the CPU when records are written. Counts are not summed across data-parallel ranks; each rank writes its own file.
 - **Activation statistics, per-parameter gradient norms and the 50-step float64 weight check** run only in full capture; router-only is the MoE default. Activations are per repeated block by default.
 - **Cross-GPU spread** runs every 50 steps by default (`replica_every=`), like Megatron's `check_weight_hash_across_dp_replicas_interval`, rather than once per N-step transfer. Until Nov 14, 2026 it ran on every step, a float64 norm and sum over every replicated parameter plus one `all_gather`; a float64 pass over Granite's weights costs about 3.7 ms on the RTX PRO 6000.

@@ -209,6 +209,24 @@ def _median(values: list[float]) -> float:
     return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
 
 
+def scalar_context(
+    records: list[dict[str, Any]], step: int, *, window: int = SPIKE_WINDOW
+) -> dict[str, dict[str, Any]]:
+    """Values logged with `session.log` at `step`, each with the median of its finite
+    values over the previous `window` records, so an incident shows what the loss did."""
+    index = next((i for i, record in enumerate(records) if record.get("step") == step), None)
+    if index is None:
+        return {}
+    context = {}
+    for name, value in (records[index].get("scalars") or {}).items():
+        before = [
+            v for v in (_finite((r.get("scalars") or {}).get(name)) for r in records[max(0, index - window) : index])
+            if v is not None
+        ]
+        context[name] = {"value": value, "median_before": _median(before) if before else None}
+    return context
+
+
 def detect_grad_spikes(
     records: list[dict[str, Any]],
     *,
@@ -618,6 +636,12 @@ def build_evidence(
     if drift_hit is not None:
         incidents.append(drift_hit)
 
+    if any(record.get("scalars") for record in records):
+        for incident in incidents:
+            context = scalar_context(records, incident["step"])
+            if context:
+                incident["scalars"] = context
+
     run_id = records[0].get("run_id") if records else None
     return {
         "schema_version": 1,
@@ -823,21 +847,42 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
 def incident_summary(evidence: Mapping[str, Any]) -> str:
     """Human- and agent-readable summary matching the bake-off's text document format."""
     lines: list[str] = []
+    incidents = evidence.get("incidents", ())
     moe = first_incident(evidence)
     if moe is not None:
         lines += _moe_lines(evidence, moe)
+        moe_incident = next((i for i in incidents if i["kind"] == "moe_imbalance"), None)
+        if moe_incident is not None:
+            lines += _scalar_lines(moe_incident)
     starved = _starved_line(evidence)
     if starved is not None:
         lines.append(starved)
-    for incident in evidence.get("incidents", ()):
+    for incident in incidents:
         if incident["kind"] not in ("moe_imbalance", "starved_experts"):
             text = _describe(incident)
             lines.append(text or f"Incident at step {incident['step']}: {incident['kind']}")
+            lines += _scalar_lines(incident)
     if not lines:
         return "No incidents detected."
     if evidence.get("layer_count"):
         lines.append(_legend(evidence))
     return "\n".join(lines)
+
+
+def _scalar_lines(incident: Mapping[str, Any]) -> list[str]:
+    context = incident.get("scalars")
+    if not context:
+        return []
+
+    def fmt(value: Any) -> str:
+        return f"{value:.4g}" if isinstance(value, (int, float)) else str(value)
+
+    parts = [
+        f"{name} {fmt(entry['value'])}"
+        + (f" (median before {fmt(entry['median_before'])})" if entry.get("median_before") is not None else "")
+        for name, entry in sorted(context.items())
+    ]
+    return [f"  Logged at step {incident['step']}: " + ", ".join(parts)]
 
 
 def _moe_lines(evidence: Mapping[str, Any], incident: Mapping[str, Any]) -> list[str]:
@@ -994,6 +1039,7 @@ def export_rerun(
 
     activation_paths: dict[str, set[str]] = {}
     training_paths: dict[str, str] = {}
+    logged_paths: dict[str, str] = {}
     if records is not None:
         for record in records:
             rr.set_time("training_step", sequence=int(record["step"]))
@@ -1012,6 +1058,13 @@ def export_rerun(
             if record.get("lr"):
                 rr.log("/training/lr", rr.Scalars(float(record["lr"][0])))
                 training_paths["/training/lr"] = "Learning rate"
+            for name, val in (record.get("scalars") or {}).items():
+                value = _finite(val)
+                if value is not None:
+                    parts = "/".join(rr.escape_entity_path_part(p) for p in name.split("/") if p)
+                    entity = f"/logged/{parts}"
+                    rr.log(entity, rr.Scalars(value))
+                    logged_paths[entity] = name
             for layer_name, stats in record.get("layers", {}).items():
                 for key, val in stats.items():
                     if isinstance(val, (int, float)) and math.isfinite(val):
@@ -1034,6 +1087,11 @@ def export_rerun(
             rrb.TimeSeriesView(origin=entity, name=name)
             for entity, name in sorted(training_paths.items())
         ), name="Optimizer"))
+    if logged_paths:
+        tabs.append(rrb.Tabs(*(
+            rrb.TimeSeriesView(origin=entity, name=name)
+            for entity, name in sorted(logged_paths.items(), key=lambda item: item[1])
+        ), name="Logged"))
 
     summary = rrb.TextDocumentView(origin="/incident/summary", name="Training incidents")
     layout = rrb.Vertical(summary, rrb.Tabs(*tabs), row_shares=[1, 4]) if tabs else summary

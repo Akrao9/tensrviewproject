@@ -561,3 +561,27 @@ def test_replica_drift_check_runs_every_replica_every_steps(monkeypatch):
     assert [("replica_spread" in r) for r in sink.records] == [False, False, True] * 2
     with pytest.raises(ValueError, match="replica_every"):
         tensorlens.init(nn.Linear(2, 2), sink=tensorlens.MemorySink(), replica_every=0)
+
+
+def test_incidents_carry_logged_scalars_and_export_plots_them(tmp_path, monkeypatch):
+    norms = [(1.0, 0.1 + 0.01 * (s % 3)) for s in range(30)] + [(1.0, 4.0), (1.2, 30.0), (1.0, 0.1)]
+    records = _grad_records(norms)
+    for record in records:
+        record["scalars"] = {"train/loss": 2.0, "rl/kl": 0.01}
+    records[31]["scalars"] = {"train/loss": 9.5, "rl/kl": "nan"}
+
+    evidence = tensorlens.build_evidence(records)
+    hit = next(i for i in evidence["incidents"] if i["kind"] == "grad_spike")
+    assert hit["scalars"]["train/loss"] == {"value": 9.5, "median_before": 2.0}
+    assert hit["scalars"]["rl/kl"]["value"] == "nan"
+    summary = tensorlens.incident_summary(evidence)
+    assert "Logged at step 31: rl/kl nan (median before 0.01), train/loss 9.5 (median before 2)" in summary
+    assert tensorlens.scalar_context(records, 999) == {}
+
+    rr = pytest.importorskip("rerun")
+    logged = []
+    real_log = rr.log
+    monkeypatch.setattr(rr, "log", lambda path, *a, **kw: (logged.append(path), real_log(path, *a, **kw)))
+    tensorlens.export_rerun(evidence, tmp_path / "run.rrd", records=records)
+    assert "/logged/train/loss" in logged and "/logged/rl/kl" in logged
+    assert logged.count("/logged/rl/kl") == len(records) - 1  # the NaN value is skipped

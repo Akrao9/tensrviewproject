@@ -31,6 +31,7 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 - **`lr`**: each parameter group's learning rate after the step.
 - **`clip_grad_norm`**: the total gradient norm before clipping, in any capture mode, when your training clips gradients. TensorLens records what `torch.nn.utils.clip_grad_norm_` returns for this model's parameters while the session is open, which also covers Lightning's `gradient_clip_val` (Lightning calls that function and discards the result). It costs nothing extra: the norm is computed anyway and stays on the GPU until the next flush. Code that imported the function before `init`, or computes the norm elsewhere, can call `session.record_grad_norm(norm)`; with Megatron, pass the `grad_norm` that `optimizer.step()` returns. `clip_norm=False` turns the automatic recording off.
 - **`moe`**, **`moe_stats`** and **`moe_top_k`**: tokens routed to each expert, plus router entropy, diversity (`exp(H)/N`), and dead-expert count/fraction, for every router you name (works whether the router outputs integer indices or floating-point logits with `Router(n_experts, top_k=...)`). Set `top_k` for top-k routers; the detectors need it.
+- **`scalars`**: values you pass to `session.log`, such as `session.log({"train/loss": loss})`. A one-element tensor is copied on its device and moved to the CPU with the rest of the step data, so logging a CUDA loss adds no GPU sync, as Lightning keeps logged values on the device until it writes them. Call it before `optimizer.step()`, because with automatic step counting the step ends there. Pass the same values your tracker logs: TensorLens does not capture the loss on its own, since patching `Tensor.backward` would miss Megatron (which calls `torch.autograd.backward` directly) and record the scaled loss under `GradScaler`. Every incident in the evidence carries the logged values at its step with the median of the previous 50, and the Rerun export plots them under a Logged tab.
 
 ## What is built
 
@@ -40,7 +41,8 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 | On-device ring buffer, moved to the CPU every `every` steps, written by a worker thread | Built, tested |
 | Step counting through PyTorch's global optimizer hooks, limited to this model's optimizer | Built, tested |
 | Gradient norms grouped by device and dtype (`torch._foreach_norm`, with `DTensor.to_local()` and fallback) | Built, tested |
-| MoE expert load (`scatter_add_`) and router entropy / diversity (`moe_stats`) | Built, tested |
+| MoE expert load (a compare-and-sum per router, accumulated on the device) and router entropy / diversity (`moe_stats`) | Built, tested |
+| Logged scalars (`session.log`) attached to incidents and plotted in Rerun | Built, tested on CPU and Apple MPS; not run on a GPU |
 | Cross-GPU parameter fingerprints and replica spread (`parameter_fingerprints`, `replica_spread`) | Built, unit-tested on drift and sign-flip cases |
 | Detectors and Rerun exporter (`build_evidence`, `export_rerun`, `python -m tensorlens`) | Built, tested on MoE collapse (top-k aware), starved experts, gradient spikes, weights not updating, repeated steps, NaN/Inf, and replica drift |
 | Run ID from `run_id=`, `MLFLOW_RUN_ID`, the active MLflow run or the active W&B run | Built, tested with stand-in tracker modules |

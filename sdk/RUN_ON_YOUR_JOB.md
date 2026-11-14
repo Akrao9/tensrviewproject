@@ -84,12 +84,14 @@ for batch in loader:
     loss = model(batch)
     optimizer.zero_grad()
     loss.backward()
+    session.log({"train/loss": loss})                        # no GPU sync
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # recorded automatically
     optimizer.step()                                         # counted automatically
 session.close()
 ```
 
 - **Mixed precision with `torch.amp.GradScaler`:** the scaler skips `optimizer.step()` when gradients overflow, so count steps yourself: `init(..., auto_step=False)` and call `session.step(lr=optimizer.param_groups[0]["lr"])` once per iteration.
+- **Logging the loss and other scalars:** `session.log` takes the values your tracker logs, as numbers or one-element tensors, and attaches them to the step in progress. Call it before `optimizer.step()`; afterwards, the value lands on the next step. Log the unscaled loss, not `scaler.scale(loss)`. With gradient accumulation, log the step's mean once, since a name logged twice keeps the last value.
 - **Resuming from a checkpoint:** pass `start_step=` the step you resume from, or step numbers start at 0 again.
 - **`from torch.nn.utils import clip_grad_norm_` at the top of your script** binds the function before `init` wraps it. Either call `torch.nn.utils.clip_grad_norm_`, or pass the returned norm yourself: `session.record_grad_norm(norm)`.
 
@@ -104,6 +106,11 @@ class MyModule(L.LightningModule):
 
     def on_fit_end(self):
         self.tensorlens.close()
+
+    def training_step(self, batch, batch_idx):
+        loss = ...
+        self.tensorlens.log({"train/loss": loss})  # before Lightning's optimizer step
+        return loss
 ```
 
 Steps are counted from the optimizer, and `Trainer(gradient_clip_val=...)` clipping is recorded. This was tested on CPU with Lightning 2.6.5. With `MLFlowLogger`, pass `run_id=self.logger.run_id`. Combining this with `torch.compile` under Lightning has not been tested.
@@ -118,6 +125,7 @@ session = tensorlens.init(model_chunk, routers=routers, auto_step=False, start_s
 update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 if grad_norm is not None:
     session.record_grad_norm(grad_norm)
+session.log({"train/loss": loss})  # e.g. the reduced loss train_step returns; before session.step
 session.step(step=iteration, lr=optimizer.param_groups[0]["lr"])
 ```
 
@@ -144,6 +152,8 @@ What the summary can report:
 - **Weights not updating** (full capture): parameters with gradients that the optimizer left exactly unchanged. In pure-bf16 training without float32 master weights, RMSNorm weights near 1.0 show up here because their updates round away.
 - **Activation spikes, drift or dead outputs** (full capture): a block whose largest value or spread jumps or drifts far from its own history, or whose outputs turn to zero.
 - **Repeated steps, NaN or Inf, cross-GPU drift.**
+
+Each incident also lists what you logged with `session.log` at its step, next to the median of the previous 50 values, so you can see whether the loss moved.
 
 The thresholds are first guesses from one model, so treat a report as something to check, not a verdict.
 

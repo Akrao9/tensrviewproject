@@ -13,6 +13,7 @@ Rules this module follows (see the Capture SDK section of the v3 plan):
 from __future__ import annotations
 
 import math
+import numbers
 import queue
 import threading
 import weakref
@@ -380,6 +381,8 @@ class Session:
         self._steps: list[int] = []
         self._ring_lr: list[list[float] | None] = []
         self._pending_lr: list[float] | None = None
+        self._ring_scalars: list[dict[str, Any]] = []
+        self._pending_scalars: dict[str, Any] = {}
         self._next_step = start_step
         self._steps_committed = 0
         self._grads_recorded = False
@@ -542,6 +545,40 @@ class Session:
             self._clip.add_(float(norm) ** 2)
         self._clip_recorded = True
 
+    def log(self, values: Mapping[str, Any] | None = None, **named: Any) -> None:
+        """Record scalars such as the loss for the step in progress, without a GPU sync.
+
+        `session.log({"train/loss": loss})` or `session.log(loss=loss)`. Values are
+        Python numbers or one-element tensors. A tensor is copied on its device and moved
+        to the CPU with the rest of the step data every `every` steps, so logging a CUDA
+        loss does not stall training. Call it before `optimizer.step()`: with automatic
+        step counting, the step ends there, and a value logged afterwards belongs to the
+        next step. A name logged twice in one step keeps the last value. Images, tables
+        and other non-scalar values raise `TypeError`; pass the tracker the same values
+        it already logs, not a replacement for it.
+        """
+        if self._closed:
+            raise RuntimeError("the session is closed")
+        items = dict(values or {}, **named)
+        for name, value in items.items():
+            if not isinstance(name, str) or not name:
+                raise TypeError(f"scalar names must be non-empty strings, got {name!r}")
+            if isinstance(value, torch.Tensor):
+                tensor = value.detach()
+                if type(tensor) is not torch.Tensor:
+                    tensor = unwrap_local(tensor)
+                if tensor.numel() != 1:
+                    raise ValueError(f"{name}: expected one value, got shape {tuple(tensor.shape)}")
+                # A copy, so the value neither keeps a larger tensor alive nor changes later.
+                dtype = torch.float32 if tensor.device.type == "mps" else torch.float64
+                self._pending_scalars[name] = tensor.reshape(()).to(dtype, copy=True)
+            elif isinstance(value, numbers.Real):
+                self._pending_scalars[name] = (
+                    int(value) if isinstance(value, numbers.Integral) else float(value)
+                )
+            else:
+                raise TypeError(f"{name}: expected a number or one-element tensor, got {type(value).__name__}")
+
     def _ensure_spread_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._spread is None or self._ring_spread is None:
             # Apple MPS rejects float64 allocations; keep float64 replica buffers on CPU there.
@@ -635,6 +672,8 @@ class Session:
         self._steps.append(current)
         self._ring_lr.append(self._pending_lr)
         self._pending_lr = None
+        self._ring_scalars.append(self._pending_scalars)
+        self._pending_scalars = {}
         self._next_step = current + 1
         self._steps_committed += 1
         if len(self._steps) == self.every:
@@ -645,6 +684,7 @@ class Session:
         if self._error is not None:
             self._steps = []
             self._ring_lr = []
+            self._ring_scalars = []
             self._ring_grad_seen = []
             self._ring_weight_seen = []
             self._ring_clip_seen = []
@@ -681,15 +721,20 @@ class Session:
         grad_seen = self._ring_grad_seen
         weight_seen = self._ring_weight_seen
         spread_seen = self._ring_spread_seen
+        scalars = _scalars_to_cpu(self._ring_scalars)
         steps, lrs = self._steps, self._ring_lr
         self._steps = []
         self._ring_lr = []
+        self._ring_scalars = []
         self._ring_grad_seen = []
         self._ring_weight_seen = []
         self._ring_clip_seen = []
         self._ring_spread_seen = []
         self._queue.put(
-            (steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen, spread_seen)
+            (
+                steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
+                spread_seen, scalars,
+            )
         )
 
     def close(self) -> None:
@@ -746,6 +791,7 @@ class Session:
         grad_seen: list[bool],
         weight_seen: list[bool],
         spread_seen: list[bool],
+        scalars: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
         split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
@@ -802,6 +848,8 @@ class Session:
                 record["clip_grad_norm"] = math.sqrt(float(clips[i]))
             if lrs[i] is not None:
                 record["lr"] = lrs[i]
+            if scalars is not None and scalars[i]:
+                record["scalars"] = scalars[i]
             if spread_rows is not None and spread_seen[i]:
                 record["replica_spread"] = {
                     name: [float(norm_s), float(sum_s)]
@@ -816,6 +864,21 @@ class Session:
                 }
             records.append(record)
         return records
+
+
+def _scalars_to_cpu(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Replace logged tensors with Python floats: one transfer per device for the block."""
+    by_device: dict[torch.device, list[tuple[int, str, torch.Tensor]]] = {}
+    for i, row in enumerate(rows):
+        for name, value in row.items():
+            if isinstance(value, torch.Tensor):
+                by_device.setdefault(value.device, []).append((i, name, value))
+    out = [dict(row) for row in rows]
+    for entries in by_device.values():
+        values = torch.stack([t.to(entries[0][2].dtype) for _, _, t in entries]).cpu().tolist()
+        for (i, name, _), value in zip(entries, values):
+            out[i][name] = value
+    return out
 
 
 def _router_stats(counts: list[int]) -> dict[str, Any]:

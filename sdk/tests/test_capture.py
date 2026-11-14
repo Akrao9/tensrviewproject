@@ -577,3 +577,43 @@ def test_activation_spike_is_found_through_real_capture():
     spike = hits["activation_spike"]
     assert spike["step"] == 70
     assert spike["modules"][0]["module"] in ("layers.1", "layers.2")
+
+
+def test_log_records_scalars_for_the_step_in_progress():
+    model = nn.Linear(4, 2)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(model, sink=sink, every=2)
+    peaks = torch.arange(1.0, 7.0)
+    losses = []
+    for step in range(3):
+        loss = model(torch.ones(2, 4)).pow(2).mean()
+        loss.backward()
+        session.log({"train/loss": loss}, tokens=8, peak=peaks[step])
+        session.log(tokens=16)  # the last value for a name wins
+        losses.append(loss.item())
+        opt.step()
+        opt.zero_grad()
+        if step == 0:
+            peaks.zero_()  # a logged view is copied, so later changes do not reach it
+    session.log(after_last_step=1.0)  # belongs to a step that never ends: not written
+    session.close()
+
+    scalars = [record["scalars"] for record in sink.records]
+    assert [s["tokens"] for s in scalars] == [16, 16, 16]
+    assert [s["peak"] for s in scalars] == [1.0, 0.0, 0.0]
+    assert [s["train/loss"] for s in scalars] == pytest.approx(losses)
+    assert all("after_last_step" not in s for s in scalars)
+    with pytest.raises(RuntimeError, match="closed"):
+        session.log(x=1.0)
+
+
+def test_log_rejects_non_scalars():
+    session = tensorlens.init(nn.Linear(2, 2), sink=tensorlens.MemorySink())
+    with pytest.raises(ValueError, match="one value"):
+        session.log(x=torch.ones(3))
+    with pytest.raises(TypeError, match="number"):
+        session.log(image=object())
+    with pytest.raises(TypeError, match="names"):
+        session.log({"": 1.0})
+    session.close()
