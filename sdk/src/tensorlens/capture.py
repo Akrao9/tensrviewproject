@@ -147,16 +147,46 @@ def _cpu_copy(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().clone() if tensor.device.type == "cpu" else tensor.detach().cpu()
 
 
+def _leaf_layers(named: list[tuple[str, nn.Module]]) -> list[tuple[str, nn.Module]]:
+    return [
+        (name, module)
+        for name, module in named
+        if not any(module.children()) and any(True for _ in module.parameters(recurse=False))
+    ]
+
+
+def _block_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
+    """The model's repeated blocks: the children of its largest `ModuleList` of composite
+    modules that share one class, such as a transformer's decoder layers.
+
+    This is the unit PyTorch's FSDP `transformer_auto_wrap_policy` wraps. One hook per
+    block locates a problem to a block at a fraction of the cost of one per leaf module.
+    """
+    best: list[tuple[str, nn.Module]] = []
+    best_params = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.ModuleList) or len(module) < 2:
+            continue
+        children = list(module)
+        if len({type(c) for c in children}) != 1 or not any(children[0].children()):
+            continue
+        count = sum(p.numel() for p in module.parameters())
+        if count > best_params:
+            best_params = count
+            best = [(f"{name}.{i}" if name else str(i), child) for i, child in enumerate(children)]
+    return best
+
+
 def _select_layers(
-    model: nn.Module, layers: LayerFilter | Sequence[str] | None
+    model: nn.Module, layers: LayerFilter | Sequence[str] | str | None
 ) -> list[tuple[str, nn.Module]]:
     named = [(name, module) for name, module in model.named_modules() if name]
-    if layers is None:
-        return [
-            (name, module)
-            for name, module in named
-            if not any(module.children()) and any(True for _ in module.parameters(recurse=False))
-        ]
+    if layers is None or layers == "blocks":
+        return _block_layers(model) or _leaf_layers(named)
+    if layers == "all":
+        return _leaf_layers(named)
+    if isinstance(layers, str):
+        raise ValueError('layers must be "blocks", "all", a list of module names or a filter')
     if callable(layers):
         return [(name, module) for name, module in named if layers(name, module)]
     wanted = list(layers)
@@ -177,7 +207,7 @@ class Session:
         run: RunInfo,
         every: int,
         sink: Sink,
-        layers: LayerFilter | Sequence[str] | None,
+        layers: LayerFilter | Sequence[str] | str | None,
         routers: Mapping[str, Router | int] | None,
         grads: bool | int = True,
         weights: bool | int = True,
@@ -731,7 +761,7 @@ def init(
     run_id: str | None = None,
     every: int = 50,
     sink: Sink | None = None,
-    layers: LayerFilter | Sequence[str] | None = None,
+    layers: LayerFilter | Sequence[str] | str | None = None,
     routers: Mapping[str, Router | int] | None = None,
     grads: bool | int = True,
     weights: bool | int = True,
@@ -746,8 +776,11 @@ def init(
             the active W&B run, in that order.
         every: steps kept on the device between transfers to the CPU.
         sink: where records go. Defaults to a JSON Lines file under `tensorlens-out/`.
-        layers: module names, or a `(name, module) -> bool` filter. Defaults to every leaf
-            module that has parameters.
+        layers: which modules' outputs to summarize. Default `"blocks"`: each repeated
+            block, such as each transformer layer, or every leaf module with parameters if
+            the model has no repeated blocks. `"all"`: every leaf module with parameters,
+            which costs several times more. Or module names, or a `(name, module) -> bool`
+            filter; `()` for none.
         routers: MoE router module names mapped to their expert count or a `Router`.
         grads: True to record gradient norms every step, False or 0 to disable automatic
             gradient norm capture, or a positive integer N to record every Nth captured step.

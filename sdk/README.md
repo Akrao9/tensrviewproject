@@ -20,7 +20,7 @@ session.close()
 
 Each optimizer step becomes one JSON line in `tensorlens-out/<run_id>.rank<rank>.jsonl`:
 
-- **`layers`**: mean, standard deviation, absolute maximum and zero fraction of each watched layer's output.
+- **`layers`**: mean, standard deviation, absolute maximum and zero fraction of each watched module's output. By default the watched modules are the model's repeated blocks, such as each transformer decoder layer: the largest `ModuleList` of composite modules of one class, the unit PyTorch's FSDP `transformer_auto_wrap_policy` wraps. A model without such a list falls back to every leaf module with parameters, which `layers="all"` also selects; for Granite that is 171 modules against 24 blocks.
 - **`grad_norms`** and **`grad_norm`**: the L2 norm of each parameter's gradient and their total.
 - **`weight_norms`** and **`weights_unchanged`**: each parameter's L2 norm after the optimizer step, and which parameters are exactly unchanged since the previous check. Checked every 50 steps by default (`weights=N` for every N steps, `weights=False` to turn it off); a check also records that step's gradient norms.
 - **`lr`**: each parameter group's learning rate after the step.
@@ -147,6 +147,7 @@ Mark this complete when both NCCL ranks report `PASS`. Each rank checks healthy 
 - **Gradient accumulation.** A hook runs on every forward pass; the record keeps the last one before the optimizer step.
 - **Non-finite values** are written as the strings `"nan"`, `"inf"` and `"-inf"`, so the file stays standard JSON.
 - **Hooks stay on the model after `close()`**, because removing a hook from a compiled module triggers a recompile.
+- **Full-capture cost.** Each watched module adds a few small kernels per step. Granite's measured ~6% for activation capture was with every leaf module (171); blocks are the default now, and the benchmark's Stage 3 measures full capture with defaults directly against capture off (`--layers all` for the old selection). Not yet run on a GPU.
 
 ## Develop
 

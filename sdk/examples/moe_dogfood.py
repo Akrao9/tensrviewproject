@@ -226,6 +226,12 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=200, help="timed steps per round")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=50)
+    parser.add_argument(
+        "--layers",
+        choices=("blocks", "all"),
+        default="blocks",
+        help="activation capture: one hook per decoder layer (default) or every leaf module",
+    )
     parser.add_argument("--collapse-layer", type=int, help="inject a collapse into this 1-based MoE layer in the final round")
     compile_mode = parser.add_mutually_exclusive_group()
     compile_mode.add_argument(
@@ -246,6 +252,7 @@ def main() -> None:
     capture_path = args.out / "granite.jsonl"
     no_grads_path = args.out / "granite-no-grads.jsonl"
     router_only_path = args.out / "granite-router-only.jsonl"
+    full_path = args.out / "granite-full.jsonl"
     mode = "eager" if args.eager else f"Inductor, CUDA graphs {'on' if args.cuda_graphs else 'off'}"
     print(f"{torch.__version__} on {torch.cuda.get_device_name()} | {MODEL} | {mode}", flush=True)
     batches = load_batches(args, args.warmup + args.steps)
@@ -259,8 +266,11 @@ def main() -> None:
         batches,
         ("full (grads off)", "full (grads on)"),
         (
-            {"run_id": "granite-no-grads", "grads": False, "sink": tensorlens.JsonlSink(no_grads_path)},
-            {"run_id": "granite", "grads": True, "sink": tensorlens.JsonlSink(capture_path)},
+            # A weight check records that step's gradient norms, so this arm turns it off.
+            {"run_id": "granite-no-grads", "grads": False, "weights": False,
+             "layers": args.layers, "sink": tensorlens.JsonlSink(no_grads_path)},
+            {"run_id": "granite", "grads": True, "layers": args.layers,
+             "sink": tensorlens.JsonlSink(capture_path)},
         ),
     )
     verify_capture(
@@ -304,6 +314,7 @@ def main() -> None:
                 "run_id": "granite-router-only",
                 "layers": (),
                 "grads": False,
+                "weights": False,
                 "sink": tensorlens.JsonlSink(router_only_path),
             },
         ),
@@ -328,8 +339,35 @@ def main() -> None:
     )
     print(f"Verified {expected_steps} recorded steps across {len(routers)} routers: {router_only_path}")
     print(tensorlens.incident_summary(router_evidence))
+
+    print(f"\n--- Stage 3: baseline (capture off) vs. full capture (defaults, layers={args.layers}) ---", flush=True)
+    off_full_ms, full_default_ms, routers, expected_steps, expected_assignments, collapse_step, top_k = run_comparison(
+        args,
+        batches,
+        ("capture off", "full capture"),
+        (None, {"run_id": "granite-full", "layers": args.layers, "sink": tensorlens.JsonlSink(full_path)}),
+    )
+    verify_capture(
+        full_path,
+        routers,
+        expected_steps,
+        expected_assignments,
+        collapse_step,
+        args.collapse_layer,
+        top_k,
+        expect_grads=True,
+        expect_layers=True,
+    )
+    full_delta_ms = full_default_ms - off_full_ms
+    full_overhead = 100 * (full_default_ms / off_full_ms - 1)
+    print(
+        f"Median: off {off_full_ms:.3f} ms/step, full capture {full_default_ms:.3f} ms/step, "
+        f"overhead {full_delta_ms:+.3f} ms/step ({full_overhead:+.2f}%)",
+        flush=True,
+    )
     if not args.eager and args.collapse_layer is None:
         print(f"1% overhead target (router-only): {'PASS' if router_overhead < 1 else 'FAIL'}")
+        print(f"1% overhead target (full capture): {'PASS' if full_overhead < 1 else 'FAIL'}")
     if args.cuda_graphs:
         skips = counters["inductor"]["cudagraph_skips"]
         if skips:

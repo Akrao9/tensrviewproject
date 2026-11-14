@@ -425,3 +425,66 @@ def test_weight_check_cadence_turns_on_gradients_for_its_steps(toy_moe):
         assert off.weight_every == 0
     with pytest.raises(ValueError):
         tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), weights=-1)
+
+
+class _Block(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.attn = nn.Linear(dim, dim)
+        self.mlp = nn.Linear(dim, dim)
+
+    def forward(self, h):
+        return h + self.mlp(torch.relu(self.attn(h)))
+
+
+class _Stack(nn.Module):
+    def __init__(self, dim: int = 8, n: int = 3) -> None:
+        super().__init__()
+        self.embed = nn.Linear(dim, dim)
+        self.layers = nn.ModuleList(_Block(dim) for _ in range(n))
+        self.heads = nn.ModuleList(nn.Linear(dim, 1) for _ in range(2))  # leaf modules
+        self.out = nn.Linear(dim, 1)
+
+    def forward(self, x):
+        h = self.embed(x)
+        for layer in self.layers:
+            h = layer(h)
+        return self.out(h) + sum(head(h) for head in self.heads)
+
+
+def test_default_layers_are_the_repeated_blocks_and_all_keeps_every_leaf(toy_moe):
+    model = _Stack()
+    with tensorlens.init(model, sink=tensorlens.MemorySink()) as session:
+        assert session.layer_names == ["layers.0", "layers.1", "layers.2"]
+    with tensorlens.init(model, sink=tensorlens.MemorySink(), layers="all") as session:
+        assert len(session.layer_names) == 1 + 3 * 2 + 2 + 1
+    # A model with no list of composite blocks falls back to every leaf module.
+    with tensorlens.init(toy_moe, sink=tensorlens.MemorySink()) as session:
+        with tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), layers="all") as every:
+            assert session.layer_names == every.layer_names
+    with pytest.raises(ValueError):
+        tensorlens.init(model, sink=tensorlens.MemorySink(), layers="leaves")
+
+
+def test_block_statistics_match_and_compile_cleanly():
+    torch.manual_seed(0)
+    model = _Stack()
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(model, sink=sink, every=2, auto_step=False)
+    compiled = torch.compile(model, backend="aot_eager")
+    x = torch.randn(16, 8)
+    torch._dynamo.utils.counters.clear()
+    with torch._dynamo.config.patch(error_on_recompile=True):
+        for _ in range(2):
+            compiled(x).sum().backward()
+            session.step()
+    session.close()
+    assert dict(torch._dynamo.utils.counters["graph_break"]) == {}
+    with torch.no_grad():
+        h = model.embed(x)
+        for layer in model.layers:
+            h = layer(h)
+        expected = {"mean": h.mean().item(), "std": h.std().item(), "abs_max": h.abs().max().item()}
+    got = sink.records[-1]["layers"]["layers.2"]
+    for key, value in expected.items():
+        assert got[key] == pytest.approx(value, rel=1e-5)
