@@ -507,3 +507,53 @@ def test_capture_modes(toy_moe):
         tensorlens.init(_Stack(), sink=tensorlens.MemorySink(), capture="routers")
     with pytest.raises(ValueError):
         tensorlens.init(_Stack(), sink=tensorlens.MemorySink(), capture="everything")
+
+
+def test_clip_grad_norm_is_recorded_in_router_only_mode(toy_moe):
+    original = torch.nn.utils.clip_grad_norm_
+    other = nn.Linear(4, 1)
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(toy_moe, sink=sink, every=2, routers={"router": 4})
+    assert torch.nn.utils.clip_grad_norm_ is not original
+    opt = torch.optim.SGD(toy_moe.parameters(), lr=0.01)
+    returned = []
+    for _ in range(3):
+        opt.zero_grad()
+        toy_moe(torch.randn(16, 8)).sum().backward()
+        returned.append(torch.nn.utils.clip_grad_norm_(toy_moe.parameters(), 0.5).item())
+        other(torch.randn(2, 4)).sum().backward()
+        torch.nn.utils.clip_grad_norm_(other.parameters(), 0.5)  # another model: ignored
+        opt.step()
+    session.close()
+    assert torch.nn.utils.clip_grad_norm_ is original  # restored on close
+    assert [r["grad_norm"] for r in sink.records] == [None, None, None]
+    assert [r["clip_grad_norm"] for r in sink.records] == pytest.approx(returned, rel=1e-6)
+
+
+def test_record_grad_norm_by_hand_and_spikes_without_per_parameter_norms(toy_moe):
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(
+        toy_moe, sink=sink, every=8, routers={"router": 4}, clip_norm=False, auto_step=False
+    )
+    assert torch.nn.utils.clip_grad_norm_.__module__ == "torch.nn.utils.clip_grad"
+    for step in range(30):
+        session.record_grad_norm(40.0 if step == 25 else 1.0 + 0.01 * (step % 3))  # Megatron-style float
+        session.step()
+    session.close()
+    assert sink.records[25]["clip_grad_norm"] == pytest.approx(40.0)
+    hit = tensorlens.detect_grad_spikes(sink.records)
+    assert hit["step"] == 25 and hit["parameters"] == []
+
+
+def test_lightning_gradient_clipping_is_recorded(toy_moe):
+    precision = pytest.importorskip("lightning.pytorch.plugins.precision")
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(toy_moe, sink=sink, every=1, routers={"router": 4})
+    opt = torch.optim.SGD(toy_moe.parameters(), lr=0.01)
+    opt.zero_grad()
+    toy_moe(torch.randn(16, 8)).sum().backward()
+    expected = torch.nn.utils.get_total_norm([p.grad for p in toy_moe.parameters() if p.grad is not None])
+    precision.Precision().clip_grad_by_norm(opt, 0.5)  # what Trainer(gradient_clip_val=0.5) calls
+    opt.step()
+    session.close()
+    assert sink.records[0]["clip_grad_norm"] == pytest.approx(expected.item(), rel=1e-6)

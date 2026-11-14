@@ -208,7 +208,9 @@ def detect_grad_spikes(
     """Return the first gradient-norm spike and the parameters that spiked most, or None.
 
     Each parameter's norm is compared with its own median over the same window, so the
-    report names where the spike is, not only that the total jumped. `rising_since` is
+    report names where the spike is, not only that the total jumped. Without per-parameter
+    norms (router-only capture), the total comes from `clip_grad_norm` and no parameter
+    is named. `rising_since` is
     the first step in the window at which that parameter was already above half the
     spike factor, which points at where a spike started when it builds over several steps.
     """
@@ -216,7 +218,10 @@ def detect_grad_spikes(
     per_param: dict[str, list[tuple[int, float]]] = {}
     spikes: list[dict[str, Any]] = []
     for record in sorted(records, key=lambda r: r["step"]):
+        # Per-parameter norms when captured, else the norm gradient clipping reported.
         total = _finite(record.get("grad_norm"))
+        if total is None:
+            total = _finite(record.get("clip_grad_norm"))
         if total is None:
             continue
         step = int(record["step"])

@@ -74,7 +74,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Per-parameter gradient norms, to show which layer the spike started in, and update norms.
 
-**TensorLens today.** Detected. A step at 5× the median of the last 50 recorded steps is a spike; the report ranks parameters by their own spike and names the one that started rising first. Tested on synthetic records only; the factor is untuned.
+**TensorLens today.** Detected, in router-only mode too when the run clips gradients: the total norm returned by `clip_grad_norm_` (or passed to `record_grad_norm`, as from Megatron's optimizer) is recorded every step at no extra cost. A step at 5× the median of the last 50 recorded steps is a spike; the report ranks parameters by their own spike and names the one that started rising first. Tested on synthetic records only; the factor is untuned.
 
 ### 6. Bad state after resuming from a checkpoint
 

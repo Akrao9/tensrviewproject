@@ -204,6 +204,56 @@ def _select_layers(
     return [(name, by_name[name]) for name in wanted]
 
 
+_clip_sessions: list["Session"] = []
+_clip_original: Callable[..., Any] | None = None
+
+
+def _clip_grad_norm_wrapper(parameters: Any, *args: Any, **kwargs: Any) -> Any:
+    # `clip_grad_norm_` turns a generator into a list itself; do it first so the
+    # parameters can also be matched against each session's model.
+    if not isinstance(parameters, torch.Tensor):
+        parameters = list(parameters)
+    total_norm = _clip_original(parameters, *args, **kwargs)  # type: ignore[misc]
+    first = parameters if isinstance(parameters, torch.Tensor) else next(iter(parameters), None)
+    for session in list(_clip_sessions):
+        if first is not None and id(first) in session._param_ids:
+            session.record_grad_norm(total_norm)
+    return total_norm
+
+
+def _watch_clipping(session: "Session") -> None:
+    """Record the norm `torch.nn.utils.clip_grad_norm_` returns while `session` is open.
+
+    The norm is computed anyway when gradients are clipped, so recording it is free.
+    Lightning calls `torch.nn.utils.clip_grad_norm_` and discards the result, so this
+    also covers Lightning's `gradient_clip_val`. Callers that bound the function before
+    `init` (`from torch.nn.utils import clip_grad_norm_`) bypass it; they, and Megatron,
+    whose optimizer returns the norm from `step()`, can call `record_grad_norm` instead.
+    """
+    global _clip_original
+    import torch.nn.utils as nn_utils
+    import torch.nn.utils.clip_grad as clip_module
+
+    if not _clip_sessions:
+        _clip_original = nn_utils.clip_grad_norm_
+        nn_utils.clip_grad_norm_ = _clip_grad_norm_wrapper  # type: ignore[assignment]
+        clip_module.clip_grad_norm_ = _clip_grad_norm_wrapper  # type: ignore[assignment]
+    _clip_sessions.append(session)
+
+
+def _unwatch_clipping(session: "Session") -> None:
+    global _clip_original
+    import torch.nn.utils as nn_utils
+    import torch.nn.utils.clip_grad as clip_module
+
+    if session in _clip_sessions:
+        _clip_sessions.remove(session)
+        if not _clip_sessions and _clip_original is not None:
+            nn_utils.clip_grad_norm_ = _clip_original  # type: ignore[assignment]
+            clip_module.clip_grad_norm_ = _clip_original  # type: ignore[assignment]
+            _clip_original = None
+
+
 class Session:
     """One model's capture. Create it with `tensorlens.init`."""
 
@@ -221,6 +271,7 @@ class Session:
         auto_step: bool,
         replica_group: Any = None,
         start_step: int = 0,
+        clip_norm: bool = True,
     ) -> None:
         if hasattr(model, "_orig_mod"):
             raise ValueError("call tensorlens.init(model) before torch.compile(model)")
@@ -289,6 +340,12 @@ class Session:
         self._ring_grad = torch.zeros(every, *self._grad.shape, **f32)
         self._ring_grad_seen: list[bool] = []
         self._ring_weight_seen: list[bool] = []
+        # Squared total gradient norm reported by gradient clipping this step (summed over
+        # calls, for models clipped in several groups), and its ring.
+        self._clip = torch.zeros((), **f32)
+        self._ring_clip = torch.zeros(every, **f32)
+        self._clip_recorded = False
+        self._ring_clip_seen: list[bool] = []
         self._ring_spread: torch.Tensor | None = None
         self._ring_spread_seen: list[bool] = []
         if replica_group is not None and n_params > 0:
@@ -327,6 +384,10 @@ class Session:
         self._queue: queue.Queue[Any] = queue.Queue()
         self._worker = threading.Thread(target=self._drain, name="tensorlens-writer", daemon=True)
         self._worker.start()
+
+        self._clip_watched = clip_norm
+        if clip_norm:
+            _watch_clipping(self)
 
         self._optimizer_handles = []
         if auto_step:
@@ -456,6 +517,25 @@ class Session:
             else:
                 self._prev_weight.copy_(current)
 
+    @torch.no_grad()
+    def record_grad_norm(self, norm: torch.Tensor | float) -> None:
+        """Record the total gradient norm (L2, before clipping) computed this step.
+
+        Called automatically with the value `torch.nn.utils.clip_grad_norm_` returns.
+        Call it yourself with a norm computed elsewhere, such as the `grad_norm` that
+        Megatron's `optimizer.step()` returns. A tensor stays on its device; no sync.
+        """
+        if isinstance(norm, torch.Tensor):
+            value = norm.detach()
+            if type(value) is not torch.Tensor:
+                value = unwrap_local(value)
+            if value.numel() != 1:
+                return
+            self._clip.add_(value.reshape(()).to(self._clip).square())
+        else:
+            self._clip.add_(float(norm) ** 2)
+        self._clip_recorded = True
+
     def _ensure_spread_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._spread is None or self._ring_spread is None:
             # Apple MPS rejects float64 allocations; keep float64 replica buffers on CPU there.
@@ -522,6 +602,11 @@ class Session:
             self._grad.zero_()
         self._ring_grad_seen.append(self._grads_recorded)
         self._ring_weight_seen.append(weights_checked)
+        if self._clip_recorded:
+            self._ring_clip[row].copy_(self._clip)
+            self._clip.zero_()
+        self._ring_clip_seen.append(self._clip_recorded)
+        self._clip_recorded = False
         if self._spread_recorded and self._spread is not None and self._ring_spread is not None:
             self._ring_spread[row].copy_(self._spread)
             self._spread.zero_()
@@ -549,6 +634,7 @@ class Session:
             self._ring_lr = []
             self._ring_grad_seen = []
             self._ring_weight_seen = []
+            self._ring_clip_seen = []
             self._ring_spread_seen = []
             self._raise_worker_error()
         n = len(self._steps)
@@ -577,6 +663,8 @@ class Session:
             if self._ring_spread is not None and any(self._ring_spread_seen)
             else None
         )
+        clips = _cpu_copy(self._ring_clip[:n]) if any(self._ring_clip_seen) else None
+        clip_seen = self._ring_clip_seen
         grad_seen = self._ring_grad_seen
         weight_seen = self._ring_weight_seen
         spread_seen = self._ring_spread_seen
@@ -585,8 +673,11 @@ class Session:
         self._ring_lr = []
         self._ring_grad_seen = []
         self._ring_weight_seen = []
+        self._ring_clip_seen = []
         self._ring_spread_seen = []
-        self._queue.put((steps, lrs, floats, counts, spreads, grad_seen, weight_seen, spread_seen))
+        self._queue.put(
+            (steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen, spread_seen)
+        )
 
     def close(self) -> None:
         """Flush what is left and stop the writer. Forward hooks stay on the model, because
@@ -596,6 +687,7 @@ class Session:
         self._closed = True
         for handle in self._optimizer_handles:
             handle.remove()
+        _unwatch_clipping(self)
         try:
             self.flush()
         finally:
@@ -636,6 +728,8 @@ class Session:
         floats: torch.Tensor | None,
         counts: torch.Tensor | None,
         spreads: torch.Tensor | None,
+        clips: torch.Tensor | None,
+        clip_seen: list[bool],
         grad_seen: list[bool],
         weight_seen: list[bool],
         spread_seen: list[bool],
@@ -691,6 +785,8 @@ class Session:
                     record["weights_unchanged"] = [
                         name for name, row in zip(self.param_names, grad[i]) if row[3] > 0
                     ]
+            if clips is not None and clip_seen[i]:
+                record["clip_grad_norm"] = math.sqrt(float(clips[i]))
             if lrs[i] is not None:
                 record["lr"] = lrs[i]
             if spread_rows is not None and spread_seen[i]:
@@ -776,6 +872,7 @@ def init(
     auto_step: bool = True,
     replica_group: Any = None,
     start_step: int = 0,
+    clip_norm: bool = True,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -809,6 +906,9 @@ def init(
             for cross-GPU parameter drift checks.
         start_step: the first step number. Pass the step you resume from, so a resumed
             run does not repeat step numbers already written.
+        clip_norm: record the total gradient norm that `torch.nn.utils.clip_grad_norm_`
+            returns for this model's parameters, as `clip_grad_norm`, in any capture mode.
+            Free when you clip anyway, and enough for gradient-spike detection.
     """
     mode = capture if capture is not None else ("routers" if routers else "full")
     if mode not in CAPTURE_MODES:
@@ -835,4 +935,5 @@ def init(
         auto_step=auto_step,
         replica_group=replica_group,
         start_step=start_step,
+        clip_norm=clip_norm,
     )
