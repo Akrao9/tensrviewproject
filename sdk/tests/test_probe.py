@@ -53,8 +53,12 @@ def _reference(q, k, causal=True):
         t = q.shape[-2]
         scores = scores.masked_fill(~torch.ones(t, t, dtype=torch.bool).tril(), -math.inf)
     p = scores.softmax(-1)
-    ent = -(p * p.clamp_min(1e-30).log()).sum(-1).mean(dim=(0, 2))
-    return scores.amax(dim=(0, 2, 3)), ent, p[0].mean(0)
+    ent = -(p * p.clamp_min(1e-30).log()).sum(-1)  # [batch, heads, rows]
+    # Rows with one visible key (the first query under a causal mask) carry no choice.
+    visible = torch.arange(1, q.shape[-2] + 1).float() if causal else torch.full((q.shape[-2],), float(k.shape[-2]))
+    rich = visible >= 2
+    share = (ent / visible.clamp_min(2).log())[..., rich].mean(dim=(0, 2))
+    return scores.amax(dim=(0, 2, 3)), ent[..., rich].mean(dim=(0, 2)), share, p[0].mean(0)
 
 
 def _train(model, session, steps, batch):
@@ -97,15 +101,18 @@ def test_attention_stats_match_explicit_softmax_with_chunking(monkeypatch):
     torch.manual_seed(1)
     q, k = torch.randn(2, 4, 10, 8), torch.randn(2, 2, 10, 8)
     full = probe_mod._attention_stats(q, k, None, True, None, map_size=10)
-    max_logit, entropy, attn = _reference(q, k)
+    max_logit, entropy, share, attn = _reference(q, k)
     assert full["max_logit"] == pytest.approx(max_logit.tolist(), rel=1e-5)
     assert full["entropy"] == pytest.approx(entropy.tolist(), rel=1e-5)
+    assert full["entropy_share"] == pytest.approx(share.tolist(), rel=1e-5)
+    assert full["masked_rows"] == full["invalid_rows"] == 0 and full["rows"] == 2 * 4 * 10
     assert torch.allclose(torch.tensor(full["map"]), attn, atol=1e-6)
 
     monkeypatch.setattr(probe_mod, "CHUNK_ELEMENTS", 2 * 4 * 10 * 3)  # 3 query rows per chunk
     chunked = probe_mod._attention_stats(q, k, None, True, None, map_size=4)
     assert chunked["max_logit"] == pytest.approx(full["max_logit"], rel=1e-6)
     assert chunked["entropy"] == pytest.approx(full["entropy"], rel=1e-6)
+    assert chunked["entropy_share"] == pytest.approx(full["entropy_share"], rel=1e-6)
     pooled = torch.tensor(chunked["map"])
     assert pooled.shape == (4, 4) and torch.allclose(pooled.sum(-1), torch.ones(4), atol=1e-5)
 
@@ -197,3 +204,49 @@ def test_probe_is_written_to_jsonl_and_exported_to_rerun(tmp_path, monkeypatch):
         assert logged.count(f"/probe/histograms/{layer}") == 2
         assert logged.count(f"/probe/attention/{layer}") == 2
         assert f"/probe/max_logit/{layer}" in logged and f"/probe/entropy/{layer}" in logged
+
+
+def test_uniform_attention_reads_as_full_entropy_despite_causal_mask_and_padding():
+    q, k = torch.zeros(1, 2, 4, 8), torch.zeros(1, 2, 4, 8)  # every score equal: uniform
+    causal = probe_mod._attention_stats(q, k, None, True, None, map_size=4)
+    assert causal["entropy_share"] == pytest.approx([1.0, 1.0])
+    padded_mask = torch.ones(4, 4, dtype=torch.bool)
+    padded_mask[2:] = False  # the last two queries are padding: every key masked
+    padded = probe_mod._attention_stats(q, k, padded_mask, False, None, map_size=4)
+    assert padded["entropy_share"] == pytest.approx([1.0, 1.0])
+    assert padded["masked_rows"] == 2 * 2 and padded["invalid_rows"] == 0
+    assert padded["map"][2] == [0.0] * 4 and sum(padded["map"][0]) == pytest.approx(1.0)
+
+
+def test_nan_scores_are_reported_as_invalid_not_as_concentrated_attention():
+    torch.manual_seed(2)
+    q, k = torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8)
+    q[0, :, 1] = float("nan")  # query 1 is broken in both heads
+    stats = probe_mod._attention_stats(q, k, None, False, None, map_size=4)
+    assert stats["invalid_rows"] == 2 and stats["masked_rows"] == 0
+    assert all(math.isfinite(v) for v in stats["max_logit"])
+    assert all(0 < v <= 1 for v in stats["entropy_share"])  # from the three healthy rows
+    assert stats["map"][1] == [0.0] * 4
+    broken = probe_mod._attention_stats(torch.full_like(q, float("nan")), k, None, False, None, map_size=4)
+    assert broken["invalid_rows"] == 8 and all(math.isnan(v) for v in broken["entropy"])
+
+
+def test_a_failing_probe_keeps_the_step_and_records_the_error():
+    model = Toy()
+    calls = []
+
+    def flaky(m):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("probe broke")
+        m(torch.zeros(1, 4, dtype=torch.long))
+
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(model, sink=sink, every=4, probe=flaky, probe_every=1)
+    with pytest.warns(RuntimeWarning, match="probe broke"):
+        _train(model, session, 3, torch.randint(0, 32, (2, 6)))
+    session.close()
+    assert [r["step"] for r in sink.records] == [0, 1, 2]
+    assert sink.records[1]["probe"] == {"error": "RuntimeError: probe broke"}
+    assert "histograms" in sink.records[2]["probe"]
+    assert model.training and not model.frozen.training

@@ -198,7 +198,8 @@ The check passes `replica_every=1`. In a training job the drift check runs every
 `tensorlens.init(model, probe={"input_ids": fixed_batch}, probe_every=1000)` runs one fixed batch through the model every 1,000 steps (wandb.watch's default for histograms) and adds a `probe` field to that step's record:
 
 - **`histograms`**: a 64-bin histogram of each repeated block's output (`lo`, `hi`, `counts`, and `nonfinite` for NaN and Inf values left out).
-- **`attention`**: for each `scaled_dot_product_attention` call, named after the block it ran in, the largest pre-softmax logit and the mean attention entropy per head (with `max_entropy`, the entropy of uniform attention), and sample 0's attention map averaged over heads and pooled to at most 64 × 64 (keys summed and query rows averaged per bin, so each row still sums to 1).
+- **`attention`**: for each `scaled_dot_product_attention` call, named after the block it ran in, per head: the largest finite pre-softmax logit (`max_logit`), the mean entropy in nats (`entropy`), and `entropy_share`, each query row's entropy divided by the log of that row's own visible key count, so uniform attention is 1.0 under a causal mask too. Rows are kept apart by kind, so padding and numerical failures do not read as concentrated attention: `masked_rows` (every key masked, as for padded queries) and `invalid_rows` (a NaN or +Inf score among the visible keys) are counted over batch × heads × queries (`rows`) and left out of the entropy, as are rows with a single visible key. Also sample 0's attention map over its valid rows, averaged over heads and pooled to at most 64 × 64 (keys summed and query rows averaged per bin, so each row sums to 1; rows with no valid query are 0).
+- **`error`** instead of the above when the probe raised. The step itself is always written: the probe runs after the step is complete, and a failure is reported as a `RuntimeWarning`.
 
 `probe` can be a tensor (`model(batch)`), a mapping of keyword inputs (`model(**batch)`), or a callable `fn(model)`. How it runs:
 
@@ -209,7 +210,7 @@ The check passes `replica_every=1`. In a training job the drift check runs every
 - **Deterministic mode** is turned off during the probe, because `histc` and `index_add_` have no deterministic CUDA kernels; the probe's results do not feed training.
 - **Cost** is one eager forward pass plus the attention recomputation and one sync per histogram, every `probe_every` steps; not yet measured on a GPU. A Granite probe record should be on the order of 2 MB of JSON (24 maps of 64 × 64), also not measured. The Granite benchmark takes `--probe-every N`.
 
-The Rerun export adds a Probe tab: the largest attention logit and the entropy (as a share of its maximum) per layer over training, a histogram per block and an attention map per layer at each probe step. There is no detector on the probe data yet: thresholds for logit growth or entropy collapse need real failures first.
+The Rerun export adds a Probe tab: the largest attention logit and `entropy_share` per layer over training, the count of invalid attention rows when there are any, a histogram per block and an attention map per layer at each probe step. There is no detector on the probe data yet: thresholds for logit growth or entropy collapse need real failures first.
 
 ## Things to know
 

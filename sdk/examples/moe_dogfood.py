@@ -387,8 +387,11 @@ def main() -> None:
             last = probes[-1]["attention"]
             print(f"Last probe: {len(probes[-1]['histograms'])} histograms, attention in {len(last)} layers")
             for name, att in list(last.items())[:: max(1, len(last) // 4)]:
-                share = sum(att["entropy"]) / len(att["entropy"]) / att["max_entropy"]
-                print(f"  {name}: largest logit {max(att['max_logit']):.2f}, entropy {share:.2f} of maximum")
+                share = sum(att["entropy_share"]) / len(att["entropy_share"])
+                print(
+                    f"  {name}: largest logit {max(att['max_logit']):.2f}, entropy {share:.2f} of maximum, "
+                    f"{att['masked_rows']} masked and {att['invalid_rows']} invalid rows"
+                )
     if args.cuda_graphs:
         skips = counters["inductor"]["cudagraph_skips"]
         if skips:

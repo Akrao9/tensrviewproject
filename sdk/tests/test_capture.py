@@ -617,3 +617,13 @@ def test_log_rejects_non_scalars():
     with pytest.raises(TypeError, match="names"):
         session.log({"": 1.0})
     session.close()
+
+
+def test_cached_clip_wrapper_still_works_after_the_last_session_closes():
+    model = nn.Linear(4, 2)
+    session = tensorlens.init(model, sink=tensorlens.MemorySink())
+    cached = torch.nn.utils.clip_grad_norm_  # bound while the session is open
+    session.close()
+    model(torch.ones(1, 4)).sum().backward()
+    assert float(cached(model.parameters(), 1.0)) > 0
+    assert torch.nn.utils.clip_grad_norm_ is not cached  # the original is back in place

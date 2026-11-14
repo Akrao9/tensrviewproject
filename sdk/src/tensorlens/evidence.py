@@ -1043,6 +1043,7 @@ def export_rerun(
     probe_hist: dict[str, str] = {}
     probe_maps: dict[str, str] = {}
     probe_series = False
+    probe_invalid = [False]
     if records is not None:
         for record in records:
             rr.set_time("training_step", sequence=int(record["step"]))
@@ -1070,7 +1071,7 @@ def export_rerun(
                     logged_paths[entity] = name
             probe = record.get("probe")
             if probe:
-                probe_series |= _log_probe(rr, probe, probe_hist, probe_maps)
+                probe_series |= _log_probe(rr, probe, probe_hist, probe_maps, probe_invalid)
             for layer_name, stats in record.get("layers", {}).items():
                 for key, val in stats.items():
                     if isinstance(val, (int, float)) and math.isfinite(val):
@@ -1100,6 +1101,8 @@ def export_rerun(
                 rrb.TimeSeriesView(origin="/probe/max_logit", name="Largest attention logit"),
                 rrb.TimeSeriesView(origin="/probe/entropy", name="Attention entropy (share of maximum)"),
             ]
+        if probe_invalid[0]:
+            probe_views.append(rrb.TimeSeriesView(origin="/probe/invalid_rows", name="Attention rows with NaN or Inf"))
         probe_views += [rrb.BarChartView(origin=e, name=f"Histogram {n}") for e, n in probe_hist.items()]
         probe_views += [rrb.TensorView(origin=e, name=f"Attention {n}") for e, n in probe_maps.items()]
         tabs.append(rrb.Tabs(*probe_views, name="Probe"))
@@ -1117,7 +1120,9 @@ def export_rerun(
     return out_path
 
 
-def _log_probe(rr: Any, probe: Mapping[str, Any], hist_paths: dict, map_paths: dict) -> bool:
+def _log_probe(
+    rr: Any, probe: Mapping[str, Any], hist_paths: dict, map_paths: dict, invalid_series: list[bool]
+) -> bool:
     """Log one probe pass: per-block histograms, attention maps, and per-layer attention
     logit and entropy series. Returns whether any series was logged."""
     import numpy as np
@@ -1142,11 +1147,14 @@ def _log_probe(rr: Any, probe: Mapping[str, Any], hist_paths: dict, map_paths: d
         if logits:
             rr.log(f"/probe/max_logit/{part}", rr.Scalars(max(logits)))
             series = True
-        entropy = [v for v in (_finite(x) for x in att.get("entropy", [])) if v is not None]
-        top = _finite(att.get("max_entropy"))
-        if entropy and top:
-            rr.log(f"/probe/entropy/{part}", rr.Scalars(sum(entropy) / len(entropy) / top))
+        shares = [v for v in (_finite(x) for x in att.get("entropy_share", [])) if v is not None]
+        if shares:
+            rr.log(f"/probe/entropy/{part}", rr.Scalars(sum(shares) / len(shares)))
             series = True
+        if att.get("invalid_rows"):
+            # NaN or Inf attention scores: a numerical failure, kept apart from entropy.
+            rr.log(f"/probe/invalid_rows/{part}", rr.Scalars(float(att["invalid_rows"])))
+            invalid_series[0] = True
         if att.get("map"):
             entity = f"/probe/attention/{part}"
             rr.log(entity, rr.Tensor(np.asarray(att["map"], dtype=np.float32), dim_names=("query", "key")))

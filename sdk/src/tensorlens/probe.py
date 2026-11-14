@@ -93,9 +93,21 @@ def _attention_stats(
     scale: float | None,
     map_size: int,
 ) -> dict[str, Any]:
-    """Per-head largest logit and mean entropy over the batch, and sample 0's map
-    averaged over heads and pooled to at most `map_size` × `map_size`: keys summed and
-    query rows averaged within each bin, so every row of the map sums to 1."""
+    """Attention statistics per head over the batch, and sample 0's map.
+
+    Rows are query positions of one head and batch item. Three kinds are kept apart, so
+    padding and numerical failures do not look like concentrated attention:
+
+    - `masked_rows`: every key masked out, as for padded queries. Left out of the rest.
+    - `invalid_rows`: a NaN or +Inf score among the visible keys. Left out of the rest.
+    - informative rows: at least two visible keys. Only these count in `entropy` (nats)
+      and `entropy_share`, each row's entropy divided by the log of its own visible key
+      count, so causal masking does not lower it: uniform attention is 1.0 in every row.
+
+    `max_logit` is the largest finite visible pre-softmax score per head. The map averages
+    sample 0's valid rows over heads, sums keys and averages query rows within each bin of
+    at most `map_size` × `map_size`; rows of the map with no valid query are zero.
+    """
     q = query.detach().float()
     k = key.detach().float()
     if q.ndim == 3:
@@ -110,13 +122,18 @@ def _attention_stats(
         k = k.repeat_interleave(heads // k.shape[-3], dim=-3)
     scale = scale if scale is not None else 1 / math.sqrt(dim)
 
-    max_logit = torch.full((heads,), -math.inf, device=q.device)
-    entropy = torch.zeros(heads, device=q.device)
+    dev = q.device
+    max_logit = torch.full((heads,), -math.inf, device=dev)
+    entropy = torch.zeros(heads, device=dev)
+    share = torch.zeros(heads, device=dev)
+    informative = torch.zeros(heads, device=dev)
+    masked_rows = torch.zeros((), dtype=torch.int64, device=dev)
+    invalid_rows = torch.zeros((), dtype=torch.int64, device=dev)
     out_rows, out_cols = min(rows, map_size), min(keys, map_size)
-    attn_map = torch.zeros(out_rows, out_cols, device=q.device)
-    row_hits = torch.zeros(out_rows, device=q.device)
+    attn_map = torch.zeros(out_rows, out_cols, device=dev)
+    row_hits = torch.zeros(out_rows, device=dev)
     step = max(1, CHUNK_ELEMENTS // max(1, batch * heads * keys))
-    cols = torch.arange(keys, device=q.device)
+    cols = torch.arange(keys, device=dev)
     col_bins = cols * out_cols // keys
     for r0 in range(0, rows, step):
         r1 = min(rows, r0 + step)
@@ -124,30 +141,50 @@ def _attention_stats(
         valid = torch.ones_like(scores, dtype=torch.bool)
         if is_causal:
             # SDPA's is_causal aligns the mask to the top left: query i sees keys 0..i.
-            valid &= cols <= torch.arange(r0, r1, device=q.device)[:, None]
+            valid &= cols <= torch.arange(r0, r1, device=dev)[:, None]
         if attn_mask is not None:
             mask = attn_mask[..., r0:r1, :] if attn_mask.shape[-2] == rows else attn_mask
             if mask.dtype == torch.bool:
                 valid &= mask
             else:
                 scores = scores + mask.float()
-        scores = scores.masked_fill(~valid, -math.inf)
+        bad = valid & (scores.isnan() | (scores == math.inf))
+        visible = valid & ~bad & (scores > -math.inf)
+        n_visible = visible.sum(-1)  # [batch, heads, chunk rows]
+        row_invalid = bad.any(-1)
+        row_masked = (n_visible == 0) & ~row_invalid
+        row_ok = ~row_invalid & ~row_masked
+        invalid_rows += row_invalid.sum()
+        masked_rows += row_masked.sum()
+
+        scores = scores.masked_fill(~visible, -math.inf)
         max_logit = torch.maximum(max_logit, scores.amax(dim=(0, 2, 3)))
-        probs = torch.softmax(scores, dim=-1).nan_to_num(0.0)  # fully masked rows give 0
+        probs = torch.softmax(scores, dim=-1).nan_to_num(0.0) * row_ok.unsqueeze(-1)
         ent = -(probs * torch.log(probs.clamp_min(1e-30))).sum(-1)
-        entropy += ent.sum(dim=(0, 2))
-        sample = probs[0].mean(0)  # [chunk rows, keys]
+        rich = row_ok & (n_visible >= 2)
+        entropy += (ent * rich).sum(dim=(0, 2))
+        share += (ent / n_visible.clamp_min(2).float().log() * rich).sum(dim=(0, 2))
+        informative += rich.sum(dim=(0, 2))
+
+        ok0 = row_ok[0].float()  # [heads, chunk rows]
+        heads_ok = ok0.sum(0)
+        sample = (probs[0] * ok0.unsqueeze(-1)).sum(0) / heads_ok.clamp_min(1).unsqueeze(-1)
         # Sum the keys in each column bin, so each pooled row stays a distribution.
         pooled = sample.new_zeros(r1 - r0, out_cols).index_add_(1, col_bins, sample)
-        bins = torch.arange(r0, r1, device=q.device) * out_rows // rows
+        bins = torch.arange(r0, r1, device=dev) * out_rows // rows
         attn_map.index_add_(0, bins, pooled)
-        row_hits.index_add_(0, bins, torch.ones(r1 - r0, device=q.device))
+        row_hits.index_add_(0, bins, (heads_ok > 0).float())
     attn_map /= row_hits.clamp_min(1).unsqueeze(1)
-    entropy /= batch * rows
+    counted = informative.clamp_min(1)
+    none_counted = informative == 0
+    nan = torch.full_like(entropy, math.nan)
     return {
         "max_logit": max_logit.tolist(),
-        "entropy": entropy.tolist(),
-        "max_entropy": math.log(keys),
+        "entropy": torch.where(none_counted, nan, entropy / counted).tolist(),
+        "entropy_share": torch.where(none_counted, nan, share / counted).tolist(),
+        "masked_rows": int(masked_rows),
+        "invalid_rows": int(invalid_rows),
+        "rows": batch * heads * rows,
         "query_len": rows,
         "key_len": keys,
         "map": attn_map.tolist(),

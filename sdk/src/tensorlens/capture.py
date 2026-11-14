@@ -16,6 +16,7 @@ import math
 import numbers
 import queue
 import threading
+import warnings
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
@@ -241,23 +242,25 @@ def _watch_clipping(session: "Session") -> None:
     import torch.nn.utils.clip_grad as clip_module
 
     if not _clip_sessions:
-        _clip_original = nn_utils.clip_grad_norm_
+        if _clip_original is None:
+            _clip_original = nn_utils.clip_grad_norm_
         nn_utils.clip_grad_norm_ = _clip_grad_norm_wrapper  # type: ignore[assignment]
         clip_module.clip_grad_norm_ = _clip_grad_norm_wrapper  # type: ignore[assignment]
     _clip_sessions.append(session)
 
 
 def _unwatch_clipping(session: "Session") -> None:
-    global _clip_original
     import torch.nn.utils as nn_utils
     import torch.nn.utils.clip_grad as clip_module
 
     if session in _clip_sessions:
         _clip_sessions.remove(session)
         if not _clip_sessions and _clip_original is not None:
+            # `_clip_original` stays set: code that kept a reference to the wrapper (for
+            # example `from torch.nn.utils import clip_grad_norm_` while a session was
+            # open) still calls it after the last session closes.
             nn_utils.clip_grad_norm_ = _clip_original  # type: ignore[assignment]
             clip_module.clip_grad_norm_ = _clip_original  # type: ignore[assignment]
-            _clip_original = None
 
 
 class Session:
@@ -682,15 +685,20 @@ class Session:
             torch._foreach_zero_(self._counts_list)
         self._grads_recorded = False
         self._spread_recorded = False
-        self._ring_probe.append(self._probe() if self._cadence_probe() else None)
+        probe_due = self._cadence_probe()
         current = self._next_step if step is None else step
         self._steps.append(current)
+        self._ring_probe.append(None)
         self._ring_lr.append(self._pending_lr)
         self._pending_lr = None
         self._ring_scalars.append(self._pending_scalars)
         self._pending_scalars = {}
         self._next_step = current + 1
         self._steps_committed += 1
+        if probe_due:
+            # The step is complete before the probe runs, so a failing probe loses only
+            # its own result, recorded against the step, and never the step.
+            self._ring_probe[-1] = self._probe()
         if len(self._steps) == self.every:
             self.flush()
 
@@ -703,6 +711,9 @@ class Session:
         devices = sorted({p.device for p in self._params}, key=str) or [self.device]
         try:
             return run_probe(self._model, self._probe_fn, self._probe_state, devices)
+        except Exception as error:  # noqa: BLE001
+            warnings.warn(f"TensorLens probe failed and was skipped: {error!r}", RuntimeWarning, stacklevel=3)
+            return {"error": f"{type(error).__name__}: {error}"}
         finally:
             buffers = [self._act, *self._counts_list]
             torch._foreach_zero_([b for b in buffers if b.numel() > 0])
