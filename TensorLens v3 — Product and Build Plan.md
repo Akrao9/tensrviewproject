@@ -106,7 +106,7 @@ The W&B Python client is MIT-licensed. The W&B server is proprietary, and its fr
 
 This detector checks that weights meant to be identical copies on several GPUs stay identical, and fires on the first step they drift apart.
 
-**Why it is in the plan.** In the BLOOM-176B run, gradient clipping was applied on only one worker in each tensor-parallel group. LayerNorm weights that should have matched drifted apart while the loss curve looked healthy. It took 10 days to notice. A separate study of faulty hardware found the same pattern: parameters on an unhealthy node drift while the loss stays close to normal.
+**Why it is in the plan.** In the BLOOM-176B run, gradient clipping was applied on only one worker in each tensor-parallel group. LayerNorm weights that should have matched drifted apart while the loss curve looked healthy. It was found 13 days into the run, by a test that compared the weights across ranks, and the bug predated the run (TrainCheck's write-ups say ten or fifteen days). A separate study of faulty hardware found the same pattern: parameters on an unhealthy node drift while the loss stays close to normal.
 
 **How it works**
 
@@ -224,7 +224,7 @@ Work ran ahead of the gate order: the SDK, detectors and exporter were built bef
 
 | Steps | State |
 | --- | --- |
-| 1–5, Gate 0 | Partly. The working dogfood run is IBM Granite 3.0 1B-A400M (MoE, 24 routers of 32 experts, top-8) trained on WikiText-2 on one RTX PRO 6000 in Colab. It is a benchmark rather than one of the author's own jobs. The failure list, tracker choice and multi-GPU setup are not written down, and the competitor re-check is not done |
+| 1–5, Gate 0 | Partly. The working dogfood run is IBM Granite 3.0 1B-A400M (MoE, 24 routers of 32 experts, top-8) trained on WikiText-2 on one RTX PRO 6000 in Colab. It is a benchmark rather than one of the author's own jobs. A researched [failure list](TensorLens%20failure%20list.md) of 15 public failure types exists; the author's own failures, tracker choice and multi-GPU setup are not written down, and the competitor re-check is not done (add TrainCheck to it) |
 | 6–9, Gate 1 | Not started |
 | 10, SDK skeleton | Done except the Lightning callback |
 | 11, Tier 0 capture | Done except Arrow Flight; records go to JSON Lines |
