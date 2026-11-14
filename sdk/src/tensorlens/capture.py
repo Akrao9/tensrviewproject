@@ -274,6 +274,7 @@ class Session:
         replica_group: Any = None,
         start_step: int = 0,
         clip_norm: bool = True,
+        replica_every: int = WEIGHT_EVERY,
     ) -> None:
         if hasattr(model, "_orig_mod"):
             raise ValueError("call tensorlens.init(model) before torch.compile(model)")
@@ -296,6 +297,9 @@ class Session:
             raise ValueError("weights must be a bool or a non-negative integer")
         self.weight_every = weight_every
         self.weights = weight_every > 0
+        if isinstance(replica_every, bool) or not isinstance(replica_every, int) or replica_every < 1:
+            raise ValueError("replica_every must be a positive integer")
+        self.replica_every = replica_every
         self.auto_step = auto_step
         self._sink = sink
         self._replica_group = replica_group
@@ -586,7 +590,14 @@ class Session:
 
     @torch.no_grad()
     def _commit(self, step: int | None) -> None:
-        if not self._spread_recorded and self._replica_group is not None and self._params:
+        if (
+            not self._spread_recorded
+            and self._replica_group is not None
+            and self._params
+            and self._cadence(self.replica_every)
+        ):
+            # Like Megatron's check_weight_hash_across_dp_replicas_interval: a float64 pass
+            # over every weight plus an all_gather is too costly for every step.
             self.record_replica_spread(self._replica_group)
         weights_checked = self._grads_recorded and self._should_check_weights() and bool(self._params)
         if weights_checked:
@@ -875,6 +886,7 @@ def init(
     replica_group: Any = None,
     start_step: int = 0,
     clip_norm: bool = True,
+    replica_every: int = WEIGHT_EVERY,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -906,6 +918,9 @@ def init(
             and call `session.step()` yourself when using `torch.amp.GradScaler`.
         replica_group: optional replication `ProcessGroup` (or precomputed spread tensor)
             for cross-GPU parameter drift checks.
+        replica_every: run the cross-GPU drift check every N steps (default 50). Each
+            check reads every weight in float64 and gathers 16 bytes per parameter tensor
+            from each rank. `session.record_replica_spread()` records one on demand.
         start_step: the first step number. Pass the step you resume from, so a resumed
             run does not repeat step numbers already written.
         clip_norm: record the total gradient norm that `torch.nn.utils.clip_grad_norm_`
@@ -938,4 +953,5 @@ def init(
         replica_group=replica_group,
         start_step=start_step,
         clip_norm=clip_norm,
+        replica_every=replica_every,
     )

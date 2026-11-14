@@ -79,6 +79,7 @@ def test_non_finite_and_replica_drift_detectors_from_capture_session(tmp_path, m
         every=1,
         auto_step=False,
         replica_group=group,
+        replica_every=1,
     )
     # Step 0: identical replicas, finite activations and gradients
     model_a(torch.ones(2, 4)).sum().backward()
@@ -531,3 +532,32 @@ def test_activation_detectors_skip_non_finite_values():
     records = _act_records(steps=30)
     records[20]["layers"]["blocks.0"]["abs_max"] = "nan"
     assert tensorlens.detect_activation_anomalies(records) == []
+
+
+def test_replica_drift_check_runs_every_replica_every_steps(monkeypatch):
+    import torch.distributed as dist
+    from torch import nn
+
+    model = nn.Linear(4, 2, bias=False)
+    gathers = []
+    monkeypatch.setattr(dist, "get_world_size", lambda g=None: 2)
+
+    def fake_all_gather(out_list, tensor, group=None):
+        gathers.append(1)
+        for out in out_list:
+            out.copy_(tensor)
+
+    monkeypatch.setattr(dist, "all_gather", fake_all_gather)
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(
+        model, sink=sink, every=2, auto_step=False, replica_group=object(), replica_every=3
+    )
+    for _ in range(6):
+        model(torch.ones(2, 4)).sum().backward()
+        session.step()
+    session.close()
+
+    assert len(gathers) == 2
+    assert [("replica_spread" in r) for r in sink.records] == [False, False, True] * 2
+    with pytest.raises(ValueError, match="replica_every"):
+        tensorlens.init(nn.Linear(2, 2), sink=tensorlens.MemorySink(), replica_every=0)

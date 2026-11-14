@@ -41,7 +41,7 @@ def main() -> None:
         x = torch.ones(2, 4, device=device)
 
         with tensorlens.init(
-            model, sink=sink, auto_step=False, replica_group=dist.group.WORLD
+            model, sink=sink, auto_step=False, replica_group=dist.group.WORLD, replica_every=1
         ) as session:
             for step in range(4):
                 optimizer.zero_grad(set_to_none=True)

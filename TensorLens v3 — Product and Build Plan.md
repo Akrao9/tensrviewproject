@@ -91,7 +91,7 @@ As built on Nov 14, 2026, the capture differs from this table:
 - **Loss** is not captured; the tracker already has it.
 - **Router counts** are accumulated on every step in the router hook, inside the compiled graph, with a compare-and-sum into an int64 buffer rather than `scatter_add_`, and copied every N steps. Entropy, diversity and dead experts are computed on the CPU when records are written. Counts are not summed across data-parallel ranks; each rank writes its own file.
 - **Activation statistics, per-parameter gradient norms and the 50-step float64 weight check** run only in full capture; router-only is the MoE default. Activations are per repeated block by default.
-- **Cross-GPU spread** is computed on every step when `replica_group` is set, not every N steps: a float64 norm and sum over every replicated parameter plus one `all_gather`. The weight check showed a float64 pass over Granite's weights costs about 3.7 ms on the RTX PRO 6000, so this needs the same 50-step cadence before a multi-GPU run.
+- **Cross-GPU spread** runs every 50 steps by default (`replica_every=`), like Megatron's `check_weight_hash_across_dp_replicas_interval`, rather than once per N-step transfer. Until Nov 14, 2026 it ran on every step, a float64 norm and sum over every replicated parameter plus one `all_gather`; a float64 pass over Granite's weights costs about 3.7 ms on the RTX PRO 6000.
 - **Tiers 2 and 3** (histograms, attention maps, replay) are not built.
 
 Attention needs the probe because FlashAttention and SDPA never store the attention map. The probe uses a fixed batch, so it compares cleanly across steps but does not show the live batch; the Tier 3 replay covers that. Sizes are estimates.

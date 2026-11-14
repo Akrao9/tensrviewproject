@@ -174,6 +174,8 @@ python -m torch.distributed.run --standalone --nproc-per-node=2 examples/replica
 
 Mark this complete when both NCCL ranks report `PASS`. Each rank checks healthy replicas at steps 0 and 2, injected drift at step 1, and a sign flip at step 3.
 
+The check passes `replica_every=1`. In a training job the drift check runs every 50 steps by default (`replica_every=`), as Megatron's `check_weight_hash_across_dp_replicas_interval` does: each check reads every weight in float64 and gathers 16 bytes per parameter tensor from every rank, and a float64 pass over Granite's weights cost about 3.7 ms on the RTX PRO 6000. Until Nov 14, 2026 it ran on every step.
+
 ## Things to know
 
 - **Mixed precision.** `torch.amp.GradScaler` skips `optimizer.step()` when gradients overflow, so the automatic step count misses those steps. Pass `auto_step=False` and call `session.step(lr=...)` once per iteration.
