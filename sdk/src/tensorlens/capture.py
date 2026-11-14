@@ -1137,7 +1137,7 @@ def init(
     weights = defaults["weights"] if weights is None else weights
     run = resolve_run(run_id)
     if sink is None:
-        name = run.run_id or "run"
+        name = run.run_id
         sink = JsonlSink(Path("tensorlens-out") / f"{name}.rank{run.rank}.jsonl")
     return Session(
         model,

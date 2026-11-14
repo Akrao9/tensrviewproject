@@ -69,7 +69,7 @@ routers = {
 
 ## 4. Add TensorLens to the training loop
 
-Call `init` after the model is on its device and before `torch.compile`. Pass your tracker's run ID if TensorLens cannot find it on its own: it looks for `run_id=`, then `MLFLOW_RUN_ID`, then the active MLflow run, then the active W&B run.
+Call `init` after the model is on its device and before `torch.compile`. Pass your tracker's run ID if TensorLens cannot find it on its own: it looks for `run_id=`, then `MLFLOW_RUN_ID`, then the active MLflow run, then the active W&B run. Without any of those it uses the launcher's job ID (torchrun's `TORCHELASTIC_RUN_ID`, or SLURM's job and step IDs), and otherwise generates a unique `run-<UTC time>-<6 hex>` ID, broadcast from rank 0 when `torch.distributed` is initialized so every rank writes under the same name.
 
 ### Plain PyTorch
 

@@ -7,14 +7,16 @@ script has already imported, so it adds no import cost and no dependency.
 from __future__ import annotations
 
 import os
+import secrets
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 
 @dataclass(frozen=True)
 class RunInfo:
     run_id: str | None
-    source: str  # "explicit", "env", "mlflow", "wandb" or "none"
+    source: str  # "explicit", "env", "mlflow", "wandb", "launcher" or "generated"
     rank: int
 
 
@@ -30,7 +32,9 @@ def _rank() -> int:
 
 
 def resolve_run(run_id: str | None = None) -> RunInfo:
-    """Resolve the run ID: explicit, then MLFLOW_RUN_ID, then MLflow, then W&B.
+    """Resolve the run ID: explicit, then MLFLOW_RUN_ID, then MLflow, then W&B, then a
+    launcher's job ID (torchrun, SLURM), and otherwise a generated unique ID, so separate
+    runs never append to the same file.
 
     `mlflow.active_run()` is thread-local and is None when the run was created through
     `MlflowClient` (PyTorch Lightning's `MLFlowLogger` does that, and only on rank 0), so
@@ -53,4 +57,39 @@ def resolve_run(run_id: str | None = None) -> RunInfo:
         # Read the ID once. Never read `wandb.run.step`: it is a round trip to the W&B
         # background process and raises in shared-mode runs.
         return RunInfo(run.id, "wandb", rank)
-    return RunInfo(None, "none", rank)
+    shared = _launcher_run_id()
+    if shared is not None:
+        return RunInfo(shared, "launcher", rank)
+    return RunInfo(_shared_generated_id(), "generated", rank)
+
+
+def _launcher_run_id() -> str | None:
+    """A job ID every rank of the job sees: torchrun's rendezvous ID (a fresh UUID with
+    `--standalone`, "none" unless set otherwise), or SLURM's job and step IDs."""
+    elastic = os.environ.get("TORCHELASTIC_RUN_ID")
+    if elastic and elastic != "none":
+        return f"run-{elastic}"
+    job = os.environ.get("SLURM_JOB_ID")
+    if job:
+        step = os.environ.get("SLURM_STEP_ID")
+        return f"run-slurm{job}" + (f".{step}" if step else "")
+    return None
+
+
+def generate_run_id() -> str:
+    """`run-<UTC time>-<6 hex digits>`, sortable by start time, as W&B generates run IDs
+    when none is given (`wandb/sdk/lib/runid.py`)."""
+    return f"run-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
+
+
+def _shared_generated_id() -> str:
+    # Every rank must use the same ID, or one run's files split under different names.
+    # With torch.distributed initialized, rank 0's ID is broadcast: a collective, so it
+    # needs every rank to call tensorlens.init, which per-rank capture does anyway.
+    run_id = generate_run_id()
+    dist = sys.modules.get("torch.distributed")
+    if dist is not None and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        box = [run_id]
+        dist.broadcast_object_list(box, src=0)
+        run_id = box[0]
+    return run_id

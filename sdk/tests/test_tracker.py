@@ -9,6 +9,8 @@ def clear(monkeypatch):
     monkeypatch.delenv("MLFLOW_RUN_ID", raising=False)
     monkeypatch.delitem(sys.modules, "mlflow", raising=False)
     monkeypatch.delitem(sys.modules, "wandb", raising=False)
+    for name in ("TORCHELASTIC_RUN_ID", "SLURM_JOB_ID", "SLURM_STEP_ID"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_explicit_run_id_wins(monkeypatch):
@@ -19,7 +21,7 @@ def test_explicit_run_id_wins(monkeypatch):
 
 def test_env_then_active_mlflow_run_then_wandb(monkeypatch):
     clear(monkeypatch)
-    assert resolve_run().source == "none"
+    assert resolve_run().source == "generated"
 
     run = types.SimpleNamespace(id="w-1")
     monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(run=run))
@@ -37,7 +39,7 @@ def test_no_active_mlflow_run_falls_through(monkeypatch):
     # What PyTorch Lightning's MLFlowLogger looks like: mlflow imported, no active run.
     clear(monkeypatch)
     monkeypatch.setitem(sys.modules, "mlflow", types.SimpleNamespace(active_run=lambda: None))
-    assert resolve_run().source == "none"
+    assert resolve_run().source == "generated"
 
 
 def test_wandb_step_is_never_read(monkeypatch):
@@ -52,3 +54,43 @@ def test_wandb_step_is_never_read(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(run=Run()))
     assert resolve_run().run_id == "w-2"
+
+
+def test_untracked_runs_get_distinct_ids_and_files(monkeypatch, tmp_path):
+    import re
+
+    from torch import nn
+
+    clear(monkeypatch)
+    first, second = resolve_run(), resolve_run()
+    assert re.fullmatch(r"run-\d{8}-\d{6}-[0-9a-f]{6}", first.run_id)
+    assert first.run_id != second.run_id
+    monkeypatch.chdir(tmp_path)
+    for _ in range(2):
+        tensorlens.init(nn.Linear(2, 2)).close()
+    assert len(list((tmp_path / "tensorlens-out").glob("run-*.rank0.jsonl"))) == 2
+
+
+def test_launcher_job_id_is_shared_by_every_rank(monkeypatch):
+    clear(monkeypatch)
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "none")  # torchrun's default: not a job ID
+    monkeypatch.setenv("SLURM_JOB_ID", "4242")
+    monkeypatch.setenv("SLURM_STEP_ID", "1")
+    assert resolve_run() == tensorlens.RunInfo("run-slurm4242.1", "launcher", 0)
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "5c1e")
+    assert resolve_run().run_id == "run-5c1e"
+
+
+def test_generated_id_is_broadcast_from_rank_zero(monkeypatch):
+    import torch.distributed as dist
+
+    clear(monkeypatch)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: 1)
+
+    def broadcast(box, src=0):
+        box[0] = "run-from-rank-0"
+
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    assert resolve_run() == tensorlens.RunInfo("run-from-rank-0", "generated", 1)

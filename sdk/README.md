@@ -46,7 +46,7 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 | Logged scalars (`session.log`) attached to incidents and plotted in Rerun | Built, tested on CPU and Apple MPS; not run on a GPU |
 | Cross-GPU parameter fingerprints and replica spread (`parameter_fingerprints`, `replica_spread`) | Built, unit-tested on drift and sign-flip cases |
 | Detectors and Rerun exporter (`build_evidence`, `export_rerun`, `python -m tensorlens`) | Built, tested on MoE collapse (top-k aware), starved experts, gradient spikes, weights not updating, repeated steps, NaN/Inf, and replica drift |
-| Run ID from `run_id=`, `MLFLOW_RUN_ID`, the active MLflow run or the active W&B run | Built, tested with stand-in tracker modules |
+| Run ID from `run_id=`, `MLFLOW_RUN_ID`, the active MLflow run or the active W&B run; otherwise torchrun's or SLURM's job ID, or a generated `run-<UTC time>-<6 hex>` broadcast from rank 0, so separate untracked runs never append to the same file | Built, tested with stand-in tracker modules and two Gloo processes |
 | No graph breaks and no recompiles under `torch.compile` | Tested with `eager`, `aot_eager`, and AOTAutograd static-input checks on CPU; on CUDA with Inductor and CUDA graphs on a toy MoE, and with Inductor and CUDA graphs off on Granite |
 
 ## What is not built or not verified
