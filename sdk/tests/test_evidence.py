@@ -131,6 +131,17 @@ def test_imbalance_rule_allows_balanced_two_expert_router_and_preserves_bakeoff(
     assert hit["overloaded"] == [1]
     assert hit["dead"] == [2]
 
+    # Pretrained 32-expert top-8 router (8,192 assignments) with 1 unused expert and
+    # healthy diversity (~0.79) must not fire a false-positive dead-expert collapse.
+    granite_healthy = [560] * 8 + [220] * 12 + [97] * 11 + [0]
+    healthy_ev = tensorlens.build_evidence(
+        [{"run_id": "granite", "step": 1, "moe": {"layer-17": granite_healthy}}]
+    )
+    assert healthy_ev["samples"][0]["diversity"] == pytest.approx(0.79, abs=0.02)
+    assert healthy_ev["samples"][0]["overloaded"] == []
+    assert healthy_ev["samples"][0]["dead"] == []
+    assert tensorlens.first_incident(healthy_ev) is None
+
 
 def test_missing_routing_data_and_mixed_expert_counts():
     records = [

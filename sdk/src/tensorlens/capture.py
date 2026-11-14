@@ -32,6 +32,7 @@ from .tracker import RunInfo, resolve_run
 
 STATS = ("mean", "std", "abs_max", "zero_frac")
 _SEEN = len(STATS)  # last column: 1.0 when the hook ran this step
+_CHUNKS = 512  # single-stage reduction width on GPU; summarized in _commit()
 _LOW_PRECISION = (torch.float16, torch.bfloat16)
 
 LayerFilter = Callable[[str, nn.Module], bool]
@@ -68,25 +69,65 @@ def _first_tensor(output: Any, *, integer: bool) -> torch.Tensor | None:
     return None
 
 
-def _stats_hook(buf: torch.Tensor, row: int) -> Callable[..., None]:
+def _stats_hook(buf: torch.Tensor, stat_idx: torch.Tensor, row: int) -> Callable[..., None]:
     def hook(module: nn.Module, args: Any, output: Any) -> None:
         x = _first_tensor(output, integer=False)
-        if x is None or x.numel() == 0:
+        if x is None:
             return
-        x = x.detach().float()
-        if x.numel() > 1:
-            std, mean = torch.std_mean(x)
+        n = x.numel()
+        if n == 0:
+            return
+        x = x.detach()
+        if n >= _CHUNKS and n % _CHUNKS == 0 and x.is_contiguous():
+            xc = x.view(_CHUNKS, -1).float()
+            var, mean = torch.var_mean(xc, dim=1, correction=0)
+            amax = xc.abs().amax(dim=1)
+            zfrac = (xc == 0).float().mean(dim=1)
         else:
-            mean = x.mean()
-            std = torch.zeros_like(mean)
-        buf[row] = torch.stack(
-            (mean, std, x.abs().amax(), (x == 0).float().mean(), torch.ones_like(mean))
+            xf = x.float()
+            if n > 1:
+                var, mean = torch.var_mean(xf, correction=0)
+            else:
+                mean = xf.reshape(())
+                var = torch.zeros_like(mean)
+            amax = xf.abs().amax()
+            zfrac = (x == 0).float().mean()
+        buf[row] = torch.where(
+            stat_idx == 0,
+            mean,
+            torch.where(
+                stat_idx == 1,
+                var,
+                torch.where(
+                    stat_idx == 2,
+                    amax,
+                    torch.where(stat_idx == 3, zfrac, float(n)),
+                ),
+            ),
         )
 
     return hook
 
 
-def _router_hook(counts: torch.Tensor, spec: Router) -> Callable[..., None]:
+def _summarize_act(act: torch.Tensor, out: torch.Tensor) -> None:
+    if act.numel() == 0:
+        return
+    means = act[:, 0]
+    vars_ = act[:, 1]
+    mean = means.mean(dim=1)
+    pop_var = vars_.mean(dim=1) + (means - mean.unsqueeze(1)).square().mean(dim=1)
+    n = act[:, _SEEN, 0]
+    scale = torch.where(n > 1.0, n / (n - 1.0), torch.zeros_like(n))
+    out[:, 0] = mean
+    out[:, 1] = (pop_var * scale).sqrt()
+    out[:, 2] = act[:, 2].amax(dim=1)
+    out[:, 3] = act[:, 3].mean(dim=1)
+    out[:, _SEEN] = (n > 0.0).float()
+
+
+def _router_hook(
+    counts: torch.Tensor, expert_ids: torch.Tensor, spec: Router
+) -> Callable[..., None]:
     def hook(module: nn.Module, args: Any, output: Any) -> None:
         if spec.indices is not None:
             idx = spec.indices(output)
@@ -102,10 +143,9 @@ def _router_hook(counts: torch.Tensor, spec: Router) -> Callable[..., None]:
                     )
         if idx is None:
             return
-        idx = idx.detach().reshape(-1).to(torch.int64)
         # Fixed output shape: `bincount` would make the shape depend on the data.
         # Accumulate across gradient-accumulation microbatches; `_commit` zeroes `counts`.
-        counts.scatter_add_(0, idx, torch.ones_like(idx))
+        counts.add_((idx.detach().reshape(-1, 1) == expert_ids).sum(0))
 
     return hook
 
@@ -188,14 +228,19 @@ class Session:
 
         n_layers, n_params = len(self.layer_names), len(self._params)
         f32 = {"dtype": torch.float32, "device": self.device}
-        self._act = torch.zeros(n_layers, _SEEN + 1, **f32)
+        self._act = torch.zeros(n_layers, _SEEN + 1, _CHUNKS, **f32)
+        self._stat_idx = torch.arange(_SEEN + 1, dtype=torch.int64, device=self.device)[:, None]
         self._grad = torch.zeros(n_params, 2, **f32)  # norm, seen
         self._spread: torch.Tensor | None = None
         self._counts = {
             name: torch.zeros(spec.n_experts, dtype=torch.int64, device=self.device)
             for name, spec in self._routers.items()
         }
-        self._ring_act = torch.zeros(every, *self._act.shape, **f32)
+        self._expert_ids = {
+            name: torch.arange(spec.n_experts, dtype=torch.int64, device=self.device)
+            for name, spec in self._routers.items()
+        }
+        self._ring_act = torch.zeros(every, n_layers, _SEEN + 1, **f32)
         self._ring_grad = torch.zeros(every, *self._grad.shape, **f32)
         self._ring_spread: torch.Tensor | None = None
         self._ring_spread_seen: list[bool] = []
@@ -208,15 +253,17 @@ class Session:
         self._counts_list = list(self._counts.values())
         self._ring_counts_list = list(self._ring_counts.values())
         self._grad_idx_cache: dict[tuple[int, ...], torch.Tensor] = {}
-        for buf in (self._act, *self._counts_list):
+        for buf in (self._act, self._stat_idx, *self._counts_list, *self._expert_ids.values()):
             _mark_static(buf)
 
         self._handles = [
-            module.register_forward_hook(_stats_hook(self._act, row))
+            module.register_forward_hook(_stats_hook(self._act, self._stat_idx, row))
             for row, (_, module) in enumerate(selected)
         ]
         self._handles += [
-            modules[name].register_forward_hook(_router_hook(self._counts[name], spec))
+            modules[name].register_forward_hook(
+                _router_hook(self._counts[name], self._expert_ids[name], spec)
+            )
             for name, spec in self._routers.items()
         ]
 
@@ -349,7 +396,8 @@ class Session:
         if not self._spread_recorded and self._replica_group is not None and self._params:
             self.record_replica_spread(self._replica_group)
         row = len(self._steps)
-        torch._foreach_copy_((self._ring_act[row], self._ring_grad[row]), (self._act, self._grad))
+        _summarize_act(self._act, self._ring_act[row])
+        self._ring_grad[row].copy_(self._grad)
         torch._foreach_zero_((self._act, self._grad))
         if self._spread_recorded and self._spread is not None and self._ring_spread is not None:
             self._ring_spread[row].copy_(self._spread)

@@ -19,22 +19,24 @@ def train(model, session_steps, opt=None, batch=16, dim=8):
 
 def test_layer_statistics_match_a_direct_calculation():
     torch.manual_seed(0)
-    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 512))
     sink = tensorlens.MemorySink()
     session = tensorlens.init(model, sink=sink, every=1, auto_step=False)
     x = torch.randn(5, 4)
-    expected = model[0](x).detach()
+    expected0 = model[0](x).detach()
+    expected2 = model(x).detach()
     model(x).sum().backward()
     session.step()
     session.close()
 
     (record,) = sink.records
     assert list(record["layers"]) == ["0", "2"]  # leaf modules with parameters
-    stats = record["layers"]["0"]
-    assert stats["mean"] == pytest.approx(expected.mean().item(), rel=1e-6)
-    assert stats["std"] == pytest.approx(expected.std().item(), rel=1e-6)
-    assert stats["abs_max"] == pytest.approx(expected.abs().max().item(), rel=1e-6)
-    assert stats["zero_frac"] == 0.0
+    for name, expected in (("0", expected0), ("2", expected2)):
+        stats = record["layers"][name]
+        assert stats["mean"] == pytest.approx(expected.mean().item(), rel=1e-6)
+        assert stats["std"] == pytest.approx(expected.std().item(), rel=1e-6)
+        assert stats["abs_max"] == pytest.approx(expected.abs().max().item(), rel=1e-6)
+        assert stats["zero_frac"] == pytest.approx((expected == 0).float().mean().item(), rel=1e-6)
 
 
 def test_gradient_norms_match_and_total_is_their_root_sum_square():

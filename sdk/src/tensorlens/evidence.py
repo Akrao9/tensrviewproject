@@ -46,13 +46,21 @@ def effective_overload_threshold(
     return max(base_threshold, 1.5 * mean_share, mean_share + 3.0 * se_share)
 
 
-def _dead_experts_significant(n_experts: int, routed_tokens: int, overloaded: list[int]) -> bool:
-    if n_experts <= 1 or routed_tokens <= 0:
+def _dead_experts_significant(
+    n_experts: int,
+    routed_tokens: int,
+    overloaded: list[int],
+    dead_count: int = 0,
+    diversity: float = 1.0,
+) -> bool:
+    if n_experts <= 1 or routed_tokens <= 0 or dead_count <= 0:
         return False
     if overloaded:
         return True
     expected_empty = n_experts * ((1.0 - 1.0 / n_experts) ** routed_tokens)
-    return expected_empty < 0.01
+    if expected_empty >= 0.01:
+        return False
+    return (dead_count / n_experts) >= 0.25 or diversity < 0.5
 
 
 def load_records(source: str | Path | Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -170,9 +178,12 @@ def build_evidence(
                 )
                 threshold = effective_overload_threshold(n_experts, tokens, overload_threshold)
                 overloaded = [i for i, share in enumerate(shares, 1) if share > threshold]
+                zero_experts = [i for i, c in enumerate(counts, 1) if c == 0]
                 dead = (
-                    [i for i, c in enumerate(counts, 1) if c == 0]
-                    if _dead_experts_significant(n_experts, tokens, overloaded)
+                    zero_experts
+                    if _dead_experts_significant(
+                        n_experts, tokens, overloaded, len(zero_experts), diversity
+                    )
                     else []
                 )
             sample: dict[str, Any] = {
