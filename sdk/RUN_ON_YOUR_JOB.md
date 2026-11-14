@@ -157,9 +157,20 @@ Tested on CPU, one process, with Transformers 5.23.0 and Accelerate 1.15.0, and 
 
 ### Hugging Face Accelerate, in your own loop
 
-Call `tensorlens.init` before `accelerator.prepare` if Accelerate compiles the model, since `init` refuses a model that is already compiled. With mixed precision, pass `scaler=accelerator.scaler`.
+```python
+from tensorlens.accelerator import watch_accelerator
 
-Clipping depends on the Accelerate version. Up to 1.15.0, `accelerator.clip_grad_norm_` calls `torch.nn.utils.clip_grad_norm_` and is recorded with nothing more to do. The development version (1.16.0.dev0) computes the norm another way and is not recorded; there, pass on the value it returns: `session.record_grad_norm(accelerator.clip_grad_norm_(model.parameters(), max_norm))`. Do not do that on 1.15.0, or the norm is counted twice.
+session = tensorlens.init(model, scaler=accelerator.scaler)  # before accelerator.prepare if it compiles the model
+watch_accelerator(session)
+```
+
+- **Clipping.** The norm `accelerator.clip_grad_norm_` returns, before clipping, is recorded as `clip_grad_norm`. Without `watch_accelerator` this depends on the Accelerate version: up to 1.15.0 it is recorded anyway, and the development version (1.16.0.dev0) clips another way and is not.
+- **Loss.** The loss passed to `accelerator.backward` is logged as `train/loss` for each optimizer step, as the mean over gradient-accumulation microbatches. `loss_name=None` turns it off; do that if two models train through Accelerate in one process, since every loss passed to `backward` counts.
+- **Mixed precision.** Pass `scaler=accelerator.scaler` to `init`; it is `None` when there is no scaler, which is fine.
+- **`init` refuses a model that is already compiled**, so call it before `accelerator.prepare` if Accelerate compiles the model.
+- Watching stops when the session closes. It wraps two `Accelerator` methods for the whole process in the meantime.
+
+Tested on CPU, one process, with Accelerate 1.15.0 and 1.16.0.dev0, with gradient accumulation and a learning-rate scheduler. Not run: mixed precision, several ranks, a GPU.
 
 ### DeepSpeed
 
