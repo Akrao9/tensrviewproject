@@ -322,6 +322,52 @@ def _spiking_parameters(
     return found[:10]
 
 
+def _weight_kind(name: str) -> str:
+    lowered = name.lower()
+    if "embed" in lowered or lowered.endswith(("wte.weight", "wpe.weight")):
+        return "embedding"
+    if "norm" in lowered or ".ln" in lowered or lowered.startswith("ln"):
+        return "norm"
+    if lowered.endswith(".bias") or lowered == "bias":
+        return "bias"
+    return "matrix"
+
+
+def weight_norm_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Each kind of parameter's float64 norm now, relative to its first recorded norm.
+
+    Numbers only, with no threshold and no incident: steady growth, and shrinkage under
+    weight decay, are normal in a healthy run, and a cutoff for "too much" needs real
+    failing runs to set (OLMo 2's embedding shrinkage is the case to look for). Parameters
+    are grouped by name into embeddings, norms, biases and matrices. Returns None with
+    fewer than two weight checks.
+    """
+    checked = [r for r in sorted(records, key=lambda r: r["step"]) if r.get("weight_norms")]
+    if len(checked) < 2:
+        return None
+    first, last = checked[0], checked[-1]
+    kinds: dict[str, list[tuple[str, float]]] = {}
+    for name, norm in last["weight_norms"].items():
+        base, now = _finite(first["weight_norms"].get(name)), _finite(norm)
+        if base is None or now is None or base <= 0:
+            continue
+        kinds.setdefault(_weight_kind(name), []).append((name, now / base))
+    if not kinds:
+        return None
+    summary: dict[str, Any] = {}
+    for kind, ratios in sorted(kinds.items()):
+        values = sorted(v for _, v in ratios)
+        lowest = min(ratios, key=lambda item: item[1])
+        highest = max(ratios, key=lambda item: item[1])
+        summary[kind] = {
+            "parameters": len(ratios),
+            "median_ratio": values[len(values) // 2],
+            "lowest": {"name": lowest[0], "ratio": lowest[1]},
+            "highest": {"name": highest[0], "ratio": highest[1]},
+        }
+    return {"baseline_step": int(first["step"]), "latest_step": int(last["step"]), "kinds": summary}
+
+
 def _optimizer_evidence(ownership: Mapping[str, Any] | None, stalled: list[str]) -> dict[str, Any]:
     if not ownership:
         return {"state": "unknown", "reason": "not recorded by this capture"}
@@ -1040,6 +1086,7 @@ def build_evidence(
                 incident["scalars"] = context
 
     run_id = records[0].get("run_id") if records else None
+    trends = weight_norm_trends(records)
     return {
         "schema_version": 1,
         "run_id": run_id,
@@ -1053,6 +1100,7 @@ def build_evidence(
         "incidents": incidents,
         "samples": samples,
         **({"not_checked": not_checked} if not_checked else {}),
+        **({"weight_trends": trends} if trends else {}),
     }
 
 

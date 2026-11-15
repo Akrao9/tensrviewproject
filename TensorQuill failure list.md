@@ -134,7 +134,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Per-parameter weight norms, which the optimizer hooks already have access to.
 
-**TensorQuill today.** Recorded: weight norms per parameter after each recorded step, and the total in the Rerun recording. No detector for slow norm drift yet.
+**TensorQuill today.** Recorded: weight norms per parameter after each recorded step, and the total in the Rerun recording. Since Nov 15, 2026 `build_evidence` also writes `weight_trends`: for embeddings, norms, biases and matrices (grouped by parameter name), the median ratio of the latest float64 norm to the first recorded one and the lowest and highest parameters. Numbers only, no incident and no cutoff: steady growth and decay-driven shrinkage are normal in a healthy run, and "too much" needs real failing traces (OLMo 2's embedding shrinkage is the case to look for) to set. An incident waits for Gate 0 data.
 
 ### 13. Silent compiler or framework bugs
 

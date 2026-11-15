@@ -857,3 +857,23 @@ def test_a_resume_without_a_recorded_learning_rate_is_listed_as_not_checked():
     # A restart of the numbering is left to repeated_steps.
     restart = _lr(1, range(30), lambda s: 1e-3) + _lr(2, range(5), lambda s: 5e-4)
     assert tensorquill.detect_resume_lr_changes(restart) is None
+
+
+def test_weight_norm_trends_are_numbers_by_kind_and_never_an_incident():
+    def rec(step, scale):
+        return {"run_id": "w", "step": step, "weight_norms": {
+            "embed_tokens.weight": 10.0 * scale, "layers.0.input_layernorm.weight": 5.0,
+            "layers.0.q_proj.weight": 20.0, "layers.1.q_proj.weight": 40.0 * (2 - scale),
+            "layers.0.q_proj.bias": 1.0}}
+    records = [rec(49, 1.0), rec(99, 1.0), rec(149, 0.5)]  # the embedding halves, one matrix grows
+    trends = tensorquill.weight_norm_trends(records)
+    assert (trends["baseline_step"], trends["latest_step"]) == (49, 149)
+    assert set(trends["kinds"]) == {"embedding", "norm", "matrix", "bias"}
+    assert trends["kinds"]["embedding"]["median_ratio"] == pytest.approx(0.5)
+    matrix = trends["kinds"]["matrix"]
+    assert matrix["parameters"] == 2 and matrix["highest"] == {"name": "layers.1.q_proj.weight", "ratio": pytest.approx(1.5)}
+    assert tensorquill.weight_norm_trends(records[:1]) is None
+    evidence = tensorquill.build_evidence(records)
+    assert evidence["weight_trends"] == trends
+    assert evidence["incidents"] == []  # no cutoff is chosen: numbers only
+    assert "weight_trends" not in tensorquill.build_evidence(records[:1])
