@@ -1056,6 +1056,7 @@ def build_evidence(
     watchdog: str | Path | Mapping[str, Any] | None = None,
     flight_recorder: str | Path | None = None,
     flight_recorder_prefix: str | None = None,
+    traincheck: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build viewer-neutral detector evidence from captured step records.
 
@@ -1067,6 +1068,8 @@ def build_evidence(
     them and its first problem becomes `collective_hang` or `collective_desync`. When the
     analyzer is missing (PyTorch before 2.10) or the dumps cannot be read, the check is
     listed under `not_checked` with the reason.
+    `traincheck` is TrainCheck's `violations_summary.json` (or its results directory):
+    the violated invariants become one `traincheck_violation` incident.
 
     `top_k` overrides the experts-per-token recorded as `moe_top_k`, for captures made
     before it was recorded: one value for every router, or a value per router name.
@@ -1185,6 +1188,20 @@ def build_evidence(
         incidents.append(non_finite_hit)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
     incidents.extend(detect_watchdog_incidents(status))
+    last_step = max((int(r["step"]) for r in records), default=0)
+    traincheck_summary: dict[str, Any] | None = None
+    if traincheck is not None:
+        from .invariants import read_traincheck, traincheck_incident
+
+        try:
+            found = read_traincheck(traincheck)
+        except (OSError, ValueError) as error:
+            not_checked.append({"check": "traincheck", "reason": str(error)})
+        else:
+            traincheck_summary = {k: found[k] for k in ("distinct_invariants_violated", "first_violation_step")}
+            hit = traincheck_incident(found, step=last_step)
+            if hit is not None:
+                incidents.append(hit)
     recorder_summary: dict[str, Any] | None = None
     if flight_recorder is not None:
         from .collectives import analyze_flight_recorder, flight_recorder_incident
@@ -1195,7 +1212,7 @@ def build_evidence(
             not_checked.append({"check": "flight_recorder", "reason": str(error)})
         else:
             recorder_summary = {k: analysis[k] for k in ("dumped_ranks", "collectives", "problem_count", "incomplete_dumps")}
-            hit = flight_recorder_incident(analysis, step=max((int(r["step"]) for r in records), default=0))
+            hit = flight_recorder_incident(analysis, step=last_step)
             if hit is not None:
                 incidents.append(hit)
     drift_hit = detect_replica_drift(records, tolerance=drift_tolerance)
@@ -1225,6 +1242,7 @@ def build_evidence(
         **({"not_checked": not_checked} if not_checked else {}),
         **({"weight_trends": trends} if trends else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
+        **({"traincheck": traincheck_summary} if traincheck_summary else {}),
         **({"watchdog": {k: status[k] for k in ("summary", "written_at_ms", "world_size") if k in status}} if status else {}),
     }
 
@@ -1438,6 +1456,19 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             f"Ranks out of step with the job: {'; '.join(parts)} while others reached step"
             f" {incident['newest_step']}. A hung rank, a killed process or a stuck telemetry sender"
             " look the same to the server"
+        )
+    if kind == "traincheck_violation":
+        shown = incident["violations"][:3]
+        names = "; ".join(
+            f"{v['display_name']}" + (f" (steps {v['first_step']}-{v['last_step']})" if v.get("first_step") is not None else "")
+            for v in shown
+        )
+        more = incident["distinct_invariants_violated"] - len(shown)
+        return (
+            f"TrainCheck reports {incident['distinct_invariants_violated']} violated invariant"
+            f"{'s' if incident['distinct_invariants_violated'] != 1 else ''}, the first at its step {incident['step']}: "
+            f"{names}{f'; and {more} more' if more > 0 else ''}. TrainCheck counts its own iterations, which match"
+            " TensorQuill's steps only without gradient accumulation"
         )
     if kind in ("collective_hang", "collective_desync"):
         group = incident["group"]
@@ -1863,6 +1894,12 @@ def main() -> None:
         help="directory of PyTorch Flight Recorder dumps (one pickle per rank): the first stuck or "
         "mismatched collective becomes an incident (PyTorch 2.10 or later)",
     )
+    parser.add_argument(
+        "--traincheck",
+        type=Path,
+        help="TrainCheck's violations_summary.json, or the results directory traincheck-check wrote: "
+        "its violated invariants become one incident",
+    )
     parser.add_argument("--flight-recorder-prefix", help="common start of the dump file names, if PyTorch cannot infer it")
     parser.add_argument(
         "--overload-threshold",
@@ -1898,6 +1935,7 @@ def main() -> None:
             args.input, args.output, interval=args.interval, rank=rank, on_update=report,
             overload_threshold=args.overload_threshold, top_k=args.top_k,
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
+            traincheck=args.traincheck,
         )
         return
 
@@ -1906,6 +1944,7 @@ def main() -> None:
         records, overload_threshold=args.overload_threshold, top_k=args.top_k,
         watchdog=_watchdog_beside(args.input),
         flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
+        traincheck=args.traincheck,
     )
     out_json = write_evidence(evidence, args.output or default_evidence_path(args.input, records))
     print(incident_summary(evidence))
