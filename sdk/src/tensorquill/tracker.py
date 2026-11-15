@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import secrets
 import sys
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -108,8 +109,20 @@ def _shared_generated_id() -> str:
     # needs every rank to call tensorquill.init, which per-rank capture does anyway.
     run_id = generate_run_id()
     dist = sys.modules.get("torch.distributed")
-    if dist is not None and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        box = [run_id]
-        dist.broadcast_object_list(box, src=0)
-        run_id = box[0]
+    if dist is not None and dist.is_available() and dist.is_initialized():
+        if dist.get_world_size() > 1:
+            box = [run_id]
+            dist.broadcast_object_list(box, src=0)
+            run_id = box[0]
+    elif _world_size() > 1:
+        # Several ranks, nothing to share an ID through yet: each rank picks its own, so the
+        # job is written as one run per rank, each missing the others, and nothing says so.
+        warnings.warn(
+            f"tensorquill.init on rank {_rank()} of {_world_size()} found no run ID the ranks share "
+            "(no tracker run, TORCHELASTIC_RUN_ID or SLURM_JOB_ID) and torch.distributed is not "
+            f"initialized, so this rank's run is {run_id!r} and the other ranks' runs have other IDs. "
+            "Pass the same run_id= on every rank, or call tensorquill.init after init_process_group.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
     return run_id

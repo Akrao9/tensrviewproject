@@ -685,7 +685,7 @@ def test_a_resumed_attempt_replaces_the_steps_it_rolled_back():
     assert tensorquill.load_records(records, rank=1) == _steps(1, range(10), rank=1)
     # A resume from a checkpoint is not an incident.
     assert tensorquill.detect_repeated_steps(records) is None
-    assert not [i for i in tensorquill.build_evidence(records)["incidents"] if i["kind"] == "repeated_steps"]
+    assert not [i for i in tensorquill.build_evidence(records, rank=0)["incidents"] if i["kind"] == "repeated_steps"]
     # A third attempt from step 50 rolls back both earlier ones.
     kept = tensorquill.load_records(records + _steps(3, range(50, 60)), rank=0)
     assert [(r["attempt"], r["step"]) for r in kept] == [(1, s) for s in range(50)] + [(3, s) for s in range(50, 60)]
@@ -971,3 +971,34 @@ def test_a_scheduler_milestone_at_the_resume_step_is_not_reported_when_the_earli
     # Small learning rates are compared relatively, not against an absolute floor.
     tiny = lambda s: 1e-9 * (1 + s)
     assert tensorquill.detect_resume_lr_changes(_lr(1, range(30), tiny) + _lr(2, range(30, 40), tiny)) is None
+
+
+def test_build_evidence_reads_one_rank_of_a_run_directory(tmp_path):
+    # Two ranks' steps merged repeat every step number and give incidents that belong to
+    # neither rank, so a directory or a list of records with several ranks needs a rank.
+    pytest.importorskip("pyarrow.parquet")
+    from tensorquill.evidence import watch
+
+    def moe(rank, collapse):
+        out = _steps(1, range(40), rank=rank)
+        for record in out:
+            record["moe"] = {"router": [25] * 8}
+            if collapse and record["step"] >= 20:
+                record["moe"] = {"router": [100, 0, 0, 0, 0, 0, 0, 0]}
+        return out
+
+    records = moe(0, collapse=False) + moe(1, collapse=True)
+    _write_parts(tmp_path, records)
+    healthy = tensorquill.build_evidence(tmp_path, rank=0)
+    broken = tensorquill.build_evidence(tmp_path, rank=1)
+    assert not healthy["incidents"]
+    assert broken["incidents"] and broken["incidents"][0]["step"] >= 20
+    assert tensorquill.build_evidence(records, rank=1)["incidents"] == broken["incidents"]
+    with pytest.raises(ValueError, match=r"ranks \[0, 1\].*pass rank="):
+        tensorquill.build_evidence(tmp_path)
+    with pytest.raises(ValueError, match="pass rank="):
+        tensorquill.build_evidence(records)
+    assert tensorquill.build_evidence(moe(1, collapse=False))["incidents"] == []  # one rank needs no argument
+    with pytest.raises(ValueError, match="pass rank="):  # --watch on a run of several ranks
+        watch(tmp_path, tmp_path / "e.json", polls=1)
+    assert watch(tmp_path, tmp_path / "e.json", rank=1, polls=1) == tmp_path / "e.json"

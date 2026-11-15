@@ -278,7 +278,7 @@ def test_both_ranks_reach_parquet_unchanged_and_the_run_is_finished(clean_run):
     assert [(r["rank"], r["state"], r["stream"], r["last_step"]) for r in status["ranks"]] == [
         (0, "finished", "finished", 119), (1, "finished", "finished", 94)]
     assert status["summary"] == "finished"
-    assert tensorquill.build_evidence(cluster.run_dir)["watchdog"]["summary"] == "finished"
+    assert tensorquill.build_evidence(cluster.run_dir, rank=0)["watchdog"]["summary"] == "finished"
 
 
 def _cli(cluster: Cluster, *args: str) -> tuple[str, dict]:
@@ -344,7 +344,7 @@ def test_a_killed_rank_is_lost_and_named_while_the_other_stays_active(cluster):
         time.sleep(0.25)
     assert _state(later, 0)["last_step"] > before
 
-    evidence = tensorquill.build_evidence(cluster.run_dir)
+    evidence = tensorquill.build_evidence(cluster.run_dir, rank=0)
     assert not [i for i in evidence["incidents"] if i["kind"] == "job_stalled"]
     [incident] = [i for i in evidence["incidents"] if i["kind"] == "rank_silent"]
     assert [r["rank"] for r in incident["ranks"]] == [1] and incident["ranks"][0]["state"] == "lost"
@@ -382,7 +382,7 @@ def test_a_rank_that_never_starts_is_named_by_world_size_while_the_other_runs(cl
     assert later["missing_ranks"] == [missing] and later["summary"] == "degraded"
     assert _state(later, running)["state"] == "active"
 
-    evidence = tensorquill.build_evidence(cluster.run_dir)
+    evidence = tensorquill.build_evidence(cluster.run_dir, rank=running)
     assert not [i for i in evidence["incidents"] if i["kind"] == "job_stalled"]
     [incident] = [i for i in evidence["incidents"] if i["kind"] == "rank_silent"]
     assert incident["missing_ranks"] == [missing] and incident["ranks"] == []
@@ -407,7 +407,7 @@ def test_a_rank_that_starts_after_being_reported_missing_stops_being_missing(clu
     status = cluster.wait_for(lambda s: s["missing_ranks"] == [] and len(s["ranks"]) == 2
                               and all(r["state"] == "active" for r in s["ranks"]))
     assert status["summary"] == "active" and status["world_size"] == 2
-    assert not [i for i in tensorquill.build_evidence(cluster.run_dir)["incidents"] if i["kind"] == "rank_silent"]
+    assert not [i for i in tensorquill.build_evidence(cluster.run_dir, rank=0)["incidents"] if i["kind"] == "rank_silent"]
     first.finish()
     late.finish()
     assert cluster.wait_for(lambda s: s["summary"] == "finished")["missing_ranks"] == []

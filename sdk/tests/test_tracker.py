@@ -94,3 +94,24 @@ def test_generated_id_is_broadcast_from_rank_zero(monkeypatch):
 
     monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
     assert resolve_run() == tensorquill.RunInfo("run-from-rank-0", "generated", 1)
+
+
+def test_ranks_with_no_shared_id_are_warned(monkeypatch, recwarn):
+    import pytest
+
+    clear(monkeypatch)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "none")
+    with pytest.warns(RuntimeWarning, match="rank 1 of 2 found no run ID the ranks share"):
+        run = resolve_run()
+    assert run.source == "generated" and run.rank == 1
+    # An ID the ranks can share, or one passed in, is not a problem.
+    recwarn.clear()
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "5c1e")
+    resolve_run()
+    resolve_run("mine")
+    monkeypatch.delenv("WORLD_SIZE")
+    monkeypatch.delenv("TORCHELASTIC_RUN_ID")
+    resolve_run()  # one process
+    assert not [w for w in recwarn if "run ID the ranks share" in str(w.message)]

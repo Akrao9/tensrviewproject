@@ -1091,6 +1091,7 @@ def detect_replica_drift(
 def build_evidence(
     source: str | Path | Iterable[Mapping[str, Any]],
     *,
+    rank: int | None = None,
     overload_threshold: float = OVERLOAD_THRESHOLD,
     drift_tolerance: float = DRIFT_TOLERANCE,
     starve_window: int = STARVE_WINDOW,
@@ -1102,6 +1103,10 @@ def build_evidence(
     traincheck: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build viewer-neutral detector evidence from captured step records.
+
+    The detectors read one rank's steps. `rank` picks that rank out of a run directory or a
+    list of records; records of several ranks with no `rank` given raise `ValueError`,
+    because merged they repeat step numbers and give incidents that belong to neither rank.
 
     `watchdog` is the server's `watchdog.json` (a path or the parsed document). When
     `source` is a directory of Parquet parts, `watchdog.json` beside the `rank=` folders is
@@ -1117,7 +1122,10 @@ def build_evidence(
     `top_k` overrides the experts-per-token recorded as `moe_top_k`, for captures made
     before it was recorded: one value for every router, or a value per router name.
     """
-    every_attempt = load_records(source, all_attempts=True)
+    every_attempt = load_records(source, rank=rank, all_attempts=True)
+    ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
+    if len(ranks) > 1:
+        raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
     records = resolve_attempts(every_attempt)
     router_sizes = _router_sizes(records)
     routers = list(router_sizes)

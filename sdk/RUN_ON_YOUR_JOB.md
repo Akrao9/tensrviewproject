@@ -69,7 +69,7 @@ routers = {
 
 ## 4. Add TensorQuill to the training loop
 
-Call `init` after the model is on its device and before `torch.compile`. Pass your tracker's run ID if TensorQuill cannot find it on its own: it looks for `run_id=`, then `MLFLOW_RUN_ID`, then the active MLflow run, then the active W&B run. Without any of those it uses the launcher's job ID (torchrun's `TORCHELASTIC_RUN_ID`, or SLURM's job and step IDs), and otherwise generates a unique `run-<UTC time>-<6 hex>` ID, broadcast from rank 0 when `torch.distributed` is initialized so every rank writes under the same name.
+Call `init` after the model is on its device and before `torch.compile`. Pass your tracker's run ID if TensorQuill cannot find it on its own: it looks for `run_id=`, then `MLFLOW_RUN_ID`, then the active MLflow run, then the active W&B run. Without any of those it uses the launcher's job ID (torchrun's `TORCHELASTIC_RUN_ID`, or SLURM's job and step IDs), and otherwise generates a unique `run-<UTC time>-<6 hex>` ID, broadcast from rank 0 when `torch.distributed` is initialized so every rank writes under the same name. If you start several ranks with plain `torchrun` (no `--rdzv-id`, so `TORCHELASTIC_RUN_ID` is `none`) and call `init` before `init_process_group`, nothing is shared yet: each rank generates its own ID, `init` warns, and the job is written as one run per rank. Pass the same `run_id=` on every rank, or call `init` after `init_process_group`.
 
 ### Plain PyTorch
 
@@ -235,7 +235,7 @@ What the summary can report:
 
 Each incident also lists what you logged with `session.log` at its step, next to the median of the previous 50 values, so you can see whether the loss moved.
 
-If you streamed to `tensorquill-server`, point the same command at the run's directory in the store, `python -m tensorquill <store>/runs/<run_id>`; add `--rank <n>` for a rank other than 0. The server's `watchdog.json` in that directory is read too: `job_stalled` or `rank_silent` means ranks stopped sending steps, whatever the cause (a hang, a long checkpoint or evaluation pause, a killed job); raise the server's `--silent-seconds` above your longest pause. Add `--watch` to keep it running while the job trains: it re-reads the input every 2 seconds and replaces the evidence file.
+If you streamed to `tensorquill-server`, point the same command at the run's directory in the store, `python -m tensorquill <store>/runs/<run_id>`; add `--rank <n>` for a rank other than 0. From Python, `build_evidence(<run directory>, rank=n)` does the same; with several ranks in the directory it raises unless you give a rank, because the detectors read one rank's steps. The server's `watchdog.json` in that directory is read too: `job_stalled` or `rank_silent` means ranks stopped sending steps, whatever the cause (a hang, a long checkpoint or evaluation pause, a killed job); raise the server's `--silent-seconds` above your longest pause. Add `--watch` to keep it running while the job trains: it re-reads the input every 2 seconds and replaces the evidence file.
 
 With `endpoint=`, mark your evaluation and checkpoint code so it is not reported as a hang: `with session.phase("eval"): ...` (the Lightning and Hugging Face callbacks do it for you). The server then measures how long those pauses last and `watchdog.json` and the summary recommend a `--silent-seconds` above them; TensorQuill only reports and never blocks or terminates training. The thresholds (silence 300 s, critical 900 s) are uncalibrated starting values.
 

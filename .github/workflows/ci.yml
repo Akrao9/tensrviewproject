@@ -72,6 +72,8 @@ jobs:
           pip install -e ".[dev,lightning,huggingface,rerun,flight]"
       - name: Tests
         run: pytest -ra
+      - name: Gate 1 fixtures through the SDK pipeline
+        run: pytest -ra ../experiments/moe-bakeoff/test_fixtures.py
       - name: Trainer callback acceptance script, toy model
         run: python examples/trainer_check.py --toy --backend aot_eager --steps 150 --seed-step 100 --probe-every 50 --out "$RUNNER_TEMP/trainer-check"
 
@@ -93,7 +95,7 @@ jobs:
           pip install "torch==2.14.*" --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[dev,flight]"
       - name: Sender and end-to-end tests
-        run: pytest -ra tests/test_flight.py tests/test_flight_e2e.py
+        run: pytest -ra tests/test_flight.py tests/test_flight_e2e.py tests/test_two_ranks_e2e.py
 
   gpu:
     # GitHub's free runners have no GPU, so this runs only when started by hand, on a
