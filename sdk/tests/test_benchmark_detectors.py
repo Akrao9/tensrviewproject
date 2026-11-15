@@ -81,4 +81,4 @@ def test_one_memory_scenario_runs_in_a_fresh_process(store):
     path, template, _ = store
     args = bd.parse_args(["--store", str(path)])
     result = bd.child_memory("rank_build", path, args, 100, 1, template["attempt"])
-    assert result["records"] == 100 and result["peak_mb"] > 0, result
+    assert "error" not in result and result["records"] == 100, result

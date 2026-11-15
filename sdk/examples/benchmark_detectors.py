@@ -2,8 +2,8 @@
 
     cd sdk
     pip install -e '.[flight]'
-    python examples/benchmark_detectors.py            # 64 ranks, 10,000 steps: about 40 minutes
-    python examples/benchmark_detectors.py --quick    # 4 ranks, 600 steps: about a minute
+    python examples/benchmark_detectors.py            # 64 ranks, 10,000 steps: about 6 minutes, 3 GB of disk
+    python examples/benchmark_detectors.py --quick    # 4 ranks, 600 steps: about half a minute
 
 The plan (Step 14) ports the detectors to Rust only if the Python worker needs more than
 250 ms per 50-step flush across 64 ranks, or one CPU core in steady state. This script
@@ -393,8 +393,8 @@ def steady_tail(run_dir: Path, rank: int, flush_low: int):
     """A `_Tail` as a long-running `--watch` has it just before the flush that starts at step
     `flush_low`: every part read, the rank's records in memory, the flush's parts new.
 
-    A cold poll would read all 64 ranks' parts into memory before dropping 63 of them, which
-    does not fit (see the memory result), so the state is set directly."""
+    The state is set directly, so that the update timed from here is the steady-state one
+    and not a cold start from step 0 (which also reads the whole run)."""
     from tensorquill import evidence
 
     tail = evidence._Tail(run_dir, rank)
@@ -530,7 +530,7 @@ def measure_updates(
     for size in sizes:
         view = make_view(store, range(ranks), size, scratch / f"b{size}", attempt)
         started = time.perf_counter()
-        evidence._parquet_parts(view)
+        listed = len(evidence._parquet_parts(view, 0))
         listing = time.perf_counter() - started
         rows = [
             watch_update(view, 0, size - FLUSH_STEPS, scratch / f"b{size}.evidence.json") for _ in range(runs)
@@ -538,6 +538,7 @@ def measure_updates(
         out[size] = {
             "rows": rows,
             "listing": listing,
+            "listed": listed,
             "files": ranks * (size // FLUSH_STEPS),
             **{key: summarize([row[key] for row in rows]) for key in ("poll", "build", "write", "total", "cpu")},
             "bytes": rows[-1]["bytes"],
@@ -703,8 +704,9 @@ def print_report(report: dict[str, Any]) -> None:
         )
         if row["incidents"]:
             out(f"          incidents in the run: {row['incidents']}")
-    out(f"  (listing {report['updates'][max(report['updates'])]['files']} part files: "
-        f"{ms(report['updates'][max(report['updates'])]['listing'])} ms; poll includes it)")
+    last = report["updates"][max(report["updates"])]
+    out(f"  (a poll lists the {last['listed']} part files of rank 0, of {last['files']} in the directory: "
+        f"{ms(last['listing'])} ms of it)")
 
     budget = report.get("budget", {})
     if budget.get("fit"):
