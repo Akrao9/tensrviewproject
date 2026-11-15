@@ -736,3 +736,62 @@ def test_cli_reads_a_directory_of_parts(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["tensorquill", str(run_dir), "--rank", "1", "-o", "one.json"])
     main()
     assert len(json.loads((tmp_path / "one.json").read_text())["samples"]) == 5
+
+
+def _lr(attempt, steps, fn, rank=0):
+    return [{"run_id": "r", "rank": rank, "attempt": attempt, "step": s, "lr": [fn(s)]} for s in steps]
+
+
+def _warmup_then_decay(step):
+    return 1e-3 * min(1.0, (step + 1) / 20) * (0.999 ** max(0, step - 20))
+
+
+def test_a_resume_that_restores_the_scheduler_is_not_reported():
+    # Attempt 1 reached step 59; the job resumed from step 40 with the scheduler restored.
+    records = _lr(1, range(60), _warmup_then_decay) + _lr(2, range(40, 60), _warmup_then_decay)
+    assert tensorquill.detect_resume_lr_changes(records) is None
+    # The same when the earlier attempt stopped before the resume step (extrapolated basis).
+    gap = _lr(1, range(30), _warmup_then_decay) + _lr(2, range(32, 50), _warmup_then_decay)
+    assert tensorquill.detect_resume_lr_changes(gap) is None
+    assert not [i for i in tensorquill.build_evidence(records)["incidents"] if i["kind"] == "resume_lr_change"]
+
+
+def test_warmup_starting_over_after_a_resume_is_reported_as_an_observation():
+    restarted = lambda s: _warmup_then_decay(s - 40)  # the scheduler began again at step 40
+    records = _lr(1, range(60), _warmup_then_decay) + _lr(2, range(40, 60), restarted)
+    hit = tensorquill.detect_resume_lr_changes(records)
+    assert hit["kind"] == "resume_lr_change" and hit["step"] == 40
+    change = hit["changes"][0]
+    assert change["basis"] == "same_step"
+    assert change["resumed_lr"] == [pytest.approx(5e-5)]
+    assert change["expected_lr"] == [pytest.approx(_warmup_then_decay(40))]
+    assert change["equals_first_lr"] is True  # the run began at 5e-5 too
+    summary = tensorquill.incident_summary(tensorquill.build_evidence(records))
+    assert "after the resume at step 40" in summary and "warmup starts over" in summary and "on purpose" in summary
+
+
+def test_a_resume_to_the_first_learning_rate_is_labelled():
+    flat = lambda s: 3e-4
+    records = _lr(1, range(30), lambda s: 3e-4 * 0.5 if s > 10 else 3e-4) + _lr(2, range(25, 35), flat)
+    hit = tensorquill.detect_resume_lr_changes(records)
+    assert hit["changes"][0]["equals_first_lr"] is True
+
+
+def test_a_resume_after_the_earlier_attempt_stopped_uses_its_slope():
+    ramp = lambda s: 1e-4 * (s + 1)
+    ok = _lr(1, range(30), ramp) + _lr(2, range(34, 40), ramp)
+    assert tensorquill.detect_resume_lr_changes(ok) is None
+    jump = _lr(1, range(30), ramp) + _lr(2, range(34, 40), lambda s: 1e-4)
+    hit = tensorquill.detect_resume_lr_changes(jump)
+    assert hit["changes"][0]["basis"] == "extrapolated"
+
+
+def test_a_resume_without_a_recorded_learning_rate_is_listed_as_not_checked():
+    records = _steps(1, range(30)) + _steps(2, range(20, 30))
+    skipped = []
+    assert tensorquill.detect_resume_lr_changes(records, not_checked=skipped) is None
+    assert skipped == [{"check": "resume_lr", "step": 20, "rank": 0, "reason": "no learning rate recorded in the resumed attempt"}]
+    assert tensorquill.build_evidence(records)["not_checked"] == skipped
+    # A restart of the numbering is left to repeated_steps.
+    restart = _lr(1, range(30), lambda s: 1e-3) + _lr(2, range(5), lambda s: 5e-4)
+    assert tensorquill.detect_resume_lr_changes(restart) is None

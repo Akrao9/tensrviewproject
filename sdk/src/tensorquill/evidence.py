@@ -497,6 +497,118 @@ def detect_repeated_steps(records: list[dict[str, Any]]) -> dict[str, Any] | Non
             "steps": repeated[:20]}
 
 
+RESUME_LR_TOLERANCE = 1e-6  # relative; the same scheduler restored gives the same value
+
+
+def _lr_values(record: Mapping[str, Any]) -> list[float] | None:
+    lr = record.get("lr")
+    if not lr:
+        return None
+    values = [_finite(v) for v in lr]
+    return None if any(v is None for v in values) else [float(v) for v in values]  # type: ignore[arg-type]
+
+
+def detect_resume_lr_changes(
+    records: list[dict[str, Any]], *, not_checked: list[dict[str, Any]] | None = None
+) -> dict[str, Any] | None:
+    """Report where a resumed attempt's learning rate differs from the earlier attempt's.
+
+    Pass every attempt (`load_records(..., all_attempts=True)`). At the first step of each
+    later attempt that resumed from a checkpoint (it starts after the run's first step, so
+    a restart of the numbering is left to `repeated_steps`), the learning rate is compared
+    with where the earlier attempt's own trajectory puts it:
+
+    - `same_step`: the earlier attempt also recorded that step, so the two values are read
+      at the same step;
+    - `extrapolated`: it did not, so its last values are continued along their recent
+      slope, with a tolerance that grows with the slope and the gap.
+
+    A difference is an observation, not a verdict: some restarts change the schedule on
+    purpose, and a record cannot show the intent. The incident says whether the resumed
+    value equals the run's first learning rate, as when warmup starts over. A resume that
+    cannot be compared (no learning rate recorded) is added to `not_checked`.
+    """
+    by_rank: dict[Any, dict[int, dict[int, list[float] | None]]] = {}
+    for record in records:
+        attempts = by_rank.setdefault(record.get("rank", 0), {})
+        attempts.setdefault(record.get("attempt", 0), {})[int(record["step"])] = _lr_values(record)
+    changes: list[dict[str, Any]] = []
+    for rank, attempts in sorted(by_rank.items(), key=lambda kv: str(kv[0])):
+        order = sorted(attempts)
+        first_steps = attempts[order[0]]
+        run_start = min(first_steps)
+        first_lr = first_steps[run_start]
+        for previous, current in zip(order, order[1:]):
+            steps = attempts[current]
+            resumed_at = min(steps)
+            if resumed_at <= run_start:
+                continue
+            new = steps[resumed_at]
+            before = {k: v for k, v in attempts[previous].items() if v is not None and k <= resumed_at}
+            if new is None or not before:
+                if not_checked is not None:
+                    not_checked.append(
+                        {
+                            "check": "resume_lr",
+                            "step": resumed_at,
+                            "rank": rank,
+                            "reason": "no learning rate recorded"
+                            + (" in the resumed attempt" if new is None else " in the earlier attempt"),
+                        }
+                    )
+                continue
+            if resumed_at in before:
+                basis, expected, tolerance = "same_step", before[resumed_at], RESUME_LR_TOLERANCE
+            else:
+                recent = sorted(before)[-10:]
+                last = recent[-1]
+                gap = resumed_at - last
+                expected = list(before[last])
+                slope = [0.0] * len(expected)
+                if len(recent) > 1 and len(before[recent[0]]) == len(expected):
+                    span = last - recent[0]
+                    slope = [(a - b) / span for a, b in zip(before[last], before[recent[0]])]
+                    expected = [a + m * gap for a, m in zip(before[last], slope)]
+                basis = "extrapolated"
+                tolerance = max(RESUME_LR_TOLERANCE, 0.5 * max((abs(m) for m in slope), default=0.0) * gap)
+            same_groups = len(new) == len(expected)
+            differs = (not same_groups) or any(
+                abs(n - e) > max(RESUME_LR_TOLERANCE * abs(e), tolerance if basis == "extrapolated" else 0.0)
+                for n, e in zip(new, expected)
+            )
+            if not differs:
+                continue
+            resets = (
+                first_lr is not None
+                and len(first_lr) == len(new)
+                and all(abs(n - f) <= RESUME_LR_TOLERANCE * abs(f) for n, f in zip(new, first_lr))
+                and any(abs(e - f) > RESUME_LR_TOLERANCE * abs(f) for e, f in zip(expected, first_lr))
+            )
+            changes.append(
+                {
+                    "step": resumed_at,
+                    "rank": rank,
+                    "attempt": current,
+                    "previous_attempt": previous,
+                    "basis": basis,
+                    "expected_lr": expected,
+                    "resumed_lr": new,
+                    "first_lr": first_lr,
+                    "equals_first_lr": resets,
+                }
+            )
+    if not changes:
+        return None
+    changes.sort(key=lambda c: c["step"])
+    return {
+        "kind": "resume_lr_change",
+        "step": changes[0]["step"],
+        "resumes": len(changes),
+        "changes": changes[:5],
+        "note": "an observation: some restarts change the schedule on purpose",
+    }
+
+
 def load_records(
     source: str | Path | Iterable[Mapping[str, Any]],
     *,
@@ -890,6 +1002,10 @@ def build_evidence(
         hit = detector(detector_records)
         if hit is not None:
             incidents.append(hit)
+    not_checked: list[dict[str, Any]] = []
+    resume_hit = detect_resume_lr_changes(every_attempt, not_checked=not_checked)
+    if resume_hit is not None:
+        incidents.append(resume_hit)
     incidents.extend(detect_activation_anomalies(records))
     non_finite_hit = detect_non_finite(records)
     if non_finite_hit is not None:
@@ -917,6 +1033,7 @@ def build_evidence(
         "starve_ratio": starve_ratio,
         "incidents": incidents,
         "samples": samples,
+        **({"not_checked": not_checked} if not_checked else {}),
     }
 
 
@@ -1094,6 +1211,19 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         return (
             f"Repeated step numbers from step {incident['step']}: {incident['repeated']} steps"
             " recorded more than once; pass start_step= to tensorquill.init when resuming"
+        )
+    if kind == "resume_lr_change":
+        change = incident["changes"][0]
+        shown = ", ".join(f"{v:.3g}" for v in change["resumed_lr"])
+        wanted = ", ".join(f"{v:.3g}" for v in change["expected_lr"])
+        how = "at the same step" if change["basis"] == "same_step" else "continuing its recent slope"
+        return (
+            f"Learning rate after the resume at step {incident['step']} is {shown}; the earlier attempt"
+            f" had {wanted} {how}"
+            + (", and the resumed value equals the run's first learning rate (as when warmup starts over)"
+               if change["equals_first_lr"] else "")
+            + ". Expected if the restart changed the schedule on purpose; the records cannot show the intent"
+            + (f"; {incident['resumes']} resumes differ" if incident["resumes"] > 1 else "")
         )
     if kind == "loss_scale_trouble":
         why = (

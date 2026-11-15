@@ -84,7 +84,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Learning rate, global step and data position recorded per step, and a check that they continue across a restart.
 
-**TensorQuill today.** Partly. `init(start_step=...)` continues the step numbers on resume, repeated step numbers are reported (a resume from an earlier checkpoint is recognised by its `attempt` and not reported; its records replace the ones it rolled back), and each step's learning rate is recorded. A check that the learning rate continues smoothly across a restart is not built.
+**TensorQuill today.** Partly. `init(start_step=...)` continues the step numbers on resume, repeated step numbers are reported (a resume from an earlier checkpoint is recognised by its `attempt` and not reported; its records replace the ones it rolled back), and each step's learning rate is recorded. Since Nov 15, 2026 `resume_lr_change` compares the learning rate at each resume with the earlier attempt's (at the same step, or along its recent slope) and reports a difference as an observation: a restart that resets warmup on purpose looks the same, and the records cannot show intent. Data position and optimizer-state checks are not built.
 
 ### 7. Attention logit growth and entropy collapse
 
