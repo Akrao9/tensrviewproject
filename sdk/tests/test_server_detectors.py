@@ -394,6 +394,8 @@ def test_resumes_and_restarts_are_compared_with_the_attempts_before_them(tmp_pat
         ("the restart goes on", attempt(8, range(30, 60), warmup(0))),
         ("the restart passes the first resume", attempt(8, range(60, 120), warmup(0))),
         ("a restart from before the run began is not a resume", attempt(9, range(0, 10), lambda step: 3e-4)),
+        # It goes on over steps that already count as repeated: they are not counted again.
+        ("the second restart goes on", attempt(9, range(10, 20), lambda step: 3e-4)),
     ]
     rebuilds, documents = [], {}
     for name, records in stretches:
@@ -404,7 +406,7 @@ def test_resumes_and_restarts_are_compared_with_the_attempts_before_them(tmp_pat
         rebuilds.append(document["rebuilds"])
         documents[name] = document
     # Every new attempt is read against the store; an attempt that goes on is not.
-    assert rebuilds == [1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 9]
+    assert rebuilds == [1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 9, 9]
     by_kind = {i["kind"]: i for i in document["incidents"]}
     assert set(by_kind) == ATTEMPT_KINDS
     assert by_kind["repeated_steps"]["repeated"] == 120 and by_kind["repeated_steps"]["steps"] == list(range(20))
@@ -419,7 +421,7 @@ def test_resumes_and_restarts_are_compared_with_the_attempts_before_them(tmp_pat
 
     assert logged_at_the_resume("the restart goes on") is None
     assert logged_at_the_resume("the restart passes the first resume") == pytest.approx(2.0 - 0.1 + 0.08)
-    assert logged_at_the_resume("a restart from before the run began is not a resume") is None
+    assert logged_at_the_resume("the second restart goes on") is None
     reasons = [n["reason"] for n in document["not_checked"] if n["check"] == "resume_lr"]
     assert len(reasons) == 2 and "no learning rate recorded in the resumed attempt" in reasons
     # The server's own Parquet gives Python the same answer.
