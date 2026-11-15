@@ -13,6 +13,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import re
+import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -462,24 +465,223 @@ def detect_loss_scale_trouble(
 
 
 def detect_repeated_steps(records: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Return step numbers recorded more than once, as after a resume without `start_step`."""
-    seen: dict[tuple[Any, int], int] = {}
+    """Return step numbers recorded more than once, as after a resume without `start_step`.
+
+    Pass every attempt (`load_records(..., all_attempts=True)`). A later attempt that
+    starts after the run's first step resumed from a checkpoint, and the steps it writes
+    again are expected. One that starts at the run's first step again restarted the
+    numbering, and the steps it shares with earlier attempts are reported. So is a step
+    written twice within one attempt.
+    """
+    seen: dict[tuple[Any, int, int], int] = {}
     for record in records:
-        key = (record.get("rank"), int(record["step"]))
+        key = (record.get("rank"), record.get("attempt", 0), int(record["step"]))
         seen[key] = seen.get(key, 0) + 1
-    repeated = sorted(step for (_, step), n in seen.items() if n > 1)
+    repeated_steps = {step for (_, _, step), n in seen.items() if n > 1}
+    for rank in {rank for rank, _, _ in seen}:
+        steps: dict[int, set[int]] = {}
+        for r, attempt, step in seen:
+            if r == rank:
+                steps.setdefault(attempt, set()).add(step)
+        attempts = sorted(steps)
+        start = min(steps[attempts[0]])
+        earlier = set(steps[attempts[0]])
+        for attempt in attempts[1:]:
+            if min(steps[attempt]) <= start:
+                repeated_steps |= steps[attempt] & earlier
+            earlier |= steps[attempt]
+    repeated = sorted(repeated_steps)
     if not repeated:
         return None
     return {"kind": "repeated_steps", "step": repeated[0], "repeated": len(repeated),
             "steps": repeated[:20]}
 
 
-def load_records(source: str | Path | Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Read captured step records from a `.jsonl` file path or an iterable of dicts."""
+def load_records(
+    source: str | Path | Iterable[Mapping[str, Any]],
+    *,
+    rank: int | None = None,
+    all_attempts: bool = False,
+) -> list[dict[str, Any]]:
+    """Read captured step records.
+
+    `source` is a `.jsonl` file from `tensorlens.init`, a directory of the Parquet parts
+    `tensorlens-server` wrote (a run's `runs/<run_id>` directory, or a `rank=<rank>`
+    directory inside it), one `.parquet` part, or an iterable of dicts. Reading Parquet
+    needs `pyarrow` (`pip install "tensorlens[flight]"`) and gives the same dicts as the
+    `.jsonl` file the parts were streamed from.
+
+    `rank` keeps one rank's records. When a job resumed from an earlier checkpoint under
+    the same run ID, the records the later attempt replaced are left out (see
+    `resolve_attempts`); `all_attempts=True` returns everything that was written.
+    """
     if isinstance(source, (str, Path)):
-        lines = Path(source).read_text(encoding="utf-8").splitlines()
-        return [json.loads(line) for line in lines if line.strip()]
-    return [dict(item) for item in source]
+        path = Path(source)
+        if path.is_dir():
+            records = [r for part in _parquet_parts(path) for r in _read_part(part)]
+        elif path.suffix == ".parquet":
+            records = _read_part(path)
+        else:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            records = [json.loads(line) for line in lines if line.strip()]
+    else:
+        records = [dict(item) for item in source]
+    if rank is not None:
+        records = [r for r in records if r.get("rank", 0) == rank]
+    return records if all_attempts else resolve_attempts(records)
+
+
+def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Leave out the records a later attempt replaced.
+
+    Each `tensorlens.init` stamps its records with `attempt`, its start time. A job that
+    resumes from the checkpoint at step S writes step S and onwards again as a new
+    attempt; from then on, what earlier attempts of that rank recorded at step S or later
+    is history that training rolled back, including steps the new attempt has not reached
+    yet. Records without `attempt` (written before it existed) count as attempt 0. The
+    order of the remaining records is unchanged.
+    """
+    first_step: dict[tuple[Any, int], int] = {}
+    for record in records:
+        key = (record.get("rank", 0), record.get("attempt", 0))
+        step = int(record["step"])
+        if key not in first_step or step < first_step[key]:
+            first_step[key] = step
+    if len({rank for rank, _ in first_step}) == len(first_step):
+        return records  # one attempt per rank: nothing was replaced
+    cutoff: dict[tuple[Any, int], float] = {}
+    for rank in {rank for rank, _ in first_step}:
+        cut = math.inf
+        for attempt in sorted((a for r, a in first_step if r == rank), reverse=True):
+            cutoff[(rank, attempt)] = cut
+            cut = min(cut, first_step[(rank, attempt)])
+    return [
+        record for record in records
+        if int(record["step"]) < cutoff[(record.get("rank", 0), record.get("attempt", 0))]
+    ]
+
+
+_PART_NAME = re.compile(r"part-(-?\d+)-(-?\d+)\.parquet$")
+
+
+def _parquet_parts(directory: Path) -> list[Path]:
+    """The server's part files under `directory`, ordered by rank, attempt and first step."""
+
+    def order(path: Path) -> tuple[int, int, int, str]:
+        numbers = {"rank": 0, "attempt": 0}
+        for parent in path.relative_to(directory.parent).parts[:-1]:
+            name, _, value = parent.partition("=")
+            if name in numbers and value.lstrip("-").isdigit():
+                numbers[name] = int(value)
+        match = _PART_NAME.search(path.name)
+        return numbers["rank"], numbers["attempt"], int(match.group(1)) if match else 0, path.name
+
+    return sorted(directory.rglob("part-*.parquet"), key=order)
+
+
+def _read_part(path: Path) -> list[dict[str, Any]]:
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as error:
+        raise ImportError('reading Parquet parts needs pyarrow: pip install "tensorlens[flight]"') from error
+    from .flight import row_to_record
+
+    return [row_to_record(row) for row in pq.read_table(path).to_pylist()]
+
+
+def write_evidence(evidence: Mapping[str, Any], path: str | Path) -> Path:
+    """Write `evidence` as JSON through a temporary file and a rename, so a reader polling
+    the file never sees half of it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(evidence, separators=(",", ":")) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+class _Tail:
+    """Reads what is new in a `.jsonl` file or a directory of Parquet parts."""
+
+    def __init__(self, source: Path, rank: int | None) -> None:
+        self.source = source
+        self.rank = rank
+        self.records: list[dict[str, Any]] = []
+        self._offset = 0
+        self._seen: set[Path] = set()
+
+    def poll(self) -> bool:
+        """Add newly written records; return whether there were any."""
+        new: list[dict[str, Any]] = []
+        if self.source.is_dir():
+            for part in _parquet_parts(self.source):
+                if part not in self._seen:  # a part is written once and never changed
+                    new.extend(_read_part(part))
+                    self._seen.add(part)
+        elif self.source.exists():
+            with self.source.open("rb") as file:
+                file.seek(self._offset)
+                data = file.read()
+            end = data.rfind(b"\n") + 1  # a last line with no newline is still being written
+            for line in data[:end].splitlines():
+                if line.strip():
+                    try:
+                        new.append(json.loads(line))
+                    except ValueError:
+                        pass  # a line torn by a killed process
+            self._offset += end
+        if self.rank is not None:
+            new = [r for r in new if r.get("rank", 0) == self.rank]
+        self.records.extend(new)
+        return bool(new)
+
+
+def watch(
+    source: str | Path,
+    output: str | Path | None = None,
+    *,
+    interval: float = 2.0,
+    rank: int | None = None,
+    polls: int | None = None,
+    on_update: Any = None,
+    **build_options: Any,
+) -> Path | None:
+    """Rebuild the evidence whenever `source` grows, until interrupted.
+
+    `source` is a `.jsonl` file a job is writing, or a directory `tensorlens-server` is
+    writing Parquet parts into. Every `interval` seconds the new records are read and,
+    if there were any, the detectors run over the whole run and the evidence file is
+    replaced by rename. `polls` stops after that many looks, for scripts and tests;
+    `on_update(evidence, path)` is called after each write. Returns the evidence path,
+    or None if nothing was ever written.
+    """
+    source = Path(source)
+    tail = _Tail(source, rank)
+    written: Path | None = None
+    done = 0
+    try:
+        while polls is None or done < polls:
+            if done:
+                time.sleep(interval)
+            done += 1
+            if not tail.poll():
+                continue
+            evidence = build_evidence(tail.records, **build_options)
+            written = write_evidence(evidence, output or default_evidence_path(source, tail.records))
+            if on_update is not None:
+                on_update(evidence, written)
+    except KeyboardInterrupt:
+        pass
+    return written
+
+
+def default_evidence_path(source: Path, records: list[dict[str, Any]]) -> Path:
+    """`<file>.evidence.json` next to a `.jsonl` file; `<run_id>.evidence.json` in the
+    current directory for a directory of Parquet parts."""
+    if source.is_dir():
+        run_id = str(records[0]["run_id"]) if records and records[0].get("run_id") else source.name
+        return Path(f"{run_id}.evidence.json")
+    return source.with_suffix(".evidence.json")
 
 
 def _router_sizes(records: list[dict[str, Any]]) -> dict[str, int]:
@@ -581,7 +783,8 @@ def build_evidence(
     `top_k` overrides the experts-per-token recorded as `moe_top_k`, for captures made
     before it was recorded: one value for every router, or a value per router name.
     """
-    records = load_records(source)
+    every_attempt = load_records(source, all_attempts=True)
+    records = resolve_attempts(every_attempt)
     router_sizes = _router_sizes(records)
     routers = list(router_sizes)
     expert_count = max(router_sizes.values(), default=0)
@@ -679,7 +882,9 @@ def build_evidence(
     if starved_hit is not None:
         incidents.append(starved_hit)
     for detector in (detect_grad_spikes, detect_stalled_weights, detect_repeated_steps, detect_loss_scale_trouble):
-        hit = detector(records)
+        # Only this detector looks at what a later attempt replaced.
+        detector_records = every_attempt if detector is detect_repeated_steps else records
+        hit = detector(detector_records)
         if hit is not None:
             incidents.append(hit)
     incidents.extend(detect_activation_anomalies(records))
@@ -1241,12 +1446,29 @@ def _log_probe(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", type=Path, help="captured .jsonl file from tensorlens.init")
+    parser.add_argument(
+        "input",
+        type=Path,
+        help="captured .jsonl file from tensorlens.init, or a directory of Parquet parts "
+        "written by tensorlens-server (runs/<run_id>, or a rank=<rank> directory in it)",
+    )
     parser.add_argument(
         "-o",
         "--output",
         type=Path,
-        help="path to write viewer-neutral evidence JSON (default: <input>.evidence.json)",
+        help="path to write viewer-neutral evidence JSON (default: <input>.evidence.json, "
+        "or <run_id>.evidence.json for a directory)",
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="keep running: re-read the input when it grows and replace the evidence file",
+    )
+    parser.add_argument("--interval", type=float, default=2.0, help="seconds between looks with --watch")
+    parser.add_argument(
+        "--rank",
+        type=int,
+        help="the rank to read (default: rank 0 for a directory holding several ranks)",
     )
     parser.add_argument("--rerun", type=Path, help="optional path to write a Rerun .rrd file")
     parser.add_argument(
@@ -1262,17 +1484,38 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    records = load_records(args.input)
+    rank = args.rank
+    if rank is None and args.input.is_dir() and len(list(args.input.glob("rank=*"))) > 1:
+        rank = 0  # the detectors read one rank's steps
+        print("several ranks here; reading rank 0 (choose another with --rank)")
+    if args.watch:
+        if args.rerun is not None:
+            parser.error("--rerun cannot be combined with --watch")
+        shown: list[str] = []
+
+        def report(evidence: dict[str, Any], path: Path) -> None:
+            summary = incident_summary(evidence)
+            if [summary] != shown:
+                shown[:] = [summary]
+                print(summary)
+            print(f"updated {path}", flush=True)
+
+        print(f"watching {args.input} every {args.interval:g} s; Ctrl-C to stop", flush=True)
+        watch(
+            args.input, args.output, interval=args.interval, rank=rank, on_update=report,
+            overload_threshold=args.overload_threshold, top_k=args.top_k,
+        )
+        return
+
+    records = load_records(args.input, rank=rank, all_attempts=True)
     evidence = build_evidence(
         records, overload_threshold=args.overload_threshold, top_k=args.top_k
     )
-    out_json = args.output or args.input.with_suffix(".evidence.json")
-    out_json.parent.mkdir(parents=True, exist_ok=True)
-    out_json.write_text(json.dumps(evidence, separators=(",", ":")) + "\n", encoding="utf-8")
+    out_json = write_evidence(evidence, args.output or default_evidence_path(args.input, records))
     print(incident_summary(evidence))
     print(f"wrote evidence -> {out_json}")
     if args.rerun is not None:
-        export_rerun(evidence, args.rerun, records=records)
+        export_rerun(evidence, args.rerun, records=resolve_attempts(records))
         print(f"wrote Rerun recording -> {args.rerun}")
 
 

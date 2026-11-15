@@ -2,7 +2,7 @@
 kill it mid-stream. Usage: `python flight_fake_server.py <store_dir> <port>`.
 
 It follows the server's `DoPut` contract: rows whose step is not above the last one kept for
-`(run_id, rank)` are dropped, and each batch is answered with its `end_byte_offset`. Kept
+`(run_id, rank, attempt)` are dropped, and each batch is answered with its `end_byte_offset`. Kept
 rows go to `<store_dir>/rows.jsonl` and one line per received batch to `batches.jsonl`, so
 the store outlives a restart. While `<store_dir>/full` exists every batch is refused.
 """
@@ -19,17 +19,17 @@ class FakeServer(flight.FlightServerBase):
     def __init__(self, store: Path, port: int) -> None:
         super().__init__(f"grpc://127.0.0.1:{port}")
         self.store = store
-        self.watermark: dict[tuple[str, int], int] = {}
+        self.watermark: dict[tuple[str, int, int], int] = {}
         rows = store / "rows.jsonl"
         if rows.exists():
             for line in rows.read_text().splitlines():
                 row = json.loads(line)
-                key = (row["run_id"], row["rank"])
+                key = (row["run_id"], row["rank"], row.get("attempt", 0))
                 self.watermark[key] = max(row["step"], self.watermark.get(key, -1))
 
     def do_put(self, context, descriptor, reader, writer):
         _, run_id, rank = (part.decode() for part in descriptor.path)
-        key = (run_id, int(rank.removeprefix("rank=")))
+        stream = (run_id, int(rank.removeprefix("rank=")))
         while True:
             try:
                 chunk = reader.read_chunk()
@@ -41,6 +41,7 @@ class FakeServer(flight.FlightServerBase):
             rows = chunk.data.to_pylist()
             kept = []
             for row in rows:
+                key = (*stream, row.get("attempt", 0))
                 if row["step"] > self.watermark.get(key, -1):
                     self.watermark[key] = row["step"]
                     kept.append(row)

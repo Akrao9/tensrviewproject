@@ -113,6 +113,10 @@ async fn open_as(server: &TestServer, run_id: &str, rank: i32, token: Option<&st
 }
 
 async fn open_at(address: &str, run_id: &str, rank: i32, token: Option<&str>) -> Put {
+    open_with(address, run_id, rank, token, schema()).await
+}
+
+async fn open_with(address: &str, run_id: &str, rank: i32, token: Option<&str>, schema: Arc<Schema>) -> Put {
     let channel = Channel::from_shared(address.to_string())
         .unwrap()
         .connect()
@@ -127,7 +131,7 @@ async fn open_at(address: &str, run_id: &str, rank: i32, token: Option<&str>) ->
     let descriptor = FlightDescriptor::new_path(vec!["runs".into(), run_id.into(), format!("rank={rank}")]);
     let opening: Vec<FlightData> = FlightDataEncoderBuilder::new()
         .with_flight_descriptor(Some(descriptor))
-        .with_schema(schema())
+        .with_schema(schema)
         .build(futures::stream::empty())
         .try_collect()
         .await
@@ -278,10 +282,93 @@ async fn resending_steps_writes_no_duplicate_rows() {
     assert_eq!(
         part_names(dir.path()),
         [
-            "runs/run-a/rank=0/part-00000000-00000049.parquet",
-            "runs/run-a/rank=0/part-00000050-00000059.parquet"
+            "runs/run-a/rank=0/attempt=0/part-00000000-00000049.parquet",
+            "runs/run-a/rank=0/attempt=0/part-00000050-00000059.parquet"
         ]
     );
+    assert_eq!(server.ingest.buffered_bytes(), 0);
+}
+
+fn attempt_schema() -> Arc<Schema> {
+    let mut fields: Vec<Field> = schema().fields().iter().map(|field| field.as_ref().clone()).collect();
+    fields.insert(3, Field::new("attempt", DataType::Int64, false));
+    Arc::new(Schema::new(fields))
+}
+
+async fn open_attempts(server: &TestServer) -> Put {
+    open_with(&server.address, RUN, 0, None, attempt_schema()).await
+}
+
+/// Rows as a sender with attempts writes them: `rows` is `(attempt, step)` in file order.
+fn attempt_batch(rows: &[(i64, i64)]) -> RecordBatch {
+    let n = rows.len();
+    RecordBatch::try_new(
+        attempt_schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1; n])),
+            Arc::new(StringArray::from(vec![RUN; n])),
+            Arc::new(Int32Array::from(vec![0; n])),
+            Arc::new(Int64Array::from(rows.iter().map(|row| row.0).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(rows.iter().map(|row| row.1).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(vec![0.5; n])),
+            Arc::new(StringArray::from(vec!["{}"; n])),
+        ],
+    )
+    .unwrap()
+}
+
+fn rows(attempt: i64, steps: std::ops::Range<i64>) -> Vec<(i64, i64)> {
+    steps.map(|step| (attempt, step)).collect()
+}
+
+#[tokio::test]
+async fn a_resumed_attempt_keeps_the_steps_it_writes_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = rows(100, 0..150);
+    let resumed = rows(200, 100..180); // restarted from the checkpoint at step 100
+    let whole_file: Vec<_> = first.iter().chain(&resumed).copied().collect();
+    let expected = [
+        "runs/run-a/rank=0/attempt=100/part-00000000-00000149.parquet",
+        "runs/run-a/rank=0/attempt=200/part-00000100-00000179.parquet",
+    ];
+    {
+        let server = start(dir.path(), manual(), None).await;
+        let mut put = open_attempts(&server).await;
+        put.send(attempt_batch(&first), 1000).await;
+        assert_eq!(put.finish().await, vec![1000]);
+        let mut put = open_attempts(&server).await;
+        put.send(attempt_batch(&resumed), 1600).await;
+        assert_eq!(put.finish().await, vec![1600]);
+        assert_eq!(part_names(dir.path()), expected);
+
+        // The offset file was lost: the sender resends the file from byte 0, both attempts
+        // in one batch. Each row is checked against its own attempt, so nothing is new.
+        let mut put = open_attempts(&server).await;
+        put.send(attempt_batch(&whole_file), 1600).await;
+        assert_eq!(put.ack().await, Ok(1600));
+        put.finish().await;
+    }
+    // A restarted server finds each attempt's watermark in that attempt's parts.
+    let server = start(dir.path(), manual(), None).await;
+    let mut put = open_attempts(&server).await;
+    put.send(attempt_batch(&whole_file), 1600).await;
+    assert_eq!(put.ack().await, Ok(1600));
+    // One batch that ends one attempt and starts the next is written as two parts.
+    let mut tail = rows(200, 180..185);
+    tail.extend(rows(300, 50..60));
+    put.send(attempt_batch(&tail), 1900).await;
+    assert_eq!(put.finish().await, vec![1900]);
+
+    let names = part_names(dir.path());
+    assert_eq!(names[..2], expected);
+    assert_eq!(
+        names[2..],
+        [
+            "runs/run-a/rank=0/attempt=200/part-00000180-00000184.parquet",
+            "runs/run-a/rank=0/attempt=300/part-00000050-00000059.parquet",
+        ]
+    );
+    assert_eq!(stored_steps(dir.path())[&0].len(), 150 + 80 + 5 + 10);
     assert_eq!(server.ingest.buffered_bytes(), 0);
 }
 
@@ -403,7 +490,7 @@ async fn a_part_is_written_every_500_steps_and_acknowledged_only_then() {
     assert_eq!(put.ack().await, Ok(1000));
     assert_eq!(
         part_names(dir.path()),
-        ["runs/run-a/rank=0/part-00000000-00000499.parquet"]
+        ["runs/run-a/rank=0/attempt=0/part-00000000-00000499.parquet"]
     );
 
     let file = std::fs::File::open(&part_files(dir.path())[0]).unwrap();
@@ -427,7 +514,7 @@ async fn a_part_is_written_after_the_flush_interval_while_the_stream_stays_open(
     assert_eq!(put.ack().await, Ok(70));
     assert_eq!(
         part_names(dir.path()),
-        ["runs/run-a/rank=0/part-00000000-00000006.parquet"]
+        ["runs/run-a/rank=0/attempt=0/part-00000000-00000006.parquet"]
     );
     put.send(batch(0, 7..9), 90).await;
     assert_eq!(put.ack().await, Ok(90));
@@ -510,7 +597,7 @@ async fn sigterm_flushes_buffered_rows_before_exit() {
     assert_eq!(stored_steps(dir.path())[&0], (0..50).collect::<Vec<_>>());
     assert_eq!(
         part_names(dir.path()),
-        ["runs/run-a/rank=0/part-00000000-00000049.parquet"]
+        ["runs/run-a/rank=0/attempt=0/part-00000000-00000049.parquet"]
     );
 }
 

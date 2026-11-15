@@ -1,4 +1,4 @@
-//! Parquet part files under `{store_root}/runs/{run_id}/rank={rank}/`.
+//! Parquet part files under `{store_root}/runs/{run_id}/rank={rank}/attempt={attempt}/`.
 
 use std::sync::Arc;
 
@@ -45,8 +45,13 @@ impl Storage {
         Ok(Self::new(Arc::from(store), root))
     }
 
-    fn rank_dir(&self, run_id: &str, rank: i32) -> Path {
-        self.root.clone().join("runs").join(run_id).join(format!("rank={rank}"))
+    fn attempt_dir(&self, run_id: &str, rank: i32, attempt: i64) -> Path {
+        self.root
+            .clone()
+            .join("runs")
+            .join(run_id)
+            .join(format!("rank={rank}"))
+            .join(format!("attempt={attempt}"))
     }
 
     /// Writes `batches` as one immutable part and returns its path. All batches share a schema.
@@ -54,6 +59,7 @@ impl Storage {
         &self,
         run_id: &str,
         rank: i32,
+        attempt: i64,
         batches: &[RecordBatch],
         min_step: i64,
         max_step: i64,
@@ -68,17 +74,17 @@ impl Storage {
         }
         writer.close()?;
         let path = self
-            .rank_dir(run_id, rank)
+            .attempt_dir(run_id, rank, attempt)
             .join(format!("part-{min_step:08}-{max_step:08}.parquet"));
         self.store.put(&path, PutPayload::from(Bytes::from(bytes))).await?;
         Ok(path)
     }
 
-    /// The highest step already stored for this rank, from the `step` column statistics in
+    /// The highest step already stored for this attempt of this rank, from the `step` column statistics in
     /// the Parquet footers. Only the parts whose file name claims the highest last step are
     /// opened; a part with a name this server did not write is always opened.
-    pub async fn max_step(&self, run_id: &str, rank: i32) -> Result<Option<i64>, Error> {
-        let dir = self.rank_dir(run_id, rank);
+    pub async fn max_step(&self, run_id: &str, rank: i32, attempt: i64) -> Result<Option<i64>, Error> {
+        let dir = self.attempt_dir(run_id, rank, attempt);
         let objects: Vec<_> = self.store.list(Some(&dir)).try_collect().await?;
         let mut named: Vec<(Option<i64>, Path)> = objects
             .into_iter()

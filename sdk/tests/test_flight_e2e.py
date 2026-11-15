@@ -62,7 +62,7 @@ class Server:
 
 
 def stored_records(store: Path, run_id: str, rank: int = 0) -> list[dict]:
-    parts = sorted((store / "runs" / run_id / f"rank={rank}").glob("part-*.parquet"))
+    parts = sorted((store / "runs" / run_id / f"rank={rank}").glob("attempt=*/part-*.parquet"))
     return [row_to_record(row) for part in parts for row in pq.read_table(part).to_pylist()]
 
 
@@ -106,6 +106,8 @@ def test_a_capture_file_reaches_parquet_unchanged(tmp_path, toy_moe, monkeypatch
         assert any(r["scalars"]["nan_now_and_then"] == "nan" for r in stored)
         # The detectors read the same thing from either side.
         assert tensorlens.build_evidence(stored) == tensorlens.build_evidence(written)
+        assert tensorlens.load_records(store / "runs" / "e2e") == written
+        assert tensorlens.build_evidence(store / "runs" / "e2e") == tensorlens.build_evidence(path)
     finally:
         assert server.terminate() == 0
 
@@ -203,3 +205,45 @@ def test_forked_dataloader_workers_do_not_disturb_the_sender(tmp_path, monkeypat
     finally:
         server.terminate()
     assert [r["step"] for r in stored_records(store, "forked")] == list(range(48))
+
+
+def test_a_resumed_run_keeps_its_repeated_steps_and_watch_reads_them(tmp_path, toy_moe, monkeypatch):
+    from tensorlens.evidence import watch
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TENSORLENS_TOKEN", raising=False)
+    store = tmp_path / "store"
+    server = Server(store)
+    path = tmp_path / "tensorlens-out" / "resumed.rank0.jsonl"
+    run_dir = store / "runs" / "resumed"
+    try:
+        session = tensorlens.init(toy_moe, run_id="resumed", every=10, routers={"router": 4}, endpoint=server.endpoint)
+        train(toy_moe, session, 120)
+        session.close()
+        live = watch(run_dir, tmp_path / "live.json", interval=0.0, polls=1)
+        assert live is not None and len(tensorlens.load_records(run_dir)) == 120
+
+        # The job crashed and resumes from the checkpoint at step 80, under the same run ID.
+        session = tensorlens.init(
+            toy_moe, run_id="resumed", every=10, routers={"router": 4}, endpoint=server.endpoint, start_step=80
+        )
+        train(toy_moe, session, 60)
+        session.close()
+
+        # The offset file is lost: the whole file, both attempts, is sent again.
+        offset_path(path).unlink()
+        from tensorlens.flight import send_file
+
+        assert send_file(path, server.endpoint, "resumed") is True
+    finally:
+        assert server.terminate() == 0
+    written = tensorlens.load_records(path, all_attempts=True)
+    assert len(written) == 180 and len({r["attempt"] for r in written}) == 2
+    assert len(list(run_dir.glob("rank=0/attempt=*"))) == 2
+    assert tensorlens.load_records(run_dir, all_attempts=True) == written  # none dropped, none twice
+    resolved = tensorlens.load_records(run_dir)
+    assert [r["step"] for r in resolved] == list(range(140))
+    assert {r["attempt"] for r in resolved if r["step"] >= 80} == {max(r["attempt"] for r in written)}
+    evidence = tensorlens.build_evidence(run_dir)
+    assert evidence == tensorlens.build_evidence(path)
+    assert not [i for i in evidence["incidents"] if i["kind"] == "repeated_steps"]

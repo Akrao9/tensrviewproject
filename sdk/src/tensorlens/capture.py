@@ -237,6 +237,16 @@ def _on_stack(frame: Any, start: Any, limit: int = 64) -> bool:
     return False
 
 
+_last_attempt = 0
+
+
+def _next_attempt() -> int:
+    """This moment in Unix milliseconds, and never the same value twice in one process."""
+    global _last_attempt
+    _last_attempt = max(time.time_ns() // 1_000_000, _last_attempt + 1)
+    return _last_attempt
+
+
 def _recomputing() -> bool:
     """True while activation checkpointing recomputes a forward pass during backward.
 
@@ -330,6 +340,10 @@ class Session:
         else:
             raise ValueError("grads must be a bool or a non-negative integer")
         self.run = run
+        # When this session started, in Unix milliseconds. A job that resumes from an
+        # earlier checkpoint under the same run ID writes the same step numbers again;
+        # the attempt tells those records from the ones they replace.
+        self.attempt = _next_attempt()
         self.every = every
         self.grad_every = grad_every
         if isinstance(weights, bool):
@@ -1042,6 +1056,7 @@ class Session:
                 "schema_version": SCHEMA_VERSION,
                 "run_id": self.run.run_id,
                 "rank": self.run.rank,
+                "attempt": self.attempt,
                 "step": step,
                 "ts": stamps[i] if stamps is not None else None,
                 "layers": (

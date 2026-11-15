@@ -112,7 +112,7 @@ _FIELDS: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "moe_stats": ("moe_stats_json", _json),
     "probe": ("probe_json", _json),
 }
-_KEY_COLUMNS = ("schema_version", "run_id", "rank", "step")
+_KEY_COLUMNS = ("schema_version", "run_id", "rank", "attempt", "step")
 # Capture always writes these two, as null when there is no value, so a null column reads
 # back as a present `None`. Every other null column reads back as an absent key.
 _ALWAYS = ("ts", "grad_norm")
@@ -129,6 +129,7 @@ def flight_schema() -> Any:
             pa.field("schema_version", pa.int32(), nullable=False),
             pa.field("run_id", pa.string(), nullable=False),
             pa.field("rank", pa.int32(), nullable=False),
+            pa.field("attempt", pa.int64(), nullable=False),  # 0: written before attempts
             pa.field("step", pa.int64(), nullable=False),
             pa.field("ts", f64),
             pa.field("lr", pa.list_(f64)),
@@ -170,6 +171,7 @@ def record_to_row(record: Mapping[str, Any]) -> dict[str, Any]:
     row["schema_version"] = _int(record.get("schema_version", 0))
     row["run_id"] = _str(record["run_id"])
     row["rank"] = _int(record.get("rank", 0))
+    row["attempt"] = _int(record.get("attempt", 0))
     row["step"] = _int(record["step"])
     if extra:
         row["extra_json"] = _json(extra)
@@ -200,7 +202,10 @@ def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
     record: dict[str, Any] = {}
     if row["schema_version"]:
         record["schema_version"] = row["schema_version"]
-    record.update(run_id=row["run_id"], rank=row["rank"], step=row["step"])
+    record.update(run_id=row["run_id"], rank=row["rank"])
+    if row.get("attempt"):
+        record["attempt"] = row["attempt"]
+    record["step"] = row["step"]
     for key, (column, convert) in _FIELDS.items():
         value = row.get(column)
         if value is None:

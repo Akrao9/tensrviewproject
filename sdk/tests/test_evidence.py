@@ -585,3 +585,153 @@ def test_incidents_carry_logged_scalars_and_export_plots_them(tmp_path, monkeypa
     tensorlens.export_rerun(evidence, tmp_path / "run.rrd", records=records)
     assert "/logged/train/loss" in logged and "/logged/rl/kl" in logged
     assert logged.count("/logged/rl/kl") == len(records) - 1  # the NaN value is skipped
+
+
+def _steps(attempt, steps, rank=0, **more):
+    return [{"run_id": "r", "rank": rank, "attempt": attempt, "step": s, "grad_norm": float(attempt), **more}
+            for s in steps]
+
+
+def test_a_resumed_attempt_replaces_the_steps_it_rolled_back():
+    # Attempt 1 reached step 149 and crashed; the job resumed from the checkpoint at step
+    # 100 and has reached step 119. Steps 120 to 149 of attempt 1 never happened either.
+    records = _steps(1, range(150)) + _steps(2, range(100, 120)) + _steps(1, range(10), rank=1)
+    kept = tensorlens.load_records(records)
+    assert [(r["attempt"], r["step"]) for r in kept if r["rank"] == 0] == (
+        [(1, s) for s in range(100)] + [(2, s) for s in range(100, 120)]
+    )
+    assert [r["step"] for r in kept if r["rank"] == 1] == list(range(10))  # each rank on its own
+    assert len(tensorlens.load_records(records, all_attempts=True)) == 180
+    assert tensorlens.load_records(records, rank=1) == _steps(1, range(10), rank=1)
+    # A resume from a checkpoint is not an incident.
+    assert tensorlens.detect_repeated_steps(records) is None
+    assert not [i for i in tensorlens.build_evidence(records)["incidents"] if i["kind"] == "repeated_steps"]
+    # A third attempt from step 50 rolls back both earlier ones.
+    kept = tensorlens.load_records(records + _steps(3, range(50, 60)), rank=0)
+    assert [(r["attempt"], r["step"]) for r in kept] == [(1, s) for s in range(50)] + [(3, s) for s in range(50, 60)]
+
+
+def test_an_attempt_that_restarts_the_numbering_is_still_reported():
+    records = _steps(1, range(30)) + _steps(2, range(5))  # resumed without start_step
+    hit = tensorlens.detect_repeated_steps(records)
+    assert hit["steps"] == [0, 1, 2, 3, 4]
+    evidence = tensorlens.build_evidence(records)
+    assert "pass start_step=" in tensorlens.incident_summary(evidence)
+    # Records written before attempts existed all count as one attempt, as before.
+    old = [{"run_id": "r", "step": s} for s in (0, 1, 1, 2)]
+    assert tensorlens.load_records(old) == old
+    assert tensorlens.detect_repeated_steps(old)["steps"] == [1]
+
+
+def _write_parts(root, records, rows_per_part=40):
+    """Lay records out as tensorlens-server does: rank=<rank>/attempt=<attempt>/part-*.parquet."""
+    pq = pytest.importorskip("pyarrow.parquet")
+    import pyarrow as pa
+
+    from tensorlens.flight import records_to_batch
+
+    groups = {}
+    for record in records:
+        groups.setdefault((record.get("rank", 0), record.get("attempt", 0)), []).append(record)
+    for (rank, attempt), group in groups.items():
+        directory = root / f"rank={rank}" / f"attempt={attempt}"
+        directory.mkdir(parents=True, exist_ok=True)
+        for start in range(0, len(group), rows_per_part):
+            chunk = group[start : start + rows_per_part]
+            name = f"part-{chunk[0]['step']:08}-{chunk[-1]['step']:08}.parquet"
+            pq.write_table(pa.Table.from_batches([records_to_batch(chunk)]), directory / name)
+
+
+def _capture(toy_moe, path, steps, **kwargs):
+    session = tensorlens.init(
+        toy_moe, run_id="pq", sink=tensorlens.JsonlSink(path), every=10, capture="full",
+        routers={"router": 4}, weights=5, probe=torch.randn(4, 8), probe_every=20, **kwargs,
+    )
+    opt = torch.optim.SGD(toy_moe.parameters(), lr=0.01)
+    for step in range(steps):
+        opt.zero_grad()
+        loss = toy_moe(torch.randn(16, 8)).pow(2).mean()
+        loss.backward()
+        session.log({"train/loss": loss, "sometimes_nan": float("nan") if step % 7 == 0 else 1.0})
+        opt.step()
+    session.close()
+
+
+def test_evidence_from_parquet_parts_equals_evidence_from_the_jsonl_file(toy_moe, tmp_path):
+    path = tmp_path / "pq.rank0.jsonl"
+    _capture(toy_moe, path, 130)
+    _capture(toy_moe, path, 40, start_step=90)  # resumed from the checkpoint at step 90
+    written = tensorlens.load_records(path, all_attempts=True)
+    assert len(written) == 170 and len({r["attempt"] for r in written}) == 2
+    assert any("probe" in r for r in written) and any(r.get("moe_stats") for r in written)
+
+    run_dir = tmp_path / "store" / "runs" / "pq"
+    _write_parts(run_dir, written)
+    for source in (run_dir, run_dir / "rank=0"):
+        assert tensorlens.load_records(source, all_attempts=True) == written
+        assert tensorlens.load_records(source) == tensorlens.load_records(path)
+        assert tensorlens.build_evidence(source) == tensorlens.build_evidence(path)
+    assert [r["step"] for r in tensorlens.load_records(run_dir)] == list(range(130))
+    one_part = sorted(run_dir.rglob("part-*.parquet"))[0]
+    assert tensorlens.load_records(one_part, all_attempts=True) == written[:40]
+
+
+def test_watch_follows_a_growing_jsonl_file_and_new_parquet_parts(tmp_path):
+    import json
+
+    from tensorlens.evidence import watch
+
+    records = _steps(1, range(60), moe={"r": [10, 10]})
+    path = tmp_path / "w.rank0.jsonl"
+    seen = []
+
+    def grow(evidence, out):
+        assert not out.with_name(out.name + ".tmp").exists()  # replaced by rename
+        assert json.loads(out.read_text()) == evidence
+        seen.append(len(evidence["samples"]))
+        with path.open("a") as file:
+            if len(seen) == 1:
+                file.writelines(json.dumps(r) + "\n" for r in records[20:40])
+                file.write(json.dumps(records[40])[:15])  # a line still being written
+            elif len(seen) == 2:
+                file.write(json.dumps(records[40])[15:] + "\n")
+
+    path.write_text("".join(json.dumps(r) + "\n" for r in records[:20]))
+    out = watch(path, interval=0.0, polls=6, on_update=grow)
+    assert out == tmp_path / "w.rank0.evidence.json"
+    assert seen == [20, 40, 41]  # one rebuild per change, none while nothing changed
+    assert json.loads(out.read_text()) == tensorlens.build_evidence(records[:41])
+
+    pytest.importorskip("pyarrow.parquet")
+    run_dir = tmp_path / "store" / "runs" / "r"
+    _write_parts(run_dir, records[:40])
+    seen.clear()
+
+    def more_parts(evidence, out):
+        seen.append(len(evidence["samples"]))
+        if len(seen) == 1:
+            _write_parts(run_dir, records[40:] + _steps(2, range(30, 50), moe={"r": [10, 10]}))
+
+    out = watch(run_dir, tmp_path / "live.evidence.json", interval=0.0, polls=4, on_update=more_parts)
+    assert seen == [40, 50]  # attempt 2 resumed at step 30 and reached 49
+    assert json.loads(out.read_text()) == tensorlens.build_evidence(records + _steps(2, range(30, 50), moe={"r": [10, 10]}))
+    assert watch(tmp_path / "nothing-here.jsonl", interval=0.0, polls=2) is None
+
+
+def test_cli_reads_a_directory_of_parts(tmp_path, monkeypatch, capsys):
+    import json
+    import sys
+
+    from tensorlens.evidence import main
+
+    pytest.importorskip("pyarrow.parquet")
+    run_dir = tmp_path / "runs" / "r"
+    _write_parts(run_dir, _steps(1, range(30), moe={"r": [10, 10]}) + _steps(1, range(5), rank=1, moe={"r": [1, 1]}))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["tensorlens", str(run_dir)])
+    main()
+    assert "reading rank 0" in capsys.readouterr().out
+    assert len(json.loads((tmp_path / "r.evidence.json").read_text())["samples"]) == 30
+    monkeypatch.setattr(sys, "argv", ["tensorlens", str(run_dir), "--rank", "1", "-o", "one.json"])
+    main()
+    assert len(json.loads((tmp_path / "one.json").read_text())["samples"]) == 5

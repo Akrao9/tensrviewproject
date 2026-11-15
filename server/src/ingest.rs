@@ -5,8 +5,11 @@
 //! `{"schema_version": 1, "run_id", "rank", "min_step", "max_step", "end_byte_offset"}`,
 //! where `end_byte_offset` is the position in the sender's local file just after the batch.
 //!
-//! Rows whose step is not above the last step kept for that `(run_id, rank)` are dropped, so
-//! a resend after a lost acknowledgement stores nothing twice. Kept rows wait in memory and
+//! Every row names its `attempt`: the session that wrote it, as that session's start time in
+//! Unix milliseconds. Rows whose step is not above the last step kept for that
+//! `(run_id, rank, attempt)` are dropped, so a resend after a lost acknowledgement stores
+//! nothing twice, while a job that resumed from an earlier checkpoint under the same run ID
+//! is a new attempt and keeps the steps it writes again. Each attempt has its own directory. Kept rows wait in memory and
 //! are written as one Parquet part every 500 steps or 10 seconds, at the end of the stream,
 //! and at shutdown. Only after a part is stored does the server answer with
 //! `PutResult.app_metadata = {"end_byte_offset": N}`: everything up to byte N of the
@@ -75,10 +78,11 @@ type AckSender = mpsc::UnboundedSender<Result<PutResult, Status>>;
 
 #[derive(Default)]
 struct RankBuffer {
-    /// Whether `watermark` has been read from the parts already in the store.
-    loaded: bool,
-    /// The highest step kept so far, buffered or stored.
-    watermark: Option<i64>,
+    /// Per attempt, the highest step kept so far, buffered or stored. An attempt is added
+    /// the first time it is seen, from the parts already in the store.
+    watermarks: HashMap<i64, Option<i64>>,
+    /// The attempt of the buffered batches; a part file holds one attempt.
+    attempt: i64,
     batches: Vec<RecordBatch>,
     rows: usize,
     bytes: usize,
@@ -144,40 +148,8 @@ impl Ingest {
         if self.closed.load(Ordering::SeqCst) {
             return Err(Status::unavailable("the server is shutting down"));
         }
-        if !buffer.loaded {
-            buffer.watermark = self
-                .storage
-                .max_step(&key.0, key.1)
-                .await
-                .map_err(|error| Status::unavailable(format!("cannot read the store: {error}")))?;
-            buffer.loaded = true;
-        }
-        let (batch, first, last) = keep_new_rows(key, batch, buffer.watermark)?;
-        if batch.num_rows() > 0 {
-            if buffer
-                .batches
-                .first()
-                .is_some_and(|held| held.schema() != batch.schema())
-            {
-                self.flush(key, &mut buffer).await?; // a part file has one schema
-            }
-            let bytes = batch_bytes(&batch)?;
-            if !self.reserve(bytes) {
-                // Writing this rank's own buffer may make the room; otherwise refuse.
-                self.flush(key, &mut buffer).await?;
-                if !self.reserve(bytes) {
-                    return Err(Status::resource_exhausted("ingest buffer full"));
-                }
-            }
-            if buffer.batches.is_empty() {
-                buffer.min_step = first;
-                buffer.since = Some(Instant::now());
-            }
-            buffer.max_step = last;
-            buffer.watermark = Some(last);
-            buffer.rows += batch.num_rows();
-            buffer.bytes += bytes;
-            buffer.batches.push(batch);
+        for (attempt, batch) in split_by_attempt(batch)? {
+            self.accept_attempt(key, attempt, batch, &mut buffer).await?;
         }
         buffer.ack = Some(ack.clone());
         buffer.pending_offset = Some(end_byte_offset.max(buffer.pending_offset.unwrap_or(0)));
@@ -187,12 +159,70 @@ impl Ingest {
         Ok(())
     }
 
+    /// Buffers the new rows of a batch whose rows all belong to one attempt.
+    async fn accept_attempt(
+        &self,
+        key: &Key,
+        attempt: i64,
+        batch: RecordBatch,
+        buffer: &mut RankBuffer,
+    ) -> Result<(), Status> {
+        let watermark = match buffer.watermarks.get(&attempt) {
+            Some(watermark) => *watermark,
+            None => {
+                let stored = self
+                    .storage
+                    .max_step(&key.0, key.1, attempt)
+                    .await
+                    .map_err(|error| Status::unavailable(format!("cannot read the store: {error}")))?;
+                buffer.watermarks.insert(attempt, stored);
+                stored
+            }
+        };
+        let (batch, first, last) = keep_new_rows(key, batch, watermark)?;
+        if batch.num_rows() > 0 {
+            if buffer
+                .batches
+                .first()
+                .is_some_and(|held| held.schema() != batch.schema() || buffer.attempt != attempt)
+            {
+                self.flush(key, buffer).await?; // a part file has one schema and one attempt
+            }
+            let bytes = batch_bytes(&batch)?;
+            if !self.reserve(bytes) {
+                // Writing this rank's own buffer may make the room; otherwise refuse.
+                self.flush(key, buffer).await?;
+                if !self.reserve(bytes) {
+                    return Err(Status::resource_exhausted("ingest buffer full"));
+                }
+            }
+            if buffer.batches.is_empty() {
+                buffer.min_step = first;
+                buffer.since = Some(Instant::now());
+            }
+            buffer.attempt = attempt;
+            buffer.max_step = last;
+            buffer.watermarks.insert(attempt, Some(last));
+            buffer.rows += batch.num_rows();
+            buffer.bytes += bytes;
+            buffer.batches.push(batch);
+        }
+        Ok(())
+    }
+
     /// Stores what the buffer holds as one part, then acknowledges the offset it covers.
     /// On a store error the rows stay buffered and a later flush tries again.
     async fn flush(&self, key: &Key, buffer: &mut RankBuffer) -> Result<(), Status> {
         if !buffer.batches.is_empty() {
             self.storage
-                .write_part(&key.0, key.1, &buffer.batches, buffer.min_step, buffer.max_step)
+                .write_part(
+                    &key.0,
+                    key.1,
+                    buffer.attempt,
+                    &buffer.batches,
+                    buffer.min_step,
+                    buffer.max_step,
+                )
                 .await
                 .map_err(|error| Status::unavailable(format!("cannot write to the store: {error}")))?;
             self.used.fetch_sub(buffer.bytes, Ordering::SeqCst);
@@ -335,6 +365,32 @@ fn parse_descriptor(descriptor: &FlightDescriptor) -> Result<Key, Status> {
         ));
     }
     Ok((run_id.clone(), rank))
+}
+
+/// Splits a batch into runs of consecutive rows with the same `attempt`. A batch from a
+/// sender that predates attempts has no such column and is attempt 0.
+fn split_by_attempt(batch: RecordBatch) -> Result<Vec<(i64, RecordBatch)>, Status> {
+    let Some(column) = batch.column_by_name("attempt") else {
+        return Ok(vec![(0, batch)]);
+    };
+    let attempts = column
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .filter(|attempts| attempts.null_count() == 0)
+        .ok_or_else(|| Status::invalid_argument("column `attempt` is null or of the wrong type"))?
+        .values();
+    if attempts.iter().any(|attempt| *attempt < 0) {
+        return Err(Status::invalid_argument("column `attempt` holds a negative value"));
+    }
+    let mut runs = Vec::new();
+    let mut start = 0;
+    for row in 1..=attempts.len() {
+        if row == attempts.len() || attempts[row] != attempts[start] {
+            runs.push((attempts[start], batch.slice(start, row - start)));
+            start = row;
+        }
+    }
+    Ok(runs)
 }
 
 /// Drops rows whose step is not above `watermark` or above the rows before them. Returns
