@@ -9,6 +9,7 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::async_reader::{MetadataFetch, MetadataSuffixFetch};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
@@ -24,6 +25,15 @@ use parquet::file::statistics::Statistics;
 const FOOTER_PREFETCH_BYTES: usize = 64 * 1024;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// One stored part of a rank, as its path says: `attempt=<attempt>/part-<first>-<last>.parquet`.
+#[derive(Clone, Debug)]
+pub struct StoredPart {
+    pub attempt: i64,
+    /// The first step in the part; unknown for a part this server did not name.
+    pub first_step: Option<i64>,
+    pub location: Path,
+}
 
 #[derive(Clone)]
 pub struct Storage {
@@ -61,6 +71,60 @@ impl Storage {
         let bytes = serde_json::to_vec_pretty(document)?;
         self.store.put(&path, PutPayload::from(Bytes::from(bytes))).await?;
         Ok(())
+    }
+
+    /// Replaces `runs/<run_id>/rank=<rank>/incidents.json`, what the server's detectors found.
+    pub async fn write_incidents(&self, run_id: &str, rank: i32, document: &serde_json::Value) -> Result<(), Error> {
+        let path = self.rank_dir(run_id, rank).join("incidents.json");
+        let bytes = serde_json::to_vec_pretty(document)?;
+        self.store.put(&path, PutPayload::from(Bytes::from(bytes))).await?;
+        Ok(())
+    }
+
+    fn rank_dir(&self, run_id: &str, rank: i32) -> Path {
+        self.root.clone().join("runs").join(run_id).join(format!("rank={rank}"))
+    }
+
+    /// Every part stored for a rank, ordered by attempt, then first step, then name: the
+    /// order `load_records` reads them in.
+    pub async fn rank_parts(&self, run_id: &str, rank: i32) -> Result<Vec<StoredPart>, Error> {
+        let dir = self.rank_dir(run_id, rank);
+        let objects: Vec<_> = self.store.list(Some(&dir)).try_collect().await?;
+        let mut parts: Vec<StoredPart> = objects
+            .into_iter()
+            .filter(|object| {
+                object.location.extension() == Some("parquet")
+                    && object.location.filename().is_some_and(|name| name.starts_with("part-"))
+            })
+            .map(|object| StoredPart {
+                attempt: object
+                    .location
+                    .parts()
+                    .find_map(|part| {
+                        part.as_ref()
+                            .strip_prefix("attempt=")
+                            .and_then(|attempt| attempt.parse().ok())
+                    })
+                    .unwrap_or(0),
+                first_step: name_min_step(&object.location),
+                location: object.location,
+            })
+            .collect();
+        parts.sort_by(|a, b| {
+            (a.attempt, a.first_step.unwrap_or(0), a.location.filename()).cmp(&(
+                b.attempt,
+                b.first_step.unwrap_or(0),
+                b.location.filename(),
+            ))
+        });
+        Ok(parts)
+    }
+
+    /// The rows of one part, in order.
+    pub async fn read_part(&self, location: &Path) -> Result<Vec<RecordBatch>, Error> {
+        let bytes = self.store.get(location).await?.bytes().await?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
+        Ok(reader.collect::<Result<Vec<_>, _>>()?)
     }
 
     fn attempt_dir(&self, run_id: &str, rank: i32, attempt: i64) -> Path {
@@ -188,6 +252,12 @@ fn name_max_step(path: &Path) -> Option<i64> {
     let name = path.filename()?.strip_prefix("part-")?.strip_suffix(".parquet")?;
     // Steps are not negative in practice, so the last `-` separates the two numbers.
     name.rsplit_once('-')?.1.parse().ok()
+}
+
+/// `part-00000000-00000049.parquet` -> `0`.
+fn name_min_step(path: &Path) -> Option<i64> {
+    let name = path.filename()?.strip_prefix("part-")?.strip_suffix(".parquet")?;
+    name.rsplit_once('-')?.0.parse().ok()
 }
 
 #[cfg(test)]
