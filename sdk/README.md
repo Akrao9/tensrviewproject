@@ -323,8 +323,31 @@ What these numbers do not show:
 - The store is healthy, and most of the speed comes from skipping a median when a window's lowest or highest value already rules a hit out, which is exact. Before those shortcuts the first six kinds took 136 ms per flush; take that as the cost when every check has to work its median out, as on a run that is failing everywhere.
 - Two thirds of the detector time is decoding the two JSON columns. Typed columns for the per-layer statistics would remove most of it; that is a schema change and is not made.
 - The store has a weight check and a replica check once in 50 steps and no loss scaler. A run that checks weights on every step pays for 219 name comparisons on each; that was not timed.
-- The detectors' state is outside the server's memory quota and is kept until the server exits: about 1 MB per rank at Granite's shape, estimated from the window sizes, not measured. A replay also holds every step number and learning rate of the rank while it runs (under 100 bytes a step, by its layout).
-- A 10,000-step run, a real model's values, a GPU job, S3 or GCS, and the server under 64 live streams are not measured. Rebuilding 64 ranks of 10,000 steps after a restart would take about 5 s by the same slope, during which those ranks' later parts wait. A job that restarts now costs one such rebuild per rank.
+- The detectors' state is outside the server's memory quota and is kept until the server exits: 1.5 to 2 MB per rank at Granite's shape, measured under live streams below. A replay also holds every step number and learning rate of the rank while it runs (under 100 bytes a step, by its layout).
+- A real model's values, a GPU job, and S3 or GCS are not measured.
+
+### Under 64 live streams
+
+[`server/examples/live_streams.rs`](../server/examples/live_streams.rs) opens one `DoPut` stream per rank against a running release server and replays the same store, one 50-step part per message, each rank waiting for its acknowledgement as the Python sender does (`--flush-steps 50`, so every message is one flush; all 64 ranks start together, so their flushes coincide, which is the worst case). Same machine (8 cores), with the client on it too, decoding Parquet and encoding Flight beside the server it times.
+
+| 64 ranks, 2,000 steps each | Detectors on | `--no-detect` |
+| --- | ---: | ---: |
+| As fast as acknowledgements return | 3.4 to 4.0 s, 32,000 to 37,800 steps/s (18 runs) | 2.7 to 2.9 s, 44,700 to 48,000 steps/s (3 runs) |
+| At 10 ms per step: sent to acknowledged, median / p99 / worst | 52 / 99 / 125 ms | 41 / 81 / 92 ms |
+| At 65 ms per step (Granite's): the same | 54 / 100 / 132 ms | not run |
+| Acknowledged to `incidents.json` covering the part, median / p99 / worst | 0.1 / 15 to 25 / 50 ms | |
+| Server CPU for the run (2,560 flushes) | 14.3 s at 10 ms per step, 15.2 s at 65 ms | 10.1 s |
+| Server peak memory | 360 to 415 MB | 260 to 300 MB |
+
+- **Rate.** 64 ranks at Granite's 65 ms per step produce 985 steps a second; the server took 35 times that with the detectors on. At that pace it used 15.2 s of CPU in 130 s, 12% of one core.
+- **The budget.** Every one of the 64 simultaneous flushes was stored and acknowledged within 132 ms, under 250 ms. As CPU it is over: 5.6 ms per rank and flush, 358 ms for a flush of all 64, of which the detectors and the incidents files are about 105 ms (1.6 ms per rank; 69 ms when timed alone on one thread above) and receiving, decoding and storing the rest (253 ms with `--no-detect`). The single-thread table above leaves out receiving and decoding the Flight messages.
+- **Memory.** The detectors add roughly 100 MB for 64 ranks, 1.5 to 2 MB a rank, measured as the difference in peak memory between the two columns; the estimate from window sizes was 1 MB. It is outside the 128 MiB quota.
+- **10,000 steps.** 64 ranks × 10,000 steps sent flat out took 18.3 s (35,000 steps/s, the same rate as at 2,000), acknowledgements 73 / 218 / 1,027 ms, the report 0.1 / 6.6 / 77 ms behind, peak memory 448 MB.
+- **A restart with 10,000 steps stored.** Each rank's first part after the restart was stored and acknowledged in 100 to 170 ms at the median (442 worst, four runs). The server then rebuilt all 64 ranks from the store at once: the reports were current again 6.1 to 7.0 s later, and each rank's next part waited that long for its acknowledgement (6.2 to 7.1 s), because a rank's parts are taken one at a time. Nothing is lost while it waits: the sender keeps the lines in its file. The rebuild used 29 to 32 s of CPU over 8 cores, 0.5 s a rank, and peak memory was 400 to 535 MB.
+- **A new attempt on all 64 ranks at once** (no restart) cost the same rebuild: 6.2 to 6.8 s (two runs).
+- **Same answers.** After five restarts and three new attempts (10,800 stored steps, four attempts), the reports for the two ranks compared (5 and 40) equal `build_evidence` on the same store, one `resume_lr_change` each. A watcher's look at such a rank (216 part names listed, the report and the status read, the evidence written) took 2.0 ms (worst 4.3 of 50); `build_evidence` on it took 12.0 s.
+- **One stream dropped once.** In the first of 19 flat-out runs with detectors on, made while the machine was still busy from a build, one rank's stream ended with a broken pipe 6 s in and the server logged nothing. It did not happen again and is not explained. A real sender reconnects and resumes from its offset file; this client does not.
+- **Not covered:** more than 64 ranks, a second machine between client and server, TLS, S3 or GCS, a run where incidents happen (the store is healthy until the resumes), and rebuilds longer than 10,800 steps. By the slope, 64 ranks of 100,000 steps would take about a minute to rebuild, longer than the watcher's default 30-second wait; `--report-grace` raises it.
 
 ### Watching a run the server is judging
 
@@ -335,7 +358,7 @@ An empty `incidents` list means "no incidents" only in a report that covers what
 | State | Meaning | What the watcher does |
 | --- | --- | --- |
 | `current` | The report ends exactly at the newest stored step of the newest attempt, covers all twelve kinds, and used the thresholds asked for | Uses it. "No incidents detected" is followed by "current through step N of attempt A (M steps judged)" |
-| `behind` | The report stops before the newest part. Normal for a moment after every part | Waits, up to 30 seconds since the report was last current; then the report is `stale` |
+| `behind` | The report stops before the newest part. Normal for a moment after every part (0.1 ms at the median, 77 ms at worst, measured), and for 6 to 7 s while a restarted server rebuilds 64 ranks of 10,000 steps | Waits, up to 30 seconds (`--report-grace`) since the report was last current; then the report is `stale` |
 | `stale` | Still behind after that wait: the server was restarted with `--no-detect`, its detectors failed for this rank, or it died between storing a part and reporting on it | Reads the parts and runs the detectors here, and says the report stops at step X while the store holds step Y |
 | `missing` | Parts, and no report: `--no-detect`, or a server from before its detectors | The same, at once if no report was ever seen |
 | `unusable` | A report for another run or rank, from a server with fewer kinds, ahead of the store, or beside parts whose names carry no steps | The same, at once |

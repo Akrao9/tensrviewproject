@@ -945,8 +945,10 @@ SERVER_KINDS = (
     "resume_lr_change", "activation_spike", "activation_drift", "dead_activations", "non_finite", "replica_drift",
 )
 # How long a watcher waits for the server's report to cover the newest stored part before
-# it calls the report stale and works the incidents out itself. The server reports within
-# milliseconds of a part; a rebuild after a restart is the long case (README, "Detectors in the server").
+# it calls the report stale and works the incidents out itself. Measured with 64 ranks on an
+# 8-core laptop: the report followed a part by 0.1 ms at the median and 77 ms at worst, and
+# by 6 to 7 s while all 64 ranks were rebuilt from 10,000 stored steps after a restart or a
+# new attempt. That rebuild grows with the run, so raise this for runs of 50,000 steps or more.
 REPORT_GRACE_SECONDS = 30.0
 # The server rewrites `watchdog.json` every `--watchdog-seconds` (10 by default). Older
 # than this while it claims to be running, and nothing is watching the run for stalls.
@@ -2327,6 +2329,14 @@ def main() -> None:
         "read the parts and run the detectors here (slower; gives per-step samples)",
     )
     parser.add_argument(
+        "--report-grace",
+        type=float,
+        default=REPORT_GRACE_SECONDS,
+        help="with --watch on a server's store: seconds the server's report may stay behind the stored parts "
+        "before it is called stale and the detectors run here (default: 30; a restarted server rebuilds a rank "
+        "from its whole store first, about 6 s for 64 ranks of 10,000 steps)",
+    )
+    parser.add_argument(
         "--rank",
         type=int,
         help="the rank to read (default: rank 0 for a directory holding several ranks)",
@@ -2377,7 +2387,7 @@ def main() -> None:
         print(f"watching {args.input} every {args.interval:g} s; Ctrl-C to stop", flush=True)
         watch(
             args.input, args.output, interval=args.interval, rank=rank, on_update=report,
-            server_reports=not args.recompute,
+            server_reports=not args.recompute, report_grace=args.report_grace,
             overload_threshold=args.overload_threshold, top_k=args.top_k,
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
             traincheck=args.traincheck,
