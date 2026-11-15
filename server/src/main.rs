@@ -57,6 +57,9 @@ struct Args {
     /// Rewrite runs/<run_id>/watchdog.json this often; 0 turns the file off.
     #[arg(long, default_value_t = 10.0)]
     watchdog_seconds: f64,
+    /// Do not run the detectors over stored parts or write rank=<rank>/incidents.json.
+    #[arg(long)]
+    no_detect: bool,
 }
 
 async fn terminated() {
@@ -92,6 +95,7 @@ async fn run(args: Args) -> Result<(), Error> {
         critical: Duration::from_secs_f64(args.critical_seconds),
         pause_limit: Duration::from_secs_f64(args.pause_seconds),
         watchdog_interval: Duration::from_secs_f64(args.watchdog_seconds),
+        detect: !args.no_detect,
     };
     let ingest = Ingest::new(Storage::from_url(&args.store)?, config);
     let listener = TcpListener::bind(args.listen).await?;

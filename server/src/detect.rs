@@ -547,6 +547,10 @@ struct Moe {
     starved: BTreeMap<(usize, usize), (i64, f64)>,
     /// What was logged on the step the first expert was flagged.
     starved_scalars: Option<Value>,
+    /// How many samples (a router on a step) had an overloaded or dead expert, and the
+    /// last step one did: an incident names the first, this says whether it goes on.
+    flagged_samples: u64,
+    last_flagged_step: Option<i64>,
     present: Vec<Option<usize>>,
     scratch: Vec<f64>,
 }
@@ -665,6 +669,10 @@ impl Moe {
                 // A flagged sample stays out of the baseline, so a collapse that continues
                 // is compared with the router as it was before.
                 router.keep_in_baseline(&shared, tokens, diversity);
+            }
+            if flagged {
+                self.flagged_samples += 1;
+                self.last_flagged_step = Some(step);
             }
             if flagged && self.first.is_none() {
                 self.first = Some(json!({
@@ -1170,6 +1178,18 @@ impl RankDetectors {
             self.gradients.first.is_some(),
             self.activations.found.len(),
         )
+    }
+
+    /// How many MoE samples (a router on a step) had an overloaded or dead expert, and the
+    /// last step one did. `moe_imbalance` names the first such sample; the per-step samples
+    /// stay in the Parquet parts, so this is what says whether the imbalance is still there.
+    pub fn moe_flagged(&self) -> Value {
+        json!({"samples": self.moe.flagged_samples, "last_step": self.moe.last_flagged_step})
+    }
+
+    /// The newest attempt read.
+    pub fn attempt(&self) -> i64 {
+        self.attempt
     }
 
     /// The last step read.

@@ -289,6 +289,33 @@ The rebuild costs about 0.72 ms of detector time per step, so an update grows wi
 
 Two fixes came out of it, with identical output on 29 healthy and faulted runs, except for a store whose `rank=<n>` folder holds another rank's rows, which the server never writes. Reading `--rank N` from a directory of ranks opened every rank's parts and kept one in 64: the poll took 1.0 to 1.5 s, and the whole directory sat in memory at once (495 MB for 64 ranks of 100 steps, about 50 GB at 10,000 steps); it now opens only that rank's folder (poll 13 to 21 ms, 32 MB). The activation drift check now computes each module's baseline once, taking the 10,000-step build from 9.2 s to 7.2 s.
 
+## Detectors in the server (first slice)
+
+`tensorquill-server` now runs six of the detectors itself, in Rust (`server/src/detect.rs`): `moe_imbalance`, `starved_experts`, `grad_spike`, `activation_spike`, `activation_drift` and `dead_activations`. The other eleven kinds are still Python's alone. Python (`evidence.py`) stays the reference: new rules land there first, and the server must give the same answer.
+
+- **What it writes.** After each part is stored and acknowledged, the server reads that part's rows and rewrites `runs/<run_id>/rank=<rank>/incidents.json`: the incidents in the shape `build_evidence` gives them, `last_step` (detection has run through here), `checked` and `not_checked` kinds, the thresholds applied, `moe_flagged` (how many router samples had an overloaded or dead expert and the last step one did, which says whether an imbalance is still going on), and `rebuilds`. It holds no per-step samples: those stay in the Parquet parts, so the file stays a few KB however long the run is. `--no-detect` turns it off. `python -m tensorquill` does not read this file yet.
+- **Only stored rows are judged**, so the file can always be rebuilt from the store. After a server restart, and whenever rows arrive that are not a plain continuation (a resume that rolled steps back, an older attempt's rows resent late), the rank's state is rebuilt from all of its stored parts with the same attempt rules as `load_records`. A detector error or panic is logged and never fails a flush.
+- **How late it is.** Detection follows storage, and a part is written every `--flush-steps` steps (500 by default) or `--flush-seconds` (10), so by default an incident shows about 10 seconds after its step reached the server, at the latest.
+- **Same answers as Python.** [`tests/test_server_detectors.py`](tests/test_server_detectors.py) streams a 300-step run in which each of the six kinds happens once (with a router missing on some steps, one that appears late, clipping that starts after 20 steps, a loss-scaler skip, NaN values and a module without statistics) through the real binary, and compares `incidents.json` with `build_evidence` on the same records after 12 stretches of the run, then across a server restart in the middle of a 140-step collapse, and across two resumes that roll back an incident. Steps, layers, experts and names match exactly and numbers to 1e-12. One difference is deliberate: a NaN that Python writes as `NaN` is `null` in the server's file, which is strict JSON. A stream cannot look ahead as Python does over a finished list; the three places that matters (when clipping starts, a `moe_top_k` that changes in mid-run, and attempts) are described at the top of `detect.rs`.
+
+Timed with `cargo run --release --example detect_store -- <store> <run_id> --bench` on the benchmark's own synthetic store (64 ranks, 2,000 steps, Granite's shape, healthy), Apple M1 Pro, one thread, load average about 5, median and worst of 40 flushes of 50 steps from every rank:
+
+| Per flush of 64 ranks | Rust, six kinds | Python, all kinds |
+| --- | ---: | ---: |
+| Detectors | 54 ms (58) | 2,220 ms, projected with state kept |
+| of which decoding `layers_json` and `moe_stats_json` | about 33 ms, measured apart | |
+| Writing the 64 Parquet parts (already on the live path) | 138 ms (148) | |
+| Writing 64 `incidents.json` files | 13 ms (14) | |
+| Reading the parts back | not needed live | 830 ms |
+
+That is 17 µs of detector time per step against Python's 693 µs for all seventeen kinds, of which the six ported ones were about 69%. Detection, storage and the incidents files together are about 205 ms on one thread, under the 250 ms budget; the server spreads ranks over its threads, which this does not measure. Rebuilding one rank from 2,000 stored steps takes 73 ms, and all 64 at once 0.94 s.
+
+What these numbers do not show:
+- The store is healthy, and most of the speed comes from skipping a median when a window's lowest or highest value already rules a hit out, which is exact. Before those shortcuts the same run took 136 ms per flush; take that as the cost when every check has to work its median out, as on a run that is failing everywhere.
+- Two thirds of the detector time is decoding the two JSON columns. Typed columns for the per-layer statistics would remove most of it; that is a schema change and is not made.
+- Eleven kinds are not ported. If they cost Rust what they cost Python in proportion, all seventeen would take about 80 ms; that is a guess until they are written.
+- A 10,000-step run, a real model's values, a GPU job, S3 or GCS, and the server under 64 live streams are not measured. Rebuilding 64 ranks of 10,000 steps after a restart would take about 5 s by the same slope, during which those ranks' later parts wait.
+
 ## Things to know
 
 - **Mixed precision.** Pass the run's scaler: `init(..., scaler=scaler)`. `torch.amp.GradScaler` skips `optimizer.step()` when gradients overflow, so the optimizer hooks alone would miss those steps; with `scaler=`, the step ends at `scaler.update()`, which runs every iteration, and each record gets `step_skipped` and `grad_scale` (the loss scale used), read as tensors before `update()` resets them, with no added sync. Gradient spikes and non-finite gradients are not reported on skipped steps, where the scaler expects them, and `loss_scale_trouble` reports 10 or more skips in a row or a loss scale below 1 (first guesses; a few skips in a row at the start, while the scaler halves its initial 65,536, are normal). Without `scaler=`, pass `auto_step=False` and call `session.step(lr=...)` once per iteration.

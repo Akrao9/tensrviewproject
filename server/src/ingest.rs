@@ -32,12 +32,13 @@ use arrow_flight::{
     PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::stream::BoxStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::detect::RankDetectors;
 use crate::storage::Storage;
 use crate::watchdog::{Watchdog, WatchdogConfig, DEFAULT_WATCHDOG_INTERVAL};
 
@@ -64,6 +65,8 @@ pub struct IngestConfig {
     pub pause_limit: Duration,
     /// How often `runs/<run_id>/watchdog.json` is rewritten. Zero turns the watchdog's file off.
     pub watchdog_interval: Duration,
+    /// Whether the detectors run over each stored part and `incidents.json` is written (see `detect`).
+    pub detect: bool,
 }
 
 impl Default for IngestConfig {
@@ -77,6 +80,7 @@ impl Default for IngestConfig {
             critical: crate::watchdog::DEFAULT_CRITICAL,
             pause_limit: crate::watchdog::DEFAULT_PAUSE_LIMIT,
             watchdog_interval: DEFAULT_WATCHDOG_INTERVAL,
+            detect: true,
         }
     }
 }
@@ -129,6 +133,14 @@ struct RankBuffer {
     pending_offset: Option<i64>,
     /// The open stream to acknowledge on.
     ack: Option<AckSender>,
+    /// The detectors' state over this rank's stored rows; none until the first part is
+    /// stored after a start, and again whenever it has to be rebuilt from the store.
+    detectors: Option<RankDetectors>,
+    /// How many times this server rebuilt that state from the store.
+    rebuilds: u64,
+    /// Set when a rebuild panicked: the same rows would panic again at every part, each
+    /// time after reading the whole rank, so this rank is left alone until a restart.
+    detect_off: bool,
 }
 
 pub struct Ingest {
@@ -278,6 +290,7 @@ impl Ingest {
     /// Stores what the buffer holds as one part, then acknowledges the offset it covers.
     /// On a store error the rows stay buffered and a later flush tries again.
     async fn flush(&self, key: &Key, buffer: &mut RankBuffer) -> Result<(), Status> {
+        let mut stored = Vec::new();
         if !buffer.batches.is_empty() {
             self.storage
                 .write_part(
@@ -291,7 +304,7 @@ impl Ingest {
                 .await
                 .map_err(|error| Status::unavailable(format!("cannot write to the store: {error}")))?;
             self.used.fetch_sub(buffer.bytes, Ordering::SeqCst);
-            buffer.batches.clear();
+            stored = std::mem::take(&mut buffer.batches);
             buffer.rows = 0;
             buffer.bytes = 0;
             buffer.since = None;
@@ -302,7 +315,79 @@ impl Ingest {
             };
             let _ = ack.send(Ok(result)); // the sender may be gone; it resends from its offset
         }
+        if self.config.detect && !stored.is_empty() {
+            self.detect(key, buffer, &stored).await;
+        }
         Ok(())
+    }
+
+    /// Runs the detectors over a part that has just been stored and acknowledged, and
+    /// rewrites the rank's `incidents.json`. Only stored rows are ever judged, so what the
+    /// file says can always be rebuilt from the store. Nothing here can fail a flush: an
+    /// error is logged and the state is rebuilt from the store at the next part; a panic during
+    /// a rebuild turns this rank's detectors off.
+    async fn detect(&self, key: &Key, buffer: &mut RankBuffer, stored: &[RecordBatch]) {
+        if buffer.detect_off {
+            return;
+        }
+        let (attempt, first_step) = (buffer.attempt, buffer.min_step);
+        let appended = match buffer.detectors.as_mut() {
+            Some(detectors) if detectors.continues(attempt, first_step) => {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    for batch in stored {
+                        detectors.append(attempt, batch);
+                    }
+                }))
+                .is_ok()
+            }
+            _ => false,
+        };
+        if !appended {
+            // The first part since this server started, or rows that are not a plain
+            // continuation (a resume that rolled steps back, an older attempt's rows sent
+            // late): rebuild from everything stored, which includes this part.
+            let replayed = std::panic::AssertUnwindSafe(crate::detect::replay(&self.storage, &key.0, key.1))
+                .catch_unwind()
+                .await;
+            buffer.rebuilds += 1;
+            buffer.detectors = match replayed {
+                Ok(Ok(detectors)) => Some(detectors),
+                Ok(Err(error)) => {
+                    eprintln!("tensorquill-server: detectors for {} rank {}: {error}", key.0, key.1);
+                    None
+                }
+                Err(_) => {
+                    eprintln!(
+                        "tensorquill-server: detectors for {} rank {} panicked and are off until a restart",
+                        key.0, key.1
+                    );
+                    buffer.detect_off = true;
+                    None
+                }
+            };
+        }
+        let Some(detectors) = &buffer.detectors else { return };
+        let document = serde_json::json!({
+            "schema_version": 1,
+            "source": "tensorquill-server",
+            "run_id": key.0,
+            "rank": key.1,
+            "attempt": detectors.attempt(),
+            "last_step": detectors.last_step(),
+            "steps": detectors.rows(),
+            "rebuilds": buffer.rebuilds,
+            "checked": crate::detect::PORTED,
+            "not_checked": crate::detect::NOT_PORTED,
+            "thresholds": crate::detect::thresholds(),
+            "moe_flagged": detectors.moe_flagged(),
+            "incidents": detectors.incidents(),
+        });
+        if let Err(error) = self.storage.write_incidents(&key.0, key.1, &document).await {
+            eprintln!(
+                "tensorquill-server: cannot write incidents.json for {} rank {}: {error}",
+                key.0, key.1
+            );
+        }
     }
 
     async fn flush_key(&self, key: &Key) -> Result<(), Status> {

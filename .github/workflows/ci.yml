@@ -99,7 +99,7 @@ jobs:
           TENSORQUILL_SERVER_BIN: ${{ github.workspace }}/server/target/debug/tensorquill-server
         run: |
           test -x "$TENSORQUILL_SERVER_BIN"
-          pytest -ra tests/test_flight.py tests/test_flight_e2e.py tests/test_two_ranks_e2e.py
+          pytest -ra tests/test_flight.py tests/test_flight_e2e.py tests/test_two_ranks_e2e.py tests/test_server_detectors.py
 
   gpu:
     # GitHub's free runners have no GPU, so this runs only when started by hand, on a

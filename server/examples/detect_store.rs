@@ -98,7 +98,8 @@ async fn main() -> Result<(), Error> {
     let scratch = Storage::from_url(scratch_dir.path().to_str().ok_or("bad scratch path")?)?;
 
     let mut detectors: Vec<RankDetectors> = ranks.iter().map(|_| RankDetectors::new()).collect();
-    let (mut detect, mut write, mut decode, mut read) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut detect, mut write, mut decode, mut read, mut report) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut rows, mut steps_per_flush) = (0usize, 0usize);
     for flush in 0..flushes {
         let started = Instant::now();
@@ -133,6 +134,13 @@ async fn main() -> Result<(), Error> {
                 .await?;
         }
         write.push(ms(started.elapsed()));
+
+        let started = Instant::now();
+        for (rank, detectors) in ranks.iter().zip(&detectors) {
+            let document = serde_json::json!({"rank": rank, "last_step": detectors.last_step(), "incidents": detectors.incidents()});
+            scratch.write_incidents(run_id, *rank, &document).await?;
+        }
+        report.push(ms(started.elapsed()));
     }
     let incidents: usize = detectors.iter().map(|detectors| detectors.incidents().len()).sum();
     let worst = |values: &[f64]| values.iter().copied().fold(0.0, f64::max);
@@ -142,6 +150,7 @@ async fn main() -> Result<(), Error> {
         ("detectors", &mut detect),
         ("  of which JSON decoding alone (measured apart)", &mut decode),
         ("writing the Parquet parts", &mut write),
+        ("writing incidents.json for every rank", &mut report),
         ("reading the parts back (not on the live path)", &mut read),
     ] {
         let worst = worst(values);
