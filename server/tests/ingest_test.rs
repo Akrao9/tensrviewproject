@@ -673,9 +673,10 @@ async fn the_watchdog_sees_progress_a_hang_and_a_clean_finish() {
     .await;
     let status = &server.ingest.watchdog_statuses()[RUN];
     assert_eq!(status["world_size"], 3);
-    assert_eq!(status["missing_ranks"], serde_json::json!([2]));
     assert_eq!(status["ranks"][0]["last_step"], 49);
-    assert_eq!(status["summary"], "degraded"); // rank 2 never connected
+    // Rank 2 has not connected, but ranks start a moment apart: not missing yet.
+    assert_eq!(status["missing_ranks"], serde_json::json!([]));
+    assert_eq!(status["summary"], "active");
 
     // Rank 1 keeps its stream open and sends nothing new; rank 0 goes on.
     let mut rank0 = ranks.remove(0);
@@ -698,14 +699,29 @@ async fn the_watchdog_sees_progress_a_hang_and_a_clean_finish() {
     .await;
     assert_eq!(rank_states(&server)[0].1, "active");
     assert_eq!(server.ingest.watchdog_statuses()[RUN]["ranks"][1]["last_step"], 49);
+    // Past the floor, the rank that never connected is named.
+    assert_eq!(
+        server.ingest.watchdog_statuses()[RUN]["missing_ranks"],
+        serde_json::json!([2])
+    );
 
-    // The status file is what readers see.
+    // The status file is what readers see. Wait for rank 0's last batch to land first.
+    until("rank 0's last batch", || {
+        server.ingest.watchdog_statuses()[RUN]["ranks"][0]["last_step"] == 199
+    })
+    .await;
     server.ingest.write_watchdog().await;
     let written: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("runs").join(RUN).join("watchdog.json")).unwrap())
             .unwrap();
     assert_eq!(written["summary"], "degraded");
     assert_eq!(written["ranks"][1]["state"], "silent");
+    // An unchanged status is not written again, even though its clock fields moved.
+    let path = dir.path().join("runs").join(RUN).join("watchdog.json");
+    let first = std::fs::metadata(&path).unwrap().modified().unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    server.ingest.write_watchdog().await;
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), first);
 
     // A clean end is finished; a stream that is cut is not.
     let _ = rank0.finish().await;
@@ -717,4 +733,40 @@ async fn the_watchdog_sees_progress_a_hang_and_a_clean_finish() {
         .await;
     assert_eq!(rank1.ack().await, Err(Code::InvalidArgument));
     until("rank 1 dropped", || rank_states(&server)[1].2 == "dropped").await;
+}
+
+#[tokio::test]
+async fn the_last_write_before_shutdown_says_the_server_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), watch_config(60_000), None).await;
+    let mut put = open(&server, 0).await;
+    put.send_with_metadata(batch(0, 0..10), world_metadata(0, 1, 50)).await;
+    until("the rank is seen", || rank_states(&server).len() == 1).await;
+    server.ingest.write_watchdog().await;
+    let path = dir.path().join("runs").join(RUN).join("watchdog.json");
+    let live: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        (live["summary"].as_str(), live["server_running"].as_bool()),
+        (Some("active"), Some(true))
+    );
+    server.ingest.write_watchdog_stopped().await;
+    let stopped: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        (stopped["summary"].as_str(), stopped["server_running"].as_bool()),
+        (Some("server_stopped"), Some(false))
+    );
+}
+
+#[tokio::test]
+async fn a_finished_run_keeps_its_verdict_when_the_server_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), watch_config(60_000), None).await;
+    let mut put = open(&server, 0).await;
+    put.send_with_metadata(batch(0, 0..10), world_metadata(0, 1, 50)).await;
+    let _ = put.finish().await;
+    until("the rank finished", || rank_states(&server)[0].1 == "finished").await;
+    server.ingest.write_watchdog_stopped().await;
+    let path = dir.path().join("runs").join(RUN).join("watchdog.json");
+    let status: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(status["summary"], "finished");
 }

@@ -52,7 +52,6 @@ def read_traincheck(source: str | Path) -> dict[str, Any]:
         raise FileNotFoundError(f"{path} does not exist")
     violations: list[dict[str, Any]] = []
     firsts: list[int] = []
-    distinct = 0
     for file in files:
         try:
             document = json.loads(file.read_text(encoding="utf-8"))
@@ -64,7 +63,6 @@ def read_traincheck(source: str | Path) -> dict[str, Any]:
             or not isinstance(document.get("distinct_invariants_violated"), int)
         ):
             raise ValueError(f"{file} is not a TrainCheck violations summary")
-        distinct += document["distinct_invariants_violated"]
         if isinstance(document.get("first_violation_step"), int):
             firsts.append(document["first_violation_step"])
         for entry in document["violations"]:
@@ -80,6 +78,8 @@ def read_traincheck(source: str | Path) -> dict[str, Any]:
                 }
             )
     violations.sort(key=lambda v: (v["first_step"] is None, v["first_step"] if v["first_step"] is not None else 0))
+    # One invariant can be violated in several traces; count each name once.
+    distinct = len({v["display_name"] for v in violations})
     return {
         "files": [str(f) for f in files],
         "distinct_invariants_violated": distinct,

@@ -239,7 +239,7 @@ If you streamed to `tensorquill-server`, point the same command at the run's dir
 
 If you also run TrainCheck, add `--traincheck <violations_summary.json>` (or the results directory `traincheck-check` wrote): its violated invariants appear as one `traincheck_violation` incident, with TrainCheck's own step numbers.
 
-If a multi-GPU job hangs, enable PyTorch's Flight Recorder dumps (`TORCH_FR_BUFFER_SIZE`, `TORCH_FR_DUMP_TEMP_FILE`, `TORCH_NCCL_ENABLE_MONITORING=1`, `TORCH_NCCL_DUMP_ON_TIMEOUT=1`; see the SDK README) and add `--flight-recorder <dump dir>` to the command: `collective_hang` names the ranks that never entered the stuck collective, or says every rank did and it did not complete (a network, NCCL or GPU problem); `collective_desync` says ranks issued different collectives.
+If a multi-GPU job hangs, enable PyTorch's Flight Recorder dumps (`TORCH_FR_BUFFER_SIZE`, `TORCH_FR_DUMP_TEMP_FILE`, `TORCH_NCCL_ENABLE_MONITORING=1`, `TORCH_NCCL_DUMP_ON_TIMEOUT=1`; see the SDK README) and add `--flight-recorder <dump dir>` to the command: `collective_hang` names the ranks that never entered the stuck collective, or says every rank did and it did not complete (a network, NCCL or GPU problem); `collective_desync` says ranks issued different collectives. The dumps are pickles: read only dumps your own job wrote.
 
 The thresholds are first guesses from one model, so treat a report as something to check, not a verdict.
 

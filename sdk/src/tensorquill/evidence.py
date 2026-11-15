@@ -1211,7 +1211,10 @@ def build_evidence(
         except (ImportError, OSError, ValueError) as error:
             not_checked.append({"check": "flight_recorder", "reason": str(error)})
         else:
-            recorder_summary = {k: analysis[k] for k in ("dumped_ranks", "collectives", "problem_count", "incomplete_dumps")}
+            recorder_summary = {
+                k: analysis[k]
+                for k in ("dumped_ranks", "collectives", "problem_count", "incomplete_dumps", "ignored_before_buffer_start")
+            }
             hit = flight_recorder_incident(analysis, step=last_step)
             if hit is not None:
                 incidents.append(hit)
@@ -1451,7 +1454,8 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         parts = [f"rank {r['rank']} {'lost its connection' if r['state'] == 'lost' else 'sent no new step'}"
                  f" since step {r['last_step']}" for r in who[:4]]
         if incident["missing_ranks"]:
-            parts.append("ranks " + ", ".join(str(r) for r in incident["missing_ranks"][:8]) + " never connected")
+            parts.append("ranks " + ", ".join(str(r) for r in incident["missing_ranks"][:8]) + " never connected"
+                         " (if only some ranks call tensorquill.init, ignore this)")
         return (
             f"Ranks out of step with the job: {'; '.join(parts)} while others reached step"
             f" {incident['newest_step']}. A hung rank, a killed process or a stuck telemetry sender"
@@ -1482,13 +1486,13 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             )
         if incident["missing_ranks"]:
             return (
-                f"Collective hang at {where}: rank{'s' if len(incident['missing_ranks']) != 1 else ''}"
-                f" {', '.join(map(str, incident['missing_ranks']))} never entered it (state {incident['state']} on the"
+                f"Collective hang at {where}: at dump time rank{'s' if len(incident['missing_ranks']) != 1 else ''}"
+                f" {', '.join(map(str, incident['missing_ranks']))} had not entered it (state {incident['state']} on the"
                 f" others), after step {incident['step']}. Look at what those ranks were doing instead: a stuck"
                 f" data loader or CPU-side branch, an exception, or a dead process{partial}"
             )
         return (
-            f"Collective hang at {where}: every rank entered it but it did not complete (state {incident['state']}),"
+            f"Collective hang at {where}: at dump time every rank had entered it but it had not completed (state {incident['state']}),"
             f" after step {incident['step']}. That points at the network, NCCL or a GPU, not at one rank{partial}"
         )
     if kind == "resume_lr_change":

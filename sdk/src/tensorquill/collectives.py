@@ -92,14 +92,34 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
             return "hang"
         return None
 
+    # Each rank's buffer is a ring of the last N entries (2000 by default) and ranks dump at
+    # different moments, so the oldest collectives of one rank may have been overwritten on
+    # another. The analyzer then calls them unmatched. A collective older than the newest
+    # first entry of any rank in its group cannot be judged and is left out.
+    edge: dict[str, int] = {}
+    for dump in details.values():
+        firsts: dict[str, int] = {}
+        for entry in dump["entries"]:
+            group_name, number = str(entry["process_group"][0]), str(entry.get("collective_seq_id", ""))
+            if not entry.get("is_p2p") and number.isdigit():
+                firsts[group_name] = min(firsts.get(group_name, int(number)), int(number))
+        for group_name, first_seq in firsts.items():
+            edge[group_name] = max(edge.get(group_name, 0), first_seq)
+
+    def judgeable(collective: Any) -> bool:
+        number = seq(collective)
+        return not isinstance(number, int) or number >= edge.get(str(collective.group_id), 0)
+
     problems = [(kind_of(c), c) for c in db.collectives]
-    problems = [(kind, c) for kind, c in problems if kind is not None]
+    flagged = [(kind, c) for kind, c in problems if kind is not None]
+    problems = [(kind, c) for kind, c in flagged if judgeable(c)]
     result: dict[str, Any] = {
         "version": version,
         "dumped_ranks": dumped,
         "groups": len(db.groups),
         "collectives": len(db.collectives),
         "problem_count": len(problems),
+        "ignored_before_buffer_start": len(flagged) - len(problems),
         "incomplete_dumps": any(set(group) - set(dumped) for group in members.values()),
         "problem": None,
     }
@@ -135,6 +155,7 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
         "expected_ranks": expected,
         "missing_ranks": missing,
         "all_ranks_entered": not missing,
+        "buffer_start": edge.get(str(first.group_id), 0),
         "mismatch": culprit,
     }
     return result

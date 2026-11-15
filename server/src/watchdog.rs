@@ -80,6 +80,7 @@ impl RankState {
 
 #[derive(Debug)]
 pub struct Progress {
+    created: Instant,
     attempt: i64,
     last_step: Option<i64>,
     last_progress: Instant,
@@ -93,6 +94,7 @@ pub struct Progress {
 impl Progress {
     fn new(now: Instant) -> Self {
         Self {
+            created: now,
             attempt: 0,
             last_step: None,
             last_progress: now,
@@ -199,8 +201,10 @@ impl Watchdog {
         });
     }
 
-    /// One status document per run, as of `now`.
-    pub fn statuses(&self, now: Instant) -> BTreeMap<String, Value> {
+    /// One status document per run, as of `now`. `running` is false for the last write at
+    /// shutdown, which says the server stopped: the verdicts it holds would otherwise stay on
+    /// disk as if they were current.
+    pub fn statuses(&self, now: Instant, running: bool) -> BTreeMap<String, Value> {
         let written_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_millis() as i64);
@@ -214,7 +218,7 @@ impl Watchdog {
                 members.sort_by_key(|(rank, _)| *rank);
                 (
                     run_id.to_string(),
-                    run_status(run_id, &members, now, written_at_ms, &self.config),
+                    run_status(run_id, &members, now, written_at_ms, &self.config, running),
                 )
             })
             .collect()
@@ -228,18 +232,29 @@ pub fn run_status(
     now: Instant,
     written_at_ms: i64,
     config: &WatchdogConfig,
+    running: bool,
 ) -> Value {
     let world_size = members.iter().filter_map(|(_, p)| p.world_size).max();
     let highest = members.iter().map(|(rank, _)| *rank).max().unwrap_or(-1);
     let expected = world_size.map_or(highest + 1, |size| size.max(highest + 1));
     let seen: Vec<i32> = members.iter().map(|(rank, _)| *rank).collect();
-    let missing: Vec<i32> = (0..expected).filter(|rank| !seen.contains(rank)).collect();
+    // Ranks start a moment apart, so a rank is missing only once the run has been seen for
+    // longer than the silence floor.
+    let first_seen = members.iter().map(|(_, p)| p.created).min();
+    let settled = first_seen.is_some_and(|first| now.saturating_duration_since(first) > config.silent_floor);
+    let missing: Vec<i32> = if settled {
+        (0..expected).filter(|rank| !seen.contains(rank)).collect()
+    } else {
+        Vec::new()
+    };
     let states: Vec<RankState> = members.iter().map(|(_, p)| p.state(now, config)).collect();
     let count = |wanted: &[RankState]| states.iter().filter(|state| wanted.contains(state)).count();
     let active = count(&[RankState::Active, RankState::Reconnecting]);
     let stopped = count(&[RankState::Silent, RankState::Lost]);
     let all_finished = !members.is_empty() && count(&[RankState::Finished]) == members.len();
-    let summary = if all_finished && missing.is_empty() {
+    let summary = if !running {
+        "server_stopped"
+    } else if all_finished && missing.is_empty() {
         "finished"
     } else if all_finished {
         "degraded"
@@ -272,6 +287,7 @@ pub fn run_status(
         "schema_version": 1,
         "run_id": run_id,
         "written_at_ms": written_at_ms,
+        "server_running": running,
         "silent_floor_seconds": config.silent_floor.as_secs_f64(),
         "silent_factor": config.silent_factor,
         "world_size": world_size,
@@ -294,11 +310,11 @@ mod tests {
     }
 
     fn summary(dog: &Watchdog, now: Instant) -> String {
-        dog.statuses(now)["run"]["summary"].as_str().unwrap().to_string()
+        dog.statuses(now, true)["run"]["summary"].as_str().unwrap().to_string()
     }
 
     fn states(dog: &Watchdog, now: Instant) -> Vec<String> {
-        dog.statuses(now)["run"]["ranks"]
+        dog.statuses(now, true)["run"]["ranks"]
             .as_array()
             .unwrap()
             .iter()
@@ -344,7 +360,7 @@ mod tests {
         }
         assert_eq!(summary(&dog, at(t0, 30)), "active");
         assert_eq!(summary(&dog, at(t0, 90)), "stalled");
-        let status = &dog.statuses(at(t0, 90))["run"];
+        let status = &dog.statuses(at(t0, 90), true)["run"];
         assert_eq!(status["ranks"][0]["last_step"], 9);
         assert_eq!(status["ranks"][0]["stream"], "open");
     }
@@ -393,14 +409,21 @@ mod tests {
     }
 
     #[test]
-    fn ranks_that_never_connected_are_missing_by_world_size_or_by_gap() {
+    fn ranks_that_never_connected_are_missing_by_world_size_or_by_gap_after_the_grace_period() {
         let t0 = Instant::now();
         let dog = Watchdog::new(config(60));
         for rank in [0, 1, 3] {
             dog.stream_opened(&key(rank), t0);
             dog.batch(&key(rank), 1, Some(9), Some(6), at(t0, 1));
         }
-        let status = &dog.statuses(at(t0, 5))["run"];
+        // Ranks start a moment apart: inside the floor nothing is missing yet.
+        let status = &dog.statuses(at(t0, 5), true)["run"];
+        assert_eq!(status["missing_ranks"], json!([]));
+        assert_eq!(status["summary"], "active");
+        for rank in [0, 1, 3] {
+            dog.batch(&key(rank), 1, Some(19), Some(6), at(t0, 70));
+        }
+        let status = &dog.statuses(at(t0, 71), true)["run"];
         assert_eq!(status["missing_ranks"], json!([2, 4, 5])); // world_size 6 names 4 and 5 too
         assert_eq!(status["summary"], "degraded");
         // Without a world size only gaps below the highest rank can be seen.
@@ -408,8 +431,21 @@ mod tests {
         for rank in [0, 3] {
             dog.stream_opened(&key(rank), t0);
             dog.batch(&key(rank), 1, Some(9), None, at(t0, 1));
+            dog.batch(&key(rank), 1, Some(19), None, at(t0, 70));
         }
-        assert_eq!(dog.statuses(at(t0, 5))["run"]["missing_ranks"], json!([1, 2]));
+        assert_eq!(dog.statuses(at(t0, 71), true)["run"]["missing_ranks"], json!([1, 2]));
+    }
+
+    #[test]
+    fn a_stopped_server_says_so_instead_of_leaving_its_last_verdict() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(9), Some(1), at(t0, 1));
+        assert_eq!(dog.statuses(at(t0, 2), true)["run"]["summary"], "active");
+        let stopped = &dog.statuses(at(t0, 2), false)["run"];
+        assert_eq!(stopped["summary"], "server_stopped");
+        assert_eq!(stopped["server_running"], false);
     }
 
     #[test]
@@ -421,7 +457,12 @@ mod tests {
             dog.batch(&key(rank), 1, Some(9), Some(3), at(t0, 1));
             dog.stream_ended(&key(rank), true, at(t0, 2));
         }
-        assert_eq!(summary(&dog, at(t0, 3)), "degraded"); // rank 2 never connected
+        assert_eq!(summary(&dog, at(t0, 3)), "finished"); // rank 2 is not missing yet: inside the grace
+        for rank in 0..2 {
+            dog.stream_opened(&key(rank), at(t0, 4));
+            dog.stream_ended(&key(rank), true, at(t0, 70));
+        }
+        assert_eq!(summary(&dog, at(t0, 71)), "degraded"); // rank 2 never connected
         let dog = Watchdog::new(config(60));
         for rank in 0..2 {
             dog.stream_opened(&key(rank), t0);

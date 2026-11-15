@@ -115,6 +115,8 @@ pub struct Ingest {
     closed: AtomicBool,
     buffers: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<RankBuffer>>>>,
     watchdog: Watchdog,
+    /// What was last written per run, so an unchanged status is not written again.
+    written: Mutex<HashMap<String, String>>,
 }
 
 impl Ingest {
@@ -127,6 +129,7 @@ impl Ingest {
             storage,
             config,
             watchdog,
+            written: Mutex::new(HashMap::new()),
             used: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             buffers: Mutex::new(HashMap::new()),
@@ -387,14 +390,46 @@ impl Ingest {
 
     /// The progress status of every run, as the server sees it now.
     pub fn watchdog_statuses(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
-        self.watchdog.statuses(Instant::now())
+        self.watchdog.statuses(Instant::now(), true)
     }
 
-    /// Writes `runs/<run_id>/watchdog.json` for every run that has connected.
+    /// Writes `runs/<run_id>/watchdog.json` for each run whose status changed since it was last
+    /// written: its summary, a rank's state, stream or last step, or the ranks missing. The
+    /// clock fields change every time, so they do not count; a finished run stops being written.
     pub async fn write_watchdog(&self) {
-        for (run_id, status) in self.watchdog_statuses() {
-            if let Err(error) = self.storage.write_status(&run_id, &status).await {
-                eprintln!("tensorquill-server: cannot write the watchdog status of {run_id}: {error}");
+        self.write_statuses(self.watchdog_statuses()).await;
+    }
+
+    /// The last write before the server stops. A finished run keeps its verdict, which does not
+    /// depend on the server; every other run's status says the server stopped.
+    pub async fn write_watchdog_stopped(&self) {
+        self.write_watchdog().await;
+        let now = Instant::now();
+        let live = self.watchdog.statuses(now, true);
+        let mut stopped = self.watchdog.statuses(now, false);
+        stopped.retain(|run_id, _| live[run_id]["summary"] != "finished");
+        self.write_statuses(stopped).await;
+    }
+
+    async fn write_statuses(&self, statuses: std::collections::BTreeMap<String, serde_json::Value>) {
+        for (run_id, status) in statuses {
+            let signature = serde_json::json!({
+                "summary": status["summary"],
+                "running": status["server_running"],
+                "missing": status["missing_ranks"],
+                "ranks": status["ranks"].as_array().map(|ranks| {
+                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone())).collect::<Vec<_>>()
+                }),
+            })
+            .to_string();
+            if self.written.lock().unwrap().get(&run_id) == Some(&signature) {
+                continue;
+            }
+            match self.storage.write_status(&run_id, &status).await {
+                Ok(()) => {
+                    self.written.lock().unwrap().insert(run_id, signature);
+                }
+                Err(error) => eprintln!("tensorquill-server: cannot write the watchdog status of {run_id}: {error}"),
             }
         }
     }

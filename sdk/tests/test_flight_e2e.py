@@ -339,3 +339,46 @@ def test_the_server_calls_a_job_that_goes_quiet_stalled_and_evidence_says_so(tmp
         assert status["summary"] == "finished"
     finally:
         assert server.terminate() == 0
+
+
+_DIES = """
+import os, signal, sys, time
+import torch, tensorquill
+model = torch.nn.Linear(4, 2)
+session = tensorquill.init(model, run_id="dies", every=10, endpoint=sys.argv[1])
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+for _ in range(60):
+    optimizer.zero_grad()
+    model(torch.randn(8, 4)).sum().backward()
+    optimizer.step()
+time.sleep(1.5)  # let the sender deliver what was written
+if sys.argv[2] == "kill":
+    os.kill(os.getpid(), signal.SIGKILL)  # as the OOM killer does: no close(), no atexit
+os._exit(0)  # leaves without close(): the connection closes, the stream is never ended
+"""
+
+
+@pytest.mark.parametrize("how", ["kill", "exit"])
+def test_a_job_that_dies_without_closing_is_lost_not_finished(tmp_path, how):
+    server = Server(tmp_path / "store", 0, "--silent-seconds", "1", "--watchdog-seconds", "0.2", "--flush-seconds", "0.3")
+    run_dir = tmp_path / "store" / "runs" / "dies"
+    try:
+        import sys
+
+        child = subprocess.run(
+            [sys.executable, "-c", _DIES, server.endpoint, how], cwd=tmp_path, timeout=60,
+            capture_output=True, text=True,
+        )
+        assert child.returncode == (-signal.SIGKILL if how == "kill" else 0), child.stderr
+        deadline = time.monotonic() + 15
+        status = None
+        while time.monotonic() < deadline:
+            status = tensorquill.evidence.read_watchdog(run_dir / "watchdog.json")
+            if status and status["ranks"] and status["ranks"][0]["state"] == "lost":
+                break
+            time.sleep(0.2)
+        assert status and status["ranks"][0]["state"] == "lost", status
+        assert status["ranks"][0]["stream"] == "dropped"  # never "finished": nobody called close()
+        assert status["summary"] == "stalled" and status["ranks"][0]["last_step"] >= 49
+    finally:
+        assert server.terminate() == 0

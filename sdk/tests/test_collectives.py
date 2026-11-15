@@ -50,7 +50,7 @@ def test_a_rank_that_never_entered_a_collective_is_the_hang_s_culprit(tmp_path, 
     assert incident["kind"] == "collective_hang" and incident["step"] == 149
     text = tensorquill.incident_summary({"incidents": [incident], "samples": [], "layer_count": 0,
                                           "expert_count": 0, "router_names": []})
-    assert "rank 1 never entered it" in text and "all_reduce #2 in group" in text and "default_pg" in text
+    assert "at dump time rank 1 had not entered it" in text and "all_reduce #2 in group" in text and "default_pg" in text
 
 
 def test_ranks_that_issued_different_collectives_are_a_desync(tmp_path):
@@ -73,7 +73,7 @@ def test_every_rank_entering_but_not_finishing_points_at_the_network_not_one_ran
     assert incident["kind"] == "collective_hang" and incident["all_ranks_entered"] is True
     text = tensorquill.incident_summary({"incidents": [incident], "samples": [], "layer_count": 0,
                                           "expert_count": 0, "router_names": []})
-    assert "every rank entered it but it did not complete" in text and "network, NCCL or a GPU" in text
+    assert "every rank had entered it but it had not completed" in text and "network, NCCL or a GPU" in text
 
 
 def test_a_healthy_dump_and_a_partial_dump(tmp_path):
@@ -128,3 +128,23 @@ def test_the_command_reads_the_dumps_and_the_servers_status(tmp_path, capsys):
         sys.argv = old
     assert "Collective hang at all_reduce #2" in capsys.readouterr().out
     assert any(i["kind"] == "collective_hang" for i in json.loads((tmp_path / "out.json").read_text())["incidents"])
+
+
+def test_a_wrapped_buffer_is_not_mistaken_for_a_hang(tmp_path):
+    # Each rank keeps only its last entries and they dumped at different moments: rank 0
+    # still holds collectives 10 to 20, rank 1's buffer starts at 12. Collective 21 is the one
+    # that is stuck. Reporting 10 or 11 as missing on rank 1 would be a buffer-edge artifact.
+    rank0 = [_entry(i - 10, "all_reduce", i) for i in range(10, 21)] + [_entry(11, "all_reduce", 21, "started")]
+    rank1 = [_entry(i - 12, "all_reduce", i) for i in range(12, 21)]
+    directory = _write(tmp_path, rank0, rank1)
+    analysis = analyze_flight_recorder(directory)
+    assert analysis["ignored_before_buffer_start"] >= 1  # 10 and 11 are not judged
+    problem = analysis["problem"]
+    assert (problem["collective_seq_id"], problem["missing_ranks"], problem["buffer_start"]) == (21, [1], 12)
+    # With nothing stuck, a wrapped buffer is not a problem at all.
+    healthy = tmp_path / "healthy"
+    healthy.mkdir()
+    _dump(healthy, 0, [_entry(i - 10, "all_reduce", i) for i in range(10, 21)])
+    _dump(healthy, 1, [_entry(i - 12, "all_reduce", i) for i in range(12, 21)])
+    analysis = analyze_flight_recorder(healthy)
+    assert analysis["problem"] is None and analysis["ignored_before_buffer_start"] >= 1

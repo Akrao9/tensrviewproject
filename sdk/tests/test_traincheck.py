@@ -39,6 +39,11 @@ def test_a_results_directory_with_several_traces_is_merged_and_no_violation_is_n
     merged = read_traincheck(tmp_path / "check_results")
     assert merged["distinct_invariants_violated"] == 2 and merged["first_violation_step"] == 4
     assert len(merged["files"]) == 2
+    # The same invariant violated in two traces is one invariant.
+    (tmp_path / "check_results" / "trace_c").mkdir()
+    (tmp_path / "check_results" / "trace_c" / "violations_summary.json").write_text(json.dumps(_summary([_violation("a", 12, 12)], 12)))
+    assert read_traincheck(tmp_path / "check_results")["distinct_invariants_violated"] == 2
+    (tmp_path / "check_results" / "trace_c" / "violations_summary.json").unlink()
 
     clean = tmp_path / "clean.json"
     clean.write_text(json.dumps(_summary([])))

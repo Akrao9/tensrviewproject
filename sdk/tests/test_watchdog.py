@@ -101,3 +101,38 @@ def test_the_command_reads_the_status_beside_a_run_directory(tmp_path, capsys, m
     monkeypatch.setattr("sys.argv", ["tensorquill", str(run), "-o", str(tmp_path / "out.json")])
     main()
     assert "Job stalled after step 4" in capsys.readouterr().out
+
+
+def test_the_rerun_export_handles_every_incident_kind_from_outside_tools(tmp_path):
+    rr = pytest.importorskip("rerun")
+    del rr
+    records = [{"run_id": "r", "rank": 0, "step": s, "grad_norm": 1.0, "lr": [1e-3]} for s in range(30)]
+    records += [{"run_id": "r", "rank": 0, "attempt": 2, "step": s, "grad_norm": 1.0, "lr": [5e-5]} for s in range(20, 30)]
+    for r in records[:30]:
+        r["attempt"] = 1
+    traincheck = tmp_path / "violations_summary.json"
+    traincheck.write_text(json.dumps({"first_violation_step": 4, "distinct_invariants_violated": 1,
+                                      "violations": [{"display_name": "x", "relation_type": "R", "first_step": 4,
+                                                      "last_step": 9, "occurrences": 2}]}))
+    kwargs = {"traincheck": traincheck, "watchdog": _status("degraded", [_rank(0, "active", 29), _rank(1, "silent", 20, 600.0)], missing=[2], world_size=3)}
+    pytest.importorskip("torch.distributed.flight_recorder.components.builder")
+    import pickle
+
+    def entry(i, seq, state="completed"):
+        return {"profiling_name": "nccl:all_reduce", "state": state, "process_group": ("0", "default_pg"),
+                "input_sizes": [[4]], "output_sizes": [[4]], "input_dtypes": "float32", "output_dtypes": "float32",
+                "collective_seq_id": str(seq), "p2p_seq_id": "0", "time_created_ns": 0, "frames": [], "record_id": i, "is_p2p": False}
+
+    dumps = tmp_path / "fr"
+    dumps.mkdir()
+    for rank, entries in ((0, [entry(0, 1), entry(1, 2, "started")]), (1, [entry(0, 1)])):
+        (dumps / f"nccl_trace_rank_{rank}").write_bytes(pickle.dumps({
+            "entries": entries, "version": "2.8",
+            "pg_config": {"0": {"name": "0", "desc": "default_pg", "ranks": "[0, 1]"}}}))
+    evidence = tensorquill.build_evidence(records, flight_recorder=dumps, **kwargs)
+    kinds = {i["kind"] for i in evidence["incidents"]}
+    assert {"rank_silent", "collective_hang", "traincheck_violation", "resume_lr_change"} <= kinds
+    out = tmp_path / "x.rrd"
+    tensorquill.export_rerun(evidence, out, records=tensorquill.load_records(records))
+    assert out.stat().st_size > 0
+    assert tensorquill.incident_summary(evidence).count("\n") >= 3

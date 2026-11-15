@@ -99,7 +99,7 @@ async fn run(args: Args) -> Result<(), Error> {
     }
     flusher.abort();
     watchdog.abort();
-    ingest.write_watchdog().await; // the last word on each run before the server stops
+    ingest.write_watchdog_stopped().await; // each status says the server stopped, not a stale verdict
     ingest.shutdown().await?;
     Ok(())
 }
