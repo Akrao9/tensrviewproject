@@ -322,15 +322,33 @@ def _spiking_parameters(
     return found[:10]
 
 
+def _optimizer_evidence(ownership: Mapping[str, Any] | None, stalled: list[str]) -> dict[str, Any]:
+    if not ownership:
+        return {"state": "unknown", "reason": "not recorded by this capture"}
+    if ownership.get("state") != "known":
+        return {"state": "unknown", "reason": ownership.get("reason", "not established")}
+    unheld = set(ownership.get("unheld", ()))
+    not_held = [name for name in stalled if name in unheld]
+    if ownership.get("unheld_count", 0) > len(unheld) and not not_held:
+        # Only the first names are recorded; a stalled parameter may be among the rest.
+        return {"state": "unknown", "reason": "the list of parameters no optimizer holds was cut short"}
+    return {"state": "known", "not_held": not_held[:20], "not_held_count": len(not_held),
+            "held_count": len(stalled) - len(not_held)}
+
+
 def detect_stalled_weights(
     records: list[dict[str, Any]], *, steps: int = STALL_STEPS
 ) -> dict[str, Any] | None:
     """Return the first step where parameters with a gradient stopped changing, or None.
 
     Uses `weights_unchanged`, which the capture sets when a parameter's float64 norm is
-    exactly what it was at the previous weight check. A parameter is reported once that
-    holds on `steps` checks in a row while its gradient is finite and non-zero, for example because
-    it was left out of the optimizer. Steps with a non-finite gradient norm are skipped,
+    exactly what it was at the previous weight check. Equal norms are strong evidence
+    but not proof that the weights are equal, so this is a warning: it is reported once
+    that holds on `steps` checks in a row while the parameter's gradient is finite and
+    non-zero, and it says whether an optimizer that stepped holds the parameters
+    (`optimizer`: `known` with the stalled parameters no optimizer holds, or `unknown`
+    with the reason, for DeepSpeed, Megatron, FSDP1, `auto_step=False` or captures that
+    did not record it). A stalled parameter that no optimizer holds is the likely cause. Steps with a non-finite gradient norm are skipped,
     because mixed-precision loss scaling skips those optimizer steps on purpose. Captures
     without `weights_unchanged` (older files, or Apple MPS) are not checked: a float32 norm
     stays the same while bf16 weights change by a few elements.
@@ -363,6 +381,7 @@ def detect_stalled_weights(
                     "stalled": len(stalled),
                     "with_gradients": sum(1 for v in grads.values() if (_finite(v) or 0) > 0),
                     "consecutive": steps,
+                    "optimizer": _optimizer_evidence(record.get("optimizer_ownership"), stalled),
                 }
     if first is not None:
         first["stalled_steps"] = stalled_steps
@@ -1178,11 +1197,24 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
     if kind == "stalled_weights":
         names = ", ".join(incident["parameters"][:3])
         extra = incident["stalled"] - min(3, incident["stalled"])
+        optimizer = incident.get("optimizer") or {"state": "unknown", "reason": "not recorded by this capture"}
+        if optimizer["state"] != "known":
+            held = f"; whether an optimizer holds them is unknown ({optimizer['reason']})"
+        elif optimizer["not_held_count"] == incident["stalled"]:
+            held = "; no optimizer that stepped holds any of them, the likely cause"
+        elif optimizer["not_held_count"]:
+            held = f"; no optimizer holds {optimizer['not_held_count']} of them, the likely cause for those"
+        else:
+            held = (
+                "; an optimizer holds all of them, so check for updates too small for the weight"
+                " dtype (bf16) or a zero learning rate"
+            )
         return (
-            f"Weights not updating from step {incident['step']}: {incident['stalled']} of"
-            f" {incident['with_gradients']} parameters with gradients were exactly unchanged for"
-            f" {incident['consecutive']} weight checks in a row ({names}{f', and {extra} more' if extra > 0 else ''});"
-            f" {incident['stalled_steps']} step{'s' if incident['stalled_steps'] != 1 else ''} affected"
+            f"Weights possibly not updating from step {incident['step']}: {incident['stalled']} of"
+            f" {incident['with_gradients']} parameters with gradients had a float64 norm that did not change for"
+            f" {incident['consecutive']} weight checks in a row ({names}{f', and {extra} more' if extra > 0 else ''})"
+            f"{held}; {incident['stalled_steps']} step{'s' if incident['stalled_steps'] != 1 else ''} affected."
+            " Equal norms do not prove the weights are equal"
         )
     if kind == "activation_spike":
         top = incident["modules"][0]

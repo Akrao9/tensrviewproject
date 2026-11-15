@@ -457,6 +457,68 @@ def test_parameter_left_out_of_the_optimizer_is_reported(toy_moe):
     hit = tensorquill.detect_stalled_weights(sink.records)
     assert hit is not None and hit["step"] == 3
     assert sorted(hit["parameters"]) == ["out.bias", "out.weight"]
+    # No optimizer that stepped holds them: the likely cause, said as such.
+    assert hit["optimizer"]["state"] == "known"
+    assert sorted(hit["optimizer"]["not_held"]) == ["out.bias", "out.weight"]
+    assert hit["optimizer"]["held_count"] == 0
+    summary = tensorquill.incident_summary(tensorquill.build_evidence(sink.records))
+    assert "no optimizer that stepped holds any of them" in summary
+    assert "do not prove the weights are equal" in summary
+
+
+def _run_with_optimizer(toy_moe, make_optimizer, **init_kwargs):
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(toy_moe, sink=sink, every=2, weights=1, routers={"router": 4}, **init_kwargs)
+    opt = make_optimizer(toy_moe)
+    for _ in range(5):
+        opt.zero_grad()
+        toy_moe(torch.randn(16, 8)).sum().backward()
+        opt.step()
+        if not session.auto_step:
+            session.step()
+    session.close()
+    return sink
+
+
+def test_a_stalled_parameter_an_optimizer_holds_points_away_from_the_optimizer(toy_moe):
+    # Every parameter is held but the learning rate is zero: the cause is not ownership.
+    sink = _run_with_optimizer(toy_moe, lambda m: torch.optim.SGD(m.parameters(), lr=0.0))
+    hit = tensorquill.detect_stalled_weights(sink.records)
+    assert hit["optimizer"] == {"state": "known", "not_held": [], "not_held_count": 0, "held_count": hit["stalled"]}
+    assert "an optimizer holds all of them" in tensorquill.incident_summary(tensorquill.build_evidence(sink.records))
+
+
+def test_ownership_is_unknown_when_it_cannot_be_established(toy_moe):
+    # Hooks off: nothing was seen stepping.
+    sink = _run_with_optimizer(toy_moe, lambda m: torch.optim.SGD(m.parameters(), lr=0.0), auto_step=False)
+    hit = tensorquill.detect_stalled_weights(sink.records)
+    assert hit["optimizer"]["state"] == "unknown" and "auto_step=False" in hit["optimizer"]["reason"]
+    summary = tensorquill.incident_summary(tensorquill.build_evidence(sink.records))
+    assert "whether an optimizer holds them is unknown" in summary
+
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(toy_moe, sink=sink, every=2, weights=1, routers={"router": 4}, auto_step=False)
+    assert session._optimizer_ownership()["state"] == "unknown"
+    session.close()
+
+    # Records from before ownership was recorded.
+    old = [{"run_id": "w", "step": s, "grad_norm": 1.0, "grad_norms": {"a": 1.0},
+            "weight_norms": {"a": 1.0}, "weights_unchanged": ["a"]} for s in range(4)]
+    assert tensorquill.detect_stalled_weights(old)["optimizer"] == {
+        "state": "unknown", "reason": "not recorded by this capture"}
+
+
+def test_ownership_unknown_when_the_optimizer_holds_none_of_the_models_parameters(toy_moe):
+    other = torch.nn.Linear(2, 2)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(toy_moe, sink=sink, every=2, weights=1, routers={"router": 4})
+    opt = torch.optim.SGD(other.parameters(), lr=0.1)  # steps, but not this model's parameters
+    for _ in range(3):
+        other(torch.randn(3, 2)).sum().backward()
+        opt.step()
+    assert session._optimizer_ownership() == {
+        "state": "unknown", "reason": "no optimizer that has stepped holds this model's parameters"}
+    session.close()
 
 
 def test_repeated_steps_after_resume_and_start_step(toy_moe):

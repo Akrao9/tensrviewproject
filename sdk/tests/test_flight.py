@@ -276,6 +276,7 @@ def test_records_round_trip_through_the_arrow_schema():
             moe_top_k={"router": 2},
             moe_stats={"router": {"routed_tokens": 8, "entropy": 0.6}},
             probe={"blocks.0": {"hist": [1, 2, 3]}},
+            optimizer_ownership={"state": "known", "unheld": ["w"], "unheld_count": 1},
             something_new={"added": "later"},
         ),
         {"run_id": "run-a", "rank": 0, "step": 2, "lr": "not a list"},  # an old or odd record

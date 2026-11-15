@@ -103,6 +103,8 @@ def test_a_capture_file_reaches_parquet_unchanged(tmp_path, toy_moe, monkeypatch
         stored = stored_records(store, "e2e")
         assert stored == written
         assert any("probe" in r for r in stored) and any("weight_norms" in r for r in stored)
+        # Optimizer ownership travels in extra_json and must survive the server.
+        assert any(r.get("optimizer_ownership", {}).get("state") == "known" for r in stored)
         assert any(r["scalars"]["nan_now_and_then"] == "nan" for r in stored)
         # The detectors read the same thing from either side.
         assert tensorquill.build_evidence(stored) == tensorquill.build_evidence(written)

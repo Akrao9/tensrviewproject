@@ -414,7 +414,7 @@ class Session:
         self._ring_act = torch.zeros(every, n_layers, _SEEN + 1, **f32)
         self._ring_grad = torch.zeros(every, *self._grad.shape, **f32)
         self._ring_grad_seen: list[bool] = []
-        self._ring_weight_seen: list[bool] = []
+        self._ring_weight_seen: list[Any] = []  # False, or the weight check's optimizer ownership
         # Squared total gradient norm reported by gradient clipping this step (summed over
         # calls, for models clipped in several groups), and its ring.
         self._clip = torch.zeros((), **f32)
@@ -510,6 +510,29 @@ class Session:
             )
             self._owned[optimizer] = owned
         return owned
+
+    def _optimizer_ownership(self) -> dict[str, Any]:
+        """Whether an optimizer that has stepped holds each trainable parameter, read at a
+        weight check. Ownership can only be established from optimizers seen stepping, so it
+        is reported as unknown, never as "not held", when that is not the case: the optimizer
+        hooks are off (`auto_step=False`), or no optimizer that stepped holds any of this
+        model's parameters (DeepSpeed ZeRO, Megatron and FSDP1 step flattened or copied
+        parameters). A parameter left out on purpose also shows as not held; the detector
+        only uses this to explain a stalled norm, never as an alarm of its own.
+        """
+        if not self.auto_step:
+            return {"state": "unknown", "reason": "optimizer hooks are off (auto_step=False)"}
+        held: set[int] = set()
+        seen = False
+        for optimizer in list(self._owned):
+            ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+            if ids & self._param_ids:
+                seen = True
+                held |= ids
+        if not seen:
+            return {"state": "unknown", "reason": "no optimizer that has stepped holds this model's parameters"}
+        unheld = [name for name, p in zip(self.param_names, self._params) if id(p) not in held]
+        return {"state": "known", "unheld": unheld[:20], "unheld_count": len(unheld)}
 
     def _should_record_grads(self) -> bool:
         # Weight checks need the step's gradient norms, so they also turn gradients on.
@@ -839,7 +862,7 @@ class Session:
             self._ring_grad[row].copy_(self._grad)
             self._grad.zero_()
         self._ring_grad_seen.append(self._grads_recorded)
-        self._ring_weight_seen.append(weights_checked)
+        self._ring_weight_seen.append(self._optimizer_ownership() if weights_checked else False)
         if self._clip_recorded:
             self._ring_clip[row].copy_(self._clip)
             self._clip.zero_()
@@ -1023,7 +1046,7 @@ class Session:
         clips: torch.Tensor | None,
         clip_seen: list[bool],
         grad_seen: list[bool],
-        weight_seen: list[bool],
+        weight_seen: list[Any],
         spread_seen: list[bool],
         scalars: list[dict[str, Any]] | None = None,
         probes: list[dict[str, Any] | None] | None = None,
@@ -1082,6 +1105,8 @@ class Session:
                 record["weight_norms"] = {
                     name: row[2] for name, row in zip(self.param_names, grad[i])
                 }
+                if isinstance(weight_seen[i], dict):
+                    record["optimizer_ownership"] = weight_seen[i]
                 if self.param_names and grad[i][0][3] >= 0:
                     record["weights_unchanged"] = [
                         name for name, row in zip(self.param_names, grad[i]) if row[3] > 0

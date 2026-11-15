@@ -227,7 +227,7 @@ What the summary can report:
 - **MoE collapse or overload** at a step and layer, with the experts involved.
 - **Starved experts**: experts that got almost no tokens over 50 steps. A pretrained model can arrive with some; on Granite, 20 came that way.
 - **Gradient spikes**: a step at 5 times the recent median, and in full capture the parameter where it started.
-- **Weights not updating** (full capture): parameters with gradients that the optimizer left exactly unchanged. In pure-bf16 training without float32 master weights, RMSNorm weights near 1.0 show up here because their updates round away.
+- **Weights not updating** (full capture): parameters with gradients whose float64 norm did not change (a warning, not proof the weights are equal; the incident says whether an optimizer holds them, or that it cannot tell, as under DeepSpeed ZeRO). In pure-bf16 training without float32 master weights, RMSNorm weights near 1.0 show up here because their updates round away.
 - **Activation spikes, drift or dead outputs** (full capture): a block whose largest value or spread jumps or drifts far from its own history, or whose outputs turn to zero.
 - **Repeated steps, NaN or Inf, cross-GPU drift.**
 
