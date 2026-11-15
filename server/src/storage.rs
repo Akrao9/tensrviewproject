@@ -17,7 +17,11 @@ use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics;
 
-const FOOTER_PREFETCH_BYTES: usize = 8 * 1024;
+/// The first read from the end of a part. The server's own parts have footers of about
+/// 7.2 to 7.7 KiB (measured Nov 14, 2026 on router-only and full captures), and longer
+/// statistics or more columns make them grow; 64 KiB leaves room and stays small next to
+/// a part. A larger footer costs a second read, never a wrong answer.
+const FOOTER_PREFETCH_BYTES: usize = 64 * 1024;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -101,8 +105,10 @@ impl Storage {
         named.retain(|(step, _, _)| step.is_none() || *step == newest);
         let mut max = None;
         for (_, path, size) in named {
-            // Keep default PageIndexPolicy::Skip so suffix prefetching issues a single tail read
-            // for row-group step Statistics and avoids the arrow-rs#11207 page-index offset bug.
+            // The default PageIndexPolicy::Skip: the row-group statistics in the footer hold
+            // the step range, so the page indexes, stored before the footer, are never fetched.
+            // (Loading them after a suffix read sliced the wrong bytes before parquet 60.0,
+            // arrow-rs#11207, fixed by #11208; the pinned 60.1.0 has the fix.)
             let metadata = ParquetMetaDataReader::new()
                 .with_prefetch_hint(Some(FOOTER_PREFETCH_BYTES))
                 .load_via_suffix_and_finish(FooterSuffixFetch {
@@ -346,7 +352,7 @@ mod tests {
         let spy = Arc::new(SpyStore::new(local, false));
         let storage = Storage::new(spy.clone(), Path::from("prefix"));
 
-        let batch = make_batch(0..300, 128);
+        let batch = make_batch(0..300, 512);
         let path = storage.write_part("run-1", 0, 1, &[batch], 0, 299).await.unwrap();
         let meta = spy.head(&path).await.unwrap();
         assert!(
@@ -405,7 +411,7 @@ mod tests {
         let spy = Arc::new(SpyStore::new(Arc::new(InMemory::new()), true));
         let storage = Storage::new(spy.clone(), Path::from("root"));
 
-        let batch = make_batch(0..300, 128);
+        let batch = make_batch(0..300, 512);
         let path = storage.write_part("run-1", 0, 1, &[batch], 0, 299).await.unwrap();
         let meta = spy.head(&path).await.unwrap();
         assert!(meta.size > FOOTER_PREFETCH_BYTES as u64);
@@ -427,8 +433,8 @@ mod tests {
         let spy = Arc::new(SpyStore::new(Arc::new(InMemory::new()), false));
         let storage = Storage::new(spy.clone(), Path::from("root"));
 
-        // Many small batches written as separate row groups produce a Thrift footer > 8 KiB.
-        let batches: Vec<RecordBatch> = (0..120).map(|step| make_batch(step..step + 1, 8)).collect();
+        // Many small batches written as separate row groups produce a Thrift footer larger than the first read.
+        let batches: Vec<RecordBatch> = (0..1200).map(|step| make_batch(step..step + 1, 8)).collect();
         let properties = WriterProperties::builder().set_max_row_group_row_count(Some(1)).build();
         let mut buf = Vec::new();
         let mut writer = ArrowWriter::try_new(&mut buf, batches[0].schema(), Some(properties)).unwrap();
@@ -439,11 +445,11 @@ mod tests {
         writer.close().unwrap();
         let path = storage
             .attempt_dir("run-1", 0, 1)
-            .join("part-00000000-00000119.parquet");
+            .join("part-00000000-00001199.parquet");
         spy.put(&path, PutPayload::from(Bytes::from(buf))).await.unwrap();
 
         let max = storage.max_step("run-1", 0, 1).await.unwrap();
-        assert_eq!(max, Some(119));
+        assert_eq!(max, Some(1199));
         let gets = spy.recorded_gets();
         assert_eq!(
             gets.len(),
