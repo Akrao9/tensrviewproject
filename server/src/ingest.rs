@@ -344,8 +344,8 @@ impl Ingest {
         };
         if !appended {
             // The first part since this server started, or rows that are not a plain
-            // continuation (a resume that rolled steps back, an older attempt's rows sent
-            // late): rebuild from everything stored, which includes this part.
+            // continuation (a new attempt, an older attempt's rows sent late): rebuild
+            // from everything stored, which includes this part.
             let replayed = std::panic::AssertUnwindSafe(crate::detect::replay(&self.storage, &key.0, key.1))
                 .catch_unwind()
                 .await;
@@ -377,7 +377,7 @@ impl Ingest {
             "steps": detectors.rows(),
             "rebuilds": buffer.rebuilds,
             "checked": crate::detect::PORTED,
-            "not_checked": crate::detect::NOT_PORTED,
+            "not_checked": detectors.not_checked(),
             "thresholds": crate::detect::thresholds(),
             "moe_flagged": detectors.moe_flagged(),
             "incidents": detectors.incidents(),

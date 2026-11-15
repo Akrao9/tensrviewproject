@@ -456,7 +456,7 @@ pub fn run_status(
     let longest = pauses.values().map(|stats| stats.max).fold(0.0_f64, f64::max);
     // Twice the longest pause seen, never below the floor: a measurement, not a guarantee.
     let recommended = (longest > 0.0).then(|| (longest * 2.0).ceil().max(config.silent_floor.as_secs_f64()));
-    json!({
+    let mut status = json!({
         "schema_version": 1,
         "run_id": run_id,
         "written_at_ms": written_at_ms,
@@ -475,12 +475,151 @@ pub fn run_status(
         "missing_ranks": missing,
         "summary": summary,
         "ranks": ranks,
-    })
+    });
+    status["incidents"] = json!(incidents(&status));
+    status
+}
+
+/// A status as incidents: Python's `detect_watchdog_incidents`. `job_stalled` when no rank
+/// is making progress, `rank_silent` when some are silent, lost or never connected while
+/// others go on. These are observations of the stream the server receives; the cause is
+/// not known, and a hang is only ever suspected from the stream alone.
+pub fn incidents(status: &Value) -> Vec<Value> {
+    let summary = status["summary"].as_str().unwrap_or_default();
+    if summary != "stalled" && summary != "degraded" {
+        return Vec::new();
+    }
+    let ranks: &[Value] = status["ranks"].as_array().map_or(&[], Vec::as_slice);
+    let state = |rank: &Value| rank["state"].as_str().unwrap_or_default().to_owned();
+    let stopped: Vec<&Value> = ranks
+        .iter()
+        .filter(|rank| matches!(state(rank).as_str(), "silent" | "lost" | "unresponsive"))
+        .collect();
+    let assessment = if stopped.iter().any(|rank| state(rank) != "lost") {
+        "suspected_hang"
+    } else if !stopped.is_empty() {
+        "lost_connection"
+    } else {
+        "ranks_never_connected"
+    };
+    let severity = if stopped.iter().any(|rank| rank["severity"] == "critical") {
+        "critical"
+    } else {
+        "warning"
+    };
+    let last_steps = |ranks: &mut dyn Iterator<Item = &Value>| -> Vec<i64> {
+        ranks.filter_map(|rank| rank["last_step"].as_i64()).collect()
+    };
+    let newest = last_steps(&mut ranks.iter()).into_iter().max().unwrap_or(0);
+    let mut incident = json!({
+        "severity": severity,
+        "assessment": assessment,
+        "written_at_ms": status["written_at_ms"],
+        "silent_floor_seconds": status["silent_floor_seconds"],
+        "critical_seconds": status["critical_seconds"],
+        "world_size": status["world_size"],
+        "missing_ranks": status["missing_ranks"],
+    });
+    if summary == "stalled" {
+        incident["kind"] = json!("job_stalled");
+        incident["step"] = json!(newest);
+        incident["ranks"] = ranks.iter().filter(|rank| state(rank) != "finished").cloned().collect();
+    } else {
+        incident["kind"] = json!("rank_silent");
+        incident["step"] = json!(last_steps(&mut stopped.iter().copied())
+            .into_iter()
+            .min()
+            .unwrap_or(newest));
+        incident["ranks"] = json!(stopped);
+        incident["newest_step"] = json!(newest);
+    }
+    vec![incident]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_status_is_read_as_incidents_the_way_python_reads_it() {
+        let rank = |rank: i64, state: &str, severity: Value, last_step: Value| json!({"rank": rank, "state": state, "severity": severity, "last_step": last_step});
+        let status = |summary: &str, ranks: Vec<Value>, missing: Value| {
+            json!({"summary": summary, "ranks": ranks, "missing_ranks": missing, "written_at_ms": 7,
+                   "silent_floor_seconds": 300.0, "critical_seconds": 900.0, "world_size": 3})
+        };
+        // Nothing to report while the run is active, finished or the server stopped.
+        for summary in ["active", "finished", "server_stopped"] {
+            assert!(incidents(&status(
+                summary,
+                vec![rank(0, "silent", json!("warning"), json!(5))],
+                json!([])
+            ))
+            .is_empty());
+        }
+        // One rank lost and one silent while a third goes on: the oldest of the stopped steps.
+        let found = incidents(&status(
+            "degraded",
+            vec![
+                rank(0, "active", Value::Null, json!(90)),
+                rank(1, "lost", json!("critical"), json!(40)),
+                rank(2, "silent", json!("warning"), json!(60)),
+            ],
+            json!([]),
+        ));
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (
+                &found[0]["kind"],
+                &found[0]["step"],
+                &found[0]["newest_step"],
+                &found[0]["assessment"],
+                &found[0]["severity"]
+            ),
+            (
+                &json!("rank_silent"),
+                &json!(40),
+                &json!(90),
+                &json!("suspected_hang"),
+                &json!("critical")
+            )
+        );
+        assert_eq!(found[0]["ranks"].as_array().unwrap().len(), 2);
+        // Every rank stopped: the newest step, and the finished ranks are left out.
+        let found = incidents(&status(
+            "stalled",
+            vec![
+                rank(0, "finished", Value::Null, json!(99)),
+                rank(1, "lost", json!("warning"), json!(40)),
+            ],
+            json!([2]),
+        ));
+        assert_eq!(
+            (
+                &found[0]["kind"],
+                &found[0]["step"],
+                &found[0]["assessment"],
+                &found[0]["missing_ranks"]
+            ),
+            (
+                &json!("job_stalled"),
+                &json!(99),
+                &json!("lost_connection"),
+                &json!([2])
+            )
+        );
+        assert_eq!(found[0]["ranks"].as_array().unwrap().len(), 1);
+        assert!(found[0].get("newest_step").is_none());
+        // A rank that never connected and has no step yet.
+        let found = incidents(&status(
+            "degraded",
+            vec![rank(0, "starting", Value::Null, Value::Null)],
+            json!([1, 2]),
+        ));
+        assert_eq!(
+            (&found[0]["step"], &found[0]["assessment"], &found[0]["severity"]),
+            (&json!(0), &json!("ranks_never_connected"), &json!("warning"))
+        );
+    }
 
     fn key(rank: i32) -> Key {
         ("run".to_string(), rank)

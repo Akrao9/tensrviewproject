@@ -350,6 +350,9 @@ def test_a_killed_rank_is_lost_and_named_while_the_other_stays_active(cluster):
     assert [r["rank"] for r in incident["ranks"]] == [1] and incident["ranks"][0]["state"] == "lost"
     assert incident["step"] == lost_at and incident["newest_step"] > lost_at
     assert incident["missing_ranks"] == [] and incident["assessment"] == "lost_connection"
+    # The server writes the same incident into the status itself.
+    assert later["incidents"] == tensorquill.evidence.detect_watchdog_incidents(later)
+    assert [(i["kind"], i["step"], i["assessment"]) for i in later["incidents"]] == [("rank_silent", lost_at, "lost_connection")]
     assert "rank 1 sent no new step since step" in tensorquill.incident_summary(evidence)
 
     # What the killed rank had delivered is in Parquet, whole and in order, a prefix of its file.
@@ -388,6 +391,8 @@ def test_a_rank_that_never_starts_is_named_by_world_size_while_the_other_runs(cl
     assert incident["missing_ranks"] == [missing] and incident["ranks"] == []
     assert incident["assessment"] == "ranks_never_connected" and incident["world_size"] == 2
     assert incident["step"] == incident["newest_step"] > 0
+    assert later["incidents"] == tensorquill.evidence.detect_watchdog_incidents(later)
+    assert [(i["kind"], i["assessment"]) for i in later["incidents"]] == [("rank_silent", "ranks_never_connected")]
     assert f"{missing} never connected" in tensorquill.incident_summary(evidence)
 
     # The rank that ran closes cleanly; with the other never seen, the run is not finished.

@@ -330,6 +330,7 @@ def test_the_server_calls_a_job_that_goes_quiet_stalled_and_evidence_says_so(tmp
         evidence = tensorquill.build_evidence(run_dir)
         [incident] = [i for i in evidence["incidents"] if i["kind"] == "job_stalled"]
         assert incident["step"] == 39
+        assert [i["kind"] for i in same_incidents_as_python(status)] == ["job_stalled"]
         # Training resumes and finishes: the next status says so.
         session.close()
         deadline = time.monotonic() + 10
@@ -338,7 +339,7 @@ def test_the_server_calls_a_job_that_goes_quiet_stalled_and_evidence_says_so(tmp
             if status["summary"] == "finished":
                 break
             time.sleep(0.2)
-        assert status["summary"] == "finished"
+        assert status["summary"] == "finished" and same_incidents_as_python(status) == []
     finally:
         assert server.terminate() == 0
 
@@ -382,12 +383,21 @@ def test_a_job_that_dies_without_closing_is_lost_not_finished(tmp_path, how):
         assert status and status["ranks"][0]["state"] == "lost", status
         assert status["ranks"][0]["stream"] == "dropped"  # never "finished": nobody called close()
         assert status["summary"] == "stalled" and status["ranks"][0]["last_step"] >= 49
+        [incident] = same_incidents_as_python(status)
+        assert (incident["kind"], incident["assessment"]) == ("job_stalled", "lost_connection")
     finally:
         assert server.terminate() == 0
 
 
 def _status_of(run_dir):
     return tensorquill.evidence.read_watchdog(run_dir / "watchdog.json")
+
+
+def same_incidents_as_python(status):
+    """The server writes the status as incidents too; Python's reading of the same status
+    is the reference."""
+    assert status["incidents"] == tensorquill.evidence.detect_watchdog_incidents(status), status
+    return status["incidents"]
 
 
 def _wait_for(run_dir, ready, seconds=20):
@@ -431,6 +441,10 @@ def test_evaluation_is_paused_and_measured_but_a_quiet_training_phase_is_a_suspe
         evidence = tensorquill.build_evidence(run_dir)
         [incident] = [i for i in evidence["incidents"] if i["kind"] == "job_stalled"]
         assert (incident["severity"], incident["assessment"]) == ("critical", "suspected_hang")
+        status = _status_of(run_dir)
+        if status["summary"] == "stalled":  # read a moment later than the evidence was
+            [written] = same_incidents_as_python(status)
+            assert (written["severity"], written["assessment"]) == ("critical", "suspected_hang")
         assert "Pauses the job reported: eval up to" in tensorquill.incident_summary(evidence)
         session.close()
         _wait_for(run_dir, lambda s: s["summary"] == "finished")
