@@ -417,9 +417,9 @@ def test_a_rank_that_starts_after_being_reported_missing_stops_being_missing(clu
 
 
 def test_a_server_killed_and_restarted_under_two_streaming_ranks_loses_and_repeats_nothing(cluster):
-    # A long flush interval: when the server is killed it holds steps only in memory, steps the
-    # ranks have sent but that were never confirmed.
-    flags = ("--flush-seconds", "30", "--watchdog-seconds", "0.2")
+    # A long flush interval and no step threshold: when the server is killed it holds steps only
+    # in memory, steps the ranks have sent but that were never confirmed.
+    flags = ("--flush-seconds", "30", "--flush-steps", "1000000", "--watchdog-seconds", "0.2")
     server = cluster.start_server(*flags)
     port = server.port
     ranks = [cluster.start_rank(0), cluster.start_rank(1)]
@@ -427,8 +427,12 @@ def test_a_server_killed_and_restarted_under_two_streaming_ranks_loses_and_repea
     assert cluster.stored(0) == [] and cluster.stored(1) == []  # sent, but not stored
     server.kill()
     time.sleep(2)  # both ranks keep stepping with no server
+    restarted_ms = int(time.time() * 1000)
     cluster.start_server(*flags, port=port)
-    status = cluster.wait_for(lambda s: len(s["ranks"]) == 2 and all(r["state"] == "active" for r in s["ranks"]))
+    # The dead server left its last watchdog.json behind, both ranks active; only a status the
+    # new server wrote, after both ranks reconnected to it, counts.
+    status = cluster.wait_for(lambda s: s["written_at_ms"] > restarted_ms and s["server_running"]
+                              and len(s["ranks"]) == 2 and all(r["state"] == "active" for r in s["ranks"]))
     assert status["world_size"] == 2 and status["summary"] == "active"
     for started in ranks:
         started.finish()
