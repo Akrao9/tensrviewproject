@@ -84,7 +84,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Learning rate, global step and data position recorded per step, and a check that they continue across a restart.
 
-**TensorLens today.** Partly. `init(start_step=...)` continues the step numbers on resume, repeated step numbers are reported, and each step's learning rate is recorded. A check that the learning rate continues smoothly across a restart is not built.
+**TensorLens today.** Partly. `init(start_step=...)` continues the step numbers on resume, repeated step numbers are reported (a resume from an earlier checkpoint is recognised by its `attempt` and not reported; its records replace the ones it rolled back), and each step's learning rate is recorded. A check that the learning rate continues smoothly across a restart is not built.
 
 ### 7. Attention logit growth and entropy collapse
 

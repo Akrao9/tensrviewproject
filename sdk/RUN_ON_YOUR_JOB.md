@@ -10,7 +10,7 @@ From a clone of this repository, in the training job's Python environment:
 python -m pip install -e 'sdk[rerun]'
 ```
 
-Do not run `pip install tensorlens`: that name on PyPI belongs to an unrelated package. Keep the job's own PyTorch build. TensorLens needs PyTorch 2.6 or later and has been run with 2.10 and 2.14.
+Add extras in the same way when you need them: `sdk[lightning]`, `sdk[huggingface]` (Transformers and Accelerate), or `sdk[flight]` to stream to an ingest server. Do not run `pip install tensorlens`: that name on PyPI belongs to an unrelated package. Keep the job's own PyTorch build. TensorLens needs PyTorch 2.6 or later and has been run with 2.10 and 2.14.
 
 ## 2. Choose a capture mode
 
@@ -142,7 +142,7 @@ from tensorlens.huggingface import TensorLensCallback
 trainer = Trainer(model=model, args=args, train_dataset=data, callbacks=[TensorLensCallback(capture="full")])
 ```
 
-Install with `pip install 'tensorlens[huggingface]'`. `SFTTrainer` and the other TRL trainers subclass `Trainer` and take the same callback, but none has been run with it.
+Install with `python -m pip install -e 'sdk[huggingface]'`. `SFTTrainer` and the other TRL trainers subclass `Trainer` and take the same callback, but none has been run with it.
 
 - **Run ID.** `Trainer` starts the W&B or MLflow run on the main process only; the callback reads it there and broadcasts it to the other ranks.
 - **Steps** are counted from optimizer steps, like `global_step`, and start at `state.global_step`, so a resumed run continues the numbering.
@@ -232,6 +232,8 @@ What the summary can report:
 - **Repeated steps, NaN or Inf, cross-GPU drift.**
 
 Each incident also lists what you logged with `session.log` at its step, next to the median of the previous 50 values, so you can see whether the loss moved.
+
+If you streamed to `tensorlens-server`, point the same command at the run's directory in the store, `python -m tensorlens <store>/runs/<run_id>`; add `--rank <n>` for a rank other than 0. Add `--watch` to keep it running while the job trains: it re-reads the input every 2 seconds and replaces the evidence file.
 
 The thresholds are first guesses from one model, so treat a report as something to check, not a verdict.
 

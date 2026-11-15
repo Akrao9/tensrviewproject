@@ -7,7 +7,7 @@ only when the server acknowledges that the bytes are stored. Nothing here runs o
 training thread, and a server that is down, slow or full only delays the stream: the
 sender keeps no backlog in memory and re-reads the file from the saved offset.
 
-`pyarrow` is imported only when an endpoint is set (`pip install "tensorlens[flight]"`).
+`pyarrow` is imported only when an endpoint is set (`pip install pyarrow`).
 """
 
 from __future__ import annotations
@@ -629,6 +629,6 @@ def attach(
         )
     except ImportError as error:
         raise ImportError(
-            'endpoint= needs pyarrow: pip install "tensorlens[flight]"'
+            'endpoint= needs pyarrow: pip install pyarrow'
         ) from error
     return StreamingSink(sink, sender)

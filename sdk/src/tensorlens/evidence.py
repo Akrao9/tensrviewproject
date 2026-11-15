@@ -508,7 +508,7 @@ def load_records(
     `source` is a `.jsonl` file from `tensorlens.init`, a directory of the Parquet parts
     `tensorlens-server` wrote (a run's `runs/<run_id>` directory, or a `rank=<rank>`
     directory inside it), one `.parquet` part, or an iterable of dicts. Reading Parquet
-    needs `pyarrow` (`pip install "tensorlens[flight]"`) and gives the same dicts as the
+    needs `pyarrow` (`pip install pyarrow`) and gives the same dicts as the
     `.jsonl` file the parts were streamed from.
 
     `rank` keeps one rank's records. When a job resumed from an earlier checkpoint under
@@ -583,7 +583,7 @@ def _read_part(path: Path) -> list[dict[str, Any]]:
     try:
         import pyarrow.parquet as pq
     except ImportError as error:
-        raise ImportError('reading Parquet parts needs pyarrow: pip install "tensorlens[flight]"') from error
+        raise ImportError('reading Parquet parts needs pyarrow: pip install pyarrow') from error
     from .flight import row_to_record
 
     return [row_to_record(row) for row in pq.read_table(path).to_pylist()]

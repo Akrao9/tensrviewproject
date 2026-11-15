@@ -1233,7 +1233,7 @@ def init(
         endpoint: also stream the local file to a `tensorlens-server`, as `grpc://host:port`
             or `grpcs://host:port`. Defaults to `TENSORLENS_ENDPOINT`; when neither is set
             no socket is opened. For custom/self-signed server certificates under `grpcs://`,
-            set `TENSORLENS_TLS_CA` to the PEM CA path. Needs `pip install "tensorlens[flight]"`.
+            set `TENSORLENS_TLS_CA` to the PEM CA path. Needs `pip install pyarrow`.
             See `flight.py`.
         layers: which modules' outputs to summarize. In full capture, `"blocks"`: each repeated
             block, such as each transformer layer, or every leaf module with parameters if

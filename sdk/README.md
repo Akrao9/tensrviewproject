@@ -52,6 +52,7 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 | Logged scalars (`session.log`) attached to incidents and plotted in Rerun | Built, tested on CPU and Apple MPS; not run on a GPU |
 | Opt-in streaming (`endpoint=` or `TENSORLENS_ENDPOINT`, `tensorlens/flight.py`): a daemon thread tails the rank's `.jsonl` file from `<run_id>.rank<rank>.offset` and sends it over Arrow Flight `DoPut` | Built, tested on CPU against a stand-in server and the real `tensorlens-server` on loopback: torn lines, offset resume, duplicate resend, a refused batch, a server killed for 200 steps, and `grpcs://` with `--tls-cert`/`--tls-key` and `TENSORLENS_TLS_CA`. Not run to a remote host or from a GPU job |
 | Ingest server (`../server`, binary `tensorlens-server`): `DoPut`, `(run_id, rank, attempt, step)` deduplication, 128 MiB buffer quota, Zstd Parquet parts through `object_store`, Bearer token, TLS | Built; `cargo test` passes on a local-disk store and TLS passes end-to-end on loopback. S3 and GCS have never run |
+| Detectors on the server's Parquet: `load_records` and `python -m tensorlens` read a run's parts directory, one rank's, or one part, and give the same evidence as the source `.jsonl`; `--watch` re-reads a growing file or directory every 2 seconds (`--interval`) and replaces the evidence by rename; `--rank` picks a rank | Built, tested on CPU, also through the real server binary |
 | Cross-GPU parameter fingerprints and replica spread (`parameter_fingerprints`, `replica_spread`) | Built, unit-tested on drift and sign-flip cases |
 | Detectors and Rerun exporter (`build_evidence`, `export_rerun`, `python -m tensorlens`) | Built, tested on MoE collapse (top-k aware), starved experts, gradient spikes, weights not updating, repeated steps, NaN/Inf, and replica drift |
 | Run ID from `run_id=`, `MLFLOW_RUN_ID`, the active MLflow run or the active W&B run; otherwise torchrun's or SLURM's job ID, or a generated `run-<UTC time>-<6 hex>` broadcast from rank 0, so separate untracked runs never append to the same file | Built, tested with stand-in tracker modules and two Gloo processes |
@@ -59,8 +60,8 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 
 ## What is not built or not verified
 
-- **Detectors on the server's Parquet: built, on local disk only.** `python -m tensorlens <store>/runs/<run_id>` reads the server's Parquet parts and gives the same evidence as the `.jsonl` file they were streamed from, and `--watch` re-reads either kind of input every 2 seconds (`--interval`) and replaces the evidence file by rename. A directory holding several ranks is read one rank at a time (`--rank`, default 0). Not built: reading parts from S3 or GCS (the reader takes a local path), and incremental detection: every update runs the detectors over the whole run again, which has not been timed on a long run.
-- **Streaming, not verified:** S3 and GCS stores, several ranks streaming at once, a remote server, a GPU job, and the 64-rank benchmark. A token from the Python sender, TLS on loopback (`--tls-cert`/`--tls-key` with `TENSORLENS_TLS_CA`), a non-zero rank, and forked `DataLoader` workers while the sender runs each pass an end-to-end test on macOS; forking has not run on Linux outside CI. In a forked child the sender does nothing: the fork copies the object but not its thread, so `close()` there returns at once and the parent keeps streaming. No deadlock was seen in either fork test, but gRPC's behaviour across `fork` differs by platform, so Linux is the result that counts. The sender's memory bound during an outage is measured with `tracemalloc`, which does not see gRPC's own allocations.
+- **Detectors on the server's Parquet, limits.** The reader takes a local path, so parts in S3 or GCS cannot be read yet. A directory holding several ranks is read one rank at a time. `--watch` reruns the detectors over the whole run on every update, which has not been timed on a long run.
+- **Streaming, not verified:** S3 and GCS stores, several ranks streaming at once, a remote server, a GPU job, and the 64-rank benchmark. A token from the Python sender, TLS on loopback (`--tls-cert`/`--tls-key` with `TENSORLENS_TLS_CA`), a non-zero rank, and forked `DataLoader` workers while the sender runs each pass an end-to-end test on macOS and on Linux in CI (as of `f30e639`). In a forked child the sender does nothing: the fork copies the object but not its thread, so `close()` there returns at once and the parent keeps streaming. No deadlock was seen in either fork test, but gRPC's behaviour across `fork` differs by platform, so a Linux machine with a CUDA job is still worth checking. The sender's memory bound during an outage is measured with `tracemalloc`, which does not see gRPC's own allocations.
 - **Replay** of a flagged batch (Tier 3). The probe pass (Tier 2) is built but has not run on a GPU.
 - **Multi-rank reporting.** Every rank writes its own file.
 - **Detector thresholds are untuned.** The gradient-spike factor (5× the median of the last 50 recorded steps), the top-k diversity drop (0.6 of its recent median), the starved-expert ratio and the stalled-weight check have been checked on synthetic cases and, for the MoE rules, on one Granite capture. Weight norms, learning rates and the spike and stalled-weight detectors have run on the Granite captures from the A100 and RTX PRO 6000 runs below, but not against a planted failure of their own kind on a GPU; the steps they flagged there are unconfirmed.
@@ -243,7 +244,7 @@ The Rerun export adds a Probe tab: the largest attention logit and `entropy_shar
 The local `.jsonl` file is always written and stays the source of truth. Streaming is off unless you set an endpoint, and then needs `pyarrow`:
 
 ```sh
-pip install 'tensorlens[flight]'
+pip install -e 'sdk[flight]'
 cargo build --release --manifest-path server/Cargo.toml
 server/target/release/tensorlens-server --listen 127.0.0.1:50051 --store file:///var/lib/tensorlens
 ```
@@ -289,6 +290,8 @@ python3 -m venv .venv
 .venv/bin/python -m pip install 'torch==2.14.1' -e './sdk[dev,rerun]'
 ```
 
+That environment skips the Lightning, Hugging Face, Accelerate and streaming tests. Before committing a change to an adapter or to streaming, run the tests with every extra installed and the server built, as CI does: `pip install -e './sdk[dev,lightning,huggingface,rerun,flight]'` and `cargo build --manifest-path server/Cargo.toml`. A change once passed locally and failed there because only the project environment was used.
+
 For CUDA dogfooding, use the training job's PyTorch build and CUDA environment.
 
 ```sh
@@ -308,7 +311,7 @@ CI ([ci.yml](../.github/workflows/ci.yml)) runs the tests on every push and pull
 The `Trainer` callback has its own acceptance check, a dense model fine-tuned through `transformers.Trainer` with `torch_compile=True`, clipping and fp16, with the same seeded outlier as `dense_outlier_check.py`. It exits non-zero unless every step, loss and clipping norm is recorded and agrees with what `Trainer` logs, the detector finds the outlier, and nothing recompiles:
 
 ```sh
-pip install 'tensorlens[huggingface]' pyarrow
+pip install -e 'sdk[huggingface,flight]'
 python examples/trainer_check.py --out runs/trainer-check
 ```
 
