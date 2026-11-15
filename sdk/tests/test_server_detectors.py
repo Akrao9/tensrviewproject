@@ -144,7 +144,10 @@ def everything(steps: int = 300) -> list[dict]:
         norms = {"w1": 0.6 * wobble(step, 1), "w2": 0.4 * wobble(step, 2)}
         if 147 <= step <= 150:  # w2 builds up to the spike at step 150
             norms["w2"] *= 1.5 ** (step - 146) * 3
-        if step in (150, 151, 220):
+        # Step 25 is five steps after clipping began. Python reads the clipped runs' norm
+        # from `clip_grad_norm` alone, so it has five values of history there and says
+        # nothing; a stream that kept the 20 steps before clipping would call it a spike.
+        if step in (25, 150, 151, 220):
             grad *= 8
             norms["w1"] *= 9 if step == 220 else 1
         values = {
@@ -167,7 +170,9 @@ def everything(steps: int = 300) -> list[dict]:
             values["clip_grad_norm"] = grad * 1.25  # read before clipping, so the spike shows here
         if step == 40:
             values["grad_norm"] = values["clip_grad_norm"] = float("nan")
-        if step == 90:
+        if step == 90:  # a skipped step with a huge but finite norm must not count as a spike
+            values.update(step_skipped=True, grad_norm=grad * 9, clip_grad_norm=grad * 9)
+        if step == 95:
             values.update(step_skipped=True, grad_norm=float("inf"), clip_grad_norm=float("inf"))
         out.append(record(step, **values))
     return out
@@ -264,6 +269,71 @@ def test_a_resume_takes_back_the_incidents_of_the_steps_it_rolled_back(tmp_path)
     assert [i["step"] for i in document["incidents"]] == [175]
     assert document["rebuilds"] == 3
     assert stream.server.terminate() == 0
+
+
+def moe_edges(steps: int = 30) -> list[dict]:
+    """Two MoE rules the long run does not reach: a top-k router that collapses before it
+    has a baseline (attributed by share), and dead experts with no expert overloaded."""
+    out = []
+    for step in range(steps):
+        early = [500] * 4 + [0] * 12 if 3 <= step < 6 else [125] * 16  # top-4 of 16
+        quiet = [300, 301, 299, 300, 300, 300, 0, 0] if step >= 12 else [225] * 8  # top-1 of 8
+        out.append(record(step, moe={"early": early, "quiet": quiet}, moe_top_k={"early": 4, "quiet": 1}))
+    return out
+
+
+def test_moe_rules_before_a_baseline_and_without_an_overloaded_expert(tmp_path):
+    records = moe_edges()
+    samples = {(s["step"], s["router"]): s for s in tensorquill.build_evidence(records)["samples"]}
+    assert samples[(3, "early")]["overload_rule"]["rule"] == "collapse" and samples[(3, "early")]["overloaded"] == [1, 2, 3, 4]
+    assert samples[(12, "quiet")]["dead"] == [7, 8] and samples[(12, "quiet")]["overloaded"] == []
+    stream = Stream(tmp_path, *FAST)
+    sent = 0
+    for upto in (3, 4, 10, 13, 30):
+        document = stream.send(records[sent:upto])
+        sent = upto
+        assert differences(reference(records[:upto]), document["incidents"]) == [], f"after {upto} steps"
+        assert document["moe_flagged"] == flagged(records[:upto]), f"after {upto} steps"
+    assert document["moe_flagged"] == {"samples": 3 + 18, "last_step": 29}
+    assert stream.server.terminate() == 0
+
+
+def test_the_gate_1_fixtures_give_the_same_incidents(tmp_path):
+    # The seven bake-off fixtures (four MoE shapes, a gradient spike, an activation
+    # outlier), each planted with one failure and made through the SDK's own pipeline.
+    import sys
+
+    bakeoff = Path(__file__).resolve().parents[2] / "experiments" / "moe-bakeoff"
+    if not (bakeoff / "generate.py").exists():
+        pytest.skip("the bake-off experiment is not in this checkout")
+    sys.path.insert(0, str(bakeoff))
+    try:
+        import generate
+    finally:
+        sys.path.remove(str(bakeoff))
+    server = Server(tmp_path / "store", 0, *FAST)
+    for name, fixture in generate.BY_NAME.items():
+        records = fixture.records()
+        run_id = records[0]["run_id"]
+        file = tmp_path / f"{name}.jsonl"
+        file.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        assert send_file(file, server.endpoint, run_id, timeout=60.0)
+        target = tmp_path / "store" / "runs" / run_id / "rank=0" / "incidents.json"
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                document = json.loads(target.read_text(encoding="utf-8"))
+                if document["last_step"] == records[-1]["step"]:
+                    break
+            except (FileNotFoundError, ValueError):
+                pass
+            assert time.monotonic() < deadline, name
+            time.sleep(0.05)
+        expected = reference(records)
+        assert len(expected) == 1, name  # each fixture has its one planted failure
+        assert differences(expected, document["incidents"]) == [], name
+        assert document["moe_flagged"] == flagged(records), name
+    assert server.terminate() == 0
 
 
 def test_no_detect_writes_no_incidents_file(tmp_path):
