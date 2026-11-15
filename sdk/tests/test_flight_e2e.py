@@ -282,7 +282,7 @@ def test_grpcs_streams_with_custom_ca_and_rejects_untrusted_server(tmp_path, toy
         _steps(untrusted, "untrusted", 0, range(3))
         bad_sender = FlightSender(untrusted, endpoint, "untrusted", 0)
         assert bad_sender.close(timeout=0.5) is False
-        assert bad_sender.last_error is not None
+        assert "certificate verify failed" in str(bad_sender.last_error)  # not some other failure
         assert not (store / "runs" / "untrusted").exists()
 
         # With TENSORLENS_TLS_CA pointing at the server certificate, streaming succeeds.

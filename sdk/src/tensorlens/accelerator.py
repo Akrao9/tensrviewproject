@@ -103,9 +103,15 @@ def _restore_if_unused() -> None:
 
 def _clip_grad_norm(self: Any, parameters: Any, *args: Any, **kwargs: Any) -> Any:
     original = _originals[0]  # type: ignore[index]
-    if not isinstance(parameters, torch.Tensor):
-        parameters = list(parameters)
-    first = parameters if isinstance(parameters, torch.Tensor) else next(iter(parameters), None)
+    if isinstance(parameters, torch.Tensor):
+        # Unlike torch's, Accelerate's clip_grad_norm_ (1.15 and 1.16.0.dev0) iterates a
+        # single tensor into its rows, which have no gradients, and returns 0. Recording
+        # that would be a false norm, so a bare tensor is passed through unrecorded.
+        norm = original(self, parameters, *args, **kwargs)
+        _restore_if_unused()
+        return norm
+    parameters = list(parameters)
+    first = next(iter(parameters), None)
     sessions = [
         w.session for w in _live()
         if w.session._clip_watched and first is not None and id(first) in w.session._param_ids

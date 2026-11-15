@@ -92,7 +92,9 @@ def test_another_models_accelerator_calls_are_not_recorded():
     assert sink.records[0]["clip_grad_norm"] > 0
 
 
-def test_clip_grad_norm_accepts_a_single_tensor():
+def test_a_single_tensor_is_clipped_as_accelerate_does_but_not_recorded():
+    # Accelerate iterates a bare tensor into rows and returns 0, where torch returns the
+    # real norm. TensorLens must neither fail nor record that 0 as the step's norm.
     accelerator, model, optimizer = _setup()
     sink = tensorlens.MemorySink()
     session = tensorlens.init(model, sink=sink, capture="full")
@@ -100,9 +102,10 @@ def test_clip_grad_norm_accepts_a_single_tensor():
     param = next(model.parameters())
     loss = model(torch.randn(4, 4)).pow(2).mean()
     accelerator.backward(loss)
-    accelerator.clip_grad_norm_(param, 0.05)
+    watched = accelerator.clip_grad_norm_(param, 1e9)
     optimizer.step()
+    session.close()  # restores Accelerate's own method
+    assert watched == accelerator.clip_grad_norm_(param, 1e9)  # what Accelerate itself returns
     optimizer.zero_grad()
-    session.close()
     assert len(sink.records) == 1
-    assert sink.records[0]["clip_grad_norm"] > 0
+    assert sink.records[0].get("clip_grad_norm") is None

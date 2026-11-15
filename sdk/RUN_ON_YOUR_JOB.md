@@ -168,6 +168,7 @@ watch_accelerator(session)
 - **Loss.** The loss passed to `accelerator.backward` is logged as `train/loss` for each optimizer step, as the mean over gradient-accumulation microbatches. `loss_name=None` turns it off; do that if two models train through Accelerate in one process, since every loss passed to `backward` counts.
 - **Mixed precision.** Pass `scaler=accelerator.scaler` to `init`; it is `None` when there is no scaler, which is fine.
 - **`init` refuses a model that is already compiled**, so call it before `accelerator.prepare` if Accelerate compiles the model.
+- **Clipping a single tensor** (`accelerator.clip_grad_norm_(weight, max_norm)`) is not recorded. Accelerate, unlike PyTorch, iterates a bare tensor into its rows and returns 0 for it, so there is no real norm to record. Pass a list (`[weight]`) or `model.parameters()`.
 - Watching stops when the session closes. It wraps two `Accelerator` methods for the whole process in the meantime.
 
 Tested on CPU, one process, with Accelerate 1.15.0 and 1.16.0.dev0, with gradient accumulation and a learning-rate scheduler. Not run: mixed precision, several ranks, a GPU.
