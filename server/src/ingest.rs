@@ -39,6 +39,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::storage::Storage;
+use crate::watchdog::{Watchdog, WatchdogConfig, DEFAULT_WATCHDOG_INTERVAL};
 
 pub const SCHEMA_VERSION: i64 = 1;
 pub const DEFAULT_QUOTA_BYTES: usize = 128 * 1024 * 1024;
@@ -53,6 +54,12 @@ pub struct IngestConfig {
     pub flush_steps: usize,
     /// A rank's buffer is written once its oldest row has waited this long.
     pub flush_interval: Duration,
+    /// How long a rank may make no progress before it is called silent (see `watchdog`).
+    pub silent_floor: Duration,
+    /// A rank's threshold is at least this many times its own recent time between batches.
+    pub silent_factor: f64,
+    /// How often `runs/<run_id>/watchdog.json` is rewritten. Zero turns the watchdog's file off.
+    pub watchdog_interval: Duration,
 }
 
 impl Default for IngestConfig {
@@ -61,6 +68,9 @@ impl Default for IngestConfig {
             quota_bytes: DEFAULT_QUOTA_BYTES,
             flush_steps: DEFAULT_FLUSH_STEPS,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
+            silent_floor: crate::watchdog::DEFAULT_SILENT_FLOOR,
+            silent_factor: crate::watchdog::DEFAULT_SILENT_FACTOR,
+            watchdog_interval: DEFAULT_WATCHDOG_INTERVAL,
         }
     }
 }
@@ -71,6 +81,9 @@ struct BatchMetadata {
     run_id: String,
     rank: i32,
     end_byte_offset: i64,
+    /// The number of ranks in the job, when the sender knows it; names ranks that never connect.
+    #[serde(default)]
+    world_size: Option<i32>,
 }
 
 type Key = (String, i32);
@@ -101,13 +114,19 @@ pub struct Ingest {
     used: AtomicUsize,
     closed: AtomicBool,
     buffers: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<RankBuffer>>>>,
+    watchdog: Watchdog,
 }
 
 impl Ingest {
     pub fn new(storage: Storage, config: IngestConfig) -> Arc<Self> {
+        let watchdog = Watchdog::new(WatchdogConfig {
+            silent_floor: config.silent_floor,
+            silent_factor: config.silent_factor,
+        });
         Arc::new(Self {
             storage,
             config,
+            watchdog,
             used: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             buffers: Mutex::new(HashMap::new()),
@@ -142,15 +161,32 @@ impl Ingest {
             .is_ok()
     }
 
-    async fn accept(&self, key: &Key, batch: RecordBatch, end_byte_offset: i64, ack: &AckSender) -> Result<(), Status> {
+    async fn accept(
+        &self,
+        key: &Key,
+        batch: RecordBatch,
+        end_byte_offset: i64,
+        world_size: Option<i32>,
+        ack: &AckSender,
+    ) -> Result<(), Status> {
         let buffer = self.buffer(key);
         let mut buffer = buffer.lock().await;
         if self.closed.load(Ordering::SeqCst) {
             return Err(Status::unavailable("the server is shutting down"));
         }
+        let mut progressed: Option<(i64, i64)> = None; // (attempt, highest step kept)
         for (attempt, batch) in split_by_attempt(batch)? {
-            self.accept_attempt(key, attempt, batch, &mut buffer).await?;
+            if let Some(last) = self.accept_attempt(key, attempt, batch, &mut buffer).await? {
+                progressed = Some((attempt, progressed.map_or(last, |(_, step)| step.max(last))));
+            }
         }
+        self.watchdog.batch(
+            key,
+            progressed.map_or(buffer.attempt, |(attempt, _)| attempt),
+            progressed.map(|(_, step)| step),
+            world_size,
+            Instant::now(),
+        );
         buffer.ack = Some(ack.clone());
         buffer.pending_offset = Some(end_byte_offset.max(buffer.pending_offset.unwrap_or(0)));
         if buffer.batches.is_empty() || buffer.rows >= self.config.flush_steps {
@@ -166,7 +202,7 @@ impl Ingest {
         attempt: i64,
         batch: RecordBatch,
         buffer: &mut RankBuffer,
-    ) -> Result<(), Status> {
+    ) -> Result<Option<i64>, Status> {
         let watermark = match buffer.watermarks.get(&attempt) {
             Some(watermark) => *watermark,
             None => {
@@ -206,8 +242,9 @@ impl Ingest {
             buffer.rows += batch.num_rows();
             buffer.bytes += bytes;
             buffer.batches.push(batch);
+            return Ok(Some(last));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Stores what the buffer holds as one part, then acknowledges the offset it covers.
@@ -310,7 +347,9 @@ impl Ingest {
             })?;
             if key.is_none() {
                 if let Some(descriptor) = &message.inner.flight_descriptor {
-                    *key = Some(parse_descriptor(descriptor)?);
+                    let parsed = parse_descriptor(descriptor)?;
+                    self.watchdog.stream_opened(&parsed, Instant::now());
+                    *key = Some(parsed);
                 }
             }
             let DecodedPayload::RecordBatch(batch) = message.payload else {
@@ -332,12 +371,49 @@ impl Ingest {
                     "app_metadata names another run or rank than the descriptor",
                 ));
             }
-            self.accept(key, batch, metadata.end_byte_offset, ack).await?;
+            self.accept(key, batch, metadata.end_byte_offset, metadata.world_size, ack)
+                .await?;
         }
         if let Some(key) = key {
             self.flush_key(key).await?; // end of stream
         }
         Ok(())
+    }
+
+    /// Records how a stream ended: cleanly (the sender closed it) or not (an error or a drop).
+    fn stream_ended(&self, key: &Key, clean: bool) {
+        self.watchdog.stream_ended(key, clean, Instant::now());
+    }
+
+    /// The progress status of every run, as the server sees it now.
+    pub fn watchdog_statuses(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        self.watchdog.statuses(Instant::now())
+    }
+
+    /// Writes `runs/<run_id>/watchdog.json` for every run that has connected.
+    pub async fn write_watchdog(&self) {
+        for (run_id, status) in self.watchdog_statuses() {
+            if let Err(error) = self.storage.write_status(&run_id, &status).await {
+                eprintln!("tensorquill-server: cannot write the watchdog status of {run_id}: {error}");
+            }
+        }
+    }
+
+    /// Runs `write_watchdog` every `watchdog_interval` until the returned task is aborted.
+    /// With an interval of zero no file is written and the task ends at once.
+    pub fn spawn_watchdog(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let ingest = self.clone();
+        tokio::spawn(async move {
+            let period = ingest.config.watchdog_interval;
+            if period.is_zero() {
+                return;
+            }
+            let mut ticker = tokio::time::interval(period);
+            loop {
+                ticker.tick().await;
+                ingest.write_watchdog().await;
+            }
+        })
     }
 }
 
@@ -481,6 +557,7 @@ impl FlightService for IngestService {
             let mut key = None;
             let result = ingest.run_stream(stream, &mut key, &ack).await;
             if let Some(key) = &key {
+                ingest.stream_ended(key, result.is_ok());
                 ingest.detach(key, &ack).await;
             }
             if let Err(status) = result {

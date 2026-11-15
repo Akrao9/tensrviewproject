@@ -345,6 +345,7 @@ class FlightSender:
         *,
         token: str | None = None,
         tls_root_certs: bytes | str | os.PathLike[str] | None = None,
+        world_size: int | None = None,
         batch_steps: int = BATCH_STEPS,
         batch_seconds: float = BATCH_SECONDS,
         batch_bytes: int = BATCH_BYTES,
@@ -359,6 +360,7 @@ class FlightSender:
         self.endpoint = endpoint
         self.run_id = run_id
         self.rank = rank
+        self.world_size = world_size  # lets the server name ranks that never connect
         self.last_error: BaseException | None = None
         self.skipped_lines = 0
         self._location = _location(endpoint)
@@ -537,6 +539,7 @@ class FlightSender:
                             "min_step": min(steps) if steps else None,
                             "max_step": max(steps) if steps else None,
                             "end_byte_offset": end,
+                            **({"world_size": self.world_size} if self.world_size else {}),
                         }
                         batch = pa.RecordBatch.from_pylist(
                             [record_to_row(r) for r in records], schema=schema
@@ -610,6 +613,7 @@ def attach(
     *,
     token: str | None = None,
     tls_root_certs: bytes | str | os.PathLike[str] | None = None,
+    world_size: int | None = None,
 ) -> Any:
     """Start streaming `sink`'s file when `endpoint` or `TENSORQUILL_ENDPOINT` is set;
     otherwise return `sink` unchanged, with no socket opened and `pyarrow` not imported."""
@@ -625,7 +629,8 @@ def attach(
         )
     try:
         sender = FlightSender(
-            path, endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs
+            path, endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs,
+            world_size=world_size,
         )
     except ImportError as error:
         raise ImportError(

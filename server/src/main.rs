@@ -40,6 +40,17 @@ struct Args {
     /// Write a rank's Parquet part once its oldest step has waited this many seconds.
     #[arg(long, default_value_t = 10.0)]
     flush_seconds: f64,
+    /// A rank with no new step for this long (or this many times its own usual time between
+    /// batches, if that is longer) is reported silent in runs/<run_id>/watchdog.json. Set it
+    /// above your longest evaluation or checkpoint pause; the default is not calibrated.
+    #[arg(long, default_value_t = 300.0)]
+    silent_seconds: f64,
+    /// How many times a rank's usual time between batches it may stay quiet before it is silent.
+    #[arg(long, default_value_t = 5.0)]
+    silent_factor: f64,
+    /// Rewrite runs/<run_id>/watchdog.json this often; 0 turns the file off.
+    #[arg(long, default_value_t = 10.0)]
+    watchdog_seconds: f64,
 }
 
 async fn terminated() {
@@ -70,12 +81,16 @@ async fn run(args: Args) -> Result<(), Error> {
         quota_bytes: args.quota_mib * 1024 * 1024,
         flush_steps: args.flush_steps,
         flush_interval: Duration::from_secs_f64(args.flush_seconds),
+        silent_floor: Duration::from_secs_f64(args.silent_seconds),
+        silent_factor: args.silent_factor,
+        watchdog_interval: Duration::from_secs_f64(args.watchdog_seconds),
     };
     let ingest = Ingest::new(Storage::from_url(&args.store)?, config);
     let listener = TcpListener::bind(args.listen).await?;
     // Scripts and tests that ask for port 0 read the real address from this line.
     println!("tensorquill-server listening on {}", listener.local_addr()?);
     let flusher = ingest.spawn_flusher();
+    let watchdog = ingest.spawn_watchdog();
     // Open streams never end on their own, so do not wait for them: on a signal, stop
     // taking batches, write what is buffered, and exit.
     tokio::select! {
@@ -83,6 +98,8 @@ async fn run(args: Args) -> Result<(), Error> {
         _ = terminated() => {}
     }
     flusher.abort();
+    watchdog.abort();
+    ingest.write_watchdog().await; // the last word on each run before the server stops
     ingest.shutdown().await?;
     Ok(())
 }

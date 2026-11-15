@@ -368,6 +368,71 @@ def weight_norm_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     return {"baseline_step": int(first["step"]), "latest_step": int(last["step"]), "kinds": summary}
 
 
+def _watchdog_beside(source: Any) -> Path | None:
+    if isinstance(source, (str, Path)) and Path(source).is_dir():
+        return Path(source) / "watchdog.json"
+    return None
+
+
+def read_watchdog(source: str | Path | Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The server's progress status (`watchdog.json`), or None when there is none to read.
+
+    A missing, half-written or unrecognised file is None, never an error: the status is
+    rewritten every few seconds, and a reader may meet it mid-replace.
+    """
+    if source is None:
+        return None
+    if isinstance(source, Mapping):
+        document: Any = dict(source)
+    else:
+        try:
+            document = json.loads(Path(source).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+    if not isinstance(document, dict) or document.get("schema_version") != 1 or "ranks" not in document:
+        return None
+    return document
+
+
+def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """Turn the server's progress status into incidents.
+
+    `job_stalled`: no rank is making progress. `rank_silent`: some ranks are silent, lost
+    (their stream dropped and did not return) or never connected while others progress.
+    These are observations of the stream the server receives, and the cause is not known:
+    a hang, a long evaluation or checkpoint pause, a crashed launcher and a dead telemetry
+    sender all look the same. The server's `--silent-seconds` is the pause it tolerates.
+    """
+    if not status or status.get("summary") not in ("stalled", "degraded"):
+        return []
+    ranks = list(status.get("ranks", ()))
+    stopped = [r for r in ranks if r.get("state") in ("silent", "lost")]
+    steps = [r["last_step"] for r in ranks if r.get("last_step") is not None]
+    common = {
+        "written_at_ms": status.get("written_at_ms"),
+        "silent_floor_seconds": status.get("silent_floor_seconds"),
+        "world_size": status.get("world_size"),
+    }
+    if status["summary"] == "stalled":
+        return [{
+            "kind": "job_stalled",
+            "step": max(steps, default=0),
+            "ranks": [r for r in ranks if r.get("state") != "finished"],
+            "missing_ranks": list(status.get("missing_ranks", ())),
+            **common,
+        }]
+    affected = [r for r in stopped]
+    behind = [r["last_step"] for r in affected if r.get("last_step") is not None]
+    return [{
+        "kind": "rank_silent",
+        "step": min(behind) if behind else max(steps, default=0),
+        "ranks": affected,
+        "missing_ranks": list(status.get("missing_ranks", ())),
+        "newest_step": max(steps, default=0),
+        **common,
+    }]
+
+
 def _optimizer_evidence(ownership: Mapping[str, Any] | None, stalled: list[str]) -> dict[str, Any]:
     if not ownership:
         return {"state": "unknown", "reason": "not recorded by this capture"}
@@ -850,14 +915,31 @@ def watch(
     tail = _Tail(source, rank)
     written: Path | None = None
     done = 0
+    status_file = build_options.get("watchdog")
+    status_file = Path(status_file) if isinstance(status_file, (str, Path)) else _watchdog_beside(source)
+    status_seen: Any = None
     try:
         while polls is None or done < polls:
             if done:
                 time.sleep(interval)
             done += 1
-            if not tail.poll():
+            grown = tail.poll()
+            # A hung job writes no new records, so the server's status file is also watched.
+            changed = False
+            if status_file is not None:
+                # The server rewrites the file every few seconds; only a change of verdict,
+                # of a rank's state or of the ranks missing is worth rebuilding for.
+                current = read_watchdog(status_file)
+                stamp = current and (
+                    current["summary"], tuple(current.get("missing_ranks", ())),
+                    tuple((r.get("rank"), r.get("state"), r.get("last_step")) for r in current["ranks"]),
+                )
+                changed, status_seen = stamp is not None and stamp != status_seen, stamp
+            if not grown and not (changed and tail.records):
                 continue
-            evidence = build_evidence(tail.records, **build_options)
+            evidence = build_evidence(
+                tail.records, **{**build_options, **({"watchdog": status_file} if status_file else {})}
+            )
             written = write_evidence(evidence, output or default_evidence_path(source, tail.records))
             if on_update is not None:
                 on_update(evidence, written)
@@ -971,8 +1053,13 @@ def build_evidence(
     starve_window: int = STARVE_WINDOW,
     starve_ratio: float = STARVE_RATIO,
     top_k: int | Mapping[str, int] | None = None,
+    watchdog: str | Path | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build viewer-neutral detector evidence from captured step records.
+
+    `watchdog` is the server's `watchdog.json` (a path or the parsed document). When
+    `source` is a directory of Parquet parts, `watchdog.json` beside the `rank=` folders is
+    read without being named; its progress verdict becomes `job_stalled` or `rank_silent`.
 
     `top_k` overrides the experts-per-token recorded as `moe_top_k`, for captures made
     before it was recorded: one value for every router, or a value per router name.
@@ -1089,6 +1176,8 @@ def build_evidence(
     non_finite_hit = detect_non_finite(records)
     if non_finite_hit is not None:
         incidents.append(non_finite_hit)
+    status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
+    incidents.extend(detect_watchdog_incidents(status))
     drift_hit = detect_replica_drift(records, tolerance=drift_tolerance)
     if drift_hit is not None:
         incidents.append(drift_hit)
@@ -1115,6 +1204,7 @@ def build_evidence(
         "samples": samples,
         **({"not_checked": not_checked} if not_checked else {}),
         **({"weight_trends": trends} if trends else {}),
+        **({"watchdog": {k: status[k] for k in ("summary", "written_at_ms", "world_size") if k in status}} if status else {}),
     }
 
 
@@ -1305,6 +1395,28 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         return (
             f"Repeated step numbers from step {incident['step']}: {incident['repeated']} steps"
             " recorded more than once; pass start_step= to tensorquill.init when resuming"
+        )
+    if kind == "job_stalled":
+        ranks = incident["ranks"]
+        quiet = max((r.get("seconds_since_progress") or 0 for r in ranks), default=0)
+        lost = sum(1 for r in ranks if r.get("state") == "lost")
+        return (
+            f"Job stalled after step {incident['step']}: none of {len(ranks)} rank{'s' if len(ranks) != 1 else ''}"
+            f" has sent a new step for up to {quiet:.0f} s"
+            + (f", and {lost} lost its connection" if lost else "")
+            + ". A hang, a long evaluation or checkpoint pause, or a killed job all look the same to the"
+            " server; PyTorch's Flight Recorder shows a stuck collective"
+        )
+    if kind == "rank_silent":
+        who = incident["ranks"]
+        parts = [f"rank {r['rank']} {'lost its connection' if r['state'] == 'lost' else 'sent no new step'}"
+                 f" since step {r['last_step']}" for r in who[:4]]
+        if incident["missing_ranks"]:
+            parts.append("ranks " + ", ".join(str(r) for r in incident["missing_ranks"][:8]) + " never connected")
+        return (
+            f"Ranks out of step with the job: {'; '.join(parts)} while others reached step"
+            f" {incident['newest_step']}. A hung rank, a killed process or a stuck telemetry sender"
+            " look the same to the server"
         )
     if kind == "resume_lr_change":
         change = incident["changes"][0]

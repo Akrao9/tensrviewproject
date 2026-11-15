@@ -614,3 +614,107 @@ fn the_binary_refuses_an_unauthenticated_public_bind() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("TENSORQUILL_TOKEN"));
 }
+
+fn watch_config(floor_ms: u64) -> IngestConfig {
+    IngestConfig {
+        silent_floor: Duration::from_millis(floor_ms),
+        silent_factor: 5.0,
+        watchdog_interval: Duration::ZERO,
+        ..manual()
+    }
+}
+
+fn rank_states(server: &TestServer) -> Vec<(i64, String, String)> {
+    server.ingest.watchdog_statuses()[RUN]["ranks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["rank"].as_i64().unwrap(),
+                r["state"].as_str().unwrap().to_string(),
+                r["stream"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    for _ in 0..100 {
+        if ready() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+fn world_metadata(rank: i32, world_size: i32, end: i64) -> String {
+    format!(
+        "{{\"schema_version\":1,\"run_id\":\"{RUN}\",\"rank\":{rank},\"min_step\":null,\"max_step\":null,\"end_byte_offset\":{end},\"world_size\":{world_size}}}"
+    )
+}
+
+#[tokio::test]
+async fn the_watchdog_sees_progress_a_hang_and_a_clean_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), watch_config(400), None).await;
+    let mut ranks = Vec::new();
+    for rank in 0..2 {
+        let mut put = open(&server, rank).await;
+        put.send_with_metadata(batch(rank, 0..50), world_metadata(rank, 3, 100))
+            .await;
+        ranks.push(put);
+    }
+    until("both ranks active", || {
+        let states = rank_states(&server);
+        states.len() == 2 && states.iter().all(|(_, state, _)| state == "active")
+    })
+    .await;
+    let status = &server.ingest.watchdog_statuses()[RUN];
+    assert_eq!(status["world_size"], 3);
+    assert_eq!(status["missing_ranks"], serde_json::json!([2]));
+    assert_eq!(status["ranks"][0]["last_step"], 49);
+    assert_eq!(status["summary"], "degraded"); // rank 2 never connected
+
+    // Rank 1 keeps its stream open and sends nothing new; rank 0 goes on.
+    let mut rank0 = ranks.remove(0);
+    let mut rank1 = ranks.remove(0);
+    for step in [50, 100, 150] {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        rank0
+            .send_with_metadata(batch(0, step..step + 50), world_metadata(0, 3, 100 + step))
+            .await;
+        // A resend of rows already kept is not progress.
+        rank1
+            .send_with_metadata(batch(1, 0..50), world_metadata(1, 3, 100))
+            .await;
+    }
+    until("rank 1 silent", || {
+        rank_states(&server)
+            .iter()
+            .any(|(rank, state, _)| *rank == 1 && state == "silent")
+    })
+    .await;
+    assert_eq!(rank_states(&server)[0].1, "active");
+    assert_eq!(server.ingest.watchdog_statuses()[RUN]["ranks"][1]["last_step"], 49);
+
+    // The status file is what readers see.
+    server.ingest.write_watchdog().await;
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("runs").join(RUN).join("watchdog.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["summary"], "degraded");
+    assert_eq!(written["ranks"][1]["state"], "silent");
+
+    // A clean end is finished; a stream that is cut is not.
+    let _ = rank0.finish().await;
+    until("rank 0 finished", || rank_states(&server)[0].1 == "finished").await;
+    // A stream that ends in an error, as a cut connection does, is dropped, not finished. A
+    // bad batch is the way to make the server end one here.
+    rank1
+        .send_with_metadata(batch(1, 50..60), world_metadata(1, 3, 999).replace(RUN, "another-run"))
+        .await;
+    assert_eq!(rank1.ack().await, Err(Code::InvalidArgument));
+    until("rank 1 dropped", || rank_states(&server)[1].2 == "dropped").await;
+}

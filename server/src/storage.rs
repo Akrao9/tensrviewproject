@@ -55,6 +55,14 @@ impl Storage {
         Ok(Self::new(Arc::from(store), root))
     }
 
+    /// Replaces `runs/<run_id>/watchdog.json`, the run's progress status.
+    pub async fn write_status(&self, run_id: &str, document: &serde_json::Value) -> Result<(), Error> {
+        let path = self.root.clone().join("runs").join(run_id).join("watchdog.json");
+        let bytes = serde_json::to_vec_pretty(document)?;
+        self.store.put(&path, PutPayload::from(Bytes::from(bytes))).await?;
+        Ok(())
+    }
+
     fn attempt_dir(&self, run_id: &str, rank: i32, attempt: i64) -> Path {
         self.root
             .clone()

@@ -22,7 +22,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 | 12 | Embedding or other weight norms shrinking or growing | No | Recorded every 50 steps in float64; no slow-drift detector yet | Low |
 | 13 | Silent compiler or framework bugs | No, or slow convergence | Not captured | Low |
 | 14 | Data problems: repeated text, bad batches, repeated data | Spikes, or nothing | Out of scope | Low |
-| 15 | Hardware stops, hangs and slow GPUs | The job stops or slows | Out of scope | — |
+| 15 | Hardware stops, hangs and slow GPUs | The job stops or slows | Partly: the server notices ranks that stop sending steps (`job_stalled`, `rank_silent`); it cannot say why, or find a slow GPU | Low |
 
 ## Details
 
@@ -152,7 +152,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 ### 15. Hardware stops, hangs and slow GPUs
 
-Meta logged 419 unexpected interruptions in 54 days of Llama 3 405B training, 58.7% of them GPU issues. BLOOM lost hours to GPU deaths, hangs at evaluation (about 18 hours once) and a slow GPU that cut throughput from 149 to 140 TFLOPs until found by binary search. These are cluster-monitoring problems; TensorQuill does not address them.
+Meta logged 419 unexpected interruptions in 54 days of Llama 3 405B training, 58.7% of them GPU issues. BLOOM lost hours to GPU deaths, hangs at evaluation (about 18 hours once) and a slow GPU that cut throughput from 149 to 140 TFLOPs until found by binary search. These are mostly cluster-monitoring problems. **TensorQuill today (Nov 15, 2026).** `tensorquill-server` watches progress from what it receives, independently of the training process: a rank whose stream is open but sends no new step for longer than its threshold is `silent` (what a hang looks like), one whose stream dropped and did not return is `lost`, and ranks that never connected are named from the `world_size` the SDK sends. The server writes `runs/<run_id>/watchdog.json`, and `build_evidence` turns it into `job_stalled` or `rank_silent`. These are observations: a hang, a long evaluation or checkpoint pause, a killed job and a dead telemetry sender look the same. It does not find a slow GPU: `ts` is the host clock and synchronous ranks wait for each other, so step times even out. The threshold is not calibrated (`--silent-seconds`, default 300, and 5 times the rank's own time between batches).
 
 ## What this means for the detectors
 

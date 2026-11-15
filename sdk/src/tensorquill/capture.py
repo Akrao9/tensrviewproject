@@ -34,7 +34,7 @@ from torch.optim.optimizer import (
 from .distributed import FINGERPRINT_WIDTH, replica_spread, unwrap_local
 from .probe import ProbeState, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink
-from .tracker import RunInfo, resolve_run
+from .tracker import RunInfo, _world_size, resolve_run
 
 STATS = ("mean", "std", "abs_max", "zero_frac")
 _SEEN = len(STATS)  # last column: 1.0 when the hook ran this step
@@ -1332,7 +1332,7 @@ def init(
         sink = JsonlSink(Path("tensorquill-out") / f"{name}.rank{run.rank}.jsonl")
     from .flight import attach  # a no-op unless endpoint= or TENSORQUILL_ENDPOINT is set
 
-    sink = attach(sink, run.run_id, run.rank, endpoint)
+    sink = attach(sink, run.run_id, run.rank, endpoint, world_size=_world_size())
     return Session(
         model,
         run=run,

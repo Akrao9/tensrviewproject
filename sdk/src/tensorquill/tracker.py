@@ -94,6 +94,14 @@ def generate_run_id() -> str:
     return f"run-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
 
 
+def _world_size() -> int:
+    dist = sys.modules.get("torch.distributed")
+    if dist is not None and dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    value = os.environ.get("WORLD_SIZE")
+    return int(value) if value is not None and value.isdigit() and int(value) > 0 else 1
+
+
 def _shared_generated_id() -> str:
     # Every rank must use the same ID, or one run's files split under different names.
     # With torch.distributed initialized, rank 0's ID is broadcast: a collective, so it

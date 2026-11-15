@@ -250,6 +250,8 @@ cargo build --release --manifest-path server/Cargo.toml
 server/target/release/tensorquill-server --listen 127.0.0.1:50051 --store file:///var/lib/tensorquill
 ```
 
+The server also watches each run for ranks that stop making progress, using only what it receives, so it works when the training process is hung. It writes `runs/<run_id>/watchdog.json` every 10 seconds (`--watchdog-seconds`, 0 turns it off); `python -m tensorquill <store>/runs/<run_id>` reads it and reports `job_stalled` (no rank progressing) or `rank_silent` (some ranks silent, lost or never connected). A rank is silent after `--silent-seconds` without a new step (default 300) or `--silent-factor` times its own usual time between batches (default 5), whichever is longer. Set it above your longest evaluation or checkpoint pause: the default is not calibrated, and a long pause looks the same as a hang. The server sees only ranks that connected since it started.
+
 ```python
 session = tensorquill.init(model, routers=..., endpoint="grpc://127.0.0.1:50051")  # or TENSORQUILL_ENDPOINT
 ```

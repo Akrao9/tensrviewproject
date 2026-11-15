@@ -235,7 +235,7 @@ What the summary can report:
 
 Each incident also lists what you logged with `session.log` at its step, next to the median of the previous 50 values, so you can see whether the loss moved.
 
-If you streamed to `tensorquill-server`, point the same command at the run's directory in the store, `python -m tensorquill <store>/runs/<run_id>`; add `--rank <n>` for a rank other than 0. Add `--watch` to keep it running while the job trains: it re-reads the input every 2 seconds and replaces the evidence file.
+If you streamed to `tensorquill-server`, point the same command at the run's directory in the store, `python -m tensorquill <store>/runs/<run_id>`; add `--rank <n>` for a rank other than 0. The server's `watchdog.json` in that directory is read too: `job_stalled` or `rank_silent` means ranks stopped sending steps, whatever the cause (a hang, a long checkpoint or evaluation pause, a killed job); raise the server's `--silent-seconds` above your longest pause. Add `--watch` to keep it running while the job trains: it re-reads the input every 2 seconds and replaces the evidence file.
 
 The thresholds are first guesses from one model, so treat a report as something to check, not a verdict.
 

@@ -247,6 +247,8 @@ def test_a_resumed_run_keeps_its_repeated_steps_and_watch_reads_them(tmp_path, t
     assert [r["step"] for r in resolved] == list(range(140))
     assert {r["attempt"] for r in resolved if r["step"] >= 80} == {max(r["attempt"] for r in written)}
     evidence = tensorquill.build_evidence(run_dir)
+    # The server's own progress status is all the directory has and the file has not.
+    assert evidence.pop("watchdog")["summary"] == "finished"  # close() ended every stream cleanly
     assert evidence == tensorquill.build_evidence(path)
     assert not [i for i in evidence["incidents"] if i["kind"] == "repeated_steps"]
 
@@ -300,3 +302,40 @@ def test_grpcs_streams_with_custom_ca_and_rejects_untrusted_server(tmp_path, toy
     written = tensorquill.load_records(tmp_path / "tensorquill-out" / "tls.rank0.jsonl")
     assert len(written) == 20
     assert stored_records(store, "tls") == written
+
+
+def test_the_server_calls_a_job_that_goes_quiet_stalled_and_evidence_says_so(tmp_path, toy_moe, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)
+    store = tmp_path / "store"
+    server = Server(store, 0, "--silent-seconds", "1", "--watchdog-seconds", "0.2", "--flush-seconds", "0.3")
+    run_dir = store / "runs" / "hung"
+    try:
+        session = tensorquill.init(
+            toy_moe, run_id="hung", every=10, routers={"router": 4}, endpoint=server.endpoint,
+        )
+        train(toy_moe, session, 40)  # then the job hangs: the session stays open and sends nothing
+        deadline = time.monotonic() + 15
+        status = None
+        while time.monotonic() < deadline:
+            status = tensorquill.evidence.read_watchdog(run_dir / "watchdog.json")
+            if status and status["summary"] == "stalled" and list(run_dir.glob("rank=0/attempt=*/part-*.parquet")):
+                break
+            time.sleep(0.2)
+        assert status and status["summary"] == "stalled", status
+        assert status["world_size"] == 1 and status["ranks"][0]["state"] == "silent"
+        assert status["ranks"][0]["stream"] == "open" and status["ranks"][0]["last_step"] == 39
+        evidence = tensorquill.build_evidence(run_dir)
+        [incident] = [i for i in evidence["incidents"] if i["kind"] == "job_stalled"]
+        assert incident["step"] == 39
+        # Training resumes and finishes: the next status says so.
+        session.close()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            status = tensorquill.evidence.read_watchdog(run_dir / "watchdog.json")
+            if status["summary"] == "finished":
+                break
+            time.sleep(0.2)
+        assert status["summary"] == "finished"
+    finally:
+        assert server.terminate() == 0
