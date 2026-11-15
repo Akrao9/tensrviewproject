@@ -69,11 +69,31 @@ jobs:
       - name: Install
         run: |
           pip install "torch==2.14.*" --index-url https://download.pytorch.org/whl/cpu
-          pip install -e ".[dev,lightning,huggingface,rerun]"
+          pip install -e ".[dev,lightning,huggingface,rerun,flight]"
       - name: Tests
         run: pytest -ra
       - name: Trainer callback acceptance script, toy model
         run: python examples/trainer_check.py --toy --backend aot_eager --steps 150 --seed-step 100 --probe-every 50 --out "$RUNNER_TEMP/trainer-check"
+
+  server:
+    name: Ingest server and end-to-end streaming
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: sdk/pyproject.toml
+      - name: Server tests
+        run: cargo test --manifest-path ../server/Cargo.toml
+      - name: Install
+        run: |
+          pip install "torch==2.14.*" --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev,flight]"
+      - name: Sender and end-to-end tests
+        run: pytest -ra tests/test_flight.py tests/test_flight_e2e.py
 
   gpu:
     # GitHub's free runners have no GPU, so this runs only when started by hand, on a

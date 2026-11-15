@@ -49,6 +49,8 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 | PyTorch Lightning callback (`tensorlens.lightning.TensorLensCallback`): run ID from the trainer's logger broadcast from rank 0, steps from `trainer.global_step`, the back-propagated loss per optimizer step, and the `16-mixed` scaler | Built, tested on CPU with Lightning 2.6.5 on one process and two (`ddp_spawn`) |
 | Probe pass (`probe=`): activation histograms per block and attention logit, entropy and maps per layer, on a fixed batch every `probe_every` steps | Built, tested on CPU, under `torch.compile` with no graph breaks or recompiles, and on a small randomly initialized Hugging Face Granite MoE; not run on a GPU |
 | Logged scalars (`session.log`) attached to incidents and plotted in Rerun | Built, tested on CPU and Apple MPS; not run on a GPU |
+| Opt-in streaming (`endpoint=` or `TENSORLENS_ENDPOINT`, `tensorlens/flight.py`): a daemon thread tails the rank's `.jsonl` file from `<run_id>.rank<rank>.offset` and sends it over Arrow Flight `DoPut` | Built, tested on CPU against a stand-in server and the real `tensorlens-server` on loopback: torn lines, offset resume, duplicate resend, a refused batch, and a server killed for 200 steps. Not run over `grpcs://`, to a remote host, or from a GPU job |
+| Ingest server (`../server`, binary `tensorlens-server`): `DoPut`, `(run_id, rank, step)` deduplication, 128 MiB buffer quota, Zstd Parquet parts through `object_store`, Bearer token | Built; `cargo test` passes on a local-disk store. S3, GCS and TLS have never run |
 | Cross-GPU parameter fingerprints and replica spread (`parameter_fingerprints`, `replica_spread`) | Built, unit-tested on drift and sign-flip cases |
 | Detectors and Rerun exporter (`build_evidence`, `export_rerun`, `python -m tensorlens`) | Built, tested on MoE collapse (top-k aware), starved experts, gradient spikes, weights not updating, repeated steps, NaN/Inf, and replica drift |
 | Run ID from `run_id=`, `MLFLOW_RUN_ID`, the active MLflow run or the active W&B run; otherwise torchrun's or SLURM's job ID, or a generated `run-<UTC time>-<6 hex>` broadcast from rank 0, so separate untracked runs never append to the same file | Built, tested with stand-in tracker modules and two Gloo processes |
@@ -56,7 +58,8 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 
 ## What is not built or not verified
 
-- **Arrow Flight and the Rust ingest server.** Records go to a JSON Lines file, and Python detectors/exporters turn that file into `evidence.json` and `.rrd`.
+- **Detectors on the server's Parquet.** The sender and the ingest server are built (see [Streaming to an ingest server](#streaming-to-an-ingest-server)), but `python -m tensorlens` still reads only `.jsonl`: reading a directory of `part-*.parquet` and `--watch` are not built. `tensorlens.flight.row_to_record` already turns a Parquet row back into the record the detectors read.
+- **Streaming, not verified:** S3 and GCS stores, TLS (`--tls-cert`, `grpcs://`), a token sent by the Python sender (the token check is tested from a Rust client), more than one rank end to end, a remote server, a GPU job, a training script that forks `DataLoader` workers while the sender thread runs, and the 64-rank benchmark. The sender's memory bound during an outage is measured with `tracemalloc`, which does not see gRPC's own allocations.
 - **Replay** of a flagged batch (Tier 3). The probe pass (Tier 2) is built but has not run on a GPU.
 - **Multi-rank reporting.** Every rank writes its own file.
 - **Detector thresholds are untuned.** The gradient-spike factor (5× the median of the last 50 recorded steps), the top-k diversity drop (0.6 of its recent median), the starved-expert ratio and the stalled-weight check have been checked on synthetic cases and, for the MoE rules, on one Granite capture. Weight norms, learning rates and the spike and stalled-weight detectors have run on the Granite captures from the A100 and RTX PRO 6000 runs below, but not against a planted failure of their own kind on a GPU; the steps they flagged there are unconfirmed.
@@ -234,6 +237,30 @@ The check passes `replica_every=1`. In a training job the drift check runs every
 
 The Rerun export adds a Probe tab: the largest attention logit and `entropy_share` per layer over training, the count of invalid attention rows when there are any, a histogram per block and an attention map per layer at each probe step. There is no detector on the probe data yet: thresholds for logit growth or entropy collapse need real failures first.
 
+## Streaming to an ingest server
+
+The local `.jsonl` file is always written and stays the source of truth. Streaming is off unless you set an endpoint, and then needs `pyarrow`:
+
+```sh
+pip install 'tensorlens[flight]'
+cargo build --release --manifest-path server/Cargo.toml
+server/target/release/tensorlens-server --listen 127.0.0.1:50051 --store file:///var/lib/tensorlens
+```
+
+```python
+session = tensorlens.init(model, routers=..., endpoint="grpc://127.0.0.1:50051")  # or TENSORLENS_ENDPOINT
+```
+
+- **It does not touch the training thread.** A daemon thread reads complete lines from the file, at most 50 steps or 4 MiB at a time, every 50 steps or 2 seconds. A line the writer has not finished is never sent.
+- **A server that is down, slow or full only delays the stream.** The sender keeps no backlog in memory: it sleeps (100 ms doubling to 30 s, with full jitter) and reads the file again from `<run_id>.rank<rank>.offset`. That file moves only when the server confirms the bytes are in a stored Parquet part, so it trails the `.jsonl` by up to 10 seconds or 500 steps, and a server killed with rows still in memory loses nothing.
+- **Resending is harmless.** The server drops rows whose step is not above the last one it kept for that `(run_id, rank)`, and reads that mark from its Parquet files after a restart.
+- **`session.close()` waits up to 5 seconds** for the server to store what is left, and otherwise prints the local path. `tensorlens.flight.send_file(path, endpoint, run_id, rank)` sends the rest later.
+- **Errors in the setup raise at `init`:** an endpoint that is not `grpc://` or `grpcs://`, a missing `pyarrow`, or `endpoint=` with a sink that has no file. Nothing raises once training runs; `session._sink.sender.last_error` holds the last failure.
+- **The server** writes `{store}/runs/{run_id}/rank={rank}/part-{first step}-{last step}.parquet`, one row per step. It listens on loopback by default; any other address needs `TENSORLENS_TOKEN` (the sender reads the same variable and sends it as a Bearer token) or `--allow-unauthenticated`. On `SIGTERM` it writes what it holds and exits. It buffers at most 128 MiB across all ranks and refuses batches beyond that, which the sender retries.
+- **Run IDs** may hold only letters, digits, `-`, `_` and `.` on the server, because the ID becomes a directory name.
+- **A run restarted from an earlier step under the same run ID** has those repeated steps dropped by the server as duplicates. The local file keeps them.
+- **Columns.** Numbers and name-to-number maps are typed columns; `layers`, `moe_stats` and `probe` are JSON strings (`layers_json`, `moe_stats_json`, `probe_json`); anything else travels in `extra_json`, so a row converts back to exactly the record in the `.jsonl` file. The choices behind this are in the plan's Decisions section.
+
 ## Things to know
 
 - **Mixed precision.** Pass the run's scaler: `init(..., scaler=scaler)`. `torch.amp.GradScaler` skips `optimizer.step()` when gradients overflow, so the optimizer hooks alone would miss those steps; with `scaler=`, the step ends at `scaler.update()`, which runs every iteration, and each record gets `step_skipped` and `grad_scale` (the loss scale used), read as tensors before `update()` resets them, with no added sync. Gradient spikes and non-finite gradients are not reported on skipped steps, where the scaler expects them, and `loss_scale_trouble` reports 10 or more skips in a row or a loss scale below 1 (first guesses; a few skips in a row at the start, while the scaler halves its initial 65,536, are normal). Without `scaler=`, pass `auto_step=False` and call `session.step(lr=...)` once per iteration.
@@ -267,6 +294,12 @@ For CUDA dogfooding, use the training job's PyTorch build and CUDA environment.
 cd sdk
 ../.venv/bin/python -m pytest
 ../.venv/bin/python examples/toy_moe.py --rerun
+```
+
+The ingest server needs a Rust toolchain. `test_flight.py` needs only `pyarrow` (`pip install -e './sdk[flight]'`); `test_flight_e2e.py` runs against the server binary and is skipped until it is built (or set `TENSORLENS_SERVER_BIN`):
+
+```sh
+cargo test --manifest-path server/Cargo.toml
 ```
 
 CI ([ci.yml](../.github/workflows/ci.yml)) runs the tests on every push and pull request, on Python 3.11 and 3.12 with PyTorch 2.6, 2.10 and 2.14 (CPU builds), and once more with the Lightning, Hugging Face and Rerun extras installed. It also runs `gpu_check.py --skip-overhead`, which on CPU uses the `aot_eager` backend. The real GPU gate is a separate job, started by hand from the Actions tab with `gpu` ticked; it needs a self-hosted runner with a CUDA build of PyTorch, and none is registered yet.

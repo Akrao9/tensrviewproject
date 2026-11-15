@@ -1200,6 +1200,7 @@ def init(
     probe_every: int = PROBE_EVERY,
     scaler: Any = None,
     replica_params: Any = None,
+    endpoint: str | None = None,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -1214,6 +1215,9 @@ def init(
             `routers` are given and `"full"` otherwise. `layers`, `grads` and `weights`
             override the mode's settings.
         sink: where records go. Defaults to a JSON Lines file under `tensorlens-out/`.
+        endpoint: also stream the local file to a `tensorlens-server`, as `grpc://host:port`
+            or `grpcs://host:port`. Defaults to `TENSORLENS_ENDPOINT`; when neither is set
+            no socket is opened. Needs `pip install "tensorlens[flight]"`. See `flight.py`.
         layers: which modules' outputs to summarize. In full capture, `"blocks"`: each repeated
             block, such as each transformer layer, or every leaf module with parameters if
             the model has no repeated blocks. `"all"`: every leaf module with parameters,
@@ -1271,6 +1275,9 @@ def init(
     if sink is None:
         name = run.run_id
         sink = JsonlSink(Path("tensorlens-out") / f"{name}.rank{run.rank}.jsonl")
+    from .flight import attach  # a no-op unless endpoint= or TENSORLENS_ENDPOINT is set
+
+    sink = attach(sink, run.run_id, run.rank, endpoint)
     return Session(
         model,
         run=run,

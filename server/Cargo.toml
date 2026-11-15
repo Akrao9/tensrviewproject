@@ -1,0 +1,24 @@
+[package]
+name = "tensorlens-server"
+version = "0.0.1"
+edition = "2021"
+description = "Self-hosted ingest server for TensorLens: Arrow Flight DoPut in, partitioned Parquet out."
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+arrow = "60.1.0"
+arrow-flight = "60.1.0"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+object_store = { version = "0.14.2", features = ["aws", "gcp"] }
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["tls-ring"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
