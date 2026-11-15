@@ -369,9 +369,14 @@ def weight_norm_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _watchdog_beside(source: Any) -> Path | None:
-    if isinstance(source, (str, Path)) and Path(source).is_dir():
-        return Path(source) / "watchdog.json"
-    return None
+    if not isinstance(source, (str, Path)) or not Path(source).is_dir():
+        return None
+    directory = Path(source).resolve()
+    status = directory / "watchdog.json"
+    key, _, rank = directory.name.partition("=")
+    if key == "rank" and rank.isdecimal() and not status.is_file():
+        return directory.parent / status.name
+    return status
 
 
 def read_watchdog(source: str | Path | Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -1108,9 +1113,9 @@ def build_evidence(
     list of records; records of several ranks with no `rank` given raise `ValueError`,
     because merged they repeat step numbers and give incidents that belong to neither rank.
 
-    `watchdog` is the server's `watchdog.json` (a path or the parsed document). When
-    `source` is a directory of Parquet parts, `watchdog.json` beside the `rank=` folders is
-    read without being named; its progress verdict becomes `job_stalled` or `rank_silent`.
+    `watchdog` is the server's `watchdog.json` (a path or the parsed document). A run directory
+    or one of its `rank=` folders automatically reads the run's status; its progress verdict
+    becomes `job_stalled` or `rank_silent`.
     `flight_recorder` is a directory of PyTorch Flight Recorder dumps (one pickle per rank,
     `flight_recorder_prefix` the common start of their names): PyTorch's analyzer runs over
     them and its first problem becomes `collective_hang` or `collective_desync`. When the
@@ -1449,10 +1454,13 @@ def _how_stopped(rank: Mapping[str, Any]) -> str:
 
 def _describe_stream(incident: Mapping[str, Any]) -> str:
     assessment = str(incident.get("assessment", "suspected_hang")).replace("_", " ")
+    corroboration = incident.get("corroborated_by")
     tail = f" [{incident.get('severity', 'warning')}, {assessment}"
-    if incident.get("corroborated_by"):
-        tail += f", corroborated by {incident['corroborated_by']}"
+    if corroboration:
+        tail += f", corroborated by {corroboration}"
     tail += "]"
+    if corroboration == "collective_hang":
+        tail = " PyTorch's Flight Recorder shows a stuck collective." + tail
     if incident["kind"] == "job_stalled":
         ranks = incident["ranks"]
         quiet = max((r.get("seconds_since_progress") or 0 for r in ranks), default=0)
@@ -1460,8 +1468,7 @@ def _describe_stream(incident: Mapping[str, Any]) -> str:
         return (
             f"Job stalled after step {incident['step']}: none of {len(ranks)} rank{'s' if len(ranks) != 1 else ''}"
             f" has sent a new step for at least {quiet:.0f} s ({'; '.join(reasons)})."
-            " A hang, a long evaluation or checkpoint pause, or a killed job can look the same from here;"
-            " PyTorch's Flight Recorder shows a stuck collective" + tail
+            " A hang, a long evaluation or checkpoint pause, or a killed job can look the same from here." + tail
         )
     parts = []
     for r in incident["ranks"][:4]:
@@ -1471,7 +1478,7 @@ def _describe_stream(incident: Mapping[str, Any]) -> str:
                      " (if only some ranks call tensorquill.init, ignore this)")
     return (
         f"Ranks out of step with the job: {'; '.join(parts)} while others reached step {incident['newest_step']}."
-        " A hung rank, a killed process or a stuck telemetry sender look the same to the server" + tail
+        " A hung rank, a killed process or a stuck telemetry sender look the same to the server." + tail
     )
 
 

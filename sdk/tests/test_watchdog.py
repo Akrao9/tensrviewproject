@@ -27,7 +27,7 @@ def test_a_stalled_job_and_a_silent_rank_become_incidents():
     summary = tensorquill.incident_summary({"incidents": [hit], "samples": [], "layer_count": 0,
                                              "expert_count": 0, "router_names": []})
     assert "Job stalled after step 149" in summary and "its connection dropped and did not return" in summary
-    assert "Flight Recorder" in summary
+    assert "Flight Recorder shows a stuck collective" not in summary
     assert hit["severity"] == "warning" and hit["assessment"] == "suspected_hang"
 
     degraded = _status("degraded", [_rank(0, "active", 400), _rank(1, "silent", 349, 900.0)], missing=[2], world_size=3)
@@ -38,6 +38,7 @@ def test_a_stalled_job_and_a_silent_rank_become_incidents():
                                           "expert_count": 0, "router_names": []})
     assert "rank 1 sent no new step since step 349" in text and "ranks 2 never connected" in text
     assert "no heartbeat, so the phase is unknown" in text
+    assert "Flight Recorder shows a stuck collective" not in text
 
     # Only missing ranks, everyone else fine: still reported, at the newest step.
     [hit] = detect_watchdog_incidents(_status("degraded", [_rank(0, "active", 50)], missing=[1], world_size=2))
@@ -89,7 +90,8 @@ def test_watch_rebuilds_when_only_the_status_changes(tmp_path):
     assert seen == [[], ["job_stalled"]]
 
 
-def test_the_command_reads_the_status_beside_a_run_directory(tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize("rank_only", [False, True])
+def test_the_command_reads_the_run_status(tmp_path, capsys, monkeypatch, rank_only):
     pq = pytest.importorskip("pyarrow.parquet")
     from tensorquill.evidence import main
     from tensorquill.flight import records_to_batch
@@ -100,7 +102,12 @@ def test_the_command_reads_the_status_beside_a_run_directory(tmp_path, capsys, m
     records = [{"run_id": "r", "rank": 0, "attempt": 1, "step": s, "schema_version": 1, "grad_norm": 1.0} for s in range(5)]
     pq.write_table(__import__("pyarrow").Table.from_batches([records_to_batch(records)]), part / "part-00000000-00000004.parquet")
     (run / "watchdog.json").write_text(json.dumps(_status("stalled", [_rank(0, "silent", 4, 900.0)])))
-    monkeypatch.setattr("sys.argv", ["tensorquill", str(run), "-o", str(tmp_path / "out.json")])
+    source = part.parent if rank_only else run
+    assert tensorquill.build_evidence(source)["watchdog"]["summary"] == "stalled"
+    out = tmp_path / "out.json"
+    tensorquill.evidence.watch(source, out, polls=1)
+    assert json.loads(out.read_text())["watchdog"]["summary"] == "stalled"
+    monkeypatch.setattr("sys.argv", ["tensorquill", str(source), "-o", str(out)])
     main()
     assert "Job stalled after step 4" in capsys.readouterr().out
 
@@ -193,6 +200,12 @@ def test_a_stuck_collective_in_pytorch_s_dump_confirms_the_hang_the_stream_sugge
     [stream] = [i for i in both["incidents"] if i["kind"] == "job_stalled"]
     assert stream["assessment"] == "confirmed_hang" and stream["corroborated_by"] == "collective_hang"
     assert "corroborated by collective_hang" in tensorquill.incident_summary(both)
+    assert "Flight Recorder shows a stuck collective" in _text([stream])
+
+    degraded = _status("degraded", [_rank(0, "active", 4), _rank(1, "silent", 4, 900.0)])
+    both = tensorquill.build_evidence(records, watchdog=degraded, flight_recorder=dumps)
+    [stream] = [i for i in both["incidents"] if i["kind"] == "rank_silent"]
+    assert "Flight Recorder shows a stuck collective" in _text([stream])
 
     # Dumps from before the last recorded step prove nothing about now.
     for path in dumps.iterdir():
