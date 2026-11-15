@@ -66,7 +66,6 @@ class Fixture:
     steps: tuple[int, ...]
     events: tuple[Event, ...] = ()
     top_k: int = 1
-    flagged_exactly: bool = True
 
     def flagged_samples(self) -> set[tuple[int, int]]:
         """The (step, layer) pairs a correct detector flags, from the planted events alone."""
@@ -250,7 +249,7 @@ HOT_EVENTS = (
     Event(step=1500, layer=9, hot={5: 0.40}),  # later, in an earlier layer: not the first
 )
 DEAD_STEPS = tuple(range(1600, 2500, 100))
-DEAD_EVENTS = (Event(step=2000, layer=8, dead=DEAD_BLOCK),)
+DEAD_EVENTS = (Event(step=2000, layer=8, hot={1: 0.34}, dead=DEAD_BLOCK),)
 TOPK_STEPS = tuple(range(0, 620, 20))
 TOPK_EVENTS = (Event(step=400, layer=11, hot={expert: 0.36 / 4 for expert in range(9, 15)}),)
 TWO_STEPS = tuple(range(300, 1000, 100))
@@ -293,12 +292,12 @@ FIXTURES = (
         {"kind": "moe_imbalance", "step": 400, "layer": 11, "overloaded": list(range(9, 15)), "dead": []},
         moe_records("unseen-3", steps=TOPK_STEPS, layers=24, experts=64, tokens=32_768, top_k=4,
                     events=TOPK_EVENTS, pinned={3: 0.7 / 4}),
-        TOPK_STEPS, TOPK_EVENTS, top_k=4, flagged_exactly=False,
+        TOPK_STEPS, TOPK_EVENTS, top_k=4,
     ),
     Fixture(
         "unseen-4",
-        "MoE, 32 layers x 128 experts. From step 2000 layer 8 sends nothing to 40 experts, and no"
-        " expert is overloaded.",
+        "MoE, 32 layers x 128 experts. From step 2000 layer 8 sends nothing to 40 experts."
+        " Expert 1 receives 34% of assignments, below the overload threshold.",
         {"kind": "moe_imbalance", "step": 2000, "layer": 8, "overloaded": [], "dead": list(DEAD_BLOCK)},
         moe_records("unseen-4", steps=DEAD_STEPS, layers=32, experts=128, tokens=98_304, events=DEAD_EVENTS),
         DEAD_STEPS, DEAD_EVENTS,

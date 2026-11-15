@@ -148,7 +148,8 @@ def test_imbalance_rule_allows_balanced_two_expert_router_and_preserves_bakeoff(
     granite_ev = tensorquill.build_evidence(
         [
             {"run_id": "granite-router-only", "step": 449, "moe": {"layer-12": [256] * 32}},
-            {"run_id": "granite-router-only", "step": 450, "moe": {"layer-12": granite_collapsed}},
+            {"run_id": "granite-router-only", "step": 450, "moe": {"layer-12": granite_collapsed},
+             "moe_top_k": {"layer-12": 8}},
         ]
     )
     granite_hit = tensorquill.first_incident(granite_ev)
@@ -157,6 +158,7 @@ def test_imbalance_rule_allows_balanced_two_expert_router_and_preserves_bakeoff(
     assert granite_hit["layer"] == 1
     assert granite_hit["overloaded"] == list(range(1, 9))
     assert granite_hit["dead"] == list(range(9, 33))
+    assert granite_hit["overload_rule"]["rule"] == "collapse"
     assert granite_hit["diversity"] == pytest.approx(0.25)
     assert "Expert 1 (12.5%)" in tensorquill.incident_summary(granite_ev)
     granite_table = tensorquill.expert_load_table(granite_ev, 450, 1).splitlines()
@@ -392,6 +394,45 @@ def test_top_k_jump_flags_concentration_without_dead_experts():
 
     # Without k the old share threshold (unreachable at 12.5%) misses it.
     assert tensorquill.first_incident(tensorquill.build_evidence(_topk_records(), top_k=1)) is None
+
+
+def test_top_k_collapse_keeps_its_baseline_until_recovery():
+    rows = _topk_records(steps=145)
+    healthy = _topk_records(steps=145, shift_at=145)
+    rows[100:120] = healthy[100:120]
+    # One missing sample interrupts reporting without adding a healthy sample to the baseline.
+    rows[70] = {**rows[70], "moe": {}}
+    evidence = tensorquill.build_evidence(rows, starve_window=5)
+    flagged = {s["step"]: s["overloaded"] for s in evidence["samples"] if s["overloaded"]}
+    expected = (set(range(30, 100)) - {70}) | set(range(120, 145))
+    assert flagged == {step: list(range(9, 16)) for step in expected}
+    assert tensorquill.first_incident(evidence)["step"] == 30
+
+
+@pytest.mark.parametrize("top_k", [1, 2])
+@pytest.mark.parametrize("count, overloaded", [(3400, []), (3500, []), (3501, [1])])
+def test_dead_experts_do_not_lower_the_share_threshold(top_k, count, overloaded):
+    rest, remainder = divmod(10_000 - count, 5)
+    counts = [count, *[rest + (i < remainder) for i in range(5)], 0, 0]
+    sample = tensorquill.first_incident(tensorquill.build_evidence(
+        [{"step": 0, "moe": {"r": counts}, "moe_top_k": {"r": top_k}}],
+    ))
+    assert sample["dead"] == [7, 8]
+    assert sample["overloaded"] == overloaded
+    assert sample["overload_rule"] == {"rule": "share", "threshold": 0.35}
+
+
+def test_mature_top_k_does_not_attribute_a_dead_expert_event_to_a_stably_hot_expert():
+    # Expert 1 is always picked by every token at top-4. Six experts go dead,
+    # but no surviving expert's selection rate rises by 25 points.
+    normal = [1000] + [200] * 15
+    bad = [1000] + [334] * 3 + [333] * 6 + [0] * 6
+    rows = [{"step": s, "moe": {"r": normal if s < 20 else bad}, "moe_top_k": {"r": 4}}
+            for s in range(22)]
+    hit = tensorquill.first_incident(tensorquill.build_evidence(rows))
+    assert hit["step"] == 20 and hit["dead"] == list(range(11, 17))
+    assert hit["overloaded"] == []
+    assert hit["overload_rule"]["rule"] == "diversity_drop"
 
 
 def _grad_records(norms):

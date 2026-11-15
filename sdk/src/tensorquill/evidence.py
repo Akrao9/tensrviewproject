@@ -33,13 +33,14 @@ STARVE_MIN_EXPECTED = 100
 # trained models some experts are picked by nearly every token, while with small batches
 # single experts often jump to most tokens for one step. So a fixed share threshold either
 # never fires or fires on healthy layers. Instead the router's diversity must fall below
-# DIVERSITY_DROP times its median over the previous STARVE_WINDOW samples; the overloaded
-# experts are then those whose fraction of tokens rose by at least OVERLOAD_JUMP over
-# their average in that window. On a healthy Granite run the lowest diversity ratio seen
-# was 0.82; the seeded collapse fell to 0.29.
+# DIVERSITY_DROP times its median over the previous OVERLOAD_WINDOW unflagged samples.
+# The overloaded experts are then those whose fraction of tokens rose by at least
+# OVERLOAD_JUMP over their average in that window. On a healthy Granite run the lowest
+# diversity ratio seen was 0.82, and the seeded collapse fell to 0.29.
 DIVERSITY_DROP = 0.6
 OVERLOAD_JUMP = 0.25
 OVERLOAD_MIN_HISTORY = 10
+OVERLOAD_WINDOW = 50
 # A gradient-norm spike is a step whose total norm is at least SPIKE_FACTOR times the
 # median of the previous SPIKE_WINDOW recorded steps (once SPIKE_MIN_HISTORY are known).
 SPIKE_FACTOR = 5.0
@@ -1126,6 +1127,8 @@ def build_evidence(
 
     `top_k` overrides the experts-per-token recorded as `moe_top_k`, for captures made
     before it was recorded: one value for every router, or a value per router name.
+    `overload_threshold` is the base assignment-share threshold for top-1 and top-2.
+    Top-3 and higher use a per-router baseline once ten unflagged samples are available.
     """
     every_attempt = load_records(source, rank=rank, all_attempts=True)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
@@ -1165,8 +1168,9 @@ def build_evidence(
                     else _diversity_from_counts(counts, n_experts)
                 )
                 k = router_top_k.get(router_name, 1)
+                window = history[router_name]
                 if k >= 3:
-                    overloaded = _jump_overloaded(counts, k, diversity, history[router_name])
+                    overloaded = _jump_overloaded(counts, k, diversity, window)
                     rule: dict[str, Any] = {
                         "rule": "diversity_drop", "drop": DIVERSITY_DROP, "jump": OVERLOAD_JUMP
                     }
@@ -1182,7 +1186,10 @@ def build_evidence(
                     )
                     else []
                 )
-                if dead and not overloaded and n_experts > 1:
+                # During top-k warm-up we can attribute an independently detected dead-expert
+                # collapse using share. With a baseline, only a change from that router's
+                # own past can mark an expert overloaded.
+                if k >= 3 and len(window) < OVERLOAD_MIN_HISTORY and dead:
                     mean_share = 1.0 / n_experts
                     se_share = math.sqrt(mean_share * (1.0 - mean_share) / tokens)
                     collapse_threshold = max(2.0 * mean_share, mean_share + 3.0 * se_share)
@@ -1190,10 +1197,12 @@ def build_evidence(
                         i for i, share in enumerate(shares, 1) if share > collapse_threshold
                     ]
                     rule = {"rule": "collapse", "threshold": collapse_threshold}
-                window = history[router_name]
-                window.append((counts, tokens, diversity))
-                if len(window) > starve_window:
-                    window.pop(0)
+                if k >= 3 and not (overloaded or dead):
+                    # Once a collapse is flagged, compare subsequent samples to the same
+                    # pre-collapse baseline. A recovered sample starts updating it again.
+                    window.append((counts, tokens, diversity))
+                    if len(window) > OVERLOAD_WINDOW:
+                        window.pop(0)
             sample: dict[str, Any] = {
                 "step": step,
                 "layer": layer_idx,
@@ -2008,7 +2017,7 @@ def main() -> None:
         "--overload-threshold",
         type=float,
         default=OVERLOAD_THRESHOLD,
-        help="expert share threshold for overload detection (default: 0.35)",
+        help="base assignment-share threshold for top-1 and top-2 routers (default: 0.35)",
     )
     parser.add_argument(
         "--top-k",

@@ -22,7 +22,7 @@ Each fixture writes three files into `artifacts/<name>/`: the step records `<nam
 | `unseen-1` | MoE, 48 × 64, top-1, 8 steps | Step 1,300, layer 17: expert 53 gets 44%, experts 20–27 get none. From step 1,500 layer 9 sends 40% to expert 5, later and in an earlier layer, so it is not the first |
 | `unseen-2` | Dense, 12 blocks, 400 steps | Step 310: the gradient of `blocks.7.mlp.fc2.weight` jumps 80× after two steps of build-up (rising since 308), and the loss jumps with it |
 | `unseen-3` | MoE, 24 × 64, top-4, 31 steps | Step 400, layer 11: experts 9–14 are each picked by 36% of tokens. Expert 3 is picked by 70% of tokens in every layer, always (healthy). The summary and table report shares of the router's assignments, so 36% of tokens is shown as 9% |
-| `unseen-4` | MoE, 32 × 128, top-1, 9 steps | Step 2,000, layer 8: 40 scattered experts get no tokens, and none is overloaded |
+| `unseen-4` | MoE, 32 × 128, top-1, 9 steps | Step 2,000, layer 8: 40 scattered experts get no tokens. Expert 1 receives 34% of assignments and stays below the overload threshold |
 | `unseen-5` | Dense, 20 monitored blocks, 400 steps | Step 260: the largest activation in `blocks.13` is 100× normal for four steps. `blocks.1` carries massive activations all along (healthy) |
 | `unseen-6` | MoE, 24 × 32, top-1, 7 steps | Step 700, layer 3: expert 7 gets 39% and expert 22 gets 36%. At steps 500–600 layer 9 sends 34% to expert 13, just under the 35% rule (healthy) |
 
@@ -30,8 +30,8 @@ MoE counts carry sampling noise and a per-layer skew, except in `seeded`, whose 
 
 Three behaviors of the SDK's detectors show up in the fixtures, and the trial questions should allow for them:
 
-- A top-k collapse is judged against the router's own recent window, which fills with the collapse itself. In `unseen-3` the heatmap flags experts 9–14 at step 400, and by step 520 it flags nothing, although the router's diversity stays at 0.35 against 0.75 before. Judging "does it persist at the next sample" from the heatmap alone would mislead, and the diversity timeline does not.
-- In a layer with many dead experts (a quarter of the experts, or diversity below 0.5) where the 35% rule flags nothing, the SDK lowers the bar to about twice an even share, 3.1% for 64 experts. With expert 53 at 34% instead of 44%, `unseen-1` still reports it as overloaded, while `unseen-6`'s 34% decoy, in a layer with no dead experts, is not flagged. So the 35% boundary is a boundary only beside healthy neighbors.
+- In `unseen-3`, the heatmap flags experts 9–14 from step 400 through the final sample at 600. Flagged samples stay out of the router's baseline, so the collapse cannot become its own reference.
+- Top-1 and top-2 routers use the calibrated assignment-share threshold, even when the dead-expert detector fires. The two 34% decoys test both cases. `unseen-4` still reports 40 dead experts, and `unseen-6` stays clear at steps 500–600.
 - The detector reports the first incident of each kind. `unseen-1`'s second event is in the samples and the heatmap but not in `incidents`.
 
 ## Checks
@@ -43,7 +43,7 @@ Three behaviors of the SDK's detectors show up in the fixtures, and the trial qu
 `test_fixtures.py` runs the whole pipeline for all seven fixtures and reads the results back from disk. The expected answers are the planted values in `generate.py` (`Fixture.answer` and `Fixture.events`), never the detectors' output. It checks that:
 
 - Each fixture's evidence has exactly one incident, of the planted kind, at the planted step, with the planted layer and expert IDs (or parameter or module). `unseen-2` also names the parameter that started the spike and the step it began rising.
-- The flagged MoE samples are exactly the planted ones, and the decoys are not flagged. In `unseen-3` they are a subset, for the reason above.
+- The flagged MoE samples are exactly the planted ones. At every planted sample on the incident layer, the expected expert IDs match the overload and dead labels.
 - The records before the planted step produce no incident, and the records up to and including it produce the incident at that step.
 - The CLI gives byte-identical evidence, and a recording with the same contents.
 - Each `.rrd` holds exactly one recording, named after its fixture, with the fixture's steps and summary. The exporter starts a global recording on each call, so this guards against one export leaking into the next.
@@ -98,7 +98,7 @@ Use the first sampled bad step, first affected layer, and expert IDs as orientat
 
 ### Seeded fixture answer key
 
-The last healthy sample is step 1,800. The first affected sample is step 1,850, layer 31. Expert 42 receives 36% of routed tokens. Experts 1–14 receive zero. Diversity is 0.3094112778 using `exp(H) / 128`. The detector flags strictly above 35%. The 35% boundary gives an upper bound of about 0.3225. At the actual 36% share, distributing the rest evenly across 113 experts gives a ceiling of about 0.30941129.
+The last healthy sample is step 1,800. The first affected sample is step 1,850, layer 31. Expert 42 receives 36% of routed tokens. Experts 1–14 receive zero. Diversity is 0.3094112778 using `exp(H) / 128`. This fixture's calibrated overload threshold is 35%, and the share must exceed it. The 35% boundary gives an upper bound of about 0.3225. At the actual 36% share, distributing the rest evenly across 113 experts gives a ceiling of about 0.30941129.
 
 ### Not ready for the trial
 

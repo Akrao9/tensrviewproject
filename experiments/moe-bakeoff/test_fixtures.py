@@ -108,12 +108,11 @@ def test_only_the_planted_samples_are_flagged_and_decoys_are_left_alone(fixture,
     expected, found = fixture.flagged_samples(), flagged(evidence)
     first = (fixture.answer["step"], fixture.answer["layer"])
     assert first in found and first == min(expected)
-    if fixture.flagged_exactly:
-        assert found == expected
-    else:
-        # A top-k collapse is judged against the router's own recent window, which fills with
-        # the collapse: the heatmap flags only its first samples (see the README).
-        assert found <= expected
+    assert found == expected
+    for sample in evidence["samples"]:
+        if (sample["step"], sample["layer"]) in expected and sample["layer"] == fixture.answer["layer"]:
+            assert sample["overloaded"] == fixture.answer["overloaded"]
+            assert sample["dead"] == fixture.answer["dead"]
 
 
 @pytest.mark.parametrize("fixture", FIXTURES, ids=NAMES)
