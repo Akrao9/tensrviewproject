@@ -32,6 +32,9 @@ from test_server_detectors import FAST, PORTED, RUN, Stream, differences, everyt
 pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
 
 QUICK_STATUS = ("--watchdog-seconds", "0.2")
+# With that, an unfinished run's status is rewritten at least every 0.6 s, and a reader
+# calls it old after twice that.
+STATUS_OLD = 1.5
 
 
 def healthy(steps, attempt: int = 1) -> list[dict]:
@@ -55,6 +58,7 @@ def push(stream: Stream, records: list[dict]) -> None:
 
 def look(stream: Stream, tmp_path: Path, **options) -> tuple[dict, str]:
     """One look by a watcher that has seen nothing before: its evidence and its summary."""
+    tmp_path.mkdir(exist_ok=True)
     out = watch(stream.incidents_file.parent, tmp_path / "live.json", interval=0.0, polls=1, **options)
     assert out is not None, "the watcher wrote nothing"
     evidence = json.loads(out.read_text())
@@ -90,8 +94,7 @@ def test_a_current_report_with_no_incidents_is_said_to_be_current(tmp_path, monk
     watch(stream.incidents_file.parent, tmp_path / "again.json", interval=0.0, polls=4, on_update=lambda *a: writes.append(a))
     assert len(writes) == 1
     # The rank closed its stream, so the run is finished: a status nobody rewrites is not a warning.
-    monkeypatch.setattr(ev, "STATUS_STALE_SECONDS", 0.0)
-    time.sleep(0.5)  # a status is written
+    time.sleep(STATUS_OLD)
     evidence, summary = look(stream, tmp_path)
     assert evidence["watchdog"]["summary"] == "finished" and "last written" not in summary
     assert stream.server.terminate() == 0
@@ -107,6 +110,10 @@ def test_a_stall_shows_from_the_status_though_no_part_arrives(tmp_path, monkeypa
         out = watch(stream.incidents_file.parent, tmp_path / "live.json", interval=0.25, polls=12,
                     on_update=lambda evidence, path: seen.append([i["kind"] for i in evidence["incidents"]]))
         status = json.loads((stream.store / "runs" / RUN / "watchdog.json").read_text())
+        # The stream stays open and silent for longer than a status may go unwritten.
+        time.sleep(STATUS_OLD)
+        later = json.loads((stream.store / "runs" / RUN / "watchdog.json").read_text())
+        still_stalled, still_summary = look(stream, tmp_path / "later")
     finally:
         sender.close(0.0)
     assert seen[0] == [] and seen[-1] == ["job_stalled"]
@@ -119,6 +126,12 @@ def test_a_stall_shows_from_the_status_though_no_part_arrives(tmp_path, monkeypa
         k: v for k, v in ev.detect_watchdog_incidents(status)[0].items()
         if k not in ("ranks", "written_at_ms", "severity")}
     assert incident_summary(evidence).startswith("Job stalled after step 59")
+    # The verdict has not changed for longer than a status may go unwritten, and the server
+    # is alive: it kept rewriting the status, so the stall is not mistaken for a dead server.
+    assert later["summary"] == "stalled" and later["written_at_ms"] > status["written_at_ms"]
+    assert later["refresh_seconds"] == pytest.approx(0.6)
+    assert [i["kind"] for i in still_stalled["incidents"]] == ["job_stalled"]
+    assert "not_written_for_seconds" not in still_stalled["watchdog"] and "last written" not in still_summary
     assert stream.server.terminate() == 0
 
 
@@ -226,7 +239,7 @@ def test_after_a_kill_the_report_stands_and_the_status_is_called_old(tmp_path, m
         assert evidence["watchdog"]["summary"] == "active" and "status was last written" not in summary
 
         # Later the dead server's last status still says "active". It is not taken as news.
-        monkeypatch.setattr(ev, "STATUS_STALE_SECONDS", 0.0)
+        time.sleep(STATUS_OLD)
         evidence, summary = look(stream, tmp_path)
         assert evidence["watchdog"]["not_written_for_seconds"] > 0
         assert "The server's status was last written" in summary and "Nothing is watching this run for stalls" in summary
@@ -237,13 +250,17 @@ def test_after_a_kill_the_report_stands_and_the_status_is_called_old(tmp_path, m
         time.sleep(0.5)
         evidence, summary = look(stream, tmp_path)
         assert evidence["detection"]["state"] == "current" and "The server's status was last written" in summary
-        monkeypatch.setattr(ev, "STATUS_STALE_SECONDS", 60.0)
     finally:
         sender.close(0.0)
 
     # The rank reconnects: the server rebuilds its state from the store and reports on.
     document = stream.send(records[200:])
     assert document["rebuilds"] == 1
+    status_file = stream.store / "runs" / RUN / "watchdog.json"
+    deadline = time.monotonic() + 10
+    while json.loads(status_file.read_text())["summary"] != "finished":  # the new server's first status
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
     evidence, summary = look(stream, tmp_path)
     assert evidence["detection"]["report_last_step"] == 299 and "status was last written" not in summary
     assert differences(reference(records), evidence["incidents"]) == []

@@ -736,6 +736,50 @@ async fn the_watchdog_sees_progress_a_hang_and_a_clean_finish() {
 }
 
 #[tokio::test]
+async fn an_unchanged_status_is_written_again_after_the_refresh_time_until_the_run_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        status_refresh: Duration::from_millis(150),
+        ..watch_config(60_000)
+    };
+    let server = start(dir.path(), config, None).await;
+    let mut put = open(&server, 0).await;
+    put.send_with_metadata(batch(0, 0..10), world_metadata(0, 1, 50)).await;
+    until("the rank's batch", || {
+        rank_states(&server).len() == 1 && server.ingest.watchdog_statuses()[RUN]["ranks"][0]["last_step"] == 9
+    })
+    .await;
+    let path = dir.path().join("runs").join(RUN).join("watchdog.json");
+    let read = || -> serde_json::Value { serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap() };
+    server.ingest.write_watchdog().await;
+    let first = read();
+    assert_eq!(
+        (first["summary"].as_str(), first["refresh_seconds"].as_f64()),
+        (Some("active"), Some(0.15))
+    );
+    // Nothing moves in the run. Within the refresh time the file is left alone; after it
+    // the same verdict is written again with a new time, which is how a reader knows the
+    // server is still there.
+    server.ingest.write_watchdog().await;
+    assert_eq!(read()["written_at_ms"], first["written_at_ms"]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.ingest.write_watchdog().await;
+    let second = read();
+    assert_eq!(second["summary"], "active");
+    assert!(second["written_at_ms"].as_i64() > first["written_at_ms"].as_i64());
+
+    // A finished run needs no watching, and its status is not written again.
+    let _ = put.finish().await;
+    until("the rank finished", || rank_states(&server)[0].1 == "finished").await;
+    server.ingest.write_watchdog().await;
+    let finished = read();
+    assert_eq!(finished["summary"], "finished");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.ingest.write_watchdog().await;
+    assert_eq!(read()["written_at_ms"], finished["written_at_ms"]);
+}
+
+#[tokio::test]
 async fn the_last_write_before_shutdown_says_the_server_stopped() {
     let dir = tempfile::tempdir().unwrap();
     let server = start(dir.path(), watch_config(60_000), None).await;

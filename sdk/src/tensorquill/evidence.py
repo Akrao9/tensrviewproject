@@ -950,9 +950,11 @@ SERVER_KINDS = (
 # by 6 to 7 s while all 64 ranks were rebuilt from 10,000 stored steps after a restart or a
 # new attempt. That rebuild grows with the run, so raise this for runs of 50,000 steps or more.
 REPORT_GRACE_SECONDS = 30.0
-# The server rewrites `watchdog.json` every `--watchdog-seconds` (10 by default). Older
-# than this while it claims to be running, and nothing is watching the run for stalls.
-STATUS_STALE_SECONDS = 60.0
+# While a run is unfinished the server rewrites `watchdog.json` at least every
+# `refresh_seconds`, which the status carries (three looks: 30 s by default), whether or not
+# anything changed. Older than this many times that while it claims a running server, and
+# nothing is watching the run for stalls.
+STATUS_STALE_FACTOR = 2.0
 
 
 def _rank_folder(source: Path, rank: int | None) -> Path | None:
@@ -1144,14 +1146,15 @@ def _report_evidence(
 
 def _status_age(status: Mapping[str, Any] | None) -> float | None:
     """Seconds since a status that claims a running server was written, when that is too
-    long ago for the server to be still writing it; None otherwise."""
-    written = (status or {}).get("written_at_ms")
+    long ago for the server to be still writing it; None otherwise. A status with no
+    `refresh_seconds` is from a server that wrote only on a change, and its age says nothing."""
+    written, refresh = (status or {}).get("written_at_ms"), (status or {}).get("refresh_seconds")
     if not status or status.get("server_running") is not True or not isinstance(written, (int, float)):
         return None
-    if status.get("summary") == "finished":
+    if status.get("summary") == "finished" or not isinstance(refresh, (int, float)) or refresh <= 0:
         return None  # every rank closed its stream: there is nothing left to watch
     age = time.time() - written / 1000.0
-    return age if age > STATUS_STALE_SECONDS else None
+    return age if age > STATUS_STALE_FACTOR * refresh else None
 
 
 def watch(

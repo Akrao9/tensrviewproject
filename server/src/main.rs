@@ -54,7 +54,8 @@ struct Args {
     /// How many times a rank's usual time between batches it may stay quiet before it is silent.
     #[arg(long, default_value_t = 5.0)]
     silent_factor: f64,
-    /// Rewrite runs/<run_id>/watchdog.json this often; 0 turns the file off.
+    /// Look at each run's progress this often and rewrite runs/<run_id>/watchdog.json when its verdict
+    /// changed, and every third look while the run is unfinished; 0 turns the file off.
     #[arg(long, default_value_t = 10.0)]
     watchdog_seconds: f64,
     /// Do not run the detectors over stored parts or write rank=<rank>/incidents.json.
@@ -95,6 +96,7 @@ async fn run(args: Args) -> Result<(), Error> {
         critical: Duration::from_secs_f64(args.critical_seconds),
         pause_limit: Duration::from_secs_f64(args.pause_seconds),
         watchdog_interval: Duration::from_secs_f64(args.watchdog_seconds),
+        status_refresh: Duration::from_secs_f64(args.watchdog_seconds * 3.0),
         detect: !args.no_detect,
     };
     let ingest = Ingest::new(Storage::from_url(&args.store)?, config);

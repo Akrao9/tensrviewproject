@@ -65,6 +65,10 @@ pub struct IngestConfig {
     pub pause_limit: Duration,
     /// How often `runs/<run_id>/watchdog.json` is rewritten. Zero turns the watchdog's file off.
     pub watchdog_interval: Duration,
+    /// An unfinished run's status is rewritten at least this often although nothing in it
+    /// changed, so a reader can tell a server that is watching a stalled run from one that
+    /// is gone. The status carries it as `refresh_seconds`.
+    pub status_refresh: Duration,
     /// Whether the detectors run over each stored part and `incidents.json` is written (see `detect`).
     pub detect: bool,
 }
@@ -80,6 +84,7 @@ impl Default for IngestConfig {
             critical: crate::watchdog::DEFAULT_CRITICAL,
             pause_limit: crate::watchdog::DEFAULT_PAUSE_LIMIT,
             watchdog_interval: DEFAULT_WATCHDOG_INTERVAL,
+            status_refresh: DEFAULT_WATCHDOG_INTERVAL * 3,
             detect: true,
         }
     }
@@ -150,8 +155,9 @@ pub struct Ingest {
     closed: AtomicBool,
     buffers: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<RankBuffer>>>>,
     watchdog: Watchdog,
-    /// What was last written per run, so an unchanged status is not written again.
-    written: Mutex<HashMap<String, String>>,
+    /// What was last written per run and when, so an unchanged status is not written again
+    /// until `status_refresh` has passed.
+    written: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl Ingest {
@@ -516,7 +522,9 @@ impl Ingest {
 
     /// Writes `runs/<run_id>/watchdog.json` for each run whose status changed since it was last
     /// written: its summary, a rank's state, stream or last step, or the ranks missing. The
-    /// clock fields change every time, so they do not count; a finished run stops being written.
+    /// clock fields change every time, so they do not count. An unchanged status is still
+    /// written again once `status_refresh` has passed, unless the run finished: a reader has
+    /// only this file to tell that the server is still watching a run in which nothing moves.
     pub async fn write_watchdog(&self) {
         self.write_statuses(self.watchdog_statuses()).await;
     }
@@ -533,7 +541,8 @@ impl Ingest {
     }
 
     async fn write_statuses(&self, statuses: std::collections::BTreeMap<String, serde_json::Value>) {
-        for (run_id, status) in statuses {
+        for (run_id, mut status) in statuses {
+            status["refresh_seconds"] = serde_json::json!(self.config.status_refresh.as_secs_f64());
             let signature = serde_json::json!({
                 "summary": status["summary"],
                 "running": status["server_running"],
@@ -544,12 +553,15 @@ impl Ingest {
                 }),
             })
             .to_string();
-            if self.written.lock().unwrap().get(&run_id) == Some(&signature) {
+            let fresh = self.written.lock().unwrap().get(&run_id).is_some_and(|(written, at)| {
+                *written == signature && (status["summary"] == "finished" || at.elapsed() < self.config.status_refresh)
+            });
+            if fresh {
                 continue;
             }
             match self.storage.write_status(&run_id, &status).await {
                 Ok(()) => {
-                    self.written.lock().unwrap().insert(run_id, signature);
+                    self.written.lock().unwrap().insert(run_id, (signature, Instant::now()));
                 }
                 Err(error) => eprintln!("tensorquill-server: cannot write the watchdog status of {run_id}: {error}"),
             }
