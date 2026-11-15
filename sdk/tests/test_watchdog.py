@@ -85,3 +85,19 @@ def test_watch_rebuilds_when_only_the_status_changes(tmp_path):
 
     tensorquill.evidence.watch(path, tmp_path / "out.json", interval=0.01, polls=4, on_update=on_update, watchdog=status)
     assert seen == [[], ["job_stalled"]]
+
+
+def test_the_command_reads_the_status_beside_a_run_directory(tmp_path, capsys, monkeypatch):
+    pq = pytest.importorskip("pyarrow.parquet")
+    from tensorquill.evidence import main
+    from tensorquill.flight import records_to_batch
+
+    run = tmp_path / "runs" / "r"
+    part = run / "rank=0" / "attempt=1"
+    part.mkdir(parents=True)
+    records = [{"run_id": "r", "rank": 0, "attempt": 1, "step": s, "schema_version": 1, "grad_norm": 1.0} for s in range(5)]
+    pq.write_table(__import__("pyarrow").Table.from_batches([records_to_batch(records)]), part / "part-00000000-00000004.parquet")
+    (run / "watchdog.json").write_text(json.dumps(_status("stalled", [_rank(0, "silent", 4, 900.0)])))
+    monkeypatch.setattr("sys.argv", ["tensorquill", str(run), "-o", str(tmp_path / "out.json")])
+    main()
+    assert "Job stalled after step 4" in capsys.readouterr().out

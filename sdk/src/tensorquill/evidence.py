@@ -1054,12 +1054,19 @@ def build_evidence(
     starve_ratio: float = STARVE_RATIO,
     top_k: int | Mapping[str, int] | None = None,
     watchdog: str | Path | Mapping[str, Any] | None = None,
+    flight_recorder: str | Path | None = None,
+    flight_recorder_prefix: str | None = None,
 ) -> dict[str, Any]:
     """Build viewer-neutral detector evidence from captured step records.
 
     `watchdog` is the server's `watchdog.json` (a path or the parsed document). When
     `source` is a directory of Parquet parts, `watchdog.json` beside the `rank=` folders is
     read without being named; its progress verdict becomes `job_stalled` or `rank_silent`.
+    `flight_recorder` is a directory of PyTorch Flight Recorder dumps (one pickle per rank,
+    `flight_recorder_prefix` the common start of their names): PyTorch's analyzer runs over
+    them and its first problem becomes `collective_hang` or `collective_desync`. When the
+    analyzer is missing (PyTorch before 2.10) or the dumps cannot be read, the check is
+    listed under `not_checked` with the reason.
 
     `top_k` overrides the experts-per-token recorded as `moe_top_k`, for captures made
     before it was recorded: one value for every router, or a value per router name.
@@ -1178,6 +1185,19 @@ def build_evidence(
         incidents.append(non_finite_hit)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
     incidents.extend(detect_watchdog_incidents(status))
+    recorder_summary: dict[str, Any] | None = None
+    if flight_recorder is not None:
+        from .collectives import analyze_flight_recorder, flight_recorder_incident
+
+        try:
+            analysis = analyze_flight_recorder(flight_recorder, prefix=flight_recorder_prefix)
+        except (ImportError, OSError, ValueError) as error:
+            not_checked.append({"check": "flight_recorder", "reason": str(error)})
+        else:
+            recorder_summary = {k: analysis[k] for k in ("dumped_ranks", "collectives", "problem_count", "incomplete_dumps")}
+            hit = flight_recorder_incident(analysis, step=max((int(r["step"]) for r in records), default=0))
+            if hit is not None:
+                incidents.append(hit)
     drift_hit = detect_replica_drift(records, tolerance=drift_tolerance)
     if drift_hit is not None:
         incidents.append(drift_hit)
@@ -1204,6 +1224,7 @@ def build_evidence(
         "samples": samples,
         **({"not_checked": not_checked} if not_checked else {}),
         **({"weight_trends": trends} if trends else {}),
+        **({"flight_recorder": recorder_summary} if recorder_summary else {}),
         **({"watchdog": {k: status[k] for k in ("summary", "written_at_ms", "world_size") if k in status}} if status else {}),
     }
 
@@ -1418,6 +1439,27 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             f" {incident['newest_step']}. A hung rank, a killed process or a stuck telemetry sender"
             " look the same to the server"
         )
+    if kind in ("collective_hang", "collective_desync"):
+        group = incident["group"]
+        where = f"{incident['collective']} #{incident['collective_seq_id']} in group {group['desc'] or group['id']}"
+        partial = " (dumps from only some ranks: ranks " + ", ".join(map(str, incident["dumped_ranks"])) + ")" if incident["incomplete_dumps"] else ""
+        if kind == "collective_desync":
+            return (
+                f"Ranks issued different collectives at {where}: {incident['mismatch'] or 'see the analyzer output'}."
+                f" The first of {incident['problems']} problem{'s' if incident['problems'] != 1 else ''} in the"
+                f" Flight Recorder dumps, after step {incident['step']}{partial}"
+            )
+        if incident["missing_ranks"]:
+            return (
+                f"Collective hang at {where}: rank{'s' if len(incident['missing_ranks']) != 1 else ''}"
+                f" {', '.join(map(str, incident['missing_ranks']))} never entered it (state {incident['state']} on the"
+                f" others), after step {incident['step']}. Look at what those ranks were doing instead: a stuck"
+                f" data loader or CPU-side branch, an exception, or a dead process{partial}"
+            )
+        return (
+            f"Collective hang at {where}: every rank entered it but it did not complete (state {incident['state']}),"
+            f" after step {incident['step']}. That points at the network, NCCL or a GPU, not at one rank{partial}"
+        )
     if kind == "resume_lr_change":
         change = incident["changes"][0]
         shown = ", ".join(f"{v:.3g}" for v in change["resumed_lr"])
@@ -1472,11 +1514,16 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
             text = _describe(incident)
             lines.append(text or f"Incident at step {incident['step']}: {incident['kind']}")
             lines += _scalar_lines(incident)
+    notes = [
+        f"Not checked ({item['check']}): {item['reason']}"
+        for item in evidence.get("not_checked", ())
+        if item["check"] != "resume_lr"
+    ]
     if not lines:
-        return "No incidents detected."
+        return "\n".join(["No incidents detected.", *notes])
     if evidence.get("layer_count"):
         lines.append(_legend(evidence))
-    return "\n".join(lines)
+    return "\n".join([*lines, *notes])
 
 
 def _scalar_lines(incident: Mapping[str, Any]) -> list[str]:
@@ -1811,6 +1858,13 @@ def main() -> None:
     )
     parser.add_argument("--rerun", type=Path, help="optional path to write a Rerun .rrd file")
     parser.add_argument(
+        "--flight-recorder",
+        type=Path,
+        help="directory of PyTorch Flight Recorder dumps (one pickle per rank): the first stuck or "
+        "mismatched collective becomes an incident (PyTorch 2.10 or later)",
+    )
+    parser.add_argument("--flight-recorder-prefix", help="common start of the dump file names, if PyTorch cannot infer it")
+    parser.add_argument(
         "--overload-threshold",
         type=float,
         default=OVERLOAD_THRESHOLD,
@@ -1843,12 +1897,15 @@ def main() -> None:
         watch(
             args.input, args.output, interval=args.interval, rank=rank, on_update=report,
             overload_threshold=args.overload_threshold, top_k=args.top_k,
+            flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
         )
         return
 
     records = load_records(args.input, rank=rank, all_attempts=True)
     evidence = build_evidence(
-        records, overload_threshold=args.overload_threshold, top_k=args.top_k
+        records, overload_threshold=args.overload_threshold, top_k=args.top_k,
+        watchdog=_watchdog_beside(args.input),
+        flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
     )
     out_json = write_evidence(evidence, args.output or default_evidence_path(args.input, records))
     print(incident_summary(evidence))

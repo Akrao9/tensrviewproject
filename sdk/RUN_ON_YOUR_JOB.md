@@ -237,6 +237,8 @@ Each incident also lists what you logged with `session.log` at its step, next to
 
 If you streamed to `tensorquill-server`, point the same command at the run's directory in the store, `python -m tensorquill <store>/runs/<run_id>`; add `--rank <n>` for a rank other than 0. The server's `watchdog.json` in that directory is read too: `job_stalled` or `rank_silent` means ranks stopped sending steps, whatever the cause (a hang, a long checkpoint or evaluation pause, a killed job); raise the server's `--silent-seconds` above your longest pause. Add `--watch` to keep it running while the job trains: it re-reads the input every 2 seconds and replaces the evidence file.
 
+If a multi-GPU job hangs, enable PyTorch's Flight Recorder dumps (`TORCH_FR_BUFFER_SIZE`, `TORCH_FR_DUMP_TEMP_FILE`, `TORCH_NCCL_ENABLE_MONITORING=1`, `TORCH_NCCL_DUMP_ON_TIMEOUT=1`; see the SDK README) and add `--flight-recorder <dump dir>` to the command: `collective_hang` names the ranks that never entered the stuck collective, or says every rank did and it did not complete (a network, NCCL or GPU problem); `collective_desync` says ranks issued different collectives.
+
 The thresholds are first guesses from one model, so treat a report as something to check, not a verdict.
 
 ## 6. What to send back
