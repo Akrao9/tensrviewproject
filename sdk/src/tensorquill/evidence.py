@@ -522,8 +522,13 @@ def detect_activation_anomalies(records: list[dict[str, Any]]) -> list[dict[str,
     affected at that step, and how many steps were affected in all.
     """
     history: dict[str, list[tuple[float, float, float]]] = {}
+    # Each module's baseline for drift, from its first ACT_WINDOW records. A module's history
+    # only grows, so those records never change once the drift check starts; they are
+    # summarized once, not again for every later record.
+    baselines: dict[str, tuple[float, float, float]] = {}
     found: dict[str, dict[str, Any]] = {}
     counts: dict[str, int] = {}
+    outlier = lambda rows: _median([a / s for s, a, _ in rows if s > 0] or [0.0])
 
     def report(kind: str, step: int, hits: list[dict[str, Any]]) -> None:
         if not hits:
@@ -552,17 +557,19 @@ def detect_activation_anomalies(records: list[dict[str, Any]]) -> list[dict[str,
                         break
             past.append((std, amax, zfrac))
             if len(past) >= ACT_WINDOW + ACT_RECENT:
-                first, last = past[:ACT_WINDOW], past[-ACT_RECENT:]
-                outlier = lambda rows: _median([a / s for s, a, _ in rows if s > 0] or [0.0])
+                last = past[-ACT_RECENT:]
+                if name not in baselines:
+                    first = past[:ACT_WINDOW]
+                    baselines[name] = (_median([p[0] for p in first]), outlier(first), _median([p[2] for p in first]))
+                base_std, base_outlier, base_zero = baselines[name]
                 for key, base, now in (
-                    ("std", _median([p[0] for p in first]), _median([p[0] for p in last])),
-                    ("abs_max/std", outlier(first), outlier(last)),
+                    ("std", base_std, _median([p[0] for p in last])),
+                    ("abs_max/std", base_outlier, outlier(last)),
                 ):
                     if base > 0 and now > 0 and max(now / base, base / now) >= ACT_DRIFT_FACTOR:
                         drifts.append({"module": name, "stat": key, "baseline": base,
                                        "recent": now, "ratio": now / base})
                         break
-                base_zero = _median([p[2] for p in first])
                 now_zero = _median([p[2] for p in last])
                 if now_zero - base_zero >= ACT_DEAD_RISE:
                     dead.append({"module": name, "baseline": base_zero, "recent": now_zero})
@@ -785,7 +792,11 @@ def load_records(
     if isinstance(source, (str, Path)):
         path = Path(source)
         if path.is_dir():
-            records = [r for part in _parquet_parts(path) for r in _read_part(part)]
+            # One rank at a time: a run of many ranks never has to fit in memory at once.
+            records = [
+                r for part in _parquet_parts(path, rank) for r in _read_part(part)
+                if rank is None or r.get("rank", 0) == rank
+            ]
         elif path.suffix == ".parquet":
             records = _read_part(path)
         else:
@@ -831,8 +842,19 @@ def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 _PART_NAME = re.compile(r"part-(-?\d+)-(-?\d+)\.parquet$")
 
 
-def _parquet_parts(directory: Path) -> list[Path]:
-    """The server's part files under `directory`, ordered by rank, attempt and first step."""
+def _other_rank_folder(entry: os.DirEntry[str], rank: int) -> bool:
+    name, _, value = entry.name.partition("=")
+    return name == "rank" and value.lstrip("-").isdigit() and int(value) != rank
+
+
+def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
+    """The server's part files under `directory`, ordered by rank, attempt and first step.
+
+    With `rank`, the `rank=<n>` folders of other ranks directly under `directory` are not
+    entered: the server writes a rank's records only into its own folder, so reading and
+    discarding them would cost every other rank's share of the run on each look. Parts
+    anywhere else are listed as before and their records filtered by the caller.
+    """
 
     def order(path: Path) -> tuple[int, int, int, str]:
         numbers = {"rank": 0, "attempt": 0}
@@ -843,7 +865,15 @@ def _parquet_parts(directory: Path) -> list[Path]:
         match = _PART_NAME.search(path.name)
         return numbers["rank"], numbers["attempt"], int(match.group(1)) if match else 0, path.name
 
-    return sorted(directory.rglob("part-*.parquet"), key=order)
+    if rank is None:
+        found = list(directory.rglob("part-*.parquet"))
+    else:
+        found = list(directory.glob("part-*.parquet"))
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False) and not _other_rank_folder(entry, rank):
+                    found.extend((directory / entry.name).rglob("part-*.parquet"))
+    return sorted(found, key=order)
 
 
 def _read_part(path: Path) -> list[dict[str, Any]]:
@@ -881,7 +911,7 @@ class _Tail:
         """Add newly written records; return whether there were any."""
         new: list[dict[str, Any]] = []
         if self.source.is_dir():
-            for part in _parquet_parts(self.source):
+            for part in _parquet_parts(self.source, self.rank):
                 if part not in self._seen:  # a part is written once and never changed
                     new.extend(_read_part(part))
                     self._seen.add(part)

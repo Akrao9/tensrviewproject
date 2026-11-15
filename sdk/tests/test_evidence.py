@@ -799,6 +799,50 @@ def test_watch_follows_a_growing_jsonl_file_and_new_parquet_parts(tmp_path):
     assert watch(tmp_path / "nothing-here.jsonl", interval=0.0, polls=2) is None
 
 
+def test_reading_one_rank_leaves_the_other_ranks_parts_unread(tmp_path, monkeypatch):
+    from tensorquill import evidence
+
+    pq = pytest.importorskip("pyarrow.parquet")
+    import pyarrow as pa
+
+    from tensorquill.flight import records_to_batch
+
+    ranks = {rank: _steps(1, range(25 + rank), rank=rank, moe={"r": [10 + rank, 10]}) for rank in range(3)}
+    run_dir = tmp_path / "runs" / "r"
+    _write_parts(run_dir, [record for group in ranks.values() for record in group], rows_per_part=10)
+    read = []
+    real = evidence._read_part
+    monkeypatch.setattr(evidence, "_read_part", lambda path: (read.append(path), real(path))[1])
+
+    def steps_of(records):
+        return [(r["rank"], r["step"]) for r in records]
+
+    for rank, written in ranks.items():
+        read.clear()
+        assert steps_of(tensorquill.load_records(run_dir, rank=rank, all_attempts=True)) == steps_of(written)
+        assert len(read) == -(-len(written) // 10) and {p.parent.parent.name for p in read} == {f"rank={rank}"}
+        read.clear()
+        tail = evidence._Tail(run_dir, rank)
+        assert tail.poll() and steps_of(tail.records) == steps_of(written)
+        assert {p.parent.parent.name for p in read} == {f"rank={rank}"}
+        read.clear()
+        assert not tail.poll() and not read  # nothing new, nothing read
+    read.clear()
+    assert tensorquill.load_records(run_dir, rank=7) == [] and not read  # no folder for that rank
+    everyone = tensorquill.load_records(run_dir, all_attempts=True)
+    assert sorted(steps_of(everyone)) == sorted(steps_of([r for group in ranks.values() for r in group]))
+    assert evidence._parquet_parts(run_dir, 1) == [p for p in evidence._parquet_parts(run_dir) if "rank=1" in p.parts]
+
+    # Without the server's folders nothing can be skipped by name, and the records are filtered.
+    flat = tmp_path / "flat"
+    flat.mkdir()
+    mixed = [r for step in range(6) for rank in range(3) for r in _steps(1, [step], rank=rank)]
+    pq.write_table(pa.Table.from_batches([records_to_batch(mixed)]), flat / "part-00000000-00000005.parquet")
+    assert steps_of(tensorquill.load_records(flat, rank=1, all_attempts=True)) == [(1, s) for s in range(6)]
+    tail = evidence._Tail(flat, 2)
+    assert tail.poll() and steps_of(tail.records) == [(2, s) for s in range(6)]
+
+
 def test_cli_reads_a_directory_of_parts(tmp_path, monkeypatch, capsys):
     import json
     import sys
