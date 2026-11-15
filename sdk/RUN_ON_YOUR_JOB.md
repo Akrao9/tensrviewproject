@@ -227,6 +227,8 @@ What the summary can report:
 - **MoE collapse or overload** at a step and layer, with the experts involved.
 - **Starved experts**: experts that got almost no tokens over 50 steps. A pretrained model can arrive with some; on Granite, 20 came that way.
 - **Gradient spikes**: a step at 5 times the recent median, and in full capture the parameter where it started.
+- **Learning rate after a resume** (`resume_lr_change`): at the first step of a resumed attempt, the learning rate differs from the earlier attempt's. An observation, not a verdict: restarts that change the schedule on purpose look the same. Resumes that cannot be compared are listed under `not_checked` in `evidence.json`; `weight_trends` there gives numbers only for each parameter kind's norm change.
+- **Cross-GPU drift:** now also carries a seeded projection that catches swapped elements; `replica_projection=False` turns it off if its cost matters (GPU cost not yet measured).
 - **Weights not updating** (full capture): parameters with gradients whose float64 norm did not change (a warning, not proof the weights are equal; the incident says whether an optimizer holds them, or that it cannot tell, as under DeepSpeed ZeRO). In pure-bf16 training without float32 master weights, RMSNorm weights near 1.0 show up here because their updates round away.
 - **Activation spikes, drift or dead outputs** (full capture): a block whose largest value or spread jumps or drifts far from its own history, or whose outputs turn to zero.
 - **Repeated steps, NaN or Inf, cross-GPU drift.**

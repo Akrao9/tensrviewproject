@@ -488,6 +488,24 @@ def test_a_stalled_parameter_an_optimizer_holds_points_away_from_the_optimizer(t
     assert "an optimizer holds all of them" in tensorquill.incident_summary(tensorquill.build_evidence(sink.records))
 
 
+def test_every_parameter_no_optimizer_holds_is_recorded_not_just_the_first_twenty():
+    model = torch.nn.Sequential(*[torch.nn.Linear(2, 2) for _ in range(15)])  # 30 tensors
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=2, weights=1)
+    opt = torch.optim.SGD(model[0].parameters(), lr=0.1)  # the other 28 are left out
+    for _ in range(6):
+        model(torch.randn(3, 2)).sum().backward()
+        opt.step()
+        opt.zero_grad()
+    session.close()
+    ownership = sink.records[-1]["optimizer_ownership"]
+    assert ownership["unheld_count"] == 28 and len(ownership["unheld"]) == 28
+    hit = tensorquill.detect_stalled_weights(sink.records)
+    assert hit["optimizer"]["not_held_count"] == hit["stalled"] == 28 and hit["optimizer"]["held_count"] == 0
+    assert "no optimizer that stepped holds any of them" in tensorquill.incident_summary(
+        tensorquill.build_evidence(sink.records))
+
+
 def test_ownership_is_unknown_when_it_cannot_be_established(toy_moe):
     # Hooks off: nothing was seen stepping.
     sink = _run_with_optimizer(toy_moe, lambda m: torch.optim.SGD(m.parameters(), lr=0.0), auto_step=False)
@@ -877,3 +895,35 @@ def test_weight_norm_trends_are_numbers_by_kind_and_never_an_incident():
     assert evidence["weight_trends"] == trends
     assert evidence["incidents"] == []  # no cutoff is chosen: numbers only
     assert "weight_trends" not in tensorquill.build_evidence(records[:1])
+
+
+def test_a_third_attempt_is_compared_with_the_history_that_survives_the_rollbacks():
+    # Attempt 1 reached step 149, attempt 2 resumed at 100, attempt 3 resumed at 50 and
+    # rolls both back. Step 50's learning rate comes from attempt 1, not from attempt 2.
+    fn = _warmup_then_decay
+    base = _lr(1, range(150), fn) + _lr(2, range(100, 120), fn)
+    skipped = []
+    assert tensorquill.detect_resume_lr_changes(base + _lr(3, range(50, 60), fn), not_checked=skipped) is None
+    assert skipped == []
+    hit = tensorquill.detect_resume_lr_changes(base + _lr(3, range(50, 60), lambda s: 7e-4))
+    assert hit["step"] == 50 and hit["resumes"] == 1
+    assert hit["changes"][0]["previous_attempt"] == 1 and hit["changes"][0]["basis"] == "same_step"
+
+
+def test_a_scheduler_milestone_at_the_resume_step_is_not_reported_when_the_earlier_attempt_ended_before_it():
+    # A hard kill lost the last steps, so the earlier attempt ends at step 39. The restored
+    # scheduler drops the learning rate at step 40, as a StepLR milestone does. That looks
+    # the same as a reset, so it is listed as not checked, with its numbers, not reported.
+    step_lr = lambda s: 1e-3 if s < 40 else 1e-4
+    records = _lr(1, range(40), step_lr) + _lr(2, range(40, 50), step_lr)
+    skipped = []
+    assert tensorquill.detect_resume_lr_changes(records, not_checked=skipped) is None
+    assert len(skipped) == 1 and skipped[0]["step"] == 40
+    assert skipped[0]["expected_lr"] == [pytest.approx(1e-3)] and skipped[0]["resumed_lr"] == [pytest.approx(1e-4)]
+    # Warmup starting over from the same ending point is still reported.
+    reset = _lr(1, range(40), lambda s: 1e-3 if s > 5 else 1e-4 * (s + 1)) + _lr(2, range(40, 50), lambda s: 1e-4)
+    hit = tensorquill.detect_resume_lr_changes(reset)
+    assert hit["changes"][0]["basis"] == "extrapolated" and hit["changes"][0]["equals_first_lr"] is True
+    # Small learning rates are compared relatively, not against an absolute floor.
+    tiny = lambda s: 1e-9 * (1 + s)
+    assert tensorquill.detect_resume_lr_changes(_lr(1, range(30), tiny) + _lr(2, range(30, 40), tiny)) is None

@@ -74,6 +74,24 @@ def main() -> None:
         # The older norm and sum fingerprint sees nothing here; only the projection does.
         assert spread["norm_spread"] < 1e-6 and spread["sum_spread"] < 1e-6, spread
         assert spread["projection_spread"] > 1e-6, spread
+        import time
+
+        timings = {}
+        for projection in (False, True):
+            tensorquill.parameter_fingerprints(model.parameters(), projection=projection)  # warm up
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start = time.perf_counter()
+            for _ in range(20):
+                tensorquill.parameter_fingerprints(model.parameters(), projection=projection)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            timings[projection] = (time.perf_counter() - start) / 20 * 1000
+        print(
+            f"rank {rank} fingerprint time on {device.type}: {timings[False]:.3f} ms norm and sum,"
+            f" {timings[True]:.3f} ms with the seeded projection (a tiny model: only the ratio and a GPU"
+            " run mean anything)"
+        )
         print(f"PASS {backend} rank {rank}: healthy at 0, 2 and 4, drift at 1, sign flip at 3, swap at 5")
     finally:
         dist.destroy_process_group()

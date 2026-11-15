@@ -532,7 +532,7 @@ class Session:
         if not seen:
             return {"state": "unknown", "reason": "no optimizer that has stepped holds this model's parameters"}
         unheld = [name for name, p in zip(self.param_names, self._params) if id(p) not in held]
-        return {"state": "known", "unheld": unheld[:20], "unheld_count": len(unheld)}
+        return {"state": "known", "unheld": unheld, "unheld_count": len(unheld)}
 
     def _should_record_grads(self) -> bool:
         # Weight checks need the step's gradient norms, so they also turn gradients on.

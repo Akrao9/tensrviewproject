@@ -375,9 +375,6 @@ def _optimizer_evidence(ownership: Mapping[str, Any] | None, stalled: list[str])
         return {"state": "unknown", "reason": ownership.get("reason", "not established")}
     unheld = set(ownership.get("unheld", ()))
     not_held = [name for name in stalled if name in unheld]
-    if ownership.get("unheld_count", 0) > len(unheld) and not not_held:
-        # Only the first names are recorded; a stalled parameter may be among the rest.
-        return {"state": "unknown", "reason": "the list of parameters no optimizer holds was cut short"}
     return {"state": "known", "not_held": not_held[:20], "not_held_count": len(not_held),
             "held_count": len(stalled) - len(not_held)}
 
@@ -576,92 +573,61 @@ def _lr_values(record: Mapping[str, Any]) -> list[float] | None:
 def detect_resume_lr_changes(
     records: list[dict[str, Any]], *, not_checked: list[dict[str, Any]] | None = None
 ) -> dict[str, Any] | None:
-    """Report where a resumed attempt's learning rate differs from the earlier attempt's.
+    """Report where a resumed attempt's learning rate differs from the run's history.
 
-    Pass every attempt (`load_records(..., all_attempts=True)`). At the first step of each
-    later attempt that resumed from a checkpoint (it starts after the run's first step, so
-    a restart of the numbering is left to `repeated_steps`), the learning rate is compared
-    with where the earlier attempt's own trajectory puts it:
+    Pass every attempt (`load_records(..., all_attempts=True)`). At the first step S of
+    each later attempt that resumed from a checkpoint (it starts after the run's first
+    step, so a restart of the numbering is left to `repeated_steps`), the learning rate is
+    compared with the run's history as it stood before that attempt, which is every earlier
+    attempt with each rollback applied:
 
-    - `same_step`: the earlier attempt also recorded that step, so the two values are read
-      at the same step;
-    - `extrapolated`: it did not, so its last values are continued along their recent
-      slope, with a tolerance that grows with the slope and the gap.
+    - `same_step`: the history has step S, because an earlier attempt ran past the
+      checkpoint. The two values come from the same step, so any difference is reported.
+    - `extrapolated`: it does not, as after a hard kill that lost the last steps. The
+      history's last values are continued along their recent slope. A scheduler that
+      legitimately changes at S looks the same as a reset, so this basis reports only the
+      distinctive case, a resumed value equal to the run's first learning rate while the
+      history is elsewhere (warmup starting over). Any other difference goes into
+      `not_checked` with its numbers.
 
     A difference is an observation, not a verdict: some restarts change the schedule on
-    purpose, and a record cannot show the intent. The incident says whether the resumed
-    value equals the run's first learning rate, as when warmup starts over. A resume that
-    cannot be compared (no learning rate recorded) is added to `not_checked`.
+    purpose, and a record cannot show the intent. A resume with no learning rate recorded
+    on either side is added to `not_checked`.
     """
     by_rank: dict[Any, dict[int, dict[int, list[float] | None]]] = {}
     for record in records:
         attempts = by_rank.setdefault(record.get("rank", 0), {})
         attempts.setdefault(record.get("attempt", 0), {})[int(record["step"])] = _lr_values(record)
     changes: list[dict[str, Any]] = []
+
+    def skip(rank: Any, step: int, reason: str, **numbers: Any) -> None:
+        if not_checked is not None:
+            not_checked.append({"check": "resume_lr", "step": step, "rank": rank, "reason": reason, **numbers})
+
     for rank, attempts in sorted(by_rank.items(), key=lambda kv: str(kv[0])):
         order = sorted(attempts)
-        first_steps = attempts[order[0]]
-        run_start = min(first_steps)
-        first_lr = first_steps[run_start]
-        for previous, current in zip(order, order[1:]):
-            steps = attempts[current]
+        run_start = min(attempts[order[0]])
+        first_lr = attempts[order[0]][run_start]
+        history: dict[int, tuple[list[float], int]] = {}  # step -> (learning rate, attempt)
+        for attempt in order:
+            steps = attempts[attempt]
             resumed_at = min(steps)
-            if resumed_at <= run_start:
-                continue
-            new = steps[resumed_at]
-            before = {k: v for k, v in attempts[previous].items() if v is not None and k <= resumed_at}
-            if new is None or not before:
-                if not_checked is not None:
-                    not_checked.append(
-                        {
-                            "check": "resume_lr",
-                            "step": resumed_at,
-                            "rank": rank,
-                            "reason": "no learning rate recorded"
-                            + (" in the resumed attempt" if new is None else " in the earlier attempt"),
-                        }
+            if attempt != order[0] and resumed_at > run_start:
+                result = _compare_resume(history, steps[resumed_at], resumed_at, first_lr)
+                if isinstance(result, str):
+                    skip(rank, resumed_at, result)
+                elif result is not None and result["basis"] == "extrapolated" and not result["equals_first_lr"]:
+                    skip(
+                        rank, resumed_at,
+                        "the earlier attempts ended before the resume step, so the learning rate cannot be"
+                        " compared at the same step; a schedule that changes there looks the same",
+                        expected_lr=result["expected_lr"], resumed_lr=result["resumed_lr"],
                     )
-                continue
-            if resumed_at in before:
-                basis, expected, tolerance = "same_step", before[resumed_at], RESUME_LR_TOLERANCE
-            else:
-                recent = sorted(before)[-10:]
-                last = recent[-1]
-                gap = resumed_at - last
-                expected = list(before[last])
-                slope = [0.0] * len(expected)
-                if len(recent) > 1 and len(before[recent[0]]) == len(expected):
-                    span = last - recent[0]
-                    slope = [(a - b) / span for a, b in zip(before[last], before[recent[0]])]
-                    expected = [a + m * gap for a, m in zip(before[last], slope)]
-                basis = "extrapolated"
-                tolerance = max(RESUME_LR_TOLERANCE, 0.5 * max((abs(m) for m in slope), default=0.0) * gap)
-            same_groups = len(new) == len(expected)
-            differs = (not same_groups) or any(
-                abs(n - e) > max(RESUME_LR_TOLERANCE * abs(e), tolerance if basis == "extrapolated" else 0.0)
-                for n, e in zip(new, expected)
-            )
-            if not differs:
-                continue
-            resets = (
-                first_lr is not None
-                and len(first_lr) == len(new)
-                and all(abs(n - f) <= RESUME_LR_TOLERANCE * abs(f) for n, f in zip(new, first_lr))
-                and any(abs(e - f) > RESUME_LR_TOLERANCE * abs(f) for e, f in zip(expected, first_lr))
-            )
-            changes.append(
-                {
-                    "step": resumed_at,
-                    "rank": rank,
-                    "attempt": current,
-                    "previous_attempt": previous,
-                    "basis": basis,
-                    "expected_lr": expected,
-                    "resumed_lr": new,
-                    "first_lr": first_lr,
-                    "equals_first_lr": resets,
-                }
-            )
+                elif result is not None:
+                    changes.append({"step": resumed_at, "rank": rank, "attempt": attempt, **result})
+            # This attempt rolls back whatever earlier attempts recorded from its first step on.
+            history = {k: v for k, v in history.items() if k < resumed_at}
+            history.update({k: (v, attempt) for k, v in steps.items() if v is not None})
     if not changes:
         return None
     changes.sort(key=lambda c: c["step"])
@@ -671,6 +637,54 @@ def detect_resume_lr_changes(
         "resumes": len(changes),
         "changes": changes[:5],
         "note": "an observation: some restarts change the schedule on purpose",
+    }
+
+
+def _compare_resume(
+    history: dict[int, tuple[list[float], int]],
+    new: list[float] | None,
+    resumed_at: int,
+    first_lr: list[float] | None,
+) -> dict[str, Any] | str | None:
+    """A change to report, a reason the resume cannot be checked, or None when it continues."""
+    if new is None:
+        return "no learning rate recorded in the resumed attempt"
+    if not history:
+        return "no learning rate recorded in the earlier attempts"
+    if resumed_at in history:
+        basis, (expected, source) = "same_step", history[resumed_at]
+        slope_tolerance = 0.0
+    else:
+        recent = sorted(k for k in history if k < resumed_at)[-10:]
+        if not recent:
+            return "the earlier attempts recorded no learning rate before the resume step"
+        last = recent[-1]
+        expected, source = history[last]
+        slope = [0.0] * len(expected)
+        if len(recent) > 1 and len(history[recent[0]][0]) == len(expected):
+            span = last - recent[0]
+            slope = [(a - b) / span for a, b in zip(expected, history[recent[0]][0])]
+            expected = [a + m * (resumed_at - last) for a, m in zip(expected, slope)]
+        basis = "extrapolated"
+        slope_tolerance = 0.5 * max((abs(m) for m in slope), default=0.0) * (resumed_at - last)
+    differs = len(new) != len(expected) or any(
+        abs(n - e) > max(RESUME_LR_TOLERANCE * abs(e), slope_tolerance) for n, e in zip(new, expected)
+    )
+    if not differs:
+        return None
+    resets = (
+        first_lr is not None
+        and len(first_lr) == len(new)
+        and all(abs(n - f) <= RESUME_LR_TOLERANCE * abs(f) for n, f in zip(new, first_lr))
+        and any(abs(e - f) > RESUME_LR_TOLERANCE * abs(f) for e, f in zip(expected, first_lr))
+    )
+    return {
+        "previous_attempt": source,
+        "basis": basis,
+        "expected_lr": expected,
+        "resumed_lr": new,
+        "first_lr": first_lr,
+        "equals_first_lr": resets,
     }
 
 
