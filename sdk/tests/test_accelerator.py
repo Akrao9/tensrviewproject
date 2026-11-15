@@ -90,3 +90,19 @@ def test_another_models_accelerator_calls_are_not_recorded():
     session.close()
     assert len(sink.records) == 1
     assert sink.records[0]["clip_grad_norm"] > 0
+
+
+def test_clip_grad_norm_accepts_a_single_tensor():
+    accelerator, model, optimizer = _setup()
+    sink = tensorlens.MemorySink()
+    session = tensorlens.init(model, sink=sink, capture="full")
+    watch_accelerator(session, loss_name=None)
+    param = next(model.parameters())
+    loss = model(torch.randn(4, 4)).pow(2).mean()
+    accelerator.backward(loss)
+    accelerator.clip_grad_norm_(param, 0.05)
+    optimizer.step()
+    optimizer.zero_grad()
+    session.close()
+    assert len(sink.records) == 1
+    assert sink.records[0]["clip_grad_norm"] > 0

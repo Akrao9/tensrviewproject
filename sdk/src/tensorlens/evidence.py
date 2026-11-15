@@ -475,7 +475,7 @@ def detect_repeated_steps(records: list[dict[str, Any]]) -> dict[str, Any] | Non
     """
     seen: dict[tuple[Any, int, int], int] = {}
     for record in records:
-        key = (record.get("rank"), record.get("attempt", 0), int(record["step"]))
+        key = (record.get("rank", 0), record.get("attempt", 0), int(record["step"]))
         seen[key] = seen.get(key, 0) + 1
     repeated_steps = {step for (_, _, step), n in seen.items() if n > 1}
     for rank in {rank for rank, _, _ in seen}:

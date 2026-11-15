@@ -247,3 +247,54 @@ def test_a_resumed_run_keeps_its_repeated_steps_and_watch_reads_them(tmp_path, t
     evidence = tensorlens.build_evidence(run_dir)
     assert evidence == tensorlens.build_evidence(path)
     assert not [i for i in evidence["incidents"] if i["kind"] == "repeated_steps"]
+
+
+def test_grpcs_streams_with_custom_ca_and_rejects_untrusted_server(tmp_path, toy_moe, monkeypatch):
+    import shutil
+
+    from tensorlens.flight import FlightSender
+
+    if shutil.which("openssl") is None:
+        pytest.skip("needs openssl")
+
+    cert, key, conf = tmp_path / "cert.pem", tmp_path / "key.pem", tmp_path / "openssl.cnf"
+    conf.write_text(
+        "[req]\ndistinguished_name=dn\nx509_extensions=san\nprompt=no\n"
+        "[dn]\nCN=localhost\n"
+        "[san]\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", str(key), "-out", str(cert), "-days", "1", "-config", str(conf)],
+        check=True, capture_output=True,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TENSORLENS_TOKEN", raising=False)
+    monkeypatch.delenv("TENSORLENS_TLS_CA", raising=False)
+    store = tmp_path / "store"
+    server = Server(store, 0, "--tls-cert", str(cert), "--tls-key", str(key))
+    endpoint = f"grpcs://127.0.0.1:{server.port}"
+    try:
+        # Without TENSORLENS_TLS_CA the self-signed certificate is rejected.
+        untrusted = tmp_path / "untrusted.rank0.jsonl"
+        _steps(untrusted, "untrusted", 0, range(3))
+        bad_sender = FlightSender(untrusted, endpoint, "untrusted", 0)
+        assert bad_sender.close(timeout=0.5) is False
+        assert bad_sender.last_error is not None
+        assert not (store / "runs" / "untrusted").exists()
+
+        # With TENSORLENS_TLS_CA pointing at the server certificate, streaming succeeds.
+        monkeypatch.setenv("TENSORLENS_TLS_CA", str(cert))
+        session = tensorlens.init(
+            toy_moe, run_id="tls", every=5, routers={"router": 4}, endpoint=endpoint
+        )
+        train(toy_moe, session, 20)
+        session.close()
+    finally:
+        assert server.terminate() == 0
+
+    written = tensorlens.load_records(tmp_path / "tensorlens-out" / "tls.rank0.jsonl")
+    assert len(written) == 20
+    assert stored_records(store, "tls") == written

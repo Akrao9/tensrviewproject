@@ -103,10 +103,12 @@ def _restore_if_unused() -> None:
 
 def _clip_grad_norm(self: Any, parameters: Any, *args: Any, **kwargs: Any) -> Any:
     original = _originals[0]  # type: ignore[index]
-    parameters = list(parameters)
+    if not isinstance(parameters, torch.Tensor):
+        parameters = list(parameters)
+    first = parameters if isinstance(parameters, torch.Tensor) else next(iter(parameters), None)
     sessions = [
         w.session for w in _live()
-        if w.session._clip_watched and parameters and id(parameters[0]) in w.session._param_ids
+        if w.session._clip_watched and first is not None and id(first) in w.session._param_ids
     ]
     before = [s._clip_calls for s in sessions]
     norm = original(self, parameters, *args, **kwargs)

@@ -32,6 +32,7 @@ CLOSE_TIMEOUT = 5.0
 POLL_SECONDS = 0.2
 ENDPOINT_ENV = "TENSORLENS_ENDPOINT"
 TOKEN_ENV = "TENSORLENS_TOKEN"
+TLS_CA_ENV = "TENSORLENS_TLS_CA"
 
 _NON_FINITE = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}
 
@@ -312,6 +313,19 @@ def _location(endpoint: str) -> str:
     raise ValueError(f"endpoint must be grpc://host:port or grpcs://host:port, got {endpoint!r}")
 
 
+def _read_tls_root_certs(tls_root_certs: bytes | str | os.PathLike[str] | None) -> bytes | None:
+    if tls_root_certs is None:
+        env_path = os.environ.get(TLS_CA_ENV)
+        if not env_path:
+            return None
+        tls_root_certs = env_path
+    if isinstance(tls_root_certs, (bytes, bytearray, memoryview)):
+        return bytes(tls_root_certs)
+    if isinstance(tls_root_certs, (str, os.PathLike)):
+        return Path(tls_root_certs).read_bytes()
+    raise TypeError(f"tls_root_certs must be bytes or a file path, got {type(tls_root_certs).__name__}")
+
+
 class FlightSender:
     """Tails one rank's `.jsonl` file and streams it to the ingest server.
 
@@ -319,7 +333,7 @@ class FlightSender:
     just after its last line; the server answers with the offset it has stored durably, and
     only then does the `.offset` file move. After any failure the sender sleeps (full-jitter
     exponential backoff) and starts again from the saved offset, so at most one batch is in
-    memory at a time and the server's `(run_id, rank, step)` filter drops what it already has.
+    memory at a time and the server's `(run_id, rank, attempt, step)` filter drops what it already has.
     """
 
     def __init__(
@@ -330,6 +344,7 @@ class FlightSender:
         rank: int = 0,
         *,
         token: str | None = None,
+        tls_root_certs: bytes | str | os.PathLike[str] | None = None,
         batch_steps: int = BATCH_STEPS,
         batch_seconds: float = BATCH_SECONDS,
         batch_bytes: int = BATCH_BYTES,
@@ -348,6 +363,11 @@ class FlightSender:
         self.skipped_lines = 0
         self._location = _location(endpoint)
         self._token = token if token is not None else os.environ.get(TOKEN_ENV)
+        self._tls_root_certs = (
+            _read_tls_root_certs(tls_root_certs)
+            if (tls_root_certs is not None or self._location.startswith("grpc+tls://"))
+            else None
+        )
         self._batch_steps = batch_steps
         self._batch_seconds = batch_seconds
         self._batch_bytes = batch_bytes
@@ -404,7 +424,9 @@ class FlightSender:
 
     def _run(self) -> None:
         attempt = 0
+        retried_on_close = False
         while True:
+            was_closing = self._closing.is_set()
             try:
                 self._stream()
                 return
@@ -423,13 +445,29 @@ class FlightSender:
                     f"continues and {self.path} stays complete; the sender keeps retrying.",
                     file=sys.stderr,
                 )
-            delay = random.uniform(0.0, min(self._backoff_cap, self._backoff_base * 2**attempt))
-            attempt += 1
-            if self._closing.wait(delay):
+            if self._closing.is_set():
+                if time.monotonic() >= self._deadline:
+                    return
+                if not was_closing and not retried_on_close:
+                    retried_on_close = True
+                    attempt = 0
+                    continue
+                delay = random.uniform(0.0, min(self._backoff_cap, self._backoff_base * 2**attempt))
+                attempt += 1
                 remaining = self._deadline - time.monotonic()
                 if remaining <= 0:
                     return
                 time.sleep(min(delay, remaining))
+                if time.monotonic() >= self._deadline:
+                    return
+                continue
+            delay = random.uniform(0.0, min(self._backoff_cap, self._backoff_base * 2**attempt))
+            attempt += 1
+            if self._closing.wait(delay):
+                if time.monotonic() >= self._deadline:
+                    return
+                retried_on_close = True
+                attempt = 0
 
     def _ack(self, offset: int) -> None:
         if offset > self._acked:
@@ -451,10 +489,12 @@ class FlightSender:
         sent = self._acked
         schema = flight_schema()
         headers = [(b"authorization", f"Bearer {self._token}".encode())] if self._token else []
-        client = flight.FlightClient(
-            self._location,
-            generic_options=[("grpc.keepalive_time_ms", 30_000), ("grpc.keepalive_timeout_ms", 10_000)],
-        )
+        client_kwargs: dict[str, Any] = {
+            "generic_options": [("grpc.keepalive_time_ms", 30_000), ("grpc.keepalive_timeout_ms", 10_000)],
+        }
+        if self._tls_root_certs is not None:
+            client_kwargs["tls_root_certs"] = self._tls_root_certs
+        client = flight.FlightClient(self._location, **client_kwargs)
         try:
             descriptor = flight.FlightDescriptor.for_path("runs", self.run_id, f"rank={self.rank}")
             writer, reader = client.do_put(descriptor, schema, flight.FlightCallOptions(headers=headers))
@@ -526,10 +566,21 @@ class FlightSender:
             client.close()
 
 
-def send_file(path: str | Path, endpoint: str, run_id: str, rank: int = 0, *, timeout: float = 60.0) -> bool:
+def send_file(
+    path: str | Path,
+    endpoint: str,
+    run_id: str,
+    rank: int = 0,
+    *,
+    timeout: float = 60.0,
+    token: str | None = None,
+    tls_root_certs: bytes | str | os.PathLike[str] | None = None,
+) -> bool:
     """Send what a finished run's `.jsonl` file still owes the server. Returns whether the
     server confirmed the whole file."""
-    return FlightSender(path, endpoint, run_id, rank).close(timeout)
+    return FlightSender(
+        path, endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs
+    ).close(timeout)
 
 
 # --- The hook used by `tensorlens.init` ------------------------------------------------
@@ -551,7 +602,15 @@ class StreamingSink:
         self.sender.close()
 
 
-def attach(sink: Any, run_id: str, rank: int, endpoint: str | None = None) -> Any:
+def attach(
+    sink: Any,
+    run_id: str,
+    rank: int,
+    endpoint: str | None = None,
+    *,
+    token: str | None = None,
+    tls_root_certs: bytes | str | os.PathLike[str] | None = None,
+) -> Any:
     """Start streaming `sink`'s file when `endpoint` or `TENSORLENS_ENDPOINT` is set;
     otherwise return `sink` unchanged, with no socket opened and `pyarrow` not imported."""
     endpoint = endpoint or os.environ.get(ENDPOINT_ENV)
@@ -565,7 +624,9 @@ def attach(sink: Any, run_id: str, rank: int, endpoint: str | None = None) -> An
             f"(or left as the default), not {type(sink).__name__}"
         )
     try:
-        sender = FlightSender(path, endpoint, run_id, rank)
+        sender = FlightSender(
+            path, endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs
+        )
     except ImportError as error:
         raise ImportError(
             'endpoint= needs pyarrow: pip install "tensorlens[flight]"'

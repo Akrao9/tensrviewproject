@@ -367,3 +367,41 @@ def test_a_forked_child_leaves_the_stream_to_its_parent(tmp_path, store, server)
         assert pipe.read() == "|False|True"  # at once, and nothing printed about lost bytes
     assert sender.close(timeout=10.0) is True
     assert store.steps() == list(range(11))
+
+
+def test_close_wakes_backoff_immediately_to_flush(tmp_path, store, monkeypatch):
+    # First get an unused loopback port, then let the sender fail and enter a long backoff.
+    first = FakeServer(store)
+    port, endpoint = first.port, first.endpoint
+    first.stop()
+
+    monkeypatch.setattr("tensorlens.flight.random.uniform", lambda _a, b: b)
+    path = tmp_path / "run-a.rank0.jsonl"
+    append(path, [record(step) for step in range(10)])
+    sender = fast_sender(path, endpoint, backoff_base=10.0, backoff_cap=10.0)
+    wait_for(lambda: sender.last_error is not None)
+    time.sleep(0.05)  # sender is now waiting in its 10s backoff
+
+    restarted = FakeServer(store, port=port)
+    try:
+        started = time.monotonic()
+        assert sender.close(timeout=3.0) is True
+        assert time.monotonic() - started < 2.0
+    finally:
+        restarted.stop()
+    assert store.steps() == list(range(10))
+
+
+def test_tls_ca_is_loaded_at_init_and_ignored_for_plaintext(tmp_path, monkeypatch):
+    path = tmp_path / "run-a.rank0.jsonl"
+    missing = tmp_path / "missing-ca.pem"
+    monkeypatch.setenv("TENSORLENS_TLS_CA", str(missing))
+    with pytest.raises(FileNotFoundError):
+        FlightSender(path, "grpcs://127.0.0.1:9", "run-a", 0)
+    monkeypatch.delenv("TENSORLENS_TLS_CA")
+    with pytest.raises(FileNotFoundError):
+        FlightSender(path, "grpcs://127.0.0.1:9", "run-a", 0, tls_root_certs=missing)
+    monkeypatch.setenv("TENSORLENS_TLS_CA", str(missing))
+    plain = FlightSender(path, "grpc://127.0.0.1:9", "run-a", 0)
+    assert plain._tls_root_certs is None
+    assert plain.close(timeout=0.05) is True  # empty missing file has 0 unacked bytes

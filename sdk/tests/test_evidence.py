@@ -621,6 +621,7 @@ def test_an_attempt_that_restarts_the_numbering_is_still_reported():
     old = [{"run_id": "r", "step": s} for s in (0, 1, 1, 2)]
     assert tensorlens.load_records(old) == old
     assert tensorlens.detect_repeated_steps(old)["steps"] == [1]
+    assert tensorlens.detect_repeated_steps([{"run_id": "r", "step": 4}, {"run_id": "r", "rank": 0, "step": 4}])["steps"] == [4]
 
 
 def _write_parts(root, records, rows_per_part=40):
