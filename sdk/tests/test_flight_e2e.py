@@ -194,7 +194,9 @@ def test_forked_dataloader_workers_do_not_disturb_the_sender(tmp_path, monkeypat
     server = Server(store)
     try:
         model = torch.nn.Linear(8, 1)
-        session = tensorquill.init(model, run_id="forked", capture="full", every=5, endpoint=server.endpoint)
+        # Heartbeats every 50 ms, so beats and forks overlap.
+        session = tensorquill.init(model, run_id="forked", capture="full", every=5, endpoint=server.endpoint,
+                                   heartbeat_seconds=0.05)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
         data = torch.utils.data.TensorDataset(torch.randn(128, 8))
         for _ in range(3):
@@ -308,7 +310,7 @@ def test_the_server_calls_a_job_that_goes_quiet_stalled_and_evidence_says_so(tmp
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)
     store = tmp_path / "store"
-    server = Server(store, 0, "--silent-seconds", "1", "--watchdog-seconds", "0.2", "--flush-seconds", "0.3")
+    server = Server(store, 0, "--silent-seconds", "1", "--silent-factor", "0", "--watchdog-seconds", "0.2", "--flush-seconds", "0.3")
     run_dir = store / "runs" / "hung"
     try:
         session = tensorquill.init(
@@ -360,7 +362,7 @@ os._exit(0)  # leaves without close(): the connection closes, the stream is neve
 
 @pytest.mark.parametrize("how", ["kill", "exit"])
 def test_a_job_that_dies_without_closing_is_lost_not_finished(tmp_path, how):
-    server = Server(tmp_path / "store", 0, "--silent-seconds", "1", "--watchdog-seconds", "0.2", "--flush-seconds", "0.3")
+    server = Server(tmp_path / "store", 0, "--silent-seconds", "1", "--silent-factor", "0", "--watchdog-seconds", "0.2", "--flush-seconds", "0.3")
     run_dir = tmp_path / "store" / "runs" / "dies"
     try:
         import sys
@@ -380,5 +382,119 @@ def test_a_job_that_dies_without_closing_is_lost_not_finished(tmp_path, how):
         assert status and status["ranks"][0]["state"] == "lost", status
         assert status["ranks"][0]["stream"] == "dropped"  # never "finished": nobody called close()
         assert status["summary"] == "stalled" and status["ranks"][0]["last_step"] >= 49
+    finally:
+        assert server.terminate() == 0
+
+
+def _status_of(run_dir):
+    return tensorquill.evidence.read_watchdog(run_dir / "watchdog.json")
+
+
+def _wait_for(run_dir, ready, seconds=20):
+    deadline = time.monotonic() + seconds
+    status = None
+    while time.monotonic() < deadline:
+        status = _status_of(run_dir)
+        if status and ready(status):
+            return status
+        time.sleep(0.1)
+    raise AssertionError(f"timed out; last status {status}")
+
+
+def test_evaluation_is_paused_and_measured_but_a_quiet_training_phase_is_a_suspected_hang(tmp_path, toy_moe, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)
+    server = Server(tmp_path / "store", 0, "--silent-seconds", "1", "--silent-factor", "0", "--critical-seconds", "3",
+                    "--watchdog-seconds", "0.1", "--flush-seconds", "0.2")
+    run_dir = tmp_path / "store" / "runs" / "phases"
+    try:
+        session = tensorquill.init(toy_moe, run_id="phases", every=10, routers={"router": 4},
+                                   endpoint=server.endpoint, heartbeat_seconds=0.2)
+        train(toy_moe, session, 30)
+        # Evaluation: no steps for longer than the silence floor, heartbeats saying so.
+        with session.phase("eval"):
+            status = _wait_for(run_dir, lambda s: s["ranks"][0]["phase"] == "eval"
+                               and s["ranks"][0]["state"] == "paused")
+            assert status["summary"] == "active" and status["ranks"][0]["severity"] is None
+            assert tensorquill.build_evidence(run_dir)["incidents"] == [] or all(
+                i["kind"] not in ("job_stalled", "rank_silent") for i in tensorquill.build_evidence(run_dir)["incidents"])
+        status = _wait_for(run_dir, lambda s: s["pauses"].get("eval", {}).get("count") == 1)
+        longest = status["pauses"]["eval"]["max_seconds"]
+        assert longest > 0.2  # the pause was measured by the server from the phase changes
+        assert status["recommended_silent_seconds"] == max(1.0, float(-(-2 * longest // 1)))  # twice, rounded up, not below the floor
+        # Back in training, the rank goes quiet: its heartbeats continue and say `train`.
+        status = _wait_for(run_dir, lambda s: s["ranks"][0]["state"] == "silent")
+        assert status["ranks"][0]["phase"] == "train" and status["ranks"][0]["severity"] == "warning"
+        assert status["ranks"][0]["heartbeat_age_seconds"] is not None
+        status = _wait_for(run_dir, lambda s: s["ranks"][0]["severity"] == "critical")
+        assert status["summary"] == "stalled"
+        evidence = tensorquill.build_evidence(run_dir)
+        [incident] = [i for i in evidence["incidents"] if i["kind"] == "job_stalled"]
+        assert (incident["severity"], incident["assessment"]) == ("critical", "suspected_hang")
+        assert "Pauses the job reported: eval up to" in tensorquill.incident_summary(evidence)
+        session.close()
+        _wait_for(run_dir, lambda s: s["summary"] == "finished")
+    finally:
+        assert server.terminate() == 0
+
+
+_FREEZES = """
+import os, signal, sys, time
+import torch, tensorquill
+model = torch.nn.Linear(4, 2)
+session = tensorquill.init(model, run_id="frozen", every=10, endpoint=sys.argv[1], heartbeat_seconds=0.2)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+for _ in range(30):
+    optimizer.zero_grad()
+    model(torch.randn(8, 4)).sum().backward()
+    optimizer.step()
+time.sleep(1.0)
+os.kill(os.getpid(), signal.SIGSTOP)  # every thread stops, the connection stays open
+"""
+
+
+def test_a_stopped_process_whose_heartbeats_cease_is_unresponsive(tmp_path):
+    import sys
+
+    server = Server(tmp_path / "store", 0, "--silent-seconds", "1", "--silent-factor", "0", "--critical-seconds", "3",
+                    "--watchdog-seconds", "0.1", "--flush-seconds", "0.2")
+    run_dir = tmp_path / "store" / "runs" / "frozen"
+    child = subprocess.Popen([sys.executable, "-c", _FREEZES, server.endpoint], cwd=tmp_path,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        status = _wait_for(run_dir, lambda s: s["ranks"][0]["state"] == "unresponsive", 40)
+        assert status["ranks"][0]["stream"] == "open" and status["summary"] == "stalled"
+        evidence = tensorquill.build_evidence(run_dir)
+        assert "heartbeats stopped too" in tensorquill.incident_summary(evidence)
+    finally:
+        child.kill()
+        child.wait(20)
+        assert server.terminate() == 0
+
+
+def test_a_pause_with_no_sign_of_work_is_limited_and_one_that_ticks_is_not(tmp_path, toy_moe, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)
+    server = Server(tmp_path / "store", 0, "--silent-seconds", "1", "--silent-factor", "0", "--critical-seconds", "30", "--pause-seconds", "6",
+                    "--watchdog-seconds", "0.1", "--flush-seconds", "0.2")
+    run_dir = tmp_path / "store" / "runs" / "bounded"
+    try:
+        session = tensorquill.init(toy_moe, run_id="bounded", every=10, routers={"router": 4},
+                                   endpoint=server.endpoint, heartbeat_seconds=0.2)
+        train(toy_moe, session, 30)
+        with session.phase("eval"):
+            # No sign of work: paused for a while, then a suspected hang, phase still `eval`.
+            _wait_for(run_dir, lambda s: s["ranks"][0]["state"] == "paused")
+            status = _wait_for(run_dir, lambda s: s["ranks"][0]["state"] == "silent", 30)
+            assert status["ranks"][0]["phase"] == "eval" and status["summary"] == "stalled"
+        train(toy_moe, session, 10)  # steps end the pause: back to active
+        _wait_for(run_dir, lambda s: s["ranks"][0]["state"] == "active" and s["ranks"][0]["phase"] == "train")
+        with session.phase("eval"):
+            deadline = time.monotonic() + 8.0  # longer than the limit, but evaluation batches keep ticking
+            while time.monotonic() < deadline:
+                session.tick()
+                time.sleep(0.1)
+            assert _status_of(run_dir)["ranks"][0]["state"] == "paused"
+        session.close()
     finally:
         assert server.terminate() == 0

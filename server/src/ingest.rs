@@ -58,6 +58,10 @@ pub struct IngestConfig {
     pub silent_floor: Duration,
     /// A rank's threshold is at least this many times its own recent time between batches.
     pub silent_factor: f64,
+    /// A rank quiet for longer than this is `critical`, not a `warning`.
+    pub critical: Duration,
+    /// A pause with no sign of work is a suspected hang after this long.
+    pub pause_limit: Duration,
     /// How often `runs/<run_id>/watchdog.json` is rewritten. Zero turns the watchdog's file off.
     pub watchdog_interval: Duration,
 }
@@ -70,9 +74,28 @@ impl Default for IngestConfig {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             silent_floor: crate::watchdog::DEFAULT_SILENT_FLOOR,
             silent_factor: crate::watchdog::DEFAULT_SILENT_FACTOR,
+            critical: crate::watchdog::DEFAULT_CRITICAL,
+            pause_limit: crate::watchdog::DEFAULT_PAUSE_LIMIT,
             watchdog_interval: DEFAULT_WATCHDOG_INTERVAL,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct Heartbeat {
+    run_id: String,
+    rank: i32,
+    #[serde(default = "default_phase")]
+    phase: String,
+    #[serde(default)]
+    interval_seconds: Option<f64>,
+    /// Steps committed plus evaluation batches, so a pause that is working can be told from one that is stuck.
+    #[serde(default)]
+    work: Option<i64>,
+}
+
+fn default_phase() -> String {
+    crate::watchdog::TRAIN.to_string()
 }
 
 #[derive(Deserialize)]
@@ -124,6 +147,8 @@ impl Ingest {
         let watchdog = Watchdog::new(WatchdogConfig {
             silent_floor: config.silent_floor,
             silent_factor: config.silent_factor,
+            critical: config.critical,
+            pause_limit: config.pause_limit,
         });
         Arc::new(Self {
             storage,
@@ -383,6 +408,17 @@ impl Ingest {
         Ok(())
     }
 
+    /// A heartbeat from a rank's own process.
+    pub fn heartbeat(&self, run_id: &str, rank: i32, phase: &str, interval_seconds: f64, work: Option<i64>) {
+        self.watchdog.heartbeat(
+            &(run_id.to_string(), rank),
+            phase,
+            interval_seconds,
+            work,
+            Instant::now(),
+        );
+    }
+
     /// Records how a stream ended: cleanly (the sender closed it) or not (an error or a drop).
     fn stream_ended(&self, key: &Key, clean: bool) {
         self.watchdog.stream_ended(key, clean, Instant::now());
@@ -417,8 +453,9 @@ impl Ingest {
                 "summary": status["summary"],
                 "running": status["server_running"],
                 "missing": status["missing_ranks"],
+                "pauses": status["pauses"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
-                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone())).collect::<Vec<_>>()
+                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone())).collect::<Vec<_>>()
                 }),
             })
             .to_string();
@@ -452,6 +489,14 @@ impl Ingest {
     }
 }
 
+/// A run ID becomes a directory name in the store, so it may hold only these characters.
+fn plain_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id != "."
+        && run_id != ".."
+        && run_id.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
 /// `["runs", "<run_id>", "rank=<rank>"]` -> `(run_id, rank)`.
 fn parse_descriptor(descriptor: &FlightDescriptor) -> Result<Key, Status> {
     let bad = || Status::invalid_argument("the descriptor path must be [\"runs\", \"<run_id>\", \"rank=<rank>\"]");
@@ -462,10 +507,7 @@ fn parse_descriptor(descriptor: &FlightDescriptor) -> Result<Key, Status> {
         .strip_prefix("rank=")
         .and_then(|rank| rank.parse().ok())
         .ok_or_else(bad)?;
-    let plain = !run_id.is_empty()
-        && run_id != "."
-        && run_id != ".."
-        && run_id.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    let plain = plain_run_id(run_id);
     if runs != "runs" || rank < 0 {
         return Err(bad());
     }
@@ -620,8 +662,31 @@ impl FlightService for IngestService {
     async fn do_get(&self, _: Request<Ticket>) -> Reply<Self::DoGetStream> {
         unimplemented()
     }
-    async fn do_action(&self, _: Request<Action>) -> Reply<Self::DoActionStream> {
-        unimplemented()
+    /// `heartbeat`: `{"run_id", "rank", "phase", "interval_seconds"}`, sent by the training
+    /// process's own thread every few seconds, whether or not it is stepping.
+    async fn do_action(&self, request: Request<Action>) -> Reply<Self::DoActionStream> {
+        let action = request.into_inner();
+        if action.r#type != "heartbeat" {
+            return Err(Status::unimplemented(format!(
+                "tensorquill-server knows the action `heartbeat`, not `{}`",
+                action.r#type
+            )));
+        }
+        let beat: Heartbeat = serde_json::from_slice(&action.body)
+            .map_err(|error| Status::invalid_argument(format!("bad heartbeat: {error}")))?;
+        if !plain_run_id(&beat.run_id) || beat.rank < 0 {
+            return Err(Status::invalid_argument("bad run_id or rank in the heartbeat"));
+        }
+        let phase: String = beat.phase.chars().take(40).collect();
+        self.ingest.heartbeat(
+            &beat.run_id,
+            beat.rank,
+            &phase,
+            beat.interval_seconds.unwrap_or(0.0),
+            beat.work,
+        );
+        let reply = arrow_flight::Result { body: "{}".into() };
+        Ok(Response::new(futures::stream::once(async move { Ok(reply) }).boxed()))
     }
     async fn list_actions(&self, _: Request<Empty>) -> Reply<Self::ListActionsStream> {
         unimplemented()

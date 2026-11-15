@@ -64,6 +64,36 @@ class TensorQuillCallback(TrainerCallback):
         self.session = init(model, run_id=run_id, **kwargs)
         self._watch = watch_accelerator(self.session, loss_name=self.loss_name)
 
+    # `Trainer` has no event before an evaluation or a save, only after. But its flow callback
+    # sets `control.should_evaluate` / `should_save` at the end of the step or epoch, just
+    # before it does them, so that is when the stretch with no training steps begins. This
+    # relies on the flow callback running before this one, as it does by default.
+    def _expect_pause(self, control: Any) -> None:
+        if self.session is None:
+            return
+        if getattr(control, "should_evaluate", False):
+            self.session.set_phase("eval")
+        elif getattr(control, "should_save", False):
+            self.session.set_phase("checkpoint")
+
+    def on_step_end(self, args: Any, state: Any, control: Any, **_: Any) -> None:
+        self._expect_pause(control)
+
+    def on_epoch_end(self, args: Any, state: Any, control: Any, **_: Any) -> None:
+        self._expect_pause(control)
+
+    def on_prediction_step(self, args: Any, state: Any, control: Any, **_: Any) -> None:
+        if self.session is not None:
+            self.session.tick()  # one evaluation batch: the pause is working, not stuck
+
+    def on_evaluate(self, args: Any, state: Any, control: Any, **_: Any) -> None:
+        if self.session is not None:
+            self.session.set_phase("checkpoint" if getattr(control, "should_save", False) else "train")
+
+    def on_save(self, args: Any, state: Any, control: Any, **_: Any) -> None:
+        if self.session is not None:
+            self.session.set_phase("train")
+
     def on_train_end(self, args: Any, state: Any, control: Any, **_: Any) -> None:
         self.close()
 

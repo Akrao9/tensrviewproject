@@ -118,6 +118,9 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
         "dumped_ranks": dumped,
         "groups": len(db.groups),
         "collectives": len(db.collectives),
+        "newest_dump_time": max(
+            (p.stat().st_mtime for p in directory.rglob("*") if p.is_file() and p.name in details), default=0.0
+        ),
         "problem_count": len(problems),
         "ignored_before_buffer_start": len(flagged) - len(problems),
         "incomplete_dumps": any(set(group) - set(dumped) for group in members.values()),

@@ -45,6 +45,12 @@ struct Args {
     /// above your longest evaluation or checkpoint pause; the default is not calibrated.
     #[arg(long, default_value_t = 300.0)]
     silent_seconds: f64,
+    /// A rank quiet for longer than this is reported `critical`; between --silent-seconds and this it is a `warning`.
+    #[arg(long, default_value_t = 900.0)]
+    critical_seconds: f64,
+    /// A phase other than training (evaluation, a checkpoint) that shows no sign of work is called a suspected hang after this long.
+    #[arg(long, default_value_t = 1800.0)]
+    pause_seconds: f64,
     /// How many times a rank's usual time between batches it may stay quiet before it is silent.
     #[arg(long, default_value_t = 5.0)]
     silent_factor: f64,
@@ -83,6 +89,8 @@ async fn run(args: Args) -> Result<(), Error> {
         flush_interval: Duration::from_secs_f64(args.flush_seconds),
         silent_floor: Duration::from_secs_f64(args.silent_seconds),
         silent_factor: args.silent_factor,
+        critical: Duration::from_secs_f64(args.critical_seconds),
+        pause_limit: Duration::from_secs_f64(args.pause_seconds),
         watchdog_interval: Duration::from_secs_f64(args.watchdog_seconds),
     };
     let ingest = Ingest::new(Storage::from_url(&args.store)?, config);

@@ -406,18 +406,29 @@ def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str
     if not status or status.get("summary") not in ("stalled", "degraded"):
         return []
     ranks = list(status.get("ranks", ()))
-    stopped = [r for r in ranks if r.get("state") in ("silent", "lost")]
+    stopped = [r for r in ranks if r.get("state") in ("silent", "lost", "unresponsive")]
+    # Never "confirmed" from the stream alone: that takes a second source (see build_evidence).
+    if any(r.get("state") in ("silent", "unresponsive") for r in stopped):
+        assessment = "suspected_hang"
+    elif stopped:
+        assessment = "lost_connection"
+    else:
+        assessment = "ranks_never_connected"
+    severity = "critical" if any(r.get("severity") == "critical" for r in stopped) else "warning"
     steps = [r["last_step"] for r in ranks if r.get("last_step") is not None]
     common = {
+        "severity": severity,
+        "assessment": assessment,
         "written_at_ms": status.get("written_at_ms"),
         "silent_floor_seconds": status.get("silent_floor_seconds"),
+        "critical_seconds": status.get("critical_seconds"),
         "world_size": status.get("world_size"),
     }
     if status["summary"] == "stalled":
         return [{
             "kind": "job_stalled",
             "step": max(steps, default=0),
-            "ranks": [r for r in ranks if r.get("state") != "finished"],
+            "ranks": [r for r in ranks if r.get("state") not in ("finished",)],
             "missing_ranks": list(status.get("missing_ranks", ())),
             **common,
         }]
@@ -932,7 +943,9 @@ def watch(
                 current = read_watchdog(status_file)
                 stamp = current and (
                     current["summary"], tuple(current.get("missing_ranks", ())),
-                    tuple((r.get("rank"), r.get("state"), r.get("last_step")) for r in current["ranks"]),
+                    json.dumps(current.get("pauses", {}), sort_keys=True), current.get("recommended_silent_seconds"),
+                    tuple((r.get("rank"), r.get("state"), r.get("last_step"), r.get("severity"), r.get("phase"))
+                          for r in current["ranks"]),
                 )
                 changed, status_seen = stamp is not None and stamp != status_seen, stamp
             if not grown and not (changed and tail.records):
@@ -1187,7 +1200,8 @@ def build_evidence(
     if non_finite_hit is not None:
         incidents.append(non_finite_hit)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
-    incidents.extend(detect_watchdog_incidents(status))
+    stream_incidents = detect_watchdog_incidents(status)
+    incidents.extend(stream_incidents)
     last_step = max((int(r["step"]) for r in records), default=0)
     traincheck_summary: dict[str, Any] | None = None
     if traincheck is not None:
@@ -1218,6 +1232,16 @@ def build_evidence(
             hit = flight_recorder_incident(analysis, step=last_step)
             if hit is not None:
                 incidents.append(hit)
+                stamps = [float(r["ts"]) for r in records if isinstance(r.get("ts"), (int, float))]
+                fresh = bool(stamps) and analysis["newest_dump_time"] >= max(stamps)
+                if hit["kind"] == "collective_hang" and fresh and not analysis["incomplete_dumps"]:
+                    # A stuck collective in PyTorch's own dump is a second source for a hang the
+                    # stream only suggested, if the dump is complete and was written after the last
+                    # step TensorQuill recorded. An old or partial dump proves nothing about now.
+                    for incident in stream_incidents:
+                        if incident["assessment"] == "suspected_hang":
+                            incident["assessment"] = "confirmed_hang"
+                            incident["corroborated_by"] = "collective_hang"
     drift_hit = detect_replica_drift(records, tolerance=drift_tolerance)
     if drift_hit is not None:
         incidents.append(drift_hit)
@@ -1246,7 +1270,10 @@ def build_evidence(
         **({"weight_trends": trends} if trends else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
         **({"traincheck": traincheck_summary} if traincheck_summary else {}),
-        **({"watchdog": {k: status[k] for k in ("summary", "written_at_ms", "world_size") if k in status}} if status else {}),
+        **({"watchdog": {k: status[k] for k in (
+            "summary", "written_at_ms", "world_size", "pauses", "recommended_silent_seconds",
+            "silent_floor_seconds", "critical_seconds",
+        ) if k in status}} if status else {}),
     }
 
 
@@ -1371,6 +1398,45 @@ def _legend(evidence: Mapping[str, Any]) -> str:
     )
 
 
+def _how_stopped(rank: Mapping[str, Any]) -> str:
+    state, beat = rank.get("state"), rank.get("heartbeat_age_seconds")
+    if state == "lost":
+        return "its connection dropped and did not return"
+    if state == "unresponsive":
+        return "its heartbeats stopped too, so the whole process is frozen or gone"
+    if beat is None:
+        return "no heartbeat, so the phase is unknown and evaluation or a checkpoint look the same"
+    return f"its heartbeats continue and it says it is in phase `{rank.get('phase', 'train')}`"
+
+
+def _describe_stream(incident: Mapping[str, Any]) -> str:
+    assessment = str(incident.get("assessment", "suspected_hang")).replace("_", " ")
+    tail = f" [{incident.get('severity', 'warning')}, {assessment}"
+    if incident.get("corroborated_by"):
+        tail += f", corroborated by {incident['corroborated_by']}"
+    tail += "]"
+    if incident["kind"] == "job_stalled":
+        ranks = incident["ranks"]
+        quiet = max((r.get("seconds_since_progress") or 0 for r in ranks), default=0)
+        reasons = sorted({_how_stopped(r) for r in ranks})
+        return (
+            f"Job stalled after step {incident['step']}: none of {len(ranks)} rank{'s' if len(ranks) != 1 else ''}"
+            f" has sent a new step for at least {quiet:.0f} s ({'; '.join(reasons)})."
+            " A hang, a long evaluation or checkpoint pause, or a killed job can look the same from here;"
+            " PyTorch's Flight Recorder shows a stuck collective" + tail
+        )
+    parts = []
+    for r in incident["ranks"][:4]:
+        parts.append(f"rank {r['rank']} sent no new step since step {r['last_step']} ({_how_stopped(r)})")
+    if incident["missing_ranks"]:
+        parts.append("ranks " + ", ".join(str(r) for r in incident["missing_ranks"][:8]) + " never connected"
+                     " (if only some ranks call tensorquill.init, ignore this)")
+    return (
+        f"Ranks out of step with the job: {'; '.join(parts)} while others reached step {incident['newest_step']}."
+        " A hung rank, a killed process or a stuck telemetry sender look the same to the server" + tail
+    )
+
+
 def _describe(incident: Mapping[str, Any]) -> str | None:
     kind = incident["kind"]
     if kind == "grad_spike":
@@ -1438,29 +1504,8 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             f"Repeated step numbers from step {incident['step']}: {incident['repeated']} steps"
             " recorded more than once; pass start_step= to tensorquill.init when resuming"
         )
-    if kind == "job_stalled":
-        ranks = incident["ranks"]
-        quiet = max((r.get("seconds_since_progress") or 0 for r in ranks), default=0)
-        lost = sum(1 for r in ranks if r.get("state") == "lost")
-        return (
-            f"Job stalled after step {incident['step']}: none of {len(ranks)} rank{'s' if len(ranks) != 1 else ''}"
-            f" has sent a new step for up to {quiet:.0f} s"
-            + (f", and {lost} lost its connection" if lost else "")
-            + ". A hang, a long evaluation or checkpoint pause, or a killed job all look the same to the"
-            " server; PyTorch's Flight Recorder shows a stuck collective"
-        )
-    if kind == "rank_silent":
-        who = incident["ranks"]
-        parts = [f"rank {r['rank']} {'lost its connection' if r['state'] == 'lost' else 'sent no new step'}"
-                 f" since step {r['last_step']}" for r in who[:4]]
-        if incident["missing_ranks"]:
-            parts.append("ranks " + ", ".join(str(r) for r in incident["missing_ranks"][:8]) + " never connected"
-                         " (if only some ranks call tensorquill.init, ignore this)")
-        return (
-            f"Ranks out of step with the job: {'; '.join(parts)} while others reached step"
-            f" {incident['newest_step']}. A hung rank, a killed process or a stuck telemetry sender"
-            " look the same to the server"
-        )
+    if kind in ("job_stalled", "rank_silent"):
+        return _describe_stream(incident)
     if kind == "traincheck_violation":
         shown = incident["violations"][:3]
         names = "; ".join(
@@ -1549,6 +1594,15 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
             text = _describe(incident)
             lines.append(text or f"Incident at step {incident['step']}: {incident['kind']}")
             lines += _scalar_lines(incident)
+    pauses = (evidence.get("watchdog") or {}).get("pauses") or {}
+    recommended = (evidence.get("watchdog") or {}).get("recommended_silent_seconds")
+    if pauses and recommended:
+        seen = ", ".join(f"{phase} up to {stats['max_seconds']:.0f} s ({stats['count']}x)" for phase, stats in sorted(pauses.items()))
+        lines.append(
+            f"Pauses the job reported: {seen}. A silence threshold of {recommended:.0f} s (twice the longest)"
+            " would have tolerated them: set the server's --silent-seconds to it or more. This is a measurement of"
+            " what happened so far, not a guarantee"
+        )
     notes = [
         f"Not checked ({item['check']}): {item['reason']}"
         for item in evidence.get("not_checked", ())

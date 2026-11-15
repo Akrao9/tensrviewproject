@@ -12,6 +12,7 @@ Rules this module follows (see the Capture SDK section of the v3 plan):
 
 from __future__ import annotations
 
+import contextlib
 import math
 import numbers
 import queue
@@ -22,7 +23,7 @@ import warnings
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import torch
 from torch import nn
@@ -471,6 +472,11 @@ class Session:
         self._step_depth = 0
         self._outer_frame: Any = None
         self._closed = False
+        self._phase = "train"
+        self._ticks = 0
+        beat = getattr(self._sink, "heartbeat", None) if hasattr(self, "_sink") else None
+        if beat is not None:
+            beat.counter = lambda: self._steps_committed + self._ticks
         self._error: BaseException | None = None
         # Bounded, as TensorBoard's SummaryWriter is (`max_queue=10`): if the sink falls
         # behind, for example on a stalled network filesystem, training waits for it
@@ -891,6 +897,10 @@ class Session:
         self._pending_scalars = {}
         self._next_step = current + 1
         self._steps_committed += 1
+        if self._phase != "train":
+            # A committed training step is training stepping: whatever pause was announced is over.
+            # This also clears a phase left behind by a callback that missed its end.
+            self.set_phase("train")
         if probe_due:
             # The step is complete before the probe runs, so a failing probe loses only
             # its own result, recorded against the step, and never the step.
@@ -991,6 +1001,33 @@ class Session:
                     stacklevel=2,
                 )
             self._queue.put(block)
+
+    def set_phase(self, phase: str = "train") -> None:
+        """Say what the process is doing: `"train"` (the default), `"eval"`, `"checkpoint"`, or
+        any short word. While it is not `"train"` and its heartbeats go on, the server does
+        not call the missing steps a hang. A no-op unless streaming with `endpoint=`."""
+        self._phase = phase
+        heartbeat = getattr(self._sink, "heartbeat", None)
+        if heartbeat is not None:
+            heartbeat.set_phase(phase)
+
+    def tick(self) -> None:
+        """Show the server that work is going on during a pause, for example once per
+        evaluation batch. A pause whose work stops moving is reported as a suspected hang;
+        one that keeps ticking is not limited. The Lightning and Hugging Face callbacks tick
+        for you. Cheap: it only adds one to a counter."""
+        self._ticks += 1
+
+    @contextlib.contextmanager
+    def phase(self, name: str) -> Iterator[None]:
+        """`with session.phase("eval"): ...` marks a stretch with no training steps, and goes
+        back to the phase it interrupted afterwards, even if the block raises."""
+        previous = self._phase
+        self.set_phase(name)
+        try:
+            yield
+        finally:
+            self.set_phase(previous)
 
     def close(self) -> None:
         """Flush what is left and stop the writer. Forward hooks stay on the model, because
@@ -1245,6 +1282,7 @@ def init(
     clip_norm: bool = True,
     replica_every: int = WEIGHT_EVERY,
     replica_projection: bool = True,
+    heartbeat_seconds: float | None = 15.0,
     probe: Any = None,
     probe_every: int = PROBE_EVERY,
     scaler: Any = None,
@@ -1293,6 +1331,10 @@ def init(
             not proof of equality. `session.record_replica_spread()` records one on demand.
         replica_projection: set False to skip the projection (two values per tensor). On
             CPU it takes about seven times the norm and sum; GPU cost is not yet measured.
+        heartbeat_seconds: with `endpoint=`, a thread of its own tells the server every this
+            many seconds that the process is alive and in which phase (see
+            `session.phase`), whether or not it is stepping, so the server can tell
+            evaluation or a checkpoint from a hang. `None` turns it off.
         probe: a fixed batch to run through the model every `probe_every` steps, for
             activation histograms per block and attention statistics: a tensor (called as
             `model(batch)`), a mapping of keyword inputs (`model(**batch)`), or a callable
@@ -1332,7 +1374,9 @@ def init(
         sink = JsonlSink(Path("tensorquill-out") / f"{name}.rank{run.rank}.jsonl")
     from .flight import attach  # a no-op unless endpoint= or TENSORQUILL_ENDPOINT is set
 
-    sink = attach(sink, run.run_id, run.rank, endpoint, world_size=_world_size())
+    sink = attach(
+        sink, run.run_id, run.rank, endpoint, world_size=_world_size(), heartbeat_seconds=heartbeat_seconds
+    )
     return Session(
         model,
         run=run,

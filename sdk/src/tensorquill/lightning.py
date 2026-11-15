@@ -62,6 +62,20 @@ class TensorQuillCallback(L.Callback):
             self.session.log({self.loss_name: self._loss})
             self._loss = None
 
+    # Validation is a stretch with no training steps: say so, so the server does not call it a hang.
+    def on_validation_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        if self.session is not None:
+            self._outer_phase = self.session._phase
+            self.session.set_phase("eval")
+
+    def on_validation_batch_end(self, trainer: L.Trainer, pl_module: L.LightningModule, *args: Any, **kwargs: Any) -> None:
+        if self.session is not None:
+            self.session.tick()  # evaluation is working, not stuck
+
+    def on_validation_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        if self.session is not None:
+            self.session.set_phase(getattr(self, "_outer_phase", "train"))
+
     def on_fit_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         self._close()
 

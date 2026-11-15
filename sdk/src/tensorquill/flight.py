@@ -28,6 +28,7 @@ BATCH_SECONDS = 2.0
 BATCH_BYTES = 4 * 1024 * 1024
 BACKOFF_BASE = 0.1
 BACKOFF_CAP = 30.0
+HEARTBEAT_SECONDS = 15.0
 CLOSE_TIMEOUT = 5.0
 POLL_SECONDS = 0.2
 ENDPOINT_ENV = "TENSORQUILL_ENDPOINT"
@@ -589,18 +590,106 @@ def send_file(
 # --- The hook used by `tensorquill.init` ------------------------------------------------
 
 
+class Heartbeat:
+    """Tells the server, from a thread of its own, that this rank's process is alive and which
+    phase it is in, whether or not it is stepping.
+
+    That is what lets the server tell a rank that is evaluating or saving a checkpoint (its
+    heartbeats go on, its phase is not `train`) from one that is stuck in training (its
+    heartbeats go on, its phase is `train`, no step arrives) and from a frozen or vanished
+    process (the heartbeats stop). The thread never raises into training and never prints:
+    the sender reports a failing connection. A forked child does nothing."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        run_id: str,
+        rank: int,
+        *,
+        token: str | None = None,
+        tls_root_certs: bytes | str | os.PathLike[str] | None = None,
+        interval: float = HEARTBEAT_SECONDS,
+    ) -> None:
+        import pyarrow.flight  # noqa: F401  fail at init, as the sender does, when pyarrow is missing
+
+        self.interval = interval
+        self.phase = "train"
+        self.counter: Any = None  # a callable returning the work done so far (steps + ticks)
+        self._location = _location(endpoint)
+        self._run_id = run_id
+        self._rank = rank
+        self._token = token if token is not None else os.environ.get(TOKEN_ENV)
+        self._tls_root_certs = (
+            _read_tls_root_certs(tls_root_certs)
+            if (tls_root_certs is not None or self._location.startswith("grpc+tls://"))
+            else None
+        )
+        self._pid = os.getpid()
+        self._changed = threading.Event()
+        self._stopped = threading.Event()
+        self.sent = 0
+        self._thread = threading.Thread(target=self._run, name=f"tensorquill-heartbeat-rank{rank}", daemon=True)
+        self._thread.start()
+
+    def set_phase(self, phase: str) -> None:
+        """Name what the process is doing (`train`, `eval`, `checkpoint`, or any short word);
+        the server is told at once, not at the next beat."""
+        if os.getpid() != self._pid:
+            return
+        self.phase = str(phase)[:40] or "train"
+        self._changed.set()
+
+    def close(self) -> None:
+        if os.getpid() != self._pid:
+            return
+        self._stopped.set()
+        self._changed.set()
+        self._thread.join(2.0)
+
+    def _run(self) -> None:
+        import pyarrow.flight as flight
+
+        headers = [(b"authorization", f"Bearer {self._token}".encode())] if self._token else []
+        client = None
+        while not self._stopped.is_set():
+            # Clear first, so a phase change made while this beat is being sent wakes the next wait.
+            self._changed.clear()
+            try:
+                if client is None:
+                    kwargs: dict[str, Any] = {}
+                    if self._tls_root_certs is not None:
+                        kwargs["tls_root_certs"] = self._tls_root_certs
+                    client = flight.FlightClient(self._location, **kwargs)
+                payload = {"run_id": self._run_id, "rank": self._rank, "phase": self.phase,
+                           "interval_seconds": self.interval}
+                if self.counter is not None:
+                    payload["work"] = int(self.counter())
+                body = json.dumps(payload).encode()
+                for _ in client.do_action(
+                    flight.Action("heartbeat", body), flight.FlightCallOptions(headers=headers, timeout=10.0)
+                ):
+                    pass
+                self.sent += 1
+            except BaseException:  # noqa: BLE001  a missed beat is the server's to notice
+                client = None
+            self._changed.wait(self.interval)
+
+
 class StreamingSink:
     """A sink that also stops the sender, after the local file is closed and complete."""
 
-    def __init__(self, sink: Any, sender: FlightSender) -> None:
+    def __init__(self, sink: Any, sender: FlightSender, heartbeat: Heartbeat | None = None) -> None:
         self._sink = sink
         self.sender = sender
+        self.heartbeat = heartbeat
         self.path = sink.path
 
     def write(self, records: list[dict[str, Any]]) -> None:
         self._sink.write(records)
 
     def close(self) -> None:
+        if self.heartbeat is not None:
+            self.heartbeat.close()
         self._sink.close()
         self.sender.close()
 
@@ -614,6 +703,7 @@ def attach(
     token: str | None = None,
     tls_root_certs: bytes | str | os.PathLike[str] | None = None,
     world_size: int | None = None,
+    heartbeat_seconds: float | None = HEARTBEAT_SECONDS,
 ) -> Any:
     """Start streaming `sink`'s file when `endpoint` or `TENSORQUILL_ENDPOINT` is set;
     otherwise return `sink` unchanged, with no socket opened and `pyarrow` not imported."""
@@ -636,4 +726,9 @@ def attach(
         raise ImportError(
             'endpoint= needs pyarrow: pip install pyarrow'
         ) from error
-    return StreamingSink(sink, sender)
+    heartbeat = None
+    if heartbeat_seconds:
+        heartbeat = Heartbeat(
+            endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs, interval=heartbeat_seconds
+        )
+    return StreamingSink(sink, sender, heartbeat)

@@ -11,7 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
-use arrow_flight::{FlightClient, FlightData, FlightDescriptor, PutResult};
+use arrow_flight::{Action, FlightClient, FlightData, FlightDescriptor, PutResult};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::local::LocalFileSystem;
@@ -769,4 +769,59 @@ async fn a_finished_run_keeps_its_verdict_when_the_server_stops() {
     let path = dir.path().join("runs").join(RUN).join("watchdog.json");
     let status: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(status["summary"], "finished");
+}
+
+async fn client(server: &TestServer) -> FlightClient {
+    let channel = Channel::from_shared(server.address.clone())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    FlightClient::new(channel)
+}
+
+#[tokio::test]
+async fn a_heartbeat_names_the_phase_and_a_bad_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), watch_config(60_000), None).await;
+    let mut flight = client(&server).await;
+    let beat = |body: &str| Action::new("heartbeat", body.to_string());
+    flight
+        .do_action(beat(&format!(
+            "{{\"run_id\":\"{RUN}\",\"rank\":0,\"phase\":\"checkpoint\",\"interval_seconds\":15}}"
+        )))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let ranks = &server.ingest.watchdog_statuses()[RUN]["ranks"];
+    assert_eq!(
+        (ranks[0]["phase"].as_str(), ranks[0]["rank"].as_i64()),
+        (Some("checkpoint"), Some(0))
+    );
+    assert!(ranks[0]["heartbeat_age_seconds"].is_number());
+    // The phase comes back to training and the pause is on record.
+    flight
+        .do_action(beat(&format!(
+            "{{\"run_id\":\"{RUN}\",\"rank\":0,\"phase\":\"train\"}}"
+        )))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        server.ingest.watchdog_statuses()[RUN]["pauses"]["checkpoint"]["count"],
+        1
+    );
+    // Refused: another action, bad JSON, a run ID that is not a plain name.
+    for action in [
+        Action::new("shutdown", "{}".to_string()),
+        beat("not json"),
+        beat("{\"run_id\":\"../x\",\"rank\":0}"),
+        beat(&format!("{{\"run_id\":\"{RUN}\",\"rank\":-1}}")),
+    ] {
+        assert!(flight.do_action(action).await.is_err());
+    }
 }
