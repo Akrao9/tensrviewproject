@@ -330,3 +330,16 @@ def test_init_rejects_a_bad_endpoint_and_a_sink_with_no_file(toy_moe, monkeypatc
         tensorlens.init(toy_moe, endpoint="http://localhost:1", sink=tensorlens.MemorySink())
     with pytest.raises(ValueError, match="JsonlSink"):
         tensorlens.init(toy_moe, endpoint="grpc://localhost:1", sink=tensorlens.MemorySink())
+
+
+def test_a_failing_stream_is_reported_once_while_training_runs(tmp_path, capsys):
+    path = tmp_path / "run-a.rank0.jsonl"
+    append(path, [record(step) for step in range(10)])
+    sender = fast_sender(path, "grpc://127.0.0.1:9")  # nothing listens on the discard port
+    deadline = time.monotonic() + 5.0
+    while sender.last_error is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.3)  # several more failed attempts
+    during = capsys.readouterr().err
+    assert during.count("is failing") == 1 and "Training continues" in during
+    sender.close(timeout=0.5)

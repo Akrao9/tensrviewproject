@@ -351,6 +351,7 @@ class FlightSender:
         self._backoff_cap = backoff_cap
         self._acked = read_offset(self.offset_path)
         self._progress = False
+        self._reported = False
         self._closing = threading.Event()
         self._deadline = math.inf
         self._thread = threading.Thread(
@@ -400,6 +401,16 @@ class FlightSender:
             if self._progress:
                 self._progress = False
                 attempt = 0
+                self._reported = False
+            elif not self._reported and not self._closing.is_set():
+                # Say once per outage that nothing is arriving: a wrong token or address
+                # would otherwise stay silent until close(). close() reports on its own.
+                self._reported = True
+                print(
+                    f"tensorlens: streaming to {self.endpoint} is failing ({self.last_error}). Training "
+                    f"continues and {self.path} stays complete; the sender keeps retrying.",
+                    file=sys.stderr,
+                )
             delay = random.uniform(0.0, min(self._backoff_cap, self._backoff_base * 2**attempt))
             attempt += 1
             if self._closing.wait(delay):

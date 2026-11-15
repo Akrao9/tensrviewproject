@@ -147,3 +147,59 @@ def test_server_killed_for_200_steps_loses_and_repeats_nothing(tmp_path, toy_moe
     assert [r["step"] for r in stored] == list(range(350))  # none lost, none twice, in order
     assert stored == written
     assert read_offset(offset_path(path)) == path.stat().st_size
+
+
+def _steps(path: Path, run_id: str, rank: int, steps: range) -> None:
+    import json
+
+    with open(path, "a", encoding="utf-8") as file:
+        for step in steps:
+            file.write(json.dumps({"schema_version": 1, "run_id": run_id, "rank": rank, "step": step,
+                                   "ts": 1.0, "grad_norm": 0.5}) + "\n")
+
+
+def test_the_python_sender_presents_its_token_and_a_non_zero_rank(tmp_path, monkeypatch, capsys):
+    from tensorlens.flight import FlightSender
+
+    store = tmp_path / "store"
+    server = Server(store, 0, "--token", "s3cret")
+    try:
+        path = tmp_path / "tok.rank1.jsonl"
+        _steps(path, "tok", 1, range(120))
+        monkeypatch.setenv("TENSORLENS_TOKEN", "s3cret")
+        assert FlightSender(path, server.endpoint, "tok", 1).close(20) is True
+
+        wrong = tmp_path / "bad.rank0.jsonl"
+        _steps(wrong, "bad", 0, range(5))
+        monkeypatch.setenv("TENSORLENS_TOKEN", "not-it")
+        sender = FlightSender(wrong, server.endpoint, "bad", 0)
+        assert sender.close(2) is False
+        assert "Bearer token" in str(sender.last_error) and "Bearer token" in capsys.readouterr().err
+    finally:
+        server.terminate()
+    assert [r["step"] for r in stored_records(store, "tok", rank=1)] == list(range(120))
+    assert not (store / "runs" / "bad").exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_forked_dataloader_workers_do_not_disturb_the_sender(tmp_path, monkeypatch):
+    # Linux's default: DataLoader workers are forked while the sender's gRPC thread runs.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TENSORLENS_TOKEN", raising=False)
+    store = tmp_path / "store"
+    server = Server(store)
+    try:
+        model = torch.nn.Linear(8, 1)
+        session = tensorlens.init(model, run_id="forked", capture="full", every=5, endpoint=server.endpoint)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        data = torch.utils.data.TensorDataset(torch.randn(128, 8))
+        for _ in range(3):
+            loader = torch.utils.data.DataLoader(data, batch_size=8, num_workers=2, multiprocessing_context="fork")
+            for (x,) in loader:
+                optimizer.zero_grad()
+                model(x).pow(2).mean().backward()
+                optimizer.step()
+        session.close()
+    finally:
+        server.terminate()
+    assert [r["step"] for r in stored_records(store, "forked")] == list(range(48))
