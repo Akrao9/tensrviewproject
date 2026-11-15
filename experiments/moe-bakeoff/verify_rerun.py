@@ -1,4 +1,10 @@
-"""Read the exported Rerun evidence and verify it against the fixture."""
+"""Read a fixture's Rerun recording back and verify it against its evidence.
+
+The tensor, the heatmap pixels, the diversity series and the expert tables are rebuilt from the
+counts here. The detector summary and the heatmap colors come from the SDK, which also wrote
+them, so those two checks show that the recording holds what the SDK computes, not that its
+rules are right: `check_fixtures.py` tests the rules against the planted failures.
+"""
 
 import argparse
 import json
@@ -7,7 +13,7 @@ from pathlib import Path
 import numpy as np
 from rerun.chunk import RrdReader
 
-from generate import incident_summary, routing_colors
+from tensorquill import incident_summary, routing_colors
 
 SHARE_ATOL = 3e-8
 
@@ -72,7 +78,8 @@ def verify_expert_load(store, by_key, steps, layer, threshold, rune_tree=None):
 
 
 def verify(directory, rune_tree=None):
-    evidence = json.loads((directory / "stats.json").read_text(encoding="utf-8"))
+    name = directory.name
+    evidence = json.loads((directory / f"{name}.evidence.json").read_text(encoding="utf-8"))
     layers = range(1, evidence["layer_count"] + 1)
     shape = (evidence["layer_count"], evidence["expert_count"])
     by_key = {(sample["step"], sample["layer"]): sample for sample in evidence["samples"]}
@@ -80,7 +87,7 @@ def verify(directory, rune_tree=None):
     if len(by_key) != len(evidence["samples"]) or set(by_key) != {(s, l) for s in steps for l in layers}:
         raise ValueError("The fixture must have exactly one sample for each step and layer")
 
-    store = RrdReader(directory / "moe.rrd").store()
+    store = RrdReader(directory / f"{name}.rrd").store()
     shares = read_samples(store, "/routing/share", "Tensor:data")
     colors = read_samples(store, "/routing/status", "Image:buffer")
     formats = read_samples(store, "/routing/status", "Image:format")
@@ -136,7 +143,9 @@ def verify(directory, rune_tree=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("directory", type=Path, nargs="?", default=Path(__file__).resolve().parent / "artifacts")
+    parser.add_argument("directory", type=Path, nargs="?",
+                        default=Path(__file__).resolve().parent / "artifacts" / "seeded",
+                        help="a fixture's folder, named after the fixture (default: artifacts/seeded)")
     parser.add_argument("--rune-tree", type=Path, help="also compare the visible Rune summary")
     args = parser.parse_args()
     verify(args.directory, args.rune_tree)

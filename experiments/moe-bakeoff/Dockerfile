@@ -2,12 +2,15 @@
 FROM rust:1.99.1-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libfontconfig1 libwayland-dev libxkbcommon-dev mesa-vulkan-drivers \
-    python3 vulkan-tools && rm -rf /var/lib/apt/lists/*
+    vulkan-tools && rm -rf /var/lib/apt/lists/*
 COPY --from=rune / /work/rune/
 WORKDIR /work/tensrviewproject/experiments/moe-bakeoff
-COPY Cargo.toml Cargo.lock generate.py rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src/ src/
-RUN rustup target add wasm32-unknown-unknown && python3 generate.py && cargo build --locked
+# generate.py needs the SDK and torch, so the fixture is made on the host and passed in as a
+# named build context (`--build-context seeded=artifacts/seeded`).
+COPY --from=seeded seeded.evidence.json artifacts/stats.json
+RUN rustup target add wasm32-unknown-unknown && cargo build --locked
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \

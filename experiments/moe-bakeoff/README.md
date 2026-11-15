@@ -4,15 +4,66 @@ Compare a focused Rune incident screen with the full Rerun 0.43.2 viewer. Both v
 
 The two tables differ in interaction. Rune's table can be re-sorted and follows the layer clicked in the heatmap. Rerun's is a Markdown document for the incident layer only; it cannot be sorted, and it follows the time cursor, so it shows the change at every sampled step after the first. The Rust package uses the sibling Rune checkout at `c4eda05889c984fff91ccd906e3c00cdfc4cae24`.
 
+## Fixtures and the pipeline
+
+`generate.py` makes seven synthetic runs, and every one of them goes through the shipped SDK, not a writer of its own:
+
+1. Step records in the shape `tensorquill.init` writes (`schema_version`, `run_id`, `rank`, `attempt`, `step`, `ts`, `layers`, `grad_norm`, `moe`, `moe_top_k`, `moe_stats`, ...) are written with `tensorquill.JsonlSink`.
+2. `tensorquill.load_records` reads that file and `tensorquill.build_evidence` runs the detectors on it. The overload rule, the diversity drop, the dead and starved experts, the gradient and activation spike rules and the table text all live in the SDK, and this folder has no copy of them.
+3. `tensorquill.export_rerun` writes the recording and its blueprint from the evidence and the records.
+
+`python -m tensorquill <name>.jsonl -o ... --rerun ...` runs the same steps. `test_fixtures.py` checks that it gives byte-identical evidence and the same recording contents.
+
+Each fixture writes three files into `artifacts/<name>/`: the step records `<name>.jsonl`, the viewer-neutral evidence `<name>.evidence.json` and the Rerun recording `<name>.rrd`. The seeded fixture's evidence is also written to `artifacts/stats.json`, which the Rune inspector bakes in at build time. `artifacts/answer-key.json` holds the planted failures. Keep it, this README and `generate.py` away from trial participants and agents. The fixture names say nothing about the failure.
+
+| Fixture | Run | Planted failure (the answer, for the scorer) |
+| --- | --- | --- |
+| `seeded` | MoE, 60 layers × 128 experts, top-1, 4 sampled steps | Step 1,850, layer 31: expert 42 gets 36% of tokens, experts 1–14 get none |
+| `unseen-1` | MoE, 48 × 64, top-1, 8 steps | Step 1,300, layer 17: expert 53 gets 44%, experts 20–27 get none. From step 1,500 layer 9 sends 40% to expert 5, later and in an earlier layer, so it is not the first |
+| `unseen-2` | Dense, 12 blocks, 400 steps | Step 310: the gradient of `blocks.7.mlp.fc2.weight` jumps 80× after two steps of build-up (rising since 308), and the loss jumps with it |
+| `unseen-3` | MoE, 24 × 64, top-4, 31 steps | Step 400, layer 11: experts 9–14 are each picked by 36% of tokens. Expert 3 is picked by 70% of tokens in every layer, always (healthy) |
+| `unseen-4` | MoE, 32 × 128, top-1, 9 steps | Step 2,000, layer 8: 40 scattered experts get no tokens, and none is overloaded |
+| `unseen-5` | Dense, 20 monitored blocks, 400 steps | Step 260: the largest activation in `blocks.13` is 100× normal for four steps. `blocks.1` carries massive activations all along (healthy) |
+| `unseen-6` | MoE, 24 × 32, top-1, 7 steps | Step 700, layer 3: expert 7 gets 39% and expert 22 gets 36%. At steps 500–600 layer 9 sends 34% to expert 13, just under the 35% rule (healthy) |
+
+MoE counts carry sampling noise and a per-layer skew, except in `seeded`, whose counts are exactly as before. Everything is seeded by name, so the bytes are the same on every run and in every process. The MoE fixtures sample steps (every 50 to 100 steps, or every 20 for `unseen-3`), as the seeded one always did; the dense ones record every step. Router names carry the evidence's layer number (`layers.31.router` is layer 31), which a real model's zero-based names would not.
+
+Three behaviors of the SDK's detectors show up in the fixtures, and the trial questions should allow for them:
+
+- A top-k collapse is judged against the router's own recent window, which fills with the collapse itself. In `unseen-3` the heatmap flags experts 9–14 at step 400, and by step 520 it flags nothing, although the router's diversity stays at 0.35 against 0.75 before. Judging "does it persist at the next sample" from the heatmap alone would mislead, and the diversity timeline does not.
+- In a layer with many dead experts (a quarter of the experts, or diversity below 0.5) where the 35% rule flags nothing, the SDK lowers the bar to about twice an even share, 3.1% for 64 experts. With expert 53 at 34% instead of 44%, `unseen-1` still reports it as overloaded, while `unseen-6`'s 34% decoy, in a layer with no dead experts, is not flagged. So the 35% boundary is a boundary only beside healthy neighbors.
+- The detector reports the first incident of each kind. `unseen-1`'s second event is in the samples and the heatmap but not in `incidents`.
+
+## Checks
+
+```sh
+.venv/bin/python -m pytest experiments/moe-bakeoff -q
+```
+
+`test_fixtures.py` runs the whole pipeline for all seven fixtures and reads the results back from disk. The expected answers are the planted values in `generate.py` (`Fixture.answer` and `Fixture.events`), never the detectors' output. It checks that:
+
+- Each fixture's evidence has exactly one incident, of the planted kind, at the planted step, with the planted layer and expert IDs (or parameter or module). `unseen-2` also names the parameter that started the spike and the step it began rising.
+- The flagged MoE samples are exactly the planted ones, and the decoys are not flagged. In `unseen-3` they are a subset, for the reason above.
+- The records before the planted step produce no incident, and the records up to and including it produce the incident at that step.
+- The CLI gives byte-identical evidence, and a recording with the same contents.
+- Each `.rrd` holds exactly one recording, named after its fixture, with the fixture's steps and summary. The exporter starts a global recording on each call, so this guards against one export leaking into the next.
+- The records have the keys and types of a real capture (a toy MoE with `Router`, and a toy dense model with `capture="full"`), and `moe_stats` equals the SDK's own `_router_stats`.
+- `seeded` is the answer key below, and a second process generates the same bytes.
+
+The checks failed as they should when the plant was shifted by a sample, a dead expert dropped, the hot experts' IDs moved, the spike moved a step, or a decoy pushed over 35%.
+
 ## Smoke-test results
+
+Rune and Rerun both read the seeded fixture. Its counts, diversity values and overloaded and dead lists are identical to the fixture the earlier stand-alone generator wrote (compared sample by sample on Nov 15, and that generator reproduced the saved Nov 13 `stats.json`), so the Rune rows below carry over from Nov 13 and were not rebuilt. The Rune binary baked in the earlier file; the new `artifacts/stats.json` has the same samples plus the SDK's `incidents`, `router` and rule fields, which the inspector ignores.
 
 | Check | Result |
 | --- | --- |
-| macOS arm64 / Metal | Two runs produced byte-identical PNGs and trees. A scripted tap selected dead expert 2 and displayed 0% routing share. |
-| Linux arm64 container / Vulkan | The container ran inside an arm64 Linux VM on the same Mac. Debian Trixie lavapipe (llvmpipe, LLVM 19.1.7) produced byte-identical outputs across two runs. Bookworm's Mesa 22.3.6 failed shader validation for `SHADER_FLOAT16_IN_FLOAT32`. Linux x86-64 and a separate Linux host remain untested. |
-| macOS Metal vs. Linux lavapipe | The element trees matched byte for byte. At 1160×720, 14.67% of pixels differed by at least one RGB channel value, and 1.68% had a channel difference greater than 16. The mean absolute channel difference was 0.946 and the maximum was 222 on a 0–255 scale. The source of the pixel differences remains unverified. |
-| Chrome / forced WebGL2 | The WASM-only patch compiled and presented a frame, with no browser errors or failed requests. |
-| Rerun 0.43.2 | The headless viewer captured step 1,850. `verify_rerun.py` checks all 30,720 float32 shares against count-derived float64 shares with absolute tolerance `3e-8` and zero relative tolerance. The observed maximum error was `1.43e-8`. All 240 diversity values, the status image pixels, and the detector summary matched exactly. The verifier recomputes the three layer 31 expert load tables from the counts without using `generate.py`, and checks the 21 table rows in Rune's element tree against the step 1,850 table. It rejected a one-token change to the step 1,800 baseline. `capture_rerun.py` waits until loading finishes and two consecutive frames match; two back-to-back captures were byte-identical. |
+| macOS arm64 / Metal | Two runs produced byte-identical PNGs and trees. A scripted tap selected dead expert 2 and displayed 0% routing share. *(Nov 13.)* |
+| Linux arm64 container / Vulkan | The container ran inside an arm64 Linux VM on the same Mac. Debian Trixie lavapipe (llvmpipe, LLVM 19.1.7) produced byte-identical outputs across two runs. Bookworm's Mesa 22.3.6 failed shader validation for `SHADER_FLOAT16_IN_FLOAT32`. Linux x86-64 and a separate Linux host remain untested. *(Nov 13. The Dockerfile now takes the fixture as a build context, and that change is untested: there is no Docker on the machine that edited it.)* |
+| macOS Metal vs. Linux lavapipe | The element trees matched byte for byte. At 1160×720, 14.67% of pixels differed by at least one RGB channel value, and 1.68% had a channel difference greater than 16. The mean absolute channel difference was 0.946 and the maximum was 222 on a 0–255 scale. The source of the pixel differences remains unverified. *(Nov 13.)* |
+| Chrome / forced WebGL2 | The WASM-only patch compiled and presented a frame, with no browser errors or failed requests. *(Nov 13.)* |
+| Rerun 0.43.2, recording made by `export_rerun` | *(Nov 15.)* `verify_rerun.py` checks all 30,720 float32 shares against count-derived float64 shares with absolute tolerance `3e-8` and zero relative tolerance. The observed maximum error was `1.43e-8`. All 240 diversity values, the status image pixels, and the detector summary matched exactly. The verifier recomputes the three layer 31 expert load tables from the counts, and checks the 21 table rows in Rune's element tree (the Nov 13 tree) against the step 1,850 table. It rejected a one-token move between two experts' step 1,800 counts. The heatmap colors and the summary text come from the SDK on both sides of that check, so it shows that the recording holds what the SDK computes. The rules are tested against the planted failures by `test_fixtures.py`. |
+| Rerun headless capture | *(Nov 15.)* `capture_rerun.py` loaded the SDK's recording and blueprint, waited until loading finished and two consecutive frames matched, and captured step 1,850. Two back-to-back captures were byte-identical. The layout matches the Nov 13 capture, except that the summary view is now named `Training incidents`, a `MoE routing` header sits above the heatmap and the table, and the legend line adds violet for starved and gray for idle experts. |
 
 The human and agent timing trials are pending. These runs establish rendering and fixture parity.
 
@@ -20,23 +71,28 @@ The v3 plan starts with stock Rerun. This prototype tests whether a sortable tab
 
 ## Run the comparison
 
+From the repository root, with an environment that has the SDK and `rerun-sdk` (the project's `.venv`, or `pip install -e 'sdk[rerun]'` in a new one; the SDK needs PyTorch):
+
 ```sh
-python3 -m venv /tmp/tensorquill-moe-venv
-. /tmp/tensorquill-moe-venv/bin/activate
-python3 -m pip install 'rerun-sdk==0.43.2'
-python3 generate.py --rerun
+.venv/bin/python experiments/moe-bakeoff/generate.py
+```
+
+```sh
+cd experiments/moe-bakeoff
 cargo build --locked
 target/debug/moe-inspector --snap artifacts/rune.png --tree artifacts/rune-tree.json \
   --theme dark --size 1160x720 --scale 1
-python3 verify_rerun.py --rune-tree artifacts/rune-tree.json
-python3 capture_rerun.py
+../../.venv/bin/python verify_rerun.py --rune-tree artifacts/rune-tree.json
+PATH=../../.venv/bin:$PATH python capture_rerun.py
 ```
 
-Open `target/debug/moe-inspector` for the interactive Rune view, or `rerun artifacts/moe.rrd` for the training timeline. The raw counts and statistics are in `artifacts/stats.json`.
+`generate.py` takes an output directory, repeated `--fixture NAME`, and `--no-rerun` to skip the recordings. `verify_rerun.py` and `capture_rerun.py` take a fixture; they default to `seeded`, and `capture_rerun.py --fixture NAME` works on any MoE fixture (the dense ones have no MoE views).
+
+Open `target/debug/moe-inspector` for the interactive Rune view, or `rerun artifacts/<name>/<name>.rrd` for a fixture's recording. All recordings share one application ID, `tensorquill`, so open one at a time. The raw counts and statistics are in `artifacts/<name>/<name>.evidence.json`.
 
 ## Score the experiment
 
-Use unseen fixtures with equivalent dimensions and different incident steps, layers, and expert IDs. Counterbalance UI order across engineers. Start both viewers at the same incident sample and confirm the shared detector summary and status heatmap are visible before starting the timer. For agents, use fresh sessions with the same model, prompt, time limit, and stats JSON. Give each condition its own viewer tools. Log start and submission times and tool calls. Include a JSON-only agent condition to measure what the views add.
+Use `unseen-1` to `unseen-6`: their dimensions, incident steps, layers, and expert IDs differ from the seeded fixture's, and the seeded one is the smoke test. Counterbalance UI order across engineers. Start both viewers at the same incident sample and confirm the shared detector summary and status heatmap are visible before starting the timer. For agents, use fresh sessions with the same model, prompt, time limit, and evidence JSON. Give each condition its own viewer tools, and give it only its fixture's `.evidence.json` (and the `.rrd` for the Rerun condition). Log start and submission times and tool calls. Include a JSON-only agent condition to measure what the views add.
 
 Use the first sampled bad step, first affected layer, and expert IDs as orientation checks. Both summaries state those answers, and both tables state the incident layer's per-expert load change from the previous sample. For the timed comparison, ask participants to verify the alert with evidence that neither default screen states, such as one expert's load change in a neighboring layer or whether the overload persists at the next sample. Pre-register the questions and balance them, since some favor Rune's layer selection and others Rerun's timeline. Score against the same counts and compare median time and tool calls at matched accuracy. The proposed gate is at least a 2× reduction in median time to correct diagnosis with accuracy preserved. A single visible fixture is a smoke test.
 
@@ -44,12 +100,19 @@ Use the first sampled bad step, first affected layer, and expert IDs as orientat
 
 The last healthy sample is step 1,800. The first affected sample is step 1,850, layer 31. Expert 42 receives 36% of routed tokens. Experts 1–14 receive zero. Diversity is 0.3094112778 using `exp(H) / 128`. The detector flags strictly above 35%. The 35% boundary gives an upper bound of about 0.3225. At the actual 36% share, distributing the rest evenly across 113 experts gives a ceiling of about 0.30941129.
 
+### Not ready for the trial
+
+- The Rune inspector bakes in the seeded fixture (`artifacts/stats.json`), so arm B cannot yet show `unseen-1` to `unseen-6`. It needs to load an evidence file at run time, and it has no view of the dense fixtures (`unseen-2` and `unseen-5`) at all, since it shows routing only. Decide whether the dense fixtures stay in the trial.
+- The six timed questions are not written, and no arm has been run.
+- The Rune rows above were not repeated on the new fixtures.
+
 ## Linux headless rendering
 
-Run this from `experiments/moe-bakeoff` with Docker and BuildKit available. The named context supplies Rune’s source at the tested revision. The build stage uses the pinned Bookworm Rust image. The runtime uses Trixie for its newer Mesa Vulkan driver.
+Run this from `experiments/moe-bakeoff` with Docker and BuildKit available, after `generate.py` has written `artifacts/seeded`. The named contexts supply Rune’s source at the tested revision and the seeded evidence. The build stage uses the pinned Bookworm Rust image. The runtime uses Trixie for its newer Mesa Vulkan driver.
 
 ```sh
-docker build --build-context rune=../../../rune -t tensorquill-moe-bakeoff .
+docker build --build-context rune=../../../rune --build-context seeded=artifacts/seeded \
+  -t tensorquill-moe-bakeoff .
 mkdir -p artifacts
 docker run --rm --network none -v "$PWD/artifacts:/output" tensorquill-moe-bakeoff
 docker run --rm --network none -v "$PWD/artifacts:/output" tensorquill-moe-bakeoff \
@@ -67,7 +130,7 @@ The pinned Rune revision fails to compile with WebGL enabled because the native 
 
 ```sh
 cargo install wasm-bindgen-cli --version 0.2.129 --locked
-python3 generate.py
+../../.venv/bin/python generate.py --fixture seeded --no-rerun
 cargo build --locked --lib --target wasm32-unknown-unknown --features webgl
 mkdir -p artifacts/web
 wasm-bindgen --target web --out-dir artifacts/web \
