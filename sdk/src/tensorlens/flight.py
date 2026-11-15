@@ -352,6 +352,7 @@ class FlightSender:
         self._acked = read_offset(self.offset_path)
         self._progress = False
         self._reported = False
+        self._pid = os.getpid()
         self._closing = threading.Event()
         self._deadline = math.inf
         self._thread = threading.Thread(
@@ -373,7 +374,13 @@ class FlightSender:
     def close(self, timeout: float = CLOSE_TIMEOUT) -> bool:
         """Send the complete lines that are left and wait up to `timeout` seconds for the
         server to store them. Returns whether the whole file was acknowledged; if not, says
-        where the local file is. Call after the local file's writer has been closed."""
+        where the local file is. Call after the local file's writer has been closed.
+
+        In a forked child (a `DataLoader` worker, a `multiprocessing` process) this does
+        nothing and returns False: a fork copies this object but not its thread, and the
+        process that called `init` is the one that streams the file."""
+        if os.getpid() != self._pid:
+            return False
         self._deadline = time.monotonic() + timeout
         self._closing.set()
         self._thread.join(timeout)

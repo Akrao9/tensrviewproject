@@ -8,6 +8,7 @@ is not above the last one it kept for `(run_id, rank)` and answers each batch wi
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -343,3 +344,26 @@ def test_a_failing_stream_is_reported_once_while_training_runs(tmp_path, capsys)
     during = capsys.readouterr().err
     assert during.count("is failing") == 1 and "Training continues" in during
     sender.close(timeout=0.5)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_a_forked_child_leaves_the_stream_to_its_parent(tmp_path, store, server):
+    path = tmp_path / "run-a.rank0.jsonl"
+    append(path, [record(step) for step in range(10)])
+    sender = fast_sender(path, server.endpoint)
+    append(path, [record(10)])  # not yet sent when the child is forked
+    read, write = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # the child has a copy of the sender but not its thread
+        sys.stderr = os.fdopen(write, "w")  # pytest's captured stderr would stay in the child
+        started = time.monotonic()
+        result = sender.close(timeout=30.0)
+        sys.stderr.write(f"|{result}|{time.monotonic() - started < 1.0}")
+        sys.stderr.flush()
+        os._exit(0)
+    os.close(write)
+    os.waitpid(pid, 0)
+    with os.fdopen(read) as pipe:
+        assert pipe.read() == "|False|True"  # at once, and nothing printed about lost bytes
+    assert sender.close(timeout=10.0) is True
+    assert store.steps() == list(range(11))
