@@ -742,9 +742,11 @@ def detect_replica_drift(
     """Return the first step where cross-GPU parameter spread exceeds `tolerance` or is
     not finite (a NaN or Inf weight on some replica).
 
-    Norm and sum fingerprints are a screening check: they miss changes that keep both,
-    such as two elements swapping places. Megatron's `check_param_hashes_across_dp_replicas`
-    compares hashes for exact equality.
+    Norm, sum and seeded-projection fingerprints are a screening check, not proof of
+    equality: the projection catches changes that keep the norm and sum, such as two
+    elements swapping places, but a change that keeps all three is still possible.
+    Megatron's `check_param_hashes_across_dp_replicas` compares hashes for exact equality.
+    Records written before the projection existed carry two values and are read as before.
     """
     for record in records:
         spreads = record.get("replica_spread")
@@ -752,13 +754,14 @@ def detect_replica_drift(
             continue
         diverged = {}
         for name, vals in spreads.items():
-            norm_s, sum_s = float(vals[0]), float(vals[1])
-            if not (math.isfinite(norm_s) and math.isfinite(sum_s)):
+            values = [float(v) for v in vals]
+            detail = dict(zip(("norm_spread", "sum_spread", "projection_spread"), values))
+            if not all(math.isfinite(v) for v in values):
                 # A NaN or Inf weight on any replica makes the spread non-finite, which
                 # compares as no drift; report it instead.
-                diverged[name] = {"norm_spread": norm_s, "sum_spread": sum_s, "non_finite": True}
-            elif max(norm_s, sum_s) > tolerance:
-                diverged[name] = {"norm_spread": norm_s, "sum_spread": sum_s}
+                diverged[name] = {**detail, "non_finite": True}
+            elif max(values) > tolerance:
+                diverged[name] = detail
         if diverged:
             return {
                 "kind": "replica_drift",

@@ -14,6 +14,9 @@ except ImportError:  # pragma: no cover
 
 F64 = torch.float64
 CHUNK = 1 << 24  # elements per float64 chunk: at most 128 MB extra memory
+PROJECTION_CHUNK = 1 << 22  # the projection also builds an int64 index chunk: 32 MB + 32 MB
+FINGERPRINT_WIDTH = 3  # norm, sum, seeded projection
+_MASK = 0xFFFFFFFF
 
 
 def unwrap_local(tensor: torch.Tensor) -> torch.Tensor:
@@ -67,38 +70,82 @@ def _norms_f64(tensors: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack(norms)  # type: ignore[arg-type]
 
 
+def _projection_weights(start: int, count: int, seed: int, device: torch.device) -> torch.Tensor:
+    """Deterministic float64 weights in [-1, 1) for elements `start .. start + count`.
+
+    Integer arithmetic on the element index (a 32-bit multiply-xorshift mix), so every rank
+    and every device computes the same weights, and the training run's random number
+    generators are never touched. `seed` is the parameter's position in the checked list.
+    """
+    idx = torch.arange(start, start + count, dtype=torch.int64, device=device)
+    h = (idx * 0x9E3779B1 + (seed + 1) * 0x7F4A7C15) & _MASK
+    h = ((h ^ (h >> 16)) * 0x85EBCA6B) & _MASK
+    h = ((h ^ (h >> 13)) * 0xC2B2AE35) & _MASK
+    h = h ^ (h >> 16)
+    return h.to(F64) * (2.0 / 4294967296.0) - 1.0
+
+
+def _projection_f64(p: torch.Tensor, seed: int) -> torch.Tensor:
+    """`sum_i w_i * p_i` in float64 with the seeded weights `w`; a swap of two unequal
+    elements changes it, where a norm and a sum do not."""
+    flat = p.reshape(-1)
+    device = torch.device("cpu") if p.device.type == "mps" else p.device
+    if flat.numel() == 0:
+        return torch.zeros((), dtype=F64, device=device)
+    parts = []
+    for i, chunk in enumerate(flat.split(PROJECTION_CHUNK)):
+        chunk = chunk.cpu() if chunk.device.type == "mps" else chunk
+        weights = _projection_weights(i * PROJECTION_CHUNK, chunk.numel(), seed, chunk.device)
+        parts.append((chunk.to(F64) * weights).sum())
+    return torch.stack(parts).sum()
+
+
 @torch.no_grad()
-def parameter_fingerprints(params: Iterable[torch.Tensor]) -> torch.Tensor:
-    """Compute `[n_params, 2]` float64 `(norm, sum)` fingerprints for `params`."""
+def parameter_fingerprints(params: Iterable[torch.Tensor], *, projection: bool = True) -> torch.Tensor:
+    """Compute float64 fingerprints for `params`: `[n_params, 3]` `(norm, sum, projection)`,
+    or `[n_params, 2]` without the seeded projection (`projection=False`).
+
+    The projection is a dot product with fixed pseudo-random weights, so it catches changes
+    that keep the norm and the sum, such as two elements swapping places. It is a screen:
+    a change that keeps all three values is possible, just far less likely, and equal
+    fingerprints are not proof that tensors are equal.
+    """
     local = [unwrap_local(p) for p in params]
     if not local:
         raise ValueError("no replicated parameters to check")
-    norms = _norms_f64(local)
-    sums = torch.stack([_sum_f64(p) for p in local])
-    return torch.stack([norms, sums], dim=1)
+    columns = [_norms_f64(local), torch.stack([_sum_f64(p) for p in local])]
+    if projection:
+        columns.append(torch.stack([_projection_f64(p, i) for i, p in enumerate(local)]))
+    return torch.stack(columns, dim=1)
 
 
 @torch.no_grad()
 def spread_from_fingerprints(allfp: torch.Tensor) -> torch.Tensor:
-    """Given `[ranks, n_params, 2]` float64 fingerprints, return `[n_params, 2]` relative spread."""
-    if allfp.ndim != 3 or allfp.shape[-1] != 2:
-        raise ValueError(f"expected shape [ranks, n_params, 2], got {tuple(allfp.shape)}")
+    """Given `[ranks, n_params, k]` float64 fingerprints (`k` is 2 or 3), return the
+    `[n_params, k]` spread relative to each tensor's mean norm."""
+    if allfp.ndim != 3 or allfp.shape[-1] not in (2, FINGERPRINT_WIDTH):
+        raise ValueError(f"expected shape [ranks, n_params, 2 or 3], got {tuple(allfp.shape)}")
     spread = allfp.max(0).values - allfp.min(0).values
     scale = allfp[..., 0].mean(0).clamp_min(1e-12)  # mean norm per tensor
     return spread / scale[:, None]
 
 
 @torch.no_grad()
-def replica_spread(params: Iterable[torch.Tensor], group: dist.ProcessGroup) -> torch.Tensor:
-    """Compare replicated parameters across `group` and return `[n_params, 2]` relative spread.
+def replica_spread(
+    params: Iterable[torch.Tensor], group: dist.ProcessGroup, *, projection: bool = True
+) -> torch.Tensor:
+    """Compare replicated parameters across `group` and return `[n_params, 3]` relative spread
+    (norm, sum, seeded projection).
 
     `params`: tensors meant to be identical on every rank in `group`.
+    `projection=False` skips the seeded projection (two columns instead of three), which
+    costs about seven times the norm and sum on CPU; its GPU cost is not yet measured.
     `group`: the replication group. Pass `dist.group.WORLD` only for plain DDP;
     under tensor, pipeline or hybrid-FSDP parallelism WORLD compares the wrong ranks.
     """
     if group is None:
         raise ValueError("pass the replication process group explicitly")
-    fp = parameter_fingerprints(params)
+    fp = parameter_fingerprints(params, projection=projection)
     out = [torch.empty_like(fp) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(out, fp, group=group)  # 16 bytes per tensor per rank
+    dist.all_gather(out, fp, group=group)  # 24 bytes per tensor per rank
     return spread_from_fingerprints(torch.stack(out))

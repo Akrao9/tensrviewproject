@@ -94,7 +94,7 @@ def test_non_finite_and_replica_drift_detectors_from_capture_session(tmp_path, m
 
     records = tensorquill.load_records(jsonl)
     assert "replica_spread" in records[0]
-    assert records[0]["replica_spread"]["0.weight"] == [0.0, 0.0]
+    assert records[0]["replica_spread"]["0.weight"] == [0.0, 0.0, 0.0]
 
     evidence = tensorquill.build_evidence(jsonl)
     kinds = {inc["kind"]: inc for inc in evidence["incidents"]}

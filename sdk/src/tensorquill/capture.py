@@ -31,7 +31,7 @@ from torch.optim.optimizer import (
     register_optimizer_step_pre_hook,
 )
 
-from .distributed import replica_spread, unwrap_local
+from .distributed import FINGERPRINT_WIDTH, replica_spread, unwrap_local
 from .probe import ProbeState, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink
 from .tracker import RunInfo, resolve_run
@@ -324,6 +324,7 @@ class Session:
         start_step: int = 0,
         clip_norm: bool = True,
         replica_every: int = WEIGHT_EVERY,
+        replica_projection: bool = True,
         probe: Any = None,
         probe_every: int = PROBE_EVERY,
         scaler: Any = None,
@@ -357,6 +358,7 @@ class Session:
         if isinstance(replica_every, bool) or not isinstance(replica_every, int) or replica_every < 1:
             raise ValueError("replica_every must be a positive integer")
         self.replica_every = replica_every
+        self._replica_projection = replica_projection
         if isinstance(probe_every, bool) or not isinstance(probe_every, int) or probe_every < 1:
             raise ValueError("probe_every must be a positive integer")
         self.probe_every = probe_every
@@ -422,7 +424,7 @@ class Session:
         self._clip_calls = 0  # lets an outer wrapper see that an inner one already recorded
         self._ring_clip_seen: list[bool] = []
         self._ring_spread: torch.Tensor | None = None
-        self._ring_spread_seen: list[bool] = []
+        self._ring_spread_seen: list[int] = []  # columns recorded at each step; 0 if none
         if replica_group is not None and self._replica_params:
             self._ensure_spread_buffers()
         self._ring_counts = {
@@ -461,7 +463,7 @@ class Session:
         self._next_step = start_step
         self._steps_committed = 0
         self._grads_recorded = False
-        self._spread_recorded = False
+        self._spread_recorded = 0
         self._owned: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
         self._lead: weakref.ref[Any] | None = None
         self._leading = True
@@ -760,18 +762,19 @@ class Session:
             # Apple MPS rejects float64 allocations; keep float64 replica buffers on CPU there.
             spread_device = torch.device("cpu") if self.device.type == "mps" else self.device
             n_params = len(self._replica_params)
-            self._spread = torch.zeros(n_params, 2, dtype=torch.float64, device=spread_device)
+            self._spread = torch.zeros(n_params, FINGERPRINT_WIDTH, dtype=torch.float64, device=spread_device)
             self._ring_spread = torch.zeros(
-                self.every, n_params, 2, dtype=torch.float64, device=spread_device
+                self.every, n_params, FINGERPRINT_WIDTH, dtype=torch.float64, device=spread_device
             )
         return self._spread, self._ring_spread
 
     @torch.no_grad()
     def record_replica_spread(self, group_or_spread: Any = None) -> None:
-        """Record cross-GPU parameter relative spread `(norm_spread, sum_spread)` for this step.
+        """Record cross-GPU parameter relative spread `(norm, sum, projection)` for this step.
 
         Pass a replication `ProcessGroup` (or rely on `replica_group` passed to `init`), or
-        pass a precomputed `[n_params, 2]` tensor from `spread_from_fingerprints`.
+        pass a precomputed `[n_params, 3]` (or older `[n_params, 2]`) tensor from
+        `spread_from_fingerprints`.
         """
         if not self._replica_params:
             return
@@ -782,9 +785,13 @@ class Session:
         if isinstance(target, torch.Tensor):
             spread = target.to(spread_buf)
         else:
-            spread = replica_spread(self._replica_params, target).to(spread_buf)
-        spread_buf.copy_(spread)
-        self._spread_recorded = True
+            spread = replica_spread(
+                self._replica_params, target, projection=self._replica_projection
+            ).to(spread_buf)
+        width = spread.shape[-1]
+        spread_buf.zero_()
+        spread_buf[:, :width].copy_(spread)
+        self._spread_recorded = width
 
     def step(self, step: int | None = None, lr: float | Sequence[float] | None = None) -> None:
         """Mark the end of one optimizer step. Only for `auto_step=False`.
@@ -848,7 +855,7 @@ class Session:
             )
             torch._foreach_zero_(self._counts_list)
         self._grads_recorded = False
-        self._spread_recorded = False
+        self._spread_recorded = 0
         probe_due = self._cadence_probe()
         self._steps.append(current)
         self._ring_probe.append(None)
@@ -1036,7 +1043,7 @@ class Session:
             else None
         )
         spread_rows = (
-            spreads.reshape(n, len(self.replica_names), 2).tolist() if spreads is not None else None
+            spreads.reshape(n, len(self.replica_names), FINGERPRINT_WIDTH).tolist() if spreads is not None else None
         )
         moe: dict[str, list[list[int]]] = {}
         offset = 0
@@ -1091,9 +1098,10 @@ class Session:
             if probes is not None and probes[i] is not None:
                 record["probe"] = probes[i]
             if spread_rows is not None and spread_seen[i]:
+                width = spread_seen[i]
                 record["replica_spread"] = {
-                    name: [float(norm_s), float(sum_s)]
-                    for name, (norm_s, sum_s) in zip(self.replica_names, spread_rows[i])
+                    name: [float(v) for v in row[:width]]
+                    for name, row in zip(self.replica_names, spread_rows[i])
                 }
             if moe:
                 step_moe = {name: rows[i] for name, rows in moe.items()}
@@ -1211,6 +1219,7 @@ def init(
     start_step: int = 0,
     clip_norm: bool = True,
     replica_every: int = WEIGHT_EVERY,
+    replica_projection: bool = True,
     probe: Any = None,
     probe_every: int = PROBE_EVERY,
     scaler: Any = None,
@@ -1253,8 +1262,12 @@ def init(
         replica_group: optional replication `ProcessGroup` (or precomputed spread tensor)
             for cross-GPU parameter drift checks.
         replica_every: run the cross-GPU drift check every N steps (default 50). Each
-            check reads every weight in float64 and gathers 16 bytes per parameter tensor
-            from each rank. `session.record_replica_spread()` records one on demand.
+            check reads every weight in float64 and gathers 24 bytes per parameter tensor
+            from each rank: norm, sum and a seeded random projection, which catches
+            changes that keep the other two, such as swapped elements. It is a screen,
+            not proof of equality. `session.record_replica_spread()` records one on demand.
+        replica_projection: set False to skip the projection (two values per tensor). On
+            CPU it takes about seven times the norm and sum; GPU cost is not yet measured.
         probe: a fixed batch to run through the model every `probe_every` steps, for
             activation histograms per block and attention statistics: a tensor (called as
             `model(batch)`), a mapping of keyword inputs (`model(**batch)`), or a callable
@@ -1309,6 +1322,7 @@ def init(
         start_step=start_step,
         clip_norm=clip_norm,
         replica_every=replica_every,
+        replica_projection=replica_projection,
         probe=probe,
         probe_every=probe_every,
         scaler=scaler,

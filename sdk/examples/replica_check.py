@@ -34,7 +34,7 @@ def main() -> None:
         rank = dist.get_rank()
         model = torch.nn.Linear(4, 1, bias=False, device=device)
         with torch.no_grad():
-            model.weight.fill_(1)
+            model.weight.copy_(torch.arange(1.0, 5.0))
         ddp = DDP(model, device_ids=device_ids)
         optimizer = torch.optim.SGD(ddp.parameters(), lr=0)
         sink = tensorquill.MemorySink()
@@ -43,30 +43,38 @@ def main() -> None:
         with tensorquill.init(
             model, sink=sink, auto_step=False, replica_group=dist.group.WORLD, replica_every=1
         ) as session:
-            for step in range(4):
+            for step in range(6):
                 optimizer.zero_grad(set_to_none=True)
                 ddp(x).sum().backward()
                 optimizer.step()
 
                 with torch.no_grad():
-                    model.weight.fill_(1)
+                    model.weight.copy_(torch.arange(1.0, 5.0))
                     if rank == 1 and step == 1:
                         model.weight[0, 0].add_(0.25)
                     if rank == 1 and step == 3:
                         model.weight[0, 0].neg_()
+                    if rank == 1 and step == 5:
+                        model.weight[0, [1, 2]] = model.weight[0, [2, 1]].clone()  # swap two elements
                 session.step(step)
 
         records = sink.records
-        assert [record["step"] for record in records] == list(range(4))
-        for step in (0, 2):
-            assert records[step]["replica_spread"]["weight"] == [0.0, 0.0]
+        assert [record["step"] for record in records] == list(range(6))
+        for step in (0, 2, 4):
+            assert records[step]["replica_spread"]["weight"] == [0.0, 0.0, 0.0]
         drift = tensorquill.detect_replica_drift(records)
         assert drift and drift["step"] == 1 and "weight" in drift["parameters"], drift
         sign_flip = tensorquill.detect_replica_drift(records[2:])
         assert sign_flip and sign_flip["step"] == 3, sign_flip
         spread = sign_flip["parameters"]["weight"]
         assert abs(spread["norm_spread"]) < 1e-6 and spread["sum_spread"] > 1e-6, spread
-        print(f"PASS {backend} rank {rank}: healthy at 0 and 2, drift at 1, sign flip at 3")
+        swap = tensorquill.detect_replica_drift(records[4:])
+        assert swap and swap["step"] == 5, swap
+        spread = swap["parameters"]["weight"]
+        # The older norm and sum fingerprint sees nothing here; only the projection does.
+        assert spread["norm_spread"] < 1e-6 and spread["sum_spread"] < 1e-6, spread
+        assert spread["projection_spread"] > 1e-6, spread
+        print(f"PASS {backend} rank {rank}: healthy at 0, 2 and 4, drift at 1, sign flip at 3, swap at 5")
     finally:
         dist.destroy_process_group()
 

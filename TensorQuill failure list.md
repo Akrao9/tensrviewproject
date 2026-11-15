@@ -34,7 +34,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Per-parameter fingerprints compared across the ranks that should hold the same weights.
 
-**TensorQuill today.** `replica_spread` is built and passes two CPU processes with seeded drift and a sign flip. Not yet run on two GPUs.
+**TensorQuill today.** `replica_spread` is built and passes two CPU processes with seeded drift, a sign flip and a swap of two elements (the swap keeps the norm and sum and is caught only by the seeded projection added Nov 15, 2026). Equal fingerprints are still not proof of equal weights, and the check compares only parameters that are really replicated (`replica_params=` leaves out sharded weights). Not yet run on two GPUs, and the projection's GPU cost is unmeasured: on CPU it takes about seven times the norm and sum alone, and `replica_projection=False` turns it off.
 
 ### 2. Silent data corruption on a faulty GPU
 

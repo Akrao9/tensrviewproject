@@ -9,7 +9,7 @@ def test_identical_replicas_have_zero_spread():
     p1 = [t.clone() for t in p0]
     fp = torch.stack([tensorquill.parameter_fingerprints(p0), tensorquill.parameter_fingerprints(p1)])
     spread = tensorquill.spread_from_fingerprints(fp)
-    assert spread.shape == (2, 2)
+    assert spread.shape == (2, 3)
     assert torch.all(spread == 0.0)
 
 
@@ -82,3 +82,77 @@ def test_replica_params_accepts_names_or_parameters_and_rejects_unknown_names():
     by_param.close()
     with pytest.raises(ValueError, match="no trainable parameter"):
         tensorquill.init(model, sink=tensorquill.MemorySink(), replica_params=["2.weight"])
+
+
+def _spread(a, b):
+    fp = torch.stack([tensorquill.parameter_fingerprints([a]), tensorquill.parameter_fingerprints([b])])
+    return tensorquill.spread_from_fingerprints(fp)[0]
+
+
+def test_swapping_two_elements_is_caught_by_the_projection_only():
+    # A swap keeps the norm and the sum, which is all the older fingerprint had.
+    a = torch.arange(1.0, 9.0)
+    b = a.clone()
+    b[[1, 5]] = b[[5, 1]]
+    spread = _spread(a, b)
+    assert spread[0].item() == pytest.approx(0.0, abs=1e-12)
+    assert spread[1].item() == pytest.approx(0.0, abs=1e-12)
+    assert spread[2].item() > 1e-3
+    old = tensorquill.spread_from_fingerprints(
+        torch.stack([tensorquill.parameter_fingerprints([a], projection=False),
+                     tensorquill.parameter_fingerprints([b], projection=False)])
+    )
+    assert old.shape == (1, 2) and torch.all(old == 0.0)
+    records = [{"step": 0, "replica_spread": {"w": spread.tolist()}}]
+    assert tensorquill.detect_replica_drift(records)["parameters"]["w"]["projection_spread"] > 1e-3
+    assert tensorquill.detect_replica_drift([{"step": 0, "replica_spread": {"w": old[0].tolist()}}]) is None
+
+
+def test_projection_is_deterministic_and_leaves_the_random_streams_alone():
+    t = torch.randn(10_000, dtype=torch.float64)
+    torch.manual_seed(7)
+    before = torch.get_rng_state()
+    first = tensorquill.parameter_fingerprints([t])
+    assert torch.equal(torch.get_rng_state(), before)
+    assert torch.equal(first, tensorquill.parameter_fingerprints([t.clone()]))
+    # Chunking must not change the value: the weights depend only on the element index.
+    from tensorquill import distributed
+
+    small = distributed.PROJECTION_CHUNK
+    distributed.PROJECTION_CHUNK = 1000
+    try:
+        chunked = tensorquill.parameter_fingerprints([t])
+    finally:
+        distributed.PROJECTION_CHUNK = small
+    assert chunked[0, 2].item() == pytest.approx(first[0, 2].item(), rel=1e-12)
+
+
+def test_records_with_two_spread_values_still_read():
+    assert tensorquill.detect_replica_drift([{"step": 0, "replica_spread": {"w": [0.0, 0.0]}}]) is None
+    hit = tensorquill.detect_replica_drift([{"step": 0, "replica_spread": {"w": [0.0, 0.5]}}])
+    assert hit["parameters"]["w"] == {"norm_spread": 0.0, "sum_spread": 0.5}
+
+
+@pytest.mark.parametrize("projection, width", [(True, 3), (False, 2)])
+def test_session_records_the_projection_unless_switched_off(monkeypatch, projection, width):
+    import torch.distributed as dist
+    from torch import nn
+
+    other = nn.Linear(3, 2)
+    model = nn.Linear(3, 2)
+    other.load_state_dict(model.state_dict())
+
+    def gather(out, fp, group=None):
+        out[0].copy_(fp)
+        out[1].copy_(tensorquill.parameter_fingerprints(other.parameters(), projection=fp.shape[-1] == 3))
+
+    monkeypatch.setattr(dist, "get_world_size", lambda g=None: 2)
+    monkeypatch.setattr(dist, "all_gather", gather)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(
+        model, sink=sink, auto_step=False, replica_group=object(), replica_every=1,
+        replica_projection=projection,
+    )
+    session.step()
+    session.close()
+    assert {len(v) for v in sink.records[0]["replica_spread"].values()} == {width}
