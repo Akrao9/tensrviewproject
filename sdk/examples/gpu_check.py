@@ -1,4 +1,4 @@
-"""Check TensorLens on a GPU: correctness under `torch.compile`, then training overhead.
+"""Check TensorQuill on a GPU: correctness under `torch.compile`, then training overhead.
 
     python examples/gpu_check.py                      # CUDA: Inductor, mode="reduce-overhead"
     python examples/gpu_check.py --dim 2048 --blocks 12 --batch 8192
@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-import tensorlens  # noqa: E402
+import tensorquill  # noqa: E402
 
 N_EXPERTS = 8
 
@@ -98,8 +98,8 @@ def check_correctness(args: argparse.Namespace, device: torch.device) -> list[st
     torch._dynamo.reset()
     torch.manual_seed(0)
     model = MoE(dim, blocks=2).to(device)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, run_id="gpu-check", every=4, sink=sink, routers=routers(model))
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, run_id="gpu-check", every=4, sink=sink, routers=routers(model))
     compiled = compile_model(model, args)
     opt = torch.optim.SGD(model.parameters(), lr=1e-3)
     proj = model.blocks[0].router.proj
@@ -139,7 +139,7 @@ def check_correctness(args: argparse.Namespace, device: torch.device) -> list[st
     wrong = [r["step"] for r, want in zip(records, expected) if r["moe"]["blocks.0.router"] != want]
     if wrong:
         failures.append(f"router counts differ from a direct calculation at steps {wrong}")
-    hit = tensorlens.first_incident(tensorlens.build_evidence(records))
+    hit = tensorquill.first_incident(tensorquill.build_evidence(records))
     if hit is None or hit["step"] != break_at:
         failures.append(f"collapse seeded at step {break_at}, detector reported {hit and hit['step']}")
     return failures
@@ -151,12 +151,12 @@ def measure_overhead(args: argparse.Namespace, device: torch.device) -> None:
         model = MoE(args.dim, args.blocks).to(device)
         session = None
         if capture:
-            session = tensorlens.init(
+            session = tensorquill.init(
                 model,
                 run_id="gpu-check-overhead",
                 capture="full",
                 every=args.every,
-                sink=tensorlens.JsonlSink(Path(tmp) / "overhead.jsonl"),  # real file writes
+                sink=tensorquill.JsonlSink(Path(tmp) / "overhead.jsonl"),  # real file writes
                 routers=routers(model),
             )
         return compile_model(model, args), torch.optim.SGD(model.parameters(), lr=1e-4), session
@@ -187,7 +187,7 @@ def measure_overhead(args: argparse.Namespace, device: torch.device) -> None:
         watched = len(session.layer_names)
         session.close()
 
-        records = tensorlens.load_records(Path(tmp) / "overhead.jsonl")
+        records = tensorquill.load_records(Path(tmp) / "overhead.jsonl")
         expected_steps = args.warmup + args.rounds * args.block_steps
         if [record["step"] for record in records] != list(range(expected_steps)):
             raise RuntimeError("Overhead run did not record the expected optimizer steps")

@@ -4,19 +4,19 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
-use tensorlens_server::ingest::{Ingest, IngestConfig, DEFAULT_FLUSH_STEPS, DEFAULT_QUOTA_BYTES};
-use tensorlens_server::server::{check_bind, serve, Tls};
-use tensorlens_server::storage::{Error, Storage};
+use tensorquill_server::ingest::{Ingest, IngestConfig, DEFAULT_FLUSH_STEPS, DEFAULT_QUOTA_BYTES};
+use tensorquill_server::server::{check_bind, serve, Tls};
+use tensorquill_server::storage::{Error, Storage};
 use tokio::net::TcpListener;
 
-/// Self-hosted TensorLens ingest: Arrow Flight DoPut in, partitioned Parquet out.
+/// Self-hosted TensorQuill ingest: Arrow Flight DoPut in, partitioned Parquet out.
 #[derive(Parser)]
-#[command(name = "tensorlens-server", version)]
+#[command(name = "tensorquill-server", version)]
 struct Args {
-    /// Address to listen on. Anything but loopback needs TENSORLENS_TOKEN or --allow-unauthenticated.
+    /// Address to listen on. Anything but loopback needs TENSORQUILL_TOKEN or --allow-unauthenticated.
     #[arg(long, default_value = "127.0.0.1:50051")]
     listen: SocketAddr,
-    /// Where Parquet parts go: file:///var/lib/tensorlens, s3://bucket/prefix, gs://bucket/prefix, or a directory.
+    /// Where Parquet parts go: file:///var/lib/tensorquill, s3://bucket/prefix, gs://bucket/prefix, or a directory.
     #[arg(long)]
     store: String,
     /// PEM certificate chain; with --tls-key, serve TLS (senders then use grpcs://).
@@ -29,7 +29,7 @@ struct Args {
     #[arg(long)]
     allow_unauthenticated: bool,
     /// Senders must present this as `Authorization: Bearer <token>`.
-    #[arg(long, env = "TENSORLENS_TOKEN", hide_env_values = true)]
+    #[arg(long, env = "TENSORQUILL_TOKEN", hide_env_values = true)]
     token: Option<String>,
     /// Cap on buffered Arrow bytes across all streams, in MiB.
     #[arg(long, default_value_t = DEFAULT_QUOTA_BYTES / (1024 * 1024))]
@@ -74,7 +74,7 @@ async fn run(args: Args) -> Result<(), Error> {
     let ingest = Ingest::new(Storage::from_url(&args.store)?, config);
     let listener = TcpListener::bind(args.listen).await?;
     // Scripts and tests that ask for port 0 read the real address from this line.
-    println!("tensorlens-server listening on {}", listener.local_addr()?);
+    println!("tensorquill-server listening on {}", listener.local_addr()?);
     let flusher = ingest.spawn_flusher();
     // Open streams never end on their own, so do not wait for them: on a signal, stop
     // taking batches, write what is buffered, and exit.
@@ -92,7 +92,7 @@ async fn main() -> ExitCode {
     match run(Args::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("tensorlens-server: {error}");
+            eprintln!("tensorquill-server: {error}");
             ExitCode::FAILURE
         }
     }

@@ -5,8 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-import tensorlens
-from tensorlens import probe as probe_mod
+import tensorquill
+from tensorquill import probe as probe_mod
 
 
 class Block(nn.Module):
@@ -73,9 +73,9 @@ def test_probe_runs_on_cadence_and_records_histograms_and_attention():
     torch.manual_seed(0)
     model = Toy()
     fixed = torch.randint(0, 32, (2, 12))
-    routers = {f"blocks.{i}.router": tensorlens.Router(4, top_k=2) for i in range(2)}
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, every=3, routers=routers, probe=fixed, probe_every=3)
+    routers = {f"blocks.{i}.router": tensorquill.Router(4, top_k=2) for i in range(2)}
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=3, routers=routers, probe=fixed, probe_every=3)
     batch = torch.randint(0, 32, (2, 12))
     _train(model, session, 6, batch)
     session.close()
@@ -135,7 +135,7 @@ def test_probe_leaves_rng_and_flags_untouched_and_switches_flash_attention():
         return original(ids)
 
     model.forward = forward
-    session = tensorlens.init(model, sink=tensorlens.MemorySink(), probe=lambda m: m(torch.zeros(1, 4, dtype=torch.long)))
+    session = tensorquill.init(model, sink=tensorquill.MemorySink(), probe=lambda m: m(torch.zeros(1, 4, dtype=torch.long)))
     torch.manual_seed(3)
     state = torch.get_rng_state()
     result = session._probe()
@@ -159,8 +159,8 @@ def test_probe_causes_no_graph_breaks_or_recompiles(backend):
     torch._dynamo.reset()
     torch._dynamo.utils.counters.clear()
     model = Toy()
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, every=2, probe=torch.zeros(2, 8, dtype=torch.long), probe_every=2)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=2, probe=torch.zeros(2, 8, dtype=torch.long), probe_every=2)
     compiled = torch.compile(model, backend=backend, fullgraph=True)
     batch = torch.randint(0, 32, (2, 8))
     with torch._dynamo.config.patch(error_on_recompile=True):
@@ -179,7 +179,7 @@ def test_probe_input_forms():
     probe_mod.probe_callable(torch.ones(1))(fake)
     assert calls[0] == ((), {"input_ids": 1}) and calls[1][0][0].shape == (1,)
     with pytest.raises(ValueError, match="probe_every"):
-        tensorlens.init(nn.Linear(2, 2), sink=tensorlens.MemorySink(), probe=torch.ones(1, 2), probe_every=0)
+        tensorquill.init(nn.Linear(2, 2), sink=tensorquill.MemorySink(), probe=torch.ones(1, 2), probe_every=0)
 
 
 def test_probe_is_written_to_jsonl_and_exported_to_rerun(tmp_path, monkeypatch):
@@ -187,19 +187,19 @@ def test_probe_is_written_to_jsonl_and_exported_to_rerun(tmp_path, monkeypatch):
     torch.manual_seed(0)
     model = Toy()
     path = tmp_path / "run.jsonl"
-    session = tensorlens.init(
-        model, sink=tensorlens.JsonlSink(path), every=2, probe=torch.zeros(1, 6, dtype=torch.long), probe_every=2
+    session = tensorquill.init(
+        model, sink=tensorquill.JsonlSink(path), every=2, probe=torch.zeros(1, 6, dtype=torch.long), probe_every=2
     )
     _train(model, session, 4, torch.randint(0, 32, (2, 6)))
     session.close()
-    records = tensorlens.load_records(path)
+    records = tensorquill.load_records(path)
     assert sum("probe" in r for r in records) == 2
 
     logged = []
     real_log = rr.log
     monkeypatch.setattr(rr, "log", lambda p, *a, **kw: (logged.append(p), real_log(p, *a, **kw)))
-    evidence = tensorlens.build_evidence(records)
-    tensorlens.export_rerun(evidence, tmp_path / "run.rrd", records=records)
+    evidence = tensorquill.build_evidence(records)
+    tensorquill.export_rerun(evidence, tmp_path / "run.rrd", records=records)
     for layer in ("blocks.0", "blocks.1"):
         assert logged.count(f"/probe/histograms/{layer}") == 2
         assert logged.count(f"/probe/attention/{layer}") == 2
@@ -241,8 +241,8 @@ def test_a_failing_probe_keeps_the_step_and_records_the_error():
             raise RuntimeError("probe broke")
         m(torch.zeros(1, 4, dtype=torch.long))
 
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, every=4, probe=flaky, probe_every=1)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=4, probe=flaky, probe_every=1)
     with pytest.warns(RuntimeWarning, match="probe broke"):
         _train(model, session, 3, torch.randint(0, 32, (2, 6)))
     session.close()

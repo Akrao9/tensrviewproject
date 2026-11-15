@@ -115,7 +115,7 @@ def export_rerun(evidence, path):
     import rerun.blueprint as rrb
 
     incident_layer = first_incident(evidence)["layer"]
-    rr.init("tensorlens-moe-bakeoff", recording_id="seeded-moe")
+    rr.init("tensorquill-moe-bakeoff", recording_id="seeded-moe")
     rr.save(path)
     rr.send_blueprint(rrb.Blueprint(
         rrb.Vertical(

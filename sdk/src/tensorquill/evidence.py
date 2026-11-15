@@ -505,8 +505,8 @@ def load_records(
 ) -> list[dict[str, Any]]:
     """Read captured step records.
 
-    `source` is a `.jsonl` file from `tensorlens.init`, a directory of the Parquet parts
-    `tensorlens-server` wrote (a run's `runs/<run_id>` directory, or a `rank=<rank>`
+    `source` is a `.jsonl` file from `tensorquill.init`, a directory of the Parquet parts
+    `tensorquill-server` wrote (a run's `runs/<run_id>` directory, or a `rank=<rank>`
     directory inside it), one `.parquet` part, or an iterable of dicts. Reading Parquet
     needs `pyarrow` (`pip install pyarrow`) and gives the same dicts as the
     `.jsonl` file the parts were streamed from.
@@ -534,7 +534,7 @@ def load_records(
 def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Leave out the records a later attempt replaced.
 
-    Each `tensorlens.init` stamps its records with `attempt`, its start time. A job that
+    Each `tensorquill.init` stamps its records with `attempt`, its start time. A job that
     resumes from the checkpoint at step S writes step S and onwards again as a new
     attempt; from then on, what earlier attempts of that rank recorded at step S or later
     is history that training rolled back, including steps the new attempt has not reached
@@ -648,7 +648,7 @@ def watch(
 ) -> Path | None:
     """Rebuild the evidence whenever `source` grows, until interrupted.
 
-    `source` is a `.jsonl` file a job is writing, or a directory `tensorlens-server` is
+    `source` is a `.jsonl` file a job is writing, or a directory `tensorquill-server` is
     writing Parquet parts into. Every `interval` seconds the new records are read and,
     if there were any, the detectors run over the whole run and the evidence file is
     replaced by rename. `polls` stops after that many looks, for scripts and tests;
@@ -1090,7 +1090,7 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
     if kind == "repeated_steps":
         return (
             f"Repeated step numbers from step {incident['step']}: {incident['repeated']} steps"
-            " recorded more than once; pass start_step= to tensorlens.init when resuming"
+            " recorded more than once; pass start_step= to tensorquill.init when resuming"
         )
     if kind == "loss_scale_trouble":
         why = (
@@ -1220,9 +1220,9 @@ def export_rerun(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     hit = first_incident(evidence)
     incident_layer = hit["layer"] if hit is not None else 1
-    run_id = str(evidence.get("run_id") or "tensorlens-run")
+    run_id = str(evidence.get("run_id") or "tensorquill-run")
 
-    rr.init("tensorlens", recording_id=run_id)
+    rr.init("tensorquill", recording_id=run_id)
     rr.save(out_path)
     rr.log("/incident/summary", rr.TextDocument(incident_summary(evidence)), static=True)
 
@@ -1449,8 +1449,8 @@ def main() -> None:
     parser.add_argument(
         "input",
         type=Path,
-        help="captured .jsonl file from tensorlens.init, or a directory of Parquet parts "
-        "written by tensorlens-server (runs/<run_id>, or a rank=<rank> directory in it)",
+        help="captured .jsonl file from tensorquill.init, or a directory of Parquet parts "
+        "written by tensorquill-server (runs/<run_id>, or a rank=<rank> directory in it)",
     )
     parser.add_argument(
         "-o",

@@ -24,7 +24,7 @@ pub fn check_bind(address: &SocketAddr, has_token: bool, allow_unauthenticated: 
         return Ok(());
     }
     Err(format!(
-        "refusing to listen on {address} without authentication: set TENSORLENS_TOKEN, \
+        "refusing to listen on {address} without authentication: set TENSORQUILL_TOKEN, \
          or pass --allow-unauthenticated, or listen on 127.0.0.1"
     ))
 }

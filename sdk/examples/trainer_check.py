@@ -5,7 +5,7 @@ Fine-tunes a small dense model on WikiText-2 through `transformers.Trainer` with
 `GradScaler` in the loop. From `--seed-step` it scales a few hidden channels of one middle
 block by `--factor`, as `dense_outlier_check.py` does. It fails unless:
 
-- TensorLens recorded every optimizer step, numbered as `Trainer` numbers them;
+- TensorQuill recorded every optimizer step, numbered as `Trainer` numbers them;
 - the loss and the gradient norm before clipping are on every step, and agree with the
   interval averages and norms `Trainer` itself logs;
 - the activation detector finds the outlier at the seeded step and block;
@@ -26,7 +26,7 @@ from pathlib import Path
 
 import torch
 
-import tensorlens
+import tensorquill
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dense_outlier_check import MODEL, install_outlier, load_batches  # noqa: E402
@@ -57,7 +57,7 @@ def main() -> None:
         AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM, Trainer, TrainerCallback, TrainingArguments,
     )
 
-    from tensorlens.huggingface import TensorLensCallback
+    from tensorquill.huggingface import TensorQuillCallback
 
     cuda = torch.cuda.is_available()
     device = torch.device("cuda" if cuda else "cpu")
@@ -92,9 +92,9 @@ def main() -> None:
     dataset = [{"input_ids": row, "labels": row} for row in rows]  # in order: no shuffling below
     fixed = batches[0].to(device)
 
-    blocks = [name for name, _ in tensorlens.capture._select_layers(model, "blocks")]
+    blocks = [name for name, _ in tensorquill.capture._select_layers(model, "blocks")]
     seeded_block = blocks[len(blocks) // 2]
-    # Before the Trainer and its callback, so the hook runs before TensorLens's hook.
+    # Before the Trainer and its callback, so the hook runs before TensorQuill's hook.
     flag, handle = install_outlier(
         model.get_submodule(seeded_block), model.config.hidden_size, args.channels, args.factor, device,
         next(model.parameters()).dtype,
@@ -106,8 +106,8 @@ def main() -> None:
                 flag.fill_(True)
 
     jsonl = args.out / "trainer.jsonl"
-    callback = TensorLensCallback(
-        run_id="trainer-check", capture="full", every=50, sink=tensorlens.JsonlSink(jsonl),
+    callback = TensorQuillCallback(
+        run_id="trainer-check", capture="full", every=50, sink=tensorquill.JsonlSink(jsonl),
         probe=lambda m: m(input_ids=fixed, use_cache=False), probe_every=args.probe_every,
     )
     training_args = TrainingArguments(
@@ -145,7 +145,7 @@ def main() -> None:
         recompiles = [f"{k[1]} ({Path(k[0]).name}:{k[2]}) compiled {n} times" for k, n in frames.items() if n > 1]
 
     # ---- checks ----------------------------------------------------------------------
-    records = tensorlens.load_records(jsonl)
+    records = tensorquill.load_records(jsonl)
     history = [e for e in trainer.state.log_history if "loss" in e and "grad_norm" in e]
     failures: list[str] = []
 
@@ -180,8 +180,8 @@ def main() -> None:
         check(all("grad_scale" in r for r in records), f"grad_scale recorded on every step ({skipped} steps skipped)")
 
     print("\n--- Detection ---")
-    evidence = tensorlens.build_evidence(records)
-    print(tensorlens.incident_summary(evidence))
+    evidence = tensorquill.build_evidence(records)
+    print(tensorquill.incident_summary(evidence))
     spike = next((i for i in evidence["incidents"] if i["kind"] == "activation_spike"), None)
     hit = spike is not None and spike["step"] == args.seed_step and any(
         m["module"] == seeded_block for m in spike["modules"]

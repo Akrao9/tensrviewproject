@@ -1,4 +1,4 @@
-"""PyTorch Lightning callback: `Trainer(callbacks=[TensorLensCallback(...)])`.
+"""PyTorch Lightning callback: `Trainer(callbacks=[TensorQuillCallback(...)])`.
 
 Lightning is imported only by this module, so the core SDK keeps no dependency on it.
 """
@@ -12,8 +12,8 @@ import lightning.pytorch as L
 from .capture import Session, init
 
 
-class TensorLensCallback(L.Callback):
-    """Start TensorLens when fitting starts and stop it when fitting ends.
+class TensorQuillCallback(L.Callback):
+    """Start TensorQuill when fitting starts and stop it when fitting ends.
 
     - **Run ID.** `MLFlowLogger` creates its run through `MlflowClient` on rank 0 only, so
       `mlflow.active_run()` is empty and the other ranks know nothing of it. The callback
@@ -28,7 +28,7 @@ class TensorLensCallback(L.Callback):
       already divided each by `accumulate_grad_batches`, so the sum is their mean). It
       stays a tensor on the device, with no sync. `loss_name=None` turns this off.
 
-    Other keyword arguments go to `tensorlens.init`, for example `routers=`, `capture=`
+    Other keyword arguments go to `tensorquill.init`, for example `routers=`, `capture=`
     or `probe=`.
     """
 
@@ -57,7 +57,7 @@ class TensorLensCallback(L.Callback):
 
     def on_before_optimizer_step(self, trainer: L.Trainer, pl_module: L.LightningModule, optimizer: Any) -> None:
         # Runs after the closure's backward and before the optimizer's update, so the loss
-        # belongs to the step TensorLens is about to record.
+        # belongs to the step TensorQuill is about to record.
         if self.session is not None and self._loss is not None:
             self.session.log({self.loss_name: self._loss})
             self._loss = None

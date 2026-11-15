@@ -1,4 +1,4 @@
-"""Check TensorLens replica drift with two distributed PyTorch workers."""
+"""Check TensorQuill replica drift with two distributed PyTorch workers."""
 
 import argparse
 import os
@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-import tensorlens
+import tensorquill
 
 
 def main() -> None:
@@ -37,10 +37,10 @@ def main() -> None:
             model.weight.fill_(1)
         ddp = DDP(model, device_ids=device_ids)
         optimizer = torch.optim.SGD(ddp.parameters(), lr=0)
-        sink = tensorlens.MemorySink()
+        sink = tensorquill.MemorySink()
         x = torch.ones(2, 4, device=device)
 
-        with tensorlens.init(
+        with tensorquill.init(
             model, sink=sink, auto_step=False, replica_group=dist.group.WORLD, replica_every=1
         ) as session:
             for step in range(4):
@@ -60,9 +60,9 @@ def main() -> None:
         assert [record["step"] for record in records] == list(range(4))
         for step in (0, 2):
             assert records[step]["replica_spread"]["weight"] == [0.0, 0.0]
-        drift = tensorlens.detect_replica_drift(records)
+        drift = tensorquill.detect_replica_drift(records)
         assert drift and drift["step"] == 1 and "weight" in drift["parameters"], drift
-        sign_flip = tensorlens.detect_replica_drift(records[2:])
+        sign_flip = tensorquill.detect_replica_drift(records[2:])
         assert sign_flip and sign_flip["step"] == 3, sign_flip
         spread = sign_flip["parameters"]["weight"]
         assert abs(spread["norm_spread"]) < 1e-6 and spread["sum_spread"] > 1e-6, spread

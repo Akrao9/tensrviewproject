@@ -36,7 +36,7 @@ impl Storage {
         Self { store, root }
     }
 
-    /// `file:///var/lib/tensorlens`, `s3://bucket/prefix`, `gs://bucket/prefix`, or a local
+    /// `file:///var/lib/tensorquill`, `s3://bucket/prefix`, `gs://bucket/prefix`, or a local
     /// directory path. Cloud credentials come from the usual environment variables.
     pub fn from_url(location: &str) -> Result<Self, Error> {
         let url = match url::Url::parse(location) {

@@ -2,12 +2,12 @@ import json
 import pytest
 import torch
 
-import tensorlens
+import tensorquill
 
 
 def test_build_evidence_detects_moe_collapse_and_formats_table(toy_moe):
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(
         toy_moe, run_id="moe-test", sink=sink, every=1, routers={"router": 4}, auto_step=False
     )
     # Step 10: balanced routing (1 token per expert)
@@ -29,12 +29,12 @@ def test_build_evidence_detects_moe_collapse_and_formats_table(toy_moe):
     session.step(20)
     session.close()
 
-    evidence = tensorlens.build_evidence(sink.records)
+    evidence = tensorquill.build_evidence(sink.records)
     assert evidence["layer_count"] == 1
     assert evidence["expert_count"] == 4
     assert evidence["router_names"] == ["router"]
 
-    hit = tensorlens.first_incident(evidence)
+    hit = tensorquill.first_incident(evidence)
     assert hit is not None
     assert hit["step"] == 20
     assert hit["layer"] == 1
@@ -42,12 +42,12 @@ def test_build_evidence_detects_moe_collapse_and_formats_table(toy_moe):
     assert hit["dead"] == [2, 3, 4]
     assert hit["diversity"] == pytest.approx(0.25)
 
-    summary = tensorlens.incident_summary(evidence)
+    summary = tensorquill.incident_summary(evidence)
     assert "First sampled bad step 20  ·  Layer 01  ·  Diversity 0.25" in summary
     assert "Overloaded: Expert 1 (100%)" in summary
     assert "Dead experts: 02, 03, 04" in summary
 
-    table = tensorlens.expert_load_table(evidence, 20, 1)
+    table = tensorquill.expert_load_table(evidence, 20, 1)
     lines = table.splitlines()
     assert lines[0] == "**Layer 01 expert load** · step 20 vs. 10"
     assert lines[4] == "| #001 | 100.00% | +75.00 | Overloaded |"
@@ -67,15 +67,15 @@ def test_non_finite_and_replica_drift_detectors_from_capture_session(tmp_path, m
 
     def fake_all_gather(out_list, tensor, group=None):
         out_list[0].copy_(tensor)
-        out_list[1].copy_(tensorlens.parameter_fingerprints(model_b.parameters()))
+        out_list[1].copy_(tensorquill.parameter_fingerprints(model_b.parameters()))
 
     monkeypatch.setattr(dist, "all_gather", fake_all_gather)
 
     jsonl = tmp_path / "run.jsonl"
-    session = tensorlens.init(
+    session = tensorquill.init(
         model_a,
         run_id="r1",
-        sink=tensorlens.JsonlSink(jsonl),
+        sink=tensorquill.JsonlSink(jsonl),
         every=1,
         auto_step=False,
         replica_group=group,
@@ -92,11 +92,11 @@ def test_non_finite_and_replica_drift_detectors_from_capture_session(tmp_path, m
     session.step(5)
     session.close()
 
-    records = tensorlens.load_records(jsonl)
+    records = tensorquill.load_records(jsonl)
     assert "replica_spread" in records[0]
     assert records[0]["replica_spread"]["0.weight"] == [0.0, 0.0]
 
-    evidence = tensorlens.build_evidence(jsonl)
+    evidence = tensorquill.build_evidence(jsonl)
     kinds = {inc["kind"]: inc for inc in evidence["incidents"]}
     assert set(kinds) == {"non_finite", "replica_drift"}
     assert kinds["non_finite"]["step"] == 5
@@ -108,25 +108,25 @@ def test_non_finite_and_replica_drift_detectors_from_capture_session(tmp_path, m
 
 def test_imbalance_rule_allows_balanced_two_expert_router_and_preserves_bakeoff():
     # Bake-off (128 experts, 128k tokens) and toy MoE (8 experts, 256 tokens) keep 0.35
-    assert tensorlens.effective_overload_threshold(128, 128_000) == pytest.approx(0.35)
-    assert tensorlens.effective_overload_threshold(8, 256) == pytest.approx(0.35)
+    assert tensorquill.effective_overload_threshold(128, 128_000) == pytest.approx(0.35)
+    assert tensorquill.effective_overload_threshold(8, 256) == pytest.approx(0.35)
 
     records = [
         {"run_id": "two-exp", "step": 0, "moe": {"router": [50, 50]}},
         {"run_id": "two-exp", "step": 1, "moe": {"router": [2, 2]}},
     ]
-    evidence = tensorlens.build_evidence(records)
-    assert tensorlens.first_incident(evidence) is None
+    evidence = tensorquill.build_evidence(records)
+    assert tensorquill.first_incident(evidence) is None
     assert evidence["incidents"] == []
     assert all(s["overloaded"] == [] and s["dead"] == [] for s in evidence["samples"])
 
-    collapsed = tensorlens.build_evidence(
+    collapsed = tensorquill.build_evidence(
         [
             {"run_id": "two-exp", "step": 0, "moe": {"router": [50, 50]}},
             {"run_id": "two-exp", "step": 1, "moe": {"router": [100, 0]}},
         ]
     )
-    hit = tensorlens.first_incident(collapsed)
+    hit = tensorquill.first_incident(collapsed)
     assert hit is not None
     assert hit["step"] == 1
     assert hit["overloaded"] == [1]
@@ -135,31 +135,31 @@ def test_imbalance_rule_allows_balanced_two_expert_router_and_preserves_bakeoff(
     # Pretrained 32-expert top-8 router (8,192 assignments) with 1 unused expert and
     # healthy diversity (~0.79) must not fire a false-positive dead-expert collapse.
     granite_healthy = [560] * 8 + [220] * 12 + [97] * 11 + [0]
-    healthy_ev = tensorlens.build_evidence(
+    healthy_ev = tensorquill.build_evidence(
         [{"run_id": "granite", "step": 1, "moe": {"layer-17": granite_healthy}}]
     )
     assert healthy_ev["samples"][0]["diversity"] == pytest.approx(0.79, abs=0.02)
     assert healthy_ev["samples"][0]["overloaded"] == []
     assert healthy_ev["samples"][0]["dead"] == []
-    assert tensorlens.first_incident(healthy_ev) is None
+    assert tensorquill.first_incident(healthy_ev) is None
 
     # Seeded collapse in a 32-expert top-8 Granite router onto experts 1..8 (12.50% each)
     granite_collapsed = [1024] * 8 + [0] * 24
-    granite_ev = tensorlens.build_evidence(
+    granite_ev = tensorquill.build_evidence(
         [
             {"run_id": "granite-router-only", "step": 449, "moe": {"layer-12": [256] * 32}},
             {"run_id": "granite-router-only", "step": 450, "moe": {"layer-12": granite_collapsed}},
         ]
     )
-    granite_hit = tensorlens.first_incident(granite_ev)
+    granite_hit = tensorquill.first_incident(granite_ev)
     assert granite_hit is not None
     assert granite_hit["step"] == 450
     assert granite_hit["layer"] == 1
     assert granite_hit["overloaded"] == list(range(1, 9))
     assert granite_hit["dead"] == list(range(9, 33))
     assert granite_hit["diversity"] == pytest.approx(0.25)
-    assert "Expert 1 (12.5%)" in tensorlens.incident_summary(granite_ev)
-    granite_table = tensorlens.expert_load_table(granite_ev, 450, 1).splitlines()
+    assert "Expert 1 (12.5%)" in tensorquill.incident_summary(granite_ev)
+    granite_table = tensorquill.expert_load_table(granite_ev, 450, 1).splitlines()
     assert granite_table[4] == "| #001 | 12.50% | +9.38 | Overloaded |"
     assert granite_table[-1] == "| #032 | 0.00% | -3.12 | Dead |"
 
@@ -178,23 +178,23 @@ def test_missing_routing_data_and_mixed_expert_counts():
             "moe": {"r4": [0, 0, 0, 0]},
         },
     ]
-    evidence = tensorlens.build_evidence(records)
+    evidence = tensorquill.build_evidence(records)
     assert evidence["layer_count"] == 2
     assert evidence["expert_count"] == 8
-    assert tensorlens.first_incident(evidence) is None
+    assert tensorquill.first_incident(evidence) is None
 
     by_key = {(s["step"], s["layer"]): s for s in evidence["samples"]}
     # Step 0, layer 1 (4 experts padded to 8): 4 active blue + 4 neutral gray
-    row0_l1 = list(tensorlens.routing_colors(by_key[0, 1], evidence["expert_count"]))
+    row0_l1 = list(tensorquill.routing_colors(by_key[0, 1], evidence["expert_count"]))
     assert len(row0_l1) == 8
     assert all(c != (236, 84, 99) for c in row0_l1)
-    assert row0_l1[4:] == [tensorlens.MISSING_COLOR] * 4
+    assert row0_l1[4:] == [tensorquill.MISSING_COLOR] * 4
 
     # Step 1, both routers skipped/missing: all neutral gray, never dead red
     for layer in (1, 2):
-        colors = list(tensorlens.routing_colors(by_key[1, layer], evidence["expert_count"]))
-        assert colors == [tensorlens.MISSING_COLOR] * 8
-        table = tensorlens.expert_load_table(evidence, 1, layer)
+        colors = list(tensorquill.routing_colors(by_key[1, layer], evidence["expert_count"]))
+        assert colors == [tensorquill.MISSING_COLOR] * 8
+        table = tensorquill.expert_load_table(evidence, 1, layer)
         assert "Missing" in table
         assert "Dead" not in table
 
@@ -204,8 +204,8 @@ def test_missing_routing_data_and_mixed_expert_counts():
         {"run_id": "skip", "step": 1, "moe": {"r2": [0, 0]}},
         {"run_id": "skip", "step": 2, "moe": {"r2": [100, 0]}},
     ]
-    ev2 = tensorlens.build_evidence(records_with_step2)
-    table2 = tensorlens.expert_load_table(ev2, 2, 1).splitlines()
+    ev2 = tensorquill.build_evidence(records_with_step2)
+    table2 = tensorquill.expert_load_table(ev2, 2, 1).splitlines()
     assert table2[0] == "**Layer 01 expert load** · step 2 vs. 0"
     assert table2[4] == "| #001 | 100.00% | +50.00 | Overloaded |"
 
@@ -219,7 +219,7 @@ def test_export_rerun_writes_explicit_width_and_height_for_single_layer(tmp_path
         {"run_id": "toy", "step": 0, "moe": {"router": [32] * 8}},
         {"run_id": "toy", "step": 1, "moe": {"router": [256, 0, 0, 0, 0, 0, 0, 0]}},
     ]
-    evidence = tensorlens.build_evidence(records)
+    evidence = tensorquill.build_evidence(records)
     assert (evidence["layer_count"], evidence["expert_count"]) == (1, 8)
 
     image_calls = []
@@ -256,7 +256,7 @@ def test_export_rerun_writes_explicit_width_and_height_for_single_layer(tmp_path
     monkeypatch.setitem(sys.modules, "rerun.blueprint", fake_rrb)
 
     rrd_path = tmp_path / "toy.rrd"
-    tensorlens.export_rerun(evidence, rrd_path, records=records)
+    tensorquill.export_rerun(evidence, rrd_path, records=records)
 
     assert len(image_calls) == 2
     for _, kwargs in image_calls:
@@ -275,7 +275,7 @@ def test_export_rerun_writes_explicit_width_and_height_for_single_layer(tmp_path
         return
 
     real_rrd = tmp_path / "real_toy.rrd"
-    tensorlens.export_rerun(evidence, real_rrd, records=records)
+    tensorquill.export_rerun(evidence, real_rrd, records=records)
     store = RrdReader(real_rrd).store()
     view = store.view(contents={"/routing/status": ["Image:format"]})
     for batch in view.select():
@@ -288,17 +288,17 @@ def test_export_rerun_writes_explicit_width_and_height_for_single_layer(tmp_path
 def test_zero_token_expert_not_flagged_as_dead_is_idle_not_red():
     # One of 32 experts gets no tokens in a healthy layer: the detector ignores it.
     counts = [264] * 31 + [0]
-    evidence = tensorlens.build_evidence(
+    evidence = tensorquill.build_evidence(
         [{"run_id": "idle", "step": 0, "moe": {"r": [256] * 32}},
          {"run_id": "idle", "step": 1, "moe": {"r": counts}}]
     )
     sample = evidence["samples"][1]
     assert sample["dead"] == []
-    assert tensorlens.first_incident(evidence) is None
-    colors = list(tensorlens.routing_colors(sample))
-    assert colors[-1] == tensorlens.IDLE_COLOR
-    assert tensorlens.DEAD_COLOR not in colors
-    table = tensorlens.expert_load_table(evidence, 1, 1)
+    assert tensorquill.first_incident(evidence) is None
+    colors = list(tensorquill.routing_colors(sample))
+    assert colors[-1] == tensorquill.IDLE_COLOR
+    assert tensorquill.DEAD_COLOR not in colors
+    table = tensorquill.expert_load_table(evidence, 1, 1)
     assert "| #032 | 0.00% | -3.12 | Idle |" in table
     assert "Dead" not in table
 
@@ -316,20 +316,20 @@ def _starving_records(steps=60, starve_from=0):
 
 
 def test_starved_expert_is_flagged_after_a_full_window():
-    evidence = tensorlens.build_evidence(_starving_records())
+    evidence = tensorquill.build_evidence(_starving_records())
     hit = next(i for i in evidence["incidents"] if i["kind"] == "starved_experts")
     assert hit["step"] == 49  # first step with a full 50-step window
     assert [(e["layer"], e["expert"]) for e in hit["experts"]] == [(1, 8)]
     assert hit["experts"][0]["window_share"] == pytest.approx(17 / (50 * 1024))
-    assert tensorlens.first_incident(evidence) is None  # no single step looks bad
+    assert tensorquill.first_incident(evidence) is None  # no single step looks bad
 
     by_step = {s["step"]: s for s in evidence["samples"]}
     assert by_step[48]["starved"] == []
     assert by_step[59]["starved"] == [8]
-    colors = list(tensorlens.routing_colors(by_step[59]))
-    assert colors[-1] == tensorlens.STARVED_COLOR
-    assert "| Starved |" in tensorlens.expert_load_table(evidence, 59, 1)
-    summary = tensorlens.incident_summary(evidence)
+    colors = list(tensorquill.routing_colors(by_step[59]))
+    assert colors[-1] == tensorquill.STARVED_COLOR
+    assert "| Starved |" in tensorquill.expert_load_table(evidence, 59, 1)
+    summary = tensorquill.incident_summary(evidence)
     assert "Starved experts (share over 50 steps, from step 49): Layer 01 expert 8 (0.033%)" in summary
     assert "violet = starved over 50 steps" in summary
 
@@ -337,7 +337,7 @@ def test_starved_expert_is_flagged_after_a_full_window():
 def test_recently_starved_expert_waits_for_the_window_and_dead_wins():
     # Healthy for 40 steps, then starved: the window average crosses 10% of an even share
     # only once most of the window is starved.
-    evidence = tensorlens.build_evidence(_starving_records(steps=100, starve_from=40))
+    evidence = tensorquill.build_evidence(_starving_records(steps=100, starve_from=40))
     hit = next(i for i in evidence["incidents"] if i["kind"] == "starved_experts")
     assert 80 < hit["step"] < 90
 
@@ -346,7 +346,7 @@ def test_recently_starved_expert_waits_for_the_window_and_dead_wins():
         {"run_id": "c", "step": s, "moe": {"r": [1024] + [0] * 7 if s >= 10 else [128] * 8}}
         for s in range(80)
     ]
-    ev = tensorlens.build_evidence(collapsed)
+    ev = tensorquill.build_evidence(collapsed)
     last = ev["samples"][-1]
     assert last["dead"] == list(range(2, 9)) and last["starved"] == []
     assert all(i["kind"] != "starved_experts" for i in ev["incidents"])
@@ -358,7 +358,7 @@ def test_small_routers_and_short_runs_are_not_judged_on_noise():
         {"run_id": "tiny", "step": s, "moe": {"r": [3, 3, 2, 0] if s % 2 else [2, 2, 2, 2]}}
         for s in range(40)
     ]
-    ev = tensorlens.build_evidence(records)
+    ev = tensorquill.build_evidence(records)
     assert all(i["kind"] != "starved_experts" for i in ev["incidents"])
 
 
@@ -382,16 +382,16 @@ def _topk_records(steps=40, shift_at=30):
 
 
 def test_top_k_jump_flags_concentration_without_dead_experts():
-    evidence = tensorlens.build_evidence(_topk_records())
+    evidence = tensorquill.build_evidence(_topk_records())
     assert evidence["top_k"] == {"r": 8}
-    hit = tensorlens.first_incident(evidence)
+    hit = tensorquill.first_incident(evidence)
     assert (hit["step"], hit["overloaded"], hit["dead"]) == (30, list(range(9, 16)), [])
     assert hit["overload_rule"]["rule"] == "diversity_drop"
     # The always-on expert 1 and the one-step jumps of expert 20 are never flagged.
     assert all(not {1, 20} & set(s["overloaded"]) for s in evidence["samples"])
 
     # Without k the old share threshold (unreachable at 12.5%) misses it.
-    assert tensorlens.first_incident(tensorlens.build_evidence(_topk_records(), top_k=1)) is None
+    assert tensorquill.first_incident(tensorquill.build_evidence(_topk_records(), top_k=1)) is None
 
 
 def _grad_records(norms):
@@ -404,16 +404,16 @@ def _grad_records(norms):
 
 def test_grad_spike_names_the_parameter_where_it_started():
     norms = [(1.0, 0.1 + 0.01 * (s % 3)) for s in range(30)] + [(1.0, 4.0), (1.2, 30.0), (1.0, 0.1)]
-    evidence = tensorlens.build_evidence(_grad_records(norms))
+    evidence = tensorquill.build_evidence(_grad_records(norms))
     hit = next(i for i in evidence["incidents"] if i["kind"] == "grad_spike")
     assert hit["step"] == 31 and hit["spike_count"] == 1
     top = hit["parameters"][0]
     assert top["name"] == "b" and top["rising_since"] == 30
-    assert "Gradient spike at step 31" in tensorlens.incident_summary(evidence)
-    assert "first in b" in tensorlens.incident_summary(evidence)
+    assert "Gradient spike at step 31" in tensorquill.incident_summary(evidence)
+    assert "first in b" in tensorquill.incident_summary(evidence)
 
     quiet = [(1.0 + 0.05 * (s % 4), 0.5) for s in range(60)]
-    assert tensorlens.detect_grad_spikes(_grad_records(quiet)) is None
+    assert tensorquill.detect_grad_spikes(_grad_records(quiet)) is None
 
 
 def test_stalled_weights_detector_and_skipped_steps():
@@ -427,19 +427,19 @@ def test_stalled_weights_detector_and_skipped_steps():
             "weights_unchanged": ["frozen", "no_grad"] + (["blip"] if step in (2, 3) else []),
         })
     records[5]["grad_norm"] = "inf"  # a skipped mixed-precision step is not counted
-    hit = tensorlens.detect_stalled_weights(records)
+    hit = tensorquill.detect_stalled_weights(records)
     assert hit["step"] == 2 and hit["parameters"] == ["frozen"]
     assert hit["stalled"] == 1 and hit["with_gradients"] == 3 and hit["stalled_steps"] == 5
 
     # Older captures without the exact flag are not judged on float32 norms.
     for record in records:
         del record["weights_unchanged"]
-    assert tensorlens.detect_stalled_weights(records) is None
+    assert tensorquill.detect_stalled_weights(records) is None
 
 
 def test_parameter_left_out_of_the_optimizer_is_reported(toy_moe):
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(toy_moe, sink=sink, every=2, weights=1, routers={"router": 4})
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(toy_moe, sink=sink, every=2, weights=1, routers={"router": 4})
     opt = torch.optim.SGD(
         [p for n, p in toy_moe.named_parameters() if not n.startswith("out.")], lr=0.1
     )
@@ -454,14 +454,14 @@ def test_parameter_left_out_of_the_optimizer_is_reported(toy_moe):
     assert sorted(sink.records[1]["weights_unchanged"]) == [
         "out.bias", "out.weight", "router.proj.bias", "router.proj.weight"
     ]
-    hit = tensorlens.detect_stalled_weights(sink.records)
+    hit = tensorquill.detect_stalled_weights(sink.records)
     assert hit is not None and hit["step"] == 3
     assert sorted(hit["parameters"]) == ["out.bias", "out.weight"]
 
 
 def test_repeated_steps_after_resume_and_start_step(toy_moe):
     def run(sink, **kwargs):
-        session = tensorlens.init(toy_moe, sink=sink, every=1, routers={"router": 4}, **kwargs)
+        session = tensorquill.init(toy_moe, sink=sink, every=1, routers={"router": 4}, **kwargs)
         opt = torch.optim.SGD(toy_moe.parameters(), lr=0.01)
         for _ in range(3):
             opt.zero_grad()
@@ -469,17 +469,17 @@ def test_repeated_steps_after_resume_and_start_step(toy_moe):
             opt.step()
         session.close()
 
-    sink = tensorlens.MemorySink()
+    sink = tensorquill.MemorySink()
     run(sink)
     run(sink)  # resumed without start_step
-    hit = tensorlens.detect_repeated_steps(sink.records)
+    hit = tensorquill.detect_repeated_steps(sink.records)
     assert hit["steps"] == [0, 1, 2]
-    assert "pass start_step=" in tensorlens.incident_summary(tensorlens.build_evidence(sink.records))
+    assert "pass start_step=" in tensorquill.incident_summary(tensorquill.build_evidence(sink.records))
 
-    sink = tensorlens.MemorySink()
+    sink = tensorquill.MemorySink()
     run(sink)
     run(sink, start_step=3)
-    assert tensorlens.detect_repeated_steps(sink.records) is None
+    assert tensorquill.detect_repeated_steps(sink.records) is None
 
 
 def _act_records(steps=120, spike=None, drift_from=None, dead_from=None):
@@ -506,24 +506,24 @@ def _act_records(steps=120, spike=None, drift_from=None, dead_from=None):
 
 
 def test_activation_detectors_on_planted_failures():
-    assert tensorlens.detect_activation_anomalies(_act_records()) == []
+    assert tensorquill.detect_activation_anomalies(_act_records()) == []
 
-    hits = tensorlens.detect_activation_anomalies(_act_records(spike=(70, 0)))
+    hits = tensorquill.detect_activation_anomalies(_act_records(spike=(70, 0)))
     assert [(h["kind"], h["step"], h["modules"][0]["module"]) for h in hits] == [
         ("activation_spike", 70, "blocks.0")
     ]
 
-    drift = tensorlens.detect_activation_anomalies(_act_records(drift_from=60))
+    drift = tensorquill.detect_activation_anomalies(_act_records(drift_from=60))
     hit = next(h for h in drift if h["kind"] == "activation_drift")
     assert hit["modules"][0]["module"] == "blocks.2" and hit["modules"][0]["ratio"] >= 3
     assert 60 < hit["step"] < 120
 
-    dead = tensorlens.detect_activation_anomalies(_act_records(dead_from=80))
+    dead = tensorquill.detect_activation_anomalies(_act_records(dead_from=80))
     hit = next(h for h in dead if h["kind"] == "dead_activations")
     assert (hit["modules"][0]["module"], hit["step"]) == ("blocks.3", 85)
 
-    evidence = tensorlens.build_evidence(_act_records(spike=(70, 0), dead_from=80))
-    summary = tensorlens.incident_summary(evidence)
+    evidence = tensorquill.build_evidence(_act_records(spike=(70, 0), dead_from=80))
+    summary = tensorquill.incident_summary(evidence)
     assert "Activation spike at step 70 in blocks.0: abs_max 19× its recent median; 1 step affected" in summary
     assert "Outputs going dead from step 85 in blocks.3: zero fraction 10% → 60%" in summary
 
@@ -531,7 +531,7 @@ def test_activation_detectors_on_planted_failures():
 def test_activation_detectors_skip_non_finite_values():
     records = _act_records(steps=30)
     records[20]["layers"]["blocks.0"]["abs_max"] = "nan"
-    assert tensorlens.detect_activation_anomalies(records) == []
+    assert tensorquill.detect_activation_anomalies(records) == []
 
 
 def test_replica_drift_check_runs_every_replica_every_steps(monkeypatch):
@@ -548,8 +548,8 @@ def test_replica_drift_check_runs_every_replica_every_steps(monkeypatch):
             out.copy_(tensor)
 
     monkeypatch.setattr(dist, "all_gather", fake_all_gather)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(
         model, sink=sink, every=2, auto_step=False, replica_group=object(), replica_every=3
     )
     for _ in range(6):
@@ -560,7 +560,7 @@ def test_replica_drift_check_runs_every_replica_every_steps(monkeypatch):
     assert len(gathers) == 2
     assert [("replica_spread" in r) for r in sink.records] == [False, False, True] * 2
     with pytest.raises(ValueError, match="replica_every"):
-        tensorlens.init(nn.Linear(2, 2), sink=tensorlens.MemorySink(), replica_every=0)
+        tensorquill.init(nn.Linear(2, 2), sink=tensorquill.MemorySink(), replica_every=0)
 
 
 def test_incidents_carry_logged_scalars_and_export_plots_them(tmp_path, monkeypatch):
@@ -570,19 +570,19 @@ def test_incidents_carry_logged_scalars_and_export_plots_them(tmp_path, monkeypa
         record["scalars"] = {"train/loss": 2.0, "rl/kl": 0.01}
     records[31]["scalars"] = {"train/loss": 9.5, "rl/kl": "nan"}
 
-    evidence = tensorlens.build_evidence(records)
+    evidence = tensorquill.build_evidence(records)
     hit = next(i for i in evidence["incidents"] if i["kind"] == "grad_spike")
     assert hit["scalars"]["train/loss"] == {"value": 9.5, "median_before": 2.0}
     assert hit["scalars"]["rl/kl"]["value"] == "nan"
-    summary = tensorlens.incident_summary(evidence)
+    summary = tensorquill.incident_summary(evidence)
     assert "Logged at step 31: rl/kl nan (median before 0.01), train/loss 9.5 (median before 2)" in summary
-    assert tensorlens.scalar_context(records, 999) == {}
+    assert tensorquill.scalar_context(records, 999) == {}
 
     rr = pytest.importorskip("rerun")
     logged = []
     real_log = rr.log
     monkeypatch.setattr(rr, "log", lambda path, *a, **kw: (logged.append(path), real_log(path, *a, **kw)))
-    tensorlens.export_rerun(evidence, tmp_path / "run.rrd", records=records)
+    tensorquill.export_rerun(evidence, tmp_path / "run.rrd", records=records)
     assert "/logged/train/loss" in logged and "/logged/rl/kl" in logged
     assert logged.count("/logged/rl/kl") == len(records) - 1  # the NaN value is skipped
 
@@ -596,40 +596,40 @@ def test_a_resumed_attempt_replaces_the_steps_it_rolled_back():
     # Attempt 1 reached step 149 and crashed; the job resumed from the checkpoint at step
     # 100 and has reached step 119. Steps 120 to 149 of attempt 1 never happened either.
     records = _steps(1, range(150)) + _steps(2, range(100, 120)) + _steps(1, range(10), rank=1)
-    kept = tensorlens.load_records(records)
+    kept = tensorquill.load_records(records)
     assert [(r["attempt"], r["step"]) for r in kept if r["rank"] == 0] == (
         [(1, s) for s in range(100)] + [(2, s) for s in range(100, 120)]
     )
     assert [r["step"] for r in kept if r["rank"] == 1] == list(range(10))  # each rank on its own
-    assert len(tensorlens.load_records(records, all_attempts=True)) == 180
-    assert tensorlens.load_records(records, rank=1) == _steps(1, range(10), rank=1)
+    assert len(tensorquill.load_records(records, all_attempts=True)) == 180
+    assert tensorquill.load_records(records, rank=1) == _steps(1, range(10), rank=1)
     # A resume from a checkpoint is not an incident.
-    assert tensorlens.detect_repeated_steps(records) is None
-    assert not [i for i in tensorlens.build_evidence(records)["incidents"] if i["kind"] == "repeated_steps"]
+    assert tensorquill.detect_repeated_steps(records) is None
+    assert not [i for i in tensorquill.build_evidence(records)["incidents"] if i["kind"] == "repeated_steps"]
     # A third attempt from step 50 rolls back both earlier ones.
-    kept = tensorlens.load_records(records + _steps(3, range(50, 60)), rank=0)
+    kept = tensorquill.load_records(records + _steps(3, range(50, 60)), rank=0)
     assert [(r["attempt"], r["step"]) for r in kept] == [(1, s) for s in range(50)] + [(3, s) for s in range(50, 60)]
 
 
 def test_an_attempt_that_restarts_the_numbering_is_still_reported():
     records = _steps(1, range(30)) + _steps(2, range(5))  # resumed without start_step
-    hit = tensorlens.detect_repeated_steps(records)
+    hit = tensorquill.detect_repeated_steps(records)
     assert hit["steps"] == [0, 1, 2, 3, 4]
-    evidence = tensorlens.build_evidence(records)
-    assert "pass start_step=" in tensorlens.incident_summary(evidence)
+    evidence = tensorquill.build_evidence(records)
+    assert "pass start_step=" in tensorquill.incident_summary(evidence)
     # Records written before attempts existed all count as one attempt, as before.
     old = [{"run_id": "r", "step": s} for s in (0, 1, 1, 2)]
-    assert tensorlens.load_records(old) == old
-    assert tensorlens.detect_repeated_steps(old)["steps"] == [1]
-    assert tensorlens.detect_repeated_steps([{"run_id": "r", "step": 4}, {"run_id": "r", "rank": 0, "step": 4}])["steps"] == [4]
+    assert tensorquill.load_records(old) == old
+    assert tensorquill.detect_repeated_steps(old)["steps"] == [1]
+    assert tensorquill.detect_repeated_steps([{"run_id": "r", "step": 4}, {"run_id": "r", "rank": 0, "step": 4}])["steps"] == [4]
 
 
 def _write_parts(root, records, rows_per_part=40):
-    """Lay records out as tensorlens-server does: rank=<rank>/attempt=<attempt>/part-*.parquet."""
+    """Lay records out as tensorquill-server does: rank=<rank>/attempt=<attempt>/part-*.parquet."""
     pq = pytest.importorskip("pyarrow.parquet")
     import pyarrow as pa
 
-    from tensorlens.flight import records_to_batch
+    from tensorquill.flight import records_to_batch
 
     groups = {}
     for record in records:
@@ -644,8 +644,8 @@ def _write_parts(root, records, rows_per_part=40):
 
 
 def _capture(toy_moe, path, steps, **kwargs):
-    session = tensorlens.init(
-        toy_moe, run_id="pq", sink=tensorlens.JsonlSink(path), every=10, capture="full",
+    session = tensorquill.init(
+        toy_moe, run_id="pq", sink=tensorquill.JsonlSink(path), every=10, capture="full",
         routers={"router": 4}, weights=5, probe=torch.randn(4, 8), probe_every=20, **kwargs,
     )
     opt = torch.optim.SGD(toy_moe.parameters(), lr=0.01)
@@ -662,25 +662,25 @@ def test_evidence_from_parquet_parts_equals_evidence_from_the_jsonl_file(toy_moe
     path = tmp_path / "pq.rank0.jsonl"
     _capture(toy_moe, path, 130)
     _capture(toy_moe, path, 40, start_step=90)  # resumed from the checkpoint at step 90
-    written = tensorlens.load_records(path, all_attempts=True)
+    written = tensorquill.load_records(path, all_attempts=True)
     assert len(written) == 170 and len({r["attempt"] for r in written}) == 2
     assert any("probe" in r for r in written) and any(r.get("moe_stats") for r in written)
 
     run_dir = tmp_path / "store" / "runs" / "pq"
     _write_parts(run_dir, written)
     for source in (run_dir, run_dir / "rank=0"):
-        assert tensorlens.load_records(source, all_attempts=True) == written
-        assert tensorlens.load_records(source) == tensorlens.load_records(path)
-        assert tensorlens.build_evidence(source) == tensorlens.build_evidence(path)
-    assert [r["step"] for r in tensorlens.load_records(run_dir)] == list(range(130))
+        assert tensorquill.load_records(source, all_attempts=True) == written
+        assert tensorquill.load_records(source) == tensorquill.load_records(path)
+        assert tensorquill.build_evidence(source) == tensorquill.build_evidence(path)
+    assert [r["step"] for r in tensorquill.load_records(run_dir)] == list(range(130))
     one_part = sorted(run_dir.rglob("part-*.parquet"))[0]
-    assert tensorlens.load_records(one_part, all_attempts=True) == written[:40]
+    assert tensorquill.load_records(one_part, all_attempts=True) == written[:40]
 
 
 def test_watch_follows_a_growing_jsonl_file_and_new_parquet_parts(tmp_path):
     import json
 
-    from tensorlens.evidence import watch
+    from tensorquill.evidence import watch
 
     records = _steps(1, range(60), moe={"r": [10, 10]})
     path = tmp_path / "w.rank0.jsonl"
@@ -701,7 +701,7 @@ def test_watch_follows_a_growing_jsonl_file_and_new_parquet_parts(tmp_path):
     out = watch(path, interval=0.0, polls=6, on_update=grow)
     assert out == tmp_path / "w.rank0.evidence.json"
     assert seen == [20, 40, 41]  # one rebuild per change, none while nothing changed
-    assert json.loads(out.read_text()) == tensorlens.build_evidence(records[:41])
+    assert json.loads(out.read_text()) == tensorquill.build_evidence(records[:41])
 
     pytest.importorskip("pyarrow.parquet")
     run_dir = tmp_path / "store" / "runs" / "r"
@@ -715,7 +715,7 @@ def test_watch_follows_a_growing_jsonl_file_and_new_parquet_parts(tmp_path):
 
     out = watch(run_dir, tmp_path / "live.evidence.json", interval=0.0, polls=4, on_update=more_parts)
     assert seen == [40, 50]  # attempt 2 resumed at step 30 and reached 49
-    assert json.loads(out.read_text()) == tensorlens.build_evidence(records + _steps(2, range(30, 50), moe={"r": [10, 10]}))
+    assert json.loads(out.read_text()) == tensorquill.build_evidence(records + _steps(2, range(30, 50), moe={"r": [10, 10]}))
     assert watch(tmp_path / "nothing-here.jsonl", interval=0.0, polls=2) is None
 
 
@@ -723,16 +723,16 @@ def test_cli_reads_a_directory_of_parts(tmp_path, monkeypatch, capsys):
     import json
     import sys
 
-    from tensorlens.evidence import main
+    from tensorquill.evidence import main
 
     pytest.importorskip("pyarrow.parquet")
     run_dir = tmp_path / "runs" / "r"
     _write_parts(run_dir, _steps(1, range(30), moe={"r": [10, 10]}) + _steps(1, range(5), rank=1, moe={"r": [1, 1]}))
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "argv", ["tensorlens", str(run_dir)])
+    monkeypatch.setattr(sys, "argv", ["tensorquill", str(run_dir)])
     main()
     assert "reading rank 0" in capsys.readouterr().out
     assert len(json.loads((tmp_path / "r.evidence.json").read_text())["samples"]) == 30
-    monkeypatch.setattr(sys, "argv", ["tensorlens", str(run_dir), "--rank", "1", "-o", "one.json"])
+    monkeypatch.setattr(sys, "argv", ["tensorquill", str(run_dir), "--rank", "1", "-o", "one.json"])
     main()
     assert len(json.loads((tmp_path / "one.json").read_text())["samples"]) == 5

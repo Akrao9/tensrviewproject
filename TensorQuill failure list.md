@@ -1,12 +1,12 @@
-# TensorLens failure list
+# TensorQuill failure list
 
 Gate 0 asks for a list of training failures that loss curves alone would not explain, with how long each took to notice. This list starts from public reports, because there are no customer interviews. It is a research list, not the author's own experience: the last section is for the failures you have hit yourself, and those should outrank everything here.
 
-Each entry says whether the loss curve shows the problem, how it was noticed and how long that took where a source says so, the signal TensorLens would need, and what TensorLens captures today. Researched on Nov 13, 2026; the sources are linked at the end.
+Each entry says whether the loss curve shows the problem, how it was noticed and how long that took where a source says so, the signal TensorQuill would need, and what TensorQuill captures today. Researched on Nov 13, 2026; the sources are linked at the end.
 
 ## Summary
 
-| # | Failure | Loss curve shows it? | TensorLens today | Priority |
+| # | Failure | Loss curve shows it? | TensorQuill today | Priority |
 | --- | --- | --- | --- | --- |
 | 1 | Replicated weights drift apart across GPUs | No | Built (`replica_every=50`), two-GPU NCCL run pending | High |
 | 2 | Silent data corruption on a faulty GPU | Usually not | Same detector as 1 | High |
@@ -34,7 +34,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Per-parameter fingerprints compared across the ranks that should hold the same weights.
 
-**TensorLens today.** `replica_spread` is built and passes two CPU processes with seeded drift and a sign flip. Not yet run on two GPUs.
+**TensorQuill today.** `replica_spread` is built and passes two CPU processes with seeded drift and a sign flip. Not yet run on two GPUs.
 
 ### 2. Silent data corruption on a faulty GPU
 
@@ -44,7 +44,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** The same cross-replica fingerprints as entry 1, plus NaN and spike detection.
 
-**TensorLens today.** Same detector as entry 1. The default tolerance of 1e-6 is a guess and must be checked against healthy multi-GPU runs, where nondeterminism alone may exceed it.
+**TensorQuill today.** Same detector as entry 1. The default tolerance of 1e-6 is a guess and must be checked against healthy multi-GPU runs, where nondeterminism alone may exceed it.
 
 ### 3. MoE routing collapse
 
@@ -52,9 +52,9 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **How it is noticed.** Per-expert token counts per layer. Practitioners track the gap between the busiest expert's load and the mean.
 
-**Signal.** Expert counts per router per step, which TensorLens already records.
+**Signal.** Expert counts per router per step, which TensorQuill already records.
 
-**TensorLens today.** Detected. A collapse seeded in Granite layer 12 was found at the right step, layer and experts. Experts starved over a 50-step window are also flagged: on Granite, 20 experts that came starved from pretraining, which per-step checks never report. Gap: the 35% overload threshold cannot be reached by a top-k router with k above 2, which was the gap until the top-k rule: for routers with k of 3 or more, a drop in the router's diversity below 0.6 of its recent median now flags the experts that took the extra tokens, without needing dead experts. On the healthy Granite capture it raises no false alarms.
+**TensorQuill today.** Detected. A collapse seeded in Granite layer 12 was found at the right step, layer and experts. Experts starved over a 50-step window are also flagged: on Granite, 20 experts that came starved from pretraining, which per-step checks never report. Gap: the 35% overload threshold cannot be reached by a top-k router with k above 2, which was the gap until the top-k rule: for routers with k of 3 or more, a drop in the router's diversity below 0.6 of its recent median now flags the experts that took the extra tokens, without needing dead experts. On the healthy Granite capture it raises no false alarms.
 
 ### 4. Weights not updating at all
 
@@ -64,7 +64,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** The size of each parameter's update per step, or its ratio to the weight's size.
 
-**TensorLens today.** Detected. Each parameter's float64 norm after the optimizer step is compared with the previous check (every 50 steps by default), and a parameter with a non-zero gradient that is exactly unchanged on 3 checks in a row is reported. Tested on a toy model with two parameters left out of the optimizer. A first version using float32 norms gave 147 false reports out of 218 parameters on Granite in bf16, because a float32 norm misses few-element bf16 changes. It also reports bf16 weights too large for their updates to register, such as RMSNorm weights near 1.0 under a 1e-5 learning rate. That is a real failure too: pure-bf16 training without float32 master weights loses those updates. On the RTX PRO 6000 Granite run it reported exactly the 49 bf16 RMSNorm weights and nothing else.
+**TensorQuill today.** Detected. Each parameter's float64 norm after the optimizer step is compared with the previous check (every 50 steps by default), and a parameter with a non-zero gradient that is exactly unchanged on 3 checks in a row is reported. Tested on a toy model with two parameters left out of the optimizer. A first version using float32 norms gave 147 false reports out of 218 parameters on Granite in bf16, because a float32 norm misses few-element bf16 changes. It also reports bf16 weights too large for their updates to register, such as RMSNorm weights near 1.0 under a 1e-5 learning rate. That is a real failure too: pure-bf16 training without float32 master weights loses those updates. On the RTX PRO 6000 Granite run it reported exactly the 49 bf16 RMSNorm weights and nothing else.
 
 ### 5. Loss spikes from gradient outliers
 
@@ -74,7 +74,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Per-parameter gradient norms, to show which layer the spike started in, and update norms.
 
-**TensorLens today.** Detected, in router-only mode too when the run clips gradients: the total norm returned by `clip_grad_norm_` (or passed to `record_grad_norm`, as from Megatron's optimizer) is recorded every step at no extra cost. A step at 5× the median of the last 50 recorded steps is a spike; the report ranks parameters by their own spike and names the one that started rising first. Tested on synthetic records only; the factor is untuned.
+**TensorQuill today.** Detected, in router-only mode too when the run clips gradients: the total norm returned by `clip_grad_norm_` (or passed to `record_grad_norm`, as from Megatron's optimizer) is recorded every step at no extra cost. A step at 5× the median of the last 50 recorded steps is a spike; the report ranks parameters by their own spike and names the one that started rising first. Tested on synthetic records only; the factor is untuned.
 
 ### 6. Bad state after resuming from a checkpoint
 
@@ -84,7 +84,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Learning rate, global step and data position recorded per step, and a check that they continue across a restart.
 
-**TensorLens today.** Partly. `init(start_step=...)` continues the step numbers on resume, repeated step numbers are reported (a resume from an earlier checkpoint is recognised by its `attempt` and not reported; its records replace the ones it rolled back), and each step's learning rate is recorded. A check that the learning rate continues smoothly across a restart is not built.
+**TensorQuill today.** Partly. `init(start_step=...)` continues the step numbers on resume, repeated step numbers are reported (a resume from an earlier checkpoint is recognised by its `attempt` and not reported; its records replace the ones it rolled back), and each step's learning rate is recorded. A check that the learning rate continues smoothly across a restart is not built.
 
 ### 7. Attention logit growth and entropy collapse
 
@@ -94,7 +94,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Attention entropy and maximum logits per head. Query and key output norms are a cheap stand-in.
 
-**TensorLens today.** Captured by the Tier 2 probe pass (`probe=`, `probe_every=1000`): for each `scaled_dot_product_attention` call, per-head `max_logit`, `entropy`, and `entropy_share` (each query row's entropy divided by the log of its visible key count, leaving out all-masked and non-finite rows), plus sample 0's 64×64 pooled attention map, plotted in Rerun's Probe tab. No detector threshold is set yet.
+**TensorQuill today.** Captured by the Tier 2 probe pass (`probe=`, `probe_every=1000`): for each `scaled_dot_product_attention` call, per-head `max_logit`, `entropy`, and `entropy_share` (each query row's entropy divided by the log of its visible key count, leaving out all-masked and non-finite rows), plus sample 0's 64×64 pooled attention map, plotted in Rerun's Probe tab. No detector threshold is set yet.
 
 ### 8. Activation outliers, especially with FP8
 
@@ -102,15 +102,15 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **How it is noticed.** Per-layer kurtosis or the ratio of the maximum to a typical value; sustained low kurtosis predicted stable FP8 training in one study.
 
-**Signal.** A fourth-moment (kurtosis) statistic per layer, which is as cheap as the statistics TensorLens already computes.
+**Signal.** A fourth-moment (kurtosis) statistic per layer, which is as cheap as the statistics TensorQuill already computes.
 
-**TensorLens today.** Detected in full capture, relative to each module's own history: a sudden jump in the largest value or spread (5× the recent median), and drift of the outlier ratio `abs_max / std` or of the spread (3× from the module's early level). Healthy Granite raises nothing, although its middle blocks already carry outliers 740–840 times the standard deviation. Kurtosis is not captured; `abs_max / std` tracks the same outliers without a second pass over each output.
+**TensorQuill today.** Detected in full capture, relative to each module's own history: a sudden jump in the largest value or spread (5× the recent median), and drift of the outlier ratio `abs_max / std` or of the spread (3× from the module's early level). Healthy Granite raises nothing, although its middle blocks already carry outliers 740–840 times the standard deviation. Kurtosis is not captured; `abs_max / std` tracks the same outliers without a second pass over each output.
 
 ### 9. NaN or Inf
 
 **What happened.** A value becomes NaN or infinite and spreads. Silent data corruption is one cause.
 
-**Signal and TensorLens today.** Detected: the first step and the layers and gradients involved.
+**Signal and TensorQuill today.** Detected: the first step and the layers and gradients involved.
 
 ### 10. Mixed-precision loss scale collapse and skipped steps
 
@@ -118,7 +118,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** The loss scale and the count of skipped steps.
 
-**TensorLens today.** Detected when the run passes its scaler, `init(..., scaler=scaler)` (Nov 14, 2026): each record carries `step_skipped` and `grad_scale`, skipped steps are counted, and `loss_scale_trouble` reports 10 or more skips in a row or a loss scale below 1. Thresholds are first guesses, and it has not run on a real fp16 job.
+**TensorQuill today.** Detected when the run passes its scaler, `init(..., scaler=scaler)` (Nov 14, 2026): each record carries `step_skipped` and `grad_scale`, skipped steps are counted, and `loss_scale_trouble` reports 10 or more skips in a row or a loss scale below 1. Thresholds are first guesses, and it has not run on a real fp16 job.
 
 ### 11. MoE token dropping
 
@@ -126,7 +126,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Dropped tokens per layer and expert.
 
-**TensorLens today.** Not captured. Granite is dropless, so this matters only for capacity-limited MoE models.
+**TensorQuill today.** Not captured. Granite is dropless, so this matters only for capacity-limited MoE models.
 
 ### 12. Weight norms shrinking or growing
 
@@ -134,7 +134,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Per-parameter weight norms, which the optimizer hooks already have access to.
 
-**TensorLens today.** Recorded: weight norms per parameter after each recorded step, and the total in the Rerun recording. No detector for slow norm drift yet.
+**TensorQuill today.** Recorded: weight norms per parameter after each recorded step, and the total in the Rerun recording. No detector for slow norm drift yet.
 
 ### 13. Silent compiler or framework bugs
 
@@ -142,17 +142,17 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 
 **Signal.** Compare compiled and uncompiled outputs or gradients on a fixed batch.
 
-**TensorLens today.** Not captured. The planned probe pass already runs a fixed batch with the compiler off, so it could also compare against the compiled step.
+**TensorQuill today.** Not captured. The planned probe pass already runs a fixed batch with the compiler off, so it could also compare against the compiled step.
 
 ### 14. Data problems
 
 **What happened.** OLMo 2 found repeated n-gram sequences in the data caused loss spikes and filtered them out. PaLM's spikes depended on specific batches meeting a particular model state. Data loaders that restart from the beginning on resume repeat data.
 
-**TensorLens today.** Out of scope except through entry 6. Recording which batch or data position each step used would let a spike be traced to its data.
+**TensorQuill today.** Out of scope except through entry 6. Recording which batch or data position each step used would let a spike be traced to its data.
 
 ### 15. Hardware stops, hangs and slow GPUs
 
-Meta logged 419 unexpected interruptions in 54 days of Llama 3 405B training, 58.7% of them GPU issues. BLOOM lost hours to GPU deaths, hangs at evaluation (about 18 hours once) and a slow GPU that cut throughput from 149 to 140 TFLOPs until found by binary search. These are cluster-monitoring problems; TensorLens does not address them.
+Meta logged 419 unexpected interruptions in 54 days of Llama 3 405B training, 58.7% of them GPU issues. BLOOM lost hours to GPU deaths, hangs at evaluation (about 18 hours once) and a slow GPU that cut throughput from 149 to 140 TFLOPs until found by binary search. These are cluster-monitoring problems; TensorQuill does not address them.
 
 ## What this means for the detectors
 

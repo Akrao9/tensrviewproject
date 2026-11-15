@@ -1,8 +1,8 @@
-"""End to end: a real capture streamed to the real `tensorlens-server`, read back from the
+"""End to end: a real capture streamed to the real `tensorquill-server`, read back from the
 Parquet parts it wrote.
 
 Needs the server binary: `cargo build --manifest-path server/Cargo.toml`, or point
-`TENSORLENS_SERVER_BIN` at one. Skipped when there is none.
+`TENSORQUILL_SERVER_BIN` at one. Skipped when there is none.
 """
 
 from __future__ import annotations
@@ -19,31 +19,31 @@ pytest.importorskip("pyarrow.flight")
 import pyarrow.parquet as pq  # noqa: E402
 import torch  # noqa: E402
 
-import tensorlens  # noqa: E402
-from tensorlens.flight import offset_path, read_offset, row_to_record  # noqa: E402
+import tensorquill  # noqa: E402
+from tensorquill.flight import offset_path, read_offset, row_to_record  # noqa: E402
 
 
 def _server_binary() -> Path | None:
-    named = os.environ.get("TENSORLENS_SERVER_BIN")
+    named = os.environ.get("TENSORQUILL_SERVER_BIN")
     if named:
         return Path(named)
     target = Path(__file__).resolve().parents[2] / "server" / "target"
-    built = [p for p in (target / "debug" / "tensorlens-server", target / "release" / "tensorlens-server") if p.exists()]
+    built = [p for p in (target / "debug" / "tensorquill-server", target / "release" / "tensorquill-server") if p.exists()]
     return max(built, key=lambda p: p.stat().st_mtime) if built else None
 
 
 BINARY = _server_binary()
-pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorlens-server is not built")
+pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
 
 
 class Server:
     def __init__(self, store: Path, port: int = 0, *extra: str) -> None:
-        env = {k: v for k, v in os.environ.items() if k != "TENSORLENS_TOKEN"}
+        env = {k: v for k, v in os.environ.items() if k != "TENSORQUILL_TOKEN"}
         self.process = subprocess.Popen(
             [str(BINARY), "--listen", f"127.0.0.1:{port}", "--store", str(store), *extra],
             stdout=subprocess.PIPE, text=True, env=env,
         )
-        line = self.process.stdout.readline()  # "tensorlens-server listening on 127.0.0.1:PORT"
+        line = self.process.stdout.readline()  # "tensorquill-server listening on 127.0.0.1:PORT"
         self.port = int(line.rsplit(":", 1)[1])
         self.endpoint = f"grpc://127.0.0.1:{self.port}"
 
@@ -81,21 +81,21 @@ def train(model: torch.nn.Module, session, steps: int, pause: float = 0.0) -> No
 
 def test_a_capture_file_reaches_parquet_unchanged(tmp_path, toy_moe, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TENSORLENS_TOKEN", raising=False)
+    monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)
     store = tmp_path / "store"
     server = Server(store)
     try:
         # Full capture: block statistics, gradient and weight norms, router load, a probe
         # pass and logged scalars, so every kind of column is exercised.
-        session = tensorlens.init(
+        session = tensorquill.init(
             toy_moe, run_id="e2e", every=10, capture="full", routers={"router": 4}, weights=5,
             probe=torch.randn(4, 8), probe_every=20, endpoint=server.endpoint,
         )
         train(toy_moe, session, 130)
         session.close()
 
-        path = tmp_path / "tensorlens-out" / "e2e.rank0.jsonl"
-        written = tensorlens.load_records(path)
+        path = tmp_path / "tensorquill-out" / "e2e.rank0.jsonl"
+        written = tensorquill.load_records(path)
         assert [r["step"] for r in written] == list(range(130))
         assert all(r["schema_version"] == 1 for r in written)
         # close() returned only after the server confirmed the whole file as stored.
@@ -105,27 +105,27 @@ def test_a_capture_file_reaches_parquet_unchanged(tmp_path, toy_moe, monkeypatch
         assert any("probe" in r for r in stored) and any("weight_norms" in r for r in stored)
         assert any(r["scalars"]["nan_now_and_then"] == "nan" for r in stored)
         # The detectors read the same thing from either side.
-        assert tensorlens.build_evidence(stored) == tensorlens.build_evidence(written)
-        assert tensorlens.load_records(store / "runs" / "e2e") == written
-        assert tensorlens.build_evidence(store / "runs" / "e2e") == tensorlens.build_evidence(path)
+        assert tensorquill.build_evidence(stored) == tensorquill.build_evidence(written)
+        assert tensorquill.load_records(store / "runs" / "e2e") == written
+        assert tensorquill.build_evidence(store / "runs" / "e2e") == tensorquill.build_evidence(path)
     finally:
         assert server.terminate() == 0
 
 
 def test_server_killed_for_200_steps_loses_and_repeats_nothing(tmp_path, toy_moe, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TENSORLENS_TOKEN", raising=False)
+    monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)
     store = tmp_path / "store"
     # A 30-second flush interval: when the server is killed it holds steps only in memory,
     # steps the sender has sent but that were never confirmed.
     server = Server(store, 0, "--flush-seconds", "30")
     port = server.port
-    session = tensorlens.init(
+    session = tensorquill.init(
         toy_moe, run_id="outage", every=10, routers={"router": 4}, endpoint=server.endpoint
     )
     sender = session._sink.sender
     sender._batch_seconds, sender._poll_seconds, sender._backoff_cap = 0.05, 0.02, 0.2
-    path = tmp_path / "tensorlens-out" / "outage.rank0.jsonl"
+    path = tmp_path / "tensorquill-out" / "outage.rank0.jsonl"
     try:
         train(toy_moe, session, 100, pause=0.002)
         session.flush()
@@ -144,7 +144,7 @@ def test_server_killed_for_200_steps_loses_and_repeats_nothing(tmp_path, toy_moe
     finally:
         code = server.terminate()
     assert code == 0
-    written = tensorlens.load_records(path)
+    written = tensorquill.load_records(path)
     stored = stored_records(store, "outage")
     assert [r["step"] for r in stored] == list(range(350))  # none lost, none twice, in order
     assert stored == written
@@ -161,19 +161,19 @@ def _steps(path: Path, run_id: str, rank: int, steps: range) -> None:
 
 
 def test_the_python_sender_presents_its_token_and_a_non_zero_rank(tmp_path, monkeypatch, capsys):
-    from tensorlens.flight import FlightSender
+    from tensorquill.flight import FlightSender
 
     store = tmp_path / "store"
     server = Server(store, 0, "--token", "s3cret")
     try:
         path = tmp_path / "tok.rank1.jsonl"
         _steps(path, "tok", 1, range(120))
-        monkeypatch.setenv("TENSORLENS_TOKEN", "s3cret")
+        monkeypatch.setenv("TENSORQUILL_TOKEN", "s3cret")
         assert FlightSender(path, server.endpoint, "tok", 1).close(20) is True
 
         wrong = tmp_path / "bad.rank0.jsonl"
         _steps(wrong, "bad", 0, range(5))
-        monkeypatch.setenv("TENSORLENS_TOKEN", "not-it")
+        monkeypatch.setenv("TENSORQUILL_TOKEN", "not-it")
         sender = FlightSender(wrong, server.endpoint, "bad", 0)
         assert sender.close(2) is False
         assert "Bearer token" in str(sender.last_error) and "Bearer token" in capsys.readouterr().err
@@ -187,12 +187,12 @@ def test_the_python_sender_presents_its_token_and_a_non_zero_rank(tmp_path, monk
 def test_forked_dataloader_workers_do_not_disturb_the_sender(tmp_path, monkeypatch):
     # Linux's default: DataLoader workers are forked while the sender's gRPC thread runs.
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TENSORLENS_TOKEN", raising=False)
+    monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)
     store = tmp_path / "store"
     server = Server(store)
     try:
         model = torch.nn.Linear(8, 1)
-        session = tensorlens.init(model, run_id="forked", capture="full", every=5, endpoint=server.endpoint)
+        session = tensorquill.init(model, run_id="forked", capture="full", every=5, endpoint=server.endpoint)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
         data = torch.utils.data.TensorDataset(torch.randn(128, 8))
         for _ in range(3):
@@ -208,23 +208,23 @@ def test_forked_dataloader_workers_do_not_disturb_the_sender(tmp_path, monkeypat
 
 
 def test_a_resumed_run_keeps_its_repeated_steps_and_watch_reads_them(tmp_path, toy_moe, monkeypatch):
-    from tensorlens.evidence import watch
+    from tensorquill.evidence import watch
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TENSORLENS_TOKEN", raising=False)
+    monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)
     store = tmp_path / "store"
     server = Server(store)
-    path = tmp_path / "tensorlens-out" / "resumed.rank0.jsonl"
+    path = tmp_path / "tensorquill-out" / "resumed.rank0.jsonl"
     run_dir = store / "runs" / "resumed"
     try:
-        session = tensorlens.init(toy_moe, run_id="resumed", every=10, routers={"router": 4}, endpoint=server.endpoint)
+        session = tensorquill.init(toy_moe, run_id="resumed", every=10, routers={"router": 4}, endpoint=server.endpoint)
         train(toy_moe, session, 120)
         session.close()
         live = watch(run_dir, tmp_path / "live.json", interval=0.0, polls=1)
-        assert live is not None and len(tensorlens.load_records(run_dir)) == 120
+        assert live is not None and len(tensorquill.load_records(run_dir)) == 120
 
         # The job crashed and resumes from the checkpoint at step 80, under the same run ID.
-        session = tensorlens.init(
+        session = tensorquill.init(
             toy_moe, run_id="resumed", every=10, routers={"router": 4}, endpoint=server.endpoint, start_step=80
         )
         train(toy_moe, session, 60)
@@ -232,27 +232,27 @@ def test_a_resumed_run_keeps_its_repeated_steps_and_watch_reads_them(tmp_path, t
 
         # The offset file is lost: the whole file, both attempts, is sent again.
         offset_path(path).unlink()
-        from tensorlens.flight import send_file
+        from tensorquill.flight import send_file
 
         assert send_file(path, server.endpoint, "resumed") is True
     finally:
         assert server.terminate() == 0
-    written = tensorlens.load_records(path, all_attempts=True)
+    written = tensorquill.load_records(path, all_attempts=True)
     assert len(written) == 180 and len({r["attempt"] for r in written}) == 2
     assert len(list(run_dir.glob("rank=0/attempt=*"))) == 2
-    assert tensorlens.load_records(run_dir, all_attempts=True) == written  # none dropped, none twice
-    resolved = tensorlens.load_records(run_dir)
+    assert tensorquill.load_records(run_dir, all_attempts=True) == written  # none dropped, none twice
+    resolved = tensorquill.load_records(run_dir)
     assert [r["step"] for r in resolved] == list(range(140))
     assert {r["attempt"] for r in resolved if r["step"] >= 80} == {max(r["attempt"] for r in written)}
-    evidence = tensorlens.build_evidence(run_dir)
-    assert evidence == tensorlens.build_evidence(path)
+    evidence = tensorquill.build_evidence(run_dir)
+    assert evidence == tensorquill.build_evidence(path)
     assert not [i for i in evidence["incidents"] if i["kind"] == "repeated_steps"]
 
 
 def test_grpcs_streams_with_custom_ca_and_rejects_untrusted_server(tmp_path, toy_moe, monkeypatch):
     import shutil
 
-    from tensorlens.flight import FlightSender
+    from tensorquill.flight import FlightSender
 
     if shutil.which("openssl") is None:
         pytest.skip("needs openssl")
@@ -271,13 +271,13 @@ def test_grpcs_streams_with_custom_ca_and_rejects_untrusted_server(tmp_path, toy
     )
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TENSORLENS_TOKEN", raising=False)
-    monkeypatch.delenv("TENSORLENS_TLS_CA", raising=False)
+    monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)
+    monkeypatch.delenv("TENSORQUILL_TLS_CA", raising=False)
     store = tmp_path / "store"
     server = Server(store, 0, "--tls-cert", str(cert), "--tls-key", str(key))
     endpoint = f"grpcs://127.0.0.1:{server.port}"
     try:
-        # Without TENSORLENS_TLS_CA the self-signed certificate is rejected.
+        # Without TENSORQUILL_TLS_CA the self-signed certificate is rejected.
         untrusted = tmp_path / "untrusted.rank0.jsonl"
         _steps(untrusted, "untrusted", 0, range(3))
         bad_sender = FlightSender(untrusted, endpoint, "untrusted", 0)
@@ -285,9 +285,9 @@ def test_grpcs_streams_with_custom_ca_and_rejects_untrusted_server(tmp_path, toy
         assert "certificate verify failed" in str(bad_sender.last_error)  # not some other failure
         assert not (store / "runs" / "untrusted").exists()
 
-        # With TENSORLENS_TLS_CA pointing at the server certificate, streaming succeeds.
-        monkeypatch.setenv("TENSORLENS_TLS_CA", str(cert))
-        session = tensorlens.init(
+        # With TENSORQUILL_TLS_CA pointing at the server certificate, streaming succeeds.
+        monkeypatch.setenv("TENSORQUILL_TLS_CA", str(cert))
+        session = tensorquill.init(
             toy_moe, run_id="tls", every=5, routers={"router": 4}, endpoint=endpoint
         )
         train(toy_moe, session, 20)
@@ -295,6 +295,6 @@ def test_grpcs_streams_with_custom_ca_and_rejects_untrusted_server(tmp_path, toy
     finally:
         assert server.terminate() == 0
 
-    written = tensorlens.load_records(tmp_path / "tensorlens-out" / "tls.rank0.jsonl")
+    written = tensorquill.load_records(tmp_path / "tensorquill-out" / "tls.rank0.jsonl")
     assert len(written) == 20
     assert stored_records(store, "tls") == written

@@ -4,9 +4,9 @@ from torch import nn
 
 pytest.importorskip("accelerate")
 
-import tensorlens  # noqa: E402
+import tensorquill  # noqa: E402
 from accelerate import Accelerator  # noqa: E402
-from tensorlens.accelerator import watch_accelerator  # noqa: E402
+from tensorquill.accelerator import watch_accelerator  # noqa: E402
 
 
 def _patched():
@@ -45,8 +45,8 @@ def _setup(accumulate=1):
 def test_loop_records_loss_and_the_norm_before_clipping_once():
     originals = _patched()
     accelerator, model, optimizer = _setup(accumulate=2)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, capture="full")
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, capture="full")
     watch_accelerator(session)
     assert _patched() != originals
     losses, norms = _loop(accelerator, model, optimizer, torch.randn(8, 8, 4))
@@ -63,13 +63,13 @@ def test_loop_records_loss_and_the_norm_before_clipping_once():
 def test_closing_the_session_or_the_watch_restores_accelerate():
     originals = _patched()
     accelerator, model, optimizer = _setup()
-    session = tensorlens.init(model, sink=tensorlens.MemorySink())
+    session = tensorquill.init(model, sink=tensorquill.MemorySink())
     watch = watch_accelerator(session, loss_name=None)
     watch.close()
     assert _patched() == originals
 
-    sink = tensorlens.MemorySink()
-    session2 = tensorlens.init(model, sink=sink)
+    sink = tensorquill.MemorySink()
+    session2 = tensorquill.init(model, sink=sink)
     watch_accelerator(session2, loss_name=None)
     _loop(accelerator, model, optimizer, torch.randn(2, 8, 4))
     session.close()
@@ -82,8 +82,8 @@ def test_another_models_accelerator_calls_are_not_recorded():
     accelerator, model, optimizer = _setup()
     other = nn.Linear(4, 1)
     other_optimizer = accelerator.prepare(torch.optim.SGD(other.parameters(), lr=0.01))
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, capture="full")
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, capture="full")
     watch_accelerator(session)
     _loop(accelerator, other, other_optimizer, torch.randn(3, 8, 4))
     _loop(accelerator, model, optimizer, torch.randn(1, 8, 4))
@@ -94,10 +94,10 @@ def test_another_models_accelerator_calls_are_not_recorded():
 
 def test_a_single_tensor_is_clipped_as_accelerate_does_but_not_recorded():
     # Accelerate iterates a bare tensor into rows and returns 0, where torch returns the
-    # real norm. TensorLens must neither fail nor record that 0 as the step's norm.
+    # real norm. TensorQuill must neither fail nor record that 0 as the step's norm.
     accelerator, model, optimizer = _setup()
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, capture="full")
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, capture="full")
     watch_accelerator(session, loss_name=None)
     param = next(model.parameters())
     loss = model(torch.randn(4, 4)).pow(2).mean()

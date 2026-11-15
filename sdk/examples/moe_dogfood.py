@@ -1,4 +1,4 @@
-"""Benchmark TensorLens during Granite MoE training on WikiText-2."""
+"""Benchmark TensorQuill during Granite MoE training on WikiText-2."""
 
 import argparse
 from contextlib import ExitStack
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-import tensorlens
+import tensorquill
 
 MODEL = "ibm-granite/granite-3.0-1b-a400m-base"
 FLUSH_EVERY = 50
@@ -64,7 +64,7 @@ def build_pair():
         for _ in range(2)
     ]
     routers = {
-        name: tensorlens.Router(module.num_experts, top_k=module.top_k, indices=lambda out: out[2])
+        name: tensorquill.Router(module.num_experts, top_k=module.top_k, indices=lambda out: out[2])
         for name, module in models[1].named_modules()
         if isinstance(module, GraniteMoeTopKRouter)
     }
@@ -93,7 +93,7 @@ def install_collapse(router):
 
 def verify_capture(
     capture_path: Path,
-    routers: dict[str, tensorlens.Router],
+    routers: dict[str, tensorquill.Router],
     expected_steps: int,
     expected_assignments: int,
     collapse_step: int | None,
@@ -103,7 +103,7 @@ def verify_capture(
     expect_grads: bool,
     expect_layers: bool,
 ) -> dict:
-    records = tensorlens.load_records(capture_path)
+    records = tensorquill.load_records(capture_path)
     if [record["step"] for record in records] != list(range(expected_steps)):
         raise RuntimeError(f"{capture_path}: capture did not record the expected optimizer steps")
     for record in records:
@@ -123,10 +123,10 @@ def verify_capture(
                     f"{name} at step {record['step']}: expected {expected_assignments} "
                     f"assignments, got {total} ({counts})"
                 )
-    evidence = tensorlens.build_evidence(records)
+    evidence = tensorquill.build_evidence(records)
     if collapse_step is None or collapse_layer is None:
         return evidence
-    hit = tensorlens.first_incident(evidence)
+    hit = tensorquill.first_incident(evidence)
     router_names = list(routers)
     collapse_router = router_names[collapse_layer - 1]
     num_experts = routers[collapse_router].n_experts
@@ -154,7 +154,7 @@ def verify_capture(
 
 def run_comparison(
     args, batches, labels, init_kwargs_pair
-) -> tuple[float, float, dict[str, tensorlens.Router], int, int, int | None, int]:
+) -> tuple[float, float, dict[str, tensorquill.Router], int, int, int | None, int]:
     torch._dynamo.reset()
     models, optimizers, routers = build_pair()
     top_k = models[1].config.num_experts_per_tok
@@ -183,7 +183,7 @@ def run_comparison(
         for model, kwargs in zip(models, init_kwargs_pair):
             if kwargs is not None:
                 stack.enter_context(
-                    tensorlens.init(model, routers=routers, every=FLUSH_EVERY, **probe_kwargs, **kwargs)
+                    tensorquill.init(model, routers=routers, every=FLUSH_EVERY, **probe_kwargs, **kwargs)
                 )
 
         # The grouped_mm fallback can copy expert offsets to CPU. On the RTX PRO
@@ -281,9 +281,9 @@ def main() -> None:
         (
             # A weight check records that step's gradient norms, so this arm turns it off.
             {"run_id": "granite-no-grads", "capture": "full", "grads": False, "weights": False,
-             "layers": args.layers, "sink": tensorlens.JsonlSink(no_grads_path)},
+             "layers": args.layers, "sink": tensorquill.JsonlSink(no_grads_path)},
             {"run_id": "granite", "capture": "full", "layers": args.layers,
-             "sink": tensorlens.JsonlSink(capture_path)},
+             "sink": tensorquill.JsonlSink(capture_path)},
         ),
     )
     verify_capture(
@@ -326,7 +326,7 @@ def main() -> None:
             {
                 "run_id": "granite-router-only",
                 "capture": "routers",
-                "sink": tensorlens.JsonlSink(router_only_path),
+                "sink": tensorquill.JsonlSink(router_only_path),
             },
         ),
     )
@@ -349,7 +349,7 @@ def main() -> None:
         flush=True,
     )
     print(f"Verified {expected_steps} recorded steps across {len(routers)} routers: {router_only_path}")
-    print(tensorlens.incident_summary(router_evidence))
+    print(tensorquill.incident_summary(router_evidence))
 
     print(f"\n--- Stage 3: baseline (capture off) vs. full capture (defaults, layers={args.layers}) ---", flush=True)
     off_full_ms, full_default_ms, routers, expected_steps, expected_assignments, collapse_step, top_k = run_comparison(
@@ -357,7 +357,7 @@ def main() -> None:
         batches,
         ("capture off", "full capture"),
         (None, {"run_id": "granite-full", "capture": "full", "layers": args.layers,
-                   "sink": tensorlens.JsonlSink(full_path)}),
+                   "sink": tensorquill.JsonlSink(full_path)}),
     )
     verify_capture(
         full_path,
@@ -381,7 +381,7 @@ def main() -> None:
         print(f"1% overhead target (router-only): {'PASS' if router_overhead < 1 else 'FAIL'}")
         print(f"1% overhead target (full capture): {'PASS' if full_overhead < 1 else 'FAIL'}")
     if args.probe_every:
-        probes = [r["probe"] for r in tensorlens.load_records(full_path) if "probe" in r]
+        probes = [r["probe"] for r in tensorquill.load_records(full_path) if "probe" in r]
         print(f"Probe passes in {full_path.name}: {len(probes)} (every {args.probe_every} steps)")
         if probes:
             last = probes[-1]["attention"]

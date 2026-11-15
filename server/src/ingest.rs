@@ -255,7 +255,7 @@ impl Ingest {
                 .is_some_and(|since| since.elapsed() >= self.config.flush_interval)
             {
                 if let Err(status) = self.flush(&key, &mut buffer).await {
-                    eprintln!("tensorlens-server: {}", status.message());
+                    eprintln!("tensorquill-server: {}", status.message());
                 }
             }
         }
@@ -460,7 +460,7 @@ type Reply<T> = Result<Response<T>, Status>;
 type ReplyStream<T> = BoxStream<'static, Result<T, Status>>;
 
 fn unimplemented<T>() -> Reply<T> {
-    Err(Status::unimplemented("tensorlens-server only accepts DoPut"))
+    Err(Status::unimplemented("tensorquill-server only accepts DoPut"))
 }
 
 #[tonic::async_trait]

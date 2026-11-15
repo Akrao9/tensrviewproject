@@ -1,4 +1,4 @@
-"""The Flight sender against an in-process stand-in for `tensorlens-server`.
+"""The Flight sender against an in-process stand-in for `tensorquill-server`.
 
 The stand-in follows the same `DoPut` contract as the Rust server: it drops rows whose step
 is not above the last one it kept for `(run_id, rank)` and answers each batch with the
@@ -20,8 +20,8 @@ import pytest
 pa = pytest.importorskip("pyarrow")
 flight = pytest.importorskip("pyarrow.flight")
 
-import tensorlens  # noqa: E402
-from tensorlens.flight import (  # noqa: E402
+import tensorquill  # noqa: E402
+from tensorquill.flight import (  # noqa: E402
     FlightSender,
     flight_schema,
     offset_path,
@@ -291,9 +291,9 @@ def test_records_round_trip_through_the_arrow_schema():
 
 def test_init_without_an_endpoint_opens_no_sender(tmp_path, toy_moe, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TENSORLENS_ENDPOINT", raising=False)
-    session = tensorlens.init(toy_moe, run_id="plain", routers={"router": 4})
-    assert isinstance(session._sink, tensorlens.JsonlSink)
+    monkeypatch.delenv("TENSORQUILL_ENDPOINT", raising=False)
+    session = tensorquill.init(toy_moe, run_id="plain", routers={"router": 4})
+    assert isinstance(session._sink, tensorquill.JsonlSink)
     session.close()
     assert not list(tmp_path.rglob("*.offset"))
 
@@ -304,11 +304,11 @@ def test_init_with_an_endpoint_streams_the_capture_file(tmp_path, toy_moe, monke
 
     monkeypatch.chdir(tmp_path)
     if how == "environment":
-        monkeypatch.setenv("TENSORLENS_ENDPOINT", server.endpoint)
-        session = tensorlens.init(toy_moe, run_id="streamed", every=5, routers={"router": 4})
+        monkeypatch.setenv("TENSORQUILL_ENDPOINT", server.endpoint)
+        session = tensorquill.init(toy_moe, run_id="streamed", every=5, routers={"router": 4})
     else:
-        monkeypatch.delenv("TENSORLENS_ENDPOINT", raising=False)
-        session = tensorlens.init(
+        monkeypatch.delenv("TENSORQUILL_ENDPOINT", raising=False)
+        session = tensorquill.init(
             toy_moe, run_id="streamed", every=5, routers={"router": 4}, endpoint=server.endpoint
         )
     optimizer = torch.optim.SGD(toy_moe.parameters(), lr=0.01)
@@ -318,19 +318,19 @@ def test_init_with_an_endpoint_streams_the_capture_file(tmp_path, toy_moe, monke
         session.log(loss=1.0)
         optimizer.step()
     session.close()
-    path = tmp_path / "tensorlens-out" / "streamed.rank0.jsonl"
-    written = tensorlens.load_records(path)
+    path = tmp_path / "tensorquill-out" / "streamed.rank0.jsonl"
+    written = tensorquill.load_records(path)
     assert len(written) == 12
     assert [row_to_record(row) for row in store.rows] == written
     assert read_offset(offset_path(path)) == path.stat().st_size
 
 
 def test_init_rejects_a_bad_endpoint_and_a_sink_with_no_file(toy_moe, monkeypatch):
-    monkeypatch.delenv("TENSORLENS_ENDPOINT", raising=False)
+    monkeypatch.delenv("TENSORQUILL_ENDPOINT", raising=False)
     with pytest.raises(ValueError, match="grpc://"):
-        tensorlens.init(toy_moe, endpoint="http://localhost:1", sink=tensorlens.MemorySink())
+        tensorquill.init(toy_moe, endpoint="http://localhost:1", sink=tensorquill.MemorySink())
     with pytest.raises(ValueError, match="JsonlSink"):
-        tensorlens.init(toy_moe, endpoint="grpc://localhost:1", sink=tensorlens.MemorySink())
+        tensorquill.init(toy_moe, endpoint="grpc://localhost:1", sink=tensorquill.MemorySink())
 
 
 def test_a_failing_stream_is_reported_once_while_training_runs(tmp_path, capsys):
@@ -375,7 +375,7 @@ def test_close_wakes_backoff_immediately_to_flush(tmp_path, store, monkeypatch):
     port, endpoint = first.port, first.endpoint
     first.stop()
 
-    monkeypatch.setattr("tensorlens.flight.random.uniform", lambda _a, b: b)
+    monkeypatch.setattr("tensorquill.flight.random.uniform", lambda _a, b: b)
     path = tmp_path / "run-a.rank0.jsonl"
     append(path, [record(step) for step in range(10)])
     sender = fast_sender(path, endpoint, backoff_base=10.0, backoff_cap=10.0)
@@ -395,13 +395,13 @@ def test_close_wakes_backoff_immediately_to_flush(tmp_path, store, monkeypatch):
 def test_tls_ca_is_loaded_at_init_and_ignored_for_plaintext(tmp_path, monkeypatch):
     path = tmp_path / "run-a.rank0.jsonl"
     missing = tmp_path / "missing-ca.pem"
-    monkeypatch.setenv("TENSORLENS_TLS_CA", str(missing))
+    monkeypatch.setenv("TENSORQUILL_TLS_CA", str(missing))
     with pytest.raises(FileNotFoundError):
         FlightSender(path, "grpcs://127.0.0.1:9", "run-a", 0)
-    monkeypatch.delenv("TENSORLENS_TLS_CA")
+    monkeypatch.delenv("TENSORQUILL_TLS_CA")
     with pytest.raises(FileNotFoundError):
         FlightSender(path, "grpcs://127.0.0.1:9", "run-a", 0, tls_root_certs=missing)
-    monkeypatch.setenv("TENSORLENS_TLS_CA", str(missing))
+    monkeypatch.setenv("TENSORQUILL_TLS_CA", str(missing))
     plain = FlightSender(path, "grpc://127.0.0.1:9", "run-a", 0)
     assert plain._tls_root_certs is None
     assert plain.close(timeout=0.05) is True  # empty missing file has 0 unacked bytes

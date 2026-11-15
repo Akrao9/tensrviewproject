@@ -7,8 +7,8 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-import tensorlens
-from tensorlens import probe as probe_mod
+import tensorquill
+from tensorquill import probe as probe_mod
 
 
 class _Routed(nn.Module):
@@ -31,8 +31,8 @@ class _Routed(nn.Module):
 def test_activation_checkpointing_does_not_double_count_routing(use_reentrant):
     model = _Routed(use_reentrant)
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, routers={"router": tensorlens.Router(4, top_k=2)})
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, routers={"router": tensorquill.Router(4, top_k=2)})
     x = torch.randn(16, 8, requires_grad=use_reentrant)
     model(x).sum().backward()
     opt.step()
@@ -47,8 +47,8 @@ def _two_part():
 
 def test_optimizers_that_clear_their_own_gradients_still_count_one_step_per_iteration():
     model, opts = _two_part()
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, capture="full", every=2)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, capture="full", every=2)
     for _ in range(4):
         model(torch.ones(2, 4)).sum().backward()
         for opt in opts:
@@ -72,8 +72,8 @@ def test_a_step_that_raised_does_not_stop_later_steps_from_counting():
             return super().step(closure)
 
     opt = Flaky(model.parameters(), lr=0.1)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink)
     model(torch.ones(1, 4)).sum().backward()
     with pytest.raises(RuntimeError, match="transient"):
         opt.step()
@@ -87,8 +87,8 @@ def test_a_step_that_raised_does_not_stop_later_steps_from_counting():
 def test_probe_on_a_model_without_capture_buffers(kwargs):
     model = nn.Linear(4, 2)
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, probe=torch.ones(1, 4), probe_every=1, capture="full", **kwargs)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, probe=torch.ones(1, 4), probe_every=1, capture="full", **kwargs)
     model(torch.ones(1, 4)).sum().backward()
     opt.step()
     session.close()
@@ -98,8 +98,8 @@ def test_probe_on_a_model_without_capture_buffers(kwargs):
 def test_closure_steps_record_gradients_after_the_closure_runs():
     model = nn.Linear(4, 1)
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, capture="full")
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, capture="full")
 
     def closure():
         opt.zero_grad()
@@ -117,10 +117,10 @@ def test_closure_steps_record_gradients_after_the_closure_runs():
 def test_replica_with_nan_weights_is_reported():
     spreads = [{"run_id": "r", "step": 0, "replica_spread": {"w": [0.0, 0.0]}},
                {"run_id": "r", "step": 1, "replica_spread": {"w": ["nan", "nan"]}}]
-    hit = tensorlens.detect_replica_drift(spreads)
+    hit = tensorquill.detect_replica_drift(spreads)
     assert hit["step"] == 1 and hit["parameters"]["w"]["non_finite"]
-    evidence = tensorlens.build_evidence(spreads)
-    assert "NaN or Inf weights" in tensorlens.incident_summary(evidence)
+    evidence = tensorquill.build_evidence(spreads)
+    assert "NaN or Inf weights" in tensorquill.incident_summary(evidence)
 
 
 def test_clipped_spike_is_found_from_the_pre_clipping_norm_and_clip_inf_is_non_finite():
@@ -129,10 +129,10 @@ def test_clipped_spike_is_found_from_the_pre_clipping_norm_and_clip_inf_is_non_f
          "clip_grad_norm": 30.0 if s == 20 else 3.0}
         for s in range(25)
     ]
-    hit = tensorlens.detect_grad_spikes(records)
+    hit = tensorquill.detect_grad_spikes(records)
     assert hit is not None and hit["step"] == 20 and hit["ratio"] == pytest.approx(10.0)
     records[22]["clip_grad_norm"] = "inf"
-    bad = tensorlens.detect_non_finite(records)
+    bad = tensorquill.detect_non_finite(records)
     assert bad["step"] == 22 and "<total before clipping>" in bad["gradients"]
 
 
@@ -151,7 +151,7 @@ def test_old_probe_records_keep_their_entropy_curve_on_export(tmp_path, monkeypa
     logged = []
     real = rr.log
     monkeypatch.setattr(rr, "log", lambda p, *a, **kw: (logged.append((p, a)), real(p, *a, **kw)))
-    tensorlens.export_rerun(tensorlens.build_evidence(records), tmp_path / "o.rrd", records=records)
+    tensorquill.export_rerun(tensorquill.build_evidence(records), tmp_path / "o.rrd", records=records)
     assert any(p == "/probe/entropy/blocks.0" for p, _ in logged)
 
 
@@ -161,8 +161,8 @@ def test_warns_when_only_another_optimizer_steps():
     model = nn.Linear(4, 1)
     copy = nn.Parameter(torch.zeros(5))
     optimizer = torch.optim.SGD([copy], lr=0.1)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, capture="full")
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, capture="full")
     with pytest.warns(RuntimeWarning, match="auto_step=False") as caught:
         for _ in range(25):
             model(torch.randn(2, 4)).sum().backward()
@@ -178,7 +178,7 @@ def test_no_warning_when_the_models_optimizer_steps_too():
     model = nn.Linear(4, 1)
     other = torch.optim.SGD([nn.Parameter(torch.zeros(5, requires_grad=True))], lr=0.1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-    session = tensorlens.init(model, sink=tensorlens.MemorySink(), capture="full")
+    session = tensorquill.init(model, sink=tensorquill.MemorySink(), capture="full")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         for _ in range(25):

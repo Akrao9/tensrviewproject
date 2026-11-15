@@ -1,4 +1,4 @@
-# TensorLens MoE inspector bake-off
+# TensorQuill MoE inspector bake-off
 
 Compare a focused Rune incident screen with the full Rerun 0.43.2 viewer. Both views show the same detector summary, status colors and incident-layer expert load table by default. The table lists each expert's load and its change from the previous sample, sorted by that change. Rerun also retains the raw-share tensor and the diversity timeline.
 
@@ -21,8 +21,8 @@ The v3 plan starts with stock Rerun. This prototype tests whether a sortable tab
 ## Run the comparison
 
 ```sh
-python3 -m venv /tmp/tensorlens-moe-venv
-. /tmp/tensorlens-moe-venv/bin/activate
+python3 -m venv /tmp/tensorquill-moe-venv
+. /tmp/tensorquill-moe-venv/bin/activate
 python3 -m pip install 'rerun-sdk==0.43.2'
 python3 generate.py --rerun
 cargo build --locked
@@ -49,10 +49,10 @@ The last healthy sample is step 1,800. The first affected sample is step 1,850, 
 Run this from `experiments/moe-bakeoff` with Docker and BuildKit available. The named context supplies Rune’s source at the tested revision. The build stage uses the pinned Bookworm Rust image. The runtime uses Trixie for its newer Mesa Vulkan driver.
 
 ```sh
-docker build --build-context rune=../../../rune -t tensorlens-moe-bakeoff .
+docker build --build-context rune=../../../rune -t tensorquill-moe-bakeoff .
 mkdir -p artifacts
-docker run --rm --network none -v "$PWD/artifacts:/output" tensorlens-moe-bakeoff
-docker run --rm --network none -v "$PWD/artifacts:/output" tensorlens-moe-bakeoff \
+docker run --rm --network none -v "$PWD/artifacts:/output" tensorquill-moe-bakeoff
+docker run --rm --network none -v "$PWD/artifacts:/output" tensorquill-moe-bakeoff \
   moe-inspector --snap /output/rune-linux-repeat.png --tree /output/rune-linux-tree-repeat.json \
   --theme dark --size 1160x720 --scale 1
 cmp artifacts/rune-linux.png artifacts/rune-linux-repeat.png

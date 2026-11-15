@@ -1,4 +1,4 @@
-"""Check TensorLens on a dense transformer with a seeded activation outlier.
+"""Check TensorQuill on a dense transformer with a seeded activation outlier.
 
 Trains a small dense Hugging Face model on WikiText-2 twice in lockstep, with capture
 off and with full capture plus the probe pass, and from `--seed-step` scales a few hidden
@@ -27,7 +27,7 @@ from pathlib import Path
 
 import torch
 
-import tensorlens
+import tensorquill
 
 MODEL = "HuggingFaceTB/SmolLM2-360M"
 FLUSH_EVERY = 50
@@ -87,7 +87,7 @@ def install_outlier(block: torch.nn.Module, hidden: int, channels: list[int], fa
         seeded = torch.where(enabled, hidden_states * scale, hidden_states)
         return (seeded, *output[1:]) if isinstance(output, tuple) else seeded
 
-    # Registered before tensorlens.init, so it runs before TensorLens's hook and the
+    # Registered before tensorquill.init, so it runs before TensorQuill's hook and the
     # capture sees the seeded output. `prepend=True` after init would do the same, but on
     # PyTorch 2.10 with Hugging Face models it crashes Dynamo's guard building.
     return enabled, block.register_forward_hook(hook)
@@ -207,7 +207,7 @@ def main() -> None:
     with ExitStack() as stack:
         stack.enter_context(torch._dynamo.config.patch(skip_nnmodule_hook_guards=False))
         # The same blocks full capture watches by default.
-        blocks = [name for name, _ in tensorlens.capture._select_layers(models[1], "blocks")]
+        blocks = [name for name, _ in tensorquill.capture._select_layers(models[1], "blocks")]
         layer = args.layer if args.layer is not None else len(blocks) // 2
         seeded_block = blocks[layer]
         hidden = models[0].config.hidden_size
@@ -219,9 +219,9 @@ def main() -> None:
             )
             flags.append(flag)
             stack.callback(handle.remove)
-        session = stack.enter_context(tensorlens.init(
+        session = stack.enter_context(tensorquill.init(
             models[1], run_id="dense-outlier", capture="full", every=FLUSH_EVERY,
-            sink=tensorlens.JsonlSink(jsonl),
+            sink=tensorquill.JsonlSink(jsonl),
             probe=lambda m: m(input_ids=fixed, use_cache=False), probe_every=args.probe_every,
         ))
         assert session.layer_names == blocks
@@ -275,11 +275,11 @@ def main() -> None:
               f"({100 * probe_cost / every / off_all:.2f}% of a step)")
 
     # ---- detection -----------------------------------------------------------------
-    records = tensorlens.load_records(jsonl)
-    evidence = tensorlens.build_evidence(records)
+    records = tensorquill.load_records(jsonl)
+    evidence = tensorquill.build_evidence(records)
     spike = next((i for i in evidence["incidents"] if i["kind"] == "activation_spike"), None)
     print("\n--- Detection ---")
-    print(tensorlens.incident_summary(evidence))
+    print(tensorquill.incident_summary(evidence))
     hit = spike is not None and spike["step"] == args.seed_step and any(
         m["module"] == seeded_block for m in spike["modules"]
     )
@@ -331,7 +331,7 @@ def main() -> None:
     if not args.eager:
         print(f"\nGraph breaks: {breaks}")
     try:
-        rrd = tensorlens.export_rerun(evidence, args.out / "dense.rrd", records=records)
+        rrd = tensorquill.export_rerun(evidence, args.out / "dense.rrd", records=records)
         print(f"Rerun recording: {rrd}")
     except ImportError:
         print("rerun-sdk is not installed; skipped the Rerun recording")

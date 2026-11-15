@@ -1,4 +1,4 @@
-"""Opt-in streaming of a rank's local `.jsonl` file to `tensorlens-server` over Arrow Flight.
+"""Opt-in streaming of a rank's local `.jsonl` file to `tensorquill-server` over Arrow Flight.
 
 The local file is always written first and stays the source of truth. A daemon thread
 tails it from the byte offset saved in `<run_id>.rank<rank>.offset`, sends complete lines
@@ -30,9 +30,9 @@ BACKOFF_BASE = 0.1
 BACKOFF_CAP = 30.0
 CLOSE_TIMEOUT = 5.0
 POLL_SECONDS = 0.2
-ENDPOINT_ENV = "TENSORLENS_ENDPOINT"
-TOKEN_ENV = "TENSORLENS_TOKEN"
-TLS_CA_ENV = "TENSORLENS_TLS_CA"
+ENDPOINT_ENV = "TENSORQUILL_ENDPOINT"
+TOKEN_ENV = "TENSORQUILL_TOKEN"
+TLS_CA_ENV = "TENSORQUILL_TLS_CA"
 
 _NON_FINITE = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}
 
@@ -381,7 +381,7 @@ class FlightSender:
         self._closing = threading.Event()
         self._deadline = math.inf
         self._thread = threading.Thread(
-            target=self._run, name=f"tensorlens-flight-rank{rank}", daemon=True
+            target=self._run, name=f"tensorquill-flight-rank{rank}", daemon=True
         )
         self._thread.start()
 
@@ -413,7 +413,7 @@ class FlightSender:
         if left:
             reason = f" ({self.last_error})" if self.last_error is not None else ""
             print(
-                f"tensorlens: {left} bytes of {self.path} were not confirmed by "
+                f"tensorquill: {left} bytes of {self.path} were not confirmed by "
                 f"{self.endpoint}{reason}. The local file is complete; streaming resumes from "
                 f"{self.offset_path.name} the next time this run ID streams.",
                 file=sys.stderr,
@@ -441,7 +441,7 @@ class FlightSender:
                 # would otherwise stay silent until close(). close() reports on its own.
                 self._reported = True
                 print(
-                    f"tensorlens: streaming to {self.endpoint} is failing ({self.last_error}). Training "
+                    f"tensorquill: streaming to {self.endpoint} is failing ({self.last_error}). Training "
                     f"continues and {self.path} stays complete; the sender keeps retrying.",
                     file=sys.stderr,
                 )
@@ -513,7 +513,7 @@ class FlightSender:
                 finally:
                     ended.set()
 
-            acks = threading.Thread(target=read_acks, name="tensorlens-flight-acks", daemon=True)
+            acks = threading.Thread(target=read_acks, name="tensorquill-flight-acks", daemon=True)
             acks.start()
             waiting_since: float | None = None
             try:
@@ -583,7 +583,7 @@ def send_file(
     ).close(timeout)
 
 
-# --- The hook used by `tensorlens.init` ------------------------------------------------
+# --- The hook used by `tensorquill.init` ------------------------------------------------
 
 
 class StreamingSink:
@@ -611,7 +611,7 @@ def attach(
     token: str | None = None,
     tls_root_certs: bytes | str | os.PathLike[str] | None = None,
 ) -> Any:
-    """Start streaming `sink`'s file when `endpoint` or `TENSORLENS_ENDPOINT` is set;
+    """Start streaming `sink`'s file when `endpoint` or `TENSORQUILL_ENDPOINT` is set;
     otherwise return `sink` unchanged, with no socket opened and `pyarrow` not imported."""
     endpoint = endpoint or os.environ.get(ENDPOINT_ENV)
     if not endpoint:

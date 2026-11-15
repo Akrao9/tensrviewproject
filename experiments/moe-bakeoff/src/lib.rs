@@ -257,5 +257,5 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(start))]
 pub fn start() {
-    rune::run(AppSpec::new("TensorLens · MoE inspector", (1160.0, 720.0), State::new, view));
+    rune::run(AppSpec::new("TensorQuill · MoE inspector", (1160.0, 720.0), State::new, view));
 }

@@ -1,7 +1,7 @@
-"""TensorLens capture SDK.
+"""TensorQuill capture SDK.
 
-    import tensorlens
-    session = tensorlens.init(model)   # after model.to(device), before torch.compile
+    import tensorquill
+    session = tensorquill.init(model)   # after model.to(device), before torch.compile
     model = torch.compile(model)
     ...train as usual...
     session.close()

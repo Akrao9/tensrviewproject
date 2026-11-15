@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch import nn
 
-import tensorlens
+import tensorquill
 
 
 def train(model, session_steps, opt=None, batch=16, dim=8):
@@ -20,8 +20,8 @@ def train(model, session_steps, opt=None, batch=16, dim=8):
 def test_layer_statistics_match_a_direct_calculation():
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 512))
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, every=1, auto_step=False)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=1, auto_step=False)
     x = torch.randn(5, 4)
     expected0 = model[0](x).detach()
     expected2 = model(x).detach()
@@ -42,8 +42,8 @@ def test_layer_statistics_match_a_direct_calculation():
 def test_gradient_norms_match_and_total_is_their_root_sum_square():
     torch.manual_seed(0)
     model = nn.Linear(4, 3)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, every=1, auto_step=False)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=1, auto_step=False)
     model(torch.randn(6, 4)).sum().backward()
     expected = {name: p.grad.norm().item() for name, p in model.named_parameters()}
     session.step()
@@ -55,8 +55,8 @@ def test_gradient_norms_match_and_total_is_their_root_sum_square():
 
 
 def test_optimizer_hooks_count_steps_and_flush_every_n(toy_moe):
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(toy_moe, sink=sink, every=4)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(toy_moe, sink=sink, every=4)
     train(toy_moe, 10)
     session.close()
     assert [record["step"] for record in sink.records] == list(range(10))
@@ -64,8 +64,8 @@ def test_optimizer_hooks_count_steps_and_flush_every_n(toy_moe):
 
 
 def test_other_optimizers_are_ignored(toy_moe):
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(toy_moe, sink=sink, every=1)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(toy_moe, sink=sink, every=1)
     other = nn.Linear(3, 3)
     other_opt = torch.optim.SGD(other.parameters(), lr=0.1)
     other(torch.randn(2, 3)).sum().backward()
@@ -77,8 +77,8 @@ def test_other_optimizers_are_ignored(toy_moe):
 def test_expert_counts_sum_to_tokens_and_match_the_router(toy_moe):
     x = torch.randn(32, 8)
     _, choice = toy_moe.router(torch.relu(toy_moe.inp(x)))
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(toy_moe, sink=sink, every=1, routers={"router": 4}, auto_step=False)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(toy_moe, sink=sink, every=1, routers={"router": 4}, auto_step=False)
     toy_moe(x).sum().backward()
     session.step()
     session.close()
@@ -94,8 +94,8 @@ def test_router_counts_accumulate_across_microbatches_and_reset_on_step(toy_moe)
     _, c2 = toy_moe.router(torch.relu(toy_moe.inp(x2)))
     expected = (torch.bincount(c1, minlength=4) + torch.bincount(c2, minlength=4)).tolist()
 
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(toy_moe, sink=sink, every=1, routers={"router": 4}, auto_step=False)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(toy_moe, sink=sink, every=1, routers={"router": 4}, auto_step=False)
     toy_moe(x1).sum().backward()
     toy_moe(x2).sum().backward()
     session.step(0)
@@ -121,8 +121,8 @@ def test_a_layer_that_did_not_run_is_left_out_and_a_nan_layer_is_kept():
             return self.used(x)
 
     model = Branchy()
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, every=1, auto_step=False)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=1, auto_step=False)
     with torch.no_grad():
         model.used.weight.fill_(float("nan"))
     model(torch.ones(1, 2)).sum().backward()
@@ -135,15 +135,15 @@ def test_a_layer_that_did_not_run_is_left_out_and_a_nan_layer_is_kept():
 
 
 def test_explicit_step_numbers_and_auto_step_guard(toy_moe):
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(toy_moe, sink=sink, every=8, auto_step=False)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(toy_moe, sink=sink, every=8, auto_step=False)
     for step in (100, 101, 150):
         toy_moe(torch.randn(4, 8)).sum().backward()
         session.step(step)
     session.close()
     assert [record["step"] for record in sink.records] == [100, 101, 150]
 
-    auto = tensorlens.init(nn.Linear(2, 2), sink=tensorlens.MemorySink())
+    auto = tensorquill.init(nn.Linear(2, 2), sink=tensorquill.MemorySink())
     with pytest.raises(RuntimeError):
         auto.step()
     auto.close()
@@ -151,16 +151,16 @@ def test_explicit_step_numbers_and_auto_step_guard(toy_moe):
 
 def test_init_rejects_a_compiled_model_and_unknown_names(toy_moe):
     with pytest.raises(ValueError, match="before torch.compile"):
-        tensorlens.init(torch.compile(toy_moe, backend="eager"), sink=tensorlens.MemorySink())
+        tensorquill.init(torch.compile(toy_moe, backend="eager"), sink=tensorquill.MemorySink())
     with pytest.raises(ValueError, match="no such modules"):
-        tensorlens.init(toy_moe, layers=["nope"], sink=tensorlens.MemorySink())
+        tensorquill.init(toy_moe, layers=["nope"], sink=tensorquill.MemorySink())
     with pytest.raises(ValueError, match="no such router"):
-        tensorlens.init(toy_moe, routers={"nope": 4}, sink=tensorlens.MemorySink())
+        tensorquill.init(toy_moe, routers={"nope": 4}, sink=tensorquill.MemorySink())
 
 
 def test_jsonl_sink_writes_standard_json_with_non_finite_values(tmp_path):
     path = tmp_path / "out" / "run.jsonl"
-    sink = tensorlens.JsonlSink(path)
+    sink = tensorquill.JsonlSink(path)
     sink.write([{"step": 0, "layers": {"a": {"mean": float("nan"), "abs_max": float("inf")}}}])
     sink.close()
     text = path.read_text()
@@ -176,7 +176,7 @@ def test_a_failing_sink_is_reported_on_close(toy_moe):
         def close(self):
             pass
 
-    session = tensorlens.init(toy_moe, sink=Broken(), every=1)
+    session = tensorquill.init(toy_moe, sink=Broken(), every=1)
     train(toy_moe, 1)
     with pytest.raises(RuntimeError, match="writer thread failed"):
         session.close()
@@ -184,8 +184,8 @@ def test_a_failing_sink_is_reported_on_close(toy_moe):
 
 def test_single_element_layer_output_has_zero_std_not_nan():
     container = nn.Sequential(nn.Linear(4, 1))
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(container, sink=sink, every=1, auto_step=False)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(container, sink=sink, every=1, auto_step=False)
     container(torch.ones(1, 4)).sum().backward()
     session.step()
     session.close()
@@ -207,12 +207,12 @@ def test_float_logit_router_and_moe_stats():
         model.gate.weight[0, 0] = 10.0
         model.gate.weight[2, 0] = 5.0
 
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(
         model,
         sink=sink,
         every=1,
-        routers={"gate": tensorlens.Router(4, top_k=2)},
+        routers={"gate": tensorquill.Router(4, top_k=2)},
         auto_step=False,
     )
     model(torch.ones(8, 4)).sum().backward()
@@ -233,8 +233,8 @@ def test_cpu_replica_spread_does_not_alias_ring_buffer_when_writer_is_paused():
     import threading
 
     model = nn.Linear(4, 2, bias=False)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, every=1, auto_step=False)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=1, auto_step=False)
 
     # Pause the writer thread by blocking it on an internal gate item before queuing two flushes.
     gate = threading.Event()
@@ -278,7 +278,7 @@ def test_session_setup_allocates_no_float64_buffers_by_default_and_keeps_mps_spr
 
     monkeypatch.setattr(torch, "zeros", spy_zeros)
     model = nn.Linear(4, 2)
-    session = tensorlens.init(model, sink=tensorlens.MemorySink(), every=2, auto_step=False)
+    session = tensorquill.init(model, sink=tensorquill.MemorySink(), every=2, auto_step=False)
     assert f64_calls == []
     assert session._spread is None and session._ring_spread is None
 
@@ -291,7 +291,7 @@ def test_session_setup_allocates_no_float64_buffers_by_default_and_keeps_mps_spr
 
 
 def test_gradient_gating_and_router_only_capture(toy_moe, monkeypatch):
-    import tensorlens.capture as cap
+    import tensorquill.capture as cap
 
     norm_calls = 0
     orig_foreach_norm = cap._foreach_norm
@@ -305,8 +305,8 @@ def test_gradient_gating_and_router_only_capture(toy_moe, monkeypatch):
 
     # grads=3 gates gradient norm computation before running _foreach_norm. The default
     # weight check (every 50 steps) does not run in 6 steps.
-    sink = tensorlens.MemorySink()
-    with tensorlens.init(toy_moe, sink=sink, every=2, grads=3, routers={"router": 4}):
+    sink = tensorquill.MemorySink()
+    with tensorquill.init(toy_moe, sink=sink, every=2, grads=3, routers={"router": 4}):
         train(toy_moe, 6)
     assert norm_calls == 2
     assert not any("weight_norms" in r for r in sink.records)
@@ -321,8 +321,8 @@ def test_gradient_gating_and_router_only_capture(toy_moe, monkeypatch):
 
     # Router-only (layers=(), grads=False) computes no layer or gradient reductions
     norm_calls = 0
-    router_sink = tensorlens.MemorySink()
-    with tensorlens.init(
+    router_sink = tensorquill.MemorySink()
+    with tensorquill.init(
         toy_moe, sink=router_sink, every=2, layers=(), grads=False, routers={"router": 4}
     ):
         train(toy_moe, 4)
@@ -340,8 +340,8 @@ def test_cpu_flush_owns_single_stats_buffer(layers, grads):
         model[0].weight.fill_(1)
     gate = threading.Event()
     entered = threading.Event()
-    sink = tensorlens.MemorySink()
-    with tensorlens.init(model, sink=sink, layers=layers, grads=grads, every=1, auto_step=False) as session:
+    sink = tensorquill.MemorySink()
+    with tensorquill.init(model, sink=sink, layers=layers, grads=grads, every=1, auto_step=False) as session:
         decode = session._decode
 
         def gated_decode(*args):
@@ -367,8 +367,8 @@ def test_cpu_flush_owns_single_stats_buffer(layers, grads):
 
 def test_manual_gradient_capture_preserves_automatic_cadence():
     model = nn.Linear(1, 1, bias=False)
-    sink = tensorlens.MemorySink()
-    with tensorlens.init(model, sink=sink, auto_step=False, grads=3) as session:
+    sink = tensorquill.MemorySink()
+    with tensorquill.init(model, sink=sink, auto_step=False, grads=3) as session:
         for i in range(4):
             model.zero_grad(set_to_none=True)
             model(torch.ones(1, 1)).sum().backward()
@@ -380,12 +380,12 @@ def test_manual_gradient_capture_preserves_automatic_cadence():
 
 
 def test_weight_norms_learning_rate_start_step_and_top_k(toy_moe):
-    sink = tensorlens.MemorySink()
+    sink = tensorquill.MemorySink()
     opt = torch.optim.SGD(toy_moe.parameters(), lr=0.1)
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=1, gamma=0.5)
-    session = tensorlens.init(
+    session = tensorquill.init(
         toy_moe, sink=sink, every=2, start_step=100, weights=1,
-        routers={"router": tensorlens.Router(4, top_k=1)},
+        routers={"router": tensorquill.Router(4, top_k=1)},
     )
     for _ in range(3):
         opt.zero_grad()
@@ -403,8 +403,8 @@ def test_weight_norms_learning_rate_start_step_and_top_k(toy_moe):
 
 
 def test_weights_false_and_manual_step_learning_rate(toy_moe):
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(toy_moe, sink=sink, every=1, weights=False, auto_step=False)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(toy_moe, sink=sink, every=1, weights=False, auto_step=False)
     toy_moe(torch.randn(16, 8)).sum().backward()
     session.step(lr=3e-4)
     session.close()
@@ -413,18 +413,18 @@ def test_weights_false_and_manual_step_learning_rate(toy_moe):
 
 
 def test_weight_check_cadence_turns_on_gradients_for_its_steps(toy_moe):
-    sink = tensorlens.MemorySink()
-    with tensorlens.init(toy_moe, sink=sink, every=3, grads=False, weights=2):
+    sink = tensorquill.MemorySink()
+    with tensorquill.init(toy_moe, sink=sink, every=3, grads=False, weights=2):
         train(toy_moe, 6)
     # Checks on the 2nd, 4th and 6th steps, each with that step's gradient norms; the first
     # check has nothing to compare with.
     assert ["weight_norms" in r for r in sink.records] == [False, True, False, True, False, True]
     assert [r["grad_norm"] is not None for r in sink.records] == [False, True, False, True, False, True]
     assert ["weights_unchanged" in r for r in sink.records] == [False, False, False, True, False, True]
-    with tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), weights=False) as off:
+    with tensorquill.init(toy_moe, sink=tensorquill.MemorySink(), weights=False) as off:
         assert off.weight_every == 0
     with pytest.raises(ValueError):
-        tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), weights=-1)
+        tensorquill.init(toy_moe, sink=tensorquill.MemorySink(), weights=-1)
 
 
 class _Block(nn.Module):
@@ -454,23 +454,23 @@ class _Stack(nn.Module):
 
 def test_default_layers_are_the_repeated_blocks_and_all_keeps_every_leaf(toy_moe):
     model = _Stack()
-    with tensorlens.init(model, sink=tensorlens.MemorySink()) as session:
+    with tensorquill.init(model, sink=tensorquill.MemorySink()) as session:
         assert session.layer_names == ["layers.0", "layers.1", "layers.2"]
-    with tensorlens.init(model, sink=tensorlens.MemorySink(), layers="all") as session:
+    with tensorquill.init(model, sink=tensorquill.MemorySink(), layers="all") as session:
         assert len(session.layer_names) == 1 + 3 * 2 + 2 + 1
     # A model with no list of composite blocks falls back to every leaf module.
-    with tensorlens.init(toy_moe, sink=tensorlens.MemorySink()) as session:
-        with tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), layers="all") as every:
+    with tensorquill.init(toy_moe, sink=tensorquill.MemorySink()) as session:
+        with tensorquill.init(toy_moe, sink=tensorquill.MemorySink(), layers="all") as every:
             assert session.layer_names == every.layer_names
     with pytest.raises(ValueError):
-        tensorlens.init(model, sink=tensorlens.MemorySink(), layers="leaves")
+        tensorquill.init(model, sink=tensorquill.MemorySink(), layers="leaves")
 
 
 def test_block_statistics_match_and_compile_cleanly():
     torch.manual_seed(0)
     model = _Stack()
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, every=2, auto_step=False)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=2, auto_step=False)
     compiled = torch.compile(model, backend="aot_eager")
     x = torch.randn(16, 8)
     torch._dynamo.utils.counters.clear()
@@ -492,28 +492,28 @@ def test_block_statistics_match_and_compile_cleanly():
 
 def test_capture_modes(toy_moe):
     # MoE models default to router-only capture; dense models to full capture.
-    with tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), routers={"router": 4}) as s:
+    with tensorquill.init(toy_moe, sink=tensorquill.MemorySink(), routers={"router": 4}) as s:
         assert (s.layer_names, s.grad_every, s.weight_every) == ([], 0, 0)
-    with tensorlens.init(_Stack(), sink=tensorlens.MemorySink()) as s:
+    with tensorquill.init(_Stack(), sink=tensorquill.MemorySink()) as s:
         assert (s.layer_names, s.grad_every, s.weight_every) == (
             ["layers.0", "layers.1", "layers.2"], 1, 50
         )
-    with tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), capture="full", routers={"router": 4}) as s:
+    with tensorquill.init(toy_moe, sink=tensorquill.MemorySink(), capture="full", routers={"router": 4}) as s:
         assert s.grad_every == 1 and s.weight_every == 50 and s.layer_names
     # Explicit settings override the mode.
-    with tensorlens.init(toy_moe, sink=tensorlens.MemorySink(), routers={"router": 4}, grads=10) as s:
+    with tensorquill.init(toy_moe, sink=tensorquill.MemorySink(), routers={"router": 4}, grads=10) as s:
         assert (s.layer_names, s.grad_every) == ([], 10)
     with pytest.raises(ValueError):
-        tensorlens.init(_Stack(), sink=tensorlens.MemorySink(), capture="routers")
+        tensorquill.init(_Stack(), sink=tensorquill.MemorySink(), capture="routers")
     with pytest.raises(ValueError):
-        tensorlens.init(_Stack(), sink=tensorlens.MemorySink(), capture="everything")
+        tensorquill.init(_Stack(), sink=tensorquill.MemorySink(), capture="everything")
 
 
 def test_clip_grad_norm_is_recorded_in_router_only_mode(toy_moe):
     original = torch.nn.utils.clip_grad_norm_
     other = nn.Linear(4, 1)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(toy_moe, sink=sink, every=2, routers={"router": 4})
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(toy_moe, sink=sink, every=2, routers={"router": 4})
     assert torch.nn.utils.clip_grad_norm_ is not original
     opt = torch.optim.SGD(toy_moe.parameters(), lr=0.01)
     returned = []
@@ -531,8 +531,8 @@ def test_clip_grad_norm_is_recorded_in_router_only_mode(toy_moe):
 
 
 def test_record_grad_norm_by_hand_and_spikes_without_per_parameter_norms(toy_moe):
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(
         toy_moe, sink=sink, every=8, routers={"router": 4}, clip_norm=False, auto_step=False
     )
     assert torch.nn.utils.clip_grad_norm_.__module__ == "torch.nn.utils.clip_grad"
@@ -541,14 +541,14 @@ def test_record_grad_norm_by_hand_and_spikes_without_per_parameter_norms(toy_moe
         session.step()
     session.close()
     assert sink.records[25]["clip_grad_norm"] == pytest.approx(40.0)
-    hit = tensorlens.detect_grad_spikes(sink.records)
+    hit = tensorquill.detect_grad_spikes(sink.records)
     assert hit["step"] == 25 and hit["parameters"] == []
 
 
 def test_lightning_gradient_clipping_is_recorded(toy_moe):
     precision = pytest.importorskip("lightning.pytorch.plugins.precision")
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(toy_moe, sink=sink, every=1, routers={"router": 4})
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(toy_moe, sink=sink, every=1, routers={"router": 4})
     opt = torch.optim.SGD(toy_moe.parameters(), lr=0.01)
     opt.zero_grad()
     toy_moe(torch.randn(16, 8)).sum().backward()
@@ -562,8 +562,8 @@ def test_lightning_gradient_clipping_is_recorded(toy_moe):
 def test_activation_spike_is_found_through_real_capture():
     torch.manual_seed(0)
     model = _Stack(dim=16)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, every=10)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=10)
     opt = torch.optim.SGD(model.parameters(), lr=1e-4)
     for step in range(80):
         if step == 70:
@@ -573,7 +573,7 @@ def test_activation_spike_is_found_through_real_capture():
         model(torch.randn(32, 16)).pow(2).mean().backward()
         opt.step()
     session.close()
-    hits = {h["kind"]: h for h in tensorlens.detect_activation_anomalies(sink.records)}
+    hits = {h["kind"]: h for h in tensorquill.detect_activation_anomalies(sink.records)}
     spike = hits["activation_spike"]
     assert spike["step"] == 70
     assert spike["modules"][0]["module"] in ("layers.1", "layers.2")
@@ -582,8 +582,8 @@ def test_activation_spike_is_found_through_real_capture():
 def test_log_records_scalars_for_the_step_in_progress():
     model = nn.Linear(4, 2)
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, every=2)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=2)
     peaks = torch.arange(1.0, 7.0)
     losses = []
     for step in range(3):
@@ -609,7 +609,7 @@ def test_log_records_scalars_for_the_step_in_progress():
 
 
 def test_log_rejects_non_scalars():
-    session = tensorlens.init(nn.Linear(2, 2), sink=tensorlens.MemorySink())
+    session = tensorquill.init(nn.Linear(2, 2), sink=tensorquill.MemorySink())
     with pytest.raises(ValueError, match="one value"):
         session.log(x=torch.ones(3))
     with pytest.raises(TypeError, match="number"):
@@ -621,7 +621,7 @@ def test_log_rejects_non_scalars():
 
 def test_cached_clip_wrapper_still_works_after_the_last_session_closes():
     model = nn.Linear(4, 2)
-    session = tensorlens.init(model, sink=tensorlens.MemorySink())
+    session = tensorquill.init(model, sink=tensorquill.MemorySink())
     cached = torch.nn.utils.clip_grad_norm_  # bound while the session is open
     session.close()
     model(torch.ones(1, 4)).sum().backward()
@@ -654,8 +654,8 @@ def test_two_optimizers_count_one_step_per_iteration(set_to_none):
             return super().step(closure)
 
     opts = [MuonLike(matrices, lr=0.1), torch.optim.AdamW(rest, lr=0.01)]
-    sink = tensorlens.MemorySink()
-    session = tensorlens.init(model, sink=sink, every=2, routers={"router": 2}, capture="full")
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=2, routers={"router": 2}, capture="full")
     for _ in range(4):
         for opt in opts:
             opt.zero_grad(set_to_none=set_to_none)
@@ -676,10 +676,10 @@ def test_drift_check_follows_the_step_number_not_the_rank_local_count(monkeypatc
     monkeypatch.setattr(dist, "get_world_size", lambda g=None: 2)
     monkeypatch.setattr(dist, "all_gather", lambda out, t, group=None: [o.copy_(t) for o in out])
     model = nn.Linear(2, 2)
-    sink = tensorlens.MemorySink()
+    sink = tensorquill.MemorySink()
     # This rank's session started at step 4, as after a resume or a late start: the check
     # still runs on steps 5 and 8, where every other rank with replica_every=3 runs it.
-    session = tensorlens.init(
+    session = tensorquill.init(
         model, sink=sink, auto_step=False, replica_group=object(), replica_every=3, start_step=4
     )
     for _ in range(6):
@@ -692,18 +692,18 @@ def test_a_slow_sink_makes_training_wait_instead_of_growing_memory(monkeypatch):
     import threading
     import warnings
 
-    from tensorlens import capture
+    from tensorquill import capture
 
     monkeypatch.setattr(capture, "WRITER_QUEUE", 2)
     release = threading.Event()
 
-    class SlowSink(tensorlens.MemorySink):
+    class SlowSink(tensorquill.MemorySink):
         def write(self, records):
             release.wait(10)
             super().write(records)
 
     sink = SlowSink()
-    session = tensorlens.init(nn.Linear(2, 2), sink=sink, every=1, auto_step=False)
+    session = tensorquill.init(nn.Linear(2, 2), sink=sink, every=1, auto_step=False)
     caught = []
 
     def train():
@@ -732,12 +732,12 @@ def test_every_record_carries_schema_version_and_timestamp(tmp_path):
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
     path = tmp_path / "run.jsonl"
     before = time.time()
-    session = tensorlens.init(model, sink=tensorlens.JsonlSink(path), every=2)
+    session = tensorquill.init(model, sink=tensorquill.JsonlSink(path), every=2)
     for _ in range(3):
         model(torch.ones(1, 2)).sum().backward()
         opt.step()
     session.close()
-    records = tensorlens.load_records(path)
+    records = tensorquill.load_records(path)
     assert [r["schema_version"] for r in records] == [1, 1, 1]
     stamps = [r["ts"] for r in records]
     assert all(isinstance(t, float) for t in stamps)

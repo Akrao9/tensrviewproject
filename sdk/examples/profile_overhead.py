@@ -1,4 +1,4 @@
-"""Find where TensorLens capture's added time goes on a GPU: GPU work, kernel launches or syncs.
+"""Find where TensorQuill capture's added time goes on a GPU: GPU work, kernel launches or syncs.
 
 Runs the Granite benchmark's training step twice, with capture off and on, first timed
 without the profiler, then under `torch.profiler` for one flush window (50 steps). For
@@ -28,7 +28,7 @@ from typing import Any, Iterable, NamedTuple
 import torch
 from torch.autograd import DeviceType
 
-import tensorlens
+import tensorquill
 
 FLUSH_EVERY = 50
 LAUNCH_CALLS = frozenset(
@@ -170,7 +170,7 @@ def build_toy(device: torch.device):
     torch.manual_seed(0)
     models = [_ToyMoE().to(device) for _ in range(2)]
     models[1].load_state_dict(models[0].state_dict())
-    routers = {f"routers.{i}": tensorlens.Router(8, top_k=2) for i in range(4)}
+    routers = {f"routers.{i}": tensorquill.Router(8, top_k=2) for i in range(4)}
     optimizers = [torch.optim.AdamW(m.parameters(), lr=1e-3) for m in models]
     batches = torch.randint(0, 256, (4 * FLUSH_EVERY, 2, 32), device=device)
     return models, optimizers, routers, batches
@@ -228,9 +228,9 @@ def main() -> None:
     with ExitStack() as stack:
         stack.enter_context(torch._dynamo.config.patch(skip_nnmodule_hook_guards=False))
         stack.enter_context(
-            tensorlens.init(
+            tensorquill.init(
                 models[1], routers=routers, every=FLUSH_EVERY, capture=args.capture,
-                run_id="profile", sink=tensorlens.JsonlSink(args.out / "profile.jsonl"),
+                run_id="profile", sink=tensorquill.JsonlSink(args.out / "profile.jsonl"),
             )
         )
         runners = models if args.eager else [

@@ -1,4 +1,4 @@
-"""A stand-in for `tensorlens-server`, run as a subprocess by `test_flight.py` so a test can
+"""A stand-in for `tensorquill-server`, run as a subprocess by `test_flight.py` so a test can
 kill it mid-stream. Usage: `python flight_fake_server.py <store_dir> <port>`.
 
 It follows the server's `DoPut` contract: rows whose step is not above the last one kept for

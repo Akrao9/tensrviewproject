@@ -1,7 +1,7 @@
 """Hugging Face Accelerate: record the loss and the clipping norm of a custom loop.
 
-    session = tensorlens.init(model, scaler=accelerator.scaler)
-    tensorlens.accelerator.watch_accelerator(session)
+    session = tensorquill.init(model, scaler=accelerator.scaler)
+    tensorquill.accelerator.watch_accelerator(session)
 
 Accelerate is imported only by this module, so the core SDK keeps no dependency on it.
 """
@@ -59,7 +59,7 @@ def watch_accelerator(session: Session, *, loss_name: str | None = "train/loss")
 
     - **Clipping.** The norm `accelerator.clip_grad_norm_` returns, before clipping, is
       recorded as `clip_grad_norm`. Accelerate 1.16 stopped clipping through
-      `torch.nn.utils.clip_grad_norm_`, which is what TensorLens wraps by default; this
+      `torch.nn.utils.clip_grad_norm_`, which is what TensorQuill wraps by default; this
       records the norm once on either version.
     - **Loss.** The loss passed to `accelerator.backward` is logged as `loss_name` for
       each optimizer step: the mean over gradient-accumulation microbatches. It stays a
@@ -122,7 +122,7 @@ def _clip_grad_norm(self: Any, parameters: Any, *args: Any, **kwargs: Any) -> An
     if norm is not None and norm_type == 2:
         for session, calls in zip(sessions, before):
             # Accelerate up to 1.15 clips through `torch.nn.utils.clip_grad_norm_`, which
-            # TensorLens already wraps; record only when that did not happen.
+            # TensorQuill already wraps; record only when that did not happen.
             if session._clip_calls == calls:
                 session.record_grad_norm(norm)
     _restore_if_unused()

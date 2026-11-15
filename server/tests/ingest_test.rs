@@ -17,9 +17,9 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::local::LocalFileSystem;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
-use tensorlens_server::ingest::{Ingest, IngestConfig, DEFAULT_FLUSH_STEPS, DEFAULT_QUOTA_BYTES};
-use tensorlens_server::server::serve;
-use tensorlens_server::storage::Storage;
+use tensorquill_server::ingest::{Ingest, IngestConfig, DEFAULT_FLUSH_STEPS, DEFAULT_QUOTA_BYTES};
+use tensorquill_server::server::serve;
+use tensorquill_server::storage::Storage;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -564,10 +564,10 @@ async fn sigterm_flushes_buffered_rows_before_exit() {
     use std::io::{BufRead, BufReader};
 
     let dir = tempfile::tempdir().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tensorlens-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
         .args(["--listen", "127.0.0.1:0", "--store"])
         .arg(dir.path())
-        .env_remove("TENSORLENS_TOKEN")
+        .env_remove("TENSORQUILL_TOKEN")
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -605,12 +605,12 @@ async fn sigterm_flushes_buffered_rows_before_exit() {
 #[test]
 fn the_binary_refuses_an_unauthenticated_public_bind() {
     let dir = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_tensorlens-server"))
+    let output = Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
         .args(["--listen", "0.0.0.0:0", "--store"])
         .arg(dir.path())
-        .env_remove("TENSORLENS_TOKEN")
+        .env_remove("TENSORQUILL_TOKEN")
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("TENSORLENS_TOKEN"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("TENSORQUILL_TOKEN"));
 }

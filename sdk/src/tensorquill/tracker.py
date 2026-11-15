@@ -1,6 +1,6 @@
 """Find the tracker run that the tensor stream belongs to.
 
-TensorLens never imports a tracker itself. It only looks at trackers the training
+TensorQuill never imports a tracker itself. It only looks at trackers the training
 script has already imported, so it adds no import cost and no dependency.
 """
 
@@ -97,7 +97,7 @@ def generate_run_id() -> str:
 def _shared_generated_id() -> str:
     # Every rank must use the same ID, or one run's files split under different names.
     # With torch.distributed initialized, rank 0's ID is broadcast: a collective, so it
-    # needs every rank to call tensorlens.init, which per-rank capture does anyway.
+    # needs every rank to call tensorquill.init, which per-rank capture does anyway.
     run_id = generate_run_id()
     dist = sys.modules.get("torch.distributed")
     if dist is not None and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:

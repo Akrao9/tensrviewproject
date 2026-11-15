@@ -306,7 +306,7 @@ def _unwatch_clipping(session: "Session") -> None:
 
 
 class Session:
-    """One model's capture. Create it with `tensorlens.init`."""
+    """One model's capture. Create it with `tensorquill.init`."""
 
     def __init__(
         self,
@@ -330,7 +330,7 @@ class Session:
         replica_params: Any = None,
     ) -> None:
         if hasattr(model, "_orig_mod"):
-            raise ValueError("call tensorlens.init(model) before torch.compile(model)")
+            raise ValueError("call tensorquill.init(model) before torch.compile(model)")
         if every < 1:
             raise ValueError("every must be at least 1")
         if isinstance(grads, bool):
@@ -475,7 +475,7 @@ class Session:
         # instead of holding every unwritten step in memory. No step is dropped.
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=WRITER_QUEUE)
         self._warned_backpressure = False
-        self._worker = threading.Thread(target=self._drain, name="tensorlens-writer", daemon=True)
+        self._worker = threading.Thread(target=self._drain, name="tensorquill-writer", daemon=True)
         self._worker.start()
 
         self._clip_watched = clip_norm
@@ -484,7 +484,7 @@ class Session:
 
         self._scaler = scaler if scaler is not None and scaler.is_enabled() else None
         # With a GradScaler, `scaler.update()` runs once per iteration whether or not the
-        # optimizer stepped, so it ends the TensorLens step; optimizer hooks still read
+        # optimizer stepped, so it ends the TensorQuill step; optimizer hooks still read
         # gradients. Without it, a step the scaler skipped would never be counted.
         self._commit_on_update = self._scaler is not None and auto_step
         if self._scaler is not None:
@@ -530,7 +530,7 @@ class Session:
         if self._foreign_steps == FOREIGN_STEPS_WARNING:
             self._foreign_steps = -1  # warn once
             warnings.warn(
-                f"TensorLens has recorded no steps: {FOREIGN_STEPS_WARNING} optimizer steps ran, none on this "
+                f"TensorQuill has recorded no steps: {FOREIGN_STEPS_WARNING} optimizer steps ran, none on this "
                 "model's parameters. If your framework steps copies of the weights (DeepSpeed ZeRO, "
                 "Megatron-LM), pass auto_step=False and call session.step() after each update.",
                 RuntimeWarning,
@@ -553,8 +553,8 @@ class Session:
             self._step_depth += 1
             return
         self._step_depth, self._outer_frame = 1, wrapper
-        # One TensorLens step per training iteration. With several optimizers on one
-        # model, the first one that ever stepped leads: its steps end TensorLens steps,
+        # One TensorQuill step per training iteration. With several optimizers on one
+        # model, the first one that ever stepped leads: its steps end TensorQuill steps,
         # and the others' steps add none and record nothing twice. Gradients are read
         # before the lead steps, after backward, so they include every optimizer's
         # parameters.
@@ -878,7 +878,7 @@ class Session:
         try:
             return run_probe(self._model, self._probe_fn, self._probe_state, devices)
         except Exception as error:  # noqa: BLE001
-            warnings.warn(f"TensorLens probe failed and was skipped: {error!r}", RuntimeWarning, stacklevel=3)
+            warnings.warn(f"TensorQuill probe failed and was skipped: {error!r}", RuntimeWarning, stacklevel=3)
             return {"error": f"{type(error).__name__}: {error}"}
         finally:
             buffers = [b for b in (self._act, *self._counts_list) if b.numel() > 0]
@@ -954,9 +954,9 @@ class Session:
             if not self._warned_backpressure:
                 self._warned_backpressure = True
                 warnings.warn(
-                    f"TensorLens's writer is {WRITER_QUEUE * self.every} steps behind; training "
+                    f"TensorQuill's writer is {WRITER_QUEUE * self.every} steps behind; training "
                     "now waits for it. The sink is slower than training, for example a stalled "
-                    "network filesystem; pass sink=tensorlens.JsonlSink(path) on local disk.",
+                    "network filesystem; pass sink=tensorquill.JsonlSink(path) on local disk.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -992,7 +992,7 @@ class Session:
     def _raise_worker_error(self) -> None:
         if self._error is not None:
             error, self._error = self._error, None
-            raise RuntimeError("the TensorLens writer thread failed") from error
+            raise RuntimeError("the TensorQuill writer thread failed") from error
 
     def _drain(self) -> None:
         while True:
@@ -1229,11 +1229,11 @@ def init(
             steps, for debugging (+4.15% on the same run). Defaults to `"routers"` when
             `routers` are given and `"full"` otherwise. `layers`, `grads` and `weights`
             override the mode's settings.
-        sink: where records go. Defaults to a JSON Lines file under `tensorlens-out/`.
-        endpoint: also stream the local file to a `tensorlens-server`, as `grpc://host:port`
-            or `grpcs://host:port`. Defaults to `TENSORLENS_ENDPOINT`; when neither is set
+        sink: where records go. Defaults to a JSON Lines file under `tensorquill-out/`.
+        endpoint: also stream the local file to a `tensorquill-server`, as `grpc://host:port`
+            or `grpcs://host:port`. Defaults to `TENSORQUILL_ENDPOINT`; when neither is set
             no socket is opened. For custom/self-signed server certificates under `grpcs://`,
-            set `TENSORLENS_TLS_CA` to the PEM CA path. Needs `pip install pyarrow`.
+            set `TENSORQUILL_TLS_CA` to the PEM CA path. Needs `pip install pyarrow`.
             See `flight.py`.
         layers: which modules' outputs to summarize. In full capture, `"blocks"`: each repeated
             block, such as each transformer layer, or every leaf module with parameters if
@@ -1291,8 +1291,8 @@ def init(
     run = resolve_run(run_id)
     if sink is None:
         name = run.run_id
-        sink = JsonlSink(Path("tensorlens-out") / f"{name}.rank{run.rank}.jsonl")
-    from .flight import attach  # a no-op unless endpoint= or TENSORLENS_ENDPOINT is set
+        sink = JsonlSink(Path("tensorquill-out") / f"{name}.rank{run.rank}.jsonl")
+    from .flight import attach  # a no-op unless endpoint= or TENSORQUILL_ENDPOINT is set
 
     sink = attach(sink, run.run_id, run.rank, endpoint)
     return Session(

@@ -2299,7 +2299,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tensorlens-server"
+name = "tensorquill-server"
 version = "0.0.1"
 dependencies = [
  "arrow",

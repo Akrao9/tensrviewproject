@@ -7,9 +7,9 @@ from torch import nn
 transformers = pytest.importorskip("transformers")
 pytest.importorskip("accelerate")
 
-import tensorlens  # noqa: E402
+import tensorquill  # noqa: E402
 from accelerate import Accelerator  # noqa: E402
-from tensorlens.huggingface import TensorLensCallback  # noqa: E402
+from tensorquill.huggingface import TensorQuillCallback  # noqa: E402
 
 
 class Model(nn.Module):
@@ -40,9 +40,9 @@ def _trainer(tmp_path, model, callback, **kwargs):
 
 def test_callback_records_steps_clipping_and_loss(tmp_path, monkeypatch):
     monkeypatch.setenv("MLFLOW_RUN_ID", "mlflow-run-9")
-    sink = tensorlens.MemorySink()
+    sink = tensorquill.MemorySink()
     model = Model()
-    callback = TensorLensCallback(sink=sink, capture="full")
+    callback = TensorQuillCallback(sink=sink, capture="full")
     trainer = _trainer(tmp_path, model, callback, max_grad_norm=0.05, gradient_accumulation_steps=2)
     originals = (Accelerator.clip_grad_norm_, Accelerator.backward)
     trainer.train()
@@ -61,10 +61,10 @@ def test_callback_records_steps_clipping_and_loss(tmp_path, monkeypatch):
 
 
 def test_callback_under_trainer_torch_compile(tmp_path):
-    sink = tensorlens.MemorySink()
+    sink = tensorquill.MemorySink()
     model = Model()
     trainer = _trainer(
-        tmp_path, model, TensorLensCallback(sink=sink, capture="full"),
+        tmp_path, model, TensorQuillCallback(sink=sink, capture="full"),
         torch_compile=True, torch_compile_backend="aot_eager",
     )
     trainer.train()
@@ -73,14 +73,14 @@ def test_callback_under_trainer_torch_compile(tmp_path):
 
 
 def test_second_train_call_and_resumed_step_numbers(tmp_path):
-    sink = tensorlens.MemorySink()
-    trainer = _trainer(tmp_path, Model(), TensorLensCallback(sink=sink))
+    sink = tensorquill.MemorySink()
+    trainer = _trainer(tmp_path, Model(), TensorQuillCallback(sink=sink))
     trainer.train()
     trainer.state.global_step = 0  # train() again from scratch: a second session
     trainer.train()
     assert [r["step"] for r in sink.records] == [0, 1, 2, 3] * 2
 
-    callback = TensorLensCallback(sink=tensorlens.MemorySink())
+    callback = TensorQuillCallback(sink=tensorquill.MemorySink())
     state = transformers.TrainerState(global_step=40)
     callback.on_train_begin(None, state, None, model=Model(), optimizer=None)
     assert callback.session._next_step == 40
@@ -94,8 +94,8 @@ def test_a_failed_train_can_be_closed_and_the_next_one_starts_clean(tmp_path):
                 raise RuntimeError("boom")
             return super().forward(x, labels)
 
-    sink = tensorlens.MemorySink()
-    callback = TensorLensCallback(sink=sink)
+    sink = tensorquill.MemorySink()
+    callback = TensorQuillCallback(sink=sink)
     with pytest.raises(RuntimeError, match="boom"):
         _trainer(tmp_path, Broken(), callback).train()
     assert callback.session is not None
@@ -107,7 +107,7 @@ def test_a_failed_train_can_be_closed_and_the_next_one_starts_clean(tmp_path):
 def test_tracker_run_on_rank_zero_reaches_every_rank(monkeypatch):
     import torch.distributed as dist
 
-    from tensorlens import huggingface
+    from tensorquill import huggingface
 
     for name in ("MLFLOW_RUN_ID",):
         monkeypatch.delenv(name, raising=False)

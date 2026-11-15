@@ -1,4 +1,4 @@
-"""Hugging Face `Trainer` callback: `Trainer(..., callbacks=[TensorLensCallback(...)])`.
+"""Hugging Face `Trainer` callback: `Trainer(..., callbacks=[TensorQuillCallback(...)])`.
 
 Transformers and Accelerate are imported only by this module, so the core SDK keeps no
 dependency on them. `SFTTrainer` and the other TRL trainers subclass `Trainer` and take
@@ -17,8 +17,8 @@ from .capture import Session, init
 from .tracker import tracker_run_id
 
 
-class TensorLensCallback(TrainerCallback):
-    """Start TensorLens when training starts and stop it when training ends.
+class TensorQuillCallback(TrainerCallback):
+    """Start TensorQuill when training starts and stop it when training ends.
 
     - **Model.** `Trainer` compiles the model (`torch_compile=True`) before any callback
       runs, but the compiled forward is traced on its first call, so hooks added in
@@ -31,7 +31,7 @@ class TensorLensCallback(TrainerCallback):
       `scaler=`, so steps the scaler skips are counted and marked.
     - **Clipping and loss.** `Trainer` clips and back-propagates through its
       `Accelerator`, and gives callbacks neither value. While a session is open the
-      callback watches the `Accelerator` (`tensorlens.accelerator.watch_accelerator`) to
+      callback watches the `Accelerator` (`tensorquill.accelerator.watch_accelerator`) to
       record the gradient norm before clipping and the loss, as `loss_name`, for each
       optimizer step (the sum over gradient-accumulation microbatches of the loss
       `Trainer` back-propagates, which is their mean). Both stay tensors on the device,
@@ -40,7 +40,7 @@ class TensorLensCallback(TrainerCallback):
     `Trainer` has no event for a failed run. If `trainer.train()` raises, call
     `callback.close()` to write what was captured.
 
-    Other keyword arguments go to `tensorlens.init`, for example `routers=`, `capture=`
+    Other keyword arguments go to `tensorquill.init`, for example `routers=`, `capture=`
     or `probe=`.
     """
 

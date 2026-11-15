@@ -1,8 +1,8 @@
 [package]
-name = "tensorlens-server"
+name = "tensorquill-server"
 version = "0.0.1"
 edition = "2021"
-description = "Self-hosted ingest server for TensorLens: Arrow Flight DoPut in, partitioned Parquet out."
+description = "Self-hosted ingest server for TensorQuill: Arrow Flight DoPut in, partitioned Parquet out."
 license = "Apache-2.0 OR MIT"
 
 [dependencies]

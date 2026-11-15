@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tensorlens"
+name = "tensorquill"
 version = "0.0.1"
 description = "See inside a PyTorch training run: cheap per-layer capture that survives torch.compile."
 readme = "README.md"
@@ -19,7 +19,7 @@ huggingface = ["transformers>=4.46", "accelerate>=1.0"]
 flight = ["pyarrow>=17"]
 
 [project.scripts]
-tensorlens = "tensorlens.evidence:main"
+tensorquill = "tensorquill.evidence:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

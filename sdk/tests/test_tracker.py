@@ -1,8 +1,8 @@
 import sys
 import types
 
-import tensorlens
-from tensorlens.tracker import resolve_run
+import tensorquill
+from tensorquill.tracker import resolve_run
 
 
 def clear(monkeypatch):
@@ -16,7 +16,7 @@ def clear(monkeypatch):
 def test_explicit_run_id_wins(monkeypatch):
     clear(monkeypatch)
     monkeypatch.setenv("MLFLOW_RUN_ID", "from-env")
-    assert resolve_run("mine") == tensorlens.RunInfo("mine", "explicit", 0)
+    assert resolve_run("mine") == tensorquill.RunInfo("mine", "explicit", 0)
 
 
 def test_env_then_active_mlflow_run_then_wandb(monkeypatch):
@@ -67,8 +67,8 @@ def test_untracked_runs_get_distinct_ids_and_files(monkeypatch, tmp_path):
     assert first.run_id != second.run_id
     monkeypatch.chdir(tmp_path)
     for _ in range(2):
-        tensorlens.init(nn.Linear(2, 2)).close()
-    assert len(list((tmp_path / "tensorlens-out").glob("run-*.rank0.jsonl"))) == 2
+        tensorquill.init(nn.Linear(2, 2)).close()
+    assert len(list((tmp_path / "tensorquill-out").glob("run-*.rank0.jsonl"))) == 2
 
 
 def test_launcher_job_id_is_shared_by_every_rank(monkeypatch):
@@ -76,7 +76,7 @@ def test_launcher_job_id_is_shared_by_every_rank(monkeypatch):
     monkeypatch.setenv("TORCHELASTIC_RUN_ID", "none")  # torchrun's default: not a job ID
     monkeypatch.setenv("SLURM_JOB_ID", "4242")
     monkeypatch.setenv("SLURM_STEP_ID", "1")
-    assert resolve_run() == tensorlens.RunInfo("run-slurm4242.1", "launcher", 0)
+    assert resolve_run() == tensorquill.RunInfo("run-slurm4242.1", "launcher", 0)
     monkeypatch.setenv("TORCHELASTIC_RUN_ID", "5c1e")
     assert resolve_run().run_id == "run-5c1e"
 
@@ -93,4 +93,4 @@ def test_generated_id_is_broadcast_from_rank_zero(monkeypatch):
         box[0] = "run-from-rank-0"
 
     monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
-    assert resolve_run() == tensorlens.RunInfo("run-from-rank-0", "generated", 1)
+    assert resolve_run() == tensorquill.RunInfo("run-from-rank-0", "generated", 1)
