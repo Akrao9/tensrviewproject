@@ -50,7 +50,8 @@ def test_a_timed_update_builds_what_watch_builds(store, tmp_path):
     row = bd.watch_update(view, 1, 100, tmp_path / "timed.json")
     assert row["steps"] == 150 and row["new_parts"] == 3 and row["incidents"] == []
     assert row["total"] == pytest.approx(row["poll"] + row["build"] + row["write"])
-    out = evidence.watch(view, tmp_path / "watched.json", interval=0.0, rank=1, polls=1)
+    # The benchmark times Python's detectors, so the watcher is told not to look for a server's report.
+    out = evidence.watch(view, tmp_path / "watched.json", interval=0.0, rank=1, polls=1, server_reports=False)
     assert out.read_bytes() == (tmp_path / "timed.json").read_bytes()
 
 

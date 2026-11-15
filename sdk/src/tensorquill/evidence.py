@@ -939,6 +939,219 @@ class _Tail:
         return bool(new)
 
 
+# The kinds `tensorquill-server` works out itself and writes to a rank's `incidents.json`.
+SERVER_KINDS = (
+    "moe_imbalance", "starved_experts", "grad_spike", "stalled_weights", "repeated_steps", "loss_scale_trouble",
+    "resume_lr_change", "activation_spike", "activation_drift", "dead_activations", "non_finite", "replica_drift",
+)
+# How long a watcher waits for the server's report to cover the newest stored part before
+# it calls the report stale and works the incidents out itself. The server reports within
+# milliseconds of a part; a rebuild after a restart is the long case (README, "Detectors in the server").
+REPORT_GRACE_SECONDS = 30.0
+# The server rewrites `watchdog.json` every `--watchdog-seconds` (10 by default). Older
+# than this while it claims to be running, and nothing is watching the run for stalls.
+STATUS_STALE_SECONDS = 60.0
+
+
+def _rank_folder(source: Path, rank: int | None) -> Path | None:
+    """The `rank=<n>` folder that `source` and `rank` name in a server's store, if any."""
+    if not source.is_dir():
+        return None
+    key, _, value = source.resolve().name.partition("=")
+    if key == "rank" and value.isdecimal():
+        return source if rank is None or int(value) == rank else None
+    if rank is not None:
+        folder = source / f"rank={rank}"
+        return folder if folder.is_dir() else None
+    folders = [path for path in source.glob("rank=*") if path.is_dir()]
+    return folders[0] if len(folders) == 1 else None
+
+
+def _newest_part(folder: Path) -> tuple[tuple[int, int] | None, Path | None, int]:
+    """The newest attempt stored in a rank's folder and its last step, read from the part
+    names alone, with that part's path and how many parts have a name the server did not give."""
+    newest: tuple[int, int] | None = None
+    newest_path: Path | None = None
+    unknown = 0
+    for part in folder.rglob("part-*.parquet"):
+        match = _PART_NAME.search(part.name)
+        key, _, attempt = part.parent.name.partition("=")
+        if match is None or key != "attempt" or not attempt.lstrip("-").isdigit() or part.parent.parent != folder:
+            unknown += 1
+            continue
+        at = (int(attempt), int(match.group(2)))
+        if newest is None or at > newest:
+            newest, newest_path = at, part
+    return newest, newest_path, unknown
+
+
+def read_server_report(
+    folder: str | Path,
+    *,
+    overload_threshold: float = OVERLOAD_THRESHOLD,
+    drift_tolerance: float = DRIFT_TOLERANCE,
+    starve_window: int = STARVE_WINDOW,
+    starve_ratio: float = STARVE_RATIO,
+    top_k: int | Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """Read a rank's `incidents.json` from a server's store and say whether it can be used.
+
+    `folder` is `runs/<run_id>/rank=<rank>`. The report has no clock in it; what makes it
+    current is that it covers exactly what is stored: its `attempt` and `last_step` are
+    those of the newest stored part, which are in the part's path, so no part is opened.
+    An empty `incidents` list means "no incidents" only in a report that is current.
+
+    Returns `{"state", "reason", "stored", "report"}`: `stored` is `(attempt, last step)`
+    of the newest part or None, `report` the parsed file or None, and `state` one of
+
+    - `current`: the report covers every stored step and uses the thresholds asked for.
+    - `nothing_stored`: no parts and no report yet.
+    - `missing`: parts, but no report (`--no-detect`, a server older than its detectors,
+      or the moment between the first part and its report).
+    - `behind`: the report stops before the newest stored part. Normal for a moment after
+      each part; lasting, it means detection is off or failed, or the server died between
+      storing a part and reporting on it.
+    - `unreadable`: the file could not be read or parsed this time.
+    - `unusable`: not a report for this rank, from a server with fewer kinds, ahead of the
+      store, or beside parts whose names say nothing about their steps.
+    - `other_thresholds`: the server applied thresholds other than the ones asked for.
+    """
+    folder = Path(folder)
+    stored, _, unknown = _newest_part(folder)
+
+    def result(state: str, reason: str, report: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {"state": state, "reason": reason, "stored": stored, "report": report}
+
+    try:
+        text = (folder / "incidents.json").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if stored is None and not unknown:
+            return result("nothing_stored", "nothing is stored for this rank yet")
+        return result("missing", "the server wrote no incidents.json for this rank (it ran with --no-detect, or is"
+                      " older than its detectors)")
+    except OSError as error:
+        return result("unreadable", f"incidents.json cannot be read ({error})")
+    try:
+        report = json.loads(text)
+    except ValueError:
+        return result("unreadable", "incidents.json is not complete JSON")
+    if (
+        not isinstance(report, dict) or report.get("schema_version") != 1 or report.get("source") != "tensorquill-server"
+        or not isinstance(report.get("incidents"), list) or not isinstance(report.get("attempt"), int)
+    ):
+        return result("unusable", "incidents.json is not a report this version can read")
+    if f"rank={report.get('rank')}" != folder.resolve().name or str(report.get("run_id")) != folder.resolve().parent.name:
+        return result("unusable", f"incidents.json is for run {report.get('run_id')!r} rank {report.get('rank')!r}, not this folder")
+    absent = [kind for kind in SERVER_KINDS if kind not in (report.get("checked") or ())]
+    if absent:
+        return result("unusable", f"the server's report does not cover {', '.join(absent)} (an older server wrote it)", report)
+    if unknown or stored is None:
+        return result("unusable", "the stored parts are not named by attempt and step, so the report cannot be dated", report)
+    applied = report.get("thresholds") or {}
+    asked = {"overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
+             "starve_window": starve_window, "starve_ratio": starve_ratio}
+    differing = [name for name, value in asked.items() if applied.get(name) != value]
+    if differing or top_k is not None:
+        what = ", ".join(f"{name} {applied.get(name)!r} where {asked[name]!r} was asked for" for name in differing)
+        return result("other_thresholds", f"the server applied {what or 'the recorded top-k, not the one given here'}", report)
+    last_step = report.get("last_step")
+    reported = (report["attempt"], last_step if isinstance(last_step, int) else -(2**63))
+    where = f"step {last_step} of attempt {report['attempt']}"
+    if reported == stored:
+        return result("current", f"the server's report is current through {where}", report)
+    if reported < stored:
+        return result("behind", f"the server's report stops at {where} and the store holds step {stored[1]} of"
+                      f" attempt {stored[0]}", report)
+    return result("unusable", f"the server's report reaches {where}, past the stored step {stored[1]} of"
+                  f" attempt {stored[0]}", report)
+
+
+def _detection(look: Mapping[str, Any], source: str, rank: int | None) -> dict[str, Any]:
+    """Where an evidence file's incidents came from, for its `detection` key."""
+    report, stored = look.get("report") or {}, look.get("stored")
+    return {
+        "source": source,
+        "state": look["state"],
+        "reason": look["reason"],
+        "rank": report.get("rank", rank),
+        **({"stored_attempt": stored[0], "stored_last_step": stored[1]} if stored else {}),
+        **({f"report_{key}": report[key] for key in ("attempt", "last_step", "steps", "rebuilds") if key in report}),
+    }
+
+
+def _report_evidence(
+    folder: Path,
+    look: Mapping[str, Any],
+    status: Mapping[str, Any] | None,
+    *,
+    traincheck: str | Path | None = None,
+    flight_recorder: str | Path | None = None,
+    flight_recorder_prefix: str | None = None,
+) -> dict[str, Any]:
+    """Evidence built from a current server report and the server's status, with no part read
+    (one is, the newest, when a stuck collective has to be dated against the last step).
+
+    The incidents are in the order `build_evidence` gives them. It has no `samples`,
+    `weight_trends` or router sizes: those are per-step data, which stays in the parts.
+    """
+    report = look["report"]
+    record_incidents = [dict(incident) for incident in report["incidents"]]
+    incidents = [i for i in record_incidents if i.get("kind") != "replica_drift"]
+    if status is not None and isinstance(status.get("incidents"), list):
+        stream_incidents = [dict(incident) for incident in status["incidents"]]
+    else:  # a status from a server that did not write the list yet
+        stream_incidents = detect_watchdog_incidents(status)
+    incidents.extend(stream_incidents)
+    # The server lists these two as not checked in every report, since it never has their
+    # files. Here they are checked when asked for, as in `build_evidence`.
+    not_checked = [
+        dict(item) for item in report.get("not_checked") or ()
+        if isinstance(item, dict) and item.get("check") not in ("flight_recorder", "traincheck")
+    ]
+
+    def newest_ts() -> float | None:
+        _, part, _ = _newest_part(folder)
+        stamps = [float(r["ts"]) for r in (_read_part(part) if part else ()) if isinstance(r.get("ts"), (int, float))]
+        return max(stamps) if stamps else None
+
+    last_step = report["last_step"] if isinstance(report.get("last_step"), int) else 0
+    traincheck_summary, recorder_summary = _check_other_sources(
+        incidents, stream_incidents, not_checked, last_step=last_step, newest_ts=newest_ts,
+        traincheck=traincheck, flight_recorder=flight_recorder, flight_recorder_prefix=flight_recorder_prefix,
+    )
+    incidents.extend(i for i in record_incidents if i.get("kind") == "replica_drift")
+    applied = report.get("thresholds") or {}
+    return {
+        "schema_version": 1,
+        "run_id": report.get("run_id"),
+        "overload_threshold": applied.get("overload_threshold", OVERLOAD_THRESHOLD),
+        "starve_window": applied.get("starve_window", STARVE_WINDOW),
+        "starve_ratio": applied.get("starve_ratio", STARVE_RATIO),
+        "incidents": incidents,
+        "samples": [],
+        "detection": {**_detection(look, "server", None), "moe_flagged": report.get("moe_flagged")},
+        **({"not_checked": not_checked} if not_checked else {}),
+        **({"flight_recorder": recorder_summary} if recorder_summary else {}),
+        **({"traincheck": traincheck_summary} if traincheck_summary else {}),
+        **({"watchdog": {k: status[k] for k in (
+            "summary", "written_at_ms", "world_size", "pauses", "recommended_silent_seconds",
+            "silent_floor_seconds", "critical_seconds",
+        ) if k in status}} if status else {}),
+    }
+
+
+def _status_age(status: Mapping[str, Any] | None) -> float | None:
+    """Seconds since a status that claims a running server was written, when that is too
+    long ago for the server to be still writing it; None otherwise."""
+    written = (status or {}).get("written_at_ms")
+    if not status or status.get("server_running") is not True or not isinstance(written, (int, float)):
+        return None
+    if status.get("summary") == "finished":
+        return None  # every rank closed its stream: there is nothing left to watch
+    age = time.time() - written / 1000.0
+    return age if age > STATUS_STALE_SECONDS else None
+
+
 def watch(
     source: str | Path,
     output: str | Path | None = None,
@@ -947,49 +1160,105 @@ def watch(
     rank: int | None = None,
     polls: int | None = None,
     on_update: Any = None,
+    server_reports: bool = True,
+    report_grace: float = REPORT_GRACE_SECONDS,
     **build_options: Any,
 ) -> Path | None:
-    """Rebuild the evidence whenever `source` grows, until interrupted.
+    """Keep the evidence file up to date while a run is going, until interrupted.
 
     `source` is a `.jsonl` file a job is writing, or a directory `tensorquill-server` is
-    writing Parquet parts into. Every `interval` seconds the new records are read and,
-    if there were any, the detectors run over the whole run and the evidence file is
-    replaced by rename. `polls` stops after that many looks, for scripts and tests;
-    `on_update(evidence, path)` is called after each write. Returns the evidence path,
-    or None if nothing was ever written.
+    writing Parquet parts into. Every `interval` seconds it is looked at again and, when
+    something changed, the evidence file is replaced by rename. `polls` stops after that
+    many looks, for scripts and tests; `on_update(evidence, path)` is called after each
+    write. Returns the evidence path, or None if nothing was ever written.
+
+    For a rank's folder in a server's store, the incidents are taken from the report the
+    server keeps there (`incidents.json`) and from its status, and no part is read, as long
+    as `read_server_report` calls that report current. The evidence then has no per-step
+    `samples`. When the report is missing or unusable, or has not caught up with the stored
+    parts `report_grace` seconds after it was last current, the parts are read and the
+    detectors run here, as they do for a `.jsonl` file; that is repeated over the whole run
+    at every change.
+    `evidence["detection"]` says which happened and why. `server_reports=False` always
+    works the incidents out here.
     """
     source = Path(source)
     tail = _Tail(source, rank)
     written: Path | None = None
     done = 0
-    status_file = build_options.get("watchdog")
+    status_file = build_options.pop("watchdog", None)
     status_file = Path(status_file) if isinstance(status_file, (str, Path)) else _watchdog_beside(source)
-    status_seen: Any = None
+    thresholds = {
+        name: build_options[name]
+        for name in ("overload_threshold", "drift_tolerance", "starve_window", "starve_ratio", "top_k")
+        if name in build_options
+    }
+    other_sources = {
+        name: build_options.get(name) for name in ("traincheck", "flight_recorder", "flight_recorder_prefix")
+    }
+    folder: Path | None = None
+    waiting_since: float | None = None
+    was_current = False
+    emitted: Any = None
     try:
         while polls is None or done < polls:
             if done:
                 time.sleep(interval)
             done += 1
-            grown = tail.poll()
+            look: dict[str, Any] | None = None
+            if server_reports:
+                folder = folder or _rank_folder(source, rank)
+            if folder is not None:
+                look = read_server_report(folder, **thresholds)
+                if look["state"] == "current":
+                    waiting_since, was_current = None, True
+                elif look["state"] in ("missing", "behind", "unreadable") and was_current:
+                    # A part is stored first and reported on a moment later, so these are
+                    # normal for that moment. The wait is counted from the last look that
+                    # found the report current, not from the newest part: a report that
+                    # never catches up must not hide behind the parts that keep arriving.
+                    # A watcher that has not seen a current report yet does not wait at all.
+                    waiting_since = time.monotonic() if waiting_since is None else waiting_since
+                    if time.monotonic() - waiting_since < report_grace:
+                        continue
+                    if look["state"] == "behind":
+                        look["state"] = "stale"
             # A hung job writes no new records, so the server's status file is also watched.
-            changed = False
-            if status_file is not None:
-                # The server rewrites the file every few seconds; only a change of verdict,
-                # of a rank's state or of the ranks missing is worth rebuilding for.
-                current = read_watchdog(status_file)
-                stamp = current and (
-                    current["summary"], tuple(current.get("missing_ranks", ())),
-                    json.dumps(current.get("pauses", {}), sort_keys=True), current.get("recommended_silent_seconds"),
-                    tuple((r.get("rank"), r.get("state"), r.get("last_step"), r.get("severity"), r.get("phase"))
-                          for r in current["ranks"]),
-                )
-                changed, status_seen = stamp is not None and stamp != status_seen, stamp
-            if not grown and not (changed and tail.records):
-                continue
-            evidence = build_evidence(
-                tail.records, **{**build_options, **({"watchdog": status_file} if status_file else {})}
+            # It is rewritten every few seconds; only a change of verdict, of a rank's state
+            # or of the ranks missing is worth a new evidence file.
+            status = read_watchdog(status_file) if status_file is not None else None
+            status_age = _status_age(status)
+            stamp = status and (
+                status["summary"], tuple(status.get("missing_ranks", ())),
+                json.dumps(status.get("pauses", {}), sort_keys=True), status.get("recommended_silent_seconds"),
+                tuple((r.get("rank"), r.get("state"), r.get("last_step"), r.get("severity"), r.get("phase"))
+                      for r in status["ranks"]),
+                status_age is not None,
             )
-            written = write_evidence(evidence, output or default_evidence_path(source, tail.records))
+            if look is not None and look["state"] == "current":
+                report = look["report"]
+                seen = ("server", report["attempt"], report.get("last_step"), report.get("steps"),
+                        report.get("rebuilds"), stamp)
+                if seen == emitted:
+                    continue
+                evidence = _report_evidence(folder, look, status, **other_sources)
+                run_id = str(report.get("run_id") or source.name)
+                path = Path(output) if output else Path(f"{run_id}.evidence.json")
+            else:
+                grown = tail.poll()
+                seen = ("python", look and look["state"], stamp)
+                if not tail.records or (not grown and seen == emitted):
+                    continue
+                evidence = build_evidence(
+                    tail.records, **{**build_options, **({"watchdog": status_file} if status_file else {})}
+                )
+                if look is not None:
+                    evidence["detection"] = _detection(look, "python", rank)
+                path = Path(output) if output else default_evidence_path(source, tail.records)
+            if status_age is not None and "watchdog" in evidence:
+                evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
+            emitted = seen
+            written = write_evidence(evidence, path)
             if on_update is not None:
                 on_update(evidence, written)
     except KeyboardInterrupt:
@@ -1092,6 +1361,65 @@ def detect_replica_drift(
                 "parameters": diverged,
             }
     return None
+
+
+def _check_other_sources(
+    incidents: list[dict[str, Any]],
+    stream_incidents: list[dict[str, Any]],
+    not_checked: list[dict[str, Any]],
+    *,
+    last_step: int,
+    newest_ts: Any,
+    traincheck: str | Path | None,
+    flight_recorder: str | Path | None,
+    flight_recorder_prefix: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Add what TrainCheck's results and PyTorch's Flight Recorder dumps show to `incidents`.
+
+    Only Python reads these two: the files are on the training nodes and never reach the
+    server. `newest_ts()` gives the time of the last recorded step, and is called only when
+    a stuck collective has to be dated against it. Returns the two summaries for the evidence.
+    """
+    traincheck_summary: dict[str, Any] | None = None
+    if traincheck is not None:
+        from .invariants import read_traincheck, traincheck_incident
+
+        try:
+            found = read_traincheck(traincheck)
+        except (OSError, ValueError) as error:
+            not_checked.append({"check": "traincheck", "reason": str(error)})
+        else:
+            traincheck_summary = {k: found[k] for k in ("distinct_invariants_violated", "first_violation_step")}
+            hit = traincheck_incident(found, step=last_step)
+            if hit is not None:
+                incidents.append(hit)
+    recorder_summary: dict[str, Any] | None = None
+    if flight_recorder is not None:
+        from .collectives import analyze_flight_recorder, flight_recorder_incident
+
+        try:
+            analysis = analyze_flight_recorder(flight_recorder, prefix=flight_recorder_prefix)
+        except (ImportError, OSError, ValueError) as error:
+            not_checked.append({"check": "flight_recorder", "reason": str(error)})
+        else:
+            recorder_summary = {
+                k: analysis[k]
+                for k in ("dumped_ranks", "collectives", "problem_count", "incomplete_dumps", "ignored_before_buffer_start")
+            }
+            hit = flight_recorder_incident(analysis, step=last_step)
+            if hit is not None:
+                incidents.append(hit)
+                if hit["kind"] == "collective_hang" and not analysis["incomplete_dumps"]:
+                    newest = newest_ts()
+                    if newest is not None and analysis["newest_dump_time"] >= newest:
+                        # A stuck collective in PyTorch's own dump is a second source for a hang the
+                        # stream only suggested, if the dump is complete and was written after the last
+                        # step TensorQuill recorded. An old or partial dump proves nothing about now.
+                        for incident in stream_incidents:
+                            if incident["assessment"] == "suspected_hang":
+                                incident["assessment"] = "confirmed_hang"
+                                incident["corroborated_by"] = "collective_hang"
+    return traincheck_summary, recorder_summary
 
 
 def build_evidence(
@@ -1255,45 +1583,14 @@ def build_evidence(
     stream_incidents = detect_watchdog_incidents(status)
     incidents.extend(stream_incidents)
     last_step = max((int(r["step"]) for r in records), default=0)
-    traincheck_summary: dict[str, Any] | None = None
-    if traincheck is not None:
-        from .invariants import read_traincheck, traincheck_incident
+    def newest_ts() -> float | None:
+        stamps = [float(r["ts"]) for r in records if isinstance(r.get("ts"), (int, float))]
+        return max(stamps) if stamps else None
 
-        try:
-            found = read_traincheck(traincheck)
-        except (OSError, ValueError) as error:
-            not_checked.append({"check": "traincheck", "reason": str(error)})
-        else:
-            traincheck_summary = {k: found[k] for k in ("distinct_invariants_violated", "first_violation_step")}
-            hit = traincheck_incident(found, step=last_step)
-            if hit is not None:
-                incidents.append(hit)
-    recorder_summary: dict[str, Any] | None = None
-    if flight_recorder is not None:
-        from .collectives import analyze_flight_recorder, flight_recorder_incident
-
-        try:
-            analysis = analyze_flight_recorder(flight_recorder, prefix=flight_recorder_prefix)
-        except (ImportError, OSError, ValueError) as error:
-            not_checked.append({"check": "flight_recorder", "reason": str(error)})
-        else:
-            recorder_summary = {
-                k: analysis[k]
-                for k in ("dumped_ranks", "collectives", "problem_count", "incomplete_dumps", "ignored_before_buffer_start")
-            }
-            hit = flight_recorder_incident(analysis, step=last_step)
-            if hit is not None:
-                incidents.append(hit)
-                stamps = [float(r["ts"]) for r in records if isinstance(r.get("ts"), (int, float))]
-                fresh = bool(stamps) and analysis["newest_dump_time"] >= max(stamps)
-                if hit["kind"] == "collective_hang" and fresh and not analysis["incomplete_dumps"]:
-                    # A stuck collective in PyTorch's own dump is a second source for a hang the
-                    # stream only suggested, if the dump is complete and was written after the last
-                    # step TensorQuill recorded. An old or partial dump proves nothing about now.
-                    for incident in stream_incidents:
-                        if incident["assessment"] == "suspected_hang":
-                            incident["assessment"] = "confirmed_hang"
-                            incident["corroborated_by"] = "collective_hang"
+    traincheck_summary, recorder_summary = _check_other_sources(
+        incidents, stream_incidents, not_checked, last_step=last_step, newest_ts=newest_ts,
+        traincheck=traincheck, flight_recorder=flight_recorder, flight_recorder_prefix=flight_recorder_prefix,
+    )
     drift_hit = detect_replica_drift(records, tolerance=drift_tolerance)
     if drift_hit is not None:
         incidents.append(drift_hit)
@@ -1634,10 +1931,11 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
     """Human- and agent-readable summary matching the bake-off's text document format."""
     lines: list[str] = []
     incidents = evidence.get("incidents", ())
-    moe = first_incident(evidence)
+    moe_incident = next((i for i in incidents if i["kind"] == "moe_imbalance"), None)
+    # Evidence built from the server's report has the incident but no per-step samples.
+    moe = first_incident(evidence) or moe_incident
     if moe is not None:
         lines += _moe_lines(evidence, moe)
-        moe_incident = next((i for i in incidents if i["kind"] == "moe_imbalance"), None)
         if moe_incident is not None:
             lines += _scalar_lines(moe_incident)
     starved = _starved_line(evidence)
@@ -1662,11 +1960,37 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
         for item in evidence.get("not_checked", ())
         if item["check"] != "resume_lr"
     ]
+    notes += _source_lines(evidence)
     if not lines:
         return "\n".join(["No incidents detected.", *notes])
     if evidence.get("layer_count"):
         lines.append(_legend(evidence))
     return "\n".join([*lines, *notes])
+
+
+def _source_lines(evidence: Mapping[str, Any]) -> list[str]:
+    """Whether the server is still watching, and whose detectors the incidents come from:
+    "no incidents" means something only next to a report that is current."""
+    lines = []
+    status = evidence.get("watchdog") or {}
+    if status.get("summary") == "server_stopped":
+        lines.append("The server has stopped: nothing is watching this run for stalls, and no new steps are stored.")
+    elif status.get("not_written_for_seconds") is not None:
+        lines.append(
+            f"The server's status was last written {status['not_written_for_seconds']:.0f} s ago: the server is not"
+            " running, or was restarted and no rank of this run has reconnected. Nothing is watching this run for stalls."
+        )
+    detection = evidence.get("detection")
+    if detection:
+        reason = detection["reason"]
+        if detection["source"] == "server":
+            lines.append(
+                f"Incidents are from tensorquill-server's report for rank {detection.get('rank')}: {reason}"
+                f" ({detection.get('report_steps')} steps judged)."
+            )
+        else:
+            lines.append(f"Incidents were worked out here from the stored parts, because {reason}.")
+    return lines
 
 
 def _scalar_lines(incident: Mapping[str, Any]) -> list[str]:
@@ -1675,6 +1999,8 @@ def _scalar_lines(incident: Mapping[str, Any]) -> list[str]:
         return []
 
     def fmt(value: Any) -> str:
+        if value is None:  # the server's report is strict JSON: a NaN or Inf is null there
+            return "not finite"
         return f"{value:.4g}" if isinstance(value, (int, float)) else str(value)
 
     parts = [
@@ -1686,9 +2012,9 @@ def _scalar_lines(incident: Mapping[str, Any]) -> list[str]:
 
 
 def _moe_lines(evidence: Mapping[str, Any], incident: Mapping[str, Any]) -> list[str]:
-    tokens = incident["routed_tokens"] or 1
+    counts, tokens = incident.get("counts"), incident.get("routed_tokens") or 1
     overloaded = ", ".join(
-        f"Expert {expert} ({_percent(incident['counts'][expert - 1] / tokens)})"
+        f"Expert {expert} ({_percent(counts[expert - 1] / tokens)})" if counts else f"Expert {expert}"
         for expert in incident["overloaded"]
     )
     dead = ", ".join(f"{expert:02}" for expert in incident["dead"])
@@ -1995,6 +2321,12 @@ def main() -> None:
     )
     parser.add_argument("--interval", type=float, default=2.0, help="seconds between looks with --watch")
     parser.add_argument(
+        "--recompute",
+        action="store_true",
+        help="with --watch on a server's store: do not use the incidents.json the server keeps for the rank; "
+        "read the parts and run the detectors here (slower; gives per-step samples)",
+    )
+    parser.add_argument(
         "--rank",
         type=int,
         help="the rank to read (default: rank 0 for a directory holding several ranks)",
@@ -2045,6 +2377,7 @@ def main() -> None:
         print(f"watching {args.input} every {args.interval:g} s; Ctrl-C to stop", flush=True)
         watch(
             args.input, args.output, interval=args.interval, rank=rank, on_update=report,
+            server_reports=not args.recompute,
             overload_threshold=args.overload_threshold, top_k=args.top_k,
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
             traincheck=args.traincheck,

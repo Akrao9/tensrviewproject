@@ -836,7 +836,11 @@ def test_watch_follows_a_growing_jsonl_file_and_new_parquet_parts(tmp_path):
 
     out = watch(run_dir, tmp_path / "live.evidence.json", interval=0.0, polls=4, on_update=more_parts)
     assert seen == [40, 50]  # attempt 2 resumed at step 30 and reached 49
-    assert json.loads(out.read_text()) == tensorquill.build_evidence(records + _steps(2, range(30, 50), moe={"r": [10, 10]}))
+    live = json.loads(out.read_text())
+    # A store with parts and no incidents.json: the detectors ran here, and the evidence says why.
+    detection = live.pop("detection")
+    assert (detection["source"], detection["state"], detection["stored_last_step"]) == ("python", "missing", 49)
+    assert live == tensorquill.build_evidence(records + _steps(2, range(30, 50), moe={"r": [10, 10]}))
     assert watch(tmp_path / "nothing-here.jsonl", interval=0.0, polls=2) is None
 
 
