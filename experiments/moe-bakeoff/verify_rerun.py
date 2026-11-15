@@ -34,25 +34,31 @@ def require_steps(samples, expected_steps, label):
         raise ValueError(f"{label}: expected steps {sorted(expected_steps)}, got {sorted(samples)}")
 
 
-def expected_expert_rows(by_key, step, layer, threshold):
-    """Recompute the expert-load rows from the counts, independently of generate.py."""
+def expected_expert_rows(by_key, step, layer):
+    """Recompute the expert-load rows from the counts, independently of the SDK's table code.
+
+    The loads, changes and order come from the counts. The status label is the detector's own
+    flag in the evidence, because the rule behind it (share, diversity drop or collapse) is
+    not a function of one sample's counts; `test_fixtures.py` checks those flags.
+    """
     previous = max(s for s, l in by_key if l == layer and s < step)
     sample, baseline = by_key[step, layer], by_key[previous, layer]
     rows = []
     for expert, (count, before) in enumerate(zip(sample["counts"], baseline["counts"], strict=True), 1):
         share = count / sample["routed_tokens"]
         delta = share - before / baseline["routed_tokens"]
-        status = "Dead" if count == 0 else "Overloaded" if share > threshold else "Active"
+        status = ("Dead" if expert in sample["dead"] else "Overloaded" if expert in sample["overloaded"]
+                  else "Starved" if expert in sample["starved"] else "Idle" if count == 0 else "Active")
         rows.append((-delta, expert, [f"#{expert:03}", f"{share * 100:.2f}%", f"{delta * 100:+.2f}", status]))
     return previous, [cells for *_, cells in sorted(rows, key=lambda row: row[:2])]
 
 
-def verify_expert_load(store, by_key, steps, layer, threshold, rune_tree=None):
+def verify_expert_load(store, by_key, steps, layer, rune_tree=None):
     tables = read_samples(store, "/incident/expert_load", "TextDocument:text")
     expected_steps = {step for step in steps if any(s < step for s in steps)}
     require_steps(tables, expected_steps, "Expert load table")
     for step in sorted(expected_steps):
-        previous, expected = expected_expert_rows(by_key, step, layer, threshold)
+        previous, expected = expected_expert_rows(by_key, step, layer)
         lines = tables[step].splitlines()
         if lines[0] != f"**Layer {layer:02} expert load** · step {step} vs. {previous}":
             raise ValueError(f"Expert load heading differs at step {step}: {lines[0]!r}")
@@ -70,7 +76,7 @@ def verify_expert_load(store, by_key, steps, layer, threshold, rune_tree=None):
         visible = sorted(cells.values(), key=lambda row: row["expert"][0])
         rune_rows = [[row[column][1] for column in ("expert", "share", "delta", "status")] for row in visible]
         incident_step = min(step for step, l in by_key if by_key[step, l]["overloaded"] or by_key[step, l]["dead"])
-        _, expected = expected_expert_rows(by_key, incident_step, layer, threshold)
+        _, expected = expected_expert_rows(by_key, incident_step, layer)
         if not rune_rows or rune_rows != expected[:len(rune_rows)]:
             raise ValueError("Rune's visible expert rows differ from the Rerun table")
         print(f"Verified Rune's {len(rune_rows)} visible expert rows against the Rerun table.")
@@ -134,7 +140,7 @@ def verify(directory, rune_tree=None):
         print("Verified matching summary text in the Rune tree and Rerun recording.")
 
     incident_layer = min(key for key, sample in by_key.items() if sample["overloaded"] or sample["dead"])[1]
-    table_count = verify_expert_load(store, by_key, steps, incident_layer, evidence["overload_threshold"], rune_tree)
+    table_count = verify_expert_load(store, by_key, steps, incident_layer, rune_tree)
 
     print(f"Verified {len(by_key) * shape[1]:,} shares (max absolute error {largest_error:.3g}, tolerance {SHARE_ATOL:g}), "
           f"{len(by_key)} diversity values, all heatmap pixels, the detector summary, "
