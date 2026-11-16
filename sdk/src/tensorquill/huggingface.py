@@ -37,6 +37,9 @@ class TensorQuillCallback(TrainerCallback):
       optimizer step (the sum over gradient-accumulation microbatches of the loss
       `Trainer` back-propagates, which is their mean). Both stay tensors on the device,
       with no sync. `loss_name=None` turns the loss off.
+    - **Data wait.** The host time spent fetching each step's batches from the `DataLoader`
+      under Accelerate's `DataLoaderShard`, before the batch is moved to the device, is
+      recorded as `data_wait` (`tensorquill.datawait`). `data_wait=False` turns it off.
 
     `Trainer` has no event for a failed run. If `trainer.train()` raises, call
     `callback.close()` to write what was captured.
@@ -62,8 +65,9 @@ class TensorQuillCallback(TrainerCallback):
         if scaler is not None:
             kwargs.setdefault("scaler", scaler)
         kwargs.setdefault("start_step", state.global_step)
+        kwargs.setdefault("data_wait", True)
         self.session = init(model, run_id=run_id, **kwargs)
-        self._watch = watch_accelerator(self.session, loss_name=self.loss_name, checkpoints=False)
+        self._watch = watch_accelerator(self.session, loss_name=self.loss_name, checkpoints=False, data_wait=False)
         if state.global_step > 0:
             # Resumed: the Trainer loaded `checkpoint-<global_step>` (or the folder it was given).
             folder = _checkpoint_folder(args, state, getattr(args, "resume_from_checkpoint", None))

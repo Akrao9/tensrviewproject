@@ -54,7 +54,9 @@ class Watch:
         self.session.log({self.loss_name: self._loss})
 
 
-def watch_accelerator(session: Session, *, loss_name: str | None = "train/loss", checkpoints: bool = True) -> Watch:
+def watch_accelerator(
+    session: Session, *, loss_name: str | None = "train/loss", checkpoints: bool = True, data_wait: bool = True
+) -> Watch:
     """Record what goes through any `Accelerator` for `session`'s model, until the session
     or the returned `Watch` is closed.
 
@@ -71,6 +73,10 @@ def watch_accelerator(session: Session, *, loss_name: str | None = "train/loss",
       the folder holds is recorded from its file names (`session.checkpoint_files`), so a resume
       that left a component out is reported (`resume_incomplete`). `checkpoints=False` turns
       this off (the `Trainer` callback records its own checkpoint folders).
+    - **Data wait.** The host time spent fetching batches from the `DataLoader` inside
+      each prepared `DataLoaderShard` is recorded as `data_wait`
+      (`session.watch_loaders()`, see `tensorquill.datawait`). The timer stops before
+      Accelerate moves the batch to the device. `data_wait=False` turns it off.
 
     It wraps `Accelerator.clip_grad_norm_`, `backward`, `save_state` and `load_state` for the whole
     process while something is watched, and restores them afterwards. Call it before or after `accelerator.prepare`.
@@ -84,6 +90,8 @@ def watch_accelerator(session: Session, *, loss_name: str | None = "train/loss",
         Accelerator.save_state = _save_state  # type: ignore[method-assign]
         Accelerator.load_state = _load_state  # type: ignore[method-assign]
     _active.append(watch)
+    if data_wait:
+        session.watch_loaders()
     close = session.close
 
     def close_and_unwatch() -> None:

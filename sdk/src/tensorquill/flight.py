@@ -126,6 +126,9 @@ _FIELDS: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "probe": ("probe_json", _ordered_json),  # attention modules in the model's order, as for layers
     "data": ("data_json", _json),
     "checkpoint": ("checkpoint_json", _json),
+    "data_wait": ("data_wait", _float),
+    "step_time": ("step_time", _float),
+    "system": ("system_json", _json),
 }
 _KEY_COLUMNS = ("schema_version", "run_id", "rank", "attempt", "step")
 # Capture always writes these two, as null when there is no value, so a null column reads
@@ -165,6 +168,9 @@ def flight_schema() -> Any:
             pa.field("probe_json", pa.string()),
             pa.field("data_json", pa.string()),
             pa.field("checkpoint_json", pa.string()),
+            pa.field("data_wait", f64),
+            pa.field("step_time", f64),
+            pa.field("system_json", pa.string()),
             pa.field("extra_json", pa.string()),
         ]
     )
@@ -449,7 +455,7 @@ class FlightSender:
                 self._stream()
                 return
             except BaseException as error:  # noqa: BLE001  the stream must never raise into training
-                self.last_error = error
+                self.last_error = _without_traceback(error)
             if self._progress:
                 self._progress = False
                 attempt = 0
@@ -583,6 +589,20 @@ class FlightSender:
                 raise ConnectionError("the server ended the stream before confirming every batch")
         finally:
             client.close()
+
+
+def _without_traceback(error: BaseException) -> BaseException:
+    """`error` and the exceptions it was raised from, without their tracebacks. A kept
+    traceback holds the sender thread's frames, and through them the sender and the gRPC
+    stream: a reference cycle. Freed by the garbage collector inside a forked DataLoader
+    worker, the stream's gRPC channel then waits forever for threads the fork did not copy."""
+    seen: set[int] = set()
+    item: BaseException | None = error
+    while item is not None and id(item) not in seen:
+        seen.add(id(item))
+        item.__traceback__ = None
+        item = item.__cause__ or item.__context__
+    return error
 
 
 def send_file(
