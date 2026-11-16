@@ -123,7 +123,7 @@ _FIELDS: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "replica_spread": ("replica_spread", _map(_list(_float))),
     "layers": ("layers_json", _ordered_json),
     "moe_stats": ("moe_stats_json", _json),
-    "probe": ("probe_json", _json),
+    "probe": ("probe_json", _ordered_json),  # attention modules in the model's order, as for layers
 }
 _KEY_COLUMNS = ("schema_version", "run_id", "rank", "attempt", "step")
 # Capture always writes these two, as null when there is no value, so a null column reads
