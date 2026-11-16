@@ -120,7 +120,11 @@ def test_a_planted_failure_in_a_growing_file_starts_the_command_once(tmp_path, h
         "run_state": "unhealthy", "kind": "non_finite", "class": "invariant", "step": 30, "rank": 0, "ranks": [0],
         "new_ranks": [0], "summary": "NaN or Inf at step 30 in <total>", "incident": incident,
     }
+    # The command inherits the watcher's environment, so a `TENSORQUILL_*` variable the watcher
+    # itself was started with (CI's server job sets `TENSORQUILL_SERVER_BIN`) is there unchanged.
+    inherited = {k: v for k, v in os.environ.items() if k.startswith("TENSORQUILL_")}
     assert env == {
+        **inherited,
         "TENSORQUILL_EVIDENCE": str(out.resolve()), "TENSORQUILL_RUN_ID": "r",
         "TENSORQUILL_INCIDENT_ID": "r/rank0/non_finite/30", "TENSORQUILL_INCIDENT_KIND": "non_finite",
         "TENSORQUILL_INCIDENT_CLASS": "invariant", "TENSORQUILL_INCIDENT_STEP": "30",
