@@ -89,17 +89,47 @@ enum Command {
     /// that rank's incidents.json. No server is started and no store is read.
     Detect {
         /// The rows as an Arrow IPC stream in the schema the SDK sends, grouped by attempt
-        /// (oldest first) and in recorded order; `-` or nothing reads standard input.
-        input: Option<PathBuf>,
+        /// (oldest first) and in recorded order; `-` or nothing reads standard input. With
+        /// --run, any number of streams.
+        input: Vec<PathBuf>,
+        /// Read every rank of one run, not one rank: the rows are grouped by their rank
+        /// column, however the ranks are spread over the inputs, and each rank is judged as
+        /// `detect` judges one. Prints the run's document: each rank's report (`reports`), and
+        /// the comparison of the ranks' batch hashes that the server makes for a run's status
+        /// (`duplicate_batches`, and `ranks_compared` for the ranks that had hashes).
+        #[arg(long)]
+        run: bool,
     },
 }
 
 /// `tensorquill-server detect`: the report goes to standard output as one line of JSON.
-fn detect(input: Option<PathBuf>, thresholds: &Arc<Thresholds>) -> Result<(), Error> {
-    use tensorquill_server::detect::detect_stream;
-    let report = match input.filter(|path| path.as_os_str() != "-") {
-        Some(path) => detect_stream(std::io::BufReader::new(std::fs::File::open(path)?), thresholds),
-        None => detect_stream(std::io::stdin().lock(), thresholds),
+fn detect(inputs: Vec<PathBuf>, run: bool, thresholds: &Arc<Thresholds>) -> Result<(), Error> {
+    use tensorquill_server::detect::{detect_run, detect_stream, read_batches};
+    let named: Vec<&PathBuf> = inputs.iter().filter(|path| path.as_os_str() != "-").collect();
+    if named.len() != inputs.len() && inputs.len() > 1 {
+        return Err("standard input (-) cannot be read beside other inputs".into());
+    }
+    let report = if run {
+        let mut batches = Vec::new();
+        if named.is_empty() {
+            batches = read_batches(std::io::stdin().lock())?;
+        }
+        for path in named {
+            let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+            batches.extend(
+                read_batches(std::io::BufReader::new(file)).map_err(|error| format!("{}: {error}", path.display()))?,
+            );
+        }
+        detect_run(&batches, thresholds)
+    } else {
+        match named[..] {
+            [] => detect_stream(std::io::stdin().lock(), thresholds),
+            [path] => detect_stream(std::io::BufReader::new(std::fs::File::open(path)?), thresholds),
+            _ => Err(
+                "several inputs are the ranks of a run: give --run (without it, detect reads one rank's rows)"
+                    .to_string(),
+            ),
+        }
     }?;
     println!("{report}");
     Ok(())
@@ -191,7 +221,9 @@ async fn run(args: Args) -> Result<(), Error> {
 async fn main() -> ExitCode {
     let mut args = Args::parse();
     let outcome = match args.command.take() {
-        Some(Command::Detect { input }) => detect(input, &Arc::new(args.thresholds.take().unwrap_or_default())),
+        Some(Command::Detect { input, run }) => {
+            detect(input, run, &Arc::new(args.thresholds.take().unwrap_or_default()))
+        }
         None => run(args).await,
     };
     match outcome {

@@ -126,3 +126,115 @@ def server_report(
     if not isinstance(report, dict) or not isinstance(report.get("incidents"), list):
         raise RuntimeError(f"{chosen} detect printed something that is not a report")
     return report
+
+
+# --- every rank of a run: `tensorquill-server detect --run` -----------------------------------
+#
+# `detect` reads one rank. With `--run` it reads the rows of every rank of one run, grouped by
+# their `rank` column, judges each rank as before, and compares the ranks' batch hashes as the
+# server does for a run's status. That comparison is `duplicate_batches`, the one kind whose
+# rule needs more than one rank's rows.
+
+# What the cross-rank comparison reads of a record: the keys, and its `data`.
+_DATA_KEYS = ("schema_version", "run_id", "rank", "attempt", "step", "ts", "data")
+
+
+def _whole(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def run_stream(records: Iterable[Mapping[str, Any]]) -> bytes:
+    """The records of every rank of one run as the Arrow IPC stream `tensorquill-server detect
+    --run` reads: grouped by rank and then by attempt, oldest first, and otherwise in the
+    order given (as `records_stream` orders one rank)."""
+    try:
+        import pyarrow as pa
+    except ImportError as error:
+        raise RuntimeError("the Rust detectors read Arrow: pip install 'tensorquill[flight]'") from error
+    from .flight import flight_schema, record_to_row
+
+    rows = [
+        record_to_row(record if isinstance(record.get("run_id"), str) else {**record, "run_id": ""})
+        for record in sorted(records, key=lambda r: (_whole(r.get("rank", 0)), _whole(r.get("attempt", 0))))
+    ]
+    schema = flight_schema()
+    out = io.BytesIO()
+    with pa.ipc.new_stream(out, schema) as writer:
+        for start in range(0, len(rows), _BATCH_ROWS):
+            writer.write_batch(pa.RecordBatch.from_pylist(rows[start:start + _BATCH_ROWS], schema=schema))
+    return out.getvalue()
+
+
+def server_run_report(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    thresholds: Mapping[str, Any] | None = None,
+    binary: str | os.PathLike[str] | None = None,
+    timeout: float | None = 300.0,
+) -> dict[str, Any]:
+    """The server's detectors over every rank of one run, from records in hand: what
+    `tensorquill-server detect --run` prints.
+
+    Pass every attempt of every rank (`load_records(..., all_attempts=True)`); records of a
+    second run are refused. Returns `{"run_id", "ranks", "reports", "ranks_compared",
+    "duplicate_batches", "incidents", ...}`: `reports` holds each rank's report as
+    `server_report` gives it for that rank alone, in rank order; `duplicate_batches` is the
+    cross-rank finding or None; `incidents` lists it as an incident; and `ranks_compared` are
+    the ranks that had a hashed batch to compare, whether or not anything was found.
+
+    `thresholds`, `binary` and the errors are `server_report`'s.
+    """
+    records = list(records)
+    if not records:
+        raise ValueError("no records to judge")
+    chosen = server_binary(binary)
+    command = [chosen, "detect", "--run"]
+    if thresholds is not None:
+        try:
+            command += ["--thresholds", json.dumps(dict(thresholds), allow_nan=False)]
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"the thresholds cannot be sent as JSON: {error}") from error
+    try:
+        done = subprocess.run(command, input=run_stream(records), capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"{chosen} detect --run did not finish in {timeout:g} s") from error
+    if done.returncode != 0:
+        message = done.stderr.decode("utf-8", "replace").strip() or f"exit status {done.returncode}"
+        if "invalid value" in message and "--thresholds" in message:
+            refused = message.split("for '--thresholds <JSON>':", 1)[-1].split("\n", 1)[0].strip()
+            raise ValueError(f"the Rust detectors refuse these thresholds: {refused}")
+        if "unrecognized subcommand" in message or "unexpected argument" in message:
+            message += " (this tensorquill-server is too old to have `detect --run`: rebuild it)"
+        raise RuntimeError(f"{chosen} detect --run failed: {message}")
+    try:
+        document = json.loads(done.stdout)
+    except ValueError as error:
+        raise RuntimeError(f"{chosen} detect --run did not print a document: {done.stdout[:200]!r}") from error
+    if not isinstance(document, dict) or not isinstance(document.get("reports"), list) \
+            or not isinstance(document.get("incidents"), list):
+        raise RuntimeError(f"{chosen} detect --run printed something that is not a run's document")
+    return document
+
+
+def server_duplicate_batches(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    binary: str | os.PathLike[str] | None = None,
+    timeout: float | None = 300.0,
+) -> dict[str, Any] | None:
+    """`duplicate_batches` across the ranks of a run, from the Rust rule: the incident
+    `data_checks.detect_duplicate_batches(resolve_attempts(records))` gives (here with its
+    `class`), or None.
+
+    Pass every attempt of every rank: the Rust side leaves out what a resume rolled back, as
+    `resolve_attempts` does. Only each record's keys and `data` are sent, so this costs far
+    less than `server_run_report`, and nothing else of a rank is judged. None is also the
+    answer when fewer than two ranks drew a hashed batch; `server_run_report`'s
+    `ranks_compared` tells the two apart.
+    """
+    slim = [{key: record[key] for key in _DATA_KEYS if key in record} for record in records]
+    if not slim:
+        return None
+    document = server_run_report(slim, binary=binary, timeout=timeout)
+    found = [i for i in document["incidents"] if isinstance(i, dict) and i.get("kind") == "duplicate_batches"]
+    return found[0] if found else None

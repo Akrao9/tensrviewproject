@@ -59,7 +59,7 @@ use serde_json::{json, Value};
 use crate::storage::{Error, Storage};
 
 mod data;
-pub use data::duplicate_batches;
+pub use data::{detect_run, duplicate_batches, read_batches};
 use data::{DataProgress, DataRow, ResumeFound, ResumePass, ResumeRow};
 mod system;
 use system::{System, SystemColumns};
