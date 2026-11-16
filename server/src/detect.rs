@@ -135,6 +135,62 @@ pub const PORTED: [&str; 25] = [
 /// The kinds only `python -m tensorquill` reports: their sources never reach the server.
 pub const NOT_PORTED: [&str; 3] = ["collective_hang", "collective_desync", "traincheck_violation"];
 
+/// What each incident kind claims, as `INCIDENT_CLASSES` in `evidence.py` (the reference, and
+/// `test_incident_classes.py` holds the two identical): `invariant` (should never happen, by a
+/// fixed rule), `anomaly` (judged against the run's own baseline) or `observation` (context that
+/// claims no failure). Every kind either language reports, the server's or not, is here.
+pub const INCIDENT_CLASSES: [(&str, &str); 32] = [
+    ("moe_imbalance", "anomaly"),
+    ("starved_experts", "anomaly"),
+    ("grad_spike", "anomaly"),
+    ("stalled_weights", "invariant"),
+    ("repeated_steps", "invariant"),
+    ("loss_scale_trouble", "invariant"),
+    ("resume_lr_change", "observation"),
+    ("resume_data_mismatch", "observation"),
+    ("resume_incomplete", "observation"),
+    ("data_stalled", "invariant"),
+    ("epoch_order_repeated", "invariant"),
+    ("duplicate_batches", "invariant"),
+    ("activation_spike", "anomaly"),
+    ("activation_drift", "anomaly"),
+    ("dead_activations", "anomaly"),
+    ("attention_collapse", "anomaly"),
+    ("attention_uniform", "anomaly"),
+    ("attention_logit_growth", "anomaly"),
+    ("non_finite", "invariant"),
+    ("replica_drift", "invariant"),
+    ("memory_growth", "anomaly"),
+    ("memory_pressure", "observation"),
+    ("allocator_retries", "observation"),
+    ("hardware_errors", "invariant"),
+    ("gpu_throttled", "observation"),
+    ("input_starvation", "anomaly"),
+    ("memory_imbalance", "observation"),
+    ("job_stalled", "observation"),
+    ("rank_silent", "observation"),
+    ("collective_hang", "invariant"),
+    ("collective_desync", "invariant"),
+    ("traincheck_violation", "invariant"),
+];
+
+/// The class of an incident kind, or None for a kind this version does not know.
+pub fn incident_class(kind: &str) -> Option<&'static str> {
+    INCIDENT_CLASSES
+        .iter()
+        .find(|(known, _)| *known == kind)
+        .map(|(_, class)| *class)
+}
+
+/// Puts `class` on each incident of a known kind.
+pub fn with_classes(incidents: &mut [Value]) {
+    for incident in incidents {
+        if let Some(class) = incident["kind"].as_str().and_then(incident_class) {
+            incident["class"] = json!(class);
+        }
+    }
+}
+
 /// The thresholds in force, written beside the incidents so a reader knows what was applied.
 pub fn thresholds() -> Value {
     json!({
@@ -2599,6 +2655,7 @@ impl RankDetectors {
         out.extend(self.non_finite.first.clone());
         self.system.incidents(&mut out);
         out.extend(self.replica_drift.first.clone());
+        with_classes(&mut out);
         out
     }
 
@@ -2695,6 +2752,24 @@ pub async fn replay(storage: &Storage, run_id: &str, rank: i32) -> Result<RankDe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_kind_reported_anywhere_has_a_class_and_no_other_does() {
+        let mut every: Vec<&str> = PORTED.to_vec();
+        every.extend(NOT_PORTED);
+        // The status's kinds (`watchdog.rs`) and Python's cross-rank `memory_imbalance`.
+        every.extend(["job_stalled", "rank_silent", "duplicate_batches", "memory_imbalance"]);
+        every.sort_unstable();
+        let mut classed: Vec<&str> = INCIDENT_CLASSES.iter().map(|(kind, _)| *kind).collect();
+        classed.sort_unstable();
+        assert_eq!(classed, every);
+        assert!(INCIDENT_CLASSES
+            .iter()
+            .all(|(_, class)| matches!(*class, "invariant" | "anomaly" | "observation")));
+        assert_eq!(incident_class("gpu_throttled"), Some("observation"));
+        assert_eq!(incident_class("non_finite"), Some("invariant"));
+        assert_eq!(incident_class("something_new"), None);
+    }
+
     use super::*;
 
     #[test]

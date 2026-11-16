@@ -554,10 +554,13 @@ def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str
     `stuck_at` lists, for each stopped rank whose process sent its stack, where its main
     thread was (see `stuck_at`); it narrows the cause and does not change the assessment.
     The stacks themselves stay in the status file: an incident's `ranks` are without them.
+    Each carries its `class`, as the server's `watchdog.json` writes it.
     """
     duplicates = status.get("duplicate_batches") if status else None
     found = [{"kind": "duplicate_batches", **duplicates}] if isinstance(duplicates, Mapping) else []
-    return _progress_incidents(status) + found
+    found = _progress_incidents(status) + found
+    with_classes(found)
+    return found
 
 
 def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]]:
@@ -1301,6 +1304,75 @@ SERVER_KINDS = (
     "activation_spike", "activation_drift", "dead_activations", *ATTN_KINDS, "non_finite", "replica_drift",
     *SYSTEM_KINDS,
 )
+# What each incident kind claims, on every incident as `class` (in `evidence.json`, and in the
+# server's `incidents.json` and `watchdog.json`, whose table in `server/src/detect.rs` must be
+# this one):
+#   invariant    something that should never happen in a healthy run, by a fixed rule
+#   anomaly      a statistical judgement against a baseline (the run's own history)
+#   observation  context that does not claim a failure, such as an intended change at a resume
+# Only invariants and anomalies make a run `unhealthy` (see `run_state`).
+INCIDENT_CLASS_NAMES = ("invariant", "anomaly", "observation")
+INCIDENT_CLASSES: dict[str, str] = {
+    "moe_imbalance": "anomaly",
+    "starved_experts": "anomaly",
+    "grad_spike": "anomaly",
+    "stalled_weights": "invariant",
+    "repeated_steps": "invariant",
+    "loss_scale_trouble": "invariant",
+    "resume_lr_change": "observation",
+    "resume_data_mismatch": "observation",
+    "resume_incomplete": "observation",
+    "data_stalled": "invariant",
+    "epoch_order_repeated": "invariant",
+    "duplicate_batches": "invariant",
+    "activation_spike": "anomaly",
+    "activation_drift": "anomaly",
+    "dead_activations": "anomaly",
+    "attention_collapse": "anomaly",
+    "attention_uniform": "anomaly",
+    "attention_logit_growth": "anomaly",
+    "non_finite": "invariant",
+    "replica_drift": "invariant",
+    "memory_growth": "anomaly",
+    "memory_pressure": "observation",
+    "allocator_retries": "observation",
+    "hardware_errors": "invariant",
+    "gpu_throttled": "observation",
+    "input_starvation": "anomaly",
+    "memory_imbalance": "observation",
+    "job_stalled": "observation",
+    "rank_silent": "observation",
+    "collective_hang": "invariant",
+    "collective_desync": "invariant",
+    "traincheck_violation": "invariant",
+}
+
+
+def incident_class(kind: Any) -> str | None:
+    """The class of an incident kind (`INCIDENT_CLASSES`), or None for a kind this version
+    does not know. Taken from the kind, never from an incident's own `class`."""
+    return INCIDENT_CLASSES.get(kind) if isinstance(kind, str) else None
+
+
+def _class_key(kind: Any) -> dict[str, str]:
+    found = incident_class(kind)
+    return {"class": found} if found is not None else {}
+
+
+def with_classes(incidents: Iterable[dict[str, Any]]) -> None:
+    """Put `class` on each incident of a known kind, right after `kind`, in place. A kind
+    this version does not know keeps whatever it has."""
+    for incident in incidents:
+        found = incident_class(incident.get("kind"))
+        if found is None:
+            continue
+        items = [(k, v) for k, v in incident.items() if k != "class"]
+        at = next((i + 1 for i, (k, _) in enumerate(items) if k == "kind"), 0)
+        items.insert(at, ("class", found))
+        incident.clear()
+        incident.update(items)
+
+
 # How long a watcher waits for the server's report to cover the newest stored part before
 # it calls the report stale and works the incidents out itself. Measured with 64 ranks on an
 # 8-core laptop: the report followed a part by 0.1 ms at the median and 77 ms at worst, and
@@ -1515,6 +1587,7 @@ def _report_evidence(
         traincheck=traincheck, flight_recorder=flight_recorder, flight_recorder_prefix=flight_recorder_prefix,
     )
     incidents.extend(i for i in record_incidents if i.get("kind") == "replica_drift")
+    with_classes(incidents)
     applied = report.get("thresholds") or {}
     evidence = {
         "schema_version": 1,
@@ -1540,18 +1613,21 @@ def _report_evidence(
 # --- One run state -----------------------------------------------------------------------
 #
 # `evidence["run_state"]`: one word for the whole picture, with every reason behind it.
-#   healthy    every expected source is current and no incident is listed
+#   healthy    every expected source is current and no invariant or anomaly is listed
 #   degraded   an optional monitor is unavailable (a check listed in `not_checked`, or no
 #              progress status at all, so stalls are not watched)
 #   unknown    required evidence is stale or missing: no steps judged, a server report that is
 #              not current, ranks without a current report, an old status, a stopped server,
-#              or a status this version does not recognise
-#   unhealthy  an incident is listed (incidents are never closed, so it stays so)
+#              or a status summary other than `active` or `finished` (a stall among them: the
+#              stream cannot tell a hang from a pause or a dead sender)
+#   unhealthy  an invariant or anomaly is listed, or a kind this version does not know
+#              (incidents are never closed, so it stays so)
+# Observations (`INCIDENT_CLASSES`) are listed as a reason of their own whose state is
+# `healthy`: they never make the state worse than the other reasons do.
 # The worst reason wins. `healthy` is only what is left when nothing at all was found
 # against it, and every status summary or report state not named here reads `unknown`.
 RUN_STATES = ("healthy", "degraded", "unknown", "unhealthy")
 _STATUS_HEALTHY = ("active", "finished")
-_STREAM_KINDS = ("job_stalled", "rank_silent")
 
 
 def _reason(state: str, code: str, detail: str, **extra: Any) -> dict[str, Any]:
@@ -1577,12 +1653,17 @@ def run_state(
     reports are not current with why and `judged_ranks` those that are (the all-ranks view).
     A rank the status expects (`missing_ranks`, or below `world_size`) that is neither listed in
     it nor judged is unknown too: the status calls a rank missing only after its silence floor,
-    and until then a run of one connected rank out of four would otherwise read healthy. Codes are stable: `incidents`;
+    and until then a run of one connected rank out of four would otherwise read healthy.
+    An incident's class is looked up from its kind (`incident_class`): observations go to the
+    `observations` reason, whose state is `healthy`, and every other incident, a kind this
+    version does not know among them, to `incidents`. Codes are stable: `incidents`;
     `no_steps`, `report_not_current`, `ranks_unknown`, `status_old`, `server_stopped`,
-    `status_summary`; `no_status`, `not_checked`.
+    `status_summary`; `no_status`, `not_checked`; `observations`.
     """
     reasons: list[dict[str, Any]] = []
-    incidents = list(incidents)
+    listed = list(incidents)
+    observed = [i for i in listed if incident_class(i.get("kind")) == "observation"]
+    incidents = [i for i in listed if incident_class(i.get("kind")) != "observation"]
     if incidents:
         kinds = list(dict.fromkeys(str(i.get("kind")) for i in incidents))
         reasons.append(_reason("unhealthy", "incidents", f"{len(incidents)} incident{'s' if len(incidents) != 1 else ''}"
@@ -1612,20 +1693,23 @@ def run_state(
                                " job is still making progress is not checked"))
     else:
         summary = status.get("summary")
-        streamed = any(i.get("kind") in _STREAM_KINDS for i in incidents)
         if summary == "server_stopped":
             reasons.append(_reason("unknown", "server_stopped", "the server has stopped: no new steps are stored and"
                                    " nothing watches the run for stalls"))
         elif status_age is not None:
             reasons.append(_reason("unknown", "status_old", f"the server's status was last written {status_age:.0f} s"
                                    " ago: nothing is watching the run for stalls"))
-        if summary not in (*_STATUS_HEALTHY, "server_stopped") and not (summary in ("stalled", "degraded") and streamed):
+        if summary not in (*_STATUS_HEALTHY, "server_stopped"):
             reasons.append(_reason("unknown", "status_summary", f"the server's status says {summary!r}",
                                    summary=summary))
     checks = [item for item in not_checked if isinstance(item, Mapping)]
     if checks:
         names = list(dict.fromkeys(str(item.get("check")) for item in checks))
         reasons.append(_reason("degraded", "not_checked", f"not checked: {', '.join(names)}", checks=names))
+    if observed:
+        kinds = list(dict.fromkeys(str(i.get("kind")) for i in observed))
+        reasons.append(_reason("healthy", "observations", f"{len(observed)} observation{'s' if len(observed) != 1 else ''}"
+                               f" listed, not counted as failures: {', '.join(kinds)}", kinds=kinds))
     state = max((r["state"] for r in reasons), key=RUN_STATES.index, default="healthy")
     return {"state": state, "reasons": reasons}
 
@@ -2151,6 +2235,8 @@ def _group_incidents(looks: Mapping[int, Mapping[str, Any]], judged: list[int]) 
     groups: dict[str, dict[str, Any]] = {}
     for number in judged:
         counted: set[str] = set()
+        # Stamped from this version's table first, so a report without `class` groups the same.
+        with_classes(i for i in looks[number]["report"]["incidents"] if isinstance(i, dict) and "kind" in i)
         for incident in looks[number]["report"]["incidents"]:
             if not isinstance(incident, dict) or "kind" not in incident:
                 continue
@@ -2174,7 +2260,7 @@ def _group_incidents(looks: Mapping[int, Mapping[str, Any]], judged: list[int]) 
     out = []
     for index, group in enumerate(found):
         out.append({
-            "id": index, "kind": group["kind"], "step": group["step"],
+            "id": index, "kind": group["kind"], **_class_key(group["kind"]), "step": group["step"],
             "ranks": group["ranks"], "rank_ranges": _rank_ranges(group["ranks"]),
             "on_all_judged_ranks": len(group["ranks"]) == len(judged),
             "numbers_differ": group["numbers_differ"], "incident_rank": group["incident_rank"],
@@ -2199,7 +2285,8 @@ def _all_ranks_evidence(
     by_rank: dict[int, list[dict[str, Any]]] = {n: [] for n in judged}
     for group in groups:
         for number in group["ranks"]:
-            by_rank[number].append({"kind": group["kind"], "step": group["step"], "group": group["id"]})
+            by_rank[number].append({"kind": group["kind"], **_class_key(group["kind"]), "step": group["step"],
+                                    "group": group["id"]})
     streams: dict[int, dict[str, Any]] = {}
     for item in (status or {}).get("ranks") or ():
         if isinstance(item, dict) and isinstance(item.get("rank"), int):
@@ -2228,6 +2315,7 @@ def _all_ranks_evidence(
                 "attempt": report.get("attempt"), "last_step": report.get("last_step"), "steps": report.get("steps"),
                 "incidents": [dict(i) for i in report.get("incidents") or () if isinstance(i, dict)],
             }
+            with_classes(entry["last_report"]["incidents"])
         if number in streams:
             entry["stream"] = streams[number]
         entries.append(entry)
@@ -2256,6 +2344,7 @@ def _all_ranks_evidence(
         run_incidents, stream_incidents, not_checked, last_step=last_step, newest_ts=newest_ts,
         traincheck=traincheck, flight_recorder=flight_recorder, flight_recorder_prefix=flight_recorder_prefix,
     )
+    with_classes(run_incidents)
     states: dict[str, list[int]] = {}
     for number in sorted(looks):
         states.setdefault(looks[number]["state"], []).append(number)
@@ -2751,6 +2840,7 @@ def build_evidence(
             context = scalar_context(records, incident["step"])
             if context:
                 incident["scalars"] = context
+    with_classes(incidents)
 
     run_id = records[0].get("run_id") if records else None
     trends = weight_norm_trends(records)
@@ -3256,6 +3346,9 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
             text = _describe(incident)
             lines.append(text or f"Incident at step {incident['step']}: {incident['kind']}")
             lines += _scalar_lines(incident)
+    classes = _class_line(incidents)
+    if classes:
+        lines.append(classes)
     pauses = (evidence.get("watchdog") or {}).get("pauses") or {}
     recommended = (evidence.get("watchdog") or {}).get("recommended_silent_seconds")
     if pauses and recommended:
@@ -3387,6 +3480,9 @@ def _all_ranks_summary(evidence: Mapping[str, Any]) -> str:
     for incident in evidence.get("run_incidents", ()):
         text = _describe(incident)
         lines.append(text or f"Incident at step {incident.get('step')}: {incident['kind']}")
+    classes = _class_line([*groups, *evidence.get("run_incidents", ())])
+    if classes:
+        lines.append(classes)
     watchdog = evidence.get("watchdog") or {}
     pauses, recommended = watchdog.get("pauses") or {}, watchdog.get("recommended_silent_seconds")
     if pauses and recommended:
@@ -3402,6 +3498,22 @@ def _all_ranks_summary(evidence: Mapping[str, Any]) -> str:
     ]
     lines += _source_lines(evidence)
     return "\n".join(lines)
+
+
+def _class_line(incidents: Iterable[Mapping[str, Any]]) -> str | None:
+    """The listed kinds by class (`INCIDENT_CLASSES`), or None when nothing is listed."""
+    by_class: dict[str, list[str]] = {}
+    for incident in incidents:
+        kind = str(incident.get("kind"))
+        named = by_class.setdefault(incident_class(kind) or "unclassified", [])
+        if kind not in named:
+            named.append(kind)
+    if not by_class:
+        return None
+    order = [*INCIDENT_CLASS_NAMES, "unclassified"]
+    parts = [f"{name} {', '.join(by_class[name])}" for name in order if name in by_class]
+    note = " (observations claim no failure and do not make the run unhealthy)" if "observation" in by_class else ""
+    return f"By class: {'; '.join(parts)}{note}"
 
 
 def _source_lines(evidence: Mapping[str, Any]) -> list[str]:

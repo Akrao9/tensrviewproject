@@ -81,9 +81,12 @@ def test_ranks_the_status_expects_are_unknown_until_judged():
     assert found["reasons"][0]["ranks"] == [5]
 
 
-def test_a_stall_is_unhealthy_through_its_incident_not_an_unknown_status():
+def test_a_stall_is_unknown_and_its_incident_an_observation():
+    """The stream cannot tell a hang from a long pause or a dead sender, so `job_stalled` claims
+    no failure (an observation) and the stalled summary makes the state unknown, never healthy."""
     stalled = {**ACTIVE, "summary": "stalled"}
-    assert state(status=stalled, incidents=[{"kind": "job_stalled", "step": 4}]) == ("unhealthy", ["incidents"])
+    assert state(status=stalled, incidents=[{"kind": "job_stalled", "step": 4}]) == (
+        "unknown", ["status_summary", "observations"])
 
 
 def test_an_optional_monitor_missing_is_degraded():

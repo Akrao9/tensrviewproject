@@ -748,8 +748,12 @@ const RUN_STATES: [&str; 4] = ["healthy", "degraded", "unknown", "unhealthy"];
 /// reason has `state`, `code`, `detail` and, by code, `kinds`, `ranks`, `summary` or `checks`.
 /// A rank this server has not judged since it started (it has not sent a part, its detectors
 /// failed, or `--no-detect`) is unknown; so is a missing rank, a stopped server and any summary
-/// other than `active` or `finished`. A reader of a `watchdog.json` that is no longer being
-/// rewritten must not trust it: Python calls such a status old, and the run state unknown.
+/// other than `active` or `finished` (a stall among them: the stream cannot tell a hang from a
+/// pause). A reader of a `watchdog.json` that is no longer being rewritten must not trust it:
+/// Python calls such a status old, and the run state unknown. Each incident's class comes from
+/// its kind ([`crate::detect::incident_class`]): observations are listed under `observations`,
+/// a reason whose state is `healthy`, and every other kind, an unknown one among them, makes the
+/// run unhealthy.
 pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bool) -> Value {
     let mut reasons: Vec<Value> = Vec::new();
     let ranks: Vec<i32> = status["ranks"]
@@ -759,23 +763,29 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
         .filter_map(|rank| rank["rank"].as_i64().and_then(|rank| i32::try_from(rank).ok()))
         .collect();
     let stream = status["incidents"].as_array().map_or(&[][..], Vec::as_slice);
-    let mut kinds: Vec<String> = Vec::new();
-    let mut count = 0;
+    let mut listed: Vec<String> = Vec::new();
     for rank in &ranks {
         if let Some(report) = reports.get(rank) {
-            count += report.kinds.len();
-            kinds.extend(report.kinds.iter().cloned());
+            listed.extend(report.kinds.iter().cloned());
         }
     }
-    count += stream.len();
-    kinds.extend(
+    listed.extend(
         stream
             .iter()
             .map(|incident| incident["kind"].as_str().unwrap_or_default().to_string()),
     );
-    let mut seen = std::collections::HashSet::new();
-    kinds.retain(|kind| seen.insert(kind.clone()));
-    if count > 0 {
+    let (observed, counted): (Vec<String>, Vec<String>) = listed
+        .into_iter()
+        .partition(|kind| crate::detect::incident_class(kind) == Some("observation"));
+    let distinct = |all: &[String]| {
+        let mut seen = std::collections::HashSet::new();
+        all.iter()
+            .filter(|kind| seen.insert(kind.as_str()))
+            .cloned()
+            .collect::<Vec<String>>()
+    };
+    if !counted.is_empty() {
+        let (count, kinds) = (counted.len(), distinct(&counted));
         reasons.push(json!({
             "state": "unhealthy", "code": "incidents", "kinds": kinds,
             "detail": format!("{count} incident{} listed: {}", if count == 1 { "" } else { "s" }, kinds.join(", ")),
@@ -820,13 +830,10 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
         }));
     }
     let summary = status["summary"].as_str().unwrap_or_default();
-    let streamed = stream
-        .iter()
-        .any(|incident| matches!(incident["kind"].as_str(), Some("job_stalled" | "rank_silent")));
     if summary == "server_stopped" {
         reasons.push(json!({"state": "unknown", "code": "server_stopped",
             "detail": "the server has stopped: no new steps are stored and nothing watches the run for stalls"}));
-    } else if !matches!(summary, "active" | "finished") && !(matches!(summary, "stalled" | "degraded") && streamed) {
+    } else if !matches!(summary, "active" | "finished") {
         reasons.push(
             json!({"state": "unknown", "code": "status_summary", "summary": status["summary"],
             "detail": format!("the server's status says {summary:?}")}),
@@ -843,6 +850,14 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
     if !checks.is_empty() {
         reasons.push(json!({"state": "degraded", "code": "not_checked", "checks": checks,
             "detail": format!("not checked: {}", checks.join(", "))}));
+    }
+    if !observed.is_empty() {
+        let (count, kinds) = (observed.len(), distinct(&observed));
+        reasons.push(json!({
+            "state": "healthy", "code": "observations", "kinds": kinds,
+            "detail": format!("{count} observation{} listed, not counted as failures: {}",
+                if count == 1 { "" } else { "s" }, kinds.join(", ")),
+        }));
     }
     let state = reasons
         .iter()
@@ -912,6 +927,7 @@ pub fn incidents(status: &Value) -> Vec<Value> {
         incident.extend(duplicates.clone());
         found.push(Value::Object(incident));
     }
+    crate::detect::with_classes(&mut found);
     found
 }
 
@@ -1821,16 +1837,93 @@ mod tests {
         let spike: &[&str] = &["grad_spike"];
         let (state, codes) = state_of(&two_ranks("active"), &[(0, none, none), (1, spike, none)], true);
         assert_eq!((state.as_str(), codes), ("unhealthy", vec!["incidents".to_string()]));
+        // A stall is an observation of the stream (a hang, a long pause and a dead sender look
+        // the same), so the stalled summary decides: unknown, never healthy.
         let mut stalled = two_ranks("stalled");
         stalled["incidents"] = json!([{"kind": "job_stalled", "step": 4}]);
         assert_eq!(
             state_of(&stalled, &[(0, none, none), (1, none, none)], true),
-            ("unhealthy".into(), vec!["incidents".into()])
+            ("unknown".into(), vec!["status_summary".into(), "observations".into()])
+        );
+        let mut silent = two_ranks("degraded");
+        silent["incidents"] = json!([{"kind": "rank_silent", "step": 4}]);
+        assert_eq!(
+            state_of(&silent, &[(0, none, none), (1, none, none)], true).0,
+            "unknown"
         );
         // Unhealthy wins over unknown, which wins over degraded; every reason is kept.
         let checks: &[&str] = &["attention"];
         let (state, codes) = state_of(&two_ranks("server_stopped"), &[(0, spike, checks)], true);
         assert_eq!(state, "unhealthy");
         assert_eq!(codes, ["incidents", "ranks_unknown", "server_stopped", "not_checked"]);
+    }
+
+    #[test]
+    fn observations_are_listed_and_never_make_a_run_worse() {
+        let none: &[&str] = &[];
+        let observed: &[&str] = &["gpu_throttled", "resume_lr_change", "gpu_throttled"];
+        let reports: &[(i32, &[&str], &[&str])] = &[(0, observed, none), (1, none, none)];
+        assert_eq!(
+            state_of(&two_ranks("active"), reports, true),
+            ("healthy".into(), vec!["observations".into()])
+        );
+        let found = run_state(
+            &two_ranks("active"),
+            &[(
+                0,
+                RankReport {
+                    kinds: observed.iter().map(|k| k.to_string()).collect(),
+                    not_checked: vec![],
+                },
+            )]
+            .into_iter()
+            .chain([(1, RankReport::default())])
+            .collect(),
+            true,
+        );
+        assert_eq!(found["reasons"][0]["state"], "healthy");
+        assert_eq!(
+            found["reasons"][0]["kinds"],
+            json!(["gpu_throttled", "resume_lr_change"])
+        );
+        assert_eq!(
+            found["reasons"][0]["detail"],
+            "3 observations listed, not counted as failures: gpu_throttled, resume_lr_change"
+        );
+        // Beside an anomaly: unhealthy, and the observations are still listed after the rest.
+        let both: &[&str] = &["gpu_throttled", "grad_spike"];
+        assert_eq!(
+            state_of(&two_ranks("active"), &[(0, both, none), (1, none, none)], true),
+            ("unhealthy".into(), vec!["incidents".into(), "observations".into()])
+        );
+        // Nor lifted: a rank without a report is still unknown.
+        assert_eq!(
+            state_of(&two_ranks("active"), &[(0, observed, none)], true),
+            ("unknown".into(), vec!["ranks_unknown".into(), "observations".into()])
+        );
+        // A kind this version does not know is not assumed harmless.
+        let new: &[&str] = &["something_new"];
+        assert_eq!(
+            state_of(&two_ranks("active"), &[(0, new, none), (1, none, none)], true),
+            ("unhealthy".into(), vec!["incidents".into()])
+        );
+    }
+
+    #[test]
+    fn the_status_incidents_carry_their_class() {
+        let mut status = two_ranks("stalled");
+        status["ranks"] = json!([{"rank": 0, "state": "silent", "last_step": 3}]);
+        status["duplicate_batches"] = json!({"step": 2, "ranks": [0, 1]});
+        let classes: Vec<(String, String)> = incidents(&status)
+            .iter()
+            .map(|i| (i["kind"].as_str().unwrap().into(), i["class"].as_str().unwrap().into()))
+            .collect();
+        assert_eq!(
+            classes,
+            [
+                ("job_stalled".into(), "observation".into()),
+                ("duplicate_batches".into(), "invariant".into())
+            ]
+        );
     }
 }

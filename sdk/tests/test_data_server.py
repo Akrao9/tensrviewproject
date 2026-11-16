@@ -213,7 +213,7 @@ def test_ranks_drawing_the_same_batch_show_in_the_runs_status(tmp_path):
         assert time.monotonic() < deadline, "the status never compared every rank"
         time.sleep(0.1)
     [python] = [i for i in detect_watchdog_incidents(status) if i["kind"] == "duplicate_batches"]
-    assert differences(expected, python) == []
+    assert differences({**expected, "class": "invariant"}, python) == []  # the status's incidents carry their class
     assert [i for i in status["incidents"] if i["kind"] == "duplicate_batches"] == [python]
     # A rank's own evidence reads the run's status too.
     evidence = tensorquill.build_evidence(store / "runs" / run_id, rank=1)

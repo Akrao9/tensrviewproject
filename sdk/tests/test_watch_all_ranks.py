@@ -213,11 +213,14 @@ def test_identical_incidents_on_every_rank_are_one_group_that_names_the_ranks(tm
     losses = {json.loads(run.report_file(r).read_text())["incidents"][0]["scalars"]["train/loss"]["value"] for r in range(4)}
     assert len(losses) > 1
     assert evidence["clean_ranks"] == [] and evidence["ranks_with_incidents"] == [0, 1, 2, 3]
-    assert all(entry(evidence, r)["incidents"] == [{"kind": "non_finite", "step": 30, "group": 0}] for r in range(4))
+    assert all(entry(evidence, r)["incidents"] == [{"kind": "non_finite", "class": "invariant", "step": 30, "group": 0}]
+               for r in range(4))
+    assert (group["class"], group["incident"]["class"]) == ("invariant", "invariant")
     assert summary.splitlines() == [
         "1 distinct incident on 4 of 4 ranks; every rank's report from tensorquill-server is current through step 59.",
         "Common to all 4 judged ranks (0-3):",
         "  - NaN or Inf at step 30 in blk2",
+        "By class: invariant non_finite",
     ]
     assert run.server.terminate() == 0
 
@@ -231,7 +234,9 @@ def test_the_same_fault_with_different_numbers_is_still_one_group_and_says_whose
     assert (group["kind"], group["step"], group["ranks"]) == ("grad_spike", 40, [0, 1, 2, 3])
     assert group["numbers_differ"] is True and group["incident_rank"] == 0
     assert round(group["incident"]["ratio"]) == 8
-    assert summary.splitlines()[2].startswith("  - Gradient spike at step 40: norm 8") and summary.endswith("(rank 0's numbers)")
+    lines = summary.splitlines()
+    assert lines[2].startswith("  - Gradient spike at step 40: norm 8") and lines[2].endswith("(rank 0's numbers)")
+    assert lines[3:] == ["By class: anomaly grad_spike"]
     assert run.server.terminate() == 0
 
 
@@ -243,13 +248,14 @@ def test_an_incident_on_one_rank_only_is_named_and_the_others_are_listed_as_havi
     [group] = evidence["incident_groups"]
     assert (group["ranks"], group["on_all_judged_ranks"]) == ([2], False)
     assert evidence["clean_ranks"] == [0, 1, 3] and evidence["ranks_with_incidents"] == [2]
-    assert entry(evidence, 2)["incidents"] == [{"kind": "grad_spike", "step": 40, "group": 0}]
+    assert entry(evidence, 2)["incidents"] == [{"kind": "grad_spike", "class": "anomaly", "step": 40, "group": 0}]
     assert entry(evidence, 1)["incidents"] == []
     assert summary.splitlines() == [
         "1 distinct incident on 1 of 4 ranks; every rank's report from tensorquill-server is current through step 59.",
         "Only on some ranks:",
         "  - rank 2 only: Gradient spike at step 40: norm 8, 8× the median of recent steps",
         "No incidents on ranks 0-1, 3 (3 of 4 judged).",
+        "By class: anomaly grad_spike",
     ]
     assert run.server.terminate() == 0
 
@@ -282,6 +288,7 @@ def test_the_same_kind_at_the_same_step_naming_different_things_is_two_groups(tm
         "Only on some ranks:",
         "  - ranks 0-2 (3 of 4): NaN or Inf at step 30 in blk2",
         "  - rank 3 only: NaN or Inf at step 30 in blk3",
+        "By class: invariant non_finite",
     ]
     assert run.server.terminate() == 0
 
@@ -705,7 +712,9 @@ def test_a_stall_is_one_run_level_incident_and_the_ranks_are_still_judged(tmp_pa
     lines = summary.splitlines()
     assert lines[0] == ("No incidents in the ranks' step records on any of the 3 ranks: every rank's report from"
                         " tensorquill-server is current through step 59.")
-    assert lines[1].startswith("Job stalled after step 59: none of 3 ranks has sent a new step") and len(lines) == 2
+    assert lines[1].startswith("Job stalled after step 59: none of 3 ranks has sent a new step") and len(lines) == 3
+    assert lines[2] == "By class: observation job_stalled (observations claim no failure and do not make the run unhealthy)"
+    assert (stall["class"], evidence["run_state"]["state"]) == ("observation", "unknown")
 
 
 def test_traincheck_is_read_once_for_the_run_and_a_bad_path_is_listed_not_checked(tmp_path):
@@ -951,10 +960,11 @@ def test_when_every_rank_has_a_different_incident_the_summary_is_still_a_few_lin
     evidence = json.loads(out.read_text())
     assert len(evidence["incident_groups"]) == 64 and [g["ranks"] for g in evidence["incident_groups"]][:2] == [[0], [1]]
     lines = incident_summary(evidence).splitlines()
-    assert len(lines) == 1 + 1 + ev.SUMMARY_PARTIAL_LINES + 1 == 11
+    assert len(lines) == 1 + 1 + ev.SUMMARY_PARTIAL_LINES + 1 + 1 == 12
     assert lines[0] == "64 distinct incidents on 64 of 64 ranks; every rank's report from tensorquill-server is current through step 1999."
     assert lines[2] == "  - rank 0 only: NaN or Inf at step 100 in blk0" and lines[9] == "  - rank 7 only: NaN or Inf at step 107 in blk7"
     assert lines[10] == "  - and 56 more distinct incidents on other ranks (non_finite x56); see incident_groups in the evidence file"
+    assert lines[11] == "By class: invariant non_finite"
     # Common and partial together: ten incidents on every rank and one extra on rank 5 only.
     run = fabricated_run(tmp_path / "g", 64, 2000, template, lambda rank: template["incidents"] + (
         [{"kind": "non_finite", "step": 9, "layers": ["x"], "gradients": []}] if rank == 5 else []))
