@@ -37,6 +37,8 @@ class TensorQuillCallback(L.Callback):
         self.init_kwargs = init_kwargs
         self.session: Session | None = None
         self._loss: Any = None
+        self._loaded: dict[str, Any] | None = None
+        self._loaded_step = 0
 
     def on_fit_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         kwargs = dict(self.init_kwargs)
@@ -47,8 +49,13 @@ class TensorQuillCallback(L.Callback):
         scaler = getattr(trainer.precision_plugin, "scaler", None)
         if scaler is not None:
             kwargs.setdefault("scaler", scaler)
-        kwargs.setdefault("start_step", trainer.global_step)
+        # Lightning restores the loops' progress after this hook: a resumed fit still reads 0
+        # here, and the step comes from the checkpoint `on_load_checkpoint` was given.
+        kwargs.setdefault("start_step", max(trainer.global_step, self._loaded_step))
         self.session = init(pl_module, run_id=run_id, **kwargs)
+        if self._loaded is not None:
+            loaded, self._loaded, self._loaded_step = self._loaded, None, 0
+            self.session._record_manifest(loaded, "load")
 
     def on_before_backward(self, trainer: L.Trainer, pl_module: L.LightningModule, loss: Any) -> None:
         if self.session is not None and self.loss_name is not None:
@@ -75,6 +82,21 @@ class TensorQuillCallback(L.Callback):
     def on_validation_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         if self.session is not None:
             self.session.set_phase(getattr(self, "_outer_phase", "train"))
+
+    def on_save_checkpoint(self, trainer: L.Trainer, pl_module: L.LightningModule, checkpoint: dict[str, Any]) -> None:
+        """What the checkpoint holds (`session.checkpoint`): Lightning's `state_dict`,
+        `optimizer_states`, `lr_schedulers`, the precision plugin's scaler state and `loops`
+        (where the data stands)."""
+        if self.session is not None:
+            self.session.checkpoint(checkpoint, event="save")
+
+    def on_load_checkpoint(self, trainer: L.Trainer, pl_module: L.LightningModule, checkpoint: dict[str, Any]) -> None:
+        # Lightning restores before `on_fit_start`, where the session begins: kept until then.
+        from .data import checkpoint_manifest
+
+        self._loaded = checkpoint_manifest(checkpoint)
+        step = checkpoint.get("global_step")
+        self._loaded_step = step if isinstance(step, int) and not isinstance(step, bool) else 0
 
     def on_fit_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         self._close()

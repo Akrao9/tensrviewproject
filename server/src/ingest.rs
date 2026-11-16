@@ -16,7 +16,7 @@
 //! sender's file is durable. Buffered Arrow bytes across all streams are capped; a batch
 //! that does not fit is refused with `RESOURCE_EXHAUSTED` and the sender retries later.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,6 +39,9 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::detect::RankDetectors;
+
+/// A rank's last batch hashes: step -> (data rank, hash).
+type DataWindow = BTreeMap<i64, (Option<i64>, String)>;
 use crate::storage::Storage;
 use crate::watchdog::{Watchdog, WatchdogConfig, DEFAULT_WATCHDOG_INTERVAL};
 
@@ -183,6 +186,9 @@ pub struct Ingest {
     /// What was last written per run and when, so an unchanged status is not written again
     /// until `status_refresh` has passed.
     written: Mutex<HashMap<String, (String, Instant)>>,
+    /// Each rank's last batch hashes, from its detectors, by run and rank: compared across the
+    /// ranks of a run into the status's `duplicate_batches`.
+    data_windows: Mutex<HashMap<String, BTreeMap<i32, DataWindow>>>,
 }
 
 impl Ingest {
@@ -199,6 +205,7 @@ impl Ingest {
             config,
             watchdog,
             written: Mutex::new(HashMap::new()),
+            data_windows: Mutex::new(HashMap::new()),
             used: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             buffers: Mutex::new(HashMap::new()),
@@ -407,6 +414,16 @@ impl Ingest {
             };
         }
         let Some(detectors) = &buffer.detectors else { return };
+        {
+            let window = detectors.data_window();
+            let mut windows = self.data_windows.lock().unwrap();
+            let run = windows.entry(key.0.clone()).or_default();
+            if window.is_empty() {
+                run.remove(&key.1);
+            } else {
+                run.insert(key.1, window.clone());
+            }
+        }
         let document = serde_json::json!({
             "schema_version": 1,
             "source": "tensorquill-server",
@@ -567,7 +584,21 @@ impl Ingest {
 
     /// The progress status of every run, as the server sees it now.
     pub fn watchdog_statuses(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
-        self.watchdog.statuses(Instant::now(), true)
+        self.with_data(self.watchdog.statuses(Instant::now(), true))
+    }
+
+    /// Adds each run's cross-rank data finding to its status, and to the status's incidents.
+    /// Only ranks whose detectors have read their store since this server started are compared
+    /// (`ranks_compared`); the others are not known to be clean.
+    fn with_data(&self, mut statuses: BTreeMap<String, serde_json::Value>) -> BTreeMap<String, serde_json::Value> {
+        let windows = self.data_windows.lock().unwrap();
+        for (run_id, status) in statuses.iter_mut() {
+            if let Some(found) = windows.get(run_id).and_then(crate::detect::duplicate_batches) {
+                status["duplicate_batches"] = found;
+                status["incidents"] = serde_json::json!(crate::watchdog::incidents(status));
+            }
+        }
+        statuses
     }
 
     /// Takes up the watching of every run a stopped server left unfinished, from the
@@ -617,7 +648,7 @@ impl Ingest {
         self.write_watchdog().await;
         let now = Instant::now();
         let live = self.watchdog.statuses(now, true);
-        let mut stopped = self.watchdog.statuses(now, false);
+        let mut stopped = self.with_data(self.watchdog.statuses(now, false));
         stopped.retain(|run_id, _| live[run_id]["summary"] != "finished");
         self.write_statuses(stopped).await;
     }
@@ -632,6 +663,7 @@ impl Ingest {
                 "missing": status["missing_ranks"],
                 "pauses": status["pauses"],
                 "abandoned": status["abandoned"],
+                "duplicates": status["duplicate_batches"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
                     ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object())).collect::<Vec<_>>()
                 }),

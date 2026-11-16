@@ -124,6 +124,8 @@ _FIELDS: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "layers": ("layers_json", _ordered_json),
     "moe_stats": ("moe_stats_json", _json),
     "probe": ("probe_json", _json),
+    "data": ("data_json", _json),
+    "checkpoint": ("checkpoint_json", _json),
 }
 _KEY_COLUMNS = ("schema_version", "run_id", "rank", "attempt", "step")
 # Capture always writes these two, as null when there is no value, so a null column reads
@@ -161,6 +163,8 @@ def flight_schema() -> Any:
             pa.field("layers_json", pa.string()),
             pa.field("moe_stats_json", pa.string()),
             pa.field("probe_json", pa.string()),
+            pa.field("data_json", pa.string()),
+            pa.field("checkpoint_json", pa.string()),
             pa.field("extra_json", pa.string()),
         ]
     )
