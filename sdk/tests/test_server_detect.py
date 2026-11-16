@@ -587,9 +587,12 @@ def test_a_server_started_with_thresholds_applies_them_and_a_reader_asking_for_t
 
     folder = stream.incidents_file.parent
     assert read_server_report(folder, **asked)["state"] == "current"
-    look = read_server_report(folder)
+    # The reader's rule since Nov 16, 2026 (`test_reader_thresholds.py`): one that gives no
+    # threshold takes the server's, and only one it gives that differs is refused.
+    assert read_server_report(folder)["state"] == "current"
+    look = read_server_report(folder, overload_threshold=0.35, top_k=3)
     assert look["state"] == "other_thresholds"
-    assert "top_k 2 where None was asked for" in look["reason"] and "overload_threshold 0.5 where 0.35" in look["reason"]
+    assert "top_k 2 where 3 was asked for" in look["reason"] and "overload_threshold 0.5 where 0.35" in look["reason"]
     assert read_server_report(folder, **{**asked, "top_k": {"r1": 2}})["state"] == "other_thresholds"
     assert stream.server.terminate() == 0
 
@@ -600,10 +603,13 @@ def test_a_server_started_with_thresholds_applies_them_and_a_reader_asking_for_t
     evidence, _ = look(stream, tmp_path / "same", **asked)
     assert (evidence["detection"]["source"], evidence["detection"]["state"]) == ("server", "current")
     assert differences(reference(300), [i for i in evidence["incidents"] if i["kind"] in SERVER_KINDS]) == []
-    evidence, _ = look(stream, tmp_path / "usual")
+    evidence, _ = look(stream, tmp_path / "none given")
+    assert (evidence["detection"]["source"], evidence["detection"]["state"]) == ("server", "current")
+    other = {**asked, "starve_window": 50}  # one of its own that differs; the other four stay the server's
+    evidence, _ = look(stream, tmp_path / "another", starve_window=50)
     assert (evidence["detection"]["source"], evidence["detection"]["state"]) == ("python", "other_thresholds")
     # (A logged NaN is in these incidents, so they are compared by kind and step.)
-    usual = tensorquill.build_evidence(records)["incidents"]
+    usual = tensorquill.build_evidence(records, **other)["incidents"]
     assert [(i["kind"], i["step"]) for i in evidence["incidents"]] == [(i["kind"], i["step"]) for i in usual]
     assert [(i["kind"], i["step"]) for i in usual] != [(i["kind"], i["step"]) for i in reference(300)]
 
@@ -711,10 +717,12 @@ def test_the_command_lines_thresholds_go_to_rust(tmp_path):
     assert python_evidence["incidents"] != tensorquill.build_evidence(everything())["incidents"]
 
 
-@pytest.mark.parametrize("extra", [("--watch",), ("--rank", "all")])
-def test_the_command_line_refuses_what_the_rust_path_cannot_do(tmp_path, extra):
+def test_the_command_line_no_longer_refuses_watch_or_all_ranks_with_the_rust_path(tmp_path):
+    # Until Nov 16, 2026 `--detectors rust` was refused with `--watch` and with `--rank all`, and
+    # this test held the refusal. Both are taken now (`test_watch_rust.py`,
+    # `test_all_ranks_rust.py`). What is left is the all-ranks view's own refusal of a file.
     capture = tmp_path / "run.jsonl"
     capture.write_text("".join(json.dumps(r) + "\n" for r in moe_edges()), encoding="utf-8")
-    done = run_cli(str(capture), "--detectors", "rust", *extra)
+    done = run_cli(str(capture), "--detectors", "rust", "--rank", "all")
     assert done.returncode == 2, done.stdout
-    assert "rust" in done.stderr.lower()
+    assert "needs a run folder" in done.stderr and "reads one rank once" not in done.stderr

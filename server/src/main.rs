@@ -86,26 +86,59 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     /// Run the detectors over one rank's rows and print the report the server would write as
-    /// that rank's incidents.json. No server is started and no store is read.
+    /// that rank's incidents.json; with --run, over every rank of one run. No server is started
+    /// and no store is read.
     Detect {
         /// The rows as an Arrow IPC stream in the schema the SDK sends, grouped by attempt
-        /// (oldest first) and in recorded order; `-` or nothing reads standard input.
-        input: Option<PathBuf>,
+        /// (oldest first) and in recorded order; `-` or nothing reads standard input. With
+        /// --run, any number of streams.
+        input: Vec<PathBuf>,
         /// Add `samples` to the report: one entry for every step and MoE router, with its
         /// counts and the experts the rules found overloaded, dead or starved there. The
         /// server's own incidents.json never has them; for a long MoE run they are tens of MB.
-        #[arg(long)]
+        /// One rank only: not with --run.
+        #[arg(long, conflicts_with = "run")]
         samples: bool,
+        /// Read every rank of one run, not one rank: the rows are grouped by their rank
+        /// column, however the ranks are spread over the inputs, and each rank is judged as
+        /// `detect` judges one. Prints the run's document: each rank's report (`reports`), and
+        /// the comparison of the ranks' batch hashes that the server makes for a run's status
+        /// (`duplicate_batches`, and `ranks_compared` for the ranks that had hashes).
+        #[arg(long)]
+        run: bool,
     },
 }
 
 /// `tensorquill-server detect`: the report goes to standard output as one line of JSON.
-fn detect(input: Option<PathBuf>, samples: bool, thresholds: &Arc<Thresholds>) -> Result<(), Error> {
+fn detect(inputs: Vec<PathBuf>, samples: bool, run: bool, thresholds: &Arc<Thresholds>) -> Result<(), Error> {
     use std::io::Write;
-    use tensorquill_server::detect::{detect_stream, detect_stream_samples};
-    let input: Box<dyn std::io::Read> = match input.filter(|path| path.as_os_str() != "-") {
-        Some(path) => Box::new(std::io::BufReader::new(std::fs::File::open(path)?)),
-        None => Box::new(std::io::stdin().lock()),
+    use tensorquill_server::detect::{detect_run, detect_stream, detect_stream_samples, read_batches};
+    let named: Vec<&PathBuf> = inputs.iter().filter(|path| path.as_os_str() != "-").collect();
+    if named.len() != inputs.len() && inputs.len() > 1 {
+        return Err("standard input (-) cannot be read beside other inputs".into());
+    }
+    if run {
+        let mut batches = Vec::new();
+        if named.is_empty() {
+            batches = read_batches(std::io::stdin().lock())?;
+        }
+        for path in named {
+            let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+            batches.extend(
+                read_batches(std::io::BufReader::new(file)).map_err(|error| format!("{}: {error}", path.display()))?,
+            );
+        }
+        println!("{}", detect_run(&batches, thresholds)?);
+        return Ok(());
+    }
+    let input: Box<dyn std::io::Read> = match named[..] {
+        [] => Box::new(std::io::stdin().lock()),
+        [path] => Box::new(std::io::BufReader::new(std::fs::File::open(path)?)),
+        _ => {
+            return Err(
+                "several inputs are the ranks of a run: give --run (without it, detect reads one rank's rows)".into(),
+            )
+        }
     };
     if samples {
         let mut out = std::io::BufWriter::new(std::io::stdout().lock());
@@ -204,9 +237,12 @@ async fn run(args: Args) -> Result<(), Error> {
 async fn main() -> ExitCode {
     let mut args = Args::parse();
     let outcome = match args.command.take() {
-        Some(Command::Detect { input, samples }) => {
-            detect(input, samples, &Arc::new(args.thresholds.take().unwrap_or_default()))
-        }
+        Some(Command::Detect { input, samples, run }) => detect(
+            input,
+            samples,
+            run,
+            &Arc::new(args.thresholds.take().unwrap_or_default()),
+        ),
         None => run(args).await,
     };
     match outcome {

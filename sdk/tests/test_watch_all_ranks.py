@@ -752,8 +752,11 @@ def test_what_all_ranks_cannot_do_is_refused_with_a_message_that_says_what_to_do
     again = tensorquill(folder, "--rank", "all", "--recompute", cwd=cwd)
     assert again.returncode == 2 and "--rank all cannot be combined with --recompute" in again.stderr
     assert "--rank N --watch --recompute" in again.stderr
+    # `--top-k` was refused here until the reader's threshold rule (Nov 16, 2026): it is now a
+    # threshold like the other four, compared with what each rank's server applied.
     top = tensorquill(folder, "--rank", "all", "--top-k", "2", cwd=cwd)
-    assert top.returncode == 2 and "--top-k" in top.stderr
+    assert top.returncode == 0 and "(other_thresholds): the server applied top_k None where 2 was asked for" in top.stdout
+    (cwd / f"{RUN}.all-ranks.evidence.json").unlink()
     one = tensorquill(str(run.rank_folder(0)), "--rank", "all", cwd=cwd)
     assert one.returncode == 2 and "is one rank's folder" in one.stderr
     jsonl = tensorquill(str(run.file(0)), "--rank", "all", cwd=cwd)
@@ -764,8 +767,8 @@ def test_what_all_ranks_cannot_do_is_refused_with_a_message_that_says_what_to_do
 
     with pytest.raises(ValueError, match="cannot recompute"):
         watch(run.folder, tmp_path / "x.json", rank="all", polls=1, server_reports=False)
-    with pytest.raises(ValueError, match="top_k"):
-        watch(run.folder, tmp_path / "x.json", rank="all", polls=1, top_k=2)
+    evidence, _ = look(run, tmp_path / "top", top_k=2)  # no longer refused: compared, rank by rank
+    assert evidence["ranks_by_state"] == {"other_thresholds": [0, 1]}
     with pytest.raises(ValueError, match="rank must be"):
         watch(run.folder, tmp_path / "x.json", rank="al", polls=1)
     assert not (tmp_path / "x.json").exists()

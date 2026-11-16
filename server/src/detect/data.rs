@@ -4,13 +4,17 @@
 //! counts, and `resume_data_mismatch` and `resume_incomplete`, judged on the first row of each
 //! resumed attempt while the store is replayed (as `resume_lr_change` is). Each rank also
 //! keeps its last `DUPLICATE_WINDOW` batch hashes, which [`duplicate_batches`] compares across
-//! the ranks of a run for the run's status.
+//! the ranks of a run: for the run's status in the server, and in [`detect_run`] for
+//! `tensorquill-server detect --run`, which reads every rank's rows without a server.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use arrow::array::{Int32Array, Int64Array, StringArray};
+use arrow::record_batch::RecordBatch;
 use serde_json::{json, Map, Value};
 
-use super::{text, Columns, Scalars, Wanted};
+use super::{column, judge, report, text, with_classes, Columns, Scalars, Thresholds, Wanted};
 
 // The same values as the constants of the same names in data_checks.py.
 pub const DATA_STALL_STEPS: u32 = 3;
@@ -316,6 +320,102 @@ pub fn duplicate_batches(ranks: &BTreeMap<i32, BTreeMap<i64, (Option<i64>, Strin
         "ranks": involved,
         "duplicated_steps": duplicated,
         "ranks_compared": compared,
+    }))
+}
+
+// --- every rank of a run, without a server -------------------------------------------------
+
+/// The record batches of one Arrow IPC stream, as `tensorquill-server detect` is given them.
+pub fn read_batches(input: impl std::io::Read) -> Result<Vec<RecordBatch>, String> {
+    let reader = arrow::ipc::reader::StreamReader::try_new(input, None)
+        .map_err(|error| format!("the input is not an Arrow IPC stream: {error}"))?;
+    reader
+        .collect::<Result<Vec<RecordBatch>, _>>()
+        .map_err(|error| format!("cannot read the Arrow IPC stream: {error}"))
+}
+
+/// `tensorquill-server detect --run`: the rows of every rank of one run in, and the run's
+/// document out. The rows are grouped by their `rank` column, so it does not matter how the
+/// ranks are spread over the batches or the inputs; within a rank they must be grouped by
+/// attempt, oldest first, and in recorded order, as [`judge`] reads them. Each rank is judged
+/// alone, as `detect` judges one rank, and its [`report`] is in `reports`. Then the ranks'
+/// batch-hash windows are compared as the server compares them for a run's status
+/// ([`duplicate_batches`]): `duplicate_batches` is that finding or null, `incidents` holds it
+/// as an incident, and `ranks_compared` lists the ranks that had a hashed batch to compare,
+/// found or not, so "no duplicates" can be told from "nothing to compare". Rows of a second
+/// run are refused.
+pub fn detect_run(batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Result<Value, String> {
+    let mut run: Option<String> = None;
+    let mut by_rank: BTreeMap<i32, Vec<RecordBatch>> = BTreeMap::new();
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let (Some(run_ids), Some(ranks)) = (
+            column::<StringArray>(batch, "run_id"),
+            column::<Int32Array>(batch, "rank"),
+        ) else {
+            return Err("the rows need a run_id (string) and a rank (int32) column".to_string());
+        };
+        if column::<Int64Array>(batch, "step").is_none() {
+            return Err("the rows need a step (int64) column".to_string());
+        }
+        // The batch cut where the rank changes, so every piece belongs to one rank.
+        let mut start = 0;
+        while start < batch.num_rows() {
+            let rank = ranks.value(start);
+            let mut end = start;
+            while end < batch.num_rows() && ranks.value(end) == rank {
+                let run_id = run_ids.value(end);
+                match &run {
+                    None => run = Some(run_id.to_string()),
+                    Some(known) if known == run_id => {}
+                    Some(known) => {
+                        return Err(format!(
+                            "rows of run {run_id} beside rows of run {known}: send the ranks of one run"
+                        ));
+                    }
+                }
+                end += 1;
+            }
+            by_rank.entry(rank).or_default().push(batch.slice(start, end - start));
+            start = end;
+        }
+    }
+    let Some(run_id) = run else {
+        return Err("the inputs hold no rows".to_string());
+    };
+    let mut reports = Vec::new();
+    let mut windows = BTreeMap::new();
+    for (rank, pieces) in &by_rank {
+        let detectors = judge(*rank, pieces, thresholds).map_err(|error| format!("rank {rank}: {error}"))?;
+        windows.insert(*rank, detectors.data_window().clone());
+        reports.push(report(&run_id, *rank, &detectors, 0));
+    }
+    let compared: Vec<i32> = windows
+        .iter()
+        .filter(|(_, window)| !window.is_empty())
+        .map(|(rank, _)| *rank)
+        .collect();
+    let found = duplicate_batches(&windows);
+    // As the status lists it (`watchdog::incidents`): the finding with its kind and class.
+    let mut incidents = Vec::new();
+    if let Some(Value::Object(fields)) = &found {
+        let mut incident = Map::new();
+        incident.insert("kind".into(), json!("duplicate_batches"));
+        incident.extend(fields.clone());
+        incidents.push(Value::Object(incident));
+    }
+    with_classes(&mut incidents);
+    Ok(json!({
+        "schema_version": 1,
+        "source": "tensorquill-server",
+        "run_id": run_id,
+        "ranks": by_rank.keys().collect::<Vec<_>>(),
+        "ranks_compared": compared,
+        "duplicate_batches": found,
+        "incidents": incidents,
+        "reports": reports,
     }))
 }
 
@@ -651,5 +751,172 @@ impl ResumePass {
                 self.saves.push((after, save.clone()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rows as (rank, attempt, step, data), `data` the row's `data_json` or nothing.
+    fn rows(run: &str, rows: &[(i32, i64, i64, Option<String>)]) -> RecordBatch {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Schema::new(vec![
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("rank", DataType::Int32, false),
+            Field::new("attempt", DataType::Int64, false),
+            Field::new("step", DataType::Int64, false),
+            Field::new("data_json", DataType::Utf8, true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|_| run))),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.2))),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.3.clone()).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn drew(hash: &str) -> Option<String> {
+        Some(json!({"batches": 1, "batch_hash": hash}).to_string())
+    }
+
+    /// One rank's steps: its own batches, but rank 0's on the steps in `shared`.
+    fn rank(
+        rank: i32,
+        steps: std::ops::Range<i64>,
+        shared: std::ops::Range<i64>,
+    ) -> Vec<(i32, i64, i64, Option<String>)> {
+        steps
+            .map(|step| {
+                let whose = if shared.contains(&step) { 0 } else { rank };
+                (rank, 1, step, drew(&format!("r{whose}-{step}")))
+            })
+            .collect()
+    }
+
+    fn usual() -> Arc<Thresholds> {
+        Arc::default()
+    }
+
+    #[test]
+    fn detect_run_compares_the_ranks_however_they_are_spread_over_the_batches() {
+        let (zero, one, two) = (rank(0, 0..20, 0..0), rank(1, 0..20, 5..9), rank(2, 0..20, 0..0));
+        // A batch a rank, as one file a rank gives.
+        let apart = [rows("run", &zero), rows("run", &one), rows("run", &two)];
+        // One batch with the ranks row by row, and one with a rank's rows in two places.
+        let mut mixed = Vec::new();
+        for at in 0..20 {
+            mixed.extend([zero[at].clone(), one[at].clone(), two[at].clone()]);
+        }
+        let mut split = [&one[..10], &zero[..], &two[..], &one[10..]].concat();
+        let last = split.split_off(40);
+        let document = detect_run(&apart, &usual()).unwrap();
+        assert_eq!(document["source"], "tensorquill-server");
+        assert_eq!(
+            (&document["run_id"], &document["ranks"]),
+            (&json!("run"), &json!([0, 1, 2]))
+        );
+        assert_eq!(document["ranks_compared"], json!([0, 1, 2]));
+        assert_eq!(
+            document["duplicate_batches"],
+            json!({"step": 5, "ranks": [0, 1], "duplicated_steps": 4, "ranks_compared": [0, 1, 2]})
+        );
+        assert_eq!(
+            document["incidents"],
+            json!([{"kind": "duplicate_batches", "class": "invariant", "step": 5, "ranks": [0, 1],
+                    "duplicated_steps": 4, "ranks_compared": [0, 1, 2]}])
+        );
+        // Each rank's report is the one `detect` gives for that rank alone.
+        let reports = document["reports"].as_array().unwrap();
+        assert_eq!(reports.len(), 3);
+        for (number, piece) in [&zero, &one, &two].into_iter().enumerate() {
+            let alone = report(
+                "run",
+                number as i32,
+                &judge(number as i32, &[rows("run", piece)], &usual()).unwrap(),
+                0,
+            );
+            assert_eq!(reports[number], alone);
+            assert_eq!((&alone["rank"], &alone["steps"]), (&json!(number), &json!(20)));
+        }
+        assert_eq!(detect_run(&[rows("run", &mixed)], &usual()).unwrap(), document);
+        assert_eq!(
+            detect_run(&[rows("run", &split), rows("run", &last)], &usual()).unwrap(),
+            document
+        );
+    }
+
+    #[test]
+    fn detect_run_says_which_ranks_it_could_compare_when_it_finds_nothing() {
+        // Different batches on every step: compared, and clean.
+        let clean = [rows("run", &rank(0, 0..5, 0..0)), rows("run", &rank(1, 0..5, 0..0))];
+        let document = detect_run(&clean, &usual()).unwrap();
+        assert_eq!(document["duplicate_batches"], Value::Null);
+        assert_eq!(
+            (&document["incidents"], &document["ranks_compared"]),
+            (&json!([]), &json!([0, 1]))
+        );
+        // One rank, and a rank that hashed nothing: no finding, and not "compared and clean".
+        let alone = detect_run(&[rows("run", &rank(0, 0..5, 0..0))], &usual()).unwrap();
+        assert_eq!(
+            (&alone["duplicate_batches"], &alone["ranks_compared"]),
+            (&Value::Null, &json!([0]))
+        );
+        let unhashed: Vec<_> = (0..5)
+            .map(|step| (1, 1, step, Some(json!({"batches": 1}).to_string())))
+            .collect();
+        let document = detect_run(&[rows("run", &rank(0, 0..5, 0..0)), rows("run", &unhashed)], &usual()).unwrap();
+        assert_eq!(
+            (&document["ranks"], &document["ranks_compared"]),
+            (&json!([0, 1]), &json!([0]))
+        );
+        assert_eq!(document["duplicate_batches"], Value::Null);
+    }
+
+    #[test]
+    fn detect_run_reads_a_ranks_attempts_and_leaves_out_what_a_resume_rolled_back() {
+        // Rank 1 drew rank 0's batches at 10..20, then resumed at 15 with its own.
+        let mut one = rank(1, 0..30, 10..20);
+        one.extend((15..30).map(|step| (1, 2, step, drew(&format!("r1-{step}")))));
+        let document = detect_run(&[rows("run", &rank(0, 0..30, 0..0)), rows("run", &one)], &usual()).unwrap();
+        assert_eq!(
+            document["duplicate_batches"],
+            json!({"step": 10, "ranks": [0, 1], "duplicated_steps": 5, "ranks_compared": [0, 1]})
+        );
+        assert_eq!(document["reports"][1]["attempt"], 2);
+    }
+
+    #[test]
+    fn detect_run_refuses_what_it_cannot_judge() {
+        let error = detect_run(
+            &[rows("run", &rank(0, 0..5, 0..0)), rows("other", &rank(1, 0..5, 0..0))],
+            &usual(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("send the ranks of one run"), "{error}");
+        let error = detect_run(&[rows("run", &[])], &usual()).err().unwrap();
+        assert!(error.contains("no rows"), "{error}");
+        // A rank's attempts out of order are refused with the rank named.
+        let mut backwards: Vec<_> = (0..5).map(|step| (1, 2, step, None)).collect();
+        backwards.extend((0..5).map(|step| (1, 1, step, None)));
+        let error = detect_run(&[rows("run", &rank(0, 0..5, 0..0)), rows("run", &backwards)], &usual())
+            .err()
+            .unwrap();
+        assert!(
+            error.starts_with("rank 1: ") && error.contains("group the rows by attempt"),
+            "{error}"
+        );
+        assert!(read_batches(&b"{\"step\": 0}\n"[..])
+            .err()
+            .unwrap()
+            .contains("not an Arrow IPC stream"));
     }
 }

@@ -1706,6 +1706,48 @@ def _top_k_option(top_k: int | Mapping[str, int] | None) -> int | dict[str, int]
     return {str(name): int(k) for name, k in top_k.items()}
 
 
+# The five detector options: `build_evidence`'s, and the keys of the server's `--thresholds`.
+THRESHOLD_NAMES = ("overload_threshold", "drift_tolerance", "starve_window", "starve_ratio", "top_k")
+THRESHOLD_DEFAULTS: dict[str, Any] = {
+    "overload_threshold": OVERLOAD_THRESHOLD, "drift_tolerance": DRIFT_TOLERANCE,
+    "starve_window": STARVE_WINDOW, "starve_ratio": STARVE_RATIO, "top_k": None,
+}
+
+
+def _given_thresholds(options: Mapping[str, Any]) -> dict[str, Any]:
+    """The thresholds a caller gave: those of the five that are in `options` and not None.
+    None is "not given" for every one of them, `top_k` included."""
+    return {
+        name: _top_k_option(options[name]) if name == "top_k" else options[name]
+        for name in THRESHOLD_NAMES if options.get(name) is not None
+    }
+
+
+def _count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def applied_thresholds(report: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The five thresholds a server's report says it applied (its `thresholds`), in the shape
+    `build_evidence` takes them. One the report does not list reads as the default: a server
+    from before `--thresholds` applied the defaults and listed no `top_k`."""
+    listed = (report or {}).get("thresholds")
+    listed = listed if isinstance(listed, Mapping) else {}
+    out = dict(THRESHOLD_DEFAULTS)
+    for name in ("overload_threshold", "drift_tolerance", "starve_ratio"):
+        value = listed.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+            out[name] = value
+    if _count(listed.get("starve_window")):
+        out["starve_window"] = listed["starve_window"]
+    top_k = listed.get("top_k")
+    if _count(top_k):
+        out["top_k"] = top_k
+    elif isinstance(top_k, Mapping) and top_k and all(_count(k) for k in top_k.values()):
+        out["top_k"] = {str(name): k for name, k in top_k.items()}
+    return out
+
+
 def _same_threshold(asked: Any, applied: Any) -> bool:
     """Whether a report applied the value asked for. A float that went to the server as JSON
     text may come back one unit in the last place apart, which is the same threshold."""
@@ -1718,13 +1760,19 @@ def _same_threshold(asked: Any, applied: Any) -> bool:
 def read_server_report(
     folder: str | Path,
     *,
-    overload_threshold: float = OVERLOAD_THRESHOLD,
-    drift_tolerance: float = DRIFT_TOLERANCE,
-    starve_window: int = STARVE_WINDOW,
-    starve_ratio: float = STARVE_RATIO,
+    overload_threshold: float | None = None,
+    drift_tolerance: float | None = None,
+    starve_window: int | None = None,
+    starve_ratio: float | None = None,
     top_k: int | Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Read a rank's `incidents.json` from a server's store and say whether it can be used.
+
+    The thresholds are the server's (`tensorquill-server --thresholds`), and the report lists
+    the ones it applied (`applied_thresholds`). A reader takes those: a threshold left at None
+    here is not compared. Only one given here that differs from what the server applied makes
+    the report `other_thresholds`. `top_k=None` is "not given" too, so a reader cannot ask for
+    "what the run recorded" against a server that was started with a `top_k`.
 
     `folder` is `runs/<run_id>/rank=<rank>`. The report has no clock in it; what makes it
     current is that it covers exactly what is stored: its `attempt` and `last_step` are
@@ -1734,8 +1782,8 @@ def read_server_report(
     Returns `{"state", "reason", "stored", "report"}`: `stored` is `(attempt, last step)`
     of the newest part or None, `report` the parsed file or None, and `state` one of
 
-    - `current`: the report covers every stored step and uses the thresholds asked for
-      (the server's own are set with `tensorquill-server --thresholds`).
+    - `current`: the report covers every stored step, and no threshold given here differs
+      from the one the server applied.
     - `nothing_stored`: no parts and no report yet.
     - `missing`: parts, but no report (`--no-detect`, a server older than its detectors,
       or the moment between the first part and its report).
@@ -1745,7 +1793,7 @@ def read_server_report(
     - `unreadable`: the file could not be read or parsed this time.
     - `unusable`: not a report for this rank, from a server with fewer kinds, ahead of the
       store, or beside parts whose names say nothing about their steps.
-    - `other_thresholds`: the server applied thresholds other than the ones asked for.
+    - `other_thresholds`: a threshold given here differs from the one the server applied.
     """
     folder = Path(folder)
     stored, _, unknown = _newest_part(folder)
@@ -1784,10 +1832,13 @@ def read_server_report(
         # stalled weights at the first onset only: its report is not what this version gives.
         return result("unusable", "the server's report was made without the per-parameter gradient and stalled-weight"
                       " rules (an older server wrote it)", report)
-    asked = {"overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
-             "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": _top_k_option(top_k)}
+    asked = _given_thresholds({
+        "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
+        "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": top_k,
+    })
     # A server started with `--thresholds` lists what it applied, `top_k` among them (null: what
     # the run recorded). A server from before that option has no `top_k` there, which reads the same.
+    # Only what the reader gave is compared: the rest is taken as the server applied it.
     differing = [name for name, value in asked.items() if not _same_threshold(value, applied.get(name))]
     if differing:
         what = ", ".join(f"{name} {applied.get(name)!r} where {asked[name]!r} was asked for" for name in differing)
@@ -1868,7 +1919,9 @@ def _report_evidence(
         "starve_ratio": applied.get("starve_ratio", STARVE_RATIO),
         "incidents": incidents,
         "samples": [],
-        "detection": {**_detection(look, "server", None), "moe_flagged": report.get("moe_flagged")},
+        # `thresholds`: the five the server judged by, which a reader takes unless it gave its own.
+        "detection": {**_detection(look, "server", None), "moe_flagged": report.get("moe_flagged"),
+                      "thresholds": applied_thresholds(report)},
         **({"not_checked": not_checked} if not_checked else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
         **({"traincheck": traincheck_summary} if traincheck_summary else {}),
@@ -2107,6 +2160,12 @@ def _grace_alert_key(status: Mapping[str, Any] | None, status_age: float | None,
     )
 
 
+def _detectors_option(detectors: Any) -> str:
+    if detectors not in ("python", "rust"):
+        raise ValueError(f"detectors must be 'python' or 'rust', not {detectors!r}")
+    return str(detectors)
+
+
 def _stat_key(path: Path) -> tuple[int, int] | None:
     try:
         st = path.stat()
@@ -2188,6 +2247,20 @@ def watch(
     `evidence["detection"]` says which happened and why. `server_reports=False` always
     works the incidents out here.
 
+    The five thresholds (`overload_threshold`, `drift_tolerance`, `starve_window`,
+    `starve_ratio`, `top_k`) are the caller's only when given. For a server's store, one left
+    out is the server's: its report is taken with what it applied, and when the detectors have
+    to run here they run with those values too, so the incidents do not move with who judged
+    them. One given here that differs from the server's makes its report `other_thresholds`,
+    and the detectors run here with it. `evidence["detection"]["thresholds"]` lists the five
+    that were applied. For a `.jsonl` file one left out is `build_evidence`'s default.
+
+    `detectors="rust"` (with `server_binary`, as in `build_evidence`) judges through
+    `tensorquill-server detect` whenever the detectors run here: on every rebuild for a
+    `.jsonl` file, and for a server's store when its report cannot be used. Each rebuild sends
+    every record read so far, as the Python detectors read them all again. A missing binary or
+    `pyarrow` raises `RuntimeError` before the first look, not at the first rebuild.
+
     `compact_window` writes the compact file instead of the full one (`compact.compact_evidence`,
     that many recorded steps each side of a MoE incident), as `<name>.compact.json` unless
     `output` names the file; `on_update` still gets the full evidence.
@@ -2203,17 +2276,25 @@ def watch(
             trigger=trigger, **build_options,
         )
     source = Path(source)
+    if _detectors_option(build_options.get("detectors", "python")) == "rust":
+        # Said now, while someone is at the keyboard, not at the first rebuild hours into a run.
+        from .server_detect import rust_ready
+
+        rust_ready(build_options.get("server_binary"))
     picked_rank = rank
     tail = _Tail(source, picked_rank)
     written: Path | None = None
     done = 0
     status_file = build_options.pop("watchdog", None)
     status_file = Path(status_file) if isinstance(status_file, (str, Path)) else _watchdog_beside(source)
-    thresholds = {
-        name: build_options[name]
-        for name in ("overload_threshold", "drift_tolerance", "starve_window", "starve_ratio", "top_k")
-        if name in build_options
-    }
+    # The thresholds the caller gave. A server's report is taken with the ones it applied, and
+    # is refused only for one given here that differs (`read_server_report`).
+    thresholds = _given_thresholds(build_options)
+    for name in THRESHOLD_NAMES:
+        build_options.pop(name, None)
+    # What the rank's server applied, of the thresholds not given here: the detectors run with
+    # these when they have to run here, so the incidents do not change with who judged them.
+    adopted: dict[str, Any] = {}
     other_sources = {
         name: build_options.get(name) for name in ("traincheck", "flight_recorder", "flight_recorder_prefix")
     }
@@ -2256,6 +2337,7 @@ def watch(
                     emitted = None
                     emitted_grace = None
                 waiting_since, was_current, last_current_report = None, False, None
+                adopted = {}
             folder = new_folder
 
             look: dict[str, Any] | None = None
@@ -2263,6 +2345,8 @@ def watch(
             in_grace = False
             if folder is not None:
                 look = read_server_report(folder, **thresholds)
+                if look["state"] in ("current", "behind", "other_thresholds"):  # this rank's report, readable here
+                    adopted = {n: v for n, v in applied_thresholds(look["report"]).items() if n not in thresholds}
                 if look["state"] == "current":
                     waiting_since, was_current = None, True
                     last_current_report = look["report"]
@@ -2308,14 +2392,17 @@ def watch(
                         emitted = None
                         emitted_grace = None
                         waiting_since, was_current, last_current_report = None, False, None
+                        adopted = {}
                 seen = ("python", look and look["state"], stamp, other_stamp)
                 if not tail.records or (not grown and seen == emitted):
                     continue
+                here = {**adopted, **thresholds}
                 evidence = build_evidence(
-                    tail.records, **{**build_options, **({"watchdog": status_file} if status_file else {})}
+                    tail.records, **{**build_options, **here, **({"watchdog": status_file} if status_file else {})}
                 )
                 if look is not None:
-                    evidence["detection"] = _detection(look, "python", picked_rank)
+                    evidence["detection"] = {**_detection(look, "python", picked_rank),
+                                             "thresholds": {**THRESHOLD_DEFAULTS, **here}}
                 path = Path(output) if output else default_evidence_path(source, tail.records)
             if status_age is not None and "watchdog" in evidence:
                 evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
@@ -2646,6 +2733,16 @@ def _all_ranks_evidence(
         states.setdefault(looks[number]["state"], []).append(number)
     steps = [looks[n]["report"].get("last_step") for n in judged if isinstance(looks[n]["report"].get("last_step"), int)]
     run_ids = [str(r["run_id"]) for n in judged if (r := looks[n]["report"]).get("run_id") is not None]
+    # The thresholds each judged rank's server applied. One server judges a run, so they agree,
+    # unless it was restarted with others and some ranks have not been rebuilt since.
+    judged_by: dict[str, dict[str, Any]] = {}
+    for number in judged:
+        values = applied_thresholds(looks[number]["report"])
+        judged_by.setdefault(json.dumps(values, sort_keys=True), {"ranks": [], "thresholds": values})["ranks"].append(number)
+    by_thresholds = [
+        {"ranks": found["ranks"], "rank_ranges": _rank_ranges(found["ranks"]), "thresholds": found["thresholds"]}
+        for found in judged_by.values()
+    ]
     return {
         "view": ALL_RANKS_VIEW,
         "view_version": ALL_RANKS_VIEW_VERSION,
@@ -2661,6 +2758,10 @@ def _all_ranks_evidence(
         "never_reporting_ranks": states.get("nothing_stored", []),
         "ranks_by_state": states,
         "last_step": {"min": min(steps), "max": max(steps)} if steps else None,
+        # What the judged ranks were judged by: the first judged rank's five when they differ,
+        # with every set and its ranks in `thresholds_by_rank`.
+        "thresholds": by_thresholds[0]["thresholds"] if by_thresholds else None,
+        **({"thresholds_by_rank": by_thresholds} if len(by_thresholds) > 1 else {}),
         "incident_groups": groups,
         "run_incidents": run_incidents,
         "ranks": entries,
@@ -2687,6 +2788,115 @@ def _all_ranks_run_state(evidence: Mapping[str, Any], looks: Mapping[int, Mappin
     steps = any((looks[n].get("report") or {}).get("steps") for n in judged)
     return run_state(incidents=incidents, steps_judged=steps, status=status, status_age=status_age,
                      not_checked=not_checked, unknown_ranks=unknown, judged_ranks=judged)
+
+
+def _all_ranks_source(source: str | Path) -> Path:
+    """The run folder the all-ranks view looks at; `ValueError` for a file or one rank's folder."""
+    source = Path(source)
+    if source.exists() and not source.is_dir():
+        raise ValueError(f"rank='all' needs a run folder in a server's store (runs/<run_id>), not the file {source}")
+    if _own_rank(source) is not None:
+        raise ValueError(f"{source} is one rank's folder; rank='all' needs the run folder that holds the rank=<n> folders")
+    return source
+
+
+def _all_ranks_status_file(source: Path, watchdog: Any) -> Path:
+    return Path(watchdog) if isinstance(watchdog, (str, Path)) else _watchdog_beside(source) or source / "watchdog.json"
+
+
+def _look_at_ranks(
+    source: Path,
+    status: Mapping[str, Any] | None,
+    memory: dict[int, _RankMemory],
+    thresholds: Mapping[str, Any],
+    report_grace: float,
+) -> tuple[dict[int, Path], dict[int, dict[str, Any]], tuple[Any, ...], tuple[Any, ...]]:
+    """One look at every rank of a run folder: its `rank=<n>` folders, each rank's look
+    (`_rank_look`), and the two keys the watcher compares with what it last wrote: every
+    rank's own, and the same with a rank inside its wait held at the key it had when last
+    current. `memory` is what the watcher keeps about each rank between looks, updated here;
+    an empty one is a first look."""
+    folders = _discover_rank_folders(source)
+    absent = _ranks_without_folder(folders, status)
+    numbers = sorted({*folders, *absent})
+    for gone in set(memory) - set(numbers):
+        del memory[gone]
+    now = time.monotonic()
+    looks: dict[int, dict[str, Any]] = {}
+    full: list[tuple[int, Any]] = []
+    calm: list[tuple[int, Any]] = []
+    for number in numbers:
+        held = memory.setdefault(number, _RankMemory())
+        look, in_grace = _rank_look(folders.get(number), absent.get(number), held, thresholds, report_grace, now)
+        looks[number] = look
+        key = _rank_key(look)
+        if look["state"] == "current":
+            held.last_current_key = key
+        full.append((number, key))
+        # A rank inside its wait is a moment between a part and its report, as the
+        # single-rank watcher treats it: it alone does not cause a write.
+        calm.append((number, held.last_current_key if in_grace else key))
+    return folders, looks, tuple(full), tuple(calm)
+
+
+def _all_ranks_whole(
+    source: Path,
+    folders: Mapping[int, Path],
+    looks: Mapping[int, Mapping[str, Any]],
+    status: Mapping[str, Any] | None,
+    status_age: float | None,
+    other_sources: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The whole all-ranks evidence of one look: `_all_ranks_evidence`, how old the status is
+    when that is too old, and the run state."""
+    evidence = _all_ranks_evidence(source, folders, looks, status, **other_sources)
+    if status_age is not None and "watchdog" in evidence:
+        evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
+    evidence["run_state"] = _all_ranks_run_state(evidence, looks, status, status_age)
+    return evidence
+
+
+def all_ranks_evidence(
+    source: str | Path,
+    *,
+    watchdog: str | Path | None = None,
+    traincheck: str | Path | None = None,
+    flight_recorder: str | Path | None = None,
+    flight_recorder_prefix: str | None = None,
+    overload_threshold: float | None = None,
+    drift_tolerance: float | None = None,
+    starve_window: int | None = None,
+    starve_ratio: float | None = None,
+    top_k: int | Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """One look at every rank of a run: the evidence `watch(source, rank="all")` writes on its
+    first look, returned and not written.
+
+    `source` is a run folder in a server's store (`runs/<run_id>`, holding `rank=<n>` folders);
+    a file or one rank's folder raises `ValueError`. The look reads each rank's
+    `incidents.json`, the name of its newest part and the run's `watchdog.json` (`watchdog`
+    names another status file). No detector runs, so the server binary is not needed, and no
+    part is opened but for one case shared with the watcher: when `flight_recorder` finds a
+    stuck collective in complete dumps, the newest stored part is read to date the dump (that
+    needs `pyarrow`). A rank counts for or against incidents only while its report is current;
+    with nothing stored and no status the evidence has `rank_count` 0.
+
+    The five thresholds are the reader's (`read_server_report`): left at None, each rank's
+    report is taken with what its server applied, which the evidence lists under `thresholds`.
+    A first look has no memory of earlier ones, so a rank whose report is behind its store is
+    `behind` here where a running watcher would wait `report_grace` for it.
+    The evidence is `{"view": "all_ranks", ...}`: see `_all_ranks_evidence` and the README.
+    """
+    source = _all_ranks_source(source)
+    status = read_watchdog(_all_ranks_status_file(source, watchdog))
+    thresholds = _given_thresholds({
+        "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
+        "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": top_k,
+    })
+    folders, looks, _, _ = _look_at_ranks(source, status, {}, thresholds, REPORT_GRACE_SECONDS)
+    other_sources = {"traincheck": traincheck, "flight_recorder": flight_recorder,
+                     "flight_recorder_prefix": flight_recorder_prefix}
+    return _all_ranks_whole(source, folders, looks, status, _status_age(status), other_sources)
 
 
 def watch_all_ranks(
@@ -2716,30 +2926,26 @@ def watch_all_ranks(
     that is behind, stale, missing, unreadable, unusable, on other thresholds or has nothing
     stored is `unknown`, with its state and why, and is never listed among the ranks with no
     incidents. Rank folders may appear or disappear between looks. `server_reports=False`
-    (`--recompute`) and `top_k` are refused, because they ask for the detectors to run here, a
-    rank at a time and for the whole run each time; use `rank=<n>` for that.
+    (`--recompute`) is refused, because it asks for the detectors to run here, a rank at a
+    time and for the whole run each time; use `rank=<n>` for that. Each rank's report is taken
+    with the thresholds its server applied, which the evidence lists (`thresholds`); any of the
+    five given here (`overload_threshold`, `drift_tolerance`, `starve_window`, `starve_ratio`,
+    `top_k`) must be the one a rank's server applied, or that rank is `other_thresholds`.
     `flight_recorder` and `traincheck` are read once for the run and their incidents are run-level.
-    Returns the evidence path, or None if nothing was written.
+    `detectors` ("python" or "rust") is accepted and changes nothing: every rank's incidents are
+    the Rust detectors' already, from its server's report, and no detector runs here, so the
+    server binary is not needed. Returns the evidence path, or None if nothing was written.
     """
-    source = Path(source)
-    if source.exists() and not source.is_dir():
-        raise ValueError(f"rank='all' needs a run folder in a server's store (runs/<run_id>), not the file {source}")
-    if _own_rank(source) is not None:
-        raise ValueError(f"{source} is one rank's folder; rank='all' needs the run folder that holds the rank=<n> folders")
+    source = _all_ranks_source(source)
+    _detectors_option(build_options.pop("detectors", "python"))
+    build_options.pop("server_binary", None)
     if not server_reports:
         raise ValueError(
             "rank='all' cannot recompute: that would read the parts and run the detectors for every rank, one after"
             " another, on every change (about 8 s a rank at 10,000 steps); recompute one rank with rank=<n>"
         )
-    if build_options.get("top_k") is not None:
-        raise ValueError("top_k changes what the detectors compute, which the all-ranks view never runs; use rank=<n>")
-    status_file = build_options.pop("watchdog", None)
-    status_file = Path(status_file) if isinstance(status_file, (str, Path)) else _watchdog_beside(source) or source / "watchdog.json"
-    thresholds = {
-        name: build_options[name]
-        for name in ("overload_threshold", "drift_tolerance", "starve_window", "starve_ratio")
-        if name in build_options
-    }
+    status_file = _all_ranks_status_file(source, build_options.pop("watchdog", None))
+    thresholds = _given_thresholds(build_options)
     other_sources = {
         name: build_options.get(name) for name in ("traincheck", "flight_recorder", "flight_recorder_prefix")
     }
@@ -2758,37 +2964,15 @@ def watch_all_ranks(
             status = read_watchdog(status_file)
             status_age = status_clock.check(status)
             stamp = (_status_stamp(status, status_age), _other_sources_stamp(**other_sources))
-            folders = _discover_rank_folders(source)
-            absent = _ranks_without_folder(folders, status)
-            numbers = sorted({*folders, *absent})
-            if not numbers and status is None:
+            folders, looks, full, calm = _look_at_ranks(source, status, memory, thresholds, report_grace)
+            if not looks and status is None:
                 continue
-            for gone in set(memory) - set(numbers):
-                del memory[gone]
-            now = time.monotonic()
-            looks: dict[int, dict[str, Any]] = {}
-            full: list[tuple[int, Any]] = []
-            calm: list[tuple[int, Any]] = []
-            for number in numbers:
-                held = memory.setdefault(number, _RankMemory())
-                look, in_grace = _rank_look(folders.get(number), absent.get(number), held, thresholds, report_grace, now)
-                looks[number] = look
-                key = _rank_key(look)
-                if look["state"] == "current":
-                    held.last_current_key = key
-                full.append((number, key))
-                # A rank inside its wait is a moment between a part and its report, as the
-                # single-rank watcher treats it: it alone does not cause a write.
-                calm.append((number, held.last_current_key if in_grace else key))
             # Compared with what was written, not with the last look: a rank written while it
             # was in a wait, which then comes back with the key it had before, is rewritten.
-            seen, calmed = (tuple(full), stamp), (tuple(calm), stamp)
+            seen, calmed = (full, stamp), (calm, stamp)
             if seen == emitted or calmed == emitted:
                 continue
-            evidence = _all_ranks_evidence(source, folders, looks, status, **other_sources)
-            if status_age is not None and "watchdog" in evidence:
-                evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
-            evidence["run_state"] = _all_ranks_run_state(evidence, looks, status, status_age)
+            evidence = _all_ranks_whole(source, folders, looks, status, status_age, other_sources)
             path = Path(output) if output else Path(f"{evidence['run_id']}.all-ranks.evidence.json")
             emitted = seen
             # This view has no per-step samples, so `compact_window` only marks and names the file.
@@ -3887,6 +4071,15 @@ def _all_ranks_summary(evidence: Mapping[str, Any]) -> str:
             lines.append(line)
         lines.append("  To judge one of them here, from its stored parts (slower, in proportion to the run's length):"
                      " python -m tensorquill <run folder> --rank <n>")
+    differing = evidence.get("thresholds_by_rank") or ()
+    if len(differing) > 1:
+        usual = differing[0]["thresholds"]
+        lines.append("The judged ranks were not all judged by the same thresholds (a server restarted with others"
+                     " rebuilds a rank's report only when the rank sends again):")
+        for found in differing:
+            changed = ", ".join(f"{name} {value!r}" for name, value in found["thresholds"].items()
+                                if found is differing[0] or not _same_threshold(value, usual.get(name)))
+            lines.append(f"  - rank{'s' if len(found['ranks']) != 1 else ''} {_rank_ranges(found['ranks'], 8)}: {changed}")
     for incident in evidence.get("run_incidents", ()):
         text = _describe(incident)
         lines.append(text or f"Incident at step {incident.get('step')}: {incident['kind']}")
@@ -4280,9 +4473,6 @@ def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     if args.recompute:
         parser.error("--rank all cannot be combined with --recompute: it would run the detectors here for every rank, "
                      "one after another, on every change; recompute one rank with --rank N --watch --recompute")
-    if args.top_k is not None:
-        parser.error("--rank all cannot be combined with --top-k, which changes what the detectors compute; "
-                     "the all-ranks view runs none (use --rank N)")
     shown: list[str] = []
 
     def report(evidence: dict[str, Any], path: Path) -> None:
@@ -4299,9 +4489,10 @@ def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     try:
         written = watch(
             args.input, args.output, interval=args.interval, rank=ALL_RANKS, polls=None if args.watch else 1,
-            on_update=report, report_grace=args.report_grace, overload_threshold=args.overload_threshold,
+            on_update=report, report_grace=args.report_grace, **args.thresholds,
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
             traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
+            detectors=args.detectors,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -4355,7 +4546,8 @@ def main() -> None:
         "view of a run folder in a server's store (runs/<run_id>): one evidence file for every rank, taken from "
         "each rank's incidents.json and the run's watchdog.json, with identical incidents grouped across ranks and "
         "ranks whose report is not current listed as unknown. It reads no part and runs no detector, so it works "
-        "with or without --watch (one look without) and cannot be combined with --recompute, --top-k or --rerun; "
+        "with or without --watch (one look without) and cannot be combined with --recompute or --rerun; a "
+        "threshold option given with it must be the one each rank's server applied; "
         "its default output is <run_id>.all-ranks.evidence.json",
     )
     parser.add_argument("--rerun", type=Path, help="optional path to write a Rerun .rrd file "
@@ -4373,11 +4565,32 @@ def main() -> None:
         "its violated invariants become one incident",
     )
     parser.add_argument("--flight-recorder-prefix", help="common start of the dump file names, if PyTorch cannot infer it")
+    # The five detector thresholds. None of them has a value until it is typed: the detectors
+    # run here with the defaults named below, and a server's report is taken with the values the
+    # server applied (`tensorquill-server --thresholds`), which the evidence lists.
     parser.add_argument(
         "--overload-threshold",
         type=float,
-        default=OVERLOAD_THRESHOLD,
-        help="base assignment-share threshold for top-1 and top-2 routers (default: 0.35)",
+        help="base assignment-share threshold for top-1 and top-2 routers (default: 0.35). Reading a server's "
+        "report, this and the four options below default to what the server applied; one given here that differs "
+        "from it makes the report `other_thresholds`",
+    )
+    parser.add_argument(
+        "--drift-tolerance",
+        type=float,
+        help="largest spread of a replicated parameter's fingerprints across GPUs that is not replica drift "
+        "(default: 1e-6)",
+    )
+    parser.add_argument(
+        "--starve-window",
+        type=int,
+        help="samples of a router over which each expert's assignments are summed for starved experts (default: 50)",
+    )
+    parser.add_argument(
+        "--starve-ratio",
+        type=float,
+        help="an expert is starved when its share over that window is below this fraction of an even share "
+        "(default: 0.1)",
     )
     parser.add_argument(
         "--top-k",
@@ -4390,7 +4603,8 @@ def main() -> None:
         default="python",
         help="rust: take the incidents of the server's kinds from the Rust detectors, run on this file through "
         "`tensorquill-server detect` (the binary on PATH or named by TENSORQUILL_SERVER_BIN; needs pyarrow). "
-        "One finished file or store, read once: not with --watch or --rank all",
+        "With --watch they run on every rebuild made here, over every record read so far. With --rank all the "
+        "option changes nothing: that view takes every rank's incidents from its server's report and runs no detector",
     )
     from . import compact as _compact, trigger as _trigger
 
@@ -4399,9 +4613,8 @@ def main() -> None:
     args = parser.parse_args()
     args.compact_window = _compact.window_from_args(args)  # None: the full file
     args.trigger = _trigger.from_args(args, parser)  # None without --on-incident or --webhook
+    args.thresholds = _given_thresholds(vars(args))  # only the ones typed
 
-    if args.detectors == "rust" and (args.watch or args.rank == ALL_RANKS):
-        parser.error("--detectors rust reads one rank once: it cannot be combined with --watch or --rank all")
     if args.rank == ALL_RANKS:
         _main_all_ranks(args, parser)
         return
@@ -4430,21 +4643,26 @@ def main() -> None:
             print(f"updated {path}", flush=True)
 
         print(f"watching {args.input} every {args.interval:g} s; Ctrl-C to stop", flush=True)
-        watch(
-            args.input, args.output, interval=args.interval, rank=rank,
-            default_rank=0 if rank is None else None, on_update=report,
-            server_reports=not args.recompute, report_grace=args.report_grace,
-            overload_threshold=args.overload_threshold, top_k=args.top_k,
-            flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
-            traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
-        )
+        try:
+            watch(
+                args.input, args.output, interval=args.interval, rank=rank,
+                default_rank=0 if rank is None else None, on_update=report,
+                server_reports=not args.recompute, report_grace=args.report_grace, **args.thresholds,
+                flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
+                traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
+                detectors=args.detectors,
+            )
+        except (RuntimeError, ValueError) as error:
+            # The Rust path's own refusals: no binary, no pyarrow, thresholds its rules refuse.
+            if args.detectors != "rust":
+                raise
+            parser.error(str(error))
         return
 
     records = load_records(args.input, rank=rank, all_attempts=True)
     try:
         evidence = build_evidence(
-            records, overload_threshold=args.overload_threshold, top_k=args.top_k,
-            watchdog=_watchdog_beside(args.input),
+            records, **args.thresholds, watchdog=_watchdog_beside(args.input),
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
             traincheck=args.traincheck, detectors=args.detectors,
         )

@@ -40,11 +40,8 @@ from typing import Any, Callable, Iterable, Mapping
 from . import __version__
 from .evidence import (
     ALL_RANKS_VIEW,
-    _all_ranks_evidence,
-    _all_ranks_run_state,
     _discover_rank_folders,
-    _ranks_without_folder,
-    _status_age,
+    all_ranks_evidence,
     build_evidence,
     incident_class,
     incident_summary,
@@ -153,27 +150,9 @@ def _complete_lines(path: Path) -> tuple[list[dict[str, Any]], int]:
 
 def all_ranks_look(folder: str | Path) -> dict[str, Any]:
     """One look at every rank of a run folder: the evidence the all-ranks watcher
-    (`python -m tensorquill <run folder> --rank all`) writes, returned and not written. It reads
-    each rank's `incidents.json`, the name of its newest part and the run's `watchdog.json`; no
-    part is opened and no detector runs."""
-    folder = Path(folder)
-    status = read_watchdog(folder / "watchdog.json")
-    folders = _discover_rank_folders(folder)
-    absent = _ranks_without_folder(folders, status)
-    looks: dict[int, dict[str, Any]] = {}
-    for number in sorted({*folders, *absent}):
-        if number in folders:
-            looks[number] = read_server_report(folders[number])
-        else:
-            looks[number] = {"state": "nothing_stored", "reason": absent[number], "stored": None, "report": None}
-    evidence = _all_ranks_evidence(
-        folder, folders, looks, status, traincheck=None, flight_recorder=None, flight_recorder_prefix=None
-    )
-    status_age = _status_age(status)
-    if status_age is not None and "watchdog" in evidence:
-        evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
-    evidence["run_state"] = _all_ranks_run_state(evidence, looks, status, status_age)
-    return evidence
+    (`python -m tensorquill <run folder> --rank all`) writes, returned and not written
+    (`evidence.all_ranks_evidence`). No part is opened and no detector runs."""
+    return all_ranks_evidence(folder)
 
 
 class Source:
