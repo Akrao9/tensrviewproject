@@ -35,7 +35,24 @@ from test_flight_e2e import BINARY  # noqa: E402
 from test_server_detectors import differences, edges, everything, moe_edges, one_parameter, record, wobble  # noqa: E402
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
-FIXTURES = Path(__file__).resolve().parents[2] / "experiments" / "moe-bakeoff" / "artifacts"
+BAKEOFF = Path(__file__).resolve().parents[2] / "experiments" / "moe-bakeoff"
+
+
+def gate_fixtures() -> dict[str, list[dict]]:
+    """The seven Gate 1 fixtures' records, made by the bake-off's own generator. Its
+    `artifacts` folder is not in the repository, so nothing here reads it. Empty when the
+    experiment is not in this checkout."""
+    if not (BAKEOFF / "generate.py").exists():
+        return {}
+    sys.path.insert(0, str(BAKEOFF))
+    try:
+        import generate
+    finally:
+        sys.path.remove(str(BAKEOFF))
+    return {name: fixture.records() for name, fixture in generate.BY_NAME.items()}
+
+
+GATE_FIXTURES = gate_fixtures()
 JUDGED = ("incidents", "not_checked", "run_state")
 
 
@@ -133,9 +150,9 @@ def test_the_rust_path_gives_the_python_paths_evidence(name):
     assert both(CASES[name]) == []
 
 
-@pytest.mark.parametrize("fixture", sorted(p.name for p in FIXTURES.iterdir() if (p / f"{p.name}.jsonl").exists()))
+@pytest.mark.parametrize("fixture", sorted(GATE_FIXTURES))
 def test_the_gate_1_fixtures_give_the_same_evidence(fixture):
-    records = tensorquill.load_records(FIXTURES / fixture / f"{fixture}.jsonl", all_attempts=True)
+    records = GATE_FIXTURES[fixture]
     assert both(records) == []
     assert tensorquill.build_evidence(records, detectors="rust")["incidents"], "every fixture has a planted failure"
 
@@ -193,10 +210,7 @@ OPTIONS: list[dict] = (
 def option_sets() -> dict[str, list[dict]]:
     """The record sets these options can change: the ones with MoE counts or a replica spread."""
     sets = dict(CASES)
-    for folder in sorted(FIXTURES.iterdir()):
-        capture = folder / f"{folder.name}.jsonl"
-        if capture.exists():
-            sets[f"fixture {folder.name}"] = tensorquill.load_records(capture, all_attempts=True)
+    sets.update({f"fixture {name}": records for name, records in GATE_FIXTURES.items()})
     return {name: records for name, records in sets.items() if any(r.get("moe") or r.get("replica_spread") for r in records)}
 
 
