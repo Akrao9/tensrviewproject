@@ -70,6 +70,17 @@ def test_every_report_state_but_current_is_unknown(report_state):
     assert state(detection={"source": "python", "state": report_state, "reason": "x"}) == ("healthy", [])
 
 
+def test_ranks_the_status_expects_are_unknown_until_judged():
+    # One rank connected of three, before the status's silence floor calls the others missing.
+    found = ev.run_state(incidents=[], steps_judged=True, status={**ACTIVE, "world_size": 3})
+    assert (found["state"], found["reasons"][0]["code"], found["reasons"][0]["ranks"]) == ("unknown", "ranks_unknown", [1, 2])
+    # A rank the all-ranks view judged from its own report is not unknown, listed or not.
+    found = ev.run_state(incidents=[], steps_judged=True, status={**ACTIVE, "world_size": 3}, judged_ranks=[0, 1, 2])
+    assert found["state"] == "healthy"
+    found = ev.run_state(incidents=[], steps_judged=True, status={**ACTIVE, "missing_ranks": [5]})
+    assert found["reasons"][0]["ranks"] == [5]
+
+
 def test_a_stall_is_unhealthy_through_its_incident_not_an_unknown_status():
     stalled = {**ACTIVE, "summary": "stalled"}
     assert state(status=stalled, incidents=[{"kind": "job_stalled", "step": 4}]) == ("unhealthy", ["incidents"])
@@ -114,6 +125,21 @@ def test_a_status_beside_the_records_counts(tmp_path):
                                   "written_at_ms": int((time.time() - 60) * 1000)}))
     found = tensorquill.build_evidence(records(), watchdog=status)["run_state"]
     assert (found["state"], [r["code"] for r in found["reasons"]]) == ("unknown", ["status_old"])
+
+
+def test_the_watcher_calls_a_status_old_by_its_own_clock(tmp_path):
+    """A status stamped in the future (the server's clock ahead of this one) that is never
+    rewritten: the wall clock cannot call it old, the watcher's own clock does."""
+    source = tmp_path / "run.jsonl"
+    source.write_text("".join(json.dumps(r) + "\n" for r in records()))
+    status = tmp_path / "watchdog.json"
+    status.write_text(json.dumps({**ACTIVE, "server_running": True, "refresh_seconds": 0.1,
+                                  "written_at_ms": int((time.time() + 3600) * 1000)}))
+    seen: list[dict] = []
+    ev.watch(source, tmp_path / "e.json", interval=0.1, polls=6, watchdog=status,
+             on_update=lambda evidence, path: seen.append(evidence["run_state"]))
+    assert seen[0] == {"state": "healthy", "reasons": []}
+    assert seen[-1]["state"] == "unknown" and [r["code"] for r in seen[-1]["reasons"]] == ["status_old"]
 
 
 def test_the_cli_prints_it(tmp_path):
@@ -205,6 +231,25 @@ def test_a_stopped_server_and_a_rank_never_judged_are_unknown_in_both(tmp_path):
     assert "server_stopped" in [r["code"] for r in found["reasons"]] and found["state"] == "unknown"
     evidence, _ = twa.look(run, tmp_path / "b")
     assert comparable(evidence["run_state"]) == comparable(found)
+
+
+def test_what_a_rank_could_not_check_makes_the_run_degraded_in_both(tmp_path):
+    twa = _server()
+    from test_attention import attention
+    from test_server_reports import QUICK_STATUS
+
+    run = twa.Run(tmp_path, *twa.FAST, *QUICK_STATUS)
+    # Rank 1 ran the probe twice: too few probes for the attention rules, which its report lists.
+    probed = [{**r, "probe": {"attention": {"blk": attention(0.4, 9.0)}}} if r["step"] in (19, 39) else r
+              for r in twa.steady(60)]
+    senders = [run.keep_open(0, twa.steady(60)), run.keep_open(1, probed)]
+    found = wait_for_state(run, "degraded")
+    assert found["reasons"] == [{**found["reasons"][0], "code": "not_checked", "checks": ["attention"]}]
+    evidence, _ = twa.look(run, tmp_path / "a")
+    assert comparable(evidence["run_state"]) == comparable(found)
+    for sender in senders:
+        sender.close()
+    assert run.server.terminate() == 0
 
 
 def test_no_detect_is_unknown_in_both(tmp_path):

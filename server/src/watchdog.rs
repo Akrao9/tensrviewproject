@@ -1769,6 +1769,22 @@ mod tests {
         let mut early = two_ranks("active");
         early["world_size"] = json!(3);
         assert_eq!(state_of(&early, &clean, true).1, vec!["ranks_unknown".to_string()]);
+        // A rank the status calls missing, with no world_size to expect it by.
+        let mut missing = two_ranks("active");
+        missing["world_size"] = Value::Null;
+        missing["missing_ranks"] = json!([5]);
+        let found = run_state(
+            &missing,
+            &clean
+                .iter()
+                .map(|(rank, _, _)| (*rank, RankReport::default()))
+                .collect(),
+            true,
+        );
+        assert_eq!(
+            (found["state"].as_str(), &found["reasons"][0]["ranks"]),
+            (Some("unknown"), &json!([5]))
+        );
         assert_eq!(
             state_of(&two_ranks("server_stopped"), &clean, true),
             ("unknown".into(), vec!["server_stopped".into()])

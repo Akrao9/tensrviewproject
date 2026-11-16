@@ -153,14 +153,23 @@ def test_odd_probes_are_read_as_python_reads_them():
             a["entropy_share"] = ["nan", a["entropy_share"][1], a["entropy_share"][2], "nan"]  # masked heads left out
             a["max_logit"][0] = "-inf"
         if i == 2:
-            probe.clear()
-            probe["error"] = "RuntimeError: out of memory"  # a failed probe is not a probe
+            probe["error"] = "RuntimeError: out of memory"  # a failed probe is not a probe, whatever else it holds
         if i == 3:
             probe["attention"] = {}  # no attention seen: not a probe either
+        if i == 5:
+            a["entropy_share"][:2] = ["nan", "nan"]  # the onset probe: its mean is over the two finite heads
     run = probe_run({"a": lambda i: (0.15 if i >= 5 else 0.4, 10.0)}, 8, extra=extra)
     found = ev.detect_attention_anomalies(run)
     assert [(i["kind"], i["step"], i["probes"]) for i in found] == [("attention_collapse", 59, 6)]
-    assert found[0]["modules"][0]["baseline_probes"] == 3  # probes 0, 1 and 4
+    hit = found[0]["modules"][0]
+    assert hit["baseline_probes"] == 3  # probes 0, 1 and 4
+    assert math.isclose(hit["value"], 0.17) and hit["heads"] == 2  # (0.16 + 0.18) / 2
+
+
+def test_a_layer_is_judged_from_its_third_probe():
+    # Low from its second probe on: with one probe of baseline that would be a collapse held on
+    # probes 1 and 2; with two, the baseline already holds the low value and nothing changed.
+    assert kinds(probe_run({"a": lambda i: (0.4 if i == 0 else 0.15, 10.0)}, 8)) == []
 
 
 def test_a_probe_without_the_module_breaks_its_run():
@@ -250,6 +259,36 @@ def test_the_server_reports_the_same_attention_incidents_after_every_stretch(tmp
     # The server's own Parquet gives Python the same answer: the probe keeps the model's order there.
     from_store = tensorquill.build_evidence(stream.store / "runs" / "attn", rank=0)["incidents"]
     assert tsd.differences([i for i in from_store if i["kind"] in ev.ATTN_KINDS], document["incidents"]) == []
+    assert stream.server.terminate() == 0
+
+
+def edge_run(run: str) -> list[dict]:
+    """Two cases the long fixture does not hold: a failed probe that still carries attention
+    (`f` would collapse there), and a module missing from the probe between two low ones (`g`)."""
+    def extra(i, probe):
+        if i == 3:
+            probe["error"] = "RuntimeError: boom"
+            probe["attention"]["f"] = attention(0.12, 9.0)
+        if i == 3 or i == 8:
+            probe["attention"].pop("g", None)
+    return probe_run({
+        "f": lambda i: (0.12 if i in (4, 5) else 0.4, 9.0),
+        "g": lambda i: (0.12 if i in (7, 9) else 0.4, 9.0),
+        "h": steady(),
+    }, 11, run=run, extra=extra)
+
+
+def test_failed_probes_and_broken_runs_are_read_the_same_in_the_server(tmp_path):
+    tsd = _server_tools()
+    records = edge_run("edges")
+    expected = [i for i in tensorquill.build_evidence(records)["incidents"] if i["kind"] in ev.ATTN_KINDS]
+    # f collapses at probe 4 (the failed probe 3 is skipped); g's two low probes are not in a row.
+    assert [(i["kind"], i["step"], [m["module"] for m in i["modules"]]) for i in expected] == [
+        ("attention_collapse", 49, ["f"])]
+    assert expected[0]["probes"] == 10
+    stream = tsd.Stream(tmp_path, *tsd.FAST, run="edges")
+    document = stream.send(records)
+    assert tsd.differences(expected, document["incidents"]) == []
     assert stream.server.terminate() == 0
 
 
