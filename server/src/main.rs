@@ -86,7 +86,8 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     /// Run the detectors over one rank's rows and print the report the server would write as
-    /// that rank's incidents.json. No server is started and no store is read.
+    /// that rank's incidents.json; with --run, over every rank of one run. No server is started
+    /// and no store is read.
     Detect {
         /// The rows as an Arrow IPC stream in the schema the SDK sends, grouped by attempt
         /// (oldest first) and in recorded order; `-` or nothing reads standard input. With

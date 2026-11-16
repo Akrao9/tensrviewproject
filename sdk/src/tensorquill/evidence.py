@@ -1993,6 +1993,14 @@ def watch(
     `evidence["detection"]` says which happened and why. `server_reports=False` always
     works the incidents out here.
 
+    The five thresholds (`overload_threshold`, `drift_tolerance`, `starve_window`,
+    `starve_ratio`, `top_k`) are the caller's only when given. For a server's store, one left
+    out is the server's: its report is taken with what it applied, and when the detectors have
+    to run here they run with those values too, so the incidents do not move with who judged
+    them. One given here that differs from the server's makes its report `other_thresholds`,
+    and the detectors run here with it. `evidence["detection"]["thresholds"]` lists the five
+    that were applied. For a `.jsonl` file one left out is `build_evidence`'s default.
+
     `detectors="rust"` (with `server_binary`, as in `build_evidence`) judges through
     `tensorquill-server detect` whenever the detectors run here: on every rebuild for a
     `.jsonl` file, and for a server's store when its report cannot be used. Each rebuild sends
@@ -2613,9 +2621,11 @@ def all_ranks_evidence(
     `source` is a run folder in a server's store (`runs/<run_id>`, holding `rank=<n>` folders);
     a file or one rank's folder raises `ValueError`. The look reads each rank's
     `incidents.json`, the name of its newest part and the run's `watchdog.json` (`watchdog`
-    names another status file). No part is opened and no detector runs, so it needs neither
-    `pyarrow` nor the server binary. A rank counts for or against incidents only while its
-    report is current; with nothing stored and no status the evidence has `rank_count` 0.
+    names another status file). No detector runs, so the server binary is not needed, and no
+    part is opened but for one case shared with the watcher: when `flight_recorder` finds a
+    stuck collective in complete dumps, the newest stored part is read to date the dump (that
+    needs `pyarrow`). A rank counts for or against incidents only while its report is current;
+    with nothing stored and no status the evidence has `rank_count` 0.
 
     The five thresholds are the reader's (`read_server_report`): left at None, each rank's
     report is taken with what its server applied, which the evidence lists under `thresholds`.

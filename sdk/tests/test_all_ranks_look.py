@@ -24,7 +24,7 @@ from tensorquill.server_detect import BINARY_ENV  # noqa: E402
 
 import test_watch_all_ranks  # noqa: E402
 from test_flight_e2e import BINARY  # noqa: E402
-from test_server_detectors import FAST, everything  # noqa: E402
+from test_server_detectors import FAST  # noqa: E402
 from test_server_reports import no_part_is_read  # noqa: E402
 from test_traincheck import _summary, _violation  # noqa: E402
 from test_watch_all_ranks import Run, steady  # noqa: E402
@@ -151,4 +151,3 @@ def test_the_watcher_and_the_look_share_one_body(tmp_path):
         source = inspect.getsource(function)
         assert "_look_at_ranks(" in source and "_all_ranks_whole(" in source
         assert "_all_ranks_evidence(" not in source and "_rank_look(" not in source
-    assert everything  # (imported for the record sets other files share)
