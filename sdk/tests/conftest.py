@@ -41,3 +41,10 @@ def toy_moe() -> ToyMoE:
 def _reset_dynamo():
     yield
     torch._dynamo.reset()
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--write-golden", action="store_true",
+        help="rewrite tests/golden/ from the Python detectors before test_golden.py checks it",
+    )

@@ -1,0 +1,12 @@
+{
+"case":"system, 112 steps",
+"incidents":[
+{"baseline_share":0.1005,"class":"anomaly","kind":"input_starvation","median_data_wait":0.033124000000000015,"median_share":0.3660000000000001,"median_step_time":0.1005,"rule":"share","scalars":{"train/loss":{"median_before":0.7433235294117648,"value":0.6687500000000001}},"step":110,"window":20}
+],
+"not_checked":[
+{"check":"nvml","kinds":["hardware_errors"],"metric":"xid","reason":"NVMLError_NotSupported: Not Supported","step":9}
+],
+"records":{"count":112,"sha256":"68450d49a0105250ab219874c4a2eb04996821f883b3805d77d8d5f0d67ff85c"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: input_starvation","kinds":["input_starvation"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"checks":["nvml"],"code":"not_checked","detail":"not checked: nvml","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

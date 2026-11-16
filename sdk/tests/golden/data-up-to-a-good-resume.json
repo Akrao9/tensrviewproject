@@ -1,0 +1,13 @@
+{
+"case":"data, up to a good resume",
+"incidents":[
+{"changes":[{"attempt":2,"basis":"same_step","batches_apart":5,"expected_hash":"e7fa09ff450555eb","finding":"repeated","matched_step":45,"previous_attempt":1,"rank":0,"resumed_hash":"0d09fb6d31cf3cde","step":50}],"class":"observation","kind":"resume_data_mismatch","note":"an observation: a resume that starts its epoch over on purpose repeats data too","resumes":1,"scalars":{"train/loss":{"median_before":1.9855,"value":1.97}},"step":50},
+{"changes":[{"attempt":2,"findings":[{"component":"scheduler","finding":"missing"},{"component":"scaler","finding":"missing"},{"component":"rng","finding":"missing"},{"component":"optimizer","entries_after":2,"finding":"empty"},{"component":"scaler","expected_scale":32768.0,"finding":"initial_scale","scale":65536.0}],"rank":0,"source":"load","step":50}],"class":"observation","kind":"resume_incomplete","note":"an observation: a component left out or reset on purpose looks the same","resumes":1,"scalars":{"train/loss":{"median_before":1.9855,"value":1.97}},"step":50},
+{"class":"invariant","kind":"data_stalled","reason":"no_batch","scalars":{"train/loss":{"median_before":1.9955,"value":1.98}},"step":30,"through_step":32},
+{"batches_compared":3,"class":"invariant","epoch":2,"kind":"epoch_order_repeated","previous_epoch":1,"previous_sampler_epoch":0,"sampler_epoch":0,"scalars":{"train/loss":{"median_before":2.0004999999999997,"value":1.99}},"shuffle":true,"step":20,"through_step":22}
+],
+"not_checked":[],
+"records":{"count":110,"sha256":"e719fb6748bdbc9039d7b543169d4925dd190f16ef8cea7999fcd70c87c442c2"},
+"run_state":{"reasons":[{"code":"incidents","detail":"2 incidents listed: data_stalled, epoch_order_repeated","kinds":["data_stalled","epoch_order_repeated"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"code":"observations","detail":"2 observations listed, not counted as failures: resume_data_mismatch, resume_incomplete","kinds":["resume_data_mismatch","resume_incomplete"],"state":"healthy"}],"state":"unhealthy"},
+"samples":[]
+}

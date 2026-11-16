@@ -130,7 +130,9 @@ def test_the_rust_path_gives_the_python_paths_evidence(name):
     assert both(CASES[name]) == []
 
 
-@pytest.mark.parametrize("fixture", sorted(p.name for p in FIXTURES.iterdir() if (p / f"{p.name}.jsonl").exists()))
+# The folder is not in the repository (`generate.py` writes it): without it this is skipped,
+# and test_golden.py still judges the same seven fixtures, made in a temporary folder.
+@pytest.mark.parametrize("fixture", sorted(p.parent.name for p in FIXTURES.glob("*/*.jsonl") if p.stem == p.parent.name))
 def test_the_gate_1_fixtures_give_the_same_evidence(fixture):
     records = tensorquill.load_records(FIXTURES / fixture / f"{fixture}.jsonl", all_attempts=True)
     assert both(records) == []

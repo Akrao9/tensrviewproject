@@ -1,0 +1,10 @@
+{
+"case":"a resume from a checkpoint it cannot have loaded",
+"incidents":[],
+"not_checked":[
+{"check":"resume_state","rank":0,"reason":"no checkpoint manifest, optimizer snapshot or loss scale recorded for this resume","step":5}
+],
+"records":{"count":17,"sha256":"5ea09b26dc41267e44ccf4a9a5c82d716951e11aef4612e371db3bbf63671edc"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"checks":["resume_state"],"code":"not_checked","detail":"not checked: resume_state","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

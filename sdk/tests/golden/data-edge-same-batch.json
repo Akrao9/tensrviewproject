@@ -1,0 +1,10 @@
+{
+"case":"data edge same-batch",
+"incidents":[
+{"batch_hash":"1bf41ef6fd6f6f6c","class":"invariant","kind":"data_stalled","reason":"same_batch","step":2,"through_step":4}
+],
+"not_checked":[],
+"records":{"count":6,"sha256":"be12acb5fff36963c142aeb6985853a21cba944472517002f9ffcd3d7436025b"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: data_stalled","kinds":["data_stalled"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

@@ -1,0 +1,10 @@
+{
+"case":"data edge unknown-shuffle",
+"incidents":[
+{"batches_compared":3,"class":"invariant","epoch":1,"kind":"epoch_order_repeated","previous_epoch":0,"previous_sampler_epoch":null,"sampler_epoch":null,"shuffle":null,"step":3,"through_step":5}
+],
+"not_checked":[],
+"records":{"count":6,"sha256":"709b166069cd373d214fafef8e6f1537c82cbd6e04e35b09e75ff44960811b9b"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: epoch_order_repeated","kinds":["epoch_order_repeated"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

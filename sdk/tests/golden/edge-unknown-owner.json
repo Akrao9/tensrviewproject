@@ -1,0 +1,11 @@
+{
+"case":"edge unknown-owner",
+"incidents":[
+{"class":"invariant","consecutive":3,"kind":"stalled_weights","onsets":[{"optimizer":{"reason":"optimizer hooks are off (auto_step=False)","state":"unknown"},"parameters":["w1"],"stalled":1,"step":6,"trained_before":0}],"onsets_omitted":0,"optimizer":{"reason":"optimizer hooks are off (auto_step=False)","state":"unknown"},"parameters":["w1"],"stalled":1,"stalled_steps":3,"stalled_total":1,"step":6,"with_gradients":2},
+{"class":"invariant","gradients":["<total>"],"kind":"non_finite","layers":[],"step":4}
+],
+"not_checked":[],
+"records":{"count":12,"sha256":"273cb1eedbcc426b870d74b56176bc746ddec1fa2c700dc8a72ebd77f80ba292"},
+"run_state":{"reasons":[{"code":"incidents","detail":"2 incidents listed: stalled_weights, non_finite","kinds":["stalled_weights","non_finite"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

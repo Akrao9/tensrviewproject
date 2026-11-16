@@ -1,0 +1,10 @@
+{
+"case":"edge no-owner-recorded",
+"incidents":[
+{"class":"invariant","consecutive":3,"kind":"stalled_weights","onsets":[{"optimizer":{"reason":"not recorded by this capture","state":"unknown"},"parameters":["w1","w2"],"stalled":2,"step":2,"trained_before":0}],"onsets_omitted":0,"optimizer":{"reason":"not recorded by this capture","state":"unknown"},"parameters":["w1","w2"],"stalled":2,"stalled_steps":4,"stalled_total":2,"step":2,"with_gradients":2}
+],
+"not_checked":[],
+"records":{"count":6,"sha256":"7956a5853a2184f3272103b6297788ca53e6ea435cb44240de9eaa393ba3e26d"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: stalled_weights","kinds":["stalled_weights"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

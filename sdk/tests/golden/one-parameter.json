@@ -1,0 +1,11 @@
+{
+"case":"one parameter",
+"incidents":[
+{"baseline":10.155968552408854,"class":"anomaly","grad_norm":9.442919996873005,"kind":"grad_spike","parameters":[{"baseline":0.020541191216283963,"grad_norm":2.1116394264514184,"name":"small","ratio":102.80024192450061,"rising_since":250},{"baseline":0.01,"grad_norm":0.63,"name":"a_tiny","ratio":63.0,"rising_since":250}],"ratio":0.9297901965867427,"spike_count":0,"spike_steps":[],"step":250,"sustained":3,"trigger":"parameter"},
+{"class":"invariant","consecutive":3,"kind":"stalled_weights","onsets":[{"optimizer":{"held_count":2,"not_held":[],"not_held_count":0,"state":"known"},"parameters":["norm_a","norm_b"],"stalled":2,"step":39,"trained_before":0},{"optimizer":{"held_count":2,"not_held":[],"not_held_count":0,"state":"known"},"parameters":["frozen","a_idle"],"stalled":2,"step":229,"trained_before":1},{"optimizer":{"held_count":0,"not_held":["late"],"not_held_count":1,"state":"known"},"parameters":["late"],"stalled":1,"step":329,"trained_before":1}],"onsets_omitted":0,"optimizer":{"held_count":2,"not_held":[],"not_held_count":0,"state":"known"},"parameters":["norm_a","norm_b"],"scalars":{"train/loss":{"median_before":2.981,"value":2.961}},"stalled":2,"stalled_steps":37,"stalled_total":5,"step":39,"weight_dtypes":{"bfloat16":10},"with_gradients":9}
+],
+"not_checked":[],
+"records":{"count":400,"sha256":"09c625d32f613b3b60e52c76794866f119320946540284b9923d10a4765e59ef"},
+"run_state":{"reasons":[{"code":"incidents","detail":"2 incidents listed: grad_spike, stalled_weights","kinds":["grad_spike","stalled_weights"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}
