@@ -23,6 +23,36 @@
 //! connected since the server started, plus the missing ranks implied by `world_size`
 //! (sent by the SDK) or by gaps below the highest rank seen. The thresholds are not
 //! calibrated: set `--silent-seconds` above the longest evaluation or checkpoint pause.
+//!
+//! # A restart does not forget what the server saw
+//!
+//! Every status also carries `restart`, the clocks a restarted server needs for each rank
+//! that the rank list itself leaves out (the recent gaps between batches, which give a slow
+//! rank its threshold; the work counter; when the stream last changed; the pauses measured).
+//! All times in the file are seconds before `written_at_ms`, so the file says how long
+//! something had lasted and not when, and a restart on another host or after a long outage
+//! needs no wall clock. At startup [`Watchdog::restore`] reads the file of every run that
+//! was not finished or abandoned and takes its ranks up under these rules:
+//!
+//! - Time the server was not running does not count against a rank. It could not have
+//!   delivered anything, and a rank that was active when the server stopped must not look
+//!   stalled for the few seconds its sender takes to reconnect. Each clock carries on from
+//!   what it read when the file was written (after a SIGKILL that is at most `status_refresh`
+//!   before the death, which is forgotten; after SIGTERM it is the moment of the stop).
+//! - A rank's stream is gone with the process: every rank that was not finished is restored
+//!   as `dropped`, and `reconnecting` for the usual time while its sender comes back.
+//! - A rank that was already stopped keeps the quiet time it had, so a stall is neither
+//!   forgotten nor started again. If it was silent or unresponsive it keeps that verdict for
+//!   `--silent-seconds` while its sender comes back (a hung process whose connection was cut
+//!   by the restart is still a suspected hang, not a lost connection) and is `lost` after
+//!   that; if it was lost it is lost at once. The incident is in the first file written after
+//!   the restart. If the sender reconnects the rank reads as silent again (open stream, the
+//!   old last progress), and a new batch makes it active.
+//! - A run is abandoned when it has no open stream and every rank has been disconnected or
+//!   finished for `abandon`: it is not restored and its status is no longer refreshed.
+//!
+//! A status without `restart` (an older server's) is not restored, and the run is watched
+//! afresh when a rank connects.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
@@ -34,6 +64,8 @@ pub const DEFAULT_SILENT_FLOOR: Duration = Duration::from_secs(300);
 pub const DEFAULT_SILENT_FACTOR: f64 = 5.0;
 pub const DEFAULT_CRITICAL: Duration = Duration::from_secs(900);
 pub const DEFAULT_PAUSE_LIMIT: Duration = Duration::from_secs(1800);
+/// A run with no stream open and nothing heard for this long is given up (see `WatchdogConfig::abandon`).
+pub const DEFAULT_ABANDON: Duration = Duration::from_secs(72 * 3600);
 /// A rank is critical after this many times its own silence threshold, if that is longer than
 /// the configured critical time, so a slow rank still gets a warning first.
 const CRITICAL_THRESHOLDS: f64 = 3.0;
@@ -54,6 +86,9 @@ pub struct WatchdogConfig {
     /// A pause (a phase other than training) with no sign of work counts as a suspected hang
     /// after this long. A pause whose work counter moves is not limited.
     pub pause_limit: Duration,
+    /// A run with no stream open, whose ranks have all been disconnected or finished for this
+    /// long, is abandoned. Zero never gives a run up.
+    pub abandon: Duration,
 }
 
 impl Default for WatchdogConfig {
@@ -63,6 +98,7 @@ impl Default for WatchdogConfig {
             silent_factor: DEFAULT_SILENT_FACTOR,
             critical: DEFAULT_CRITICAL,
             pause_limit: DEFAULT_PAUSE_LIMIT,
+            abandon: DEFAULT_ABANDON,
         }
     }
 }
@@ -137,6 +173,10 @@ pub struct Progress {
     open_streams: usize,
     stream: Stream,
     world_size: Option<i32>,
+    /// After a restart, the verdict a stopped rank had and when to stop holding it: until then a
+    /// rank with no stream is not called `lost`, which would turn "suspected hang" into "lost
+    /// connection" for the seconds its sender takes to come back.
+    held: Option<(RankState, Instant)>,
 }
 
 impl Progress {
@@ -158,6 +198,7 @@ impl Progress {
             open_streams: 0,
             stream: Stream::Open,
             world_size: None,
+            held: None,
         }
     }
 
@@ -182,6 +223,11 @@ impl Progress {
         match self.stream {
             Stream::Finished => RankState::Finished,
             Stream::Dropped => {
+                if let Some((held, until)) = self.held {
+                    if now < until {
+                        return held;
+                    }
+                }
                 if now.saturating_duration_since(self.last_change) > config.silent_floor {
                     RankState::Lost
                 } else {
@@ -245,6 +291,141 @@ impl Progress {
         };
         now.saturating_duration_since(since).as_secs_f64()
     }
+    /// Seconds since the stream dropped or finished, none while a stream is open.
+    fn disconnected_seconds(&self, now: Instant) -> Option<f64> {
+        match self.stream {
+            Stream::Open => None,
+            _ => Some(now.saturating_duration_since(self.last_change).as_secs_f64()),
+        }
+    }
+
+    /// What a restarted server needs of this rank beyond what its entry in `ranks` says (see
+    /// the module notes). Seconds are before `now`, which is the status's `written_at_ms`.
+    fn carry(&self, rank: i32, now: Instant) -> Value {
+        let before = |at: Instant| round3(now.saturating_duration_since(at).as_secs_f64());
+        json!({
+            "rank": rank,
+            "age_seconds": before(self.created),
+            "since_change_seconds": before(self.last_change),
+            "heartbeat_interval_seconds": self.heartbeat_interval,
+            "work": self.work,
+            "work_still_seconds": before(self.work_moved),
+            "gaps_seconds": self.gaps.iter().copied().map(round3).collect::<Vec<_>>(),
+            "pauses": self.pauses.iter().map(|(phase, stats)| (phase.clone(), json!({
+                "count": stats.count,
+                "total_seconds": round3(stats.total),
+                "max_seconds": round3(stats.max),
+                "last_seconds": round3(stats.last),
+            }))).collect::<serde_json::Map<String, Value>>(),
+        })
+    }
+
+    /// A rank as a restarted server takes it up, from its entry in a status (`entry`) and its
+    /// `carry`. See the module notes for the rules. `None` when a field is missing or not a
+    /// plausible number.
+    fn restored(
+        entry: &Value,
+        carry: &Value,
+        world_size: Option<i32>,
+        now: Instant,
+        config: &WatchdogConfig,
+    ) -> Option<Self> {
+        let seconds = |value: &Value| value.as_f64().filter(|seconds| seconds.is_finite() && *seconds >= 0.0);
+        let stream = entry["stream"].as_str()?;
+        let state = entry["state"].as_str()?;
+        let since_progress = seconds(&entry["seconds_since_progress"])?;
+        let since_change = seconds(&carry["since_change_seconds"])?;
+        let stopped = matches!(state, "silent" | "lost" | "unresponsive");
+        let dropped = stream == "dropped";
+        // When the stream's state last changed, as an age. Finished stays finished. A rank that
+        // was already stopped keeps the quiet time it had and is at least past the floor, so it
+        // is `lost` at once. A rank whose stream had dropped goes on counting; one that was
+        // open is dropped now, by the restart.
+        let change_age = if stream == "finished" {
+            since_change
+        } else if stopped {
+            (if dropped { since_change } else { since_progress }).max(config.silent_floor.as_secs_f64() + 0.001)
+        } else if dropped {
+            since_change
+        } else {
+            0.0
+        };
+        let mut pauses = HashMap::new();
+        for (phase, stats) in carry["pauses"].as_object()? {
+            pauses.insert(
+                phase.clone(),
+                Pauses {
+                    count: stats["count"].as_u64()?,
+                    total: seconds(&stats["total_seconds"])?,
+                    max: seconds(&stats["max_seconds"])?,
+                    last: seconds(&stats["last_seconds"])?,
+                },
+            );
+        }
+        let mut gaps = VecDeque::new();
+        for gap in carry["gaps_seconds"].as_array()? {
+            gaps.push_back(seconds(gap)?);
+        }
+        while gaps.len() > GAPS_KEPT {
+            gaps.pop_front();
+        }
+        Some(Self {
+            phase: entry["phase"].as_str()?.chars().take(40).collect(),
+            phase_since: ago(now, seconds(&entry["phase_seconds"])?),
+            last_heartbeat: match &entry["heartbeat_age_seconds"] {
+                Value::Null => None,
+                age => Some(ago(now, seconds(age)?)),
+            },
+            heartbeat_interval: seconds(&carry["heartbeat_interval_seconds"])?.clamp(0.0, 3600.0),
+            work: carry["work"].as_i64(),
+            work_moved: ago(now, seconds(&carry["work_still_seconds"])?),
+            pauses,
+            created: ago(now, seconds(&carry["age_seconds"])?),
+            attempt: entry["attempt"].as_i64()?,
+            last_step: entry["last_step"].as_i64(),
+            last_progress: ago(now, since_progress),
+            last_change: ago(now, change_age),
+            gaps,
+            open_streams: 0,
+            stream: if stream == "finished" {
+                Stream::Finished
+            } else {
+                Stream::Dropped
+            },
+            world_size,
+            held: match state {
+                "silent" => Some((RankState::Silent, now + config.silent_floor)),
+                "unresponsive" => Some((RankState::Unresponsive, now + config.silent_floor)),
+                _ => None,
+            },
+        })
+    }
+}
+
+fn round3(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
+}
+
+/// `seconds` before `now`. A restored age can be longer than this host has been up (a run
+/// restarted on a new node), and an `Instant` that far back does not exist on every platform:
+/// then the oldest age the clock can show is used, never zero, so a clock is never restarted.
+fn ago(now: Instant, seconds: f64) -> Instant {
+    const LONGEST: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+    let seconds = if seconds.is_nan() || seconds < 0.0 {
+        0.0
+    } else {
+        seconds
+    };
+    let mut age = Duration::try_from_secs_f64(seconds).unwrap_or(LONGEST).min(LONGEST);
+    loop {
+        if let Some(at) = now.checked_sub(age) {
+            return at;
+        }
+        age /= 2;
+        if age.is_zero() {
+            return now;
+        }
+    }
 }
 
 type Key = (String, i32);
@@ -263,6 +444,48 @@ impl Watchdog {
         }
     }
 
+    /// Takes up the ranks of `run_id` from a status this server (or an earlier one) wrote, as
+    /// described in the module notes. `Ok(true)` when the run was taken up, `Ok(false)` when
+    /// there was nothing to take: a finished or abandoned run, a status without `restart`.
+    /// All of a run's ranks are taken up or none. A rank that has already connected is left
+    /// alone.
+    pub fn restore(&self, run_id: &str, status: &Value, now: Instant) -> Result<bool, String> {
+        if status["run_id"] != run_id || status["schema_version"] != 1 {
+            return Err("not a version 1 status of this run".to_string());
+        }
+        if status["summary"] == "finished" || status["abandoned"] == true {
+            return Ok(false);
+        }
+        let (Some(entries), Some(carried)) = (status["ranks"].as_array(), status["restart"].as_array()) else {
+            return Ok(false);
+        };
+        if entries.is_empty() {
+            return Ok(false);
+        }
+        let world_size = status["world_size"].as_i64().and_then(|size| i32::try_from(size).ok());
+        let mut restored = Vec::new();
+        for entry in entries {
+            let bad = || format!("the entry of rank {} cannot be read", entry["rank"]);
+            let rank = entry["rank"]
+                .as_i64()
+                .and_then(|rank| i32::try_from(rank).ok())
+                .filter(|rank| *rank >= 0);
+            let rank = rank.ok_or_else(bad)?;
+            let carry = carried
+                .iter()
+                .find(|carry| carry["rank"].as_i64() == Some(i64::from(rank)));
+            let progress = carry
+                .and_then(|carry| Progress::restored(entry, carry, world_size, now, &self.config))
+                .ok_or_else(bad)?;
+            restored.push(((run_id.to_string(), rank), progress));
+        }
+        let mut ranks = self.ranks.lock().unwrap();
+        for (key, progress) in restored {
+            ranks.entry(key).or_insert(progress);
+        }
+        Ok(true)
+    }
+
     fn with<R>(&self, key: &Key, now: Instant, f: impl FnOnce(&mut Progress) -> R) -> R {
         let mut ranks = self.ranks.lock().unwrap();
         f(ranks.entry(key.clone()).or_insert_with(|| Progress::new(now)))
@@ -273,6 +496,7 @@ impl Watchdog {
             p.open_streams += 1;
             p.stream = Stream::Open;
             p.last_change = now;
+            p.held = None;
         });
     }
 
@@ -477,6 +701,14 @@ pub fn run_status(
         "ranks": ranks,
     });
     status["incidents"] = json!(incidents(&status));
+    status["abandoned"] = json!(
+        !config.abandon.is_zero()
+            && !members.is_empty()
+            && members.iter().all(|(_, p)| p
+                .disconnected_seconds(now)
+                .is_some_and(|idle| idle >= config.abandon.as_secs_f64()))
+    );
+    status["restart"] = json!(members.iter().map(|(rank, p)| p.carry(*rank, now)).collect::<Vec<_>>());
     status
 }
 
@@ -648,6 +880,7 @@ mod tests {
             silent_factor: 5.0,
             critical: Duration::from_secs(floor * 3),
             pause_limit: Duration::from_secs(floor * 10),
+            abandon: Duration::from_secs(floor * 100),
         }
     }
 
@@ -925,5 +1158,257 @@ mod tests {
             dog.heartbeat(&key(0), "eval", 15.0, Some(work), at(t0, second));
         }
         assert_eq!(states(&dog, at(t0, 399)), ["silent"]);
+    }
+
+    /// The status as a file holds it: written as JSON and read back.
+    fn as_file(status: &Value) -> Value {
+        serde_json::from_slice(&serde_json::to_vec_pretty(status).unwrap()).unwrap()
+    }
+
+    /// A new server, started `now`, takes up `status` (a file the old server wrote).
+    fn restarted(status: &Value, floor: u64, now: Instant) -> Watchdog {
+        let dog = Watchdog::new(config(floor));
+        assert_eq!(dog.restore("run", &as_file(status), now), Ok(true));
+        dog
+    }
+
+    #[test]
+    fn a_stalled_run_is_stalled_again_after_a_restart_with_the_quiet_time_it_had() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60)); // critical after 180 s
+        for rank in 0..2 {
+            dog.stream_opened(&key(rank), t0);
+            dog.batch(&key(rank), 1, Some(9), Some(2), at(t0, 5));
+        }
+        // Both ranks have been quiet for 200 s: silent, critical, the job stalled.
+        for running in [true, false] {
+            // `false` is the file a clean stop leaves (`server_stopped`, no incidents); `true` the
+            // last file of a server that was killed.
+            let before = dog.statuses(at(t0, 205), running)["run"].clone();
+            assert_eq!(before["summary"], if running { "stalled" } else { "server_stopped" });
+            let now = Instant::now();
+            let fresh = restarted(&before, 60, now);
+            // The first status after the restart, before any sender has reconnected.
+            let status = &fresh.statuses(now, true)["run"];
+            assert_eq!(status["summary"], "stalled");
+            assert_eq!(states(&fresh, now), ["silent", "silent"]);
+            assert_eq!(status["incidents"][0]["kind"], "job_stalled");
+            assert_eq!(status["incidents"][0]["assessment"], "suspected_hang");
+            assert_eq!(status["incidents"][0]["severity"], "critical");
+            assert_eq!(status["ranks"][0]["seconds_since_progress"], 200.0);
+            assert_eq!(status["ranks"][0]["last_step"], 9);
+            // A sender that comes back with nothing new reads as silent from the old progress; a new
+            // batch makes the rank active, the other is still lost.
+            fresh.stream_opened(&key(0), now);
+            assert_eq!(states(&fresh, at(now, 1)), ["silent", "silent"]);
+            fresh.batch(&key(0), 1, Some(19), Some(2), at(now, 2));
+            assert_eq!(states(&fresh, at(now, 3)), ["active", "silent"]);
+            assert_eq!(fresh.statuses(at(now, 3), true)["run"]["summary"], "degraded");
+            // A rank whose sender never returns is held as it was for the floor, then lost.
+            assert_eq!(states(&fresh, at(now, 59))[1], "silent");
+            assert_eq!(states(&fresh, at(now, 61))[1], "lost");
+        }
+    }
+
+    #[test]
+    fn time_the_server_was_not_running_is_not_held_against_a_rank() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(9), Some(1), at(t0, 5));
+        let before = dog.statuses(at(t0, 8), true)["run"].clone(); // active, 3 s since progress
+        let now = Instant::now();
+        let fresh = restarted(&before, 60, now);
+        // However long the outage was, the file says only how long things had lasted.
+        let status = &fresh.statuses(now, true)["run"];
+        assert_eq!(status["ranks"][0]["seconds_since_progress"], 3.0);
+        assert_eq!(
+            (status["summary"].as_str(), states(&fresh, now)),
+            (Some("active"), vec!["reconnecting".to_string()])
+        );
+        // Its sender comes back: active at once. If nobody does, it is lost after the floor.
+        assert_eq!(states(&fresh, at(now, 59)), ["reconnecting"]);
+        assert_eq!(states(&fresh, at(now, 61)), ["lost"]);
+        fresh.stream_opened(&key(0), at(now, 10));
+        assert_eq!(states(&fresh, at(now, 11)), ["active"]);
+    }
+
+    #[test]
+    fn a_slow_ranks_cadence_survives_a_restart() {
+        // Batches 400 s apart: the threshold is 5 x 400 s, not the 60 s floor.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        for n in 1..=4u64 {
+            dog.batch(&key(0), 1, Some(n as i64 * 50), Some(1), at(t0, n * 400));
+        }
+        let before = dog.statuses(at(t0, 1600 + 1500), true)["run"].clone();
+        assert_eq!(before["summary"], "active");
+        let now = Instant::now();
+        let fresh = restarted(&before, 60, now);
+        fresh.stream_opened(&key(0), now);
+        assert_eq!(states(&fresh, at(now, 100)), ["active"]); // 1,600 s quiet, threshold 2,000
+        assert_eq!(states(&fresh, at(now, 600)), ["silent"]); // 2,100 s
+    }
+
+    #[test]
+    fn a_pause_in_progress_and_the_pauses_measured_survive_a_restart() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60)); // pause limit 600 s
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(49), Some(1), at(t0, 1));
+        dog.heartbeat(&key(0), "checkpoint", 15.0, None, at(t0, 2));
+        dog.heartbeat(&key(0), "train", 15.0, None, at(t0, 62)); // a 60 s checkpoint, on record
+        dog.heartbeat(&key(0), "eval", 15.0, None, at(t0, 100));
+        for second in (115..250).step_by(15) {
+            dog.heartbeat(&key(0), "eval", 15.0, None, at(t0, second));
+        }
+        let before = dog.statuses(at(t0, 250), true)["run"].clone();
+        assert_eq!(states(&dog, at(t0, 250)), ["paused"]);
+        let now = Instant::now();
+        let fresh = restarted(&before, 60, now);
+        let status = &fresh.statuses(now, true)["run"];
+        assert_eq!(status["pauses"]["checkpoint"]["max_seconds"], 60.0);
+        assert_eq!(status["recommended_silent_seconds"], 120.0);
+        assert_eq!(status["ranks"][0]["phase"], "eval");
+        assert_eq!(status["ranks"][0]["phase_seconds"], 150.0);
+        // Its sender and heartbeats come back: still paused (an evaluation that has run 165 s of
+        // 600), not silent. Training resumes and the pause is measured without the outage.
+        fresh.stream_opened(&key(0), now);
+        fresh.heartbeat(&key(0), "eval", 15.0, None, at(now, 15));
+        assert_eq!(states(&fresh, at(now, 16)), ["paused"]);
+        fresh.heartbeat(&key(0), "train", 15.0, None, at(now, 30));
+        let status = &fresh.statuses(at(now, 31), true)["run"];
+        assert_eq!(status["pauses"]["eval"]["count"], 1);
+        assert_eq!(status["pauses"]["eval"]["max_seconds"], 180.0);
+        assert_eq!(status["pauses"]["checkpoint"]["count"], 1);
+    }
+
+    #[test]
+    fn missing_ranks_and_the_world_size_survive_a_restart() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        for rank in [0, 1] {
+            dog.stream_opened(&key(rank), t0);
+            dog.batch(&key(rank), 1, Some(9), Some(4), at(t0, 1));
+            dog.batch(&key(rank), 1, Some(19), Some(4), at(t0, 70));
+        }
+        let before = dog.statuses(at(t0, 71), true)["run"].clone();
+        assert_eq!(before["missing_ranks"], json!([2, 3]));
+        let now = Instant::now();
+        let fresh = restarted(&before, 60, now);
+        // The run was seen for longer than the floor: the missing ranks are still named at once.
+        let status = &fresh.statuses(now, true)["run"];
+        assert_eq!(
+            (&status["world_size"], &status["missing_ranks"]),
+            (&json!(4), &json!([2, 3]))
+        );
+    }
+
+    #[test]
+    fn finished_abandoned_and_unusable_runs_are_not_taken_up() {
+        let t0 = Instant::now();
+        let fresh = || Watchdog::new(config(60)); // abandoned after 6,000 s
+        let new_run = || {
+            let dog = fresh();
+            for rank in 0..2 {
+                dog.stream_opened(&key(rank), t0);
+                dog.batch(&key(rank), 1, Some(9), Some(2), at(t0, 1));
+            }
+            dog
+        };
+        let restore = |status: &Value| {
+            let dog = fresh();
+            let result = dog.restore("run", &as_file(status), t0);
+            (result, dog.statuses(t0, true).len())
+        };
+        // Finished: nothing to watch.
+        let dog = new_run();
+        for rank in 0..2 {
+            dog.stream_ended(&key(rank), true, at(t0, 2));
+        }
+        let status = dog.statuses(at(t0, 3), true)["run"].clone();
+        assert_eq!(status["summary"], "finished");
+        assert_eq!(restore(&status), (Ok(false), 0));
+        // Both streams dropped long ago: abandoned. With one stream open and hung, never.
+        let dog = new_run();
+        for rank in 0..2 {
+            dog.stream_ended(&key(rank), false, at(t0, 2));
+        }
+        let status = dog.statuses(at(t0, 2 + 6000), true)["run"].clone();
+        assert_eq!(
+            (&status["abandoned"], &status["summary"]),
+            (&json!(true), &json!("stalled"))
+        );
+        assert_eq!(restore(&status), (Ok(false), 0));
+        assert_eq!(dog.statuses(at(t0, 2 + 5999), true)["run"]["abandoned"], false);
+        let dog = new_run();
+        dog.stream_ended(&key(0), false, at(t0, 2));
+        let status = dog.statuses(at(t0, 100_000), true)["run"].clone();
+        assert_eq!(status["abandoned"], false); // rank 1 is hung with its stream open
+        assert_eq!(restore(&status).0, Ok(true));
+        // A status an older server wrote has no `restart`.
+        let mut old = status.clone();
+        old.as_object_mut().unwrap().remove("restart");
+        assert_eq!(restore(&old), (Ok(false), 0));
+        // A status that cannot be read takes up none of the run's ranks.
+        let mut bad = status.clone();
+        bad["restart"][1]["gaps_seconds"] = json!("x");
+        let (result, ranks) = restore(&bad);
+        assert!(result.is_err() && ranks == 0, "{result:?} {ranks}");
+        for (field, value) in [("run_id", json!("other")), ("schema_version", json!(2))] {
+            let mut wrong = status.clone();
+            wrong[field] = value;
+            assert!(restore(&wrong).0.is_err());
+        }
+        let mut negative = status.clone();
+        negative["ranks"][0]["seconds_since_progress"] = json!(-1.0);
+        assert!(restore(&negative).0.is_err());
+    }
+
+    #[test]
+    fn a_rank_that_connected_before_the_restore_is_left_alone() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(9), Some(1), at(t0, 1));
+        let before = dog.statuses(at(t0, 5), true)["run"].clone();
+        let fresh = Watchdog::new(config(60));
+        let now = Instant::now();
+        fresh.stream_opened(&key(0), now);
+        assert_eq!(fresh.restore("run", &as_file(&before), now), Ok(true));
+        let status = &fresh.statuses(now, true)["run"];
+        assert_eq!(status["ranks"][0]["last_step"], Value::Null);
+        assert_eq!(status["ranks"][0]["stream"], "open");
+    }
+
+    #[test]
+    fn an_age_longer_than_the_host_has_been_up_is_never_taken_for_zero() {
+        let now = Instant::now();
+        // Whatever the platform's clock reaches back to, the age is positive, never above what was
+        // asked, and nothing panics for absurd values.
+        for seconds in [
+            1.0,
+            86_400.0 * 5.0,
+            86_400.0 * 365.0 * 40.0,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NAN,
+            -3.0,
+        ] {
+            let age = now.saturating_duration_since(ago(now, seconds));
+            let asked = Duration::try_from_secs_f64(seconds).unwrap_or(Duration::from_secs(10 * 365 * 86_400));
+            assert!(
+                age <= asked.min(Duration::from_secs(10 * 365 * 86_400)),
+                "{seconds}: {age:?}"
+            );
+            if seconds >= 1.0 {
+                assert!(age > Duration::ZERO, "{seconds}");
+            }
+        }
+        assert_eq!(
+            now.saturating_duration_since(ago(now, 1.5)),
+            Duration::from_millis(1500)
+        );
     }
 }

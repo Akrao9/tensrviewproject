@@ -1300,3 +1300,426 @@ async fn a_restart_costs_one_listing_and_one_footer_read_per_rank() {
     );
     assert_eq!(gets.load(Ordering::SeqCst), 0, "no part is read whole");
 }
+
+// ---------------------------------------------------------------------------------------------
+// The watchdog across a restart, on local disk.
+
+fn read_status(root: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(root.join("runs").join(RUN).join("watchdog.json")).unwrap()).unwrap()
+}
+
+/// Two ranks of a run of two: rank 0 steps on, rank 1 sent one batch and went quiet. Returns once
+/// rank 1 is silent and the file says so.
+async fn a_run_with_a_silent_rank(server: &TestServer) -> (Put, Put) {
+    let mut rank0 = open(server, 0).await;
+    let mut rank1 = open(server, 1).await;
+    for rank in [&mut rank0, &mut rank1] {
+        let n = rank.rank;
+        rank.send_with_metadata(batch(n, 0..50), world_metadata(n, 2, 100))
+            .await;
+    }
+    for step in [50, 100, 150, 200, 250, 300] {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        rank0
+            .send_with_metadata(batch(0, step..step + 50), world_metadata(0, 2, 100 + step))
+            .await;
+    }
+    until("rank 1 silent", || {
+        rank_states(server)
+            .iter()
+            .any(|(rank, state, _)| *rank == 1 && state == "silent")
+    })
+    .await;
+    (rank0, rank1)
+}
+
+#[tokio::test]
+async fn a_killed_servers_silent_rank_and_incident_survive_a_restart_with_their_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = start(dir.path(), watch_config(400), None).await;
+    let (_rank0, _rank1) = a_run_with_a_silent_rank(&old).await;
+    old.ingest.write_watchdog().await;
+    let before = read_status(dir.path());
+    assert_eq!(before["summary"], "degraded");
+    assert_eq!(before["incidents"][0]["kind"], "rank_silent");
+    let quiet_before = before["ranks"][1]["seconds_since_progress"].as_f64().unwrap();
+    assert!(quiet_before >= 0.4, "{quiet_before}");
+    // The old server is killed: its last file stays, and nothing more is written by it. (Its open
+    // streams are not the new server's.)
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(300)).await; // an outage
+
+    let new = start(dir.path(), watch_config(400), None).await;
+    assert_eq!(new.ingest.restore_watchdog().await.unwrap(), 1);
+    // The first status after the restart, with no sender reconnected: the stall is still there,
+    // with the quiet time it had (not reset, and not grown by the outage).
+    let status = &new.ingest.watchdog_statuses()[RUN];
+    assert_eq!(status["summary"], "degraded");
+    assert_eq!(status["incidents"][0]["kind"], "rank_silent");
+    assert_eq!(status["incidents"][0]["assessment"], "suspected_hang");
+    assert_eq!(status["ranks"][1]["state"], "silent"); // held as it was while its sender comes back
+    assert_eq!(status["ranks"][1]["stream"], "dropped");
+    assert_eq!(status["ranks"][1]["last_step"], 49);
+    assert_eq!(status["ranks"][0]["last_step"], before["ranks"][0]["last_step"]);
+    let quiet_after = status["ranks"][1]["seconds_since_progress"].as_f64().unwrap();
+    assert!(
+        quiet_after >= quiet_before && quiet_after < quiet_before + 0.25,
+        "{quiet_before} -> {quiet_after}"
+    );
+    assert_eq!(status["world_size"], 2);
+    // The file now says the new server is watching, with the incident in it.
+    new.ingest.write_watchdog().await;
+    let after = read_status(dir.path());
+    assert_eq!(after["server_running"], true);
+    assert_eq!(after["incidents"][0]["kind"], "rank_silent");
+    assert!(after["written_at_ms"].as_i64() > before["written_at_ms"].as_i64());
+
+    // The silent rank's sender returns with nothing new: silent, from its old last progress. The
+    // other rank's batch makes it active again.
+    let _rank1 = open(&new, 1).await;
+    until("rank 1 silent again", || rank_states(&new)[1].1 == "silent").await;
+    let mut rank0 = open(&new, 0).await;
+    rank0
+        .send_with_metadata(batch(0, 400..450), world_metadata(0, 2, 500))
+        .await;
+    until("rank 0's batch", || {
+        new.ingest.watchdog_statuses()[RUN]["ranks"][0]["last_step"] == 449
+    })
+    .await;
+    assert_eq!(rank_states(&new)[0].1, "active");
+}
+
+#[tokio::test]
+async fn a_clean_stop_says_server_stopped_and_a_restart_brings_the_stall_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = start(dir.path(), watch_config(400), None).await;
+    let (_rank0, _rank1) = a_run_with_a_silent_rank(&old).await;
+    old.ingest.write_watchdog_stopped().await;
+    let stopped = read_status(dir.path());
+    assert_eq!(
+        (
+            stopped["summary"].as_str(),
+            stopped["incidents"].as_array().map(Vec::len)
+        ),
+        (Some("server_stopped"), Some(0))
+    );
+    drop(old);
+
+    let new = start(dir.path(), watch_config(400), None).await;
+    assert_eq!(new.ingest.restore_watchdog().await.unwrap(), 1);
+    let status = &new.ingest.watchdog_statuses()[RUN];
+    assert_eq!(
+        (status["summary"].as_str(), status["server_running"].as_bool()),
+        (Some("degraded"), Some(true))
+    );
+    assert_eq!(status["incidents"][0]["kind"], "rank_silent");
+    assert_eq!(status["ranks"][1]["state"], "silent");
+    new.ingest.write_watchdog().await;
+    assert_eq!(read_status(dir.path())["summary"], "degraded");
+}
+
+#[tokio::test]
+async fn a_finished_run_is_left_alone_by_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = start(dir.path(), watch_config(60_000), None).await;
+    let mut put = open(&old, 0).await;
+    put.send_with_metadata(batch(0, 0..10), world_metadata(0, 1, 50)).await;
+    let _ = put.finish().await;
+    until("finished", || rank_states(&old)[0].1 == "finished").await;
+    old.ingest.write_watchdog_stopped().await;
+    let path = dir.path().join("runs").join(RUN).join("watchdog.json");
+    let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let new = start(dir.path(), watch_config(60_000), None).await;
+    assert_eq!(new.ingest.restore_watchdog().await.unwrap(), 0);
+    assert!(new.ingest.watchdog_statuses().is_empty());
+    new.ingest.write_watchdog().await;
+    new.ingest.write_watchdog_stopped().await;
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), written);
+    assert_eq!(read_status(dir.path())["summary"], "finished");
+}
+
+#[tokio::test]
+async fn an_abandoned_run_stops_being_refreshed_and_is_not_taken_up_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        status_refresh: Duration::from_millis(100),
+        abandon_after: Duration::from_millis(300),
+        ..watch_config(60_000)
+    };
+    let old = start(dir.path(), config.clone(), None).await;
+    let mut put = open(&old, 0).await;
+    put.send_with_metadata(batch(0, 0..10), world_metadata(0, 1, 50)).await;
+    until("the rank is seen", || rank_states(&old).len() == 1).await;
+    // The stream is cut and nothing comes back.
+    put.send_with_metadata(batch(0, 10..20), world_metadata(0, 1, 9).replace(RUN, "another-run"))
+        .await;
+    assert_eq!(put.ack().await, Err(Code::InvalidArgument));
+    until("dropped", || rank_states(&old)[0].2 == "dropped").await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    old.ingest.write_watchdog().await;
+    let abandoned = read_status(dir.path());
+    assert_eq!(abandoned["abandoned"], true);
+    // From here on the status is not rewritten, although its refresh time has long passed.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    old.ingest.write_watchdog().await;
+    assert_eq!(read_status(dir.path())["written_at_ms"], abandoned["written_at_ms"]);
+    drop(old);
+
+    let new = start(dir.path(), config, None).await;
+    assert_eq!(new.ingest.restore_watchdog().await.unwrap(), 0);
+    assert!(new.ingest.watchdog_statuses().is_empty());
+}
+
+#[tokio::test]
+async fn a_status_that_cannot_be_read_does_not_stop_the_server_or_the_other_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let old = start(dir.path(), watch_config(60_000), None).await;
+        let mut put = open(&old, 0).await;
+        put.send_with_metadata(batch(0, 0..10), world_metadata(0, 1, 50)).await;
+        until("the rank is seen", || rank_states(&old).len() == 1).await;
+        old.ingest.write_watchdog().await;
+    }
+    // Another run's file is not JSON, a third is JSON of the wrong shape.
+    for (run, content) in [
+        ("broken", "{not json"),
+        (
+            "other",
+            "{\"run_id\":\"other\",\"schema_version\":1,\"ranks\":[{}],\"restart\":[{}]}",
+        ),
+    ] {
+        let directory = dir.path().join("runs").join(run);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("watchdog.json"), content).unwrap();
+    }
+    let new = start(dir.path(), watch_config(60_000), None).await;
+    assert_eq!(new.ingest.restore_watchdog().await.unwrap(), 1);
+    assert_eq!(new.ingest.watchdog_statuses().keys().collect::<Vec<_>>(), [RUN]);
+}
+
+/// A server process that is killed when dropped, so a failed assertion leaves none running.
+struct Reaped(std::process::Child);
+
+impl Reaped {
+    fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// The real binary, killed with SIGKILL: its last file stays, and the next one takes the run up.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_binary_killed_with_sigkill_resumes_the_stall_it_was_watching() {
+    use std::io::{BufRead, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let launch = || {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--silent-seconds",
+                "1",
+                "--critical-seconds",
+                "2",
+            ])
+            .args(["--watchdog-seconds", "0.2", "--store"])
+            .arg(dir.path())
+            .env_remove("TENSORQUILL_TOKEN")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let address = format!("http://{}", line.trim().rsplit(' ').next().unwrap());
+        (Reaped(child), address)
+    };
+    let (mut child, address) = launch();
+    let mut put = open_at(&address, RUN, 0, None).await;
+    put.send_with_metadata(batch(0, 0..10), world_metadata(0, 1, 50)).await;
+    let path = dir.path().join("runs").join(RUN).join("watchdog.json");
+    // Quiet for longer than the floor: stalled. Wait for the file to say so.
+    let mut before = serde_json::Value::Null;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(bytes) = std::fs::read(&path) {
+            before = serde_json::from_slice(&bytes).unwrap_or_default();
+            if before["summary"] == "stalled" {
+                break;
+            }
+        }
+    }
+    assert_eq!(before["summary"], "stalled", "{before}");
+    let quiet_before = before["ranks"][0]["seconds_since_progress"].as_f64().unwrap();
+    child.kill();
+    drop(put);
+    tokio::time::sleep(Duration::from_secs(2)).await; // an outage longer than the floor
+
+    let (_child, address) = launch(); // restores before it listens
+    let mut first = serde_json::Value::Null;
+    for _ in 0..100 {
+        if let Ok(bytes) = std::fs::read(&path) {
+            let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            if status["written_at_ms"].as_i64() > before["written_at_ms"].as_i64() {
+                first = status;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The first file the new server wrote already carries the incident, with the old clock.
+    assert_eq!(first["server_running"], true, "{first}");
+    assert_eq!(first["summary"], "stalled");
+    assert_eq!(first["incidents"][0]["kind"], "job_stalled");
+    assert_eq!(first["ranks"][0]["last_step"], 9);
+    let quiet = first["ranks"][0]["seconds_since_progress"].as_f64().unwrap();
+    assert!(
+        quiet >= quiet_before && quiet < quiet_before + 3.0,
+        "{quiet_before} -> {quiet}: the outage must not count"
+    );
+    // A sender comes back and steps on: the run is active again.
+    let mut put = open_at(&address, RUN, 0, None).await;
+    put.send_with_metadata(batch(0, 10..20), world_metadata(0, 1, 90)).await;
+    let mut active = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        active = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|status| status["summary"] == "active" && status["ranks"][0]["last_step"] == 19);
+        if active {
+            break;
+        }
+    }
+    assert!(active);
+    drop(put);
+}
+
+/// Statuses for `runs` unfinished runs of 8 ranks each, written to `store` as a server would.
+async fn write_unfinished_runs(store: &Arc<TestStore>, runs: usize) {
+    use tensorquill_server::watchdog::{Watchdog, WatchdogConfig};
+    let storage = Storage::new(store.clone(), "".into());
+    let dog = Watchdog::new(WatchdogConfig::default());
+    let t0 = std::time::Instant::now();
+    for run in 0..runs {
+        for rank in 0..8 {
+            let key = (format!("run-{run}"), rank);
+            dog.stream_opened(&key, t0);
+            dog.batch(&key, 1, Some(49), Some(8), t0);
+        }
+    }
+    for (run, status) in dog.statuses(t0, true) {
+        storage.write_status(&run, &status).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn restoring_many_runs_is_one_listing_and_concurrent_small_reads() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    write_unfinished_runs(&store, 160).await;
+    store.knobs.delay_ms.store(25, Ordering::SeqCst);
+    store.knobs.lists.store(0, Ordering::SeqCst);
+    let ingest = Ingest::new(Storage::new(store.clone(), "".into()), IngestConfig::default());
+    let started = std::time::Instant::now();
+    assert_eq!(ingest.restore_watchdog().await.unwrap(), 160);
+    let took = started.elapsed();
+    assert_eq!(
+        store.knobs.lists.load(Ordering::SeqCst),
+        1,
+        "one delimiter listing of runs/"
+    );
+    assert_eq!(
+        store.knobs.gets.load(Ordering::SeqCst),
+        160,
+        "one read of one status per run, no part"
+    );
+    // 160 reads of 25 ms one after another would take 4 s.
+    assert!(took < Duration::from_millis(1500), "{took:?}");
+    assert_eq!(ingest.watchdog_statuses().len(), 160);
+}
+
+/// Prints what a remote store's latency costs (simulated with sleeps, not measured against S3).
+/// `cargo test --release --test ingest_test simulated_latency -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "a measurement, not a check"]
+async fn simulated_latency_report() {
+    use std::sync::atomic::Ordering;
+    for latency in [20u64, 50, 100] {
+        // Restore of 1,000 runs.
+        let store = TestStore::new();
+        write_unfinished_runs(&store, 1000).await;
+        store.knobs.delay_ms.store(latency, Ordering::SeqCst);
+        let ingest = Ingest::new(Storage::new(store.clone(), "".into()), IngestConfig::default());
+        let started = std::time::Instant::now();
+        let restored = ingest.restore_watchdog().await.unwrap();
+        println!(
+            "{latency} ms per request: restore of {restored} runs {:?}",
+            started.elapsed()
+        );
+
+        // 64 ranks, 20 parts of 500 steps each (10,000 steps), a restart: the first batch of each rank
+        // reads its watermark (1 listing + 1 suffix read), and with detectors on the rank is replayed:
+        // 1 listing + 20 whole-part reads, one after another per rank.
+        let config = IngestConfig {
+            flush_steps: 500,
+            ..manual()
+        };
+        for (detect, label) in [(false, "watermark only"), (true, "watermark + detector replay")] {
+            let store = TestStore::new();
+            {
+                let server = start_on(store.clone(), config.clone(), None).await;
+                for rank in 0..64 {
+                    let mut put = open(&server, rank).await;
+                    for first in (0..10_000).step_by(500) {
+                        put.send(batch(rank, first..first + 500), 1).await;
+                        put.ack().await.unwrap();
+                    }
+                }
+            }
+            store.knobs.delay_ms.store(latency, Ordering::SeqCst);
+            let server = start_on(
+                store.clone(),
+                IngestConfig {
+                    detect,
+                    ..config.clone()
+                },
+                None,
+            )
+            .await;
+            let started = std::time::Instant::now();
+            let mut puts = Vec::new();
+            for rank in 0..64 {
+                let mut put = open(&server, rank).await;
+                put.send(batch(rank, 10_000..10_500), 2).await;
+                puts.push(put);
+            }
+            for put in &mut puts {
+                put.ack().await.unwrap();
+            }
+            let first = started.elapsed();
+            // The detectors replay after the first part is acknowledged, and the rank's next part waits for it.
+            for (rank, put) in puts.iter_mut().enumerate() {
+                put.send(batch(rank as i32, 10_500..11_000), 3).await;
+            }
+            for put in &mut puts {
+                put.ack().await.unwrap();
+            }
+            let second = started.elapsed() - first;
+            println!(
+                "{latency} ms per request: 64 ranks after a restart ({label}): first part acknowledged after {first:?}, the next one {second:?} later"
+            );
+        }
+    }
+}

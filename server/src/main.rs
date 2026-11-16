@@ -65,6 +65,11 @@ struct Args {
     /// (the sender keeps its rows and tries again). Also bounds how long SIGTERM waits for a failing store.
     #[arg(long, default_value_t = 30.0)]
     store_retry_seconds: f64,
+    /// A run with no stream open, whose ranks have all been disconnected or finished for this many hours,
+    /// is given up: its watchdog.json is no longer refreshed and a restarted server does not take it up
+    /// again. 0 never gives a run up.
+    #[arg(long, default_value_t = 72.0)]
+    abandon_hours: f64,
 }
 
 async fn terminated() {
@@ -79,6 +84,16 @@ async fn terminated() {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
+}
+
+/// The store location without anything a URL can carry besides the place (a password, a query).
+fn store_name(store: &str) -> String {
+    match url::Url::parse(store) {
+        Ok(url) if url.scheme().len() > 1 => {
+            format!("{}://{}{}", url.scheme(), url.host_str().unwrap_or(""), url.path())
+        }
+        _ => store.to_string(),
+    }
 }
 
 async fn run(args: Args) -> Result<(), Error> {
@@ -102,12 +117,24 @@ async fn run(args: Args) -> Result<(), Error> {
         watchdog_interval: Duration::from_secs_f64(args.watchdog_seconds),
         status_refresh: Duration::from_secs_f64(args.watchdog_seconds * 3.0),
         detect: !args.no_detect,
+        abandon_after: Duration::from_secs_f64(args.abandon_hours * 3600.0),
     };
     let options = StoreOptions {
         retry_timeout: Duration::from_secs_f64(args.store_retry_seconds),
     };
     let ingest = Ingest::new(Storage::open(&args.store, std::env::vars(), &options)?, config);
     let listener = TcpListener::bind(args.listen).await?;
+    // Take up the runs the last server left unfinished before any stream is served: a rank
+    // that connects first would otherwise be watched from nothing. This is also the first
+    // read of the store, so a wrong bucket or bad credentials stop the server here, with the
+    // store's own message (which does not hold the credentials), not at the first batch.
+    let resumed = ingest
+        .restore_watchdog()
+        .await
+        .map_err(|error| format!("cannot read the store {}: {error}", store_name(&args.store)))?;
+    if resumed > 0 {
+        eprintln!("tensorquill-server: watching {resumed} unfinished runs from the last server's status");
+    }
     // Scripts and tests that ask for port 0 read the real address from this line.
     println!("tensorquill-server listening on {}", listener.local_addr()?);
     let flusher = ingest.spawn_flusher();

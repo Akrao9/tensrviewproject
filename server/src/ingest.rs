@@ -48,6 +48,8 @@ pub const DEFAULT_FLUSH_STEPS: usize = 500;
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 /// Parts written at once by the timed flush and at shutdown.
 const FLUSH_CONCURRENCY: usize = 16;
+/// Runs whose status is read at startup at once (see `restore_watchdog`).
+const RESTORE_CONCURRENCY: usize = 32;
 
 #[derive(Clone, Debug)]
 pub struct IngestConfig {
@@ -73,6 +75,10 @@ pub struct IngestConfig {
     pub status_refresh: Duration,
     /// Whether the detectors run over each stored part and `incidents.json` is written (see `detect`).
     pub detect: bool,
+    /// A run whose ranks have all been disconnected or finished for this long is abandoned: its
+    /// status stops being refreshed and a restarted server does not take it up again. Zero never
+    /// gives a run up.
+    pub abandon_after: Duration,
 }
 
 impl Default for IngestConfig {
@@ -88,6 +94,7 @@ impl Default for IngestConfig {
             watchdog_interval: DEFAULT_WATCHDOG_INTERVAL,
             status_refresh: DEFAULT_WATCHDOG_INTERVAL * 3,
             detect: true,
+            abandon_after: crate::watchdog::DEFAULT_ABANDON,
         }
     }
 }
@@ -175,6 +182,7 @@ impl Ingest {
             silent_factor: config.silent_factor,
             critical: config.critical,
             pause_limit: config.pause_limit,
+            abandon: config.abandon_after,
         });
         Arc::new(Self {
             storage,
@@ -543,6 +551,38 @@ impl Ingest {
         self.watchdog.statuses(Instant::now(), true)
     }
 
+    /// Takes up the watching of every run a stopped server left unfinished, from the
+    /// `watchdog.json` it wrote last, before this server serves any stream (see `watchdog`
+    /// for what is carried and the rules). One listing of `runs/` and one small read per run,
+    /// 32 at a time; finished and abandoned runs are left as they are. A run whose status
+    /// cannot be used is logged and watched afresh when its ranks connect. Returns the number
+    /// of runs taken up; an error means the store could not be listed.
+    pub async fn restore_watchdog(&self) -> Result<usize, crate::storage::Error> {
+        let runs = self.storage.list_runs().await?;
+        let documents: Vec<_> = futures::stream::iter(runs)
+            .map(|run_id| async move {
+                let status = self.storage.read_status(&run_id).await;
+                (run_id, status)
+            })
+            .buffer_unordered(RESTORE_CONCURRENCY)
+            .collect()
+            .await;
+        let now = Instant::now();
+        let mut restored = 0;
+        for (run_id, status) in documents {
+            match status {
+                Ok(Some(status)) => match self.watchdog.restore(&run_id, &status, now) {
+                    Ok(true) => restored += 1,
+                    Ok(false) => {}
+                    Err(reason) => eprintln!("tensorquill-server: not resuming the watchdog of {run_id}: {reason}"),
+                },
+                Ok(None) => {}
+                Err(error) => eprintln!("tensorquill-server: cannot read the watchdog status of {run_id}: {error}"),
+            }
+        }
+        Ok(restored)
+    }
+
     /// Writes `runs/<run_id>/watchdog.json` for each run whose status changed since it was last
     /// written: its summary, a rank's state, stream or last step, or the ranks missing. The
     /// clock fields change every time, so they do not count. An unchanged status is still
@@ -572,6 +612,7 @@ impl Ingest {
                 "running": status["server_running"],
                 "missing": status["missing_ranks"],
                 "pauses": status["pauses"],
+                "abandoned": status["abandoned"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
                     ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone())).collect::<Vec<_>>()
                 }),
@@ -580,6 +621,7 @@ impl Ingest {
             let fresh = self.written.lock().unwrap().get(&run_id).is_some_and(|(written, at)| {
                 *written == signature
                     && (status["summary"] == "finished"
+                        || status["abandoned"] == true
                         || !status_refresh_due(now.saturating_duration_since(*at), self.config.status_refresh))
             });
             if fresh {
