@@ -1,9 +1,11 @@
 """Check TensorQuill on a dense transformer with a seeded activation outlier.
 
 Trains a small dense Hugging Face model on WikiText-2 twice in lockstep, with capture
-off and with full capture plus the probe pass, and from `--seed-step` scales a few hidden
-channels of one middle block by `--factor` in both, the kind of massive activation that
-precedes many loss spikes. It reports:
+off and with full capture plus the probe pass, and from `--seed-step` scales part of one
+middle block's output by `--factor` in both (`--fault`): by default the few channels with
+the largest outputs, the massive activations that precede many loss spikes growing
+further; or the whole block output. Scaling a few ordinary channels (`--fault channels`)
+is not seen by a block summary on a model that already has massive activations. It reports:
 
 - full-capture overhead on a dense model, and what a probe step and a flush step add;
 - whether the activation detector finds the outlier at the seeded step and block;
@@ -73,6 +75,39 @@ def build_models(args, device):
     models = [m.to(device).train() for m in models]
     optimizers = [torch.optim.AdamW(m.parameters(), lr=args.lr, fused=device.type == "cuda") for m in models]
     return models, optimizers
+
+
+FAULTS = ("massive", "block", "channels")
+
+
+def outlier_channels(model, block_name: str, fault: str, channels: list[int], hidden: int, batch) -> list[int]:
+    """The hidden channels a seeded outlier scales.
+
+    - `massive`: as many channels as `channels` names, but the ones with the largest output on
+      `batch`: the massive activations trained LLMs carry, growing further.
+    - `block`: every channel, a change of the whole block output.
+    - `channels`: the ones named. Block summaries cannot see this on a model that already has
+      massive activations: SmolLM2's block 16 output has `abs_max` near 20,000 and `std` near
+      32, and two ordinary channels times 100 moved `std` 1.1 times and `abs_max` not at all
+      (the first A100 run, although the loss went from 2.3 to 6.9).
+    """
+    if fault == "channels":
+        return list(channels)
+    if fault == "block":
+        return list(range(hidden))
+    peaks: list[torch.Tensor] = []
+
+    def record(_module, _args, output):
+        states = output[0] if isinstance(output, tuple) else output
+        peaks.append(states.detach().abs().amax(dim=tuple(range(states.dim() - 1))).float())
+
+    handle = model.get_submodule(block_name).register_forward_hook(record)
+    try:
+        with torch.no_grad():
+            model(input_ids=batch, use_cache=False)
+    finally:
+        handle.remove()
+    return sorted(peaks[0].topk(len(channels)).indices.tolist())
 
 
 def install_outlier(block: torch.nn.Module, hidden: int, channels: list[int], factor: float, device, dtype):
@@ -171,7 +206,10 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=350, help="timed steps after warmup")
     parser.add_argument("--seed-step", type=int, default=250, help="step the outlier starts")
     parser.add_argument("--layer", type=int, help="block to seed (default: the middle one)")
-    parser.add_argument("--channels", type=int, nargs="+", default=[7, 300])
+    parser.add_argument("--fault", choices=FAULTS, default="massive",
+                        help="what to scale: the largest channels, the whole block, or the --channels named")
+    parser.add_argument("--channels", type=int, nargs="+", default=[7, 300],
+                        help="for --fault channels; for massive, only how many channels")
     parser.add_argument("--factor", type=float, default=100.0)
     parser.add_argument("--probe-every", type=int, default=100)
     parser.add_argument("--eager", action="store_true", help="do not compile")
@@ -211,10 +249,12 @@ def main() -> None:
         layer = args.layer if args.layer is not None else len(blocks) // 2
         seeded_block = blocks[layer]
         hidden = models[0].config.hidden_size
+        # Both models start from the same weights, so one calibration serves both.
+        channels = outlier_channels(models[0], seeded_block, args.fault, args.channels, hidden, fixed)
         flags = []
         for model in models:
             flag, handle = install_outlier(
-                model.get_submodule(seeded_block), hidden, args.channels, args.factor, device,
+                model.get_submodule(seeded_block), hidden, channels, args.factor, device,
                 next(model.parameters()).dtype,
             )
             flags.append(flag)
@@ -225,7 +265,8 @@ def main() -> None:
             probe=lambda m: m(input_ids=fixed, use_cache=False), probe_every=args.probe_every,
         ))
         assert session.layer_names == blocks
-        print(f"Seeding block {seeded_block} ({layer + 1} of {len(blocks)}), channels {args.channels} "
+        scaled = f"all {hidden} channels" if args.fault == "block" else f"channels {channels}"
+        print(f"Seeding block {seeded_block} ({layer + 1} of {len(blocks)}), {scaled} ({args.fault}) "
               f"× {args.factor:g}, from step {args.seed_step}", flush=True)
         runners = models if args.eager else [
             torch.compile(

@@ -2,8 +2,9 @@
 
 Fine-tunes a small dense model on WikiText-2 through `transformers.Trainer` with
 `torch_compile=True`, gradient clipping and (on CUDA) fp16 mixed precision, which puts a
-`GradScaler` in the loop. From `--seed-step` it scales a few hidden channels of one middle
-block by `--factor`, as `dense_outlier_check.py` does. It fails unless:
+`GradScaler` in the loop. From `--seed-step` it scales part of one middle block's output by
+`--factor`, as `dense_outlier_check.py` does: the channels with the largest outputs by default,
+or the whole block (`--fault`; see there for why not a few ordinary channels). It fails unless:
 
 - TensorQuill recorded every optimizer step, numbered as `Trainer` numbers them;
 - the loss and the gradient norm before clipping are on every step, and agree with the
@@ -29,7 +30,7 @@ import torch
 import tensorquill
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dense_outlier_check import MODEL, install_outlier, load_batches  # noqa: E402
+from dense_outlier_check import FAULTS, MODEL, install_outlier, load_batches, outlier_channels  # noqa: E402
 
 
 def reset_compile_state() -> None:
@@ -67,7 +68,10 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--seed-step", type=int, default=250, help="step the outlier starts")
-    parser.add_argument("--channels", type=int, nargs="+", default=[7, 300])
+    parser.add_argument("--fault", choices=FAULTS, default="massive",
+                        help="what to scale: the largest channels, the whole block, or the --channels named")
+    parser.add_argument("--channels", type=int, nargs="+", default=[7, 300],
+                        help="for --fault channels; for massive, only how many channels")
     parser.add_argument("--factor", type=float, default=100.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--accumulate", type=int, default=1, help="gradient accumulation steps")
@@ -120,8 +124,9 @@ def main() -> None:
     blocks = [name for name, _ in tensorquill.capture._select_layers(model, "blocks")]
     seeded_block = blocks[len(blocks) // 2]
     # Before the Trainer and its callback, so the hook runs before TensorQuill's hook.
+    channels = outlier_channels(model, seeded_block, args.fault, args.channels, model.config.hidden_size, fixed)
     flag, handle = install_outlier(
-        model.get_submodule(seeded_block), model.config.hidden_size, args.channels, args.factor, device,
+        model.get_submodule(seeded_block), model.config.hidden_size, channels, args.factor, device,
         next(model.parameters()).dtype,
     )
 
@@ -152,7 +157,8 @@ def main() -> None:
     name = torch.cuda.get_device_name() if cuda else "CPU"
     mode = "eager" if args.eager else args.backend
     print(f"{torch.__version__} on {name} | {'toy Llama' if args.toy else args.model} | {mode} | {precision} | "
-          f"clip {args.max_grad_norm:g} | seeding {seeded_block} from step {args.seed_step}", flush=True)
+          f"clip {args.max_grad_norm:g} | seeding {seeded_block} from step {args.seed_step} "
+          f"({args.fault}: {'all channels' if args.fault == 'block' else channels})", flush=True)
 
     recompiles: list[str] = []
     try:
