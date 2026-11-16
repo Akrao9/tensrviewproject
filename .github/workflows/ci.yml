@@ -76,6 +76,8 @@ jobs:
         run: pytest -ra ../experiments/moe-bakeoff/test_fixtures.py
       - name: Trainer callback acceptance script, toy model
         run: python examples/trainer_check.py --toy --backend aot_eager --steps 150 --seed-step 100 --probe-every 50 --out "$RUNNER_TEMP/trainer-check"
+      - name: Seeded gradient-spike and stalled-weight cases, toy model
+        run: python examples/seeded_failures.py --toy --case both --out "$RUNNER_TEMP/seeded-failures"
 
   server:
     name: Ingest server and end-to-end streaming
