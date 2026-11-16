@@ -45,9 +45,26 @@ from test_traincheck import _summary, _violation  # noqa: E402
 pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
 
 
+STARTED: list[Server] = []
+
+
 @pytest.fixture(autouse=True)
 def parts_are_never_read(monkeypatch):
     no_part_is_read(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def servers_are_stopped():
+    """Every server a test started is gone when it ends, whether it passed, failed or never stopped it:
+    a `Popen` child outlives pytest, and a failing run would otherwise leave one behind."""
+    yield
+    for server in STARTED:
+        if server.process.poll() is None:
+            server.process.kill()
+            server.process.wait(20)
+        if not server.process.stdout.closed:
+            server.process.stdout.close()
+    STARTED.clear()
 
 
 def steady(steps: int = 60, spike: tuple[int, float] | None = None, nan_at: tuple[int, str] | None = None,
@@ -72,7 +89,12 @@ class Run:
         self.tmp = tmp_path
         self.store = tmp_path / "store"
         self.server_args = server_args
-        self.server = Server(self.store, 0, *server_args)
+        self.server = self.start(*server_args)
+
+    def start(self, *server_args: str) -> Server:
+        server = Server(self.store, 0, *server_args)
+        STARTED.append(server)
+        return server
 
     @property
     def folder(self) -> Path:
@@ -120,7 +142,7 @@ class Run:
         else:
             assert self.server.terminate() == 0
         self.server_args = server_args
-        self.server = Server(self.store, 0, *server_args)
+        self.server = self.start(*server_args)
 
 
 def healthy_run(tmp_path: Path, ranks: int = 4, *server_args: str, steps: int = 60) -> Run:
