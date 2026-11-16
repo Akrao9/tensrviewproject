@@ -451,7 +451,7 @@ class FlightSender:
                 self._stream()
                 return
             except BaseException as error:  # noqa: BLE001  the stream must never raise into training
-                self.last_error = error
+                self.last_error = _without_traceback(error)
             if self._progress:
                 self._progress = False
                 attempt = 0
@@ -585,6 +585,20 @@ class FlightSender:
                 raise ConnectionError("the server ended the stream before confirming every batch")
         finally:
             client.close()
+
+
+def _without_traceback(error: BaseException) -> BaseException:
+    """`error` and the exceptions it was raised from, without their tracebacks. A kept
+    traceback holds the sender thread's frames, and through them the sender and the gRPC
+    stream: a reference cycle. Freed by the garbage collector inside a forked DataLoader
+    worker, the stream's gRPC channel then waits forever for threads the fork did not copy."""
+    seen: set[int] = set()
+    item: BaseException | None = error
+    while item is not None and id(item) not in seen:
+        seen.add(id(item))
+        item.__traceback__ = None
+        item = item.__cause__ or item.__context__
+    return error
 
 
 def send_file(

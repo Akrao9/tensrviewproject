@@ -207,6 +207,13 @@ def test_server_down_for_200_steps_delivers_everything_in_order_after_restart(tm
     tracemalloc.stop()
     assert after - before < 8 * 1024 * 1024
     assert sender.last_error is not None
+    # Kept without tracebacks: their frames would tie the sender and the gRPC stream into a
+    # cycle that a forked DataLoader worker's garbage collector may free, and hang on.
+    error, chain = sender.last_error, []
+    while error is not None and error not in chain:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    assert all(e.__traceback__ is None for e in chain)
     assert store.steps() == list(range(100))
     assert read_offset(offset_path(path)) < path.stat().st_size
 
