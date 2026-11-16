@@ -57,10 +57,13 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 | Cross-GPU parameter fingerprints and replica spread (`parameter_fingerprints`, `replica_spread`) | Built, unit-tested on drift and sign-flip cases |
 | Detectors and Rerun exporter (`build_evidence`, `export_rerun`, `python -m tensorquill`) | Built, tested on MoE collapse (top-k aware), starved experts, gradient spikes, weights not updating, repeated steps, NaN/Inf, and replica drift |
 | Run ID from `run_id=`, `MLFLOW_RUN_ID`, the active MLflow run or the active W&B run; otherwise torchrun's or SLURM's job ID, or a generated `run-<UTC time>-<6 hex>` broadcast from rank 0, so separate untracked runs never append to the same file | Built, tested with stand-in tracker modules and two Gloo processes |
+| Compact evidence (`--compact`) and the trigger (`--watch --on-incident COMMAND`, `--webhook URL`): once for each new incident, invariants by default | Built Nov 16, 2026, tested on CPU (macOS), the store paths through the real server binary. No real agent or outside webhook has been driven by it |
+| Read-only MCP server (`python -m tensorquill.mcp_server PATH`, four tools) and the explain-only [agent instructions](AGENT_INSTRUCTIONS.md) | Built Nov 16, 2026, tested with a scripted client on the seven Gate 1 fixtures. No live agent has used it |
 | No graph breaks and no recompiles under `torch.compile` | Tested with `eager`, `aot_eager`, and AOTAutograd static-input checks on CPU; on CUDA with Inductor and CUDA graphs on a toy MoE, and with Inductor and CUDA graphs off on Granite |
 
 ## What is not built or not verified
 
+- **The agent loop has not met an agent.** The MCP server has been driven by a scripted client only, and the trigger by a local script and a local HTTP server. No agent session has been started by the trigger or has used the server.
 - **Detectors on the server's Parquet, limits.** The reader takes a local path, so parts in S3 or GCS cannot be read yet. A directory holding several ranks is read one rank at a time, and only that rank's `rank=` folder is opened; `--rank all` reads every rank's report and no part (see "All ranks at once"). On a `.jsonl` file, or on a store whose server did not report (`--no-detect`, or `--recompute` here), `--watch` reruns the detectors over the whole run on every update, so an update takes time in proportion to the run's length: 0.4 s at 500 steps and 8.1 s at 10,000 on a Granite-shaped 64-rank store (see [Detector benchmark on 64 ranks](#detector-benchmark-on-64-ranks)). On a store the server is judging it reads the server's report and no part (see [Watching a run the server is judging](#watching-a-run-the-server-is-judging)).
 - **Streaming, not verified:** GCS stores (S3 ran against an emulator only, see "Storing to S3 or GCS"), more than two ranks from real training processes at once (two pass on CPU, `tests/test_two_ranks_e2e.py`), a remote server and a GPU job. A token from the Python sender, TLS on loopback (`--tls-cert`/`--tls-key` with `TENSORQUILL_TLS_CA`), a non-zero rank, and forked `DataLoader` workers while the sender runs each pass an end-to-end test on macOS and on Linux in CI (as of `f30e639`). In a forked child the sender does nothing: the fork copies the object but not its thread, so `close()` there returns at once and the parent keeps streaming. No deadlock was seen in either fork test, but gRPC's behaviour across `fork` differs by platform, so a Linux machine with a CUDA job is still worth checking. The sender's memory bound during an outage is measured with `tracemalloc`, which does not see gRPC's own allocations.
 - **Replay** of a flagged batch (Tier 3). The probe pass (Tier 2) has run on a GPU with SmolLM2-360M, not yet with Granite.
@@ -496,6 +499,59 @@ tensorquill-server detect --thresholds '{"starve_window": 20}' < rows.arrow
 - **Checked** in `tests/test_server_detect.py`: 17 option values and one combination of all five, each on the eight record sets that hold MoE counts or a replica spread, give the same evidence on both paths, and each changes at least one incident in Python, so an ignored option would fail. A per-router `top_k` is tested on five record sets against the value recorded on every row. A live server started with thresholds matches Python across three appended stretches and a restart, and a watcher asking for the same values takes its report while one asking for the defaults recomputes.
 - **Not re-timed:** the 64-rank detector benchmark has not been rerun with the options in place.
 
+## Compact evidence and the trigger
+
+Built Nov 16, 2026 in `compact.py` and `trigger.py`, with small calls from `watch` and the command line.
+
+**Compact evidence.** For an MoE run the per-step `samples` are nearly the whole evidence file. `--compact` writes the file an agent reads: every incident and every other key as they are, and of `samples` only the steps near each MoE incident.
+
+```sh
+python -m tensorquill run.jsonl --compact
+python -m tensorquill run.jsonl --watch --compact --compact-window 20
+```
+
+- **What is kept.** The samples within `--compact-window` recorded steps (default 5; 0 keeps the incident's own step alone) of each `moe_imbalance` or `starved_experts` incident, for every router of those steps.
+- **Where it goes.** `<input>.evidence.compact.json`, written instead of the full file. The full file is the cost being avoided and can be rebuilt from the records; under its own name, a full file already on disk is never replaced by a smaller one.
+- **What says it is compact.** A `compact` key lists the window, the incidents the windows are around, the steps kept, how many samples were left out, and how many samples were flagged and the last step one was.
+- **What still works.** `incident_summary` and the `Run state:` line print the same text for both files. `expert_load_table` and `export_rerun` raise `compact.SamplesOmitted`, naming the kept steps, when asked for what was left out. `--compact --rerun` records from the full evidence in memory.
+- **Measured** on the detector benchmark's Granite-shaped run (24 routers, 32 experts, top-8) at 10,000 steps with two MoE incidents planted:
+
+  | File | Size |
+  | --- | --- |
+  | Full | 86.5 MB |
+  | Compact, window 5 | 195 KB |
+  | Compact, window 0 | 22 KB |
+  | No samples at all | 3.9 KB |
+
+  The 1 MB line holds up to a window of 28 steps.
+
+**The trigger.** With `--watch`, `--on-incident COMMAND` starts a command and `--webhook URL` posts JSON, once for each new incident. Nothing is started or sent without one of the two.
+
+```sh
+python -m tensorquill run.jsonl --watch --compact --on-incident 'my-agent "Explain the $TENSORQUILL_INCIDENT_KIND incident in $TENSORQUILL_EVIDENCE"'
+python -m tensorquill store/runs/r --rank all --watch --webhook https://example.com/hooks/tensorquill
+```
+
+- **New** means its rank, kind and step have not fired before. What fired is kept in `<evidence>.fired.json`, so a restarted watcher does not fire again; delete the file to start over.
+- **What fires.**
+  - Invariants only, by default.
+  - `--fire-anomalies` adds the anomalies, whose thresholds are not tuned on other jobs yet.
+  - `--fire-kind KIND` adds one kind by name, and is the only way an observation fires.
+  - A stalled job (`job_stalled`) and a silent rank (`rank_silent`) are observations, so **a hang does not fire unless you name them**.
+  - A change of run state never fires, and neither does a kind this version does not know.
+- **The command** is one string run by the shell.
+  - It gets the incident as JSON on standard input, and `TENSORQUILL_EVIDENCE`, `TENSORQUILL_RUN_ID` and `TENSORQUILL_INCIDENT_ID`, `_KIND`, `_CLASS`, `_STEP`, `_RANKS` and `_SUMMARY` in its environment.
+  - It is started and not waited for, so a long agent run does not hold the watcher. The watcher never stops it.
+- **The webhook** is one POST of `application/json` with the standard library, 10 s by default (`--webhook-timeout`). Redirects are not followed, and the URL is never printed or stored. The body carries the evidence file's absolute local path.
+- **Failures** are printed and never stop the watcher. A command that cannot start or exits with a status other than 0, and a post that fails, is tried again on later looks, 4 tries in all.
+- **Limits.**
+  - An incident counts as fired once its command has started, so a command that fails while the watcher is down is not tried again.
+  - The trigger does not turn on `--compact`: the file handed over is the one the watcher writes.
+  - Two watchers must not share one evidence path; the state file is not locked.
+  - In the all-ranks view an incident several ranks share fires once for those ranks, and once more for ranks that show it later.
+- **Checked** in `tests/test_compact.py` (9 tests) and `tests/test_trigger.py` (13 tests): a planted failure in a growing file starts a command with no human step, exactly once across later looks and a restart; the webhook's body against a local HTTP server; a failing command and an unreachable webhook leave the watcher running.
+- **Not checked:** a real agent as the command, an outside webhook, https, a proxy, Linux and Windows.
+
 ## Data progress and checkpoints
 
 Built Nov 16, 2026, on CPU; no GPU run yet. Both are opt-in.
@@ -560,6 +616,26 @@ Built Nov 16, 2026, tested with mocked CUDA and NVML; the GPU side waits for a C
   - Throttling between flushes is missed.
   - A hung NVML call blocks the writer thread and, once its queue fills, training.
   - Only PyTorch's `DataLoader` iterator and `time_data` are timed.
+
+## For a coding agent: a read-only MCP server
+
+Built Nov 16, 2026. `python -m tensorquill.mcp_server PATH` serves one run's evidence to a coding agent over MCP (stdio). `PATH` is an `evidence.json`, a `.jsonl` capture, or a run folder in a server's store (`runs/<run_id>`). It needs no package beyond the SDK: the part of the protocol it uses (revision 2025-06-18) is written out in `mcp_server.py`.
+
+It has four tools, and all four only read:
+
+| Tool | Gives |
+| --- | --- |
+| `list_incidents` | The incidents with their kind, class, first step and what they name, plus the run state and what was not checked |
+| `get_incident` | One incident in full |
+| `get_series` | One layer's, parameter's, router's or logged scalar's values over a step range |
+| `get_all_ranks_status` | For a run folder: which ranks are judged, unknown, clean or showing incidents |
+
+- **It follows a live run.** The path is read again at every call.
+- **Answers are bounded.** No reply is longer than 50 KB. A long series is thinned to 200 points with the stride reported, and the minimum, maximum and median are still taken over every recorded step.
+- **For a run folder it runs no detector.** The incidents come from the server's own reports, and only `get_series` opens the Parquet parts, which needs `pyarrow`.
+- **The page to give the agent** is [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md): which tool to call first, how to name the step, the layer or parameter and the kind, what the three classes and "not checked" mean, and that it explains and takes no action on the run.
+- **Checked** in `tests/test_mcp_server.py` (29 tests): a scripted client using only the four tools recovers the kind, the first step and the layer, parameter or module of all seven Gate 1 fixtures; the size cap on a 10,000-step run; a two-rank run folder, by hand and through the real server; every error case.
+- **Not checked:** no live agent has used it.
 
 ## Things to know
 

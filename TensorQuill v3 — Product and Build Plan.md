@@ -271,10 +271,10 @@ Listed Nov 16, 2026, from the focused plan's build pieces and the four things th
 | R4 | `--watch` on a local file and `--rank all` through Rust, `duplicate_batches` across ranks, and a reader that can match or adopt a server's thresholds (Decisions: "Thresholds into Rust") | One Rust copy | `watch` and the all-ranks view in `evidence.py`; `detect/data.rs`; `main.rs` | R1 |
 | R5 | Rust as the default, then delete each Python duplicate | One Rust copy | `evidence.py`, `data_checks.py`, `evidence_system.py` and their tests | R1 to R4 |
 | A1 | Say what was checked: checked, not configured or unavailable for every kind | Focused plan, piece 1 | `build_evidence` and `run_state` in `evidence.py`; `report` in `detect.rs` | R1, because it changes the same functions |
-| A2 | Compact evidence: incidents and a window of steps around each | Piece 2 | The evidence writer and the command line in `evidence.py` | Nothing |
-| A3 | Trigger: `--on-incident` and a webhook, once per new incident | Piece 3 | `watch` and the command line in `evidence.py` | A2, because the trigger hands over the compact file |
-| A4 | Read-only MCP server with four tools | Piece 4 | A new module and its tests | Nothing; it reads the files written today |
-| A5 | Explain-only agent instructions | Piece 5 | A new document | A4, because it names the tools |
+| A2 | Compact evidence: incidents and a window of steps around each | Piece 2 | `compact.py`, with calls from the writer and the command line in `evidence.py` | **Built Nov 16, 2026** (Decisions: "Compact evidence and the trigger") |
+| A3 | Trigger: `--on-incident` and a webhook, once per new incident | Piece 3 | `trigger.py`, with calls from `watch` and the command line in `evidence.py` | **Built Nov 16, 2026** (Decisions: "Compact evidence and the trigger") |
+| A4 | Read-only MCP server with four tools | Piece 4 | `mcp_server.py` and its tests | **Built Nov 16, 2026** (Decisions: "MCP server and agent instructions"). Open: no live agent has used it |
+| A5 | Explain-only agent instructions | Piece 5 | `sdk/AGENT_INSTRUCTIONS.md` | **Written Nov 16, 2026** (Decisions: "MCP server and agent instructions") |
 | D1 | Replica drift names the rank | Focused plan, detector change 2 | `distributed.py`, `capture.py`, `flight.py`, `detect.rs` | The two-GPU run |
 | B1 | Benchmark without the Rune arm: the harness's two gate lines | Decision 3 | `experiments/gate1/harness.py`, `PREREGISTRATION.md` | The author's amendments |
 | G1 | Attention maps out of `probe_json` | Open gap | `probe.py`, `flight.py`, the attention part of `detect.rs` | Results 1 and 2, by the focused plan |
@@ -283,8 +283,8 @@ Listed Nov 16, 2026, from the focused plan's build pieces and the four things th
 
 1. **Detector path:** R1 (built), then R2, then A1, then R5. All four change the detector code in `detect.rs` and the detection block of `build_evidence`, so they go one after another.
 2. **Golden files:** R3 (built and merged). Tests only.
-3. **Agent tools:** A4, then A5. New files only.
-4. **Evidence output:** A2, then A3, then R4. These change the writer, `watch` and the command line in `evidence.py`. Lane 1 changes other functions of the same file, so a lane in its own worktree should expect a small merge. R4 waits for R1.
+3. **Agent tools:** A4 and A5 (built and merged). New files only.
+4. **Evidence output:** A2 and A3 (built and merged), then R4, which is now free to start since R1 is built. R4 should also give the all-ranks view a public one-look function: `mcp_server.all_ranks_look` composes five private helpers of `evidence.py` until then.
 
 **Three wait on something outside the code:** D1 on the two-GPU run, B1 on the amendments, and G1 on results 1 and 2.
 
@@ -623,6 +623,33 @@ State as of Nov 16, 2026.
   - *Not frozen:* the two cases where the paths differ on purpose (a step written twice in one attempt, attempts out of order), and nothing at thresholds other than the defaults.
   - *Not run:* Linux. The files were made and checked on macOS only, so CI's first run is the first test of the last-bit allowance.
   - *Found on the way.* `experiments/moe-bakeoff/artifacts/` is git-ignored, and `test_server_detect.py` read it, so that file would have failed at collection on a clean checkout. It now builds the fixtures from the generator (`6dabd75`).
+- [x] **Compact evidence and the trigger (built Nov 16, 2026 in a side session, merged the same day).** Focused plan pieces 2 and 3, in `sdk/src/tensorquill/compact.py` and `trigger.py`, with small calls from `watch` and the command line. A2 and A3 in "What is left to build".
+  - *Compact evidence.* `--compact` writes `<input>.evidence.compact.json` instead of the full file: every key as it is, and of `samples` only `--compact-window` recorded steps (5) each side of a MoE incident. It is written instead of the full file because the 86 MB write is what is being avoided and the full file can be rebuilt from the records, and under its own name so a full file is never replaced.
+  - *Size, as the side session measured it* on the benchmark's Granite-shaped run at 10,000 steps with two MoE incidents planted: 86.5 MB full, 195 KB compact, 22 KB at a window of 0, 3.9 KB with no samples at all. The proposed line of 1 MB is met up to a window of 28 steps, and stands.
+  - *Trigger.* `--watch --on-incident COMMAND` and `--webhook URL` fire once for each new incident, keyed by rank, kind and step and kept in `<evidence>.fired.json`. Invariants fire by default, `--fire-anomalies` adds anomalies, and `--fire-kind` adds one kind by name. A change of run state never fires.
+  - *How it fires.* The command is started and not waited for, gets the incident on standard input and `TENSORQUILL_*` in its environment, and is never stopped by the watcher. The webhook is one POST with the standard library; redirects are not followed and the URL is never printed or stored. A failure is retried on later looks, 4 tries in all, and never stops the watcher. Nothing is started or sent unless the user gave the command or the URL.
+  - *Decided in the side session, open to change.*
+    1. `job_stalled` and `rank_silent` are observations, so a hung job fires only when named with `--fire-kind`.
+    2. In the all-ranks view an incident the ranks share fires once for those ranks, not once per rank.
+    3. A kind this version does not know does not fire.
+    4. The trigger does not turn on `--compact`.
+    5. An incident counts as fired once its command has started, so a command that fails while the watcher is down is not retried.
+  - *Verified.* 22 tests (`test_compact.py`, `test_trigger.py`; the trigger file is in CI's server job). The side session also checked 1,546 growing prefixes of the 57 parity record sets: no incident changed its step, so none would fire twice.
+  - *Not verified:* a real agent as the command, an outside webhook, https, a proxy, Linux, Windows, and two watchers sharing one evidence path (the state file is not locked).
+- [x] **MCP server and agent instructions (built Nov 16, 2026 in a side session, merged the same day).** Focused plan pieces 4 and 5: `sdk/src/tensorquill/mcp_server.py` and `sdk/AGENT_INSTRUCTIONS.md`. A4 and A5 in "What is left to build".
+  - *The server.* `python -m tensorquill.mcp_server PATH` over stdio, where `PATH` is an `evidence.json`, a `.jsonl` capture or a run folder. Four tools, all read-only: `list_incidents`, `get_incident`, `get_series` and `get_all_ranks_status`. A test holds the tool list to exactly these four.
+  - *No new dependency.* The `mcp` package is not installed, so the part of the protocol the server needs (revision 2025-06-18: `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`) is written out by hand.
+  - *Bounds.* No reply is longer than 50 KB. A series is thinned by a stride that grows until the reply fits; anything else too long loses the tail of its largest part, with a note saying where.
+  - *The instructions* tell the agent which tool to call first, how to name the step, the layer or parameter and the kind, what the three classes and "not checked" mean, and that it writes its diagnosis beside the evidence and takes no action on the run. The agent's other tools, such as a shell, are bound only by the instructions.
+  - *Decided in the side session, to confirm.*
+    1. The diagnosis goes to `x.diagnosis.md` beside the evidence; for a run folder, into the agent's working directory and never the store.
+    2. A fourth series kind, `scalar`, for logged scalars and the run-level gradient norm, learning rate, data wait and step time.
+    3. Layer and parameter values are read from the `.jsonl` beside an evidence file, or from `--records`.
+    4. `get_all_ranks_status` on a one-rank path is an error, so it can never be read as "all ranks fine".
+    5. Incident ids are `<kind>@<step>`, so an id survives a list that grows on a live run.
+  - *Verified.* 29 tests: a scripted client using only the four tools recovers the kind, the first step and the layer, parameter or module of all seven Gate 1 fixtures. This is the plan's done test for piece 4 without a live agent.
+  - *Not verified:* no agent session has used the server, so the done test with a fresh agent is still open. Only Python 3.12 was used.
+  - *Left for R4.* `mcp_server.all_ranks_look` composes five private helpers of `evidence.py`, because no public call returns the all-ranks view without writing a file.
 - [x] **Optimizer ownership as evidence for `stalled_weights` (decided and built Nov 15, 2026).** Equal float64 norms do not prove unchanged weights, so the incident stays a warning (worded "float64 norm did not change"). Each weight check records `optimizer_ownership`: whether an optimizer that has stepped holds each trainable parameter. It is `unknown`, never "not held", when ownership cannot be established: the optimizer hooks are off (`auto_step=False`), or no optimizer that stepped holds any of the model's parameters (DeepSpeed ZeRO, Megatron and FSDP1 step copies or flattened parameters). It travels in `extra_json` through the server. It is attached to the stalled incident as `optimizer` (`known` with the parameters no optimizer holds, or `unknown` with the reason) and is never an alarm of its own, because a parameter may be left out on purpose.
 - [x] **Learning rate across a resume (decided and built Nov 15, 2026).** `detect_resume_lr_changes` reads every attempt and, at the first step of each resumed attempt, compares its learning rate with the earlier attempt's: at the same step when the earlier attempt recorded it, otherwise continuing the earlier attempt's recent slope. A difference is reported as `resume_lr_change`, an observation and not a verdict: some restarts reset warmup on purpose, and a record cannot show the intent, so the incident says whether the resumed value equals the run's first learning rate and the summary says it is expected when the schedule was changed deliberately. A restart of the numbering is left to `repeated_steps`. A resume that cannot be compared because no learning rate was recorded goes into a new optional `not_checked` list in `evidence.json` (still `schema_version: 1`; readers that ignore the key lose nothing).
 - [x] **TLS for the ingest stream (decided Nov 14, 2026):** the server uses tonic's `tls-aws-lc` feature, not `tls-ring`. `object_store` already brings rustls with the aws-lc provider, and with both providers compiled in rustls cannot pick one: a `tls-ring` build panics at startup when given `--tls-cert`/`--tls-key` (reproduced on the build before the switch). The sender trusts the system's certificate authorities for `grpcs://`; `TENSORQUILL_TLS_CA` (or `tls_root_certs=` on `FlightSender` and `send_file`) names a PEM file for a private or self-signed one, read at `init` so a wrong path fails before training starts. Tested on loopback only, with a self-signed certificate.
