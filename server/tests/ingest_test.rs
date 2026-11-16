@@ -1561,10 +1561,14 @@ async fn the_binary_killed_with_sigkill_resumes_the_stall_it_was_watching() {
         }
     }
     assert_eq!(before["summary"], "stalled", "{before}");
-    let quiet_before = before["ranks"][0]["seconds_since_progress"].as_f64().unwrap();
     child.kill();
     drop(put);
-    tokio::time::sleep(Duration::from_secs(2)).await; // an outage longer than the floor
+    // The file as the dead server left it: the first newer one is the new server's, and its quiet
+    // time is compared with this one (a dead server writes nothing more).
+    let before: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(before["summary"], "stalled");
+    let quiet_before = before["ranks"][0]["seconds_since_progress"].as_f64().unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await; // an outage longer than the floor and than the bound below
 
     let (_child, address) = launch(); // restores before it listens
     let mut first = serde_json::Value::Null;
@@ -1585,7 +1589,7 @@ async fn the_binary_killed_with_sigkill_resumes_the_stall_it_was_watching() {
     assert_eq!(first["ranks"][0]["last_step"], 9);
     let quiet = first["ranks"][0]["seconds_since_progress"].as_f64().unwrap();
     assert!(
-        quiet >= quiet_before && quiet < quiet_before + 3.0,
+        quiet >= quiet_before && quiet < quiet_before + 1.5,
         "{quiet_before} -> {quiet}: the outage must not count"
     );
     // A sender comes back and steps on: the run is active again.

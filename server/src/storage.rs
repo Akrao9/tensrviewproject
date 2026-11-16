@@ -145,8 +145,13 @@ impl Storage {
                     .into_iter()
                     .find_map(setting)
                     .is_some_and(|endpoint| endpoint.starts_with("http://"));
-                if plain_endpoint && !setting("aws_allow_http").is_some_and(|value| value.eq_ignore_ascii_case("true"))
-                {
+                // The values `object_store` itself reads as true: 1, true, on, yes, y (any case).
+                let allowed = setting("aws_allow_http").is_some_and(|value| {
+                    ["1", "true", "on", "yes", "y"]
+                        .iter()
+                        .any(|yes| value.eq_ignore_ascii_case(yes))
+                });
+                if plain_endpoint && !allowed {
                     return Err(
                         "the S3 endpoint (AWS_ENDPOINT_URL) is http://, which needs AWS_ALLOW_HTTP=true".into(),
                     );
@@ -752,10 +757,18 @@ mod tests {
             error.contains("AWS_ALLOW_HTTP") && !error.contains("SECRET-VALUE"),
             "{error}"
         );
-        let mut allowed = plain;
-        allowed.push(("AWS_ALLOW_HTTP".into(), "true".into()));
-        let built = Storage::open("s3://bucket", allowed, &options);
-        assert!(built.is_ok(), "{:?}", built.err());
+        // Any value `object_store` reads as true allows it; the others do not.
+        for yes in ["true", "TRUE", "1", "yes", "on", "y"] {
+            let mut allowed = plain.clone();
+            allowed.push(("AWS_ALLOW_HTTP".into(), yes.into()));
+            let built = Storage::open("s3://bucket", allowed, &options);
+            assert!(built.is_ok(), "{yes}: {:?}", built.err());
+        }
+        for no in ["false", "0", ""] {
+            let mut refused = plain.clone();
+            refused.push(("AWS_ALLOW_HTTP".into(), no.into()));
+            assert!(Storage::open("s3://bucket", refused, &options).is_err(), "{no:?}");
+        }
         // Other schemes are not stores this server writes.
         for location in ["az://container/p", "memory:///", "https://example.com/p"] {
             assert!(Storage::open(location, env(&[]), &options).is_err(), "{location}");

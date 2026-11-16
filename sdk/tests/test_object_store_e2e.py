@@ -262,9 +262,11 @@ def test_the_watchdog_state_in_s3_survives_a_killed_server(tmp_path, bucket):
         # Quiet for longer than the floor: lost, the job stalled. The status in S3 says so.
         before = wait_for("a stalled status", lambda: (lambda s: s if s["summary"] == "stalled" else None)(bucket.json(key)))
         assert before["incidents"][0]["kind"] == "job_stalled" and before["ranks"][0]["last_step"] == 59
-        quiet_before = before["ranks"][0]["seconds_since_progress"]
         server.kill()
-        time.sleep(2.5)  # an outage longer than the floor
+        before = bucket.json(key)  # as the dead server left it: the first newer status is the new server's
+        assert before["summary"] == "stalled"
+        quiet_before = before["ranks"][0]["seconds_since_progress"]
+        time.sleep(3.0)  # an outage longer than the floor, and than the bound below
 
         server = Server(tmp_path, bucket, prefix, *watching)
         # Nobody has reconnected. The first status the new server writes already has the incident, with
@@ -274,7 +276,7 @@ def test_the_watchdog_state_in_s3_survives_a_killed_server(tmp_path, bucket):
         )
         assert after["server_running"] is True and after["summary"] == "stalled"
         assert after["incidents"][0]["kind"] == "job_stalled" and after["ranks"][0]["last_step"] == 59
-        assert quiet_before <= after["ranks"][0]["seconds_since_progress"] < quiet_before + 5
+        assert quiet_before <= after["ranks"][0]["seconds_since_progress"] < quiet_before + 1.5
         # A sender comes back and the run is active again.
         write_steps(path, run, 0, range(60, 120))
         sender = FlightSender(path, server.grpc, run, 0)

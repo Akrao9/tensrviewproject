@@ -20,7 +20,8 @@
 //! `finished` when every rank finished, and `active` otherwise. The server writes it to
 //! `runs/<run_id>/watchdog.json` every few seconds, using its own clock, so a reader sees
 //! the verdict as of `written_at_ms` whenever it reads. It can only see ranks that
-//! connected since the server started, plus the missing ranks implied by `world_size`
+//! connected since the server started (or, after a restart, were in the status of a run that was
+//! not finished or abandoned: see below), plus the missing ranks implied by `world_size`
 //! (sent by the SDK) or by gaps below the highest rank seen. The thresholds are not
 //! calibrated: set `--silent-seconds` above the longest evaluation or checkpoint pause.
 //!
