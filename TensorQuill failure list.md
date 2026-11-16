@@ -24,6 +24,8 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 | 14 | Data problems: repeated text, bad batches, repeated data | Spikes, or nothing | Partly (opt-in, Nov 16, 2026): repeated epoch order, no new data, the same batch on two ranks, data repeated or skipped at a resume, and input starvation; content problems (repeated n-grams) are out of scope | Low |
 | 15 | Hardware stops, hangs and slow GPUs | The job stops or slows | Partly: the server notices ranks that stop sending steps (`job_stalled`, `rank_silent`); opt-in GPU readings report memory leaks and pressure, ECC and Xid errors and throttling (Nov 16, 2026, GPU run pending); it cannot find a slow GPU | Low |
 
+Each kind is an invariant, an anomaly or an observation (`INCIDENT_CLASSES`, Nov 16, 2026); only invariants and anomalies make the run state unhealthy. The observations are the resume checks (entry 6), `job_stalled` and `rank_silent` (entry 15: a stall reads `unknown`), and `memory_pressure`, `allocator_retries`, `gpu_throttled` and `memory_imbalance` (entry 15).
+
 ## Details
 
 ### 1. Replicated weights drift apart across GPUs

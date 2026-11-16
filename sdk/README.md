@@ -333,7 +333,7 @@ Two fixes came out of it, with identical output on 29 healthy and faulted runs, 
 | `incidents` in `runs/<run_id>/watchdog.json` | `job_stalled`, `rank_silent`, `duplicate_batches` (cross-rank), plus the `run_state` |
 | Python only | `collective_hang`, `collective_desync`, `traincheck_violation`, `memory_imbalance` (cross-rank, in `--rank all`) |
 
-The first three Python-only kinds stay in Python because their sources never reach the server: PyTorch's Flight Recorder dumps are pickles on the training nodes, read by PyTorch's own analyzer, and TrainCheck writes its results where it ran. `memory_imbalance` compares ranks, and the server's detectors see one rank at a time; it reads the `memory` summary the server writes into each rank's `incidents.json`. The timings below were taken with the first twelve kinds and have not been repeated with the thirteen added on Nov 16, 2026.
+The first three Python-only kinds stay in Python because their sources never reach the server: PyTorch's Flight Recorder dumps are pickles on the training nodes, read by PyTorch's own analyzer, and TrainCheck writes its results where it ran. `memory_imbalance` compares ranks, and the server's detectors see one rank at a time; it reads the `memory` summary the server writes into each rank's `incidents.json`. The timings below are from Nov 15, 2026 with twelve kinds; they were repeated with all 25 per-rank kinds on Nov 16 (see [Re-measured with 25 kinds](#re-measured-with-25-kinds)).
 
 - **What it writes.** After each part is stored and acknowledged, the server reads that part's rows and rewrites the rank's `incidents.json`: the incidents in the shape and order `build_evidence` gives them, `last_step` (detection has run through here), the kinds `checked`, `not_checked` (in the shape of the same list in `evidence.json`: the two sources the server does not have, and each resume whose learning rate could not be compared), the thresholds applied, `moe_flagged` (how many router samples had an overloaded or dead expert and the last step one did, which says whether an imbalance is still going on), and `rebuilds`. It holds no per-step samples: those stay in the Parquet parts, so the file stays a few KB however long the run is. `--no-detect` turns it off. The watchdog status carries its verdict as an `incidents` list as well, rewritten whenever the status changes, so a stall shows there although no part arrives. `python -m tensorquill --watch` reads both (see [Watching a run the server is judging](#watching-a-run-the-server-is-judging)); without `--watch` the command works the incidents out itself from the parts.
 - **Only stored rows are judged**, so the file can always be rebuilt from the store. After a server restart, on every new attempt, and whenever an older attempt's rows arrive late, the rank's state is rebuilt from all of its stored parts with the same attempt rules as `load_records`. That replay also reads the rows a later attempt rolled back: `repeated_steps` and `resume_lr_change` compare a new attempt with what it replaced. The step numbers and learning rates it needs for that are held only while the replay runs. A detector error or panic is logged and never fails a flush.
@@ -394,6 +394,25 @@ The server reads the store when it starts (it lists `runs/` and reads each unfin
 - **One stream dropped once.** In the first of 19 flat-out runs with detectors on, made while the machine was still busy from a build, one rank's stream ended with a broken pipe 6 s in and the server logged nothing. It did not happen again and is not explained. A real sender reconnects and resumes from its offset file; this client does not. It was not the memory quota: a quota refusal reaches the client as `ResourceExhausted` ("ingest buffer full"), which a run with `--quota-mib 32` shows.
 - **The quota at 64 ranks.** One 50-step part of this store is 1.4 MB as Arrow, so 64 ranks' parts arriving together hold 85 MiB of the default 128 MiB quota. With these record sizes about 90 ranks flushing at the same instant would fill it; the server then writes a rank's buffer early, and refuses the batch only if that is not enough. Not tried beyond 64.
 - **Not covered:** more than 64 ranks, a second machine between client and server, TLS, S3 or GCS, a run where incidents happen (the store is healthy until the resumes), and rebuilds longer than 10,800 steps. By the slope, 64 ranks of 100,000 steps would take about a minute to rebuild, longer than the watcher's default 30-second wait; `--report-grace` raises it.
+
+### Re-measured with 25 kinds
+
+Nov 16, 2026, same machine and examples, at load 6 to 22 from other work. The server from before that day's kinds ran beside the new one. Two stores were used: the benchmark store as it is, and a copy whose new columns are filled at realistic sizes (a data record every step, a checkpoint save and a 1.3 MB probe every 1,000 steps, a system reading every flush, data wait every step).
+
+| Per flush of 64 ranks | Store as before | New columns filled |
+| --- | ---: | ---: |
+| Detectors, one thread, median (worst) | 61 to 63 ms (73), the same as the twelve-kind server | 66 ms; 146 to 150 ms (166) on the 1-in-20 flush that carries a probe |
+| Live, 65 ms per step: sent to acknowledged, median / p99 / worst | 46 to 57 / 109 to 158 / 133 to 202 ms (3 runs) | 61 to 64 / 165 to 184 / 228 to 243 ms (3 runs); a fourth run: 72 / 248 / 620 ms |
+| Server CPU and peak memory | 11% of a core, 364 to 379 MB | 12 to 13%, 652 to 704 MB |
+| Restart with 10,000 steps stored: next part waits | 6.6 to 7.9 s | 7.1 to 7.9 s |
+
+- **Where the time goes.** The thirteen new kinds cost 3 to 5 ms on an ordinary flush. A probe flush costs about 86 ms more, and about 95% of that is serde_json reading past the probe's 64×64 attention maps. The maps are 98% of the probe's bytes, and no rule reads them.
+- **Storing a probe flush.** Writing its 64 parts takes 350 ms against 155 ms for an ordinary flush. The server already paid this before Nov 16; no earlier benchmark had a probe in it.
+- **The budget.**
+  - As detector time it holds: 66 ms on an ordinary flush, 150 ms on a probe flush.
+  - As acknowledgement time under 64 live streams it no longer holds reliably once probes are on. One filled run of four reached 620 ms; that flush is unattributed, and a probe flush under load is likeliest.
+  - The fix is to move the maps and histograms out of `probe_json` into a column the detectors do not parse, or out of the step record. That is a schema change and is not made yet.
+- **Not measured:** the 10 ms pace, more than 64 ranks, a real Granite probe, a GPU, S3 or GCS.
 
 ### Watching a run the server is judging
 
@@ -459,9 +478,14 @@ Built Nov 16, 2026.
   - `healthy`: every expected source is current and no incident is listed.
   - `degraded`: an optional monitor is unavailable (anything in `not_checked`, or no `watchdog.json`, as for a `.jsonl` read alone).
   - `unknown`: required evidence is stale or missing (no steps judged, a server report that is not current, a rank without a current report or not yet connected under `world_size`, an old status, a stopped server, a status this version does not know).
-  - `unhealthy`: an incident is listed.
+  - `unhealthy`: an invariant or anomaly is listed (or a kind this version does not know).
 
-  The CLI and `--watch` print it as `Run state: ...`. Incidents are never closed, so a run stays unhealthy once one is found, and observations such as `resume_lr_change` or `memory_imbalance` count as incidents until kinds are labelled. A `watchdog.json` that is no longer being rewritten says nothing about now: read its age (`written_at_ms`, `refresh_seconds`) before its `run_state`.
+  Every incident carries a `class` (the table is `tensorquill.evidence.INCIDENT_CLASSES`, the same in the server):
+  - `invariant`: should never happen, such as `non_finite`, `replica_drift`, `duplicate_batches`, `epoch_order_repeated` or `hardware_errors`.
+  - `anomaly`: judged against the run's own baseline, such as spikes, drift, collapse, attention, memory growth or input starvation.
+  - `observation`: context that claims no failure. These are `resume_lr_change`, `resume_data_mismatch`, `resume_incomplete`, `gpu_throttled`, `memory_imbalance`, `memory_pressure`, `allocator_retries`, `job_stalled` and `rank_silent`.
+
+  Observations are listed under the reason `observations` and never make the state worse, so a run with only observations reads `healthy` with them named. A stall is an observation of the stream (a hang, a long pause and a dead sender look the same), so a `stalled` or `degraded` status makes the run `unknown`, not `unhealthy`. The CLI and `--watch` print the state as `Run state: ...`, and the summary adds a `By class:` line. Incidents are never closed, so a run stays unhealthy once an invariant or anomaly is found. A `watchdog.json` that is no longer being rewritten says nothing about now: read its age (`written_at_ms`, `refresh_seconds`) before its `run_state`.
 
 ## GPU memory, NVML and data wait
 
