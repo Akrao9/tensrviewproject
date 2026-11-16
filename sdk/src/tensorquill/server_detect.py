@@ -132,8 +132,8 @@ def server_report(
 #
 # `detect` reads one rank. With `--run` it reads the rows of every rank of one run, grouped by
 # their `rank` column, judges each rank as before, and compares the ranks' batch hashes as the
-# server does for a run's status. That comparison is `duplicate_batches`, the one kind whose
-# rule needs more than one rank's rows.
+# server does for a run's status. That comparison is `duplicate_batches`, whose rule reads the
+# rows of several ranks.
 
 # What the cross-rank comparison reads of a record: the keys, and its `data`.
 _DATA_KEYS = ("schema_version", "run_id", "rank", "attempt", "step", "ts", "data")
