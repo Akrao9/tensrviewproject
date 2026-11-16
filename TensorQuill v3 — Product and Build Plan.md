@@ -259,6 +259,35 @@ Nov 16, 2026, later: the focused plan reorders this work into four weeks and fre
 8. **Server (frozen Nov 16, 2026 until a user asks for a cloud store; Decisions: "Focused plan: eight decisions"):** S3 is exercised (moto) and the watchdog's state survives a restart; GCS is compile-checked only: run the end-to-end test against `fake-gcs-server` or a test bucket, and teach `load_records` and `--watch` to read an `s3://` / `gs://` store (they read a local directory).
 9. **Later:** a public record builder so fixture makers stop importing private names; the TRL `SFTTrainer` + LoRA test, after the `Trainer` GPU run passes; Gate 3's Linux headless rendering and agent-diagnosis score.
 
+### What is left to build, and what can run at the same time
+
+Listed Nov 16, 2026, from the focused plan's build pieces and the four things that block deleting Python's detectors (Decisions: "One Rust copy, first step"). The GPU runs, the real job, the head-to-head and the release are the author's and are not in this table.
+
+| # | Build | From | Main files | Needs first |
+| --- | --- | --- | --- | --- |
+| R1 | Thresholds into Rust: one JSON argument on `detect` and on the server, today's values as defaults, unknown keys rejected | One Rust copy | `server/src/detect.rs`, `main.rs`, `ingest.rs`; `server_detect.py`; `build_evidence` and `read_server_report` in `evidence.py` | Nothing. Started Nov 16, 2026 |
+| R2 | Rust emits the per-step MoE samples, so Python's MoE rule can go | One Rust copy | The MoE part of `detect.rs`; `server_detect.py`; the sample loop in `build_evidence` | R1 |
+| R3 | Golden files: Python's outputs on the parity cases, frozen as the reference | One Rust copy | `sdk/tests/` only | Nothing |
+| R4 | `--watch` on a local file and `--rank all` through Rust, and `duplicate_batches` across ranks | One Rust copy | `watch` and the all-ranks view in `evidence.py`; `detect/data.rs`; `main.rs` | R1 |
+| R5 | Rust as the default, then delete each Python duplicate | One Rust copy | `evidence.py`, `data_checks.py`, `evidence_system.py` and their tests | R1 to R4 |
+| A1 | Say what was checked: checked, not configured or unavailable for every kind | Focused plan, piece 1 | `build_evidence` and `run_state` in `evidence.py`; `report` in `detect.rs` | R1, because it changes the same functions |
+| A2 | Compact evidence: incidents and a window of steps around each | Piece 2 | The evidence writer and the command line in `evidence.py` | Nothing |
+| A3 | Trigger: `--on-incident` and a webhook, once per new incident | Piece 3 | `watch` and the command line in `evidence.py` | A2, because the trigger hands over the compact file |
+| A4 | Read-only MCP server with four tools | Piece 4 | A new module and its tests | Nothing; it reads the files written today |
+| A5 | Explain-only agent instructions | Piece 5 | A new document | A4, because it names the tools |
+| D1 | Replica drift names the rank | Focused plan, detector change 2 | `distributed.py`, `capture.py`, `flight.py`, `detect.rs` | The two-GPU run |
+| B1 | Benchmark without the Rune arm: the harness's two gate lines | Decision 3 | `experiments/gate1/harness.py`, `PREREGISTRATION.md` | The author's amendments |
+| G1 | Attention maps out of `probe_json` | Open gap | `probe.py`, `flight.py`, the attention part of `detect.rs` | Results 1 and 2, by the focused plan |
+
+**Four lanes can run at the same time now**, because they change different files or different functions:
+
+1. **Detector path:** R1, then R2, then A1, then R5. All four change the detector code in `detect.rs` and the detection block of `build_evidence`, so they go one after another.
+2. **Golden files:** R3. Tests only.
+3. **Agent tools:** A4, then A5. New files only.
+4. **Evidence output:** A2, then A3, then R4. These change the writer, `watch` and the command line in `evidence.py`. Lane 1 changes other functions of the same file, so a lane in its own worktree should expect a small merge. R4 waits for R1.
+
+**Three wait on something outside the code:** D1 on the two-GPU run, B1 on the amendments, and G1 on results 1 and 2.
+
 ### File boundaries and test plan for remaining work
 
 | Step | Path | Action | One-line purpose | Required tests and assertions |
