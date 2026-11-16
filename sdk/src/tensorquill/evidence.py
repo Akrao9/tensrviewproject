@@ -1261,6 +1261,15 @@ def write_evidence(evidence: Mapping[str, Any], path: str | Path) -> Path:
     return path
 
 
+def _write_output(evidence: Mapping[str, Any], path: Path, named: bool, compact_window: int | None) -> Path:
+    """`write_evidence`, or with `compact_window` set the compact file instead (`compact.write_compact`)."""
+    if compact_window is None:
+        return write_evidence(evidence, path)
+    from .compact import write_compact
+
+    return write_compact(evidence, path, window=compact_window, named=named)
+
+
 class _Tail:
     """Reads what is new in a `.jsonl` file or a directory of Parquet parts."""
 
@@ -1897,6 +1906,8 @@ def watch(
     on_update: Any = None,
     server_reports: bool = True,
     report_grace: float = REPORT_GRACE_SECONDS,
+    compact_window: int | None = None,
+    trigger: Any = None,
     **build_options: Any,
 ) -> Path | None:
     """Keep the evidence file up to date while a run is going, until interrupted.
@@ -1922,13 +1933,20 @@ def watch(
     rank if a watched run directory ends up holding more than one `rank=*` folder.
     `evidence["detection"]` says which happened and why. `server_reports=False` always
     works the incidents out here.
+
+    `compact_window` writes the compact file instead of the full one (`compact.compact_evidence`,
+    that many recorded steps each side of a MoE incident), as `<name>.compact.json` unless
+    `output` names the file; `on_update` still gets the full evidence.
+    `trigger` (a `trigger.Trigger`) fires once for each new incident: it is told of every look
+    and handed each evidence written, and never raises into the watcher.
     """
     if isinstance(rank, str):
         if rank != ALL_RANKS:
             raise ValueError(f"rank must be a rank number or {ALL_RANKS!r}, not {rank!r}")
         return watch_all_ranks(
             source, output, interval=interval, polls=polls, on_update=on_update,
-            server_reports=server_reports, report_grace=report_grace, **build_options,
+            server_reports=server_reports, report_grace=report_grace, compact_window=compact_window,
+            trigger=trigger, **build_options,
         )
     source = Path(source)
     picked_rank = rank
@@ -1957,6 +1975,8 @@ def watch(
             if done:
                 time.sleep(interval)
             done += 1
+            if trigger is not None:
+                trigger.tick()
             # A hung job writes no new records, so the server's status file and any local
             # external sources are read on every poll, even while waiting on --report-grace.
             status = read_watchdog(status_file) if status_file is not None else None
@@ -2049,9 +2069,12 @@ def watch(
             evidence["run_state"] = _per_rank_run_state(evidence, status, status_age, steps_judged=judged)
             emitted = seen
             emitted_grace = grace_key
-            written = write_evidence(evidence, path)
+            written = _write_output(evidence, path, output is not None, compact_window)
             if on_update is not None:
                 on_update(evidence, written)
+            if trigger is not None:
+                own = _own_rank(folder) if report_look is not None else tail.records[0].get("rank", 0)
+                trigger.look(evidence, written, rank=own)
     except KeyboardInterrupt:
         pass
     return written
@@ -2421,6 +2444,8 @@ def watch_all_ranks(
     on_update: Any = None,
     server_reports: bool = True,
     report_grace: float = REPORT_GRACE_SECONDS,
+    compact_window: int | None = None,
+    trigger: Any = None,
     **build_options: Any,
 ) -> Path | None:
     """Keep one evidence file for every rank of a run up to date: `watch(run_folder, rank="all")`.
@@ -2474,6 +2499,8 @@ def watch_all_ranks(
             if done:
                 time.sleep(interval)
             done += 1
+            if trigger is not None:
+                trigger.tick()
             status = read_watchdog(status_file)
             status_age = status_clock.check(status)
             stamp = (_status_stamp(status, status_age), _other_sources_stamp(**other_sources))
@@ -2510,9 +2537,12 @@ def watch_all_ranks(
             evidence["run_state"] = _all_ranks_run_state(evidence, looks, status, status_age)
             path = Path(output) if output else Path(f"{evidence['run_id']}.all-ranks.evidence.json")
             emitted = seen
-            written = write_evidence(evidence, path)
+            # This view has no per-step samples, so `compact_window` only marks and names the file.
+            written = _write_output(evidence, path, output is not None, compact_window)
             if on_update is not None:
                 on_update(evidence, written)
+            if trigger is not None:
+                trigger.look(evidence, written)
     except KeyboardInterrupt:
         pass
     return written
@@ -2972,7 +3002,13 @@ def _missing_sample(step: int, layer: int, expert_count: int) -> dict[str, Any]:
 
 
 def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str:
-    """Markdown table of one layer's expert load, sorted by largest positive delta first."""
+    """Markdown table of one layer's expert load, sorted by largest positive delta first.
+
+    Raises `compact.SamplesOmitted` for a step, or a step to compare it with, that compact
+    evidence left out."""
+    from .compact import require_table
+
+    require_table(evidence, step, layer)
     expert_count = int(evidence.get("expert_count", 0))
     samples = {(int(s["step"]), int(s["layer"])): s for s in evidence.get("samples", ())}
     sample = samples.get((step, layer)) or _missing_sample(step, layer, expert_count)
@@ -3687,7 +3723,13 @@ def export_rerun(
     *,
     records: Iterable[Mapping[str, Any]] | None = None,
 ) -> Path:
-    """Write `evidence` (and optional Tier 0 `records`) to a Rerun `.rrd` with blueprint."""
+    """Write `evidence` (and optional Tier 0 `records`) to a Rerun `.rrd` with blueprint.
+
+    Raises `compact.SamplesOmitted` for compact evidence that left steps out: the recording
+    would show the kept windows as if they were the run."""
+    from .compact import require_all_samples
+
+    require_all_samples(evidence, "a Rerun recording")
     import numpy as np
     import rerun as rr
     import rerun.blueprint as rrb
@@ -3958,7 +4000,7 @@ def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             args.input, args.output, interval=args.interval, rank=ALL_RANKS, polls=None if args.watch else 1,
             on_update=report, report_grace=args.report_grace, overload_threshold=args.overload_threshold,
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
-            traincheck=args.traincheck,
+            traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -4049,7 +4091,13 @@ def main() -> None:
         "`tensorquill-server detect` (the binary on PATH or named by TENSORQUILL_SERVER_BIN; needs pyarrow). "
         "One finished file or store, read once: not with --watch or --rank all",
     )
+    from . import compact as _compact, trigger as _trigger
+
+    _compact.add_arguments(parser)
+    _trigger.add_arguments(parser)
     args = parser.parse_args()
+    args.compact_window = _compact.window_from_args(args)  # None: the full file
+    args.trigger = _trigger.from_args(args, parser)  # None without --on-incident or --webhook
 
     if args.detectors == "rust" and (args.watch or args.rank == ALL_RANKS):
         parser.error("--detectors rust reads one rank once: it cannot be combined with --watch or --rank all")
@@ -4087,7 +4135,7 @@ def main() -> None:
             server_reports=not args.recompute, report_grace=args.report_grace,
             overload_threshold=args.overload_threshold, top_k=args.top_k,
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
-            traincheck=args.traincheck,
+            traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
         )
         return
 
@@ -4103,10 +4151,13 @@ def main() -> None:
         if args.detectors != "rust":
             raise
         parser.error(str(error))
-    out_json = write_evidence(evidence, args.output or default_evidence_path(args.input, records))
+    out_json = _write_output(
+        evidence, args.output or default_evidence_path(args.input, records), args.output is not None,
+        args.compact_window,
+    )
     print(incident_summary(evidence))
     print(run_state_line(evidence))
-    print(f"wrote evidence -> {out_json}")
+    print(f"wrote {'evidence' if args.compact_window is None else 'compact evidence'} -> {out_json}")
     if args.rerun is not None:
         export_rerun(evidence, args.rerun, records=resolve_attempts(records))
         print(f"wrote Rerun recording -> {args.rerun}")
