@@ -478,10 +478,12 @@ def test_the_command_lines_thresholds_go_to_rust(tmp_path):
     assert python_evidence["incidents"] != tensorquill.build_evidence(everything())["incidents"]
 
 
-@pytest.mark.parametrize("extra", [("--watch",), ("--rank", "all")])
-def test_the_command_line_refuses_what_the_rust_path_cannot_do(tmp_path, extra):
+def test_the_command_line_no_longer_refuses_watch_or_all_ranks_with_the_rust_path(tmp_path):
+    # Until Nov 16, 2026 `--detectors rust` was refused with `--watch` and with `--rank all`, and
+    # this test held the refusal. Both are taken now (`test_watch_rust.py`,
+    # `test_all_ranks_rust.py`). What is left is the all-ranks view's own refusal of a file.
     capture = tmp_path / "run.jsonl"
     capture.write_text("".join(json.dumps(r) + "\n" for r in moe_edges()), encoding="utf-8")
-    done = run_cli(str(capture), "--detectors", "rust", *extra)
+    done = run_cli(str(capture), "--detectors", "rust", "--rank", "all")
     assert done.returncode == 2, done.stdout
-    assert "rust" in done.stderr.lower()
+    assert "needs a run folder" in done.stderr and "reads one rank once" not in done.stderr

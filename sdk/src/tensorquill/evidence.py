@@ -1906,6 +1906,12 @@ def _grace_alert_key(status: Mapping[str, Any] | None, status_age: float | None,
     )
 
 
+def _detectors_option(detectors: Any) -> str:
+    if detectors not in ("python", "rust"):
+        raise ValueError(f"detectors must be 'python' or 'rust', not {detectors!r}")
+    return str(detectors)
+
+
 def _stat_key(path: Path) -> tuple[int, int] | None:
     try:
         st = path.stat()
@@ -1987,6 +1993,12 @@ def watch(
     `evidence["detection"]` says which happened and why. `server_reports=False` always
     works the incidents out here.
 
+    `detectors="rust"` (with `server_binary`, as in `build_evidence`) judges through
+    `tensorquill-server detect` whenever the detectors run here: on every rebuild for a
+    `.jsonl` file, and for a server's store when its report cannot be used. Each rebuild sends
+    every record read so far, as the Python detectors read them all again. A missing binary or
+    `pyarrow` raises `RuntimeError` before the first look, not at the first rebuild.
+
     `compact_window` writes the compact file instead of the full one (`compact.compact_evidence`,
     that many recorded steps each side of a MoE incident), as `<name>.compact.json` unless
     `output` names the file; `on_update` still gets the full evidence.
@@ -2002,6 +2014,11 @@ def watch(
             trigger=trigger, **build_options,
         )
     source = Path(source)
+    if _detectors_option(build_options.get("detectors", "python")) == "rust":
+        # Said now, while someone is at the keyboard, not at the first rebuild hours into a run.
+        from .server_detect import rust_ready
+
+        rust_ready(build_options.get("server_binary"))
     picked_rank = rank
     tail = _Tail(source, picked_rank)
     written: Path | None = None
@@ -2651,9 +2668,13 @@ def watch_all_ranks(
     five given here (`overload_threshold`, `drift_tolerance`, `starve_window`, `starve_ratio`,
     `top_k`) must be the one a rank's server applied, or that rank is `other_thresholds`.
     `flight_recorder` and `traincheck` are read once for the run and their incidents are run-level.
-    Returns the evidence path, or None if nothing was written.
+    `detectors` ("python" or "rust") is accepted and changes nothing: every rank's incidents are
+    the Rust detectors' already, from its server's report, and no detector runs here, so the
+    server binary is not needed. Returns the evidence path, or None if nothing was written.
     """
     source = _all_ranks_source(source)
+    _detectors_option(build_options.pop("detectors", "python"))
+    build_options.pop("server_binary", None)
     if not server_reports:
         raise ValueError(
             "rank='all' cannot recompute: that would read the parts and run the detectors for every rank, one after"
@@ -4160,6 +4181,7 @@ def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             on_update=report, report_grace=args.report_grace, **args.thresholds,
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
             traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
+            detectors=args.detectors,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -4270,7 +4292,8 @@ def main() -> None:
         default="python",
         help="rust: take the incidents of the server's kinds from the Rust detectors, run on this file through "
         "`tensorquill-server detect` (the binary on PATH or named by TENSORQUILL_SERVER_BIN; needs pyarrow). "
-        "One finished file or store, read once: not with --watch or --rank all",
+        "With --watch they run on every rebuild made here, over every record read so far. With --rank all the "
+        "option changes nothing: that view takes every rank's incidents from its server's report and runs no detector",
     )
     from . import compact as _compact, trigger as _trigger
 
@@ -4281,8 +4304,6 @@ def main() -> None:
     args.trigger = _trigger.from_args(args, parser)  # None without --on-incident or --webhook
     args.thresholds = _given_thresholds(vars(args))  # only the ones typed
 
-    if args.detectors == "rust" and (args.watch or args.rank == ALL_RANKS):
-        parser.error("--detectors rust reads one rank once: it cannot be combined with --watch or --rank all")
     if args.rank == ALL_RANKS:
         _main_all_ranks(args, parser)
         return
@@ -4311,13 +4332,20 @@ def main() -> None:
             print(f"updated {path}", flush=True)
 
         print(f"watching {args.input} every {args.interval:g} s; Ctrl-C to stop", flush=True)
-        watch(
-            args.input, args.output, interval=args.interval, rank=rank,
-            default_rank=0 if rank is None else None, on_update=report,
-            server_reports=not args.recompute, report_grace=args.report_grace, **args.thresholds,
-            flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
-            traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
-        )
+        try:
+            watch(
+                args.input, args.output, interval=args.interval, rank=rank,
+                default_rank=0 if rank is None else None, on_update=report,
+                server_reports=not args.recompute, report_grace=args.report_grace, **args.thresholds,
+                flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
+                traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
+                detectors=args.detectors,
+            )
+        except (RuntimeError, ValueError) as error:
+            # The Rust path's own refusals: no binary, no pyarrow, thresholds its rules refuse.
+            if args.detectors != "rust":
+                raise
+            parser.error(str(error))
         return
 
     records = load_records(args.input, rank=rank, all_attempts=True)

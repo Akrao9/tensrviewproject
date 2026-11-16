@@ -37,6 +37,17 @@ def server_binary(binary: str | os.PathLike[str] | None = None) -> str:
     return str(chosen)
 
 
+def rust_ready(binary: str | os.PathLike[str] | None = None) -> str:
+    """What `server_report` needs, checked without running it: the binary (returned) and
+    `pyarrow`. Raises `RuntimeError` naming what is missing."""
+    chosen = server_binary(binary)
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError as error:
+        raise RuntimeError("the Rust detectors read Arrow: pip install 'tensorquill[flight]'") from error
+    return chosen
+
+
 def records_stream(records: Iterable[Mapping[str, Any]]) -> bytes:
     """One rank's records as the Arrow IPC stream `tensorquill-server detect` reads: grouped
     by attempt, oldest first, and otherwise in the order given."""
