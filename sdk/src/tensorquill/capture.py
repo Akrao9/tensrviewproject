@@ -32,6 +32,7 @@ from torch.optim.optimizer import (
     register_optimizer_step_pre_hook,
 )
 
+from .data import DataStep, WatchedLoader, checkpoint_manifest, data_fields, optimizer_entries, optimizer_step_value
 from .distributed import FINGERPRINT_WIDTH, replica_spread, unwrap_local
 from .probe import ProbeState, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink
@@ -462,6 +463,16 @@ class Session:
         self._pending_amp: dict[str, Any] = {}
         self._pending_scalars: dict[str, Any] = {}
         self._ring_probe: list[dict[str, Any] | None] = []
+        # Data progress (`data`): None until the first batch is noted, then every step has one.
+        self._data_step: DataStep | None = None
+        self._ring_data: list[dict[str, Any] | None] = []
+        # Checkpoint manifests and the resumed optimizer's state (`checkpoint`), for the next step.
+        self._pending_checkpoint: dict[str, Any] = {}
+        self._ring_checkpoint: list[dict[str, Any] | None] = []
+        # A session that starts after step 0 resumed: its first optimizer step says whether the
+        # optimizer came back with its state (`checkpoint.optimizer`). Once, so free.
+        self._snapshot_due = start_step > 0
+        self._snapshot_before: int | None = None
         self._next_step = start_step
         self._steps_committed = 0
         self._grads_recorded = False
@@ -594,6 +605,8 @@ class Session:
         if lead is None:
             self._lead, lead = weakref.ref(optimizer), optimizer
         self._leading = optimizer is lead
+        if self._leading and self._snapshot_due:
+            self._snapshot_before = optimizer_entries(optimizer)
         # With `step(closure)`, the closure runs forward and backward inside the step, so
         # gradients are read after it instead (Lightning steps this way).
         closure = kwargs.get("closure", args[1] if len(args) > 1 else None)
@@ -612,6 +625,13 @@ class Session:
             return
         if self._grads_after_step and not self._grads_recorded and self._should_record_grads():
             self.record_grads()
+        if self._snapshot_due and self._snapshot_before is not None:
+            self._snapshot_due = False
+            self._pending_checkpoint["optimizer"] = {
+                "entries_before": self._snapshot_before,
+                "entries_after": optimizer_entries(optimizer),
+                "step_after": optimizer_step_value(optimizer),
+            }
         self._pending_lr = _learning_rates(optimizer)
         if not self._commit_on_update:
             self._commit(None)
@@ -793,6 +813,78 @@ class Session:
             else:
                 raise TypeError(f"{name}: expected a number or one-element tensor, got {type(value).__name__}")
 
+    def data(
+        self,
+        indices: Any = None,
+        *,
+        epoch: int | None = None,
+        sampler_epoch: int | None = None,
+        shuffle: bool | None = None,
+        data_rank: int | None = None,
+        shard: Any = None,
+        offset: int | None = None,
+    ) -> None:
+        """Note one batch drawn for the step in progress: its sample indices (or ids), which
+        are hashed and never stored, and where the data stands.
+
+        `epoch` is the pass over the data; `sampler_epoch` the sampler's own epoch (what
+        `DistributedSampler.set_epoch` set); `shuffle` whether the order is meant to change
+        from pass to pass (None: unknown); `data_rank` which share of the data this process
+        reads (a `DistributedSampler`'s rank; ranks that are meant to read the same data, such
+        as a tensor-parallel group, give the same value); `shard` and `offset` where a
+        streaming dataset stands. Call it once per batch, micro-batches included; every step
+        after the first call records how many batches it drew. Host-side and cheap: one
+        BLAKE2b over the indices. `session.watch_loader(loader)` calls it for you.
+        """
+        if self._closed:
+            raise RuntimeError("the session is closed")
+        if self._data_step is None:
+            self._data_step = DataStep()
+        self._data_step.add(
+            indices,
+            data_fields(epoch=epoch, sampler_epoch=sampler_epoch, shuffle=shuffle, data_rank=data_rank,
+                        shard=shard, offset=offset),
+        )
+
+    def watch_loader(self, loader: Any, *, ids: Callable[[Any], Any] | None = None, epoch: int = 0) -> WatchedLoader:
+        """Iterate `loader` through this instead, and each batch is noted with `session.data`.
+
+        For a map-style dataset the sample indices are the ones the loader's batch sampler
+        yields, read as it yields them (in order, with or without worker processes). An
+        `IterableDataset` has no indices: pass `ids`, a callable that takes a batch and returns
+        its sample ids (CPU values). Each `iter()` is one pass, counted from `epoch`; the
+        sampler's own epoch, whether it shuffles and its rank are read from a
+        `DistributedSampler`, `RandomSampler` or `SequentialSampler`.
+        """
+        return WatchedLoader(self, loader, ids=ids, epoch=epoch)
+
+    def checkpoint(self, state: Mapping[str, Any], *, event: str = "save") -> None:
+        """Record what a checkpoint holds: call it with the dict passed to `torch.save`
+        (`event="save"`) or the one loaded to resume (`event="load"`, before the first step).
+
+        The manifest names the components found (model, optimizer, scheduler, scaler, rng,
+        data position) with cheap identities: counts, the optimizer's step, the scheduler's
+        `last_epoch`, the loss scale. A save is recorded with the last step taken (as
+        `after_step`); a load with the next step, the first of the resumed run. The detectors
+        then say what a resume did not restore.
+        """
+        if self._closed:
+            raise RuntimeError("the session is closed")
+        if event not in ("save", "load"):
+            raise ValueError('event must be "save" or "load"')
+        manifest = checkpoint_manifest(state)
+        last = self._next_step - 1 if self._steps_committed else None
+        if event == "save":
+            manifest["after_step"] = last
+            if self._steps:  # the step it follows is still in the ring: record it there
+                row = self._ring_checkpoint[-1] or {}
+                row["save"] = manifest
+                self._ring_checkpoint[-1] = row
+                return
+        else:
+            self._snapshot_due = self._snapshot_due or self._snapshot_before is None
+        self._pending_checkpoint[event] = manifest
+
     def _ensure_spread_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._spread is None or self._ring_spread is None:
             # Apple MPS rejects float64 allocations; keep float64 replica buffers on CPU there.
@@ -904,6 +996,13 @@ class Session:
         self._ring_amp.append(self._pending_amp)
         self._pending_amp = {}
         self._pending_scalars = {}
+        if self._data_step is not None:
+            self._ring_data.append(self._data_step.record())
+            self._data_step = DataStep()
+        else:
+            self._ring_data.append(None)
+        self._ring_checkpoint.append(self._pending_checkpoint or None)
+        self._pending_checkpoint = {}
         self._next_step = current + 1
         self._steps_committed += 1
         if self._phase != "train":
@@ -947,6 +1046,8 @@ class Session:
             self._ring_weight_seen = []
             self._ring_clip_seen = []
             self._ring_spread_seen = []
+            self._ring_data = []
+            self._ring_checkpoint = []
             self._raise_worker_error()
         n = len(self._steps)
         if n == 0:
@@ -983,6 +1084,9 @@ class Session:
         amps = _scalars_to_cpu(self._ring_amp)
         self._ring_amp = []
         probes = self._ring_probe
+        data_rows, checkpoints = self._ring_data, _checkpoints_to_cpu(self._ring_checkpoint)
+        self._ring_data = []
+        self._ring_checkpoint = []
         steps, lrs, stamps = self._steps, self._ring_lr, self._ring_ts
         self._ring_ts = []
         self._steps = []
@@ -995,7 +1099,7 @@ class Session:
         self._ring_spread_seen = []
         block = (
             steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
-            spread_seen, scalars, probes, stamps, amps,
+            spread_seen, scalars, probes, stamps, amps, data_rows, checkpoints,
         )
         try:
             self._queue.put_nowait(block)
@@ -1098,6 +1202,8 @@ class Session:
         probes: list[dict[str, Any] | None] | None = None,
         stamps: list[float] | None = None,
         amps: list[dict[str, Any]] | None = None,
+        data_rows: list[dict[str, Any] | None] | None = None,
+        checkpoints: list[dict[str, Any] | None] | None = None,
     ) -> list[dict[str, Any]]:
         n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
         split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
@@ -1169,6 +1275,10 @@ class Session:
                 record["scalars"] = scalars[i]
             if probes is not None and probes[i] is not None:
                 record["probe"] = probes[i]
+            if data_rows is not None and data_rows[i] is not None:
+                record["data"] = data_rows[i]
+            if checkpoints is not None and checkpoints[i] is not None:
+                record["checkpoint"] = checkpoints[i]
             if spread_rows is not None and spread_seen[i]:
                 width = spread_seen[i]
                 record["replica_spread"] = {
@@ -1184,6 +1294,17 @@ class Session:
                 }
             records.append(record)
         return records
+
+
+def _checkpoints_to_cpu(rows: list[dict[str, Any] | None]) -> list[dict[str, Any] | None]:
+    """The resumed optimizer's `step` as a number. A tensor on the device is read here, once
+    per session, with the rest of the block."""
+    for row in rows:
+        snapshot = row.get("optimizer") if row else None
+        if snapshot is not None and isinstance(snapshot.get("step_after"), torch.Tensor):
+            value = snapshot["step_after"]
+            snapshot["step_after"] = value.item() if value.numel() == 1 else None
+    return rows
 
 
 def _scalars_to_cpu(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

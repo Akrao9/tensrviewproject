@@ -781,7 +781,21 @@ fn stuck_at(rank: &Value) -> Option<Value> {
     Some(place)
 }
 
+/// The incidents a run's status shows: `job_stalled` or `rank_silent` from its summary, and
+/// `duplicate_batches` when the ranks' batch hashes say so (see `detect::duplicate_batches`),
+/// whatever the summary. The same as Python's `detect_watchdog_incidents`.
 pub fn incidents(status: &Value) -> Vec<Value> {
+    let mut found = progress_incidents(status);
+    if let Some(duplicates) = status["duplicate_batches"].as_object() {
+        let mut incident = serde_json::Map::new();
+        incident.insert("kind".into(), json!("duplicate_batches"));
+        incident.extend(duplicates.clone());
+        found.push(Value::Object(incident));
+    }
+    found
+}
+
+fn progress_incidents(status: &Value) -> Vec<Value> {
     let summary = status["summary"].as_str().unwrap_or_default();
     if summary != "stalled" && summary != "degraded" {
         return Vec::new();

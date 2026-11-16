@@ -57,6 +57,10 @@ use serde_json::{json, Value};
 
 use crate::storage::{Error, Storage};
 
+mod data;
+pub use data::duplicate_batches;
+use data::{DataProgress, DataRow, ResumeFound, ResumePass, ResumeRow};
+
 // The same values as the constants of the same names in evidence.py.
 pub const OVERLOAD_THRESHOLD: f64 = 0.35;
 pub const STARVE_WINDOW: usize = 50;
@@ -87,7 +91,7 @@ pub const DRIFT_TOLERANCE: f64 = 1e-6;
 pub const RESUME_LR_TOLERANCE: f64 = 1e-6;
 
 /// The incident kinds this module can report, in the order `build_evidence` lists them.
-pub const PORTED: [&str; 12] = [
+pub const PORTED: [&str; 16] = [
     "moe_imbalance",
     "starved_experts",
     "grad_spike",
@@ -95,6 +99,10 @@ pub const PORTED: [&str; 12] = [
     "repeated_steps",
     "loss_scale_trouble",
     "resume_lr_change",
+    "resume_data_mismatch",
+    "resume_incomplete",
+    "data_stalled",
+    "epoch_order_repeated",
     "activation_spike",
     "activation_drift",
     "dead_activations",
@@ -123,6 +131,11 @@ pub fn thresholds() -> Value {
         "scale_floor": SCALE_FLOOR,
         "drift_tolerance": DRIFT_TOLERANCE,
         "resume_lr_tolerance": RESUME_LR_TOLERANCE,
+        "data_stall_steps": data::DATA_STALL_STEPS,
+        "order_min_batches": data::ORDER_MIN_BATCHES,
+        "order_compare": data::ORDER_COMPARE,
+        "duplicate_window": data::DUPLICATE_WINDOW,
+        "scheduler_slack": data::SCHEDULER_SLACK,
     })
 }
 
@@ -361,6 +374,8 @@ struct Columns<'a> {
     moe_count_values: Option<&'a Int64Array>,
     moe_stats: Option<&'a StringArray>,
     layers: Option<&'a StringArray>,
+    data: Option<&'a StringArray>,
+    checkpoint: Option<&'a StringArray>,
 }
 
 impl<'a> Columns<'a> {
@@ -391,6 +406,8 @@ impl<'a> Columns<'a> {
             moe_count_values,
             moe_stats: column(batch, "moe_stats_json"),
             layers: column(batch, "layers_json"),
+            data: column(batch, "data_json"),
+            checkpoint: column(batch, "checkpoint_json"),
         })
     }
 }
@@ -1839,6 +1856,8 @@ struct AttemptPass {
     /// order, with each rollback applied.
     history: Vec<(i64, i64, Vec<f64>)>,
     first_lr: Option<Vec<f64>>,
+    /// The same history for the data and checkpoint checks.
+    resume: ResumePass,
 }
 
 impl AttemptPass {
@@ -1855,10 +1874,13 @@ impl AttemptPass {
             repeated: Default::default(),
             history: Vec::new(),
             first_lr: None,
+            resume: ResumePass::default(),
         }
     }
 
-    fn row(&mut self, attempt: i64, step: i64, lr: Option<Vec<f64>>, found: &mut Attempts) {
+    fn row(&mut self, attempt: i64, step: i64, resume_row: ResumeRow, found: &mut Attempts, resumes: &mut ResumeFound) {
+        let lr = resume_row.lr.clone();
+        let first_attempt = self.first_attempt == Some(attempt);
         if self.current != Some(attempt) {
             // The first row of an attempt, which is its lowest step.
             self.earlier.append(&mut self.current_steps);
@@ -1871,11 +1893,15 @@ impl AttemptPass {
                 self.first_lr = lr.clone();
             } else if !self.restarted {
                 self.resumed(attempt, step, lr.as_deref(), found);
+                self.resume
+                    .resumed(self.rank, attempt, step, self.run_start, &resume_row, resumes);
             }
             // This attempt rolls back what earlier ones recorded from its first step on.
             self.history
                 .truncate(self.history.partition_point(|(known, _, _)| *known < step));
+            self.resume.roll_back(step);
         }
+        self.resume.add(attempt, step, resume_row, first_attempt);
         if self.restarted && self.earlier.binary_search(&step).is_ok() && self.repeated.insert(step) {
             found.add_repeated(step);
         }
@@ -2004,6 +2030,8 @@ pub struct RankDetectors {
     non_finite: NonFinite,
     replica_drift: ReplicaDrift,
     attempts: Attempts,
+    data: DataProgress,
+    resumes: ResumeFound,
     scalars: Scalars,
     last_step: Option<i64>,
     rows: u64,
@@ -2028,8 +2056,12 @@ impl RankDetectors {
         let Some(columns) = Columns::new(batch) else { return };
         for row in 0..batch.num_rows() {
             let step = columns.steps.value(row);
+            let data = DataRow::read(&columns, row);
             match pass.as_deref_mut() {
-                Some(pass) => pass.row(self.attempt, step, columns.lr(row), &mut self.attempts),
+                Some(pass) => {
+                    let resume_row = ResumeRow::read(&columns, row, data.clone());
+                    pass.row(self.attempt, step, resume_row, &mut self.attempts, &mut self.resumes)
+                }
                 None => self.attempts.appended(step),
             }
             if step >= cutoff {
@@ -2083,6 +2115,17 @@ impl RankDetectors {
                     for (_, incident, _) in self.activations.found.iter_mut().skip(before.1) {
                         incident["scalars"] = context.clone();
                     }
+                }
+            }
+            self.data.row(step, data.as_ref(), &columns, row, &mut self.scalars);
+            let wanted = [&self.resumes.data_context, &self.resumes.state_context].map(|w| w.step == Some(step));
+            if wanted != [false, false] {
+                let context = self.scalars.context(&columns, row);
+                if wanted[0] {
+                    self.resumes.data_context.scalars = context.clone();
+                }
+                if wanted[1] {
+                    self.resumes.state_context.scalars = context;
                 }
             }
             self.scalars.row(&columns, row);
@@ -2154,6 +2197,8 @@ impl RankDetectors {
         self.attempts.incidents(true, &mut out);
         self.loss_scale.incidents(&mut out);
         self.attempts.incidents(false, &mut out);
+        self.resumes.incidents(&mut out);
+        self.data.incidents(&mut out);
         self.activations.incidents(&mut out);
         out.extend(self.non_finite.first.clone());
         out.extend(self.replica_drift.first.clone());
@@ -2177,7 +2222,14 @@ impl RankDetectors {
             }),
         ];
         out.extend(self.attempts.not_checked.iter().cloned());
+        out.extend(self.resumes.not_checked().cloned());
         out
+    }
+
+    /// The last `DUPLICATE_WINDOW` steps that drew a hashed batch, as (step, (data rank, hash)),
+    /// for the cross-rank comparison ([`duplicate_batches`]).
+    pub fn data_window(&self) -> &BTreeMap<i64, (Option<i64>, String)> {
+        self.data.window()
     }
 }
 

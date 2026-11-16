@@ -20,6 +20,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .data_checks import detect_data_stalled, detect_epoch_order_repeated, detect_resume_state
+
 OVERLOAD_THRESHOLD = 0.35
 DRIFT_TOLERANCE = 1e-6
 # An expert is starved when its share of a router's assignments, summed over the last
@@ -521,13 +523,21 @@ def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str
 
     `job_stalled`: no rank is making progress. `rank_silent`: some ranks are silent, lost
     (their stream dropped and did not return) or never connected while others progress.
-    These are observations of the stream the server receives, and the cause is not known:
+    `duplicate_batches` (see `data_checks.detect_duplicate_batches`) is the server's comparison of
+    the ranks' batch hashes, whatever the summary.
+    The others are observations of the stream the server receives, and the cause is not known:
     a hang, a long evaluation or checkpoint pause, a crashed launcher and a dead telemetry
     sender all look the same. The server's `--silent-seconds` is the pause it tolerates.
     `stuck_at` lists, for each stopped rank whose process sent its stack, where its main
     thread was (see `stuck_at`); it narrows the cause and does not change the assessment.
     The stacks themselves stay in the status file: an incident's `ranks` are without them.
     """
+    duplicates = status.get("duplicate_batches") if status else None
+    found = [{"kind": "duplicate_batches", **duplicates}] if isinstance(duplicates, Mapping) else []
+    return _progress_incidents(status) + found
+
+
+def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     if not status or status.get("summary") not in ("stalled", "degraded"):
         return []
     full = list(status.get("ranks", ()))
@@ -1120,7 +1130,8 @@ class _Tail:
 # The kinds `tensorquill-server` works out itself and writes to a rank's `incidents.json`.
 SERVER_KINDS = (
     "moe_imbalance", "starved_experts", "grad_spike", "stalled_weights", "repeated_steps", "loss_scale_trouble",
-    "resume_lr_change", "activation_spike", "activation_drift", "dead_activations", "non_finite", "replica_drift",
+    "resume_lr_change", "resume_data_mismatch", "resume_incomplete", "data_stalled", "epoch_order_repeated",
+    "activation_spike", "activation_drift", "dead_activations", "non_finite", "replica_drift",
 )
 # How long a watcher waits for the server's report to cover the newest stored part before
 # it calls the report stale and works the incidents out itself. Measured with 64 ranks on an
@@ -1818,8 +1829,12 @@ def _incident_identity(incident: Mapping[str, Any]) -> str:
         parts = [incident.get("reason")]
     elif kind == "replica_drift":
         parts = sorted(incident.get("parameters") or ())
-    elif kind in ("repeated_steps", "resume_lr_change"):
+    elif kind in ("repeated_steps", "resume_lr_change", "resume_data_mismatch", "resume_incomplete"):
         parts = []
+    elif kind == "data_stalled":
+        parts = [incident.get("reason")]
+    elif kind == "epoch_order_repeated":
+        parts = [incident.get("epoch")]
     else:
         parts = {k: v for k, v in incident.items() if k != "scalars"}
     return json.dumps([kind, step, parts], sort_keys=True, default=str)
@@ -2390,6 +2405,11 @@ def build_evidence(
     resume_hit = detect_resume_lr_changes(every_attempt, not_checked=not_checked)
     if resume_hit is not None:
         incidents.append(resume_hit)
+    incidents.extend(hit for hit in detect_resume_state(every_attempt, not_checked=not_checked) if hit is not None)
+    for data_detector in (detect_data_stalled, detect_epoch_order_repeated):
+        data_hit = data_detector(records)
+        if data_hit is not None:
+            incidents.append(data_hit)
     incidents.extend(detect_activation_anomalies(records))
     non_finite_hit = detect_non_finite(records)
     if non_finite_hit is not None:
@@ -2800,6 +2820,52 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
                if change["equals_first_lr"] else "")
             + ". Expected if the restart changed the schedule on purpose; the records cannot show the intent"
             + (f"; {incident['resumes']} resumes differ" if incident["resumes"] > 1 else "")
+        )
+    if kind == "resume_data_mismatch":
+        change = incident["changes"][0]
+        if change["finding"] == "differs":
+            what = "a different batch than the earlier attempt drew at that step, one the run drew nowhere else"
+        else:
+            verb = "repeats the batch drawn" if change["finding"] == "repeated" else "skips ahead to the batch drawn"
+            what = f"{verb} at step {change['matched_step']} ({change['batches_apart']} steps apart)"
+        return (
+            f"Data after the resume at step {incident['step']}: the resumed run draws {what}."
+            " The data position was not restored, unless the restart started its epoch over on purpose"
+            + (f"; {incident['resumes']} resumes differ" if incident["resumes"] > 1 else "")
+        )
+    if kind == "resume_incomplete":
+        change = incident["changes"][0]
+        words = {"missing": "not in the checkpoint", "empty": "started empty", "empty_in_checkpoint": "empty in the checkpoint",
+                 "step_reset": "step counter back at 1", "position": "last_epoch far from the step",
+                 "initial_scale": "back at its initial value"}
+        found = "; ".join(f"{f['component']} {words.get(f['finding'], f['finding'])}" for f in change["findings"])
+        source = {"load": " (from the loaded checkpoint's manifest and the first step)",
+                  "save": f" (assuming it loaded the save after step {change.get('saved_after_step')})"}.get(change["source"], "")
+        return (
+            f"Resume at step {incident['step']} did not bring everything back{source}: {found}."
+            " Expected only if left out or reset on purpose"
+            + (f"; {incident['resumes']} resumes affected" if incident["resumes"] > 1 else "")
+        )
+    if kind == "data_stalled":
+        why = ("drew no new batch" if incident["reason"] == "no_batch" else "drew the same batch again")
+        return (
+            f"No data progress from step {incident['step']}: steps advanced to {incident['through_step']} but each {why}"
+        )
+    if kind == "epoch_order_repeated":
+        sampler = (
+            f"; the sampler's epoch stayed at {incident['sampler_epoch']} (is set_epoch called each epoch?)"
+            if incident.get("sampler_epoch") is not None and incident["sampler_epoch"] == incident.get("previous_sampler_epoch")
+            else ""
+        )
+        return (
+            f"Epoch {incident['epoch']} (from step {incident['step']}) draws its first {incident['batches_compared']}"
+            f" batches in the same order as epoch {incident['previous_epoch']}{sampler}"
+        )
+    if kind == "duplicate_batches":
+        return (
+            f"Ranks {', '.join(map(str, incident['ranks']))} drew the same batch at step {incident['step']}"
+            f" ({incident['duplicated_steps']} steps duplicated among ranks {_rank_ranges(incident['ranks_compared'])})."
+            " Each rank should read its own share: a sampler without the rank, or an IterableDataset not split by rank or worker"
         )
     if kind == "loss_scale_trouble":
         why = (
