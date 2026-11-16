@@ -32,6 +32,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dense_outlier_check import MODEL, install_outlier, load_batches  # noqa: E402
 
 
+def reset_compile_state() -> None:
+    """Forget what Dynamo compiled earlier in this process; `reset()` leaves the metrics list alone."""
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    clear = getattr(torch._dynamo.utils, "clear_compilation_metrics", None)
+    if clear is not None:
+        clear()
+
+
+def recompiled_frames(metrics) -> tuple[int, list[str]]:
+    """The number of frames Dynamo compiled, and a line for each one it compiled more than once.
+
+    Only forward compiles count. Under Inductor each backward graph is a metric of its own with
+    no code object (`co_filename` is None, `is_forward` False): on the first A100 run those
+    made one key look compiled many times and `Path(None)` raised.
+    """
+    frames: dict[tuple, int] = {}
+    for m in metrics:
+        if getattr(m, "is_forward", True) is False or m.co_filename is None:
+            continue
+        key = (m.co_filename, m.co_name, m.co_firstlineno)
+        frames[key] = frames.get(key, 0) + 1
+    lines = [f"{k[1]} ({Path(k[0]).name}:{k[2]}) compiled {n} times" for k, n in frames.items() if n > 1]
+    return sum(frames.values()), lines
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", type=Path, required=True, help="new directory for the run")
@@ -70,8 +96,7 @@ def main() -> None:
         parser.error("mixed precision needs CUDA")
 
     args.out.mkdir(parents=True)
-    torch._dynamo.reset()
-    torch._dynamo.utils.counters.clear()
+    reset_compile_state()
     torch.manual_seed(0)
     micro = args.steps * args.accumulate
     if args.toy:
@@ -136,13 +161,9 @@ def main() -> None:
     finally:
         callback.close()
         handle.remove()
+    compiled = 0
     if not args.eager:
-        metrics = torch._dynamo.utils.get_compilation_metrics()
-        frames: dict[tuple, int] = {}
-        for m in metrics:
-            key = (m.co_filename, m.co_name, m.co_firstlineno)
-            frames[key] = frames.get(key, 0) + 1
-        recompiles = [f"{k[1]} ({Path(k[0]).name}:{k[2]}) compiled {n} times" for k, n in frames.items() if n > 1]
+        compiled, recompiles = recompiled_frames(torch._dynamo.utils.get_compilation_metrics())
 
     # ---- checks ----------------------------------------------------------------------
     records = tensorquill.load_records(jsonl)
@@ -196,8 +217,8 @@ def main() -> None:
         print("\n--- Compile ---")
         breaks = sum(torch._dynamo.utils.counters["graph_break"].values())
         check(breaks == 0, f"{breaks} graph breaks")
-        check(bool(metrics) and not recompiles,
-              f"{len(metrics)} frames compiled, none more than once" + ("" if not recompiles else ": " + "; ".join(recompiles)))
+        check(compiled > 0 and not recompiles,
+              f"{compiled} frames compiled, none more than once" + ("" if not recompiles else ": " + "; ".join(recompiles)))
 
     print(f"\nCapture: {jsonl}")
     if failures:

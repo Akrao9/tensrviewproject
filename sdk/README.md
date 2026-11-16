@@ -428,7 +428,7 @@ pip install -e 'sdk[huggingface,flight]'
 python examples/trainer_check.py --out runs/trainer-check
 ```
 
-It passes with `--toy --backend aot_eager` on CPU; it has not run on a GPU.
+It passes with `--toy --backend aot_eager` on CPU. First GPU run, Nov 15, 2026 (Colab, A100-SXM4-80GB, PyTorch 2.14.1+cu130, SmolLM2-360M, Inductor, fp16, clip 1): `Trainer` finished its 400 steps in 139 s with the callback attached, and the loss and gradient norm jumped after the seeded step 250 as planted. The script then crashed in its own compile check: under Inductor each backward graph is a separate Dynamo metric with no code object (`co_filename` is `None`), which the check did not expect. That is fixed (`recompiled_frames`, tested against fake metrics and a real Inductor compile), but the script's checks (steps, loss and clipping agreement, detection at step 250, graph breaks, recompiles) have not yet run to the end on a GPU, so this is not a pass.
 
 On a CUDA machine, run the GPU check. It fails on any graph break, recompile or CUDA-graph skip, and then reports the time per step with and without capture:
 
