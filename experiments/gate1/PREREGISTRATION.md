@@ -22,7 +22,7 @@ The gate is judged on the six held-out fixtures only. Their names say nothing ab
 
 ## The six questions
 
-Every participant gets the same prompt, for every fixture and every arm. It is byte-identical. `harness.py` writes it as `prompt.md`, and a test checks that every folder holds the same text. The prompt lists all 31 incident kinds the SDK can report, plus `none`. A constant list like this tells the participant nothing about any one run.
+Every participant gets the same prompt, for every fixture and every arm. It is byte-identical. `harness.py` writes it as `prompt.md`, and a test checks that every folder holds the same text. The prompt lists the 32 incident kinds the SDK can report as of Nov 16, 2026, plus `none`. A constant list like this tells the participant nothing about any one run.
 
 | # | Field | Question (as in the prompt) |
 | --- | --- | --- |
@@ -46,7 +46,7 @@ Questions 1–5 are the plan's Step 7 requirements ("the first failing step, lay
 | `dead_experts` | Same rule | MoE fixtures only |
 | `magnitude` | Router failures with an overloaded expert: a number within ±0.01 of the key's share. Router failures with none: `null`. Dense failures: a positive number within a factor of 1.5 of the key's ratio (`key / 1.5 ≤ answer ≤ key × 1.5`) | All fixtures |
 
-A missing value, `null` (except where `null` is the answer), or a value of the wrong type is wrong. On the two dense fixtures, questions 4 and 5 are **not scored** and are left out of the denominator. One complete set of the six held-out fixtures therefore has 4 × 6 + 2 × 4 = **32 scored items**.
+A missing value, `null` (except where `null` is the answer), or a value of the wrong type is wrong. **Questions 4, 5 and 6 count as right only when question 1 (`kind`) is right.** Without this rule, an answer of "no failure found" (`none`, `[]`, `[]`, `null`) would earn 4 of 32 points on fixtures whose key has an empty list or `null`. With it, that answer earns 0 of 32, which a test checks. On the two dense fixtures, questions 4 and 5 are **not scored** and are left out of the denominator. One complete set of the six held-out fixtures therefore has 4 × 6 + 2 × 4 = **32 scored items**.
 
 **Accuracy** of an arm is the share of scored items answered right, over all its answer files on held-out fixtures. A trial is **correct** when every scored question in it is right. Time and tool calls "to a correct answer" are taken over correct trials only.
 
@@ -94,9 +94,9 @@ What each participant gets, per fixture. `harness.py build` writes one folder pe
 - `unseen-2`: the loss jump and a total-norm spike at step 310, about 10× its median. This can give `kind` and `step`. It cannot name the parameter, and the total-norm ratio falls outside the accepted range for `magnitude`.
 - `unseen-5`: no visible sign of the failure.
 
-Arm A's accuracy is therefore near zero by construction. It is a floor, not a competitor.
+Arm A's accuracy is therefore near zero by construction: "no failure found" scores 0 of 32, and the best arm A can do from its data is 2 of 32 (`unseen-2`'s kind and step). It is a floor, not a competitor.
 
-**Arm B** is the author's Rune app and is not runnable yet. Its placeholder file names what the app must load at run time: the run's `evidence.json`, and for the dense fixtures the step records (`<name>.jsonl`), since dense evidence has no per-step samples. The placeholder copies neither file, so arm B cannot be run by reading files instead of using the app. Until arm B has answers, the results table shows it as "not run" and the gate lines are not checked.
+**Arm B** is the author's Rune app and is not runnable yet. Its placeholder file names what the app must load at run time: the run's `evidence.json`, and for the dense fixtures the step records (`<name>.jsonl`), since dense evidence has no per-step samples. The placeholder names the two files and the build sub-folder they are in (`fixtures/<name>/`), not an absolute path, because that build folder also holds the key. It copies neither file, so arm B cannot be run by reading files instead of using the app. Until arm B has answers, the results table shows it as "not run" and the gate lines are not checked.
 
 **Arm C** gets exactly the evidence file the SDK wrote, together with its summary. The summary states the answers to questions 1–5 outright, and question 6's share or ratio for most fixtures. Arm C measures what the evidence alone gives, and it is expected near the ceiling.
 
@@ -119,7 +119,7 @@ Plan Step 7 also asks for questions "that neither default screen answers without
 
 Each answer file records the following:
 
-- `participant`: `agent:<model>` or `human:<name>`.
+- `participant`: `agent:<model>` or `human:<name>`. The scorer refuses any other form, because the prefix decides whether a trial counts toward the agent medians or the human ones.
 - `trial`: 1–3.
 - `started_at` and `submitted_at`: ISO 8601 with a time zone.
 - `tool_calls`: an integer for agents, `null` for people.

@@ -44,12 +44,12 @@ ARMS = {
     "R": "stock Rerun 0.43.2 with the bake-off blueprint, evidence.json and its summary (plan Step 8's arm A)",
 }
 
-# Frozen on Nov 16, 2026 from the SDK's incident kinds (every kind `build_evidence`, the server
+# Frozen on Nov 16, 2026 from the SDK's 32 incident kinds (every kind `build_evidence`, the server
 # and the watcher can report). The list is the same for every fixture and arm, so it says nothing
 # about any one run.
 KINDS = (
     "activation_drift", "activation_spike", "allocator_retries", "attention_collapse",
-    "attention_logit_growth", "attention_uniform", "collective_desync", "data_stalled",
+    "attention_logit_growth", "attention_uniform", "collective_desync", "collective_hang", "data_stalled",
     "dead_activations", "duplicate_batches", "epoch_order_repeated", "gpu_throttled", "grad_spike",
     "hardware_errors", "input_starvation", "job_stalled", "loss_scale_trouble", "memory_growth",
     "memory_imbalance", "memory_pressure", "moe_imbalance", "non_finite", "rank_silent",
@@ -190,8 +190,9 @@ The participant gets the Rune app, started on this run, and this folder's `promp
   so the app needs these for its dense view: per-parameter gradient norms (`grad_norms`) and
   per-module activation statistics (`layers`).
 
-Both paths are in the operator's build folder; neither is copied here, so nothing in this
-folder can be read in place of the app. The app opens at the first incident sample, with the
+Both files are in the operator's build folder, under `fixtures/{name}/`. Neither is copied
+here, so nothing in this folder can be read in place of the app; that build folder also holds
+the scorer's key, so never hand it to a participant. The app opens at the first incident sample, with the
 detector summary and the status heatmap visible, before the timer starts.
 """
 
@@ -228,8 +229,8 @@ def build(out: Path, names: list[str] | None = None, *, rerun_arm: bool = True) 
                 (folder / "scalars.csv").write_text(scalar_export(records), encoding="utf-8")
             elif arm == "B":
                 (folder / "RUNE_APP_PLACEHOLDER.md").write_text(ARM_B_PLACEHOLDER.format(
-                    evidence=source / f"{fixture.name}.evidence.json",
-                    records=source / f"{fixture.name}.jsonl"), encoding="utf-8")
+                    name=fixture.name, evidence=f"{fixture.name}.evidence.json",
+                    records=f"{fixture.name}.jsonl"), encoding="utf-8")
             else:
                 (folder / "evidence.json").write_text(evidence_text, encoding="utf-8")
                 (folder / "summary.txt").write_text(summary, encoding="utf-8")
@@ -321,8 +322,8 @@ def check_answer(answer: dict, where: str) -> None:
     trial = answer.get("trial")
     if not isinstance(trial, int) or isinstance(trial, bool) or trial < 1:
         raise AnswerError(f"{where}: trial must be a positive integer")
-    if not isinstance(answer.get("participant"), str) or not answer["participant"]:
-        raise AnswerError(f"{where}: participant must be a string, `agent:<model>` or `human:<name>`")
+    if not isinstance(answer.get("participant"), str) or not re.fullmatch(r"(agent|human):\S.*", answer["participant"]):
+        raise AnswerError(f"{where}: participant must be `agent:<model>` or `human:<name>`")
     calls = answer.get("tool_calls")
     if calls is not None and (not isinstance(calls, int) or isinstance(calls, bool) or calls < 0):
         raise AnswerError(f"{where}: tool_calls must be a non-negative integer or null")
@@ -380,7 +381,11 @@ def _expert_set(value) -> set[int] | None:
 
 
 def score_answer(answers: dict, key: dict) -> dict[str, bool | None]:
-    """{question: True/False, or None when the question is not scored on this fixture}."""
+    """{question: True/False, or None when the question is not scored on this fixture}.
+
+    Questions 4 to 6 count only when the kind is right, so "no failure found" (`none`, `[]`,
+    `[]`, `null`) earns nothing on a fixture whose key happens to have an empty list or `null`.
+    """
     out: dict[str, bool | None] = {}
     kind = answers.get("kind")
     out["kind"] = isinstance(kind, str) and kind.strip().lower() == key["kind"]
@@ -400,6 +405,10 @@ def score_answer(answers: dict, key: dict) -> dict[str, bool | None]:
     else:
         out["magnitude"] = (_is_number(magnitude) and magnitude > 0
                             and rule["value"] / rule["factor"] <= magnitude <= rule["value"] * rule["factor"])
+    if not out["kind"]:
+        for qid in ("overloaded_experts", "dead_experts", "magnitude"):
+            if out[qid] is not None:
+                out[qid] = False
     return out
 
 

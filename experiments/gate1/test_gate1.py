@@ -170,8 +170,9 @@ def test_arm_b_is_a_placeholder_that_names_what_the_app_loads(built):
         folder = out / "trial" / fixture.name / "B"
         assert {p.name for p in folder.iterdir()} == {"prompt.md", "answer.template.json", "RUNE_APP_PLACEHOLDER.md"}
         text = (folder / "RUNE_APP_PLACEHOLDER.md").read_text(encoding="utf-8")
-        assert str(out / "fixtures" / fixture.name / f"{fixture.name}.evidence.json") in text
-        assert str(out / "fixtures" / fixture.name / f"{fixture.name}.jsonl") in text
+        assert f"`{fixture.name}.evidence.json`" in text and f"`{fixture.name}.jsonl`" in text
+        assert f"`fixtures/{fixture.name}/`" in text
+        assert str(out) not in text  # no path into the folder that holds the key
 
 
 def test_arm_c_gets_the_evidence_and_its_summary(built):
@@ -246,6 +247,17 @@ def test_the_command_line_writes_the_results_table(built, tmp_path):
     assert "Arm B: not run." in text
 
 
+def test_finding_nothing_scores_nothing(built):
+    """`none` with empty lists and `null` earns no point, though some keys hold `[]` or `null`."""
+    _, key = built
+    nothing = dict(kind="none", step=None, location=None, overloaded_experts=[], dead_experts=[], magnitude=None)
+    rows = harness.score(key, [(name, answer(fixture=name, **nothing)) for name in harness.HELD_OUT])
+    assert (sum(r["right"] for r in rows), sum(r["scored"] for r in rows)) == (0, 32)
+    # The same lists with the right kind do score where the key has them.
+    marks = harness.score_answer({**nothing, "kind": "moe_imbalance"}, key["fixtures"]["unseen-4"])
+    assert marks["overloaded_experts"] and marks["magnitude"] and not marks["dead_experts"]
+
+
 def test_scoring_needs_no_sdk(built):
     """`score` runs on the standard library: it must not import tensorquill or torch."""
     out, _ = built
@@ -282,7 +294,10 @@ def test_a_rule_per_question(built):
     good1 = dict(kind="moe_imbalance", step=1300, location=17, overloaded_experts=[53],
                  dead_experts=list(range(20, 28)), magnitude=0.44)
     assert all(harness.score_answer(good1, k1).values())
-    for change, wrong in [({"kind": "starved_experts"}, "kind"), ({"step": 1200}, "step"), ({"step": True}, "step"),
+    # A wrong kind also loses questions 4 to 6, which count only with the right kind.
+    marks = harness.score_answer({**good1, "kind": "starved_experts"}, k1)
+    assert {q for q, m in marks.items() if m is False} == {"kind", "overloaded_experts", "dead_experts", "magnitude"}
+    for change, wrong in [({"step": 1200}, "step"), ({"step": True}, "step"),
                           ({"location": 18}, "location"), ({"overloaded_experts": [53, 54]}, "overloaded_experts"),
                           ({"dead_experts": list(range(20, 28)) + [1]}, "dead_experts"),
                           ({"dead_experts": None}, "dead_experts"), ({"overloaded_experts": [True]}, "overloaded_experts"),
@@ -312,7 +327,8 @@ def test_a_rule_per_question(built):
 
 @pytest.mark.parametrize("change,message", [
     ({"format": "other"}, "not a"), ({"arm": "D"}, "arm must be"), ({"trial": 0}, "trial must be"),
-    ({"trial": True}, "trial must be"), ({"participant": ""}, "participant"), ({"tool_calls": -1}, "tool_calls"),
+    ({"trial": True}, "trial must be"), ({"participant": ""}, "participant"), ({"participant": "opus"}, "participant"),
+    ({"participant": "agent:"}, "participant"), ({"tool_calls": -1}, "tool_calls"),
     ({"started_at": "2026-11-16T10:00:00"}, "time zone"), ({"submitted_at": "2026-11-16T09:00:00Z"}, "before"),
     ({"answers": {"kind": "none"}}, "exactly the keys"),
 ])
@@ -330,6 +346,7 @@ def test_duplicates_and_unknown_fixtures_are_refused(built):
     with pytest.raises(harness.AnswerError, match="not in the key"):
         harness.score(key, [("a", answer(fixture="unseen-9"))])
     # Another trial or participant on the same fixture is a separate answer.
+    assert harness.score(key, [("h", answer(participant="human:author"))])[0]["agent"] is False
     assert len(harness.score(key, [("a", answer()), ("b", answer(trial=2)), ("c", answer(participant="human:x"))])) == 3
 
 
