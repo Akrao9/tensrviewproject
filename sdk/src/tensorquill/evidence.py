@@ -1888,6 +1888,7 @@ def watch(
     server_reports: bool = True,
     report_grace: float = REPORT_GRACE_SECONDS,
     compact_window: int | None = None,
+    trigger: Any = None,
     **build_options: Any,
 ) -> Path | None:
     """Keep the evidence file up to date while a run is going, until interrupted.
@@ -1917,6 +1918,8 @@ def watch(
     `compact_window` writes the compact file instead of the full one (`compact.compact_evidence`,
     that many recorded steps each side of a MoE incident), as `<name>.compact.json` unless
     `output` names the file; `on_update` still gets the full evidence.
+    `trigger` (a `trigger.Trigger`) fires once for each new incident: it is told of every look
+    and handed each evidence written, and never raises into the watcher.
     """
     if isinstance(rank, str):
         if rank != ALL_RANKS:
@@ -1924,7 +1927,7 @@ def watch(
         return watch_all_ranks(
             source, output, interval=interval, polls=polls, on_update=on_update,
             server_reports=server_reports, report_grace=report_grace, compact_window=compact_window,
-            **build_options,
+            trigger=trigger, **build_options,
         )
     source = Path(source)
     picked_rank = rank
@@ -1953,6 +1956,8 @@ def watch(
             if done:
                 time.sleep(interval)
             done += 1
+            if trigger is not None:
+                trigger.tick()
             # A hung job writes no new records, so the server's status file and any local
             # external sources are read on every poll, even while waiting on --report-grace.
             status = read_watchdog(status_file) if status_file is not None else None
@@ -2048,6 +2053,9 @@ def watch(
             written = _write_output(evidence, path, output is not None, compact_window)
             if on_update is not None:
                 on_update(evidence, written)
+            if trigger is not None:
+                own = _own_rank(folder) if report_look is not None else tail.records[0].get("rank", 0)
+                trigger.look(evidence, written, rank=own)
     except KeyboardInterrupt:
         pass
     return written
@@ -2418,6 +2426,7 @@ def watch_all_ranks(
     server_reports: bool = True,
     report_grace: float = REPORT_GRACE_SECONDS,
     compact_window: int | None = None,
+    trigger: Any = None,
     **build_options: Any,
 ) -> Path | None:
     """Keep one evidence file for every rank of a run up to date: `watch(run_folder, rank="all")`.
@@ -2471,6 +2480,8 @@ def watch_all_ranks(
             if done:
                 time.sleep(interval)
             done += 1
+            if trigger is not None:
+                trigger.tick()
             status = read_watchdog(status_file)
             status_age = status_clock.check(status)
             stamp = (_status_stamp(status, status_age), _other_sources_stamp(**other_sources))
@@ -2511,6 +2522,8 @@ def watch_all_ranks(
             written = _write_output(evidence, path, output is not None, compact_window)
             if on_update is not None:
                 on_update(evidence, written)
+            if trigger is not None:
+                trigger.look(evidence, written)
     except KeyboardInterrupt:
         pass
     return written
@@ -3981,7 +3994,7 @@ def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             args.input, args.output, interval=args.interval, rank=ALL_RANKS, polls=None if args.watch else 1,
             on_update=report, report_grace=args.report_grace, overload_threshold=args.overload_threshold,
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
-            traincheck=args.traincheck, compact_window=args.compact_window,
+            traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -4072,11 +4085,13 @@ def main() -> None:
         "`tensorquill-server detect` (the binary on PATH or named by TENSORQUILL_SERVER_BIN; needs pyarrow). "
         "One finished file or store at the default thresholds: not with --watch, --rank all or --top-k",
     )
-    from . import compact as _compact
+    from . import compact as _compact, trigger as _trigger
 
     _compact.add_arguments(parser)
+    _trigger.add_arguments(parser)
     args = parser.parse_args()
     args.compact_window = _compact.window_from_args(args)  # None: the full file
+    args.trigger = _trigger.from_args(args, parser)  # None without --on-incident or --webhook
 
     if args.detectors == "rust" and (args.watch or args.rank == ALL_RANKS):
         parser.error("--detectors rust reads one rank once: it cannot be combined with --watch or --rank all")
@@ -4114,7 +4129,7 @@ def main() -> None:
             server_reports=not args.recompute, report_grace=args.report_grace,
             overload_threshold=args.overload_threshold, top_k=args.top_k,
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
-            traincheck=args.traincheck, compact_window=args.compact_window,
+            traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
         )
         return
 
