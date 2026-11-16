@@ -1004,19 +1004,34 @@ def _rank_folder(source: Path, rank: int | None, dirs: list[Path] | None = None)
 def _newest_part(folder: Path) -> tuple[tuple[int, int] | None, Path | None, int]:
     """The newest attempt stored in a rank's folder and its last step, read from the part
     names alone, with that part's path and how many parts have a name the server did not give."""
+    # A walk of names with `os.scandir`, which builds no `Path` per part: with 200 parts a rank
+    # (10,000 steps) that was 94% of a look at 64 ranks, and it grows with the run. The parts
+    # counted, and the ones left out, are those `folder.rglob("part-*.parquet")` gives.
     newest: tuple[int, int] | None = None
-    newest_path: Path | None = None
+    newest_path: str | None = None
     unknown = 0
-    for part in folder.rglob("part-*.parquet"):
-        match = _PART_NAME.search(part.name)
-        key, _, attempt = part.parent.name.partition("=")
-        if match is None or key != "attempt" or not attempt.lstrip("-").isdigit() or part.parent.parent != folder:
-            unknown += 1
+    pending = [(str(folder), 0, "")]
+    while pending:
+        directory, depth, directory_name = pending.pop()
+        try:
+            entries = os.scandir(directory)
+        except OSError:
             continue
-        at = (int(attempt), int(match.group(2)))
-        if newest is None or at > newest:
-            newest, newest_path = at, part
-    return newest, newest_path, unknown
+        with entries:
+            for entry in entries:
+                name = entry.name
+                if name.startswith("part-") and name.endswith(".parquet"):
+                    match = _PART_NAME.search(name)
+                    key, _, attempt = directory_name.partition("=")
+                    if match is None or depth != 1 or key != "attempt" or not attempt.lstrip("-").isdigit():
+                        unknown += 1
+                    else:
+                        at = (int(attempt), int(match.group(2)))
+                        if newest is None or at > newest:
+                            newest, newest_path = at, entry.path
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append((entry.path, depth + 1, name))
+    return newest, Path(newest_path) if newest_path is not None else None, unknown
 
 
 def read_server_report(
@@ -1314,7 +1329,7 @@ def watch(
     output: str | Path | None = None,
     *,
     interval: float = 2.0,
-    rank: int | None = None,
+    rank: int | str | None = None,
     default_rank: int | None = None,
     polls: int | None = None,
     on_update: Any = None,
@@ -1323,6 +1338,9 @@ def watch(
     **build_options: Any,
 ) -> Path | None:
     """Keep the evidence file up to date while a run is going, until interrupted.
+
+    `rank="all"` is the all-ranks view of a run folder: one evidence file for every
+    `rank=<n>` folder in it, in a shape of its own (see `watch_all_ranks`).
 
     `source` is a `.jsonl` file a job is writing, or a directory `tensorquill-server` is
     writing Parquet parts into. Every `interval` seconds it is looked at again and, when
@@ -1343,6 +1361,13 @@ def watch(
     `evidence["detection"]` says which happened and why. `server_reports=False` always
     works the incidents out here.
     """
+    if isinstance(rank, str):
+        if rank != ALL_RANKS:
+            raise ValueError(f"rank must be a rank number or {ALL_RANKS!r}, not {rank!r}")
+        return watch_all_ranks(
+            source, output, interval=interval, polls=polls, on_update=on_update,
+            server_reports=server_reports, report_grace=report_grace, **build_options,
+        )
     source = Path(source)
     picked_rank = rank
     tail = _Tail(source, picked_rank)
@@ -1460,6 +1485,427 @@ def watch(
                 evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
             emitted = seen
             emitted_grace = grace_key
+            written = write_evidence(evidence, path)
+            if on_update is not None:
+                on_update(evidence, written)
+    except KeyboardInterrupt:
+        pass
+    return written
+
+
+# --- The all-ranks view ------------------------------------------------------------------
+#
+# `watch(run_folder, rank="all")`: one evidence file for every `rank=<n>` folder of a run in a
+# server's store. It reads what a single-rank watcher reads, for every rank: the rank's
+# `incidents.json` and the name of its newest part (`read_server_report`), and the run's
+# `watchdog.json`. It reads no part and runs no detector in any state: a rank whose report is
+# not current is listed as unknown, with its state and the reason, and is never counted among
+# the ranks that have no incidents. (The one exception is shared with the single-rank watcher:
+# when `flight_recorder` finds a stuck collective in complete dumps, the newest stored part is
+# opened once to date the dump against the last recorded step.)
+ALL_RANKS = "all"
+ALL_RANKS_VIEW = "all_ranks"
+ALL_RANKS_VIEW_VERSION = 1
+# `world_size` names the ranks a job should have; a bogus huge value is not taken as a list to expand.
+MAX_EXPECTED_RANKS = 100_000
+# Lines of the text summary given to incidents on only some ranks before the rest are counted.
+SUMMARY_PARTIAL_LINES = 8
+
+
+def _rank_number(name: str) -> int | None:
+    key, _, value = name.partition("=")
+    return int(value) if key == "rank" and value.isdecimal() else None
+
+
+def _discover_rank_folders(source: Path) -> dict[int, Path]:
+    """The `rank=<n>` folders directly under a run folder, by rank number."""
+    found: dict[int, Path] = {}
+    try:
+        with os.scandir(source) as entries:
+            for entry in entries:
+                number = _rank_number(entry.name)
+                if number is not None and entry.is_dir():
+                    found[number] = Path(entry.path)
+    except OSError:
+        return {}
+    return found
+
+
+def _ranks_without_folder(folders: Mapping[int, Path], status: Mapping[str, Any] | None) -> dict[int, str]:
+    """Ranks the server's status knows of or expects that have no folder in the store, with why.
+
+    The status only covers ranks connected since the server started (and `world_size`, when a
+    rank sent it), so after a restart it knows less than the store does: the folders are the
+    ranks that have stored anything, and the status adds only those that have not.
+    """
+    reasons: dict[int, str] = {}
+    if not status:
+        return reasons
+    world_size = status.get("world_size")
+    if isinstance(world_size, int) and not isinstance(world_size, bool) and 0 < world_size <= MAX_EXPECTED_RANKS:
+        for number in range(world_size):
+            if number not in folders:
+                reasons[number] = f"the job's world_size is {world_size} and nothing is stored for this rank"
+    for item in status.get("ranks") or ():
+        number = item.get("rank") if isinstance(item, dict) else None
+        if isinstance(number, int) and number not in folders:
+            reasons[number] = "the server saw this rank connect, and nothing is stored for it (no rank folder)"
+    for number in status.get("missing_ranks") or ():
+        if isinstance(number, int) and number not in folders:
+            reasons[number] = "the server's status lists this rank as never connected, and nothing is stored for it"
+    return reasons
+
+
+class _RankMemory:
+    """What the all-ranks watcher keeps about one rank between looks, as the single-rank
+    watcher keeps it for its one rank: whether the rank's report was ever seen current, since
+    when it has been behind, and the key it had the last time it was current."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.was_current = False
+        self.waiting_since: float | None = None
+        self.last_current_key: Any = None
+
+
+def _rank_look(
+    folder: Path | None,
+    absent: str | None,
+    memory: _RankMemory,
+    thresholds: Mapping[str, Any],
+    report_grace: float,
+    now: float,
+) -> tuple[dict[str, Any], bool]:
+    """One rank's `read_server_report`, with the single-rank watcher's wait applied to it.
+
+    A report that is `behind`, `missing` or `unreadable` after having been current gets
+    `report_grace` seconds from that moment, since a part is stored first and reported on a
+    moment later; `behind` for longer is `stale`. A rank never seen current does not wait.
+    Returns the look and whether the rank is inside its wait.
+    """
+    if folder is None:
+        memory.reset()
+        return {"state": "nothing_stored", "reason": absent, "stored": None, "report": None}, False
+    look = read_server_report(folder, **thresholds)
+    state = look["state"]
+    in_grace = False
+    if state == "current":
+        memory.was_current, memory.waiting_since = True, None
+    elif state == "nothing_stored":
+        memory.reset()
+    elif state in ("missing", "behind", "unreadable") and memory.was_current:
+        if memory.waiting_since is None:
+            memory.waiting_since = now
+        if now - memory.waiting_since < report_grace:
+            in_grace = True
+        elif state == "behind":
+            look["state"] = "stale"
+    return look, in_grace
+
+
+def _rank_key(look: Mapping[str, Any]) -> tuple[Any, ...]:
+    """What a look of one rank says that a reader of the file would want to know changed:
+    the rank's state and which report it is looking at, not how far the store has grown
+    beside a report that is not current."""
+    report = look.get("report") or {}
+    return (look["state"], report.get("attempt"), report.get("last_step"), report.get("steps"), report.get("rebuilds"))
+
+
+def _rank_ranges(ranks: Iterable[int], limit: int | None = None) -> str:
+    """Ranks as ranges: `0-63`, `0-3, 5, 7-9`; with `limit`, the first that many ranges and a count."""
+    spans: list[list[int]] = []
+    for number in sorted(set(ranks)):
+        if spans and number == spans[-1][1] + 1:
+            spans[-1][1] = number
+        else:
+            spans.append([number, number])
+    shown = spans if limit is None else spans[:limit]
+    text = ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in shown)
+    hidden = sum(b - a + 1 for a, b in spans[len(shown):])
+    return text + (f", and {hidden} more" if hidden else "")
+
+
+def _incident_identity(incident: Mapping[str, Any]) -> str:
+    """What makes two ranks' incidents "the same": the kind, the step and what it names (the
+    layer, router, experts, parameters or modules), never the measured numbers or the logged
+    scalars, which differ from rank to rank for the same fault. A kind this function does not
+    know is the same only when it is equal, but for its `scalars`."""
+    kind, step = incident.get("kind"), incident.get("step")
+    if kind == "moe_imbalance":
+        parts: Any = [incident.get("layer"), incident.get("router"), sorted(incident.get("overloaded") or ()),
+                      sorted(incident.get("dead") or ())]
+    elif kind == "starved_experts":
+        parts = sorted(([e.get("layer"), e.get("router"), e.get("expert")] for e in incident.get("experts") or ()), key=repr)
+    elif kind == "grad_spike":
+        parts = sorted(str(p.get("name")) for p in incident.get("parameters") or ())
+    elif kind == "stalled_weights":
+        parts = sorted(str(name) for name in incident.get("parameters") or ())
+    elif kind in ("activation_spike", "activation_drift", "dead_activations"):
+        # In the model's order: the first block named is where it started.
+        parts = [[m.get("module"), m.get("stat")] for m in incident.get("modules") or ()]
+    elif kind == "non_finite":
+        parts = [list(incident.get("layers") or ()), list(incident.get("gradients") or ())]
+    elif kind == "loss_scale_trouble":
+        parts = [incident.get("reason")]
+    elif kind == "replica_drift":
+        parts = sorted(incident.get("parameters") or ())
+    elif kind in ("repeated_steps", "resume_lr_change"):
+        parts = []
+    else:
+        parts = {k: v for k, v in incident.items() if k != "scalars"}
+    return json.dumps([kind, step, parts], sort_keys=True, default=str)
+
+
+def _without_scalars(incident: Mapping[str, Any]) -> dict[str, Any]:
+    """The logged values around an incident are each rank's own data and differ by construction."""
+    return {k: v for k, v in incident.items() if k != "scalars"}
+
+
+def _group_incidents(looks: Mapping[int, Mapping[str, Any]], judged: list[int]) -> list[dict[str, Any]]:
+    """The incidents of the ranks whose reports are current, grouped across ranks.
+
+    Incidents with the same identity are one group with the ranks that show it; those that
+    differ in kind, step or what they name are separate groups, so an incident on one rank is
+    listed with that rank alone. A group holds one incident, the first rank's, and says whether
+    the other ranks' incidents differ from it in their numbers (not counting `scalars`: the
+    incident's logged context is the first rank's).
+    """
+    groups: dict[str, dict[str, Any]] = {}
+    for number in judged:
+        counted: set[str] = set()
+        for incident in looks[number]["report"]["incidents"]:
+            if not isinstance(incident, dict) or "kind" not in incident:
+                continue
+            identity = _incident_identity(incident)
+            if identity in counted:
+                continue
+            counted.add(identity)
+            group = groups.get(identity)
+            if group is None:
+                groups[identity] = {"kind": incident["kind"], "step": incident.get("step"), "ranks": [number],
+                                    "incident_rank": number, "numbers_differ": False, "incident": incident}
+            else:
+                group["ranks"].append(number)
+                if not group["numbers_differ"] and _without_scalars(incident) != _without_scalars(group["incident"]):
+                    group["numbers_differ"] = True
+    order = {kind: i for i, kind in enumerate(SERVER_KINDS)}
+    found = sorted(
+        groups.values(),
+        key=lambda g: (order.get(g["kind"], len(order)), g["step"] if isinstance(g["step"], int) else -1, g["ranks"][0]),
+    )
+    out = []
+    for index, group in enumerate(found):
+        out.append({
+            "id": index, "kind": group["kind"], "step": group["step"],
+            "ranks": group["ranks"], "rank_ranges": _rank_ranges(group["ranks"]),
+            "on_all_judged_ranks": len(group["ranks"]) == len(judged),
+            "numbers_differ": group["numbers_differ"], "incident_rank": group["incident_rank"],
+            "incident": group["incident"],
+        })
+    return out
+
+
+def _all_ranks_evidence(
+    source: Path,
+    folders: Mapping[int, Path],
+    looks: Mapping[int, Mapping[str, Any]],
+    status: Mapping[str, Any] | None,
+    *,
+    traincheck: str | Path | None,
+    flight_recorder: str | Path | None,
+    flight_recorder_prefix: str | None,
+) -> dict[str, Any]:
+    """The evidence for the whole run (see `watch_all_ranks`)."""
+    judged = [n for n, look in looks.items() if look["state"] == "current"]
+    groups = _group_incidents(looks, judged)
+    by_rank: dict[int, list[dict[str, Any]]] = {n: [] for n in judged}
+    for group in groups:
+        for number in group["ranks"]:
+            by_rank[number].append({"kind": group["kind"], "step": group["step"], "group": group["id"]})
+    streams: dict[int, dict[str, Any]] = {}
+    for item in (status or {}).get("ranks") or ():
+        if isinstance(item, dict) and isinstance(item.get("rank"), int):
+            streams[item["rank"]] = {k: item[k] for k in (
+                "state", "last_step", "phase", "severity", "seconds_since_progress", "heartbeat_age_seconds",
+            ) if k in item}
+    entries = []
+    for number in sorted(looks):
+        look = looks[number]
+        report = look.get("report") or {}
+        detection = {k: v for k, v in _detection(look, "server", number).items() if k not in ("source", "rank")}
+        detection["judged"] = number in by_rank
+        entry: dict[str, Any] = {"rank": number, "detection": detection}
+        if number in by_rank:
+            if report.get("moe_flagged") is not None:
+                detection["moe_flagged"] = report["moe_flagged"]
+            entry["incidents"] = by_rank[number]
+            unchecked = [dict(i) for i in report.get("not_checked") or ()
+                         if isinstance(i, dict) and i.get("check") not in ("flight_recorder", "traincheck")]
+            if unchecked:
+                entry["not_checked"] = unchecked
+        elif look["state"] in ("behind", "stale") and report:
+            # True when it was written and says nothing of what came after: shown as that, apart from the
+            # ranks that are current, and never as the rank's incidents.
+            entry["last_report"] = {
+                "attempt": report.get("attempt"), "last_step": report.get("last_step"), "steps": report.get("steps"),
+                "incidents": [dict(i) for i in report.get("incidents") or () if isinstance(i, dict)],
+            }
+        if number in streams:
+            entry["stream"] = streams[number]
+        entries.append(entry)
+
+    if status is not None and isinstance(status.get("incidents"), list):
+        stream_incidents = [dict(i) for i in status["incidents"]]
+    else:  # a status from a server that did not write the list yet
+        stream_incidents = detect_watchdog_incidents(status)
+    run_incidents = list(stream_incidents)
+    not_checked: list[dict[str, Any]] = []
+
+    def newest_ts() -> float | None:
+        newest = max(((look["stored"], n) for n, look in looks.items() if look.get("stored")), default=None)
+        if newest is None or newest[1] not in folders:
+            return None
+        _, part, _ = _newest_part(folders[newest[1]])
+        stamps = [float(r["ts"]) for r in (_read_part(part) if part else ()) if isinstance(r.get("ts"), (int, float))]
+        return max(stamps) if stamps else None
+
+    last_step = max((look["stored"][1] for look in looks.values() if look.get("stored")), default=0)
+    traincheck_summary, recorder_summary = _check_other_sources(
+        run_incidents, stream_incidents, not_checked, last_step=last_step, newest_ts=newest_ts,
+        traincheck=traincheck, flight_recorder=flight_recorder, flight_recorder_prefix=flight_recorder_prefix,
+    )
+    states: dict[str, list[int]] = {}
+    for number in sorted(looks):
+        states.setdefault(looks[number]["state"], []).append(number)
+    steps = [looks[n]["report"].get("last_step") for n in judged if isinstance(looks[n]["report"].get("last_step"), int)]
+    run_ids = [str(r["run_id"]) for n in judged if (r := looks[n]["report"]).get("run_id") is not None]
+    return {
+        "view": ALL_RANKS_VIEW,
+        "view_version": ALL_RANKS_VIEW_VERSION,
+        "run_id": run_ids[0] if run_ids else source.name,
+        "run_folder": str(source.resolve()),
+        "written_at_ms": int(time.time() * 1000),
+        "rank_count": len(looks),
+        "world_size": (status or {}).get("world_size"),
+        "judged_ranks": judged,
+        "unknown_ranks": [n for n in sorted(looks) if n not in by_rank],
+        "clean_ranks": [n for n in judged if not by_rank[n]],
+        "ranks_with_incidents": [n for n in judged if by_rank[n]],
+        "never_reporting_ranks": states.get("nothing_stored", []),
+        "ranks_by_state": states,
+        "last_step": {"min": min(steps), "max": max(steps)} if steps else None,
+        "incident_groups": groups,
+        "run_incidents": run_incidents,
+        "ranks": entries,
+        **({"not_checked": not_checked} if not_checked else {}),
+        **({"flight_recorder": recorder_summary} if recorder_summary else {}),
+        **({"traincheck": traincheck_summary} if traincheck_summary else {}),
+        **({"watchdog": {k: status[k] for k in (
+            "summary", "written_at_ms", "world_size", "pauses", "recommended_silent_seconds",
+            "silent_floor_seconds", "critical_seconds",
+        ) if k in status}} if status else {}),
+    }
+
+
+def watch_all_ranks(
+    source: str | Path,
+    output: str | Path | None = None,
+    *,
+    interval: float = 2.0,
+    polls: int | None = None,
+    on_update: Any = None,
+    server_reports: bool = True,
+    report_grace: float = REPORT_GRACE_SECONDS,
+    **build_options: Any,
+) -> Path | None:
+    """Keep one evidence file for every rank of a run up to date: `watch(run_folder, rank="all")`.
+
+    `source` is a run folder in a server's store (`runs/<run_id>`, holding `rank=<n>` folders).
+    Each look reads, for every rank, its `incidents.json` and the name of its newest part, and
+    the run's `watchdog.json`: nothing else, so a look of 64 ranks stays cheap, and no part is
+    opened and no detector run here, in any state. The file is replaced by rename, and only
+    when something changed: a rank's report (attempt, last step, steps, rebuilds), a rank's
+    state, the ranks present, or the status. The evidence is `{"view": "all_ranks", ...}`, not
+    the per-rank evidence: see `_all_ranks_evidence` and the README for its keys.
+
+    A rank's incidents count only while its report is current (`read_server_report`); a rank
+    that is behind, stale, missing, unreadable, unusable, on other thresholds or has nothing
+    stored is `unknown`, with its state and why, and is never listed among the ranks with no
+    incidents. Rank folders may appear or disappear between looks. `server_reports=False`
+    (`--recompute`) and `top_k` are refused, because they ask for the detectors to run here, a
+    rank at a time and for the whole run each time; use `rank=<n>` for that.
+    `flight_recorder` and `traincheck` are read once for the run and their incidents are run-level.
+    Returns the evidence path, or None if nothing was written.
+    """
+    source = Path(source)
+    if source.exists() and not source.is_dir():
+        raise ValueError(f"rank='all' needs a run folder in a server's store (runs/<run_id>), not the file {source}")
+    if _own_rank(source) is not None:
+        raise ValueError(f"{source} is one rank's folder; rank='all' needs the run folder that holds the rank=<n> folders")
+    if not server_reports:
+        raise ValueError(
+            "rank='all' cannot recompute: that would read the parts and run the detectors for every rank, one after"
+            " another, on every change (about 8 s a rank at 10,000 steps); recompute one rank with rank=<n>"
+        )
+    if build_options.get("top_k") is not None:
+        raise ValueError("top_k changes what the detectors compute, which the all-ranks view never runs; use rank=<n>")
+    status_file = build_options.pop("watchdog", None)
+    status_file = Path(status_file) if isinstance(status_file, (str, Path)) else _watchdog_beside(source) or source / "watchdog.json"
+    thresholds = {
+        name: build_options[name]
+        for name in ("overload_threshold", "drift_tolerance", "starve_window", "starve_ratio")
+        if name in build_options
+    }
+    other_sources = {
+        name: build_options.get(name) for name in ("traincheck", "flight_recorder", "flight_recorder_prefix")
+    }
+    memory: dict[int, _RankMemory] = {}
+    status_clock = _StatusAgeTracker()
+    emitted: Any = None
+    written: Path | None = None
+    done = 0
+    try:
+        while polls is None or done < polls:
+            if done:
+                time.sleep(interval)
+            done += 1
+            status = read_watchdog(status_file)
+            status_age = status_clock.check(status)
+            stamp = (_status_stamp(status, status_age), _other_sources_stamp(**other_sources))
+            folders = _discover_rank_folders(source)
+            absent = _ranks_without_folder(folders, status)
+            numbers = sorted({*folders, *absent})
+            if not numbers and status is None:
+                continue
+            for gone in set(memory) - set(numbers):
+                del memory[gone]
+            now = time.monotonic()
+            looks: dict[int, dict[str, Any]] = {}
+            full: list[tuple[int, Any]] = []
+            calm: list[tuple[int, Any]] = []
+            for number in numbers:
+                held = memory.setdefault(number, _RankMemory())
+                look, in_grace = _rank_look(folders.get(number), absent.get(number), held, thresholds, report_grace, now)
+                looks[number] = look
+                key = _rank_key(look)
+                if look["state"] == "current":
+                    held.last_current_key = key
+                full.append((number, key))
+                # A rank inside its wait is a moment between a part and its report, as the
+                # single-rank watcher treats it: it alone does not cause a write.
+                calm.append((number, held.last_current_key if in_grace else key))
+            # Compared with what was written, not with the last look: a rank written while it
+            # was in a wait, which then comes back with the key it had before, is rewritten.
+            seen, calmed = (tuple(full), stamp), (tuple(calm), stamp)
+            if seen == emitted or calmed == emitted:
+                continue
+            evidence = _all_ranks_evidence(source, folders, looks, status, **other_sources)
+            if status_age is not None and "watchdog" in evidence:
+                evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
+            path = Path(output) if output else Path(f"{evidence['run_id']}.all-ranks.evidence.json")
+            emitted = seen
             written = write_evidence(evidence, path)
             if on_update is not None:
                 on_update(evidence, written)
@@ -2137,7 +2583,11 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
 
 
 def incident_summary(evidence: Mapping[str, Any]) -> str:
-    """Human- and agent-readable summary matching the bake-off's text document format."""
+    """Human- and agent-readable summary matching the bake-off's text document format.
+
+    Evidence from the all-ranks view (`"view": "all_ranks"`) gets the cross-rank summary."""
+    if evidence.get("view") == ALL_RANKS_VIEW:
+        return _all_ranks_summary(evidence)
     lines: list[str] = []
     incidents = evidence.get("incidents", ())
     moe_incident = next((i for i in incidents if i["kind"] == "moe_imbalance"), None)
@@ -2175,6 +2625,132 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
     if evidence.get("layer_count"):
         lines.append(_legend(evidence))
     return "\n".join([*lines, *notes])
+
+
+def _group_line(group: Mapping[str, Any]) -> str:
+    """One incident group as a sentence, from the first rank's incident."""
+    incident = group["incident"]
+    kind = group["kind"]
+    if kind == "moe_imbalance":
+        overloaded = ", ".join(str(e) for e in incident.get("overloaded", ())[:6]) or "none"
+        dead = ", ".join(str(e) for e in incident.get("dead", ())[:6]) or "none"
+        text = (f"MoE imbalance at step {group['step']}, layer {incident.get('layer', 0):02}:"
+                f" overloaded experts {overloaded}; dead experts {dead}")
+    elif kind == "starved_experts":
+        experts = incident.get("experts", ())
+        text = (f"Starved experts from step {group['step']}: {len(experts)} in all, first "
+                + ", ".join(f"layer {e['layer']:02} expert {e['expert']}" for e in experts[:3]))
+    else:
+        text = _describe(incident) or f"Incident at step {group['step']}: {kind}"
+    if group["numbers_differ"] and len(group["ranks"]) > 1:
+        text += f" (rank {group['incident_rank']}'s numbers)"
+    return text
+
+
+def _all_ranks_summary(evidence: Mapping[str, Any]) -> str:
+    """The cross-rank picture for an agent: what is common to every judged rank, what only some
+    ranks show (named), the ranks with nothing, and what is unknown because a rank's report is
+    not current. "No incidents" is said only of ranks that are judged."""
+    total = evidence.get("rank_count", 0)
+    judged = evidence.get("judged_ranks", [])
+    unknown = evidence.get("unknown_ranks", [])
+    groups = evidence.get("incident_groups", [])
+    clean = evidence.get("clean_ranks", [])
+    span = evidence.get("last_step")
+    through = (
+        "" if not span else f" through step {span['max']}" if span["min"] == span["max"]
+        else f" through steps {span['min']}-{span['max']}"
+    )
+    lines: list[str] = []
+    if total == 0:
+        lines.append("No rank has stored anything for this run yet, so nothing is known about incidents.")
+    elif not unknown:
+        if not groups:
+            # A stall or a silent rank belongs to the run, not to a rank's steps: say which is empty.
+            none = "No incidents in the ranks' step records" if evidence.get("run_incidents") else "No incidents detected"
+            lines.append(
+                f"{none} on any of the {total} rank{'s' if total != 1 else ''}: every rank's report from"
+                f" tensorquill-server is current{through}."
+            )
+        else:
+            with_incidents = evidence.get("ranks_with_incidents", [])
+            lines.append(
+                f"{len(groups)} distinct incident{'s' if len(groups) != 1 else ''} on {len(with_incidents)} of {total}"
+                f" rank{'s' if total != 1 else ''}; every rank's report from tensorquill-server is current{through}."
+            )
+    else:
+        lines.append(
+            f"{len(judged)} of {total} ranks are judged from tensorquill-server's current reports{through};"
+            f" {len(unknown)} {'is' if len(unknown) == 1 else 'are'} unknown, and nothing is said about incidents on"
+            f" {'it' if len(unknown) == 1 else 'them'}."
+        )
+        if judged and not groups:
+            lines.append(f"No incidents on the {len(judged)} judged rank{'s' if len(judged) != 1 else ''}"
+                         f" (ranks {_rank_ranges(judged, 8)}).")
+    common = [g for g in groups if g["on_all_judged_ranks"]]
+    partial = [g for g in groups if not g["on_all_judged_ranks"]]
+    if common:
+        only = len(judged) == 1
+        lines.append(
+            f"On the only judged rank ({_rank_ranges(judged)}):" if only
+            else f"Common to all {len(judged)} judged ranks ({_rank_ranges(judged, 8)}):"
+        )
+        lines += [f"  - {_group_line(g)}" for g in common]
+    if partial:
+        lines.append("Only on some ranks:")
+        for group in partial[:SUMMARY_PARTIAL_LINES]:
+            ranks = group["ranks"]
+            who = (f"rank {ranks[0]} only" if len(ranks) == 1
+                   else f"ranks {_rank_ranges(ranks, 8)} ({len(ranks)} of {len(judged)})")
+            lines.append(f"  - {who}: {_group_line(group)}")
+        rest = partial[SUMMARY_PARTIAL_LINES:]
+        if rest:
+            kinds: dict[str, int] = {}
+            for group in rest:
+                kinds[group["kind"]] = kinds.get(group["kind"], 0) + 1
+            named = ", ".join(f"{kind} x{count}" for kind, count in sorted(kinds.items()))
+            lines.append(f"  - and {len(rest)} more distinct incidents on other ranks ({named}); see incident_groups in"
+                         " the evidence file")
+    if groups and clean:
+        lines.append(f"No incidents on rank{'s' if len(clean) != 1 else ''} {_rank_ranges(clean, 8)}"
+                     f" ({len(clean)} of {len(judged)} judged).")
+    if unknown:
+        by_state = evidence.get("ranks_by_state", {})
+        entries = {entry["rank"]: entry for entry in evidence.get("ranks", ())}
+        lines.append("Unknown (their reports are not current, so these ranks are not counted as having no incidents):")
+        for state, ranks in by_state.items():
+            if state == "current":
+                continue
+            first = entries.get(ranks[0], {})
+            reason = (first.get("detection") or {}).get("reason", "")
+            line = (f"  - rank{'s' if len(ranks) != 1 else ''} {_rank_ranges(ranks, 8)} ({state}): {reason}")
+            held = [(r, entries[r].get("last_report")) for r in ranks if entries.get(r, {}).get("last_report")]
+            if held:
+                rank, report = held[0]
+                kinds = ", ".join(sorted({i.get("kind", "?") for i in report["incidents"]})) or "no incidents"
+                line += (f". Rank {rank}'s last report, through step {report['last_step']}, held {kinds}"
+                         + (f" (and the same for {len(held) - 1} others)" if len(held) > 1 else ""))
+            lines.append(line)
+        lines.append("  To judge one of them here, from its stored parts (slower, in proportion to the run's length):"
+                     " python -m tensorquill <run folder> --rank <n>")
+    for incident in evidence.get("run_incidents", ()):
+        text = _describe(incident)
+        lines.append(text or f"Incident at step {incident.get('step')}: {incident['kind']}")
+    watchdog = evidence.get("watchdog") or {}
+    pauses, recommended = watchdog.get("pauses") or {}, watchdog.get("recommended_silent_seconds")
+    if pauses and recommended:
+        seen = ", ".join(f"{phase} up to {stats['max_seconds']:.0f} s ({stats['count']}x)" for phase, stats in sorted(pauses.items()))
+        lines.append(
+            f"Pauses the job reported: {seen}. A silence threshold of {recommended:.0f} s (twice the longest)"
+            " would have tolerated them: set the server's --silent-seconds to it or more."
+        )
+    lines += [
+        f"Not checked ({item['check']}): {item['reason']}"
+        for item in evidence.get("not_checked", ())
+        if item["check"] != "resume_lr"
+    ]
+    lines += _source_lines(evidence)
+    return "\n".join(lines)
 
 
 def _source_lines(evidence: Mapping[str, Any]) -> list[str]:
@@ -2508,32 +3084,79 @@ def _log_probe(
     return series
 
 
+def _rank_argument(value: str) -> int | str:
+    if value == ALL_RANKS:
+        return ALL_RANKS
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is neither a rank number nor 'all'") from None
+
+
+def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """`--rank all`: the all-ranks view, kept up to date with `--watch` and written once without."""
+    if args.rerun is not None:
+        parser.error("--rank all cannot be combined with --rerun: a Rerun recording is one rank's steps; "
+                     "use --rank N (a rank number) with --rerun")
+    if args.recompute:
+        parser.error("--rank all cannot be combined with --recompute: it would run the detectors here for every rank, "
+                     "one after another, on every change; recompute one rank with --rank N --watch --recompute")
+    if args.top_k is not None:
+        parser.error("--rank all cannot be combined with --top-k, which changes what the detectors compute; "
+                     "the all-ranks view runs none (use --rank N)")
+    shown: list[str] = []
+
+    def report(evidence: dict[str, Any], path: Path) -> None:
+        summary = incident_summary(evidence)
+        if [summary] != shown:
+            shown[:] = [summary]
+            print(summary)
+        print(f"updated {path}" if args.watch else f"wrote evidence -> {path}", flush=True)
+
+    if args.watch:
+        print(f"watching every rank of {args.input} every {args.interval:g} s; Ctrl-C to stop", flush=True)
+    try:
+        written = watch(
+            args.input, args.output, interval=args.interval, rank=ALL_RANKS, polls=None if args.watch else 1,
+            on_update=report, report_grace=args.report_grace, overload_threshold=args.overload_threshold,
+            flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
+            traincheck=args.traincheck,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if written is None and not args.watch:
+        raise SystemExit(f"no rank=<n> folder under {args.input} and no watchdog.json: nothing to show")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "input",
         type=Path,
         help="captured .jsonl file from tensorquill.init, or a directory of Parquet parts "
-        "written by tensorquill-server (runs/<run_id>, or a rank=<rank> directory in it)",
+        "written by tensorquill-server (runs/<run_id>, or a rank=<rank> directory in it; "
+        "the run directory with --rank all)",
     )
     parser.add_argument(
         "-o",
         "--output",
         type=Path,
         help="path to write viewer-neutral evidence JSON (default: <input>.evidence.json, "
-        "or <run_id>.evidence.json for a directory)",
+        "or <run_id>.evidence.json for a directory, <run_id>.all-ranks.evidence.json with --rank all)",
     )
     parser.add_argument(
         "--watch",
         action="store_true",
-        help="keep running: re-read the input when it grows and replace the evidence file",
+        help="keep running: re-read the input when it grows and replace the evidence file "
+        "(with --rank all: every rank's report and the run's status)",
     )
     parser.add_argument("--interval", type=float, default=2.0, help="seconds between looks with --watch")
     parser.add_argument(
         "--recompute",
         action="store_true",
         help="with --watch on a server's store: do not use the incidents.json the server keeps for the rank; "
-        "read the parts and run the detectors here (slower; gives per-step samples)",
+        "read the parts and run the detectors here (slower; gives per-step samples). One rank at a time: not with "
+        "--rank all",
     )
     parser.add_argument(
         "--report-grace",
@@ -2541,14 +3164,21 @@ def main() -> None:
         default=REPORT_GRACE_SECONDS,
         help="with --watch on a server's store: seconds the server's report may stay behind the stored parts "
         "before it is called stale and the detectors run here (default: 30; a restarted server rebuilds a rank "
-        "from its whole store first, about 6 s for 64 ranks of 10,000 steps)",
+        "from its whole store first, about 6 s for 64 ranks of 10,000 steps). With --rank all it is kept for each "
+        "rank, and a stale rank is listed as unknown instead",
     )
     parser.add_argument(
         "--rank",
-        type=int,
-        help="the rank to read (default: rank 0 for a directory holding several ranks)",
+        type=_rank_argument,
+        help="the rank to read (default: rank 0 for a directory holding several ranks), or 'all' for the all-ranks "
+        "view of a run folder in a server's store (runs/<run_id>): one evidence file for every rank, taken from "
+        "each rank's incidents.json and the run's watchdog.json, with identical incidents grouped across ranks and "
+        "ranks whose report is not current listed as unknown. It reads no part and runs no detector, so it works "
+        "with or without --watch (one look without) and cannot be combined with --recompute, --top-k or --rerun; "
+        "its default output is <run_id>.all-ranks.evidence.json",
     )
-    parser.add_argument("--rerun", type=Path, help="optional path to write a Rerun .rrd file")
+    parser.add_argument("--rerun", type=Path, help="optional path to write a Rerun .rrd file "
+                        "(one rank's steps: not with --rank all)")
     parser.add_argument(
         "--flight-recorder",
         type=Path,
@@ -2575,12 +3205,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.rank == ALL_RANKS:
+        _main_all_ranks(args, parser)
+        return
     rank = args.rank
     announced_rank = False
     if rank is None and args.input.is_dir() and len(list(args.input.glob("rank=*"))) > 1:
         rank = 0  # the detectors read one rank's steps
         announced_rank = True
-        print("several ranks here; reading rank 0 (choose another with --rank)")
+        print("several ranks here; reading rank 0 (choose another with --rank N, or every rank with --rank all)")
     if args.watch:
         if args.rerun is not None:
             parser.error("--rerun cannot be combined with --watch")
@@ -2590,7 +3223,7 @@ def main() -> None:
             nonlocal announced_rank
             if args.rank is None and not announced_rank and len(_rank_dirs(args.input)) > 1:
                 announced_rank = True
-                print("several ranks here; reading rank 0 (choose another with --rank)")
+                print("several ranks here; reading rank 0 (choose another with --rank N, or every rank with --rank all)")
             summary = incident_summary(evidence)
             if [summary] != shown:
                 shown[:] = [summary]
