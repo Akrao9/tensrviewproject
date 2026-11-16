@@ -250,7 +250,7 @@ python -m pip install -e .
 python -m torch.distributed.run --standalone --nproc-per-node=2 examples/replica_check.py
 ```
 
-Mark this complete when both NCCL ranks report `PASS`. Each rank checks healthy replicas at steps 0 and 2, injected drift at step 1, and a sign flip at step 3.
+Add `--out runs/replica` to keep each rank's records as `runs/replica/replica-check.rank<N>.jsonl`; without it they stay in memory. Mark this complete when both NCCL ranks report `PASS`. Each rank checks healthy replicas at steps 0 and 2, injected drift at step 1, and a sign flip at step 3.
 
 The check passes `replica_every=1`. In a training job the drift check runs every 50 steps by default (`replica_every=`), as Megatron's `check_weight_hash_across_dp_replicas_interval` does: each check reads every weight in float64 and gathers 24 bytes per parameter tensor from every rank, and a float64 norm-and-sum pass over Granite's weights cost about 3.7 ms on the RTX PRO 6000 (measured before the projection was added). The seeded projection (Nov 15, 2026) took about seven times the norm and sum on CPU (3.7 s against 0.5 s for 24 bf16 4096×4096 tensors; peak extra memory about 36 MB, measured in a fresh process); its GPU cost is not measured. `replica_projection=False` drops it. Until Nov 14, 2026 it ran on every step.
 

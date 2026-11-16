@@ -3,6 +3,7 @@
 import argparse
 import os
 from datetime import timedelta
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -14,6 +15,7 @@ import tensorquill
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cpu", action="store_true", help="use Gloo instead of CUDA/NCCL")
+    parser.add_argument("--out", type=Path, help="also keep each rank's records, as <out>/replica-check.rank<N>.jsonl")
     args = parser.parse_args()
     if int(os.environ.get("WORLD_SIZE", "0")) != 2:
         parser.error("launch with torchrun --standalone --nproc-per-node=2")
@@ -37,15 +39,22 @@ def main() -> None:
             model.weight.copy_(torch.arange(1.0, 5.0))
         ddp = DDP(model, device_ids=device_ids)
         optimizer = torch.optim.SGD(ddp.parameters(), lr=0)
-        sink = tensorquill.MemorySink()
+        capture = args.out / f"replica-check.rank{rank}.jsonl" if args.out else None
+        if capture is not None:
+            capture.parent.mkdir(parents=True, exist_ok=True)
+            if capture.exists():
+                parser.error(f"{capture} exists; choose a new --out")
+        sink = tensorquill.JsonlSink(capture) if capture is not None else tensorquill.MemorySink()
         x = torch.ones(2, 4, device=device)
 
         with tensorquill.init(
-            model, sink=sink, auto_step=False, replica_group=dist.group.WORLD, replica_every=1
+            model, run_id="replica-check", sink=sink, auto_step=False, replica_group=dist.group.WORLD, replica_every=1
         ) as session:
             for step in range(6):
                 optimizer.zero_grad(set_to_none=True)
-                ddp(x).sum().backward()
+                loss = ddp(x).sum()
+                loss.backward()
+                session.log({"train/loss": loss})
                 optimizer.step()
 
                 with torch.no_grad():
@@ -58,8 +67,9 @@ def main() -> None:
                         model.weight[0, [1, 2]] = model.weight[0, [2, 1]].clone()  # swap two elements
                 session.step(step)
 
-        records = sink.records
+        records = tensorquill.load_records(capture) if capture is not None else sink.records
         assert [record["step"] for record in records] == list(range(6))
+        assert all("train/loss" in record["scalars"] for record in records), "the loss was not recorded"
         for step in (0, 2, 4):
             assert records[step]["replica_spread"]["weight"] == [0.0, 0.0, 0.0]
         drift = tensorquill.detect_replica_drift(records)
@@ -93,6 +103,8 @@ def main() -> None:
             " run mean anything)"
         )
         print(f"PASS {backend} rank {rank}: healthy at 0, 2 and 4, drift at 1, sign flip at 3, swap at 5")
+        if capture is not None:
+            print(f"Capture: {capture}")
     finally:
         dist.destroy_process_group()
 

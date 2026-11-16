@@ -128,10 +128,13 @@ def install_outlier(block: torch.nn.Module, hidden: int, channels: list[int], fa
     return enabled, block.register_forward_hook(hook)
 
 
-def train_step(model, optimizer, batch):
+def train_step(model, optimizer, batch, session=None):
     optimizer.zero_grad(set_to_none=True)
     loss = model(input_ids=batch, labels=batch, use_cache=False).loss
     loss.backward()
+    if session is not None:
+        # Before optimizer.step(), where the step ends. A copy on the device: no sync.
+        session.log({"train/loss": loss})
     optimizer.step()
     return loss.detach()
 
@@ -284,7 +287,7 @@ def main() -> None:
                     if step == args.seed_step:
                         flags[index].fill_(True)
                     begin = timers[index].start()
-                    loss = train_step(runners[index], optimizers[index], batches[step])
+                    loss = train_step(runners[index], optimizers[index], batches[step], session if index == 1 else None)
                     timers[index].stop(step, begin)
                     if step % 10 == 9:
                         losses[index].append((step, loss))

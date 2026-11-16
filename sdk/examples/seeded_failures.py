@@ -361,7 +361,7 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
                     scale.on = True
                 if case == "stalled_weights" and step == args.freeze_step:
                     group["lr"] = 0.0
-                train_step(model, optimizer, batches[step])
+                train_step(model, optimizer, batches[step], session)
     finally:
         if scale is not None:
             scale.remove()

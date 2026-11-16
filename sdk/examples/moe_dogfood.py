@@ -43,12 +43,15 @@ def load_batches(args, batch_count):
     )
 
 
-def train_step(model, optimizer, batch, cuda_graphs):
+def train_step(model, optimizer, batch, cuda_graphs, session=None):
     optimizer.zero_grad(set_to_none=True)
     if cuda_graphs:
         torch.compiler.cudagraph_mark_step_begin()
     loss = model(input_ids=batch, labels=batch, use_cache=False).loss
     loss.backward()
+    if session is not None:
+        # Before optimizer.step(), where the step ends. A copy on the device: no sync.
+        session.log({"train/loss": loss})
     optimizer.step()
     return loss.detach()
 
@@ -180,9 +183,11 @@ def run_comparison(
                 "probe": lambda m: m(input_ids=fixed, use_cache=False),
                 "probe_every": args.probe_every,
             }
-        for model, kwargs in zip(models, init_kwargs_pair):
+        # The captured arm logs its loss, as a real job does, so that cost is in the comparison.
+        sessions = [None, None]
+        for slot, (model, kwargs) in enumerate(zip(models, init_kwargs_pair)):
             if kwargs is not None:
-                stack.enter_context(
+                sessions[slot] = stack.enter_context(
                     tensorquill.init(model, routers=routers, every=FLUSH_EVERY, **probe_kwargs, **kwargs)
                 )
 
@@ -199,7 +204,7 @@ def run_comparison(
         ]
         for index in range(2):
             for batch in batches[: args.warmup]:
-                loss = train_step(runners[index], optimizers[index], batch, args.cuda_graphs)
+                loss = train_step(runners[index], optimizers[index], batch, args.cuda_graphs, sessions[index])
             if not math.isfinite(loss.item()):
                 raise RuntimeError(f"Non-finite warmup loss in {labels[index]}")
 
@@ -211,7 +216,7 @@ def run_comparison(
                 torch.cuda.synchronize()
                 start = time.perf_counter()
                 for batch in batches[args.warmup :]:
-                    loss = train_step(runners[index], optimizers[index], batch, args.cuda_graphs)
+                    loss = train_step(runners[index], optimizers[index], batch, args.cuda_graphs, sessions[index])
                 torch.cuda.synchronize()
                 elapsed = (time.perf_counter() - start) * 1000 / args.steps
                 times[index].append(elapsed)
