@@ -203,7 +203,7 @@ def judge_grad_spike(
         return Verdict("grad_spike", False, f"no grad_spike incident (gradient of {seeded} x{factor:g} from step {seed_step})", notes)
     names = [p["name"] for p in incident["parameters"]]
     where = f"step {incident['step']} (ratio {incident['ratio']:.1f}), seeded from step {seed_step}"
-    notes.append(f"incident lists {len(names)} parameter(s): {names[:5]}{' ...' if len(names) > 5 else ''}")
+    notes.append(f"incident lists {len(names)} parameter(s): {names}")
     if len(incident.get("spike_steps", [])) > 1:
         notes.append(f"{incident['spike_count']} spike steps in all, first {incident['spike_steps'][:6]}")
     if not seed_step <= incident["step"] <= seed_step + window:
@@ -265,7 +265,7 @@ def judge_stalled_weights(
         f" ({incident['with_gradients']} with a gradient)"
     )
     if extras:
-        notes.append(f"besides the seeded one: {extras[:6]}{' ...' if len(extras) > 6 else ''}")
+        notes.append(f"besides the seeded one ({len(extras)}): {extras}")
     optimizer = incident.get("optimizer", {})
     notes.append(
         f"optimizer evidence: {optimizer.get('state')}, {optimizer.get('not_held_count', 0)} stalled parameter(s) not held"
