@@ -284,3 +284,14 @@ def test_the_seeded_gpu_probes_give_the_same_incidents_in_the_server(tmp_path):
     document = stream.send(records)
     assert tsd.differences(expected, document["incidents"]) == []
     assert stream.server.terminate() == 0
+
+
+def test_the_baseline_is_the_last_probes_so_a_slow_drift_is_not_a_collapse():
+    # 0.8 for five probes, then 0.42 (0.525 times: not a collapse, so it joins the baseline),
+    # then 0.3. Against the last five probes (0.42) that is 0.71 times; against the whole run's
+    # median (0.61) it would be 0.49 times, a collapse.
+    share = lambda i: (0.8 if i < 5 else 0.42 if i < 10 else 0.3, 10.0)
+    assert kinds(probe_run({"a": share}, 13)) == []
+    # A long steady run is judged against ATTN_WINDOW probes, not all of them.
+    found = ev.detect_attention_anomalies(probe_run({"a": lambda i: (0.15 if i >= 9 else 0.4, 10.0)}, 11))
+    assert found[0]["modules"][0]["baseline_probes"] == ev.ATTN_WINDOW
