@@ -329,11 +329,11 @@ Two fixes came out of it, with identical output on 29 healthy and faulted runs, 
 
 | Where | Kinds |
 | --- | --- |
-| `runs/<run_id>/rank=<rank>/incidents.json` | `moe_imbalance`, `starved_experts`, `grad_spike`, `stalled_weights`, `repeated_steps`, `loss_scale_trouble`, `resume_lr_change`, `activation_spike`, `activation_drift`, `dead_activations`, `non_finite`, `replica_drift` |
-| `incidents` in `runs/<run_id>/watchdog.json` | `job_stalled`, `rank_silent` |
-| Python only | `collective_hang`, `collective_desync`, `traincheck_violation` |
+| `runs/<run_id>/rank=<rank>/incidents.json` | `moe_imbalance`, `starved_experts`, `grad_spike`, `stalled_weights`, `repeated_steps`, `loss_scale_trouble`, `resume_lr_change`, `resume_data_mismatch`, `resume_incomplete`, `data_stalled`, `epoch_order_repeated`, `activation_spike`, `activation_drift`, `dead_activations`, `attention_collapse`, `attention_uniform`, `attention_logit_growth`, `non_finite`, `memory_growth`, `memory_pressure`, `allocator_retries`, `hardware_errors`, `gpu_throttled`, `input_starvation`, `replica_drift` (Nov 16, 2026: the data, checkpoint, attention and system kinds added) |
+| `incidents` in `runs/<run_id>/watchdog.json` | `job_stalled`, `rank_silent`, `duplicate_batches` (cross-rank), plus the `run_state` |
+| Python only | `collective_hang`, `collective_desync`, `traincheck_violation`, `memory_imbalance` (cross-rank, in `--rank all`) |
 
-The last three stay in Python because their sources never reach the server: PyTorch's Flight Recorder dumps are pickles on the training nodes, read by PyTorch's own analyzer, and TrainCheck writes its results where it ran.
+The first three Python-only kinds stay in Python because their sources never reach the server: PyTorch's Flight Recorder dumps are pickles on the training nodes, read by PyTorch's own analyzer, and TrainCheck writes its results where it ran. `memory_imbalance` compares ranks, and the server's detectors see one rank at a time; it reads the `memory` summary the server writes into each rank's `incidents.json`. The timings below were taken with the first twelve kinds and have not been repeated with the thirteen added on Nov 16, 2026.
 
 - **What it writes.** After each part is stored and acknowledged, the server reads that part's rows and rewrites the rank's `incidents.json`: the incidents in the shape and order `build_evidence` gives them, `last_step` (detection has run through here), the kinds `checked`, `not_checked` (in the shape of the same list in `evidence.json`: the two sources the server does not have, and each resume whose learning rate could not be compared), the thresholds applied, `moe_flagged` (how many router samples had an overloaded or dead expert and the last step one did, which says whether an imbalance is still going on), and `rebuilds`. It holds no per-step samples: those stay in the Parquet parts, so the file stays a few KB however long the run is. `--no-detect` turns it off. The watchdog status carries its verdict as an `incidents` list as well, rewritten whenever the status changes, so a stall shows there although no part arrives. `python -m tensorquill --watch` reads both (see [Watching a run the server is judging](#watching-a-run-the-server-is-judging)); without `--watch` the command works the incidents out itself from the parts.
 - **Only stored rows are judged**, so the file can always be rebuilt from the store. After a server restart, on every new attempt, and whenever an older attempt's rows arrive late, the rank's state is rebuilt from all of its stored parts with the same attempt rules as `load_records`. That replay also reads the rows a later attempt rolled back: `repeated_steps` and `resume_lr_change` compare a new attempt with what it replaced. The step numbers and learning rates it needs for that are held only while the replay runs. A detector error or panic is logged and never fails a flush.
@@ -422,6 +422,66 @@ After a restart, specifically:
 Limits: the watcher judges freshness by the newest attempt only, so a part of an older attempt that arrived late and was not judged goes unnoticed; a NaN or Inf logged value prints as "not finite" (it is `null` in the server's file); `job_stalled` and `rank_silent` carry no logged scalars when they come from the status; and one rank is watched per command unless `--rank all` is used. [`tests/test_server_reports.py`](tests/test_server_reports.py) (12 tests) produces each state with the real server. Twenty-two deliberate changes to the reader's rules each fail it.
 
 **All ranks at once.** `python -m tensorquill <store>/runs/<run_id--rank all --watch` (and `watch(run_folder, rank="all")`) keeps one evidence file for a run with several `rank=N` folders, `<run_id>.all-ranks.evidence.json`, in a shape of its own (`"view": "all_ranks"`, `"view_version": 1`; no `schema_version`, `incidents` or `samples`, so the per-rank shape is never mistaken for it). A look reads each rank's `incidents.json` and newest part name, and the run's `watchdog.json`, and nothing else: 34 ms for 64 ranks of 10,000 steps, 102 ms at 50,000, on an 8-core laptop. A rank counts for or against incidents only while its report is `current`; `behind`, `stale`, `missing`, `unreadable`, `unusable`, `other_thresholds` and `nothing_stored` are *unknown*, with the reason, and never in the list of ranks with no incidents. Each rank has its own wait (`--report-grace`). Incidents with the same kind, step and named layers, experts, parameters or modules are one group naming the ranks ("0-63"); those that differ are listed with their ranks, and an incident on one rank is named with that rank alone. A group carries one incident (the first rank's) and says whether the others' numbers differ. The text summary gives what is common to all judged ranks, what only some show, the ranks with none, and the unknown ranks; stalls and silent ranks (`job_stalled`, `rank_silent`) are in `run_incidents` once for the run. Ranks are the `rank=N` folders, the status's ranks and `world_size`, so a rank that never stored anything is `nothing_stored`, and after a restart a rank that has not reconnected is still judged from the store. The file is replaced by rename only when a rank's report, a rank's state, the set of ranks or the status changed. No part is read and no detector runs here, so `--recompute`, `--top-k` and `--rerun` are refused with `--rank all` (use `--rank N`); without `--watch` it makes one look. Limits: a rank is called stale only after `--report-grace` and a blip inside it is not written; `stored_last_step` of an unknown rank is as of the last write; a rank is judged against its own store, so ranks at very different steps are all `current` (the spread is in `last_step` and in the status's `stream` entries and `rank_silent`); numbers differing between ranks are in each rank's own `incidents.json`, not copied.
+
+## Data progress and checkpoints
+
+Built Nov 16, 2026, on CPU; no GPU run yet. Both are opt-in.
+
+- **Data.** Iterate `session.watch_loader(loader)` instead of `loader` to record which samples each step drew (a 64-bit BLAKE2b of their indices, never the samples) and the sampler's epoch. For an `IterableDataset` pass `ids=lambda batch: batch["id"]`; `session.data(...)` records them by hand. Measured on CPU: 4 µs per batch of 32 indices, 48 µs per 1,024.
+- **Checkpoints.** Call `session.checkpoint(state)` with the dict you pass to `torch.save`, and `session.checkpoint(state, event="load")` with the one you resume from, before the first step; pass `start_step=` as for any resume. The Lightning, `Trainer` and Accelerate adapters record checkpoints themselves; none of them turns the loader hook on.
+- **What is reported.**
+  - `epoch_order_repeated`: an epoch in the previous epoch's order (`set_epoch` not called).
+  - `data_stalled`: steps advance without new data.
+  - `duplicate_batches`: two ranks drew the same batch (in `watchdog.json`, compared across ranks).
+  - `resume_data_mismatch`: a resume repeated or skipped data.
+  - `resume_incomplete`: a resume did not restore a component (optimizer state, scheduler, scaler, RNG). The last two are observations, judged at a resume's first step as `resume_lr_change` is.
+- `python examples/data_checkpoint_check.py` shows all of it on CPU.
+- **Limits.**
+  - A save made just after a flush is recorded with the next step and is lost if the process ends first.
+  - Per-epoch schedulers trip the scheduler check (they count epochs).
+  - Lightning saves no RNG state by default, so its resumes list `rng` missing.
+  - The server compares duplicates only among ranks it has read since it started, within each rank's last 4,096 hashed steps.
+  - Wrapping the loader before handing it to Lightning or the `Trainer` is untested.
+
+## Attention rules and run state
+
+Built Nov 16, 2026.
+
+- **Attention rules.** With `probe=`, three kinds are read from the probe's records, in Python and in the server:
+  - `attention_collapse`: a block's mean attention-entropy share at most half its own baseline.
+  - `attention_uniform`: the share risen to 0.98 or more, at least 0.2 above its baseline (attention that had structure spread evenly over every key).
+  - `attention_logit_growth`: the largest pre-softmax logit at least twice its baseline.
+
+  A block's baseline is the median of its last five probes that met no rule. A change must hold on two probes in a row and is dated at the first. With the default `probe_every=1000` nothing can be reported before the 4,000th step, and `not_checked` says so until then.
+
+  Calibrated on the recorded SmolLM2-360M seeds (the blocks after the seed go uniform, 0.23 to 1.00, or collapse, 0.30 to 0.05) and on small models trained from scratch on CPU. The logit rule's margin is thin: healthy training moved the largest logit 1.7×, and the rule needs 2.0×. Nothing about MoE models was calibrated (the Granite captures have no probe records). `probe_json` now keeps the model's module order.
+- **Run state.** `evidence.json`, the all-ranks file and the server's `watchdog.json` carry `run_state`; the worst reason wins, and each reason is listed with a stable `code`:
+  - `healthy`: every expected source is current and no incident is listed.
+  - `degraded`: an optional monitor is unavailable (anything in `not_checked`, or no `watchdog.json`, as for a `.jsonl` read alone).
+  - `unknown`: required evidence is stale or missing (no steps judged, a server report that is not current, a rank without a current report or not yet connected under `world_size`, an old status, a stopped server, a status this version does not know).
+  - `unhealthy`: an incident is listed.
+
+  The CLI and `--watch` print it as `Run state: ...`. Incidents are never closed, so a run stays unhealthy once one is found, and observations such as `resume_lr_change` or `memory_imbalance` count as incidents until kinds are labelled. A `watchdog.json` that is no longer being rewritten says nothing about now: read its age (`written_at_ms`, `refresh_seconds`) before its `run_state`.
+
+## GPU memory, NVML and data wait
+
+Built Nov 16, 2026, tested with mocked CUDA and NVML; the GPU side waits for a Colab run.
+
+- **Memory and NVML.** `tensorquill.init(model, system=True)` records, at each flush, the CUDA allocator's counters (`allocated`, `reserved`, `peak_allocated`, `alloc_retries`, `ooms`). With `pip install "tensorquill[nvml]"` it also records NVML's temperature, SM clock, power, ECC counts, throttle reasons and Xid events, read on the writer thread. Both go into `system` on the flush's last record. Reading them never waits for the GPU. A reading that cannot be taken is written once as unavailable and listed in `not_checked`. It is off by default until its GPU cost is measured.
+- **Data wait.** `data_wait=True` records `data_wait` and `step_time` per step: the host time spent fetching batches, never the move to the device. It is on in the Hugging Face, Lightning and Accelerate adapters, at +0.5 µs per batch on CPU. For a loader that is not a PyTorch `DataLoader`, use `for batch in session.time_data(loader):` and move the batch to the device inside the loop.
+- **What is reported.**
+  - `memory_growth`: allocated memory rose at six readings in a row, by at least 5% and 64 MiB.
+  - `memory_pressure`: reserved memory at 95% or more of the device total.
+  - `allocator_retries`: allocator retries or caught OOMs.
+  - `hardware_errors`: uncorrectable ECC or Xid events, as evidence about the node.
+  - `gpu_throttled`: thermal or power-brake throttling, an observation; the power cap alone is never reported.
+  - `input_starvation`: over 20 steps, the median share of step time spent waiting for data is 0.3 or more, or has risen 0.2 above the first window's.
+  - `memory_imbalance`, in `--rank all` only: one rank's peak allocated memory is 1.25× the median and 1 GiB above it.
+- **Limits.**
+  - Only the session's device is read, so a model spread over several GPUs in one process gets one device's memory.
+  - Throttling between flushes is missed.
+  - A hung NVML call blocks the writer thread and, once its queue fills, training.
+  - Only PyTorch's `DataLoader` iterator and `time_data` are timed.
 
 ## Things to know
 

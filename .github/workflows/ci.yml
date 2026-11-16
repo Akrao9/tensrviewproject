@@ -69,7 +69,7 @@ jobs:
       - name: Install
         run: |
           pip install "torch==2.14.*" --index-url https://download.pytorch.org/whl/cpu
-          pip install -e ".[dev,lightning,huggingface,rerun,flight]"
+          pip install -e ".[dev,lightning,huggingface,rerun,flight,nvml]"
       - name: Tests
         run: pytest -ra
       - name: Gate 1 fixtures through the SDK pipeline
@@ -108,7 +108,7 @@ jobs:
           TENSORQUILL_SERVER_BIN: ${{ github.workspace }}/server/target/debug/tensorquill-server
         run: |
           test -x "$TENSORQUILL_SERVER_BIN"
-          pytest -ra tests/test_flight.py tests/test_flight_e2e.py tests/test_two_ranks_e2e.py tests/test_server_detectors.py tests/test_server_reports.py tests/test_watch_all_ranks.py tests/test_object_store_e2e.py
+          pytest -ra tests/test_flight.py tests/test_flight_e2e.py tests/test_two_ranks_e2e.py tests/test_server_detectors.py tests/test_server_reports.py tests/test_watch_all_ranks.py tests/test_object_store_e2e.py tests/test_data_server.py tests/test_attention.py tests/test_run_state.py
 
   package:
     # New and never run on Linux: it may need a fix on its first run, so it does not fail the workflow yet.
