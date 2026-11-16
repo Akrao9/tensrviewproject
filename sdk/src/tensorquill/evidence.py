@@ -858,7 +858,8 @@ def detect_attention_anomalies(
     One incident per kind: the step of the first probe, the probe that confirmed it, the
     modules whose run started there (in the probe's order, at most ATTN_MODULES), how many,
     and how many probes were part of a confirmed run in all. With probes but too few for any
-    module to be judged and confirmed, `not_checked` gets an `attention` entry saying so.
+    module to be judged and confirmed, `not_checked` gets an `attention` entry saying so, and
+    a `probe` entry when any probe failed (`{"error": ...}` in place of its results).
     """
     shares: dict[str, _AttentionSeries] = {}
     logits: dict[str, _AttentionSeries] = {}
@@ -867,8 +868,15 @@ def detect_attention_anomalies(
     probe_steps: list[int] = []
     most = 0  # the most probes any module has been seen on
     seen: dict[str, int] = {}
+    asked, failed, first_failure = 0, 0, None
     for record in sorted(records, key=lambda r: r["step"]):
         probe = record.get("probe")
+        if isinstance(probe, dict):
+            asked += 1
+            if "error" in probe:
+                failed += 1
+                if first_failure is None:
+                    first_failure = (int(record["step"]), probe["error"])
         attention = probe.get("attention") if isinstance(probe, dict) and "error" not in probe else None
         if not isinstance(attention, dict) or not attention:
             continue
@@ -941,6 +949,17 @@ def detect_attention_anomalies(
             "reason": f"{most} probe{'s' if most != 1 else ''} recorded attention; a layer is judged against its own"
                       f" first {ATTN_MIN_HISTORY} and a change must hold on {ATTN_SUSTAIN} probes in a row, so"
                       f" {needed} are needed",
+        })
+    if not_checked is not None and first_failure is not None:
+        # A probe that failed leaves its step unjudged, and a rule that must hold on probes
+        # in a row may have missed a change there.
+        step, error = first_failure
+        not_checked.append({
+            "check": "probe",
+            "kinds": list(ATTN_KINDS),
+            "reason": f"{failed} of {asked} probe{'s' if asked != 1 else ''} failed, the first at step {step}:"
+                      f" {error if isinstance(error, str) else json.dumps(error)}",
+            "step": step,
         })
     return [found[kind] for kind in ATTN_KINDS if kind in found]
 
@@ -1382,6 +1401,230 @@ def with_classes(incidents: Iterable[dict[str, Any]]) -> None:
         incident.update(items)
 
 
+# --- What was checked ----------------------------------------------------------------------
+#
+# `evidence["kind_checks"]` gives every incident kind one of three values, so that "no
+# incidents" can be read against what could have been found:
+#   checked         records carried the kind's inputs and its rule ran over them (or the file
+#                   it is read from was given and read)
+#   not_configured  the capture was never set up to provide them: no record carries the
+#                   input, or the file was not given. Nothing is said about the kind, and
+#                   nothing is wrong with the monitoring
+#   unavailable     the inputs were asked for and could not be judged: a `not_checked` entry
+#                   names the kind (a probe that failed, a reading that could not be taken,
+#                   too few probes to judge, a resume that could not be compared, a file
+#                   that could not be read), or a server stores the run and its progress
+#                   status is missing
+# Only `unavailable` makes a run `degraded` (see `run_state`).
+KIND_CHECK_VALUES = ("checked", "not_configured", "unavailable")
+# What each count of `input_counts` counts, as an evidence file names it under `needs`.
+INPUT_NEEDS: dict[str, str] = {
+    "moe": "moe: a router's expert counts",
+    "grad_total": "grad_norm or clip_grad_norm",
+    "weight_check": "weights_unchanged with grad_norms (full capture)",
+    "steps": "step records",
+    "loss_scale": "step_skipped (scaler=)",
+    "lr": "lr",
+    "data": "data (session.watch_loader)",
+    "checkpoint": "checkpoint",
+    "layers": "layers (full capture)",
+    "attention": "probe with attention (probe=)",
+    "numbers": "layers, grad_norm, clip_grad_norm or grad_norms",
+    "replica_spread": "replica_spread (replica_group=)",
+    "cuda": "system.cuda (system=True)",
+    "nvml": "system.nvml (system=True)",
+    "data_wait": "data_wait with step_time (data_wait=True)",
+}
+# The input each of the server's kinds is judged from. `KIND_INPUTS` in server/src/detect.rs
+# must be this table, and test_kind_checks.py holds the two identical.
+KIND_INPUTS: dict[str, str] = {
+    "moe_imbalance": "moe", "starved_experts": "moe", "grad_spike": "grad_total", "stalled_weights": "weight_check",
+    "repeated_steps": "steps", "loss_scale_trouble": "loss_scale", "resume_lr_change": "lr",
+    "resume_data_mismatch": "data", "resume_incomplete": "checkpoint", "data_stalled": "data",
+    "epoch_order_repeated": "data", "activation_spike": "layers", "activation_drift": "layers",
+    "dead_activations": "layers", "attention_collapse": "attention", "attention_uniform": "attention",
+    "attention_logit_growth": "attention", "non_finite": "numbers", "replica_drift": "replica_spread",
+    "memory_growth": "cuda", "memory_pressure": "cuda", "allocator_retries": "cuda", "hardware_errors": "nvml",
+    "gpu_throttled": "nvml", "input_starvation": "data_wait",
+}
+# The kinds a `not_checked` entry stands for when it lists none itself (`kinds`).
+_CHECK_KINDS: dict[str, tuple[str, ...]] = {
+    "resume_lr": ("resume_lr_change",),
+    "resume_data": ("resume_data_mismatch",),
+    "resume_state": ("resume_incomplete",),
+    "attention": ATTN_KINDS,
+    "probe": ATTN_KINDS,
+    "flight_recorder": ("collective_hang", "collective_desync"),
+    "traincheck": ("traincheck_violation",),
+}
+_STATUS_NEEDS = "the server's progress status (watchdog.json)"
+_NO_STATUS = "no progress status (the server's watchdog.json): whether the job is still making progress is not checked"
+
+
+def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+    """How many of these records carry each input the server's kinds are judged from
+    (`INPUT_NEEDS`). Give the records that count (`load_records` without `all_attempts`).
+
+    "Carries" means the field holds something a rule reads: an empty `layers` or
+    `grad_norms` does not count, an empty `weights_unchanged` does (a weight check that
+    found every parameter changed), and a probe that failed carries no attention.
+    """
+    counts = dict.fromkeys(INPUT_NEEDS, 0)
+    for record in records:
+        counts["steps"] += 1
+        moe = record.get("moe")
+        if isinstance(moe, Mapping) and any(sum(int(c) for c in router) > 0 for router in moe.values()):
+            counts["moe"] += 1
+        total = record.get("grad_norm") is not None or record.get("clip_grad_norm") is not None
+        norms, layers = bool(record.get("grad_norms")), bool(record.get("layers"))
+        counts["grad_total"] += total
+        counts["weight_check"] += record.get("weights_unchanged") is not None and norms
+        counts["loss_scale"] += record.get("step_skipped") is not None
+        counts["lr"] += _lr_values(record) is not None
+        counts["data"] += isinstance(record.get("data"), Mapping)
+        counts["checkpoint"] += isinstance(record.get("checkpoint"), Mapping)
+        counts["layers"] += layers
+        probe = record.get("probe")
+        counts["attention"] += (
+            isinstance(probe, dict) and "error" not in probe
+            and isinstance(probe.get("attention"), dict) and bool(probe["attention"])
+        )
+        counts["numbers"] += layers or total or norms
+        counts["replica_spread"] += bool(record.get("replica_spread"))
+        system = record.get("system")
+        for part in ("cuda", "nvml"):
+            counts[part] += isinstance(system, dict) and isinstance(system.get(part), dict)
+        wait, took = _finite_number(record.get("data_wait")), _finite_number(record.get("step_time"))
+        counts["data_wait"] += wait is not None and took is not None and took > 0 and wait >= 0
+    return counts
+
+
+def _finite_number(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else None
+
+
+def _kinds_not_checked(not_checked: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    """Each kind a `not_checked` entry names, with the first entry that names it."""
+    named: dict[str, Mapping[str, Any]] = {}
+    for item in not_checked:
+        if not isinstance(item, Mapping):
+            continue
+        kinds = item.get("kinds")
+        if not isinstance(kinds, (list, tuple)):
+            kinds = _CHECK_KINDS.get(str(item.get("check")), ())
+        for kind in kinds:
+            named.setdefault(str(kind), item)
+    return named
+
+
+def _unavailable(entry: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
+    return {"value": "unavailable", **extra, "check": entry.get("check"), "reason": entry.get("reason")}
+
+
+def kind_checks(counts: Mapping[str, int], not_checked: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """The value of each of the server's kinds (`KIND_INPUTS`), from how many records carried
+    its input (`input_counts`) and the checks that could not be made.
+
+    A kind a `not_checked` entry names is `unavailable`, with that entry's `check` and
+    `reason`, however many records carried its input: a probe that failed once leaves a
+    step unjudged, as one failed memory reading does. Otherwise it is `checked` when any
+    record carried the input and `not_configured` when none did. `tensorquill-server`
+    gives the same object in its report (`kind_checks`).
+    """
+    named = _kinds_not_checked(not_checked)
+    checks: dict[str, dict[str, Any]] = {}
+    for kind, counter in KIND_INPUTS.items():
+        records, needs = int(counts.get(counter, 0)), INPUT_NEEDS[counter]
+        if kind in named:
+            checks[kind] = _unavailable(named[kind], records=records, needs=needs)
+        else:
+            checks[kind] = {"value": "checked" if records > 0 else "not_configured", "records": records, "needs": needs}
+    return checks
+
+
+def other_kind_checks(
+    *,
+    status: Mapping[str, Any] | None,
+    status_expected: bool,
+    not_checked: Iterable[Mapping[str, Any]],
+    flight_recorder: bool,
+    traincheck: bool,
+) -> dict[str, dict[str, Any]]:
+    """The value of each kind that is not read from one rank's step records.
+
+    - `job_stalled` and `rank_silent` come from the server's progress status: `checked`
+      when one was read; `unavailable` when one was expected (`status_expected`: the run is
+      in a server's store, or a status was named) and there is none; `not_configured` for a
+      local file no server was watching.
+    - `collective_hang`, `collective_desync` and `traincheck_violation` come from files:
+      `checked` when the file was given (`flight_recorder`, `traincheck`) and read,
+      `unavailable` when it could not be read, `not_configured` when it was not given.
+    - `duplicate_batches` and `memory_imbalance` compare ranks, which one rank's evidence
+      cannot: `not_configured` here. The all-ranks view (`--rank all`) judges them.
+    """
+    named = _kinds_not_checked(not_checked)
+    checks: dict[str, dict[str, Any]] = {}
+    for kind in ("job_stalled", "rank_silent"):
+        if status is not None:
+            checks[kind] = {"value": "checked", "needs": _STATUS_NEEDS}
+        elif status_expected:
+            checks[kind] = _unavailable({"check": "status", "reason": _NO_STATUS}, needs=_STATUS_NEEDS)
+        else:
+            checks[kind] = {"value": "not_configured", "needs": _STATUS_NEEDS}
+    for given, needs, kinds in (
+        (flight_recorder, "PyTorch Flight Recorder dumps (flight_recorder=)", ("collective_hang", "collective_desync")),
+        (traincheck, "TrainCheck results (traincheck=)", ("traincheck_violation",)),
+    ):
+        for kind in kinds:
+            if kind in named:
+                checks[kind] = _unavailable(named[kind], needs=needs)
+            else:
+                checks[kind] = {"value": "checked" if given else "not_configured", "needs": needs}
+    for kind in ("duplicate_batches", "memory_imbalance"):
+        checks[kind] = {"value": "not_configured", "needs": "every rank's report (--rank all)"}
+    return checks
+
+
+def checked_counts(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+    """How many kinds have each value in an evidence file's `kind_checks`, with the names of
+    the unavailable ones: `{"kinds", "checked", "not_configured", "unavailable", "unavailable_kinds"}`.
+    None for evidence without the key. `kinds` is every kind this version knows (32)."""
+    checks = evidence.get("kind_checks")
+    if not isinstance(checks, Mapping):
+        return None
+    of = {value: [kind for kind in INCIDENT_CLASSES if isinstance(checks.get(kind), Mapping)
+                  and checks[kind].get("value") == value] for value in KIND_CHECK_VALUES}
+    return {"kinds": len(INCIDENT_CLASSES), **{value: len(kinds) for value, kinds in of.items()},
+            "unavailable_kinds": of["unavailable"]}
+
+
+def kinds_by_value(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+    """An evidence file's `kind_checks` by value, for a reader who wants names and not every
+    entry: the kinds `checked`, the kinds `not_configured`, and for each `unavailable` kind
+    the reason. None for evidence without the key."""
+    checks = evidence.get("kind_checks")
+    if not isinstance(checks, Mapping):
+        return None
+    listed = [(kind, check) for kind, check in checks.items() if isinstance(check, Mapping)]
+    return {
+        "checked": [kind for kind, check in listed if check.get("value") == "checked"],
+        "not_configured": [kind for kind, check in listed if check.get("value") == "not_configured"],
+        "unavailable": {kind: check.get("reason") for kind, check in listed if check.get("value") == "unavailable"},
+    }
+
+
+def checked_line(evidence: Mapping[str, Any]) -> str | None:
+    """`9 of 32 kinds checked, 21 not configured, 2 unavailable (...)`, for the summary; None
+    for evidence that does not say what was checked."""
+    counts = checked_counts(evidence)
+    if counts is None:
+        return None
+    line = f"{counts['checked']} of {counts['kinds']} kinds checked, {counts['not_configured']} not configured"
+    if counts["unavailable"]:
+        line += f", {counts['unavailable']} unavailable ({', '.join(counts['unavailable_kinds'])})"
+    return line
+
+
 # How long a watcher waits for the server's report to cover the newest stored part before
 # it calls the report stale and works the incidents out itself. Measured with 64 ranks on an
 # 8-core laptop: the report followed a part by 0.1 ms at the median and 77 ms at worst, and
@@ -1642,8 +1885,10 @@ def _report_evidence(
 #
 # `evidence["run_state"]`: one word for the whole picture, with every reason behind it.
 #   healthy    every expected source is current and no invariant or anomaly is listed
-#   degraded   an optional monitor is unavailable (a check listed in `not_checked`, or no
-#              progress status at all, so stalls are not watched)
+#   degraded   a kind is `unavailable` (see "What was checked"): a check listed in
+#              `not_checked`, or no progress status where one is expected, so stalls are not
+#              watched. A kind that is `not_configured` does not degrade a run: a local
+#              file that no server was watching has no status to miss
 #   unknown    required evidence is stale or missing: no steps judged, a server report that is
 #              not current, ranks without a current report, an old status, a stopped server,
 #              or a status summary other than `active` or `finished` (a stall among them: the
@@ -1672,11 +1917,15 @@ def run_state(
     detection: Mapping[str, Any] | None = None,
     unknown_ranks: Mapping[int, str] | None = None,
     judged_ranks: Iterable[int] = (),
+    status_expected: bool = True,
 ) -> dict[str, Any]:
     """The run's state from what the evidence holds: `{"state", "reasons"}`.
 
     `status` is the server's whole `watchdog.json` (None when there is none) and `status_age`
-    how long ago it was last written when that is too long (`_status_age`). `detection` is the
+    how long ago it was last written when that is too long (`_status_age`). A missing status
+    is the reason `no_status` (degraded) only when one is expected (`status_expected`): for a
+    local file that no server was watching, the stall kinds are not configured and the
+    missing status is no reason at all. `detection` is the
     evidence's `detection` (where the incidents came from), `unknown_ranks` the ranks whose
     reports are not current with why and `judged_ranks` those that are (the all-ranks view).
     A rank the status expects (`missing_ranks`, or below `world_size`) that is neither listed in
@@ -1717,8 +1966,8 @@ def run_state(
                                f" a current report ({_rank_ranges(ranks, 8)}): nothing is said about incidents on"
                                " them", ranks=ranks))
     if status is None:
-        reasons.append(_reason("degraded", "no_status", "no progress status (the server's watchdog.json): whether the"
-                               " job is still making progress is not checked"))
+        if status_expected:
+            reasons.append(_reason("degraded", "no_status", _NO_STATUS))
     else:
         summary = status.get("summary")
         if summary == "server_stopped":
@@ -1754,9 +2003,14 @@ def run_state_line(evidence: Mapping[str, Any]) -> str | None:
 
 def _per_rank_run_state(evidence: Mapping[str, Any], status: Mapping[str, Any] | None,
                         status_age: float | None, steps_judged: bool) -> dict[str, Any]:
+    # Evidence that says what was checked says whether a status was expected at all; without
+    # the key (the server's report read by a watcher) one is, as before.
+    checks = evidence.get("kind_checks")
+    stall = checks.get("job_stalled") if isinstance(checks, Mapping) else None
     return run_state(
         incidents=evidence.get("incidents", ()), steps_judged=steps_judged, status=status, status_age=status_age,
         not_checked=evidence.get("not_checked", ()), detection=evidence.get("detection"),
+        status_expected=not (isinstance(stall, Mapping) and stall.get("value") == "not_configured"),
     )
 
 
@@ -2856,6 +3110,7 @@ def build_evidence(
     samples: list[dict[str, Any]]
     incidents: list[dict[str, Any]]
     not_checked: list[dict[str, Any]]
+    rank_checks: dict[str, dict[str, Any]]
     from_rust: list[dict[str, Any]] | None = None
     if detectors == "rust" and every_attempt:
         from .server_detect import server_report
@@ -2888,6 +3143,16 @@ def build_evidence(
                 f" {[name for _, name in named]}, where these {len(records)} records have the routers {routers}:"
                 " build the server from the same version"
             )
+        rank_checks = report.get("kind_checks")
+        if not isinstance(rank_checks, dict) or any(
+            not isinstance(rank_checks.get(kind), dict) or rank_checks[kind].get("value") not in KIND_CHECK_VALUES
+            for kind in SERVER_KINDS
+        ):
+            raise RuntimeError(
+                "this tensorquill-server does not say what was checked (`kind_checks`, an older one): build it"
+                " from the same version"
+            )
+        rank_checks = {kind: dict(rank_checks[kind]) for kind in SERVER_KINDS}
         from_rust = [dict(incident) for incident in report["incidents"]]
         incidents = [i for i in from_rust if i.get("kind") != "replica_drift"]
         # The server lists these two as not checked in every report, since it never has their
@@ -2937,7 +3202,13 @@ def build_evidence(
         if non_finite_hit is not None:
             incidents.append(non_finite_hit)
         incidents.extend(detect_system_incidents(records, not_checked))
+        rank_checks = kind_checks(input_counts(records), not_checked)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
+    # A status is expected where a server stores the run (a directory of its parts, or one
+    # part) or when one was named. A local file or a list of records has no server to miss.
+    status_expected = watchdog is not None or (
+        isinstance(source, (str, Path)) and (Path(source).is_dir() or Path(source).suffix == ".parquet")
+    )
     stream_incidents = detect_watchdog_incidents(status)
     incidents.extend(stream_incidents)
     last_step = max((int(r["step"]) for r in records), default=0)
@@ -2992,6 +3263,12 @@ def build_evidence(
             "silent_floor_seconds", "critical_seconds",
         ) if k in status}} if status else {}),
     }
+    others = other_kind_checks(
+        status=status, status_expected=status_expected, not_checked=not_checked,
+        flight_recorder=flight_recorder is not None, traincheck=traincheck is not None,
+    )
+    # Every kind, in the order `INCIDENT_CLASSES` lists them.
+    evidence["kind_checks"] = {kind: {**rank_checks, **others}[kind] for kind in INCIDENT_CLASSES}
     evidence["run_state"] = _per_rank_run_state(evidence, status, _status_age(status), steps_judged=bool(records))
     return evidence
 
@@ -3489,7 +3766,9 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
             " would have tolerated them: set the server's --silent-seconds to it or more. This is a measurement of"
             " what happened so far, not a guarantee"
         )
-    notes = [
+    checked = checked_line(evidence)
+    notes = [checked] if checked else []
+    notes += [
         f"Not checked ({item['check']}): {item['reason']}"
         for item in evidence.get("not_checked", ())
         if item["check"] != "resume_lr"

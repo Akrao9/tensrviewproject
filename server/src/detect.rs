@@ -200,6 +200,63 @@ pub fn with_classes(incidents: &mut [Value]) {
     }
 }
 
+/// What each input count counts, as a report names it under `needs`: `INPUT_NEEDS` in
+/// `evidence.py`, which is the reference.
+pub const INPUT_NEEDS: [(&str, &str); 15] = [
+    ("moe", "moe: a router's expert counts"),
+    ("grad_total", "grad_norm or clip_grad_norm"),
+    ("weight_check", "weights_unchanged with grad_norms (full capture)"),
+    ("steps", "step records"),
+    ("loss_scale", "step_skipped (scaler=)"),
+    ("lr", "lr"),
+    ("data", "data (session.watch_loader)"),
+    ("checkpoint", "checkpoint"),
+    ("layers", "layers (full capture)"),
+    ("attention", "probe with attention (probe=)"),
+    ("numbers", "layers, grad_norm, clip_grad_norm or grad_norms"),
+    ("replica_spread", "replica_spread (replica_group=)"),
+    ("cuda", "system.cuda (system=True)"),
+    ("nvml", "system.nvml (system=True)"),
+    ("data_wait", "data_wait with step_time (data_wait=True)"),
+];
+
+/// The input each kind of [`PORTED`] is judged from, in that order: `KIND_INPUTS` in
+/// `evidence.py` (`test_kind_checks.py` holds the two identical).
+pub const KIND_INPUTS: [(&str, &str); 25] = [
+    ("moe_imbalance", "moe"),
+    ("starved_experts", "moe"),
+    ("grad_spike", "grad_total"),
+    ("stalled_weights", "weight_check"),
+    ("repeated_steps", "steps"),
+    ("loss_scale_trouble", "loss_scale"),
+    ("resume_lr_change", "lr"),
+    ("resume_data_mismatch", "data"),
+    ("resume_incomplete", "checkpoint"),
+    ("data_stalled", "data"),
+    ("epoch_order_repeated", "data"),
+    ("activation_spike", "layers"),
+    ("activation_drift", "layers"),
+    ("dead_activations", "layers"),
+    ("attention_collapse", "attention"),
+    ("attention_uniform", "attention"),
+    ("attention_logit_growth", "attention"),
+    ("non_finite", "numbers"),
+    ("replica_drift", "replica_spread"),
+    ("memory_growth", "cuda"),
+    ("memory_pressure", "cuda"),
+    ("allocator_retries", "cuda"),
+    ("hardware_errors", "nvml"),
+    ("gpu_throttled", "nvml"),
+    ("input_starvation", "data_wait"),
+];
+
+/// The kinds a `not_checked` entry stands for when it lists none itself.
+const CHECK_KINDS: [(&str, &str); 3] = [
+    ("resume_lr", "resume_lr_change"),
+    ("resume_data", "resume_data_mismatch"),
+    ("resume_state", "resume_incomplete"),
+];
+
 /// The experts-per-token override: one value for every router, or a value for each router named.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(untagged)]
@@ -998,6 +1055,8 @@ struct Moe {
     /// The per-step samples, when they were asked for. The server never asks: it keeps a
     /// rank's detectors for the whole run, and the samples grow with every step.
     kept: Option<Kept>,
+    /// How many rows had a router with tokens to judge: the `moe` input count.
+    judged_rows: u64,
 }
 
 impl Moe {
@@ -1068,6 +1127,7 @@ impl Moe {
             }
         }
         let mut router_counts: Vec<i64> = Vec::new();
+        let mut judged = false;
         for index in 0..self.routers.len() {
             let Some(entry) = self.present[index] else { continue };
             router_counts.clear();
@@ -1091,6 +1151,7 @@ impl Moe {
                 }
                 continue;
             }
+            judged = true;
             let router = &mut self.routers[index];
             let experts = router_counts.len();
             let recorded = stats.as_ref().and_then(|stats| {
@@ -1178,6 +1239,7 @@ impl Moe {
                 });
             }
         }
+        self.judged_rows += u64::from(judged);
     }
 
     fn incidents(&self, out: &mut Vec<Value>) {
@@ -1864,10 +1926,11 @@ impl<'de> Deserialize<'de> for AttentionStats {
 }
 
 /// What the attention rules read of a probe: its attention modules in order, or nothing when
-/// the probe failed (`error`) or recorded no attention. Histograms and maps are skipped unread.
+/// the probe failed (`error`, kept as it was written) or recorded no attention. Histograms and
+/// maps are skipped unread.
 #[derive(Default)]
 struct Probe<'a> {
-    error: bool,
+    error: Option<Value>,
     attention: Option<Members<'a, AttentionStats>>,
 }
 
@@ -1883,10 +1946,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for Probe<'a> {
                 let mut probe = Probe::default();
                 while let Some(Key(key)) = map.next_key()? {
                     match key.as_ref() {
-                        "error" => {
-                            probe.error = true;
-                            map.next_value::<IgnoredAny>()?;
-                        }
+                        "error" => probe.error = Some(map.next_value()?),
                         // Not an object: the probe is not read at all, as Python skips it.
                         "attention" => probe.attention = Some(map.next_value()?),
                         _ => {
@@ -1946,15 +2006,29 @@ struct Attention {
     /// The probe steps that are part of a confirmed run, per kind.
     affected: [BTreeSet<i64>; 3],
     scratch: Vec<f64>,
+    /// How many rows recorded a probe at all, how many of those failed, and the first
+    /// failure as (step, what it said).
+    asked: u64,
+    failed: u64,
+    first_failure: Option<(i64, String)>,
 }
 
 impl Attention {
     fn row(&mut self, step: i64, columns: &Columns, row: usize, scalars: &mut Scalars) {
         let Some(text) = text(columns.probe, row) else { return };
+        self.asked += u64::from(text.trim_start().starts_with('{'));
         let Ok(probe) = serde_json::from_str::<Probe>(text) else {
             return;
         };
-        let Some(Members(attention)) = probe.attention.filter(|_| !probe.error) else {
+        if let Some(error) = &probe.error {
+            self.failed += 1;
+            if self.first_failure.is_none() {
+                let said = error.as_str().map_or_else(|| error.to_string(), str::to_owned);
+                self.first_failure = Some((step, said));
+            }
+            return;
+        }
+        let Some(Members(attention)) = probe.attention else {
             return;
         };
         if attention.is_empty() {
@@ -2095,6 +2169,23 @@ impl Attention {
                 ),
             })
         })
+    }
+
+    /// The `probe` entry of `not_checked`: probes that failed. A failed probe leaves its
+    /// step unjudged, and a rule that must hold on probes in a row may have missed a change.
+    fn probe_not_checked(&self) -> Option<Value> {
+        let (step, said) = self.first_failure.as_ref()?;
+        Some(json!({
+            "check": "probe",
+            "kinds": ATTN_KINDS,
+            "reason": format!(
+                "{} of {} probe{} failed, the first at step {step}: {said}",
+                self.failed,
+                self.asked,
+                if self.asked == 1 { "" } else { "s" },
+            ),
+            "step": step,
+        }))
     }
 }
 
@@ -2767,6 +2858,52 @@ impl Scalars {
     }
 }
 
+// --- what was checked --------------------------------------------------------------------
+
+/// How many rows carried each input that is read straight from a column: part of
+/// `input_counts` in `evidence.py`. The other counts are kept by the detectors that parse
+/// their input anyway (MoE counts, the probe, the system readings, the loss scaler).
+#[derive(Default)]
+struct Inputs {
+    grad_total: u64,
+    weight_check: u64,
+    lr: u64,
+    data: u64,
+    checkpoint: u64,
+    layers: u64,
+    numbers: u64,
+    replica_spread: u64,
+}
+
+impl Inputs {
+    /// `layers` and `data` say whether the row's `layers` held any module and whether it had
+    /// a `data` object, which the caller has parsed already.
+    fn row(&mut self, columns: &Columns, row: usize, layers: bool, data: bool) {
+        let total = value(columns.grad_norm, row).is_some() || value(columns.clip_grad_norm, row).is_some();
+        let norms = columns
+            .grad_norms
+            .as_ref()
+            .is_some_and(|norms| !norms.row(row).is_empty());
+        let weights = columns
+            .weights_unchanged
+            .as_ref()
+            .is_some_and(|unchanged| unchanged.row(row).is_some());
+        let spread = columns
+            .replica_spread
+            .as_ref()
+            .is_some_and(|spread| !spread.row(row).is_empty());
+        let checkpoint = text(columns.checkpoint, row).is_some_and(|text| text.trim_start().starts_with('{'));
+        self.grad_total += u64::from(total);
+        self.weight_check += u64::from(weights && norms);
+        self.lr += u64::from(columns.lr(row).is_some());
+        self.data += u64::from(data);
+        self.checkpoint += u64::from(checkpoint);
+        self.layers += u64::from(layers);
+        self.numbers += u64::from(layers || total || norms);
+        self.replica_spread += u64::from(spread);
+    }
+}
+
 // --- one rank ------------------------------------------------------------------------------
 
 /// The detectors' state for one rank of one run.
@@ -2785,6 +2922,7 @@ pub struct RankDetectors {
     data: DataProgress,
     resumes: ResumeFound,
     scalars: Scalars,
+    inputs: Inputs,
     last_step: Option<i64>,
     rows: u64,
     /// The newest attempt read.
@@ -2850,6 +2988,7 @@ impl RankDetectors {
             let layers: Option<Members<LayerStats>> =
                 text(columns.layers, row).and_then(|layers| serde_json::from_str(layers).ok());
             let layers = layers.as_ref().map_or(&[][..], |layers| &layers.0);
+            self.inputs.row(&columns, row, !layers.is_empty(), data.is_some());
             self.moe.row(step, &columns, row, &self.thresholds);
             self.gradients.row(step, &columns, row, &mut self.scalars);
             self.stalled.row(step, &columns, row);
@@ -3020,8 +3159,74 @@ impl RankDetectors {
         out.extend(self.attempts.not_checked.iter().cloned());
         out.extend(self.resumes.not_checked().cloned());
         out.extend(self.attention.not_checked());
+        out.extend(self.attention.probe_not_checked());
         self.system.not_checked(&mut out);
         out
+    }
+
+    /// How many rows carried each input, in the order of [`INPUT_NEEDS`]: Python's
+    /// `input_counts`, over the rows that count.
+    fn input_counts(&self) -> [u64; 15] {
+        let [cuda, nvml, data_wait] = self.system.inputs();
+        [
+            self.moe.judged_rows,
+            self.inputs.grad_total,
+            self.inputs.weight_check,
+            self.rows,
+            self.loss_scale.recorded,
+            self.inputs.lr,
+            self.inputs.data,
+            self.inputs.checkpoint,
+            self.inputs.layers,
+            self.attention.probe_steps.len() as u64,
+            self.inputs.numbers,
+            self.inputs.replica_spread,
+            cuda,
+            nvml,
+            data_wait,
+        ]
+    }
+
+    /// What was checked: for each kind of [`PORTED`], one of three values, as Python's
+    /// `kind_checks` gives them.
+    ///
+    /// - `unavailable`: a [`not_checked`](Self::not_checked) entry names the kind, so its
+    ///   input was asked for and could not be judged. The entry's `check` and `reason` come
+    ///   with it.
+    /// - `checked`: otherwise, when any row carried the kind's input ([`KIND_INPUTS`]).
+    /// - `not_configured`: no row did. The capture was never set up to provide it.
+    ///
+    /// Each entry also has `records`, the rows that carried the input, and `needs`, the
+    /// input by name.
+    pub fn kind_checks(&self) -> Value {
+        let not_checked = self.not_checked();
+        let counts = self.input_counts();
+        let mut checks = serde_json::Map::new();
+        for (kind, input) in KIND_INPUTS {
+            let at = INPUT_NEEDS
+                .iter()
+                .position(|(name, _)| *name == input)
+                .expect("every kind's input is listed");
+            let (records, needs) = (counts[at], INPUT_NEEDS[at].1);
+            let names = |item: &&Value| match item["kinds"].as_array() {
+                Some(kinds) => kinds.iter().any(|named| named == kind),
+                None => CHECK_KINDS
+                    .iter()
+                    .any(|(check, stands_for)| item["check"] == *check && *stands_for == kind),
+            };
+            let entry = match not_checked.iter().find(names) {
+                Some(item) => json!({
+                    "value": "unavailable", "records": records, "needs": needs,
+                    "check": item["check"], "reason": item["reason"],
+                }),
+                None => json!({
+                    "value": if records > 0 { "checked" } else { "not_configured" },
+                    "records": records, "needs": needs,
+                }),
+            };
+            checks.insert(kind.to_string(), entry);
+        }
+        Value::Object(checks)
     }
 
     /// The last `DUPLICATE_WINDOW` steps that drew a hashed batch, as (step, (data rank, hash)),
@@ -3160,6 +3365,7 @@ pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64)
         "rebuilds": rebuilds,
         "checked": PORTED,
         "not_checked": detectors.not_checked(),
+        "kind_checks": detectors.kind_checks(),
         "thresholds": detectors.thresholds().applied(),
         "moe_flagged": detectors.moe_flagged(),
         "memory": detectors.memory(),
@@ -3692,6 +3898,152 @@ mod tests {
         assert_eq!(report["steps"], 5);
     }
 
+    /// One rank's rows of attempt 1, steps 0, 1, ..., each with the probe it recorded as JSON text.
+    fn probe_rows(probes: &[Option<&str>]) -> RecordBatch {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Schema::new(vec![
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("rank", DataType::Int32, false),
+            Field::new("attempt", DataType::Int64, false),
+            Field::new("step", DataType::Int64, false),
+            Field::new("probe_json", DataType::Utf8, true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from_iter_values(probes.iter().map(|_| "run"))),
+                Arc::new(Int32Array::from_iter_values(probes.iter().map(|_| 0))),
+                Arc::new(Int64Array::from_iter_values(probes.iter().map(|_| 1))),
+                Arc::new(Int64Array::from_iter_values(0..probes.len() as i64)),
+                Arc::new(StringArray::from(probes.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn values(checks: &Value, value: &str) -> Vec<String> {
+        // In the order of `PORTED`, which a JSON object does not keep.
+        PORTED
+            .iter()
+            .filter(|kind| checks[**kind]["value"] == value)
+            .map(|kind| kind.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_tables_of_what_each_kind_needs_cover_the_kinds_in_order() {
+        let kinds: Vec<&str> = KIND_INPUTS.iter().map(|(kind, _)| *kind).collect();
+        assert_eq!(kinds, PORTED);
+        for (kind, input) in KIND_INPUTS {
+            assert!(
+                INPUT_NEEDS.iter().any(|(name, _)| *name == input),
+                "{kind} needs {input}"
+            );
+        }
+        for (check, kind) in CHECK_KINDS {
+            assert!(PORTED.contains(&kind), "{check} stands for {kind}");
+        }
+    }
+
+    #[test]
+    fn rows_that_carry_nothing_but_their_step_check_one_kind() {
+        let detectors = judge(0, &[key_rows(&steps("run", 0, 1, 0..12))], &usual()).unwrap();
+        let checks = detectors.kind_checks();
+        assert_eq!(checks.as_object().unwrap().len(), PORTED.len());
+        assert_eq!(values(&checks, "checked"), ["repeated_steps"]);
+        assert_eq!(values(&checks, "not_configured").len(), 24);
+        assert_eq!(
+            checks["repeated_steps"],
+            json!({"value": "checked", "records": 12, "needs": "step records"})
+        );
+        assert_eq!(
+            checks["stalled_weights"],
+            json!({"value": "not_configured", "records": 0, "needs": "weights_unchanged with grad_norms (full capture)"})
+        );
+        // The report carries it, beside the two lists it always had.
+        let document = report("run", 0, &detectors, 0);
+        assert_eq!(document["kind_checks"], checks);
+        assert_eq!(document["checked"], json!(PORTED));
+        assert!(document["not_checked"].as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn a_router_only_run_checks_the_moe_kinds_by_the_rows_that_routed_tokens() {
+        let rows = [
+            (1, 0, vec![("a", vec![500, 500])]),
+            (1, 1, vec![("a", vec![0, 0])]), // nothing routed: nothing to judge
+            (1, 2, vec![]),
+            (1, 3, vec![("a", vec![0, 0]), ("b", vec![1, 0])]),
+        ];
+        let checks = judge(0, &[moe_rows(&rows, 1)], &usual()).unwrap().kind_checks();
+        assert_eq!(
+            values(&checks, "checked"),
+            ["moe_imbalance", "starved_experts", "repeated_steps"]
+        );
+        let moe = json!({"value": "checked", "records": 2, "needs": "moe: a router's expert counts"});
+        assert_eq!((&checks["moe_imbalance"], &checks["starved_experts"]), (&moe, &moe));
+        assert_eq!(checks["repeated_steps"]["records"], 4);
+        assert!(values(&checks, "unavailable").is_empty());
+    }
+
+    #[test]
+    fn a_failed_probe_makes_the_attention_kinds_unavailable_and_says_why() {
+        let good = r#"{"attention":{"blocks.0.attn":{"entropy_share":[0.6,0.62],"max_logit":[2.0,2.1]}}}"#;
+        let failed = r#"{"error":"RuntimeError: CUDA out of memory"}"#;
+        let attention = &ATTN_KINDS[..];
+
+        // Five probes that all recorded attention: checked, and nothing more is listed.
+        let rows: Vec<Option<&str>> = (0..9).map(|step| (step % 2 == 0).then_some(good)).collect();
+        let clean = judge(0, &[probe_rows(&rows)], &usual()).unwrap();
+        assert_eq!(clean.not_checked().len(), 2);
+        let checks = clean.kind_checks();
+        assert_eq!(
+            values(&checks, "checked"),
+            [
+                "repeated_steps",
+                "attention_collapse",
+                "attention_uniform",
+                "attention_logit_growth"
+            ]
+        );
+        assert_eq!(checks["attention_uniform"]["records"], 5);
+
+        // One of them failed.
+        let mut rows = rows;
+        rows[4] = Some(failed);
+        let detectors = judge(0, &[probe_rows(&rows)], &usual()).unwrap();
+        let reason = "1 of 5 probes failed, the first at step 4: RuntimeError: CUDA out of memory";
+        let entry = json!({"check": "probe", "kinds": attention, "reason": reason, "step": 4});
+        assert_eq!(detectors.not_checked().last(), Some(&entry));
+        let checks = detectors.kind_checks();
+        assert_eq!(values(&checks, "unavailable"), attention);
+        for kind in attention {
+            assert_eq!(
+                checks[*kind],
+                json!({
+                    "value": "unavailable", "records": 4, "needs": "probe with attention (probe=)",
+                    "check": "probe", "reason": reason,
+                })
+            );
+        }
+        assert_eq!(values(&checks, "checked"), ["repeated_steps"]);
+
+        // Too few probes to judge is the entry there always was, and it names the kinds first.
+        let few = judge(0, &[probe_rows(&[Some(good), Some(failed), Some(good)])], &usual()).unwrap();
+        let checks: Vec<Value> = few.not_checked()[2..]
+            .iter()
+            .map(|item| item["check"].clone())
+            .collect();
+        assert_eq!(checks, [json!("attention"), json!("probe")]);
+        assert_eq!(few.kind_checks()["attention_collapse"]["check"], "attention");
+        assert_eq!(few.kind_checks()["attention_collapse"]["records"], 2);
+
+        // An error that is not text is kept as the JSON it was.
+        let odd = judge(0, &[probe_rows(&[Some(r#"{"error":{"code":3}}"#)])], &usual()).unwrap();
+        let said = odd.not_checked().last().unwrap()["reason"].clone();
+        assert_eq!(said, r#"1 of 1 probe failed, the first at step 0: {"code":3}"#);
+    }
+
     #[test]
     fn detect_stream_refuses_what_it_cannot_judge() {
         let two_ranks = [key_rows(&steps("run", 0, 1, 0..5)), key_rows(&steps("run", 1, 1, 0..5))];
@@ -3815,7 +4167,7 @@ mod tests {
             (None, None, 0)
         );
         let failed: Probe = serde_json::from_str(r#"{"error":"RuntimeError: x","attention":{}}"#).unwrap();
-        assert!(failed.error);
+        assert_eq!(failed.error, Some(json!("RuntimeError: x")));
         assert!(serde_json::from_str::<Probe>(r#"{"attention":[1]}"#).is_err());
         // skipped, as Python skips it
     }

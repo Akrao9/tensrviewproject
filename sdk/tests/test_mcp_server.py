@@ -651,7 +651,13 @@ def test_a_path_that_does_not_exist_is_an_error_until_it_does(start, tmp_path):
     write_capture(path, dense(30), tail='{"schema_version": 1, "run_id": "dense", "step": 30, "gra')
     listed = client.call("list_incidents")
     assert listed["source"]["steps"] == {"first": 0, "last": 29, "records": 30} and listed["source"]["lines_left_out"] == 1
-    assert listed["incidents"] == [] and listed["run_state"]["state"] == "degraded"  # no failure, and no status to say so
+    # No failure, and a local file has no progress status to miss.
+    assert listed["incidents"] == [] and listed["run_state"]["state"] == "healthy"
+    # What "no incidents" covers: the kinds looked for, the ones never captured, and none that failed.
+    kinds = listed["kinds"]
+    assert "grad_spike" in kinds["checked"] and "job_stalled" in kinds["not_configured"] and kinds["unavailable"] == {}
+    assert len(kinds["checked"]) + len(kinds["not_configured"]) == 32
+    assert f"{len(kinds['checked'])} of 32 kinds checked" in listed["summary"]
     assert client.call("get_series", name="loss")["range"]["end"] == 29
 
     client = start(tmp_path)  # a folder that is no run folder

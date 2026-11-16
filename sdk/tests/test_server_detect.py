@@ -3,8 +3,8 @@
 The Rust path runs `tensorquill-server detect --samples` on the records in hand and takes the
 incidents of the server's kinds and the per-step MoE `samples` from its report; everything
 else in the evidence is still made in Python. Both paths must give the same evidence:
-incidents, `not_checked` and the run state compared as the server parity tests compare them
-(numbers to 1e-12, a NaN as `null`), the rest exactly. The samples are compared with no
+incidents, `not_checked`, what was checked (`kind_checks`) and the run state compared as the
+server parity tests compare them (numbers to 1e-12, a NaN as `null`), the rest exactly. The samples are compared with no
 tolerance: every field of every sample must be the same value of the same type
 (`sample_differences`). The two places where the paths differ on purpose are pinned further
 down.
@@ -56,7 +56,7 @@ def gate_fixtures() -> dict[str, list[dict]]:
 
 
 GATE_FIXTURES = gate_fixtures()
-JUDGED = ("incidents", "not_checked", "run_state")
+JUDGED = ("incidents", "not_checked", "kind_checks", "run_state")
 
 
 @pytest.fixture(autouse=True)
@@ -188,6 +188,10 @@ def test_the_report_is_the_document_the_server_writes():
     assert tuple(report["checked"]) == tuple(SERVER_KINDS)
     assert all("class" in incident for incident in report["incidents"])
     assert "samples" not in report, "the server's incidents.json holds no per-step samples"
+    # What was checked is a key of its own; the two lists beside it keep their shapes.
+    assert list(report["kind_checks"]) == sorted(SERVER_KINDS)
+    assert all(isinstance(kind, str) for kind in report["checked"])
+    assert all(isinstance(item, dict) and "check" in item and "reason" in item for item in report["not_checked"])
 
 
 # --- the per-step MoE samples, made in Rust ---------------------------------------------------
@@ -302,6 +306,98 @@ def test_a_binary_that_gives_no_samples_or_other_routers_is_refused(monkeypatch,
     with pytest.raises(RuntimeError, match="without samples"):
         server_report(moe_edges(), samples=True, binary=silent)
     assert server_report(moe_edges(), binary=silent) == {"incidents": []}
+
+
+# --- what was checked: one of three values for every kind -------------------------------------
+
+from test_kind_checks import probed, router_only  # noqa: E402
+
+# The parity record sets have no probe run without a failed probe, and no router-only capture.
+CHECK_SETS: dict[str, list[dict]] = {
+    "router only": router_only(),
+    "probes, all good": probed(),
+    "probes, one failed": probed(fail_at=(30,)),
+    "probes, all failed": probed(fail_at=tuple(range(0, 60, 10))),
+    "probes, too few": probed(steps=30),
+    "probes, too few and one failed": probed(steps=30, fail_at=(20,)),
+}
+
+
+@pytest.mark.parametrize("name", CHECK_SETS)
+def test_both_paths_say_the_same_about_what_was_checked(name):
+    assert both(CHECK_SETS[name]) == []
+    evidence = tensorquill.build_evidence(CHECK_SETS[name], detectors="rust")
+    degraded = "failed" in name or "too few" in name
+    assert evidence["run_state"]["state"] == ("degraded" if degraded else "healthy")
+
+
+def test_a_router_only_capture_and_a_failed_probe_read_the_same_through_rust():
+    router = tensorquill.build_evidence(CHECK_SETS["router only"], detectors="rust")
+    values = {kind: check["value"] for kind, check in router["kind_checks"].items()}
+    assert all(values[kind] == "not_configured" for kind in ("stalled_weights", "activation_spike", "activation_drift", "dead_activations"))
+    assert router["run_state"] == {"state": "healthy", "reasons": []}
+    from tensorquill.evidence import incident_summary
+
+    assert incident_summary(router).splitlines()[:2] == ["No incidents detected.", "3 of 32 kinds checked, 29 not configured"]
+    failed = tensorquill.build_evidence(CHECK_SETS["probes, one failed"], detectors="rust")
+    assert failed["run_state"]["state"] == "degraded" and [n["check"] for n in failed["not_checked"]] == ["probe"]
+    assert failed["kind_checks"]["attention_collapse"] == {
+        "value": "unavailable", "records": 5, "needs": "probe with attention (probe=)", "check": "probe",
+        "reason": "1 of 6 probes failed, the first at step 30: RuntimeError: CUDA out of memory",
+    }
+
+
+def test_the_report_gives_pythons_value_for_every_kind_and_every_value_is_reached():
+    from tensorquill.evidence import load_records
+
+    sets = {**CASES, **{f"fixture {name}": records for name, records in GATE_FIXTURES.items()}, **CHECK_SETS}
+    reached: dict[str, set[str]] = {kind: set() for kind in SERVER_KINDS}
+    for name, records in sets.items():
+        python = tensorquill.build_evidence(records)["kind_checks"]
+        report = server_report(load_records(records, all_attempts=True))["kind_checks"]
+        # No tolerance: a value, a count and two strings.
+        assert report == {kind: python[kind] for kind in SERVER_KINDS}, name
+        for kind, check in report.items():
+            reached[kind].add(check["value"])
+    assert reached.pop("repeated_steps") == {"checked"}  # every record is its input
+    assert all({"checked", "not_configured"} <= found for found in reached.values()), reached
+    # The kinds a `not_checked` entry can name.
+    can_fail = {
+        "resume_lr_change", "resume_data_mismatch", "resume_incomplete", "attention_collapse", "attention_uniform",
+        "attention_logit_growth", "memory_growth", "memory_pressure", "allocator_retries", "hardware_errors", "gpu_throttled",
+    }
+    assert {kind for kind, found in reached.items() if "unavailable" in found} == can_fail
+
+
+def test_the_rust_path_takes_each_kinds_value_from_the_report(monkeypatch):
+    import tensorquill.server_detect as module
+
+    real = module.server_report
+    change: dict = {}
+
+    def other(records, **kwargs):
+        report = real(records, **kwargs)
+        if "drop" in change:
+            del report["kind_checks"]
+        else:
+            report["kind_checks"]["grad_spike"] = change["grad_spike"]
+        return report
+
+    made_up = {"value": "unavailable", "records": 7, "needs": "x", "check": "made up", "reason": "because"}
+    change["grad_spike"] = made_up
+    monkeypatch.setattr(module, "server_report", other)
+    evidence = tensorquill.build_evidence(moe_edges(), detectors="rust")
+    assert evidence["kind_checks"]["grad_spike"] == made_up
+    assert len(evidence["kind_checks"]) == 32 and evidence["kind_checks"]["job_stalled"]["value"] == "not_configured"
+    # And the comparison names it: this is what a wrong value in the Rust report looks like.
+    found = both(moe_edges())
+    assert found and all(d.startswith("kind_checks.grad_spike") for d in found), found
+    change["grad_spike"] = {"value": "fine", "records": 7, "needs": "x"}
+    with pytest.raises(RuntimeError, match="does not say what was checked"):
+        tensorquill.build_evidence(moe_edges(), detectors="rust")
+    change["drop"] = True
+    with pytest.raises(RuntimeError, match="does not say what was checked"):
+        tensorquill.build_evidence(moe_edges(), detectors="rust")
 
 
 # --- where the two paths differ, on purpose -------------------------------------------------
@@ -480,6 +576,9 @@ def test_a_server_started_with_thresholds_applies_them_and_a_reader_asking_for_t
         sent = upto
         assert differences(reference(upto), document["incidents"]) == [], f"after {upto} steps"
     assert {name: document["thresholds"][name] for name in asked} == asked and document["rebuilds"] == 1
+    # The server's own incidents.json says what was checked, as the same function makes it.
+    usual = tensorquill.build_evidence(records[:200], **asked)["kind_checks"]
+    assert document["kind_checks"] == {kind: usual[kind] for kind in SERVER_KINDS}
     stream.restart()  # the new server rebuilds from its store, with the thresholds it was started with
     document = stream.send(records[200:])
     assert differences(reference(300), document["incidents"]) == []

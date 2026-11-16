@@ -1,8 +1,8 @@
 """The Python detectors' outputs, frozen as files, and both detector paths held to them.
 
 `golden/` has one file per record set. It holds what `tensorquill.build_evidence(records)`,
-the Python detectors, gave for `incidents`, `not_checked`, `run_state` and the per-step MoE
-`samples`. The Python detectors are to be deleted once the Rust ones do the same work, and
+the Python detectors, gave for `incidents`, `not_checked`, `kind_checks` (what was checked),
+`run_state` and the per-step MoE `samples`. The Python detectors are to be deleted once the Rust ones do the same work, and
 from then on these files are the reference. Until then each file is checked twice:
 
 - the Python path still gives it, which keeps the files honest while the Python code exists;
@@ -68,7 +68,7 @@ from test_server_detectors import differences  # noqa: E402
 
 GOLDEN = Path(__file__).resolve().parent / "golden"
 GENERATE = Path(__file__).resolve().parents[2] / "experiments" / "moe-bakeoff" / "generate.py"
-FROZEN = ("incidents", "not_checked", "run_state", "samples")
+FROZEN = ("incidents", "kind_checks", "not_checked", "run_state", "samples")
 TAG = "$float"
 TOLERANCE = 1e-12  # relative, as `differences` has it
 HASH_DIGITS = 9
