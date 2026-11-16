@@ -212,7 +212,11 @@ SPIKE = {
     "spike_count": 1, "spike_steps": [40],
 }
 NOT_FINITE = {"kind": "non_finite", "step": 55, "layers": ["blocks.2"], "gradients": []}
-RESUMED = {"kind": "resume_lr_change", "step": 30, "resumes": 1}
+RESUMED = {
+    "kind": "resume_lr_change", "step": 30, "resumes": 1, "note": "an observation: some restarts change the schedule on purpose",
+    "changes": [{"step": 30, "previous_attempt": 1, "basis": "same_step", "expected_lr": [1e-3], "resumed_lr": [5e-4],
+                 "first_lr": [1e-3], "equals_first_lr": False}],
+}
 ATTENTION = {"check": "attention", "kinds": list(ev.ATTN_KINDS), "reason": "no probe recorded attention"}
 
 
@@ -435,13 +439,15 @@ def test_a_10_000_step_run_gives_bounded_answers_and_a_spike_between_points_is_s
     assert client.call("get_series", name="lr")["values"] == {"group0": [0.001] * 200}
     listed = client.call("list_incidents")
     assert listed["source"]["steps"] == {"first": 0, "last": 9_999, "records": 10_000}
-    assert 30_000 < client.largest <= mcp_server.MAX_ANSWER_BYTES
+    assert 20_000 < client.largest <= mcp_server.MAX_ANSWER_BYTES  # `read` holds every reply to the cap
 
 
 def test_a_fat_incident_and_a_long_list_are_cut_with_a_note_of_where(start, tmp_path):
     names = [f"encoder.layers.{i}.attention.self.query.weight" for i in range(5_000)]
-    stalled = {"kind": "stalled_weights", "step": 12, "parameters": names, "stalled": len(names), "consecutive": 3}
-    many = [{"kind": "grad_spike", "step": step, "parameters": [{"name": name} for name in names[:40]]} for step in range(3_000)]
+    stalled = {"kind": "stalled_weights", "step": 12, "parameters": names, "stalled": len(names), "with_gradients": 5_000,
+               "consecutive": 3, "stalled_steps": 3, "stalled_total": len(names), "onsets": [], "onsets_omitted": 0}
+    many = [{**SPIKE, "step": step, "parameters": [{**SPIKE["parameters"][0], "name": name} for name in names[:40]]}
+            for step in range(3_000)]
     fat = tmp_path / "fat.json"
     fat.write_text(json.dumps({"schema_version": 1, "incidents": [stalled, *many], "samples": []}))
     client = start(fat)
@@ -455,10 +461,11 @@ def test_a_fat_incident_and_a_long_list_are_cut_with_a_note_of_where(start, tmp_
     assert [i["id"] for i in listed["incidents"][:3]] == ["stalled_weights@12", "grad_spike@0", "grad_spike@1"]
     assert any(note.startswith("summary: ") for note in listed["truncated"])
     most = client.call("list_incidents", limit=200)
-    assert 4 <= len(most["incidents"]) <= 200 and client.largest > 40_000
+    assert 4 <= len(most["incidents"]) < 200 and client.largest > 35_000
+    assert any(note.startswith(f"incidents: {len(most['incidents'])} of 200 items") for note in most["truncated"])
 
 
-def test_fit_halves_the_largest_part_and_leaves_the_original_alone():
+def test_fit_cuts_the_largest_part_and_leaves_the_original_alone():
     payload = {"small": [1, 2, 3], "big": list(range(4_000)), "text": "x" * 300, "nested": {"rows": [{"n": list(range(900))}]}}
     kept = json.loads(json.dumps(payload))
 
@@ -651,7 +658,7 @@ def test_values_that_are_not_finite_are_strings_in_a_series(start, tmp_path):
 
 def test_the_agent_instructions_name_the_four_tools_and_offer_no_action_on_the_run():
     text = (SDK / "AGENT_INSTRUCTIONS.md").read_text(encoding="utf-8")
-    named = set(re.findall(r"`((?:list|get|set|put|write|pause|stop|resume|kill|cancel|delete|update|create|restart)_[a-z_]+)", text))
+    named = set(re.findall(r"`((?:list|get|set|put|write|pause|stop|kill|cancel|delete|update|create|restart)_[a-z_]+)", text))
     assert named == set(TOOLS)
     assert [tool["name"] for tool in mcp_server.TOOLS] == TOOLS
     for word in ("invariant", "anomaly", "observation", "not_checked", "unknown", "run_state", "python -m tensorquill.mcp_server"):

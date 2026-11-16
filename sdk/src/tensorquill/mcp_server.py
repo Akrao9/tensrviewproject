@@ -151,9 +151,10 @@ def _complete_lines(path: Path) -> tuple[list[dict[str, Any]], int]:
 
 
 def all_ranks_look(folder: str | Path) -> dict[str, Any]:
-    """One look at every rank of a run folder: the evidence `watch(folder, rank="all")` writes,
-    returned and not written. It reads each rank's `incidents.json`, the name of its newest part
-    and the run's `watchdog.json`; no part is opened and no detector runs."""
+    """One look at every rank of a run folder: the evidence the all-ranks watcher
+    (`python -m tensorquill <run folder> --rank all`) writes, returned and not written. It reads
+    each rank's `incidents.json`, the name of its newest part and the run's `watchdog.json`; no
+    part is opened and no detector runs."""
     folder = Path(folder)
     status = read_watchdog(folder / "watchdog.json")
     folders = _discover_rank_folders(folder)
@@ -632,7 +633,10 @@ def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
     if entry is None:
         known = ", ".join(e["id"] for e in entries[:20]) or "none"
         more = f" and {len(entries) - 20} more" if len(entries) > 20 else ""
-        raise ToolError(f"no incident has the id {wanted!r}. The incidents here are: {known}{more}. Call list_incidents for the current list.")
+        raise ToolError(
+            f"no incident has the id {wanted!r}. The incidents here are: {known}{more}."
+            " Call list_incidents for the current list."
+        )
     incident = entry["incident"]
     found = _class_of(incident)
     answer: dict[str, Any] = {
@@ -750,7 +754,8 @@ def _rows(kind: str, name: str, records: Iterable[Mapping[str, Any]], expert: in
             } or None
         elif kind == "router":
             stats = (record.get("moe_stats") or {}).get(name)
-            point = _router_point((record.get("moe") or {}).get(name), stats.get("diversity") if isinstance(stats, Mapping) else None, expert)
+            diversity = stats.get("diversity") if isinstance(stats, Mapping) else None
+            point = _router_point((record.get("moe") or {}).get(name), diversity, expert)
         else:
             logged = record.get("scalars")
             value = logged[name] if isinstance(logged, Mapping) and name in logged else record.get(name) if name in RUN_LEVEL else None
@@ -840,7 +845,10 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
                 " start the server on the run folder (runs/<run_id>), or with --records, to read series."
             )
         evidence, names, origin = opened["evidence"], _sample_names(opened["evidence"]), {"records": None}
-        what = f"the evidence file {source.path}, which has only its routers' samples (start the server on the .jsonl capture or the run folder, or with --records, for layers and parameters)"
+        what = (
+            f"the evidence file {source.path}, which has only its routers' samples (start the server on the"
+            " .jsonl capture or the run folder, or with --records, for layers and parameters)"
+        )
     else:
         records, names, origin = held
         what = f"rank {origin['rank']}'s step records"
@@ -941,7 +949,8 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
             {"rank": number, "report": (entry.get("detection") or {}).get("state"),
              "judged": (entry.get("detection") or {}).get("judged"),
              "last_step": (entry.get("detection") or {}).get("report_last_step"),
-             **({"incidents": [i.get("kind") for i in entry["incidents"] if isinstance(i, dict)]} if isinstance(entry.get("incidents"), list) else {}),
+             **({"incidents": [i.get("kind") for i in entry["incidents"] if isinstance(i, dict)]}
+                if isinstance(entry.get("incidents"), list) else {}),
              **({"stream": entry["stream"]} if isinstance(entry.get("stream"), dict) else {})}
             for number, entry in sorted(rows.items(), key=lambda item: item[0] if isinstance(item[0], int) else -1)
         ]
@@ -1019,13 +1028,16 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "The layer (module), parameter, router or scalar name, as an incident's `where` gives it."},
+                "name": {"type": "string",
+                         "description": "The layer (module), parameter, router or scalar name, as an incident's `where` gives it."},
                 "kind": {"type": "string", "enum": list(SERIES_KINDS), "description": "Only needed when one name is used for two kinds."},
                 "stat": {"type": "string", "description": "One column only, such as abs_max or grad_norm. Default: all of them."},
-                "expert": {"type": "integer", "minimum": 1, "description": "For a router: also give this expert's share. Experts are numbered from 1."},
+                "expert": {"type": "integer", "minimum": 1,
+                           "description": "For a router: also give this expert's share. Experts are numbered from 1."},
                 "start": {"type": "integer", "description": "First step of the range (default: the first recorded)."},
                 "end": {"type": "integer", "description": "Last step of the range, inclusive (default: the last recorded)."},
-                "max_points": {"type": "integer", "minimum": 1, "maximum": MAX_POINTS, "description": f"Most points to return (default {DEFAULT_POINTS})."},
+                "max_points": {"type": "integer", "minimum": 1, "maximum": MAX_POINTS,
+                               "description": f"Most points to return (default {DEFAULT_POINTS})."},
                 "rank": _RANK,
             },
             "required": ["name"],
@@ -1118,8 +1130,9 @@ def _largest(value: Any, path: str, found: list[tuple[int, str, Any, Any]], pare
 
 
 def fit(payload: dict[str, Any], fits: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
-    """`payload`, cut until `fits` accepts it: the largest list, map or string is halved, again
-    and again, and `truncated` says what is shown of each. The original is not changed."""
+    """`payload`, cut until `fits` accepts it: the largest list, map or string loses its last
+    quarter, again and again, and `truncated` says what is shown of each. The original is not
+    changed."""
     if fits(payload):
         return payload
     payload = copy.deepcopy(payload)
@@ -1136,13 +1149,13 @@ def fit(payload: dict[str, Any], fits: Callable[[dict[str, Any]], bool]) -> dict
         _, path, parent, key = max(found, key=lambda item: item[0])
         value = parent[key]
         if isinstance(value, str):
-            keep, unit = max(len(value) // 2, 128), "characters"
+            keep, unit = max(len(value) * 3 // 4, 128), "characters"
             parent[key] = value[:keep] + " …"
         elif isinstance(value, dict):
-            keep, unit = max(len(value) // 2, 8), "entries"
+            keep, unit = max(len(value) * 3 // 4, 8), "entries"
             parent[key] = dict(list(value.items())[:keep])
         else:
-            keep, unit = max(len(value) // 2, 4), "items"
+            keep, unit = max(len(value) * 3 // 4, 4), "items"
             parent[key] = value[:keep]
         cut[path] = (keep, cut[path][1] if path in cut else len(value), unit)
     return {"error": "the answer is too long to send and could not be shortened further", "truncated": notes}
@@ -1175,7 +1188,8 @@ def call_tool(source: Source, request_id: Any, params: Mapping[str, Any]) -> dic
         return _tool_reply(request_id, str(error)[:4000], True)
     except (Exception, SystemExit) as error:  # a request must never take the server down
         traceback.print_exc(file=sys.stderr)
-        return _tool_reply(request_id, f"{name} failed inside the server ({type(error).__name__}: {str(error)[:1000]}). The server is still running.", True)
+        text = f"{name} failed inside the server ({type(error).__name__}: {str(error)[:1000]}). The server is still running."
+        return _tool_reply(request_id, text, True)
 
 
 def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
