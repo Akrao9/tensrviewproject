@@ -496,3 +496,36 @@ def test_no_detect_writes_no_incidents_file(tmp_path):
     assert stream.server.terminate() == 0
     assert list((stream.store / "runs" / RUN / "rank=0").glob("attempt=*/part-*.parquet"))
     assert not stream.incidents_file.exists()
+
+
+def _unpadded_layers_run(blocks=12, first=2, steps=60):
+    """`model.layers.0` to `model.layers.11`, whose alphabetical order (0, 1, 10, 11, 2, ...) is not the model's.
+    From step 40 a fault starting in block `first` shows in every later block, larger with depth."""
+    out = []
+    for step in range(steps):
+        layers = {}
+        for b in range(blocks):
+            amax = 10.0 * (6 + b if step == 40 and b >= first else 1)
+            layers[f"model.layers.{b}"] = {"mean": 0.0, "std": 1.0, "abs_max": amax, "zero_frac": 0.0}
+        out.append(record(step, layers=layers))
+    return out
+
+
+def test_a_spike_leads_with_the_first_block_in_the_model_not_the_first_by_name(tmp_path):
+    records = _unpadded_layers_run()
+    expected = next(i for i in reference(records) if i["kind"] == "activation_spike")
+    assert [m["module"] for m in expected["modules"]][:2] == ["model.layers.2", "model.layers.11"]
+    stream = Stream(tmp_path, *FAST)
+    try:
+        document = stream.send(records)
+    finally:
+        stream.server.terminate()
+    # What the server judged from the stream it was sent.
+    served = next(i for i in document["incidents"] if i["kind"] == "activation_spike")
+    assert [m["module"] for m in served["modules"]] == [m["module"] for m in expected["modules"]]
+    assert differences([expected], [served]) == []
+    # And what Python makes of the Parquet parts the server stored.
+    stored = tensorquill.load_records(stream.store / "runs" / RUN / "rank=0")
+    assert list(stored[0]["layers"]) == [f"model.layers.{b}" for b in range(12)]
+    from_parts = next(i for i in tensorquill.build_evidence(stored)["incidents"] if i["kind"] == "activation_spike")
+    assert [m["module"] for m in from_parts["modules"]][0] == "model.layers.2"

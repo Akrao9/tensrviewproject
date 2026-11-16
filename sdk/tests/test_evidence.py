@@ -679,6 +679,24 @@ def test_an_activation_spike_that_travels_down_the_stack_leads_with_its_first_bl
            "(the largest, abs_max 30×, is in blocks.7); 1 step affected" in summary
 
 
+def test_the_first_block_in_the_model_leads_when_names_do_not_sort_in_model_order(tmp_path):
+    # model.layers.0 to 11 sort as 0, 1, 10, 11, 2, ...: through a JSONL file and back, block 2 still leads.
+    path = tmp_path / "run.rank0.jsonl"
+    sink = tensorquill.JsonlSink(path)
+    for step in range(60):
+        layers = {
+            f"model.layers.{b}": {"mean": 0.0, "std": 1.0, "zero_frac": 0.0,
+                                  "abs_max": 10.0 * (6 + b if step == 40 and b >= 2 else 1)}
+            for b in range(12)
+        }
+        sink.write([{"schema_version": 1, "run_id": "r", "rank": 0, "step": step, "layers": layers}])
+    sink.close()
+    records = tensorquill.load_records(path)
+    assert list(records[0]["layers"]) == [f"model.layers.{b}" for b in range(12)]
+    spike = next(h for h in tensorquill.detect_activation_anomalies(records) if h["kind"] == "activation_spike")
+    assert [m["module"] for m in spike["modules"]][:2] == ["model.layers.2", "model.layers.11"]
+
+
 def test_the_first_block_leads_even_when_it_is_also_the_largest():
     spike = next(h for h in tensorquill.detect_activation_anomalies(_propagating_records(3, [30, 12, 10, 8, 6]))
                  if h["kind"] == "activation_spike")

@@ -93,6 +93,13 @@ def _json(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True, allow_nan=False)
 
 
+def _ordered_json(value: Any) -> str:
+    """`_json` with the object's key order kept. For `layers` that order is the model's, which the
+    detectors use to say which block showed a change first; sorted, `model.layers.10` would
+    come before `model.layers.2`."""
+    return json.dumps(value, separators=(",", ":"), allow_nan=False)
+
+
 # JSONL key -> (Arrow column, converter). A value that does not fit its column's type, and
 # any key not listed here, travels in `extra_json`, so no field is ever dropped.
 _FIELDS: dict[str, tuple[str, Callable[[Any], Any]]] = {
@@ -110,7 +117,7 @@ _FIELDS: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "moe_top_k": ("moe_top_k", _map(_int)),
     "moe": ("moe_counts", _map(_list(_int))),
     "replica_spread": ("replica_spread", _map(_list(_float))),
-    "layers": ("layers_json", _json),
+    "layers": ("layers_json", _ordered_json),
     "moe_stats": ("moe_stats_json", _json),
     "probe": ("probe_json", _json),
 }
@@ -213,7 +220,7 @@ def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
         if value is None:
             if key in _ALWAYS:
                 record[key] = None
-        elif convert is _json:
+        elif convert in (_json, _ordered_json):
             record[key] = json.loads(value)
         elif column in _MAP_COLUMNS:
             record[key] = {k: _plain(v) for k, v in value}  # an empty map stays a dict

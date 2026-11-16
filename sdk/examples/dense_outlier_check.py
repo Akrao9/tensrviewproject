@@ -321,10 +321,9 @@ def main() -> None:
     spike = next((i for i in evidence["incidents"] if i["kind"] == "activation_spike"), None)
     print("\n--- Detection ---")
     print(tensorquill.incident_summary(evidence))
-    hit = spike is not None and spike["step"] == args.seed_step and any(
-        m["module"] == seeded_block for m in spike["modules"]
-    )
-    print(f"Activation spike at step {args.seed_step} in {seeded_block}: {'PASS' if hit else 'FAIL'}")
+    # The fault shows in every later block too; the incident must lead with the first, the seeded one.
+    hit = spike is not None and spike["step"] == args.seed_step and spike["modules"][0]["module"] == seeded_block
+    print(f"Activation spike at step {args.seed_step}, first in {seeded_block}: {'PASS' if hit else 'FAIL'}")
     if spike is not None and not hit:
         print(f"  First spike: step {spike['step']}, modules {[m['module'] for m in spike['modules'][:5]]}")
 

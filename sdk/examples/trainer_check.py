@@ -210,10 +210,9 @@ def main() -> None:
     evidence = tensorquill.build_evidence(records)
     print(tensorquill.incident_summary(evidence))
     spike = next((i for i in evidence["incidents"] if i["kind"] == "activation_spike"), None)
-    hit = spike is not None and spike["step"] == args.seed_step and any(
-        m["module"] == seeded_block for m in spike["modules"]
-    )
-    check(hit, f"activation spike at step {args.seed_step} in {seeded_block}")
+    # The fault shows in every later block too; the incident must lead with the first, the seeded one.
+    hit = spike is not None and spike["step"] == args.seed_step and spike["modules"][0]["module"] == seeded_block
+    check(hit, f"activation spike at step {args.seed_step}, first in {seeded_block}")
     if spike is not None and not hit:
         print(f"  First spike: step {spike['step']}, modules {[m['module'] for m in spike['modules'][:5]]}")
     probes = [r["probe"] for r in records if "probe" in r]
