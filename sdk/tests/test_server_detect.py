@@ -1,10 +1,13 @@
 """`build_evidence(detectors="rust")` against the Python detectors, on the same records.
 
-The Rust path runs `tensorquill-server detect` on the records in hand and takes the incidents
-of the server's kinds from its report; everything else in the evidence is still made in
-Python. Both paths must give the same evidence: incidents, `not_checked` and the run state
-compared as the server parity tests compare them (numbers to 1e-12, a NaN as `null`), the rest
-exactly. The two places where they differ on purpose are pinned further down.
+The Rust path runs `tensorquill-server detect --samples` on the records in hand and takes the
+incidents of the server's kinds and the per-step MoE `samples` from its report; everything
+else in the evidence is still made in Python. Both paths must give the same evidence:
+incidents, `not_checked`, what was checked (`kind_checks`) and the run state compared as the
+server parity tests compare them (numbers to 1e-12, a NaN as `null`), the rest exactly. The samples are compared with no
+tolerance: every field of every sample must be the same value of the same type
+(`sample_differences`). The two places where the paths differ on purpose are pinned further
+down.
 
 The five threshold options go to the Rust rules as the server's one `--thresholds` JSON
 object. `CASES` stays at the defaults; the options have their own table (`OPTIONS`).
@@ -53,12 +56,32 @@ def gate_fixtures() -> dict[str, list[dict]]:
 
 
 GATE_FIXTURES = gate_fixtures()
-JUDGED = ("incidents", "not_checked", "run_state")
+JUDGED = ("incidents", "not_checked", "kind_checks", "run_state")
 
 
 @pytest.fixture(autouse=True)
 def binary(monkeypatch):
     monkeypatch.setenv(BINARY_ENV, str(BINARY))
+
+
+def sample_differences(python: list[dict], rust: list[dict], limit: int = 20) -> list[str]:
+    """Where the Rust path's MoE samples differ from Python's, by step, router and field.
+
+    No tolerance: a field must hold the same value of the same type, a float the same double.
+    Both paths read the same recorded numbers and do the same arithmetic in the same order.
+    """
+    if len(python) != len(rust):
+        return [f"samples: {len(python)} from Python, {len(rust)} from Rust"]
+    found = []
+    for at, (ours, theirs) in enumerate(zip(python, rust)):
+        where = f"samples[{at}] step {ours.get('step')} router {ours.get('router')}"
+        for field in dict.fromkeys([*ours, *theirs]):
+            if field not in ours or field not in theirs:
+                found.append(f"{where}: {field} is only in {'Python' if field in ours else 'Rust'}'s sample")
+            elif json.dumps(ours[field], sort_keys=True) != json.dumps(theirs[field], sort_keys=True):
+                # As text: 1 is not 1.0, and a float is the same only when every digit is.
+                found.append(f"{where}: {field} {ours[field]!r} != {theirs[field]!r}")
+    return found[:limit] + ([f"and {len(found) - limit} more sample fields"] if len(found) > limit else [])
 
 
 def both(records, **options) -> list[str]:
@@ -67,9 +90,10 @@ def both(records, **options) -> list[str]:
     rust = tensorquill.build_evidence(records, detectors="rust", **options)
     assert "detectors" not in python and rust.pop("detectors") == "rust"
     found = [d for key in JUDGED for d in differences(python.get(key, []), rust.get(key, []), key)]
+    found += sample_differences(python["samples"], rust["samples"])
 
     def rest(evidence):
-        return json.dumps({k: v for k, v in evidence.items() if k not in JUDGED}, sort_keys=True)
+        return json.dumps({k: v for k, v in evidence.items() if k not in (*JUDGED, "samples")}, sort_keys=True)
 
     return found + (["the keys made in Python differ"] if rest(python) != rest(rust) else [])
 
@@ -163,6 +187,218 @@ def test_the_report_is_the_document_the_server_writes():
     assert (report["run_id"], report["rank"], report["steps"], report["last_step"]) == ("detect", 0, 300, 299)
     assert tuple(report["checked"]) == tuple(SERVER_KINDS)
     assert all("class" in incident for incident in report["incidents"])
+    assert "samples" not in report, "the server's incidents.json holds no per-step samples"
+    # What was checked is a key of its own; the two lists beside it keep their shapes.
+    assert list(report["kind_checks"]) == sorted(SERVER_KINDS)
+    assert all(isinstance(kind, str) for kind in report["checked"])
+    assert all(isinstance(item, dict) and "check" in item and "reason" in item for item in report["not_checked"])
+
+
+# --- the per-step MoE samples, made in Rust ---------------------------------------------------
+
+
+def moe_sets() -> dict[str, list[dict]]:
+    """The record sets that have MoE samples at all."""
+    sets = {**CASES, **{f"fixture {name}": records for name, records in GATE_FIXTURES.items()}}
+    return {name: records for name, records in sets.items() if any(r.get("moe") for r in records)}
+
+
+MOE_SETS = moe_sets()
+
+
+def test_the_moe_sets_hold_every_form_a_sample_takes():
+    assert len(MOE_SETS) >= 7, sorted(MOE_SETS)
+    samples = [s for records in MOE_SETS.values() for s in tensorquill.build_evidence(records)["samples"]]
+    judged = [s for s in samples if not s.get("missing")]
+    assert {s["overload_rule"]["rule"] for s in judged} == {"share", "diversity_drop", "collapse"}
+    assert any(s.get("missing") and not any(s["counts"]) for s in samples), "a router a step did not record"
+    assert any(s["overloaded"] for s in judged) and any(s["dead"] for s in judged) and any(s["starved"] for s in judged)
+    # A window that was judged with nobody starved, and one that could not be judged yet.
+    assert any(s.get("starved_shares") == {} for s in judged) and any("starved_shares" not in s for s in judged)
+    assert any(len(s["counts"]) != len(t["counts"]) for s in judged for t in judged[:1]), "routers of several sizes"
+
+
+@pytest.mark.parametrize("name", MOE_SETS)
+def test_rust_makes_the_samples_python_makes_field_by_field(name):
+    records = MOE_SETS[name]
+    python = tensorquill.build_evidence(records)["samples"]
+    assert python, "this record set has MoE samples"
+    assert sample_differences(python, tensorquill.build_evidence(records, detectors="rust")["samples"]) == []
+    # And straight from the report, before `build_evidence` has touched them.
+    from tensorquill.evidence import load_records
+
+    report = server_report(load_records(records, all_attempts=True), samples=True)
+    assert sample_differences(python, report["samples"]) == []
+    plain = server_report(load_records(records, all_attempts=True))
+    assert {key: value for key, value in report.items() if key != "samples"} == plain
+
+
+def test_the_rust_path_runs_no_python_moe_rule(monkeypatch):
+    import tensorquill.evidence as evidence
+
+    usual = tensorquill.build_evidence(moe_edges())["samples"]
+
+    def never(*args, **kwargs):
+        raise AssertionError("the Python MoE rule ran on the Rust path")
+
+    for name in ("_moe_samples", "_mark_starved", "_jump_overloaded", "effective_overload_threshold", "_dead_experts_significant"):
+        monkeypatch.setattr(evidence, name, never)
+    rust = tensorquill.build_evidence(moe_edges(), detectors="rust")
+    assert sample_differences(usual, rust["samples"]) == [] and len(usual) == 60
+    with pytest.raises(AssertionError, match="the Python MoE rule ran"):
+        tensorquill.build_evidence(moe_edges())
+
+
+@pytest.mark.parametrize("change, said", [
+    (lambda s: s.update(routed_tokens=s["routed_tokens"] + 1), "routed_tokens"),
+    (lambda s: s.update(diversity=s["diversity"] * (1 + 2.3e-16)), "diversity"),  # the next double
+    (lambda s: s["counts"].__setitem__(0, s["counts"][0] + 1), "counts"),
+    (lambda s: s.update(overloaded=[*s["overloaded"], 2]), "overloaded"),
+    (lambda s: s["overload_rule"].update(rule="collapse"), "overload_rule"),
+    (lambda s: s.update(starved_shares={}), "starved_shares is only in Rust's sample"),
+    (lambda s: s.pop("starved"), "starved is only in Python's sample"),
+    (lambda s: s.update(layer=float(s["layer"])), "layer"),  # 1.0 where 1 was
+])
+def test_one_wrong_field_in_one_sample_is_named(monkeypatch, change, said):
+    import tensorquill.server_detect as module
+
+    real = module.server_report
+
+    def tampered(records, **kwargs):
+        report = real(records, **kwargs)
+        sample = next(s for s in report["samples"] if not s.get("missing") and "starved_shares" not in s and s["step"] > 0)
+        change(sample)
+        return report
+
+    assert both(moe_edges()) == []
+    monkeypatch.setattr(module, "server_report", tampered)
+    found = both(moe_edges())
+    assert len(found) == 1 and said in found[0] and "step " in found[0] and "router " in found[0], found
+
+
+def test_a_binary_that_gives_no_samples_or_other_routers_is_refused(monkeypatch, tmp_path):
+    import tensorquill.server_detect as module
+
+    real = module.server_report
+    drop = {}
+
+    def other(records, **kwargs):
+        report = real(records, **kwargs)
+        report["samples"] = report["samples"][drop["from"]:]
+        return report
+
+    monkeypatch.setattr(module, "server_report", other)
+    drop["from"] = 1
+    with pytest.raises(RuntimeError, match="MoE samples"):
+        tensorquill.build_evidence(moe_edges(), detectors="rust")
+    monkeypatch.undo()
+    monkeypatch.setenv(BINARY_ENV, str(BINARY))
+
+    # A binary from before `--samples`: it refuses the flag, or (if it ignored it) prints no samples.
+    old = tmp_path / "old-server"
+    old.write_text("#!/bin/sh\necho \"error: unexpected argument '--samples' found\" >&2\nexit 2\n", encoding="utf-8")
+    old.chmod(0o755)
+    with pytest.raises(RuntimeError, match="too old to have `detect`, `--thresholds` or `--samples`"):
+        server_report(moe_edges(), samples=True, binary=old)
+    silent = tmp_path / "silent-server"
+    silent.write_text("#!/bin/sh\ncat > /dev/null\necho '{\"incidents\": []}'\n", encoding="utf-8")
+    silent.chmod(0o755)
+    with pytest.raises(RuntimeError, match="without samples"):
+        server_report(moe_edges(), samples=True, binary=silent)
+    assert server_report(moe_edges(), binary=silent) == {"incidents": []}
+
+
+# --- what was checked: one of three values for every kind -------------------------------------
+
+from test_kind_checks import probed, router_only  # noqa: E402
+
+# The parity record sets have no probe run without a failed probe, and no router-only capture.
+CHECK_SETS: dict[str, list[dict]] = {
+    "router only": router_only(),
+    "probes, all good": probed(),
+    "probes, one failed": probed(fail_at=(30,)),
+    "probes, all failed": probed(fail_at=tuple(range(0, 60, 10))),
+    "probes, too few": probed(steps=30),
+    "probes, too few and one failed": probed(steps=30, fail_at=(20,)),
+    "a probe whose error is not text": [{"run_id": "r", "step": 0, "ts": 0.0, "probe": {"error": {"code": 3, "why": [1, 2]}}}],
+}
+
+
+@pytest.mark.parametrize("name", CHECK_SETS)
+def test_both_paths_say_the_same_about_what_was_checked(name):
+    assert both(CHECK_SETS[name]) == []
+    evidence = tensorquill.build_evidence(CHECK_SETS[name], detectors="rust")
+    degraded = "failed" in name or "too few" in name or "error" in name
+    assert evidence["run_state"]["state"] == ("degraded" if degraded else "healthy")
+
+
+def test_a_router_only_capture_and_a_failed_probe_read_the_same_through_rust():
+    router = tensorquill.build_evidence(CHECK_SETS["router only"], detectors="rust")
+    values = {kind: check["value"] for kind, check in router["kind_checks"].items()}
+    assert all(values[kind] == "not_configured" for kind in ("stalled_weights", "activation_spike", "activation_drift", "dead_activations"))
+    assert router["run_state"] == {"state": "healthy", "reasons": []}
+    from tensorquill.evidence import incident_summary
+
+    assert incident_summary(router).splitlines()[:2] == ["No incidents detected.", "3 of 32 kinds checked, 29 not configured"]
+    failed = tensorquill.build_evidence(CHECK_SETS["probes, one failed"], detectors="rust")
+    assert failed["run_state"]["state"] == "degraded" and [n["check"] for n in failed["not_checked"]] == ["probe"]
+    assert failed["kind_checks"]["attention_collapse"] == {
+        "value": "unavailable", "records": 5, "needs": "probe with attention (probe=)", "check": "probe",
+        "reason": "1 of 6 probes failed, the first at step 30: RuntimeError: CUDA out of memory",
+    }
+
+
+def test_the_report_gives_pythons_value_for_every_kind_and_every_value_is_reached():
+    from tensorquill.evidence import load_records
+
+    sets = {**CASES, **{f"fixture {name}": records for name, records in GATE_FIXTURES.items()}, **CHECK_SETS}
+    reached: dict[str, set[str]] = {kind: set() for kind in SERVER_KINDS}
+    for name, records in sets.items():
+        python = tensorquill.build_evidence(records)["kind_checks"]
+        report = server_report(load_records(records, all_attempts=True))["kind_checks"]
+        # No tolerance: a value, a count and two strings.
+        assert report == {kind: python[kind] for kind in SERVER_KINDS}, name
+        for kind, check in report.items():
+            reached[kind].add(check["value"])
+    assert reached.pop("repeated_steps") == {"checked"}  # every record is its input
+    assert all({"checked", "not_configured"} <= found for found in reached.values()), reached
+    # The kinds a `not_checked` entry can name.
+    can_fail = {
+        "resume_lr_change", "resume_data_mismatch", "resume_incomplete", "attention_collapse", "attention_uniform",
+        "attention_logit_growth", "memory_growth", "memory_pressure", "allocator_retries", "hardware_errors", "gpu_throttled",
+    }
+    assert {kind for kind, found in reached.items() if "unavailable" in found} == can_fail
+
+
+def test_the_rust_path_takes_each_kinds_value_from_the_report(monkeypatch):
+    import tensorquill.server_detect as module
+
+    real = module.server_report
+    change: dict = {}
+
+    def other(records, **kwargs):
+        report = real(records, **kwargs)
+        if "drop" in change:
+            del report["kind_checks"]
+        else:
+            report["kind_checks"]["grad_spike"] = change["grad_spike"]
+        return report
+
+    made_up = {"value": "unavailable", "records": 7, "needs": "x", "check": "made up", "reason": "because"}
+    change["grad_spike"] = made_up
+    monkeypatch.setattr(module, "server_report", other)
+    evidence = tensorquill.build_evidence(moe_edges(), detectors="rust")
+    assert evidence["kind_checks"]["grad_spike"] == made_up
+    assert len(evidence["kind_checks"]) == 32 and evidence["kind_checks"]["job_stalled"]["value"] == "not_configured"
+    # And the comparison names it: this is what a wrong value in the Rust report looks like.
+    found = both(moe_edges())
+    assert found and all(d.startswith("kind_checks.grad_spike") for d in found), found
+    change["grad_spike"] = {"value": "fine", "records": 7, "needs": "x"}
+    with pytest.raises(RuntimeError, match="does not say what was checked"):
+        tensorquill.build_evidence(moe_edges(), detectors="rust")
+    change["drop"] = True
+    with pytest.raises(RuntimeError, match="does not say what was checked"):
+        tensorquill.build_evidence(moe_edges(), detectors="rust")
 
 
 # --- where the two paths differ, on purpose -------------------------------------------------
@@ -341,6 +577,9 @@ def test_a_server_started_with_thresholds_applies_them_and_a_reader_asking_for_t
         sent = upto
         assert differences(reference(upto), document["incidents"]) == [], f"after {upto} steps"
     assert {name: document["thresholds"][name] for name in asked} == asked and document["rebuilds"] == 1
+    # The server's own incidents.json says what was checked, as the same function makes it.
+    usual = tensorquill.build_evidence(records[:200], **asked)["kind_checks"]
+    assert document["kind_checks"] == {kind: usual[kind] for kind in SERVER_KINDS}
     stream.restart()  # the new server rebuilds from its store, with the thresholds it was started with
     document = stream.send(records[200:])
     assert differences(reference(300), document["incidents"]) == []

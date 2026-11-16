@@ -88,6 +88,8 @@ pub(super) struct System {
     not_checked: Vec<Value>,
     latest: Option<Value>,
     scratch: Vec<f64>,
+    /// How many rows carried a `cuda` reading, an `nvml` reading, and a usable data wait.
+    inputs: [u64; 3],
 }
 
 impl System {
@@ -110,6 +112,8 @@ impl System {
                 .filter(|part| part.is_object())
         };
         let (cuda, nvml) = (part("cuda"), part("nvml"));
+        self.inputs[0] += u64::from(cuda.is_some());
+        self.inputs[1] += u64::from(nvml.is_some());
         self.note_unavailable(step, cuda, nvml);
         if let Some(cuda) = cuda {
             self.memory_reading(step, cuda);
@@ -121,10 +125,17 @@ impl System {
         let took = value(columns.step_time, row).filter(|took| took.is_finite());
         if let (Some(wait), Some(took)) = (wait, took) {
             if took > 0.0 && wait >= 0.0 {
+                self.inputs[2] += 1;
                 self.input_reading(step, wait, took);
             }
         }
         self.found_mask() & !before
+    }
+
+    /// How many rows carried a `cuda` reading (one that could not be taken counts: it was
+    /// asked for), an `nvml` reading, and a data wait with a step time.
+    pub(super) fn inputs(&self) -> [u64; 3] {
+        self.inputs
     }
 
     fn found_mask(&self) -> u8 {

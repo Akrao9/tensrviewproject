@@ -112,10 +112,13 @@ def records(steps=30, spike_at=None):
              "grad_norm": (9.0 if s == spike_at else 1.0) * (0.9 + (s * 37 % 21) / 100)} for s in range(steps)]
 
 
-def test_build_evidence_carries_it_and_schema_version_stays_1():
+def test_build_evidence_carries_it_and_schema_version_stays_1(tmp_path):
     evidence = tensorquill.build_evidence(records())
     assert evidence["schema_version"] == 1
-    assert evidence["run_state"]["state"] == "degraded"  # a file alone: nothing watches for stalls
+    # Records alone, which no server was watching: the stall kinds are not configured, and nothing is missing.
+    assert evidence["run_state"] == {"state": "healthy", "reasons": []}
+    # A status that was named and is not there: nothing watches for stalls where something should.
+    assert tensorquill.build_evidence(records(), watchdog=tmp_path / "watchdog.json")["run_state"]["state"] == "degraded"
     assert tensorquill.build_evidence(records(spike_at=20))["run_state"]["state"] == "unhealthy"
     assert tensorquill.build_evidence([])["run_state"]["state"] == "unknown"
 

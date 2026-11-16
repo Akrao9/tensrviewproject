@@ -417,7 +417,8 @@ def watch_update(run_dir: Path, rank: int, flush_low: int, output: Path) -> dict
     t0, c0 = time.perf_counter(), time.process_time()
     grown = tail.poll()
     t1, c1 = time.perf_counter(), time.process_time()
-    built = evidence.build_evidence(tail.records)
+    # The watcher names the store's status file, there or not: a server's store is expected to have one.
+    built = evidence.build_evidence(tail.records, watchdog=evidence._watchdog_beside(run_dir))
     t2, c2 = time.perf_counter(), time.process_time()
     written = evidence.write_evidence(built, output)
     t3, c3 = time.perf_counter(), time.process_time()

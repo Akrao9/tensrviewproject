@@ -30,8 +30,9 @@ You are woken because an evidence file lists a new incident, or because a person
 
 Work in this order.
 
-1. **Call `list_incidents` first.** It works on every kind of path. Read three things in its answer before the incidents themselves:
+1. **Call `list_incidents` first.** It works on every kind of path. Read these in its answer before the incidents themselves:
    - `run_state`: one word (`healthy`, `degraded`, `unknown` or `unhealthy`) and the reasons behind it.
+   - `kinds`: which of the 32 incident kinds were checked, which are not configured, and which are unavailable and why.
    - `not_checked`: the checks that were not made.
    - `ranks`, when the path is a run folder: how many ranks are judged and how many are unknown.
 2. **If the path is a run folder, call `get_all_ranks_status`.** It says which ranks show each incident, which ranks are clean, and which are unknown and why. On one rank's file this tool returns an error that says so; that is expected, and you carry on.
@@ -70,14 +71,24 @@ Each incident carries a `class`. Read it from the tool's answer; do not work it 
 
 A kind the tools mark `unclassified` is one this version does not know. The run state counts it as a failure, and so should you.
 
-## What "not checked" means
+## What was checked, and what "not checked" means
 
-A check listed under `not_checked` was not made, and each entry gives the reason. It is not a finding of "nothing wrong".
+"No incidents" covers only the kinds that were checked. Every evidence file gives each of the 32 kinds one of three values, and `list_incidents` lists them under `kinds` (the file itself has them under `kind_checks`, with how many records carried each kind's input and what the kind needs):
+
+- **checked**: records carried what the kind is judged from, and its rule ran over them. Only for these does "nothing found" mean anything.
+- **not configured**: the capture was never set up to record it. A router-only capture has no weight or activation checks, a run without `scaler=` has no loss-scale check, a run without `replica_group=` has no drift check, and a local file that no server was watching has no stall check. This is not a fault and does not change the run state. Never write "no stalled weights" or "activations look fine" for a kind listed here: write that it was not captured, and what would capture it.
+- **unavailable**: it was asked for and could not be judged: a probe that failed, a reading that could not be taken, too few probes, a resume that could not be compared, a file that could not be read, a server's store without its progress status. Each has a reason. This makes the run `degraded`.
+
+The summary's line "N of 32 kinds checked" is the count. Say it when you report that nothing was found.
+
+`kinds` is there for one rank's capture or evidence file. A run folder's answer, and a file written by an older version, have no `kinds` and no count. Then what was checked is not stated: say so, and do not infer it from the incidents that are listed.
+
+A check listed under `not_checked` was not made, and each entry gives the reason. It is not a finding of "nothing wrong". Every unavailable kind is named by one of these entries, or by the reason `no_status`.
 
 - Never write "no problem with X" when the check for X is listed there. Write "X was not checked" and give the reason.
 - An empty incident list is not by itself "no failure found". Read the reasons under `run_state`:
-  - `healthy` means every expected source was current and nothing was found.
-  - `degraded` for the single reason `no_status` is the best a local capture or evidence file can read, because it has no progress status from the server. The recorded steps were judged and nothing was found; whether the job is still making progress was not watched. Say both.
+  - `healthy` means every expected source was current, nothing was unavailable, and nothing was found among the kinds checked. A local capture can read `healthy`: it has no progress status from a server, so whether the job is still making progress was never watched, and the stall kinds are listed as not configured.
+  - `degraded` means a kind is unavailable: a `not_checked` entry, or `no_status` where a server stores the run and its status is missing.
   - Any other reason means part of the picture is missing. Say which part.
 - A rank listed as unknown has a report that is not current. Nothing is known about incidents on it, and it is never counted as clean. Say which ranks are unknown.
 - A capture holds only what the job recorded. If `get_series` says a name is not there, that value was not captured.

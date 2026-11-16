@@ -863,7 +863,17 @@ def test_evidence_from_parquet_parts_equals_evidence_from_the_jsonl_file(toy_moe
     for source in (run_dir, run_dir / "rank=0"):
         assert tensorquill.load_records(source, all_attempts=True) == written
         assert tensorquill.load_records(source) == tensorquill.load_records(path)
-        assert tensorquill.build_evidence(source) == tensorquill.build_evidence(path)
+        # A server's store is expected to hold the server's progress status and this one has
+        # none, which is what a local file reads when a status is named and cannot be read.
+        # The file alone has no status to miss: its stall kinds are not configured.
+        from_store = tensorquill.build_evidence(source)
+        assert from_store == tensorquill.build_evidence(path, watchdog=run_dir / "watchdog.json")
+        assert from_store["kind_checks"]["job_stalled"]["value"] == "unavailable"
+        alone = tensorquill.build_evidence(path)
+        assert alone["kind_checks"]["job_stalled"]["value"] == "not_configured"
+        assert {k: v for k, v in from_store.items() if k not in ("kind_checks", "run_state")} == {
+            k: v for k, v in alone.items() if k not in ("kind_checks", "run_state")
+        }
     assert [r["step"] for r in tensorquill.load_records(run_dir)] == list(range(130))
     one_part = sorted(run_dir.rglob("part-*.parquet"))[0]
     assert tensorquill.load_records(one_part, all_attempts=True) == written[:40]
@@ -911,7 +921,11 @@ def test_watch_follows_a_growing_jsonl_file_and_new_parquet_parts(tmp_path):
     # A store with parts and no incidents.json: the detectors ran here, and the evidence says why.
     detection = live.pop("detection")
     assert (detection["source"], detection["state"], detection["stored_last_step"]) == ("python", "missing", 49)
-    assert live == tensorquill.build_evidence(records + _steps(2, range(30, 50), moe={"r": [10, 10]}))
+    # (The watcher names the store's status file, which is not there: a status was expected.)
+    assert live == tensorquill.build_evidence(
+        records + _steps(2, range(30, 50), moe={"r": [10, 10]}), watchdog=run_dir / "watchdog.json"
+    )
+    assert "no_status" in [r["code"] for r in live["run_state"]["reasons"]]
     assert watch(tmp_path / "nothing-here.jsonl", interval=0.0, polls=2) is None
 
 

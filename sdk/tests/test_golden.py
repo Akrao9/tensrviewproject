@@ -1,14 +1,17 @@
 """The Python detectors' outputs, frozen as files, and both detector paths held to them.
 
 `golden/` has one file per record set. It holds what `tensorquill.build_evidence(records)`,
-the Python detectors, gave for `incidents`, `not_checked`, `run_state` and the per-step MoE
-`samples`. The Python detectors are to be deleted once the Rust ones do the same work, and
+the Python detectors, gave for `incidents`, `not_checked`, `kind_checks` (what was checked),
+`run_state` and the per-step MoE `samples`. The Python detectors are to be deleted once the Rust ones do the same work, and
 from then on these files are the reference. Until then each file is checked twice:
 
 - the Python path still gives it, which keeps the files honest while the Python code exists;
 - the Rust path (`detectors="rust"`) gives the same, compared as the parity tests compare
   (`differences`: numbers to 1e-12, a NaN in Python as `null` in Rust). Its `samples` are
-  still made in Python today; they are compared so that the test holds when they move.
+  made in Rust too (`tensorquill-server detect --samples`), and held to the files by the
+  same rule. test_server_detect.py compares them with the live Python samples with no
+  tolerance; a file may have been written on another platform, so here the last digits of
+  a number are allowed to differ.
 
 The record sets are `CASES` of test_server_detect.py and the seven Gate 1 fixtures, made here
 by `experiments/moe-bakeoff/generate.py` and passed through the SDK's writer and reader as
@@ -65,7 +68,7 @@ from test_server_detectors import differences  # noqa: E402
 
 GOLDEN = Path(__file__).resolve().parent / "golden"
 GENERATE = Path(__file__).resolve().parents[2] / "experiments" / "moe-bakeoff" / "generate.py"
-FROZEN = ("incidents", "not_checked", "run_state", "samples")
+FROZEN = ("incidents", "kind_checks", "not_checked", "run_state", "samples")
 TAG = "$float"
 TOLERANCE = 1e-12  # relative, as `differences` has it
 HASH_DIGITS = 9

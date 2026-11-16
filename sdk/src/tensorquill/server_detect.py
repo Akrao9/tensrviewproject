@@ -2,8 +2,9 @@
 
 The server binary judges one rank's rows read from an Arrow stream and prints the report it
 would write as that rank's `incidents.json`. `server_report` is the Python side: records in,
-that report out. `build_evidence(..., detectors="rust")` takes its incidents from it, and
-passes its own threshold options on as the server's one `--thresholds` JSON object.
+that report out. `build_evidence(..., detectors="rust")` takes its incidents and its per-step
+MoE samples from it (`detect --samples`), and passes its own threshold options on as the
+server's one `--thresholds` JSON object.
 
 Needs `pyarrow` (the `flight` extra) and the binary: on `PATH`, or named by
 `TENSORQUILL_SERVER_BIN`.
@@ -70,6 +71,7 @@ def server_report(
     thresholds: Mapping[str, Any] | None = None,
     binary: str | os.PathLike[str] | None = None,
     timeout: float | None = 300.0,
+    samples: bool = False,
 ) -> dict[str, Any]:
     """The server's detectors over one rank's records: the report `tensorquill-server` writes
     as `rank=<rank>/incidents.json`, made here from records in hand.
@@ -83,13 +85,18 @@ def server_report(
     the report's own `thresholds` lists what was applied. An unknown key or a value the
     server refuses raises `ValueError`.
 
+    `samples=True` asks for one more key, `samples` (`detect --samples`): the per-step MoE
+    samples as `build_evidence` lists them, one for every record and router, judged by the
+    same rules as the incidents. The server's own `incidents.json` never has them. For a long
+    MoE run they are most of the output: 97 MB for 10,000 steps of 24 routers of 32 experts.
+
     Raises `RuntimeError` when the binary or `pyarrow` is missing, or the binary fails.
     """
     records = list(records)
     if not records:
         raise ValueError("no records to judge")
     chosen = server_binary(binary)
-    command = [chosen, "detect"]
+    command = [chosen, "detect", *(["--samples"] if samples else [])]
     if thresholds is not None:
         try:
             command += ["--thresholds", json.dumps(dict(thresholds), allow_nan=False)]
@@ -106,7 +113,7 @@ def server_report(
             refused = message.split("for '--thresholds <JSON>':", 1)[-1].split("\n", 1)[0].strip()
             raise ValueError(f"the Rust detectors refuse these thresholds: {refused}")
         if "unrecognized subcommand" in message or "unexpected argument" in message:
-            message += " (this tensorquill-server is too old to have `detect` or `--thresholds`: rebuild it)"
+            message += " (this tensorquill-server is too old to have `detect`, `--thresholds` or `--samples`: rebuild it)"
         raise RuntimeError(f"{chosen} detect failed: {message}")
     try:
         report = json.loads(done.stdout)
@@ -114,4 +121,6 @@ def server_report(
         raise RuntimeError(f"{chosen} detect did not print a report: {done.stdout[:200]!r}") from error
     if not isinstance(report, dict) or not isinstance(report.get("incidents"), list):
         raise RuntimeError(f"{chosen} detect printed something that is not a report")
+    if samples and not isinstance(report.get("samples"), list):
+        raise RuntimeError(f"{chosen} detect --samples printed a report without samples")
     return report

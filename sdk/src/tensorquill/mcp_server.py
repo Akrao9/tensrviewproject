@@ -48,6 +48,7 @@ from .evidence import (
     build_evidence,
     incident_class,
     incident_summary,
+    kinds_by_value,
     load_records,
     read_server_report,
     read_watchdog,
@@ -562,6 +563,10 @@ def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, An
     if len(entries) > limit:
         answer["incidents_omitted"] = len(entries) - limit
     answer["not_checked"] = _not_checked(opened)
+    kinds = kinds_by_value(evidence)
+    if kinds is not None:
+        # What "no incidents" covers: the kinds that were looked for, and those that could not be.
+        answer["kinds"] = kinds
     if isinstance(evidence.get("detection"), dict):
         answer["detection"] = evidence["detection"]
     summary = _summary(evidence)
@@ -989,10 +994,13 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " (invariant, anomaly or observation), first step and `where` (the MoE layer and router with expert"
             " numbers, or the parameters or modules it names), in the order the evidence lists them. Also gives the"
             " run state with its reasons, what was not checked, and a text summary. An empty list is not by itself"
-            " \"no failure\": read the run state's reasons. With no incidents, a state of healthy, or of degraded"
-            " for the one reason no_status (a local file has no progress status, so stalls are not watched), means"
-            " the recorded steps were judged and nothing was found. A not_checked entry or an unknown rank means"
-            " that part was not judged."
+            " \"no failure\": read the run state's reasons and `kinds`. With no incidents, a state of healthy means"
+            " the recorded steps were judged and nothing was found, for the kinds listed under `kinds.checked`"
+            " only. A kind under `kinds.not_configured` was never looked for, because the capture does not record"
+            " what it needs; one under `kinds.unavailable` was asked for and could not be judged, and makes the"
+            " state degraded. When the answer has no `kinds` (a run folder, or a file from an older version), what"
+            " was checked is not stated: do not infer it. A not_checked entry or an unknown rank means that part"
+            " was not judged."
             " For a run folder the incidents are grouped across ranks; `rank` keeps one rank's."
         ),
         "inputSchema": {

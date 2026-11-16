@@ -241,7 +241,7 @@ def test_evidence_with_no_incidents_keeps_no_samples_and_reads_the_same():
     assert marker["around"] == [] and marker["kept_steps"] == []
     assert marker["samples"] == {"total": 120, "kept": 0, "omitted": 120}
     assert marker["moe_flagged"] == {"samples": 0, "last_step": None}
-    assert incident_summary(small) == incident_summary(full) == "No incidents detected."
+    assert incident_summary(small) == incident_summary(full) == "No incidents detected.\n5 of 32 kinds checked, 27 not configured"
     assert run_state_line(small) == run_state_line(full)
     with pytest.raises(SamplesOmitted, match="no step, since no MoE incident is listed"):
         tensorquill.expert_load_table(small, 10, 1)
@@ -274,7 +274,8 @@ def test_the_cli_writes_the_compact_file_instead_of_the_full_one(tmp_path, monke
     assert full_path.read_bytes() == full_bytes
     small = json.loads(small_path.read_text())
     assert small["compact"]["window"] == 5 and small["compact"]["kept_steps"] == [[95, 105]]
-    assert len(small["samples"]) == 11 and small_path.stat().st_size < len(full_bytes) / 10
+    # (What was checked, `kind_checks`, is about 3 KB of either file: a tenth was the bound before it.)
+    assert len(small["samples"]) == 11 and small_path.stat().st_size < len(full_bytes) / 5
 
     # --compact-window implies --compact; -o names the file.
     full_path.unlink()

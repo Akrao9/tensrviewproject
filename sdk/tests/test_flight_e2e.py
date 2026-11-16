@@ -109,7 +109,10 @@ def test_a_capture_file_reaches_parquet_unchanged(tmp_path, toy_moe, monkeypatch
         # The detectors read the same thing from either side.
         assert tensorquill.build_evidence(stored) == tensorquill.build_evidence(written)
         assert tensorquill.load_records(store / "runs" / "e2e") == written
-        assert tensorquill.build_evidence(store / "runs" / "e2e") == tensorquill.build_evidence(path)
+        # (This server writes no status. A store is expected to have one, a local file is not.)
+        assert tensorquill.build_evidence(store / "runs" / "e2e") == tensorquill.build_evidence(
+            path, watchdog=store / "runs" / "e2e" / "watchdog.json"
+        )
     finally:
         assert server.terminate() == 0
 
@@ -252,7 +255,10 @@ def test_a_resumed_run_keeps_its_repeated_steps_and_watch_reads_them(tmp_path, t
     # The server's own progress status is all the directory has and the file has not.
     assert evidence["watchdog"]["summary"] == "finished"  # close() ended every stream cleanly
     from_file = tensorquill.build_evidence(path)
-    assert "no_status" in [r["code"] for r in from_file["run_state"]["reasons"]]
+    # A local file no server was watching has no status to miss.
+    assert "no_status" not in [r["code"] for r in from_file["run_state"]["reasons"]]
+    assert from_file["kind_checks"]["job_stalled"]["value"] == "not_configured"
+    assert evidence["kind_checks"]["job_stalled"]["value"] == "checked"
     assert _without_status(evidence) == _without_status(from_file)
     assert not [i for i in evidence["incidents"] if i["kind"] == "repeated_steps"]
 
@@ -579,9 +585,11 @@ def test_a_pause_with_no_sign_of_work_is_limited_and_one_that_ticks_is_not(tmp_p
 
 
 def _without_status(evidence: dict) -> dict:
-    """The evidence less what only a run with the server's status has: the status, and the reason the run
-    state gives for its absence (`no_status`, for a `.jsonl` read alone)."""
-    out = {k: v for k, v in evidence.items() if k not in ("watchdog", "run_state")}
+    """The evidence less what only a run with the server's status has: the status, whether the stall
+    kinds were checked, and the reason the run state gives when a status was expected and is absent
+    (`no_status`)."""
+    out = {k: v for k, v in evidence.items() if k not in ("watchdog", "run_state", "kind_checks")}
     reasons = [r for r in evidence["run_state"]["reasons"] if r["code"] != "no_status"]
     out["run_state_reasons"] = reasons
+    out["kind_checks"] = {k: v for k, v in evidence["kind_checks"].items() if k not in ("job_stalled", "rank_silent")}
     return out
