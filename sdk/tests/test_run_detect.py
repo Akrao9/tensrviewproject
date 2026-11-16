@@ -214,6 +214,11 @@ def test_the_binary_takes_a_stream_a_rank_and_only_with_run(tmp_path):
     assert two.returncode == 1 and b"send one rank of one run" in two.stderr
     one = subprocess.run([str(BINARY), "detect", files[1]], capture_output=True, timeout=60)
     assert json.loads(one.stdout) == server_report([r for r in records if r["rank"] == 1]) == document["reports"][1]
+    # The per-step MoE samples are one rank's: --samples is refused beside --run, not ignored.
+    both = subprocess.run([str(BINARY), "detect", "--run", "--samples", *files], capture_output=True, timeout=60)
+    assert both.returncode == 2 and b"--samples" in both.stderr and b"--run" in both.stderr and both.stdout == b""
+    sampled = subprocess.run([str(BINARY), "detect", "--samples", files[1]], capture_output=True, timeout=60)
+    assert sampled.returncode == 0 and {**json.loads(sampled.stdout), "samples": None} == {**document["reports"][1], "samples": None}
 
 
 def test_what_cannot_be_judged_is_refused_with_the_reason():

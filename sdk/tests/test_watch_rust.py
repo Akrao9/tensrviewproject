@@ -295,7 +295,12 @@ def test_a_store_whose_report_cannot_be_used_is_judged_here_through_rust(tmp_pat
     # Parts and no incidents.json: the detectors ran here, with the engine asked for.
     assert evidence["rust"]["detection"]["state"] == "missing" and evidence["rust"]["detection"] == evidence["python"]["detection"]
     assert same(evidence["python"], evidence["rust"]) == []
-    assert same(tensorquill.build_evidence(records), {k: v for k, v in evidence["rust"].items() if k != "detection"}) == []
+    # (The watcher names the store's status file, which is not there: a status was expected.)
+    assert same(
+        tensorquill.build_evidence(records, watchdog=folder / "watchdog.json"),
+        {k: v for k, v in evidence["rust"].items() if k != "detection"},
+    ) == []
+    assert evidence["rust"]["kind_checks"]["job_stalled"]["value"] == "unavailable"
 
 
 def test_a_missing_binary_is_said_before_the_first_look(tmp_path, monkeypatch):
@@ -316,3 +321,21 @@ def test_a_missing_binary_is_said_before_the_first_look(tmp_path, monkeypatch):
     assert done.returncode == 2 and "is not a file" in done.stderr and "Traceback" not in done.stderr
     # The Python detectors need neither.
     assert watch(path, interval=0.0, polls=1) == path.with_suffix(".evidence.json")
+
+
+def test_a_binary_too_old_for_the_samples_is_said_and_no_evidence_is_written(tmp_path, monkeypatch):
+    """The binary is there, so the check before the first look passes; it refuses `--samples`
+    at the first rebuild. The watcher stops with the message that says to rebuild it."""
+    path = tmp_path / "w.jsonl"
+    path.write_text(lines(everything()[:20]), encoding="utf-8")
+    old = tmp_path / "old-server"
+    old.write_text("#!/bin/sh\necho \"error: unexpected argument '--samples' found\" >&2\nexit 2\n", encoding="utf-8")
+    old.chmod(0o755)
+    monkeypatch.setenv(BINARY_ENV, str(old))
+    with pytest.raises(RuntimeError, match="too old to have `detect`, `--thresholds` or `--samples`: rebuild it"):
+        watch(path, interval=0.0, polls=1, detectors="rust")
+    assert not path.with_suffix(".evidence.json").exists()
+    done = subprocess.run([sys.executable, "-m", "tensorquill", str(path), "--watch", "--detectors", "rust"],
+                          capture_output=True, text=True, timeout=60, cwd=tmp_path)
+    assert done.returncode == 2 and "rebuild it" in done.stderr and "Traceback" not in done.stderr
+    assert not path.with_suffix(".evidence.json").exists()

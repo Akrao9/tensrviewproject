@@ -1930,6 +1930,21 @@ def _report_evidence(
             "silent_floor_seconds", "critical_seconds",
         ) if k in status}} if status else {}),
     }
+    # What was checked: the server's own values for the kinds it judges, and this reader's for
+    # the rest. A store is expected to hold the server's status. A report from a server older
+    # than the key has none, and then this evidence does not say what was checked.
+    rank_checks = report.get("kind_checks")
+    if isinstance(rank_checks, Mapping) and all(
+        isinstance(rank_checks.get(kind), Mapping) and rank_checks[kind].get("value") in KIND_CHECK_VALUES
+        for kind in SERVER_KINDS
+    ):
+        others = other_kind_checks(
+            status=status, status_expected=True, not_checked=not_checked,
+            flight_recorder=flight_recorder is not None, traincheck=traincheck is not None,
+        )
+        evidence["kind_checks"] = {
+            kind: dict({**rank_checks, **others}[kind]) for kind in INCIDENT_CLASSES
+        }
     evidence["run_state"] = _per_rank_run_state(evidence, status, _status_age(status), steps_judged=bool(report.get("steps")))
     return evidence
 

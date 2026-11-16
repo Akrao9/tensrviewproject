@@ -82,11 +82,15 @@ def test_a_current_report_with_no_incidents_is_said_to_be_current(tmp_path, monk
     assert (detection["source"], detection["state"]) == ("server", "current")
     assert (detection["report_attempt"], detection["report_last_step"], detection["report_steps"]) == (1, 119, 120)
     assert (detection["stored_attempt"], detection["stored_last_step"]) == (1, 119)
-    assert summary.splitlines() == [
+    lines = summary.splitlines()
+    # What was checked is counted from the server's report, in a line of its own.
+    assert [line for line in lines if "kinds checked" not in line] == [
         "No incidents detected.",
         "Incidents are from tensorquill-server's report for rank 0: the server's report is current through"
         " step 119 of attempt 1 (120 steps judged).",
     ]
+    assert len(lines) == 3 and " of 32 kinds checked" in lines[1]
+    assert list(evidence["kind_checks"]) == list(tensorquill.build_evidence(healthy(range(120)))["kind_checks"])
     # The two sources the server never has are not listed as unchecked on every look.
     assert "not_checked" not in evidence
     # Nothing changes, so nothing is written again: one evidence file in four looks.
@@ -152,9 +156,33 @@ def test_the_incidents_of_a_current_report_are_python_s_and_the_summary_shows_th
     # Every other incident reads as it does when Python worked it out, but for a NaN, which
     # is null in the server's strict JSON and cannot be told from an Inf.
     expected = [line.replace("sometimes_nan nan", "sometimes_nan not finite") for line in python_lines[2:]]
-    # (Evidence built from the server's report does not carry `kind_checks` yet, so its summary
-    # has no count of the kinds checked. The report itself has the key.)
-    assert [line for line in expected if not line.startswith("Heatmap") and "kinds checked" not in line] == ours[2:-1]
+    # What was checked is counted apart: the store has the server's status, so its two stall
+    # kinds are checked, where a list of records with no status has them not configured.
+    def counted(lines):
+        return [line for line in lines if "kinds checked" in line]
+
+    def rest(lines):
+        return [line for line in lines if not line.startswith("Heatmap") and "kinds checked" not in line]
+
+    assert rest(expected) == rest(ours[2:-1])
+    alone = tensorquill.build_evidence(records)["kind_checks"]
+    here = evidence["kind_checks"]
+    assert list(here) == list(alone)
+    # (Checked once the server's status has been read; unavailable in a look that came before it.)
+    stall = "checked" if "watchdog" in evidence else "unavailable"
+    assert {kind: here[kind]["value"] for kind in ("job_stalled", "rank_silent")} == {
+        "job_stalled": stall, "rank_silent": stall
+    }
+    assert {kind: alone[kind]["value"] for kind in ("job_stalled", "rank_silent")} == {
+        "job_stalled": "not_configured", "rank_silent": "not_configured"
+    }
+    assert {k: v for k, v in here.items() if k not in ("job_stalled", "rank_silent")} == {
+        k: v for k, v in alone.items() if k not in ("job_stalled", "rank_silent")
+    }
+    checked = sum(1 for check in here.values() if check["value"] == "checked")
+    assert len(counted(ours)) == 1 and counted(ours)[0].startswith(f"{checked} of 32 kinds checked")
+    in_python = checked - (2 if stall == "checked" else 0)
+    assert len(counted(expected)) == 1 and counted(expected)[0].startswith(f"{in_python} of 32 kinds checked")
     assert any("not finite" in line for line in ours)
     assert stream.server.terminate() == 0
 
@@ -295,6 +323,25 @@ def test_a_kill_between_a_part_and_its_report_leaves_a_report_that_is_behind(tmp
     assert stream.server.terminate() == 0
 
 
+def test_a_report_from_a_server_older_than_kind_checks_gives_evidence_that_does_not_say_what_was_checked(tmp_path):
+    stream = Stream(tmp_path, *FAST, *QUICK_STATUS)
+    stream.send(healthy(range(60)))
+    assert stream.server.terminate() == 0
+    evidence, summary = look(stream, tmp_path)
+    assert evidence["detection"]["source"] == "server" and len(evidence["kind_checks"]) == 32
+    assert "kinds checked" in summary
+    # The same report as an older server wrote it: without the key.
+    report = json.loads(stream.incidents_file.read_text())
+    del report["kind_checks"]
+    stream.incidents_file.write_text(json.dumps(report))
+    older, summary = look(stream, tmp_path)
+    assert older["detection"]["source"] == "server" and "kind_checks" not in older
+    assert "kinds checked" not in summary
+    assert {k: v for k, v in older.items() if k != "written_at_ms"} == {
+        k: v for k, v in evidence.items() if k not in ("kind_checks", "written_at_ms")
+    }
+
+
 def test_a_stopped_server_is_not_reported_as_a_quiet_run(tmp_path):
     stream = Stream(tmp_path, *FAST, *QUICK_STATUS)
     sender = keep_open(stream, healthy(range(60)))
@@ -304,7 +351,7 @@ def test_a_stopped_server_is_not_reported_as_a_quiet_run(tmp_path):
     finally:
         sender.close(0.0)
     assert evidence["watchdog"]["summary"] == "server_stopped" and evidence["incidents"] == []
-    assert summary.splitlines()[:2] == [
+    assert [line for line in summary.splitlines() if "kinds checked" not in line][:2] == [
         "No incidents detected.",
         "The server has stopped: nothing is watching this run for stalls, and no new steps are stored.",
     ]
