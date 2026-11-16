@@ -265,7 +265,8 @@ def judge_stalled_weights(
         f" ({incident['with_gradients']} with a gradient)"
     )
     if extras:
-        notes.append(f"besides the seeded one ({len(extras)}): {extras}")
+        label = "besides the seeded one" if seeded in names else "listed instead of the seeded one"
+        notes.append(f"{label} ({len(extras)}): {extras}")
     optimizer = incident.get("optimizer", {})
     notes.append(
         f"optimizer evidence: {optimizer.get('state')}, {optimizer.get('not_held_count', 0)} stalled parameter(s) not held"
