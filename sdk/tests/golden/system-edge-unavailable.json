@@ -1,0 +1,11 @@
+{
+"case":"system edge unavailable",
+"incidents":[],
+"not_checked":[
+{"check":"cuda_memory","kinds":["memory_growth","memory_pressure","allocator_retries"],"reason":"the model is on cpu, not a CUDA device","step":9},
+{"check":"nvml","kinds":["hardware_errors","gpu_throttled"],"reason":"pynvml is not installed (pip install nvidia-ml-py)","step":9}
+],
+"records":{"count":30,"sha256":"99214435da9a6096d8e9f71e11c43e8c6ad42d93cf0144f398638e166b892d53"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"checks":["cuda_memory","nvml"],"code":"not_checked","detail":"not checked: cuda_memory, nvml","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

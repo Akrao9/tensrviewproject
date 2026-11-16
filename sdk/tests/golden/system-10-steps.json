@@ -1,0 +1,10 @@
+{
+"case":"system, 10 steps",
+"incidents":[],
+"not_checked":[
+{"check":"nvml","kinds":["hardware_errors"],"metric":"xid","reason":"NVMLError_NotSupported: Not Supported","step":9}
+],
+"records":{"count":10,"sha256":"9b02e22541b74a6d85421fd30a124e37b90443febbeed6bc8d6a9e8827ad7a15"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"checks":["nvml"],"code":"not_checked","detail":"not checked: nvml","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

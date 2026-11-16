@@ -1,0 +1,10 @@
+{
+"case":"system edge large",
+"incidents":[
+{"class":"invariant","ecc_uncorrected":0,"ecc_uncorrected_at_start":0,"kind":"hardware_errors","step":70,"xid":[79,48]}
+],
+"not_checked":[],
+"records":{"count":10,"sha256":"f9f1e4e3d181d3de79ce6b566dd81c174cb0a39795fbb2cee392cdb6e1f23c65"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: hardware_errors","kinds":["hardware_errors"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

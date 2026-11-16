@@ -1,0 +1,10 @@
+{
+"case":"edge low-scale",
+"incidents":[
+{"class":"invariant","consecutive_skips":0,"grad_scale":0.5,"kind":"loss_scale_trouble","reason":"scale","recorded_steps":8,"skipped_steps":1,"step":4}
+],
+"not_checked":[],
+"records":{"count":8,"sha256":"47cbf8f208da86e4f220c75705366d5c05b157fd6a107392b66a5280000e4d91"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: loss_scale_trouble","kinds":["loss_scale_trouble"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

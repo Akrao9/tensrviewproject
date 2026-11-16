@@ -1,0 +1,12 @@
+{
+"case":"a resume after a rollback",
+"incidents":[
+{"changes":[{"attempt":2,"basis":"same_step","batches_apart":null,"expected_hash":"837bc0b9fbb3d7b1","finding":"differs","matched_step":null,"previous_attempt":1,"rank":0,"resumed_hash":"276d1aaf6474f8f8","step":10}],"class":"observation","kind":"resume_data_mismatch","note":"an observation: a resume that starts its epoch over on purpose repeats data too","resumes":1,"scalars":{"train/loss":{"median_before":2.0054999999999996,"value":2.01}},"step":10}
+],
+"not_checked":[
+{"check":"resume_data","rank":0,"reason":"the earlier attempts ended before the resume step and drew the resumed batch nowhere: a resume that repeats no batch looks the same as one that skips","step":20}
+],
+"records":{"count":40,"sha256":"f9255804310d3fd037361c26850593b105cb4a1410994da62809302651b75e13"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"checks":["resume_data"],"code":"not_checked","detail":"not checked: resume_data","state":"degraded"},{"code":"observations","detail":"1 observation listed, not counted as failures: resume_data_mismatch","kinds":["resume_data_mismatch"],"state":"healthy"}],"state":"degraded"},
+"samples":[]
+}

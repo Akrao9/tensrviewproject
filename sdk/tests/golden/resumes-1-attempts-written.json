@@ -1,0 +1,8 @@
+{
+"case":"resumes, 1 attempts written",
+"incidents":[],
+"not_checked":[],
+"records":{"count":150,"sha256":"b2225b3c59e96d838550807cfc2bbc39b4b6bf22cfa151b71f99531a905e876b"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

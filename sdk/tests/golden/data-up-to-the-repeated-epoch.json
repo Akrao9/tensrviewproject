@@ -1,0 +1,10 @@
+{
+"case":"data, up to the repeated epoch",
+"incidents":[
+{"batches_compared":3,"class":"invariant","epoch":2,"kind":"epoch_order_repeated","previous_epoch":1,"previous_sampler_epoch":0,"sampler_epoch":0,"scalars":{"train/loss":{"median_before":2.0004999999999997,"value":1.99}},"shuffle":true,"step":20,"through_step":22}
+],
+"not_checked":[],
+"records":{"count":23,"sha256":"8f7b89dbf4d345d6f12684c070461ee887e96c98de00ff40e2609bce8354ec01"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: epoch_order_repeated","kinds":["epoch_order_repeated"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}
