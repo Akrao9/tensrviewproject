@@ -2668,6 +2668,8 @@ def build_evidence(
     flight_recorder: str | Path | None = None,
     flight_recorder_prefix: str | None = None,
     traincheck: str | Path | None = None,
+    detectors: str = "python",
+    server_binary: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Build viewer-neutral detector evidence from captured step records.
 
@@ -2690,7 +2692,31 @@ def build_evidence(
     before it was recorded: one value for every router, or a value per router name.
     `overload_threshold` is the base assignment-share threshold for top-1 and top-2.
     Top-3 and higher use a per-router baseline once ten unflagged samples are available.
+
+    `detectors="rust"` takes the incidents of the server's kinds (`SERVER_KINDS`) from the
+    Rust detectors, run here on the same records through `tensorquill-server detect`
+    (`server_binary`, else `TENSORQUILL_SERVER_BIN`, else the one on `PATH`; needs `pyarrow`).
+    The Rust rules take no options, so any threshold or `top_k` other than the default raises
+    `ValueError`. The per-step `samples`, the weight trends and the kinds read from other
+    files are still made here. The evidence then carries `"detectors": "rust"`.
     """
+    if detectors not in ("python", "rust"):
+        raise ValueError(f"detectors must be 'python' or 'rust', not {detectors!r}")
+    if detectors == "rust":
+        changed = [
+            name for name, value, default in (
+                ("overload_threshold", overload_threshold, OVERLOAD_THRESHOLD),
+                ("drift_tolerance", drift_tolerance, DRIFT_TOLERANCE),
+                ("starve_window", starve_window, STARVE_WINDOW),
+                ("starve_ratio", starve_ratio, STARVE_RATIO),
+                ("top_k", top_k, None),
+            ) if value != default
+        ]
+        if changed:
+            raise ValueError(
+                f"the Rust detectors apply the default thresholds and the recorded top-k; {', '.join(changed)} "
+                "was given. Use detectors='python' for other values"
+            )
     every_attempt = load_records(source, rank=rank, all_attempts=True)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
@@ -2780,45 +2806,79 @@ def build_evidence(
                 sample["overload_rule"] = rule
             samples.append(sample)
 
-    incidents: list[dict[str, Any]] = []
-    moe_hit = first_incident({"samples": samples})
-    if moe_hit is not None:
-        incidents.append(
-            {
-                "kind": "moe_imbalance",
-                "step": moe_hit["step"],
-                "layer": moe_hit["layer"],
-                "router": moe_hit.get("router", f"layer-{moe_hit['layer']:02}"),
-                "diversity": moe_hit["diversity"],
-                "overloaded": moe_hit["overloaded"],
-                "dead": moe_hit["dead"],
-            }
-        )
     _mark_starved(samples, starve_window, starve_ratio)
-    starved_hit = detect_starved_experts(samples)
-    if starved_hit is not None:
-        incidents.append(starved_hit)
-    for detector in (detect_grad_spikes, detect_stalled_weights, detect_repeated_steps, detect_loss_scale_trouble):
-        # Only this detector looks at what a later attempt replaced.
-        detector_records = every_attempt if detector is detect_repeated_steps else records
-        hit = detector(detector_records)
-        if hit is not None:
-            incidents.append(hit)
-    not_checked: list[dict[str, Any]] = []
-    resume_hit = detect_resume_lr_changes(every_attempt, not_checked=not_checked)
-    if resume_hit is not None:
-        incidents.append(resume_hit)
-    incidents.extend(hit for hit in detect_resume_state(every_attempt, not_checked=not_checked) if hit is not None)
-    for data_detector in (detect_data_stalled, detect_epoch_order_repeated):
-        data_hit = data_detector(records)
-        if data_hit is not None:
-            incidents.append(data_hit)
-    incidents.extend(detect_activation_anomalies(records))
-    incidents.extend(detect_attention_anomalies(records, not_checked=not_checked))
-    non_finite_hit = detect_non_finite(records)
-    if non_finite_hit is not None:
-        incidents.append(non_finite_hit)
-    incidents.extend(detect_system_incidents(records, not_checked))
+    incidents: list[dict[str, Any]]
+    not_checked: list[dict[str, Any]]
+    from_rust: list[dict[str, Any]] | None = None
+    if detectors == "rust" and every_attempt:
+        from .server_detect import server_report
+
+        report = server_report(every_attempt, binary=server_binary)
+        absent = [kind for kind in SERVER_KINDS if kind not in (report.get("checked") or ())]
+        if absent:
+            raise RuntimeError(
+                f"this tensorquill-server does not check {', '.join(absent)} (an older one): build it from the same version"
+            )
+        applied = report.get("thresholds") or {}
+        asked = {
+            "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
+            "starve_window": starve_window, "starve_ratio": starve_ratio, "spike_sustain": SPIKE_SUSTAIN,
+        }
+        differing = [name for name, value in asked.items() if applied.get(name) != value]
+        if differing:
+            # The samples below are judged here and the incidents there: they must use one rule.
+            raise RuntimeError(
+                "this tensorquill-server applies other thresholds than this SDK ("
+                + ", ".join(f"{name} {applied.get(name)!r}, here {asked[name]!r}" for name in differing)
+                + "): build the server from the same version"
+            )
+        from_rust = [dict(incident) for incident in report["incidents"]]
+        incidents = [i for i in from_rust if i.get("kind") != "replica_drift"]
+        # The server lists these two as not checked in every report, since it never has their
+        # files. Here they are checked when asked for.
+        not_checked = [
+            dict(item) for item in report.get("not_checked") or ()
+            if isinstance(item, dict) and item.get("check") not in ("flight_recorder", "traincheck")
+        ]
+    else:
+        incidents = []
+        moe_hit = first_incident({"samples": samples})
+        if moe_hit is not None:
+            incidents.append(
+                {
+                    "kind": "moe_imbalance",
+                    "step": moe_hit["step"],
+                    "layer": moe_hit["layer"],
+                    "router": moe_hit.get("router", f"layer-{moe_hit['layer']:02}"),
+                    "diversity": moe_hit["diversity"],
+                    "overloaded": moe_hit["overloaded"],
+                    "dead": moe_hit["dead"],
+                }
+            )
+        starved_hit = detect_starved_experts(samples)
+        if starved_hit is not None:
+            incidents.append(starved_hit)
+        for detector in (detect_grad_spikes, detect_stalled_weights, detect_repeated_steps, detect_loss_scale_trouble):
+            # Only this detector looks at what a later attempt replaced.
+            detector_records = every_attempt if detector is detect_repeated_steps else records
+            hit = detector(detector_records)
+            if hit is not None:
+                incidents.append(hit)
+        not_checked = []
+        resume_hit = detect_resume_lr_changes(every_attempt, not_checked=not_checked)
+        if resume_hit is not None:
+            incidents.append(resume_hit)
+        incidents.extend(hit for hit in detect_resume_state(every_attempt, not_checked=not_checked) if hit is not None)
+        for data_detector in (detect_data_stalled, detect_epoch_order_repeated):
+            data_hit = data_detector(records)
+            if data_hit is not None:
+                incidents.append(data_hit)
+        incidents.extend(detect_activation_anomalies(records))
+        incidents.extend(detect_attention_anomalies(records, not_checked=not_checked))
+        non_finite_hit = detect_non_finite(records)
+        if non_finite_hit is not None:
+            incidents.append(non_finite_hit)
+        incidents.extend(detect_system_incidents(records, not_checked))
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
     stream_incidents = detect_watchdog_incidents(status)
     incidents.extend(stream_incidents)
@@ -2831,12 +2891,18 @@ def build_evidence(
         incidents, stream_incidents, not_checked, last_step=last_step, newest_ts=newest_ts,
         traincheck=traincheck, flight_recorder=flight_recorder, flight_recorder_prefix=flight_recorder_prefix,
     )
-    drift_hit = detect_replica_drift(records, tolerance=drift_tolerance)
+    if from_rust is not None:
+        drift_hit = next((i for i in from_rust if i.get("kind") == "replica_drift"), None)
+    else:
+        drift_hit = detect_replica_drift(records, tolerance=drift_tolerance)
     if drift_hit is not None:
         incidents.append(drift_hit)
 
     if any(record.get("scalars") for record in records):
+        rust_made = {id(incident) for incident in from_rust or ()}  # these carry their scalars already
         for incident in incidents:
+            if id(incident) in rust_made:
+                continue
             context = scalar_context(records, incident["step"])
             if context:
                 incident["scalars"] = context
@@ -2857,6 +2923,7 @@ def build_evidence(
         "starve_ratio": starve_ratio,
         "incidents": incidents,
         "samples": samples,
+        **({"detectors": "rust"} if from_rust is not None else {}),
         **({"not_checked": not_checked} if not_checked else {}),
         **({"weight_trends": trends} if trends else {}),
         **({"memory": memory} if memory else {}),
@@ -3968,8 +4035,18 @@ def main() -> None:
         type=int,
         help="experts chosen per token, for captures made before moe_top_k was recorded",
     )
+    parser.add_argument(
+        "--detectors",
+        choices=("python", "rust"),
+        default="python",
+        help="rust: take the incidents of the server's kinds from the Rust detectors, run on this file through "
+        "`tensorquill-server detect` (the binary on PATH or named by TENSORQUILL_SERVER_BIN; needs pyarrow). "
+        "One finished file or store at the default thresholds: not with --watch, --rank all or --top-k",
+    )
     args = parser.parse_args()
 
+    if args.detectors == "rust" and (args.watch or args.rank == ALL_RANKS):
+        parser.error("--detectors rust reads one rank once: it cannot be combined with --watch or --rank all")
     if args.rank == ALL_RANKS:
         _main_all_ranks(args, parser)
         return
@@ -4009,12 +4086,17 @@ def main() -> None:
         return
 
     records = load_records(args.input, rank=rank, all_attempts=True)
-    evidence = build_evidence(
-        records, overload_threshold=args.overload_threshold, top_k=args.top_k,
-        watchdog=_watchdog_beside(args.input),
-        flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
-        traincheck=args.traincheck,
-    )
+    try:
+        evidence = build_evidence(
+            records, overload_threshold=args.overload_threshold, top_k=args.top_k,
+            watchdog=_watchdog_beside(args.input),
+            flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
+            traincheck=args.traincheck, detectors=args.detectors,
+        )
+    except (RuntimeError, ValueError) as error:
+        if args.detectors != "rust":
+            raise
+        parser.error(str(error))
     out_json = write_evidence(evidence, args.output or default_evidence_path(args.input, records))
     print(incident_summary(evidence))
     print(run_state_line(evidence))

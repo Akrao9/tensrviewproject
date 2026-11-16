@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tensorquill_server::ingest::{Ingest, IngestConfig, DEFAULT_FLUSH_STEPS, DEFAULT_QUOTA_BYTES};
 use tensorquill_server::server::{check_bind, serve, Tls};
 use tensorquill_server::storage::{Error, Storage, StoreOptions};
@@ -11,14 +11,16 @@ use tokio::net::TcpListener;
 
 /// Self-hosted TensorQuill ingest: Arrow Flight DoPut in, partitioned Parquet out.
 #[derive(Parser)]
-#[command(name = "tensorquill-server", version)]
+#[command(name = "tensorquill-server", version, subcommand_negates_reqs = true)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Address to listen on. Anything but loopback needs TENSORQUILL_TOKEN or --allow-unauthenticated.
     #[arg(long, default_value = "127.0.0.1:50051")]
     listen: SocketAddr,
     /// Where Parquet parts go: file:///var/lib/tensorquill, s3://bucket/prefix, gs://bucket/prefix, or a directory.
-    #[arg(long)]
-    store: String,
+    #[arg(long, required = true)]
+    store: Option<String>,
     /// PEM certificate chain; with --tls-key, serve TLS (senders then use grpcs://).
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -72,6 +74,27 @@ struct Args {
     abandon_hours: f64,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Run the detectors over one rank's rows and print the report the server would write as
+    /// that rank's incidents.json. No server is started and no store is read.
+    Detect {
+        /// The rows as an Arrow IPC stream in the schema the SDK sends, grouped by attempt
+        /// (oldest first) and in recorded order; `-` or nothing reads standard input.
+        input: Option<PathBuf>,
+    },
+}
+
+/// `tensorquill-server detect`: the report goes to standard output as one line of JSON.
+fn detect(input: Option<PathBuf>) -> Result<(), Error> {
+    let report = match input.filter(|path| path.as_os_str() != "-") {
+        Some(path) => tensorquill_server::detect::detect_stream(std::io::BufReader::new(std::fs::File::open(path)?)),
+        None => tensorquill_server::detect::detect_stream(std::io::stdin().lock()),
+    }?;
+    println!("{report}");
+    Ok(())
+}
+
 async fn terminated() {
     #[cfg(unix)]
     {
@@ -97,6 +120,7 @@ fn store_name(store: &str) -> String {
 }
 
 async fn run(args: Args) -> Result<(), Error> {
+    let store = args.store.ok_or("--store is required")?;
     let token = args.token.filter(|token| !token.is_empty());
     check_bind(&args.listen, token.is_some(), args.allow_unauthenticated)?;
     let tls = match (&args.tls_cert, &args.tls_key) {
@@ -122,7 +146,7 @@ async fn run(args: Args) -> Result<(), Error> {
     let options = StoreOptions {
         retry_timeout: Duration::from_secs_f64(args.store_retry_seconds),
     };
-    let ingest = Ingest::new(Storage::open(&args.store, std::env::vars(), &options)?, config);
+    let ingest = Ingest::new(Storage::open(&store, std::env::vars(), &options)?, config);
     let listener = TcpListener::bind(args.listen).await?;
     // Take up the runs the last server left unfinished before any stream is served: a rank
     // that connects first would otherwise be watched from nothing. This is also the first
@@ -131,7 +155,7 @@ async fn run(args: Args) -> Result<(), Error> {
     let resumed = ingest
         .restore_watchdog()
         .await
-        .map_err(|error| format!("cannot read the store {}: {error}", store_name(&args.store)))?;
+        .map_err(|error| format!("cannot read the store {}: {error}", store_name(&store)))?;
     if resumed > 0 {
         eprintln!("tensorquill-server: watching {resumed} unfinished runs from the last server's status");
     }
@@ -154,7 +178,12 @@ async fn run(args: Args) -> Result<(), Error> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run(Args::parse()).await {
+    let mut args = Args::parse();
+    let outcome = match args.command.take() {
+        Some(Command::Detect { input }) => detect(input),
+        None => run(args).await,
+    };
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("tensorquill-server: {error}");

@@ -442,6 +442,31 @@ Limits: the watcher judges freshness by the newest attempt only, so a part of an
 
 **All ranks at once.** `python -m tensorquill <store>/runs/<run_id--rank all --watch` (and `watch(run_folder, rank="all")`) keeps one evidence file for a run with several `rank=N` folders, `<run_id>.all-ranks.evidence.json`, in a shape of its own (`"view": "all_ranks"`, `"view_version": 1`; no `schema_version`, `incidents` or `samples`, so the per-rank shape is never mistaken for it). A look reads each rank's `incidents.json` and newest part name, and the run's `watchdog.json`, and nothing else: 34 ms for 64 ranks of 10,000 steps, 102 ms at 50,000, on an 8-core laptop. A rank counts for or against incidents only while its report is `current`; `behind`, `stale`, `missing`, `unreadable`, `unusable`, `other_thresholds` and `nothing_stored` are *unknown*, with the reason, and never in the list of ranks with no incidents. Each rank has its own wait (`--report-grace`). Incidents with the same kind, step and named layers, experts, parameters or modules are one group naming the ranks ("0-63"); those that differ are listed with their ranks, and an incident on one rank is named with that rank alone. A group carries one incident (the first rank's) and says whether the others' numbers differ. The text summary gives what is common to all judged ranks, what only some show, the ranks with none, and the unknown ranks; stalls and silent ranks (`job_stalled`, `rank_silent`) are in `run_incidents` once for the run. Ranks are the `rank=N` folders, the status's ranks and `world_size`, so a rank that never stored anything is `nothing_stored`, and after a restart a rank that has not reconnected is still judged from the store. The file is replaced by rename only when a rank's report, a rank's state, the set of ranks or the status changed. No part is read and no detector runs here, so `--recompute`, `--top-k` and `--rerun` are refused with `--rank all` (use `--rank N`); without `--watch` it makes one look. Limits: a rank is called stale only after `--report-grace` and a blip inside it is not written; `stored_last_step` of an unknown rank is as of the last write; a rank is judged against its own store, so ranks at very different steps are all `current` (the spread is in `last_step` and in the status's `stream` entries and `rank_silent`); numbers differing between ranks are in each rank's own `incidents.json`, not copied.
 
+### The Rust detectors on a local file
+
+`tensorquill-server detect` runs the server's detectors over one rank's rows without a server or a store, and prints the report the server would write as that rank's `incidents.json`. Python calls it, so the 25 per-rank kinds can come from the one Rust implementation on a local `.jsonl` file too:
+
+```sh
+cargo build --release --manifest-path server/Cargo.toml
+export TENSORQUILL_SERVER_BIN=$PWD/server/target/release/tensorquill-server
+python -m tensorquill tensorquill-out/RUN.rank0.jsonl --detectors rust
+```
+
+In Python it is `tensorquill.build_evidence(records, detectors="rust")`, and `tensorquill.server_detect.server_report(records)` gives the report itself.
+
+- **What it needs:** the binary, on `PATH` or named by `TENSORQUILL_SERVER_BIN`, and `pyarrow` (the `flight` extra). The records travel as an Arrow stream in the schema the sender uses.
+- **What comes from Rust:** the incidents of the 25 per-rank kinds, with their scalars, and the `not_checked` entries. The evidence then carries `"detectors": "rust"`.
+- **What is still made in Python:** the per-step MoE `samples`, the weight trends, the run state, and the kinds read from other files (the server's status, TrainCheck, the Flight Recorder).
+- **Limits:**
+  - The default is still `detectors="python"`.
+  - The Rust rules take no options, so `--top-k` and any threshold other than the default are refused.
+  - It reads one rank once: `--watch` and `--rank all` are refused.
+  - A binary built from other thresholds than the SDK's, or one that lacks any of the 25 kinds, is refused.
+- **Checked** in `tests/test_server_detect.py`: both paths give the same evidence on 57 record sets and on the seven Gate 1 fixtures. The record sets plant every one of the 25 kinds and every kind of `not_checked` entry, and include resumes and restarts written a stretch at a time and the edge cases of the server parity tests. Run by hand on the seven GPU captures of Nov 15, 2026, they agree too.
+- **Two differences, both pinned by a test:**
+  - A step written twice within one attempt is reported by both, but Rust attaches the scalars logged at its second writing and Python those of its first. The server's own store never holds such rows.
+  - Attempts out of order in the input are read oldest first, as a store holds them; Python reads a file in the order written.
+
 ## Data progress and checkpoints
 
 Built Nov 16, 2026, on CPU; no GPU run yet. Both are opt-in.

@@ -432,36 +432,22 @@ impl Ingest {
                 run.insert(key.1, window.clone());
             }
         }
-        let incidents = detectors.incidents();
-        let not_checked = detectors.not_checked();
-        let report = RankReport {
-            kinds: incidents
-                .iter()
-                .map(|i| i["kind"].as_str().unwrap_or_default().to_string())
-                .collect(),
-            not_checked: not_checked
-                .iter()
-                .filter_map(|n| n["check"].as_str())
-                .filter(|check| !matches!(*check, "flight_recorder" | "traincheck"))
+        let document = crate::detect::report(&key.0, key.1, detectors, buffer.rebuilds);
+        let names = |list: &serde_json::Value, key: &str| -> Vec<String> {
+            list.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item[key].as_str())
                 .map(str::to_string)
+                .collect()
+        };
+        let report = RankReport {
+            kinds: names(&document["incidents"], "kind"),
+            not_checked: names(&document["not_checked"], "check")
+                .into_iter()
+                .filter(|check| !matches!(check.as_str(), "flight_recorder" | "traincheck"))
                 .collect(),
         };
-        let document = serde_json::json!({
-            "schema_version": 1,
-            "source": "tensorquill-server",
-            "run_id": key.0,
-            "rank": key.1,
-            "attempt": detectors.attempt(),
-            "last_step": detectors.last_step(),
-            "steps": detectors.rows(),
-            "rebuilds": buffer.rebuilds,
-            "checked": crate::detect::PORTED,
-            "not_checked": not_checked,
-            "thresholds": crate::detect::thresholds(),
-            "moe_flagged": detectors.moe_flagged(),
-            "memory": detectors.memory(),
-            "incidents": incidents,
-        });
         match self.storage.write_incidents(&key.0, key.1, &document).await {
             Ok(()) => {
                 self.reports.lock().unwrap().insert(key.clone(), report);

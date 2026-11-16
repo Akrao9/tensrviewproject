@@ -40,7 +40,8 @@
 //!   absent here (only `optimizer_ownership` and `weight_dtypes`, which have no column,
 //!   are read from there, on the rows where parameters first stall).
 //! - The server never stores a step twice within one attempt, so that case of
-//!   `repeated_steps` cannot arise from its own store and is not looked for.
+//!   `repeated_steps` cannot arise from its own store. Rows given to `tensorquill-server
+//!   detect` can hold one, and the pass over every attempt reports it as Python does.
 //! - NaN and Inf are `null` in the incidents, which are strict JSON.
 
 use std::borrow::Cow;
@@ -2290,6 +2291,9 @@ struct AttemptPass {
     /// over, and a step it shares with an earlier attempt is a repeat, not a resume.
     restarted: bool,
     current_steps: Vec<i64>,
+    /// The highest step of the current attempt so far. A row at or below it may be a step
+    /// written twice within the attempt, which only rows from outside a store can hold.
+    current_max: Option<i64>,
     /// The steps of the attempts before the current one, in order and without repeats.
     earlier: Vec<i64>,
     repeated: std::collections::BTreeSet<i64>,
@@ -2311,6 +2315,7 @@ impl AttemptPass {
             current: None,
             restarted: false,
             current_steps: Vec::new(),
+            current_max: None,
             earlier: Vec::new(),
             repeated: Default::default(),
             history: Vec::new(),
@@ -2328,6 +2333,7 @@ impl AttemptPass {
             self.earlier.sort_unstable();
             self.earlier.dedup();
             self.current = Some(attempt);
+            self.current_max = None;
             let first = self.first_attempt == Some(attempt);
             self.restarted = !first && step <= self.run_start;
             if first {
@@ -2343,10 +2349,13 @@ impl AttemptPass {
             self.resume.roll_back(step);
         }
         self.resume.add(attempt, step, resume_row, first_attempt);
-        if self.restarted && self.earlier.binary_search(&step).is_ok() && self.repeated.insert(step) {
+        let again = self.current_max.is_some_and(|max| step <= max) && self.current_steps.contains(&step);
+        let shared = self.restarted && self.earlier.binary_search(&step).is_ok();
+        if (again || shared) && self.repeated.insert(step) {
             found.add_repeated(step);
         }
         self.current_steps.push(step);
+        self.current_max = Some(self.current_max.map_or(step, |max| max.max(step)));
         if let Some(lr) = lr {
             self.history.push((step, attempt, lr));
         }
@@ -2750,6 +2759,121 @@ pub async fn replay(storage: &Storage, run_id: &str, rank: i32) -> Result<RankDe
     Ok(detectors)
 }
 
+/// The detectors over one rank's rows held in memory: [`replay`] without a store, for
+/// `tensorquill-server detect`. The rows must be grouped by attempt, oldest attempt first,
+/// and within an attempt in the order they were recorded, as stored parts are. A batch
+/// without an `attempt` column is attempt 0, and one without a `step` column is ignored.
+pub fn judge(rank: i32, batches: &[RecordBatch]) -> Result<RankDetectors, String> {
+    // Each batch cut where the attempt changes, so every piece belongs to one attempt.
+    let mut pieces: Vec<(i64, RecordBatch)> = Vec::new();
+    let mut first_steps: BTreeMap<i64, i64> = BTreeMap::new();
+    for batch in batches {
+        let Some(steps) = column::<Int64Array>(batch, "step") else {
+            continue;
+        };
+        let attempts = column::<Int64Array>(batch, "attempt");
+        let attempt_of = |row: usize| attempts.map_or(0, |attempts| attempts.value(row));
+        let mut start = 0;
+        while start < batch.num_rows() {
+            let attempt = attempt_of(start);
+            let mut end = start + 1;
+            while end < batch.num_rows() && attempt_of(end) == attempt {
+                end += 1;
+            }
+            if let Some((last, _)) = pieces.last() {
+                if *last > attempt {
+                    return Err(format!(
+                        "rows of attempt {attempt} follow rows of attempt {last}: group the rows by attempt, oldest first"
+                    ));
+                }
+            }
+            if let Some(first) = steps.values()[start..end].iter().copied().min() {
+                let known = first_steps.entry(attempt).or_insert(first);
+                *known = (*known).min(first);
+            }
+            pieces.push((attempt, batch.slice(start, end - start)));
+            start = end;
+        }
+    }
+    let cutoffs = resolve(&first_steps);
+    let mut detectors = RankDetectors::new();
+    let mut pass = AttemptPass::new(rank, &first_steps);
+    for (attempt, piece) in &pieces {
+        let Some(cutoff) = cutoffs.get(attempt).copied() else {
+            continue;
+        };
+        detectors.attempt = *attempt;
+        detectors.read(piece, cutoff, Some(&mut pass));
+    }
+    pass.finish(detectors.last_step, &mut detectors.attempts);
+    Ok(detectors)
+}
+
+/// A rank's report: the document the server writes as `rank=<rank>/incidents.json` and
+/// `tensorquill-server detect` prints. `rebuilds` is how often the server rebuilt the rank's
+/// detectors from its store, and 0 for a report made outside a server.
+pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64) -> Value {
+    json!({
+        "schema_version": 1,
+        "source": "tensorquill-server",
+        "run_id": run_id,
+        "rank": rank,
+        "attempt": detectors.attempt(),
+        "last_step": detectors.last_step(),
+        "steps": detectors.rows(),
+        "rebuilds": rebuilds,
+        "checked": PORTED,
+        "not_checked": detectors.not_checked(),
+        "thresholds": thresholds(),
+        "moe_flagged": detectors.moe_flagged(),
+        "memory": detectors.memory(),
+        "incidents": detectors.incidents(),
+    })
+}
+
+/// `tensorquill-server detect`: one rank's rows in, as an Arrow IPC stream in the schema the
+/// SDK sends, and its [`report`] out. Rows of a second run or rank are refused, because the
+/// detectors judge one rank's steps.
+pub fn detect_stream(input: impl std::io::Read) -> Result<Value, String> {
+    let reader = arrow::ipc::reader::StreamReader::try_new(input, None)
+        .map_err(|error| format!("the input is not an Arrow IPC stream: {error}"))?;
+    let batches = reader
+        .collect::<Result<Vec<RecordBatch>, _>>()
+        .map_err(|error| format!("cannot read the Arrow IPC stream: {error}"))?;
+    let mut whose: Option<(String, i32)> = None;
+    for batch in &batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let (Some(run_ids), Some(ranks)) = (
+            column::<StringArray>(batch, "run_id"),
+            column::<Int32Array>(batch, "rank"),
+        ) else {
+            return Err("the rows need a run_id (string) and a rank (int32) column".to_string());
+        };
+        if column::<Int64Array>(batch, "step").is_none() {
+            return Err("the rows need a step (int64) column".to_string());
+        }
+        for row in 0..batch.num_rows() {
+            let (run_id, rank) = (run_ids.value(row), ranks.value(row));
+            match &whose {
+                None => whose = Some((run_id.to_string(), rank)),
+                Some((known_run, known_rank)) if known_run == run_id && *known_rank == rank => {}
+                Some((known_run, known_rank)) => {
+                    return Err(format!(
+                        "rows of {run_id} rank {rank} beside rows of {known_run} rank {known_rank}: send one rank of one run"
+                    ));
+                }
+            }
+        }
+    }
+    let Some((run_id, rank)) = whose else {
+        return Err("the stream holds no rows".to_string());
+    };
+    let detectors = judge(rank, &batches)?;
+    Ok(report(&run_id, rank, &detectors, 0))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -2771,6 +2895,129 @@ mod tests {
     }
 
     use super::*;
+
+    /// Rows with only the key columns, as (run, rank, attempt, step).
+    fn key_rows(rows: &[(&str, i32, i64, i64)]) -> RecordBatch {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Schema::new(vec![
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("rank", DataType::Int32, false),
+            Field::new("attempt", DataType::Int64, false),
+            Field::new("step", DataType::Int64, false),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.1))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.2))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.3))),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn stream(batches: &[RecordBatch]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut out, &batches[0].schema()).unwrap();
+        for batch in batches {
+            writer.write(batch).unwrap();
+        }
+        writer.finish().unwrap();
+        drop(writer);
+        out
+    }
+
+    fn steps(
+        run: &'static str,
+        rank: i32,
+        attempt: i64,
+        steps: std::ops::Range<i64>,
+    ) -> Vec<(&'static str, i32, i64, i64)> {
+        steps.map(|step| (run, rank, attempt, step)).collect()
+    }
+
+    #[test]
+    fn a_step_written_twice_within_one_attempt_is_repeated_once() {
+        // Steps 0..40, then 30..50 again in the same attempt, and step 49 a third time.
+        let mut rows = steps("run", 0, 1, 0..40);
+        rows.extend(steps("run", 0, 1, 30..50));
+        rows.push(("run", 0, 1, 49));
+        let detectors = judge(0, &[key_rows(&rows)]).unwrap();
+        let incidents = detectors.incidents();
+        assert_eq!(incidents.len(), 1, "{incidents:?}");
+        assert_eq!(incidents[0]["kind"], "repeated_steps");
+        assert_eq!(incidents[0]["step"], 30);
+        assert_eq!(incidents[0]["repeated"], 11);
+        assert_eq!(detectors.rows(), 61);
+        // Rows in step order, as a store holds them, repeat nothing.
+        assert!(judge(0, &[key_rows(&steps("run", 0, 1, 0..60))])
+            .unwrap()
+            .incidents()
+            .is_empty());
+    }
+
+    #[test]
+    fn judge_reads_attempts_across_and_inside_batches_as_replay_reads_parts() {
+        // A resume at 20 is not a repeat; a restart from step 0 is, for the steps it shares.
+        let first = key_rows(&steps("run", 0, 1, 0..30));
+        let mut rest = steps("run", 0, 2, 20..40);
+        rest.extend(steps("run", 0, 3, 0..10));
+        let detectors = judge(0, &[first.clone(), key_rows(&rest)]).unwrap();
+        let incidents = detectors.incidents();
+        let repeated: Vec<&Value> = incidents.iter().filter(|i| i["kind"] == "repeated_steps").collect();
+        assert_eq!(repeated.len(), 1, "{incidents:?}");
+        assert_eq!(repeated[0]["repeated"], 10);
+        assert_eq!((detectors.attempt(), detectors.last_step()), (3, Some(9)));
+        // An older attempt after a newer one is refused, not read in the wrong order.
+        let error = judge(0, &[key_rows(&rest), first]).err().unwrap();
+        assert!(error.contains("group the rows by attempt"), "{error}");
+    }
+
+    #[test]
+    fn detect_stream_gives_the_servers_report_for_one_rank() {
+        let batches = [
+            key_rows(&steps("run-a", 3, 7, 0..25)),
+            key_rows(&steps("run-a", 3, 7, 25..40)),
+        ];
+        let report = detect_stream(&stream(&batches)[..]).unwrap();
+        assert_eq!(report["source"], "tensorquill-server");
+        assert_eq!((&report["run_id"], &report["rank"]), (&json!("run-a"), &json!(3)));
+        assert_eq!(
+            (&report["attempt"], &report["last_step"], &report["steps"]),
+            (&json!(7), &json!(39), &json!(40))
+        );
+        assert_eq!(report["rebuilds"], 0);
+        assert_eq!(report["checked"], json!(PORTED));
+        assert_eq!(report["thresholds"], thresholds());
+        assert_eq!(report["incidents"], json!([]));
+        let checks: Vec<&str> = report["not_checked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["check"].as_str())
+            .collect();
+        assert!(
+            checks.contains(&"flight_recorder") && checks.contains(&"traincheck"),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn detect_stream_refuses_what_it_cannot_judge() {
+        let two_ranks = [key_rows(&steps("run", 0, 1, 0..5)), key_rows(&steps("run", 1, 1, 0..5))];
+        let error = detect_stream(&stream(&two_ranks)[..]).err().unwrap();
+        assert!(error.contains("send one rank of one run"), "{error}");
+        let two_runs = [
+            key_rows(&steps("run", 0, 1, 0..5)),
+            key_rows(&steps("other", 0, 1, 5..9)),
+        ];
+        assert!(detect_stream(&stream(&two_runs)[..]).is_err());
+        let error = detect_stream(&stream(&[key_rows(&[])])[..]).err().unwrap();
+        assert!(error.contains("no rows"), "{error}");
+        let error = detect_stream(&b"{\"step\": 0}\n"[..]).err().unwrap();
+        assert!(error.contains("not an Arrow IPC stream"), "{error}");
+    }
 
     #[test]
     fn median_and_fsum_match_python() {
