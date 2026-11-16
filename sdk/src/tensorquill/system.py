@@ -268,6 +268,10 @@ def _throttle_names(mask: int) -> list[str]:
     return names
 
 
+class SystemPart(dict):
+    """The memory part read at a flush, waiting in the writer queue for its NVML part."""
+
+
 class SystemReadings:
     """One session's readings: CUDA memory at each flush, NVML on the writer thread."""
 
@@ -275,10 +279,10 @@ class SystemReadings:
         self.memory = CudaMemory(device)
         self.nvml = Nvml(device)
 
-    def flush(self) -> dict[str, Any]:
+    def flush(self) -> SystemPart:
         """On the training thread, when a block is flushed: the memory part."""
         reading = self.memory.read()
-        return {} if reading is None else {"cuda": reading}
+        return SystemPart() if reading is None else SystemPart(cuda=reading)
 
     def write(self, system: dict[str, Any]) -> dict[str, Any] | None:
         """On the writer thread: add the NVML part to what `flush` read. None when empty."""
@@ -291,8 +295,9 @@ class SystemReadings:
             self.nvml.close()
             reading = None if self.nvml._reported else {"unavailable": self.nvml.unavailable}
             self.nvml._reported = True
+        system = dict(system)  # a plain dict in the record
         if reading is not None:
-            system = {**system, "nvml": reading}
+            system["nvml"] = reading
         return system or None
 
     def close(self) -> None:

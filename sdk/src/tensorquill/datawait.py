@@ -65,12 +65,20 @@ def _counting() -> list["Session"]:
 
 
 def watch(session: "Session") -> None:
-    """Time `DataLoader` iterators for `session` until `unwatch`."""
+    """Time `DataLoader` iterators for `session` until `unwatch`.
+
+    Another library may wrap `__next__` on top of the timer while it is installed. Then the
+    timer cannot be taken out from under it, so it stays in that chain, passing through
+    while no session watches, and `_original_next` keeps the method it wraps."""
     global _original_next
     if session in _watching:
         return
+    current = _BaseDataLoaderIter.__dict__.get("__next__")
     if _original_next is None:
-        _original_next = _BaseDataLoaderIter.__next__
+        _original_next = current
+        _BaseDataLoaderIter.__next__ = _timed_next  # type: ignore[method-assign]
+    elif current is _original_next:
+        # The other wrapper was removed together with the timer under it: put the timer back.
         _BaseDataLoaderIter.__next__ = _timed_next  # type: ignore[method-assign]
     _watching.append(session)
 
@@ -82,7 +90,7 @@ def unwatch(session: "Session") -> None:
     if not _watching and _original_next is not None:
         if _BaseDataLoaderIter.__dict__.get("__next__") is _timed_next:
             _BaseDataLoaderIter.__next__ = _original_next  # type: ignore[method-assign]
-        _original_next = None
+            _original_next = None
 
 
 class TimedData:

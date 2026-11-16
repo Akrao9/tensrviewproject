@@ -114,7 +114,13 @@ def edges():
     # A small model's growth: a large share of its first reading but under 64 MiB, then over it.
     small = [record(s, run="small", system={"cuda": cuda(allocated=100 * MIB + (s // 10) * (12 if s < 60 else 14) * MIB)})
              for s in range(0, 120, 10)]
-    return {"rise": rise, "resume": resumed, "unavailable": unavailable, "odd": odd, "small": small}
+    # A large model: 100 MiB more at each reading is over 64 MiB but under 5% of 40 GiB, so no
+    # trend; and two real Xid events at one reading.
+    large = [record(s, run="large", system={
+        "cuda": cuda(allocated=40 * GIB + (s // 10) * 100 * MIB, total=80 * GIB),
+        "nvml": nvml(ecc=0, xid=[79, 48] if s == 70 else []),
+    }) for s in range(0, 100, 10)]
+    return {"rise": rise, "resume": resumed, "unavailable": unavailable, "odd": odd, "small": small, "large": large}
 
 
 def by_kind(records):

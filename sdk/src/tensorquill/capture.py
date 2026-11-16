@@ -36,7 +36,7 @@ from . import datawait
 from .distributed import FINGERPRINT_WIDTH, replica_spread, unwrap_local
 from .probe import ProbeState, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink
-from .system import SystemReadings
+from .system import SystemPart, SystemReadings
 from .tracker import RunInfo, _world_size, resolve_run
 
 STATS = ("mean", "std", "abs_max", "zero_frac")
@@ -491,7 +491,7 @@ class Session:
         self._fetching = False
         self._pending_data_wait = 0.0
         self._last_step_clock: float | None = None
-        self._ring_data: list[tuple[float, float | None] | None] = []
+        self._ring_wait: list[tuple[float, float | None] | None] = []
         # Bounded, as TensorBoard's SummaryWriter is (`max_queue=10`): if the sink falls
         # behind, for example on a stalled network filesystem, training waits for it
         # instead of holding every unwritten step in memory. No step is dropped.
@@ -920,10 +920,10 @@ class Session:
         if self._data_timing:
             clock = time.perf_counter()
             last, self._last_step_clock = self._last_step_clock, clock
-            self._ring_data.append((self._pending_data_wait, None if last is None else clock - last))
+            self._ring_wait.append((self._pending_data_wait, None if last is None else clock - last))
             self._pending_data_wait = 0.0
         else:
-            self._ring_data.append(None)
+            self._ring_wait.append(None)
         self._pending_amp = {}
         self._pending_scalars = {}
         self._next_step = current + 1
@@ -969,7 +969,7 @@ class Session:
             self._ring_weight_seen = []
             self._ring_clip_seen = []
             self._ring_spread_seen = []
-            self._ring_data = []
+            self._ring_wait = []
             self._raise_worker_error()
         n = len(self._steps)
         if n == 0:
@@ -1007,7 +1007,7 @@ class Session:
         self._ring_amp = []
         probes = self._ring_probe
         steps, lrs, stamps = self._steps, self._ring_lr, self._ring_ts
-        waits, self._ring_data = self._ring_data, []
+        waits, self._ring_wait = self._ring_wait, []
         # Host-side allocator counters: no GPU work, no sync (system.py).
         system = self._system.flush() if self._system is not None else None
         self._ring_ts = []
@@ -1130,8 +1130,9 @@ class Session:
                 if self._system is not None:
                     # NVML is read here, on the writer thread. A failure is written as a note
                     # in the record (system.py) and never stops the writer, which would stop training.
+                    # Found by its type, not its place, so other parts of the block can come after it.
                     try:
-                        item = (*item[:-1], self._system.write(item[-1] or {}))
+                        item = tuple(self._system.write(x) if isinstance(x, SystemPart) else x for x in item)
                     except Exception:  # noqa: BLE001
                         pass
                 try:

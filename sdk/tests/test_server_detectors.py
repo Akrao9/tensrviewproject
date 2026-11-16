@@ -753,8 +753,10 @@ def test_system_edges_match_python(tmp_path):
     assert summary == {
         "rise": [("input_starvation", 50)], "resume": [], "unavailable": [],
         "odd": [("allocator_retries", 13), ("hardware_errors", 12), ("gpu_throttled", 11)],
-        "small": [("memory_growth", 60)]  # at 50 the rise is 60 MiB,
+        "small": [("memory_growth", 60)],  # at 50 the rise is 60 MiB
+        "large": [("hardware_errors", 70)],
     }
+    assert system_reference(runs["large"])[0][0]["xid"] == [79, 48]
     server = Server(tmp_path / "store", 0, *FAST)
     for name, records in runs.items():
         document = Stream(tmp_path, run=name, server=server).send(records)

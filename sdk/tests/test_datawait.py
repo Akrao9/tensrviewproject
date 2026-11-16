@@ -314,3 +314,41 @@ def test_lightning_times_the_fetch_not_the_transfer(tmp_path, monkeypatch):
     # Validation (sanity check and every 2 steps) fetches its own slow batches, in the eval
     # phase; Lightning fetches one training batch ahead, so a fifth fetch lands in the last step.
     _assert_fetch_timed(sink.records, 5)
+
+
+def test_another_wrapper_on_top_is_never_broken():
+    """A library that wraps `__next__` after the timer (a data-progress hook, say) keeps working
+    after the session closes, and a later session still times its fetches."""
+    original = vars(_BaseDataLoaderIter)["__next__"]
+    model = _model()
+    session = tensorquill.init(model, sink=tensorquill.MemorySink(), run_id="a", data_wait=True)
+    below = vars(_BaseDataLoaderIter)["__next__"]
+    seen = []
+
+    def theirs(self):
+        seen.append(1)
+        return below(self)
+
+    _BaseDataLoaderIter.__next__ = theirs
+    try:
+        session.close()
+        assert vars(_BaseDataLoaderIter)["__next__"] is theirs  # theirs is not taken out
+        assert len(list(DataLoader(torch.randn(3, 4), batch_size=1))) == 3 and len(seen) == 4
+        sink = tensorquill.MemorySink()
+        again = tensorquill.init(model, sink=sink, every=2, run_id="b", data_wait=True)
+        assert vars(_BaseDataLoaderIter)["__next__"] is theirs
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        for x in DataLoader(Slow(2), batch_size=1):
+            model(x).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+        again.close()
+        assert all(w >= FETCH * 0.9 for w in _waits(sink.records)), _waits(sink.records)
+    finally:
+        _BaseDataLoaderIter.__next__ = original  # theirs removed, back to what it first saw
+    # With theirs gone and the timer under it gone too, a new session installs the timer again.
+    sink = tensorquill.MemorySink()
+    third = tensorquill.init(model, sink=sink, every=1, run_id="c", data_wait=True)
+    assert vars(_BaseDataLoaderIter)["__next__"] is datawait._timed_next
+    third.close()
+    assert vars(_BaseDataLoaderIter)["__next__"] is original
