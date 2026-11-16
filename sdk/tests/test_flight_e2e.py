@@ -486,6 +486,68 @@ def test_a_stopped_process_whose_heartbeats_cease_is_unresponsive(tmp_path):
         assert server.terminate() == 0
 
 
+_WAITS = """
+import sys, threading, time
+import torch, tensorquill
+model = torch.nn.Linear(4, 2)
+session = tensorquill.init(model, run_id="waits", every=10, endpoint=sys.argv[1], heartbeat_seconds=0.2,
+                           stack_seconds=0.6)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+def wait_for_the_other_ranks():
+    threading.Event().wait(120)  # a call that never returns, with the interpreter lock released
+
+def train_step(n):
+    optimizer.zero_grad()
+    model(torch.randn(8, 4)).sum().backward()
+    optimizer.step()
+    if n == 29:
+        wait_for_the_other_ranks()
+
+for n in range(30):
+    train_step(n)
+"""
+
+
+def test_a_rank_stuck_in_a_call_is_reported_with_the_call_it_is_stuck_in(tmp_path):
+    import sys
+
+    server = Server(tmp_path / "store", 0, "--silent-seconds", "1", "--silent-factor", "0", "--critical-seconds", "30",
+                    "--watchdog-seconds", "0.1", "--flush-seconds", "0.2")
+    run_dir = tmp_path / "store" / "runs" / "waits"
+    script = tmp_path / "job.py"
+    script.write_text(_WAITS)
+    child = subprocess.Popen([sys.executable, str(script), server.endpoint], cwd=tmp_path,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        status = _wait_for(run_dir, lambda s: s["ranks"][0]["state"] == "silent"
+                           and (s["ranks"][0].get("stack") or {}).get("unchanged_seconds", 0) > 0.3, 40)
+        stack = status["ranks"][0]["stack"]
+        [main] = [t for t in stack["threads"] if t["main"]]
+        names = [f["function"] for f in main["frames"]]
+        # Innermost first: the standard library's wait, then the job's own functions.
+        assert names[0] == "wait" and names[-3:] == ["wait_for_the_other_ranks", "train_step", "<module>"]
+        assert not any(t["name"].startswith("tensorquill-") for t in stack["threads"])
+        assert stack["still_seconds"] >= 0.6
+        evidence = tensorquill.build_evidence(run_dir)
+        [incident] = [i for i in evidence["incidents"] if i["kind"] == "job_stalled"]
+        # The server's own incidents say the same, and neither carries the whole stack.
+        [written] = same_incidents_as_python(status)
+        assert written["stuck_at"][0]["caller"]["function"] == "wait_for_the_other_ranks"
+        assert "stack" not in written["ranks"][0] and "stack" not in incident["ranks"][0]
+        [place] = incident["stuck_at"]
+        assert place["function"] == "wait" and place["caller"]["function"] == "wait_for_the_other_ranks"
+        assert place["caller"]["file"].endswith("job.py") and "in_tensorquill" not in place
+        assert incident["assessment"] == "suspected_hang"
+        text = tensorquill.incident_summary(evidence)
+        assert "Last stack: rank 0: main thread in `wait` (threading.py:" in text
+        assert "called from `wait_for_the_other_ranks` (job.py:" in text
+    finally:
+        child.kill()
+        child.wait(20)
+        assert server.terminate() == 0
+
+
 def test_a_pause_with_no_sign_of_work_is_limited_and_one_that_ticks_is_not(tmp_path, toy_moe, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)

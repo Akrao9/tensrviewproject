@@ -174,6 +174,69 @@ def test_severity_and_what_the_heartbeats_say_are_in_the_incident():
     assert detect_watchdog_incidents(lost)[0]["assessment"] == "lost_connection"
 
 
+def _stack(frames, unchanged=95.0, others=()):
+    threads = [{"name": "MainThread", "main": True,
+                "frames": [{"file": f, "line": n, "function": fn, **({"own": True} if own else {})}
+                           for fn, f, n, *own in frames]}]
+    threads += [{"name": name, "main": False, "frames": []} for name in others]
+    return {"still_seconds": 140.0, "unchanged_seconds": unchanged, "threads": threads}
+
+
+def test_a_stopped_rank_that_sent_its_stack_is_reported_with_where_it_was():
+    site = "/venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py"
+    stuck = _stack([("all_reduce", site, 2940), ("wrapper", "/venv/lib/python3.12/site-packages/torch/x.py", 3),
+                    ("train_step", "/job/train.py", 88), ("<module>", "/job/train.py", 120)])
+    ranks = [{**_rank(0, "silent", 149, 640.0, beat=4.0, severity="warning"), "stack": stuck},
+             {**_rank(1, "silent", 149, 640.0, beat=4.0, severity="warning"), "stack": _stack(
+                 [("all_reduce", site, 2940), ("train_step", "/job/train.py", 88)], unchanged=80.0)},
+             _rank(2, "unresponsive", 149, 640.0, beat=300.0, severity="warning")]
+    [hit] = detect_watchdog_incidents(_status("stalled", ranks))
+    # The stack narrows the cause; what the stream alone can say is unchanged.
+    assert hit["assessment"] == "suspected_hang"
+    assert [p["rank"] for p in hit["stuck_at"]] == [0, 1]  # rank 2 sent none
+    assert not any("stack" in r for r in hit["ranks"])  # the stacks stay in the status file
+    first = hit["stuck_at"][0]
+    assert (first["function"], first["line"], first["unchanged_seconds"]) == ("all_reduce", 2940, 95.0)
+    assert first["caller"] == {"function": "train_step", "file": "/job/train.py", "line": 88}
+    assert "in_tensorquill" not in first
+    text = _text([hit])
+    assert ("Last stack: ranks 0, 1: main thread in `all_reduce` (distributed_c10d.py:2940),"
+            " called from `train_step` (train.py:88), unchanged for 80 s.") in text
+
+    # A call made by TensorQuill itself is named as that, and the caller is the job's own line.
+    own = _stack([("all_gather", site, 3100),
+                  ("replica_spread", "/venv/lib/python3.12/site-packages/tensorquill/distributed.py", 150, True),
+                  ("loop", "/job/tensorquill/run.py", 7)])  # a folder of the job's with that name is the job's
+    [hit] = detect_watchdog_incidents(_status("degraded", [
+        {**_rank(0, "silent", 100, 400.0, beat=2.0, severity="warning"), "stack": own}, _rank(1, "active", 149)]))
+    assert hit["kind"] == "rank_silent"
+    [place] = hit["stuck_at"]
+    assert place["in_tensorquill"]["function"] == "replica_spread" and place["caller"]["function"] == "loop"
+    assert "reached through TensorQuill's `replica_spread` (distributed.py:150)" in _text([hit])
+
+
+def test_names_and_numbers_that_are_not_are_left_out_of_where_a_rank_was():
+    odd = {"still_seconds": True, "unchanged_seconds": "9",
+           "threads": [{"main": True, "frames": [{"file": "a.py", "function": 7}]}]}
+    [hit] = detect_watchdog_incidents(_status("stalled", [
+        {**_rank(0, "silent", 149, 640.0, beat=4.0, severity="warning"), "stack": odd}]))
+    assert hit["stuck_at"] == [{"rank": 0, "function": "?", "file": "a.py", "line": None}]
+    assert "main thread in `?` (a.py:None)." in _text([hit])
+
+
+@pytest.mark.parametrize("stack", [
+    None, "frames", [], {}, {"threads": "x"}, {"threads": [{"main": True}]}, {"threads": [{"main": True, "frames": []}]},
+    {"threads": [{"main": True, "frames": [{"line": 3}, 7]}]}, {"threads": [{"main": False, "frames": [{"file": "a.py"}]}]},
+    {"threads": [{"main": 1, "frames": [{"file": "a.py"}]}]},
+])
+def test_a_stack_that_is_not_one_is_left_out_and_nothing_else_changes(stack):
+    plain = _rank(0, "silent", 149, 640.0, beat=4.0, severity="warning")
+    [expected] = detect_watchdog_incidents(_status("stalled", [plain]))
+    [hit] = detect_watchdog_incidents(_status("stalled", [{**plain, "stack": stack}]))
+    assert "stuck_at" not in hit and "Last stack" not in _text([hit])
+    assert _text([hit]) == _text([expected])
+
+
 def test_a_stuck_collective_in_pytorch_s_dump_confirms_the_hang_the_stream_suggested(tmp_path):
     pytest.importorskip("torch.distributed.flight_recorder.components.builder")
     import pickle
@@ -300,6 +363,7 @@ def _write_current_report(run: Path, rank: int, last_step: int, steps: int) -> N
             "drift_tolerance": ev.DRIFT_TOLERANCE,
             "starve_window": ev.STARVE_WINDOW,
             "starve_ratio": ev.STARVE_RATIO,
+            "spike_sustain": ev.SPIKE_SUSTAIN,  # a report without it is an older server's
         },
         "checked": list(ev.SERVER_KINDS),
         "not_checked": [

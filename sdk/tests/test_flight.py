@@ -406,3 +406,98 @@ def test_tls_ca_is_loaded_at_init_and_ignored_for_plaintext(tmp_path, monkeypatc
     plain = FlightSender(path, "grpc://127.0.0.1:9", "run-a", 0)
     assert plain._tls_root_certs is None
     assert plain.close(timeout=0.05) is True  # empty missing file has 0 unacked bytes
+
+
+def test_thread_stacks_name_where_each_thread_is_without_the_caller_or_tensorquill_s_own():
+    import threading
+
+    from tensorquill.flight import STACK_OTHER_FRAMES, thread_stacks
+
+    release, seen = threading.Event(), {}
+
+    def parked_here():
+        release.wait(30)
+
+    def looks():
+        time.sleep(0.3)  # until the main thread is in `main_waits`
+        seen["stacks"] = thread_stacks()
+
+    def main_waits(thread):
+        thread.join(10)
+
+    parked = threading.Thread(target=parked_here, name="loader")
+    own = threading.Thread(target=parked_here, name="tensorquill-writer-test")
+    parked.start(), own.start()
+    try:
+        looker = threading.Thread(target=looks, name="looker")
+        looker.start()
+        main_waits(looker)
+    finally:
+        release.set()
+        parked.join(10), own.join(10)
+    stacks = seen["stacks"]
+    names = [t["name"] for t in stacks]
+    assert stacks[0]["main"] and "looker" not in names and "tensorquill-writer-test" not in names
+    # The main thread was waiting in `join`, called from `main_waits`; names are cut at 80 characters.
+    main = [f["function"] for f in stacks[0]["frames"]]
+    assert main[0] != "main_waits" and main[main.index("main_waits") - 1] == "join"
+    assert main[main.index("main_waits") + 1].startswith("test_thread_stacks_name_where_each_thread_is")
+    [loader] = [t for t in stacks if t["name"] == "loader"]
+    assert not loader["main"] and len(loader["frames"]) <= STACK_OTHER_FRAMES
+    assert "parked_here" in [f["function"] for f in loader["frames"]]
+    assert all(set(f) == {"file", "line", "function"} for t in stacks for f in t["frames"])  # none is TensorQuill's
+    json.dumps(stacks)
+
+
+def test_a_heartbeat_carries_a_stack_only_once_work_has_stood_still_and_times_the_unchanged_place(monkeypatch):
+    from tensorquill import flight
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(flight.time, "monotonic", lambda: clock["now"])
+    place = {"frames": [{"file": "train.py", "line": 7, "function": "step"}]}
+    monkeypatch.setattr(flight, "thread_stacks", lambda: [{"name": "MainThread", "main": True, "frames": list(place["frames"])}])
+    beat = flight.Heartbeat.__new__(flight.Heartbeat)  # no thread, no socket
+    beat.stack_seconds, beat._work, beat._work_moved, beat._place, beat._place_since = 60.0, None, clock["now"], None, 0.0
+
+    assert beat._stalled_stack(5) is None  # the first look only notes the counter
+    clock["now"] += 59
+    assert beat._stalled_stack(5) is None
+    clock["now"] += 2
+    first = beat._stalled_stack(5)
+    assert (first["still_seconds"], first["unchanged_seconds"]) == (61.0, 0.0) and first["threads"][0]["main"]
+    clock["now"] += 15
+    assert beat._stalled_stack(5)["unchanged_seconds"] == 15.0
+    # The main thread moved to another line: still no work, a new place.
+    place["frames"] = [{"file": "train.py", "line": 9, "function": "step"}]
+    clock["now"] += 15
+    moved = beat._stalled_stack(5)
+    assert (moved["still_seconds"], moved["unchanged_seconds"]) == (91.0, 0.0)
+    # Work again: nothing sent, and the next stall is timed from here.
+    assert beat._stalled_stack(6) is None
+    clock["now"] += 59
+    assert beat._stalled_stack(6) is None
+    # Off, or a capture that fails: the beat goes without one.
+    clock["now"] += 100
+    beat.stack_seconds = None
+    assert beat._stalled_stack(6) is None
+    beat.stack_seconds = 60.0
+    monkeypatch.setattr(flight, "thread_stacks", lambda: 1 / 0)
+    assert beat._stalled_stack(6) is None
+
+
+def test_frames_of_tensorquill_s_own_files_are_marked_by_where_the_package_is(monkeypatch):
+    import threading
+
+    from tensorquill import flight
+
+    def capture():
+        seen = {}
+        looker = threading.Thread(target=lambda: seen.update(stacks=flight.thread_stacks()))
+        looker.start()
+        looker.join(10)
+        [main] = [t for t in seen["stacks"] if t["main"]]
+        return [f for f in main["frames"] if f["file"].endswith("test_flight.py")]
+
+    assert capture() and not any(f.get("own") for f in capture())
+    monkeypatch.setattr(flight, "_PACKAGE", str(Path(__file__).parent) + os.sep)  # as if this file were the package's
+    assert all(f["own"] is True for f in capture())

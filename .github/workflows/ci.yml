@@ -78,6 +78,8 @@ jobs:
         run: python examples/trainer_check.py --toy --backend aot_eager --steps 150 --seed-step 100 --probe-every 50 --out "$RUNNER_TEMP/trainer-check"
       - name: Seeded gradient-spike and stalled-weight cases, toy model
         run: python examples/seeded_failures.py --toy --case both --out "$RUNNER_TEMP/seeded-failures"
+      - name: Seeded gradient spike in one small parameter (x100, the total does not move), toy model
+        run: python examples/seeded_failures.py --toy --case grad_spike --factor 100 --out "$RUNNER_TEMP/seeded-x100"
 
   server:
     name: Ingest server and end-to-end streaming

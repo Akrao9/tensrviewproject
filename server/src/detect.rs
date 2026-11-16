@@ -28,11 +28,17 @@
 //!   the rows that count). `repeated_steps` and `resume_lr_change` read every attempt,
 //!   the rolled-back rows too, and need each step's learning rate; that history is held
 //!   only while the store is replayed ([`AttemptPass`]), so every new attempt is a replay.
+//! - *An incident dated before the row that makes it.* One parameter's gradient spike is
+//!   known only once it has lasted `SPIKE_SUSTAIN` recorded steps and is dated at the
+//!   first of them. Python then looks back for what was logged on that step; here it is
+//!   read when the excursion begins and kept with it. An incident, once made, is never
+//!   replaced or dated again, so a prefix and the whole run agree on it.
 //!
 //! Three things differ from Python by design:
 //!
 //! - A value that does not fit its column's type travels in `extra_json` and reads as
-//!   absent here (only `optimizer_ownership`, which has no column, is read from there).
+//!   absent here (only `optimizer_ownership` and `weight_dtypes`, which have no column,
+//!   are read from there, on the rows where parameters first stall).
 //! - The server never stores a step twice within one attempt, so that case of
 //!   `repeated_steps` cannot arise from its own store and is not looked for.
 //! - NaN and Inf are `null` in the incidents, which are strict JSON.
@@ -63,6 +69,9 @@ pub const OVERLOAD_WINDOW: usize = 50;
 pub const SPIKE_FACTOR: f64 = 5.0;
 pub const SPIKE_WINDOW: usize = 50;
 pub const SPIKE_MIN_HISTORY: usize = 10;
+/// Recorded steps in a row a parameter must stay at `SPIKE_FACTOR` times its own median to be
+/// reported on its own; a single such step is ordinary (see `SPIKE_SUSTAIN` in `evidence.py`).
+pub const SPIKE_SUSTAIN: u32 = 3;
 pub const ACT_SPIKE_FACTOR: f64 = 5.0;
 pub const ACT_WINDOW: usize = 50;
 pub const ACT_MIN_HISTORY: usize = 10;
@@ -70,6 +79,8 @@ pub const ACT_DRIFT_FACTOR: f64 = 3.0;
 pub const ACT_RECENT: usize = 10;
 pub const ACT_DEAD_RISE: f64 = 0.25;
 pub const STALL_STEPS: u32 = 3;
+/// Onsets listed in one `stalled_weights` incident; `onsets_omitted` counts the rest.
+pub const STALL_ONSETS: usize = 20;
 pub const SCALE_SKIP_RUN: u64 = 10;
 pub const SCALE_FLOOR: f64 = 1.0;
 pub const DRIFT_TOLERANCE: f64 = 1e-6;
@@ -103,6 +114,7 @@ pub fn thresholds() -> Value {
         "overload_jump": OVERLOAD_JUMP,
         "spike_factor": SPIKE_FACTOR,
         "spike_window": SPIKE_WINDOW,
+        "spike_sustain": SPIKE_SUSTAIN,
         "activation_spike_factor": ACT_SPIKE_FACTOR,
         "activation_drift_factor": ACT_DRIFT_FACTOR,
         "activation_dead_rise": ACT_DEAD_RISE,
@@ -879,13 +891,79 @@ impl Moe {
 
 // --- grad_spike ----------------------------------------------------------------------------
 
+/// Where a parameter's excursion began: what the incident reports if it lasts.
+struct Start {
+    step: i64,
+    total: f64,
+    total_baseline: Option<f64>,
+    name: String,
+    norm: f64,
+    usual: f64,
+    /// What was logged on that step. The incident is dated here and made later, when the
+    /// window the medians come from has moved on, so it is read when the excursion begins.
+    scalars: Option<Value>,
+}
+
+impl Start {
+    fn parameter(&self) -> Value {
+        json!({
+            "name": self.name,
+            "grad_norm": self.norm,
+            "baseline": self.usual,
+            "ratio": self.norm / self.usual,
+            "rising_since": self.step,
+        })
+    }
+}
+
+/// One parameter's gradient norms: Python's `per_param` list and its `_Baseline`.
+struct Parameter {
+    /// The last `SPIKE_WINDOW` norms with their steps, excursions included.
+    past: VecDeque<(i64, f64)>,
+    /// The last `SPIKE_WINDOW` norms that were not part of an excursion, and the lowest of
+    /// them: a norm below `SPIKE_FACTOR` times the lowest cannot reach that many times the
+    /// median, so most steps need no median.
+    usual: VecDeque<f64>,
+    low: f64,
+    /// Recorded steps in a row at or above `SPIKE_FACTOR` times the median, and the first.
+    run: u32,
+    start: Option<Start>,
+}
+
+impl Default for Parameter {
+    fn default() -> Self {
+        Self {
+            past: VecDeque::new(),
+            usual: VecDeque::new(),
+            low: f64::INFINITY,
+            run: 0,
+            start: None,
+        }
+    }
+}
+
+impl Parameter {
+    fn keep(&mut self, norm: f64) {
+        self.usual.push_back(norm);
+        if norm < self.low {
+            self.low = norm;
+        }
+        if self.usual.len() > SPIKE_WINDOW {
+            let gone = self.usual.pop_front().expect("longer than the window");
+            if gone <= self.low {
+                self.low = self.usual.iter().copied().fold(f64::INFINITY, f64::min);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Gradients {
     /// Whether any record so far had `clip_grad_norm`; the total is read from it from then on.
     clips: bool,
     seen: usize,
     totals: VecDeque<f64>,
-    parameters: Named<VecDeque<(i64, f64)>>,
+    parameters: Named<Parameter>,
     first: Option<Value>,
     spikes: u64,
     spike_steps: Vec<i64>,
@@ -893,7 +971,7 @@ struct Gradients {
 }
 
 impl Gradients {
-    fn row(&mut self, step: i64, columns: &Columns, row: usize) {
+    fn row(&mut self, step: i64, columns: &Columns, row: usize, scalars: &mut Scalars) {
         if !self.clips && value(columns.clip_grad_norm, row).is_some() {
             // Python reads the pre-clipping norm for the whole run once any record has it,
             // and the records before clipping began have none: start again from here.
@@ -919,10 +997,12 @@ impl Gradients {
         let Some(total) = total.filter(|total| total.is_finite()) else {
             return;
         };
+        let mut total_baseline = None;
         if self.seen >= SPIKE_MIN_HISTORY {
             self.scratch.clear();
             self.scratch.extend(self.totals.iter());
             let baseline = median(&mut self.scratch);
+            total_baseline = Some(baseline);
             if baseline > 0.0 && total >= SPIKE_FACTOR * baseline {
                 self.spikes += 1;
                 if self.spike_steps.len() < 20 {
@@ -948,16 +1028,84 @@ impl Gradients {
         let Some(norms) = &columns.grad_norms else { return };
         let entries = norms.row(row);
         let first_entry = entries.start;
+        // The parameters whose own norm has now stayed high for `SPIKE_SUSTAIN` recorded steps.
+        let mut lasted: Vec<Start> = Vec::new();
+        // This row's logged values, read once if an excursion begins here and no incident exists.
+        let mut logged: Option<Option<Value>> = None;
         for entry in entries {
             if norms.values.is_null(entry) || !norms.values.value(entry).is_finite() {
                 continue;
             }
-            let past = self.parameters.slot(entry - first_entry, norms.keys.value(entry));
-            past.push_back((step, norms.values.value(entry)));
-            if past.len() > SPIKE_WINDOW {
-                past.pop_front();
+            let (name, norm) = (norms.keys.value(entry), norms.values.value(entry));
+            let parameter = self.parameters.slot(entry - first_entry, name);
+            parameter.past.push_back((step, norm));
+            if parameter.past.len() > SPIKE_WINDOW {
+                parameter.past.pop_front();
             }
+            // The parameter on its own: at SPIKE_FACTOR times its own median, and staying
+            // there. Norms of an excursion stay out of the median it is measured against.
+            if parameter.usual.len() >= SPIKE_MIN_HISTORY && norm >= SPIKE_FACTOR * parameter.low {
+                self.scratch.clear();
+                self.scratch.extend(parameter.usual.iter());
+                let usual = median(&mut self.scratch);
+                if usual > 0.0 && norm >= SPIKE_FACTOR * usual {
+                    if parameter.run == 0 {
+                        let scalars = if self.first.is_some() {
+                            None // the incident is made already: no later excursion is reported
+                        } else {
+                            logged.get_or_insert_with(|| scalars.context(columns, row)).clone()
+                        };
+                        parameter.start = Some(Start {
+                            step,
+                            total,
+                            total_baseline,
+                            name: name.to_owned(),
+                            norm,
+                            usual,
+                            scalars,
+                        });
+                    }
+                    parameter.run += 1;
+                    if parameter.run == SPIKE_SUSTAIN {
+                        lasted.extend(parameter.start.take());
+                    }
+                    continue;
+                }
+            }
+            parameter.run = 0;
+            parameter.keep(norm);
         }
+        if lasted.is_empty() || self.first.is_some() {
+            return; // an incident, once reported, is not replaced or dated again
+        }
+        // Usually every excursion that lasts to this record began on the same step; if not,
+        // the incident is the earliest, with the parameters that began there.
+        let began = lasted.iter().map(|start| start.step).min().expect("not empty");
+        lasted.retain(|start| start.step == began);
+        lasted.sort_by(|a, b| {
+            (b.norm / b.usual)
+                .total_cmp(&(a.norm / a.usual))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        let start = lasted.iter().find(|start| start.step == began).expect("not empty");
+        let ratio = start
+            .total_baseline
+            .filter(|baseline| *baseline != 0.0)
+            .map(|baseline| start.total / baseline);
+        let mut first = json!({
+            "kind": "grad_spike",
+            "step": began,
+            "grad_norm": start.total,
+            "baseline": start.total_baseline,
+            "ratio": ratio,
+            "parameters": lasted.iter().take(10).map(Start::parameter).collect::<Vec<_>>(),
+            "trigger": "parameter",
+            "sustained": SPIKE_SUSTAIN,
+        });
+        if let Some(scalars) = &start.scalars {
+            first["scalars"] = scalars.clone();
+        }
+        self.first = Some(first);
     }
 
     /// Python's `_spiking_parameters`: the parameters above their own median, ordered by
@@ -977,7 +1125,7 @@ impl Gradients {
             let Some(past) = self
                 .parameters
                 .find(entry - first_entry, name)
-                .map(|at| &self.parameters.items[at].1)
+                .map(|at| &self.parameters.items[at].1.past)
                 .filter(|past| past.len() >= 2)
             else {
                 continue;
@@ -1195,10 +1343,9 @@ impl Activations {
 
 /// Python's `_optimizer_evidence`: whether an optimizer that stepped holds the stalled
 /// parameters, from the `optimizer_ownership` the capture wrote at this weight check.
-fn optimizer_evidence(extra: Option<&str>, stalled: &[&str]) -> Value {
+fn optimizer_evidence(extra: Option<&Value>, stalled: &[&str]) -> Value {
     let ownership = extra
-        .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
-        .and_then(|extra| extra.get("optimizer_ownership").cloned())
+        .and_then(|extra| extra.get("optimizer_ownership"))
         .filter(|ownership| ownership.as_object().is_some_and(|ownership| !ownership.is_empty()));
     let Some(ownership) = ownership else {
         return json!({"state": "unknown", "reason": "not recorded by this capture"});
@@ -1220,12 +1367,25 @@ fn optimizer_evidence(extra: Option<&str>, stalled: &[&str]) -> Value {
     })
 }
 
+/// One parameter's weight checks.
+#[derive(Default)]
+struct Weight {
+    /// How many weight checks in a row it was unchanged with a gradient.
+    streak: u32,
+    /// Seen changing at some weight check.
+    changed: bool,
+    /// Already listed under an onset: a parameter is reported once.
+    reported: bool,
+}
+
 #[derive(Default)]
 struct Stalled {
-    /// For each parameter, how many weight checks in a row it was unchanged with a gradient.
-    streak: Named<u32>,
+    weights: Named<Weight>,
     first: Option<Value>,
     stalled_steps: u64,
+    stalled_total: u64,
+    onsets: Vec<Value>,
+    onset_steps: u64,
 }
 
 impl Stalled {
@@ -1252,42 +1412,94 @@ impl Stalled {
                 let positive = !norms.values.is_null(entry) && norm.is_finite() && norm > 0.0;
                 with_gradients += usize::from(positive);
                 let name = norms.keys.value(entry);
+                let same = unchanged.contains(&name);
                 // A parameter this row does not list keeps its streak.
-                let streak = self.streak.slot(entry - first_entry, name);
-                *streak = if positive && unchanged.contains(&name) {
-                    *streak + 1
-                } else {
-                    0
-                };
+                let weight = self.weights.slot(entry - first_entry, name);
+                weight.streak = if positive && same { weight.streak + 1 } else { 0 };
+                // It cannot be newly stalled on the row that shows it changing, so marking
+                // it here is the same as Python's marking after the row.
+                weight.changed |= !same;
             }
         }
         let stalled: Vec<&str> = self
-            .streak
+            .weights
             .items
             .iter()
-            .filter(|(_, streak)| *streak >= STALL_STEPS)
+            .filter(|(_, weight)| weight.streak >= STALL_STEPS)
             .map(|(name, _)| name.as_str())
             .collect();
         if stalled.is_empty() {
             return;
         }
         self.stalled_steps += 1;
-        if self.first.is_none() {
-            self.first = Some(json!({
+        // Parsed only on a row that reports something: `extra_json` is not small.
+        let mut extra: Option<Option<Value>> = None;
+        let mut parsed = || text(columns.extra, row).and_then(|extra| serde_json::from_str::<Value>(extra).ok());
+        let first_onset = self.first.is_none();
+        if first_onset {
+            let extra = extra.get_or_insert_with(&mut parsed);
+            let mut first = json!({
                 "kind": "stalled_weights",
                 "step": step,
                 "parameters": stalled.iter().take(20).collect::<Vec<_>>(),
                 "stalled": stalled.len(),
                 "with_gradients": with_gradients,
                 "consecutive": STALL_STEPS,
-                "optimizer": optimizer_evidence(text(columns.extra, row), &stalled),
+                "optimizer": optimizer_evidence(extra.as_ref(), &stalled),
+            });
+            let dtypes = extra
+                .as_ref()
+                .and_then(|extra| extra.get("weight_dtypes"))
+                .filter(|dtypes| dtypes.as_object().is_some_and(|dtypes| !dtypes.is_empty()));
+            if let Some(dtypes) = dtypes {
+                first["weight_dtypes"] = dtypes.clone();
+            }
+            self.first = Some(first);
+        }
+        // Each parameter on its own history: those that stall on this row for the first time,
+        // the ones that had changed at an earlier check first.
+        let new: Vec<(&str, bool)> = self
+            .weights
+            .items
+            .iter()
+            .filter(|(_, weight)| weight.streak >= STALL_STEPS && !weight.reported)
+            .map(|(name, weight)| (name.as_str(), weight.changed))
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        self.onset_steps += 1;
+        self.stalled_total += new.len() as u64;
+        if self.onsets.len() < STALL_ONSETS {
+            let names: Vec<&str> = new.iter().map(|(name, _)| *name).collect();
+            let trained = new.iter().filter(|(_, changed)| *changed).count();
+            let listed: Vec<&str> = new
+                .iter()
+                .filter(|(_, changed)| *changed)
+                .chain(new.iter().filter(|(_, changed)| !*changed))
+                .map(|(name, _)| *name)
+                .take(20)
+                .collect();
+            let extra = extra.get_or_insert_with(&mut parsed);
+            self.onsets.push(json!({
+                "step": step,
+                "parameters": listed,
+                "stalled": new.len(),
+                "trained_before": trained,
+                "optimizer": optimizer_evidence(extra.as_ref(), &names),
             }));
+        }
+        for (_, weight) in &mut self.weights.items {
+            weight.reported |= weight.streak >= STALL_STEPS;
         }
     }
 
     fn incidents(&self, out: &mut Vec<Value>) {
         if let Some(mut first) = self.first.clone() {
             first["stalled_steps"] = json!(self.stalled_steps);
+            first["stalled_total"] = json!(self.stalled_total);
+            first["onsets"] = json!(self.onsets);
+            first["onsets_omitted"] = json!(self.onset_steps - self.onsets.len() as u64);
             out.push(first);
         }
     }
@@ -1828,7 +2040,7 @@ impl RankDetectors {
                 text(columns.layers, row).and_then(|layers| serde_json::from_str(layers).ok());
             let layers = layers.as_ref().map_or(&[][..], |layers| &layers.0);
             self.moe.row(step, &columns, row);
-            self.gradients.row(step, &columns, row);
+            self.gradients.row(step, &columns, row, &mut self.scalars);
             self.stalled.row(step, &columns, row);
             self.loss_scale.row(step, &columns, row);
             self.activations.row(step, layers);
@@ -1861,7 +2073,11 @@ impl RankDetectors {
                     ];
                     for (first, was) in firsts.into_iter().zip(before.0) {
                         if let (Some(first), false) = (first, was) {
-                            first["scalars"] = context.clone();
+                            // One parameter's spike is dated at an earlier step and carries
+                            // what was logged there, not what is logged on this row.
+                            if first.get("trigger").is_none() {
+                                first["scalars"] = context.clone();
+                            }
                         }
                     }
                     for (_, incident, _) in self.activations.found.iter_mut().skip(before.1) {

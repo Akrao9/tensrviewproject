@@ -7,18 +7,18 @@ and fails unless the real capture and `build_evidence` report it in time, on tha
 - `grad_spike`: from `--seed-step` the gradient of that parameter is multiplied by `--factor` with
   a tensor hook, so no other gradient changes. PASS when the `grad_spike` incident starts at the
   seeded step or within one flush interval (50 steps) after it and lists the seeded parameter.
-  The incident is raised only when the TOTAL gradient norm reaches 5 times its median
-  (`SPIKE_FACTOR`), and the parameters are listed after that. One parameter times 100 gets there
-  only if it holds about 5% of the total norm; a k_proj holds a fraction of a percent (0.2% in
-  the toy), so x100 is invisible to the detector. Without `--factor` the script measures the
-  parameter's share of the total on the first batches and uses x100 or the factor that takes
-  the total to twice the threshold, whichever is larger. `--factor 100` shows the blind spot.
-  The detector is not changed.
+  The detector has two rules. The TOTAL gradient norm at 5 times its median (`SPIKE_FACTOR`):
+  one parameter times 100 gets there only if it holds about 5% of the total norm, and a k_proj
+  holds a fraction of a percent (0.2% in the toy). And ONE parameter at 5 times its own median
+  for 3 recorded steps in a row (`SPIKE_SUSTAIN`), whatever the total does. Without `--factor`
+  the script measures the parameter's share of the total on the first batches and uses x100 or
+  the factor that takes the total to twice the threshold, whichever is larger, which tests the
+  first rule. `--factor 100` leaves the total where it was and tests the second.
 - `stalled_weights`: from `--freeze-step` that parameter's learning rate is 0 (its own param group,
   still in the optimizer, gradient finite), so its weights stop changing. The detector needs the
   float64 norm to be exactly unchanged on 3 weight checks in a row (checks fall at steps 49, 99,
-  149, ...). PASS when the incident starts at the first step those 3 checks could show it or within
-  one check interval (50 steps) after, and lists the seeded parameter.
+  149, ...). PASS when the incident lists the seeded parameter with an onset at the first step
+  those 3 checks could show it or within one check interval (50 steps) after.
 
 Each case prints a PASS or FAIL line, with the numbers behind it, and the exit status is 1 if either
 fails.
@@ -27,11 +27,11 @@ fails.
 
 `--toy` uses a tiny random Llama on random tokens, for checking the script on CPU. Weights are
 bfloat16 on a GPU, as in `dense_outlier_check.py`. With a learning rate of 1e-5 some bfloat16
-weights (RMSNorm's, near 1.0) never change, so `stalled_weights` reports those from the third weight
-check on, before a freeze at step 100 can show. The detector builds ONE incident, at the first step
-any parameter is stalled, and lists at most 20 in model order, so the seeded parameter is not named:
-the capture has it (`weights_unchanged`) and the incident does not. `--dtype float32` trains
-without that background and is the control; `--toy --dtype bfloat16` reproduces it on CPU.
+weights (RMSNorm's, near 1.0) never change, so `stalled_weights` starts with those, from the third
+weight check on, before a freeze at step 100 can show. Each parameter is judged on its own history,
+so the incident's `onsets` name the seeded parameter at the step its own freeze shows, as one that
+had changed before, beside the earlier onset of weights that never changed. `--dtype float32`
+trains without that background; `--toy --dtype bfloat16` reproduces it on CPU.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ import torch
 
 import tensorquill
 from tensorquill.capture import WEIGHT_EVERY
-from tensorquill.evidence import SPIKE_FACTOR, SPIKE_MIN_HISTORY, SPIKE_WINDOW, STALL_STEPS
+from tensorquill.evidence import SPIKE_FACTOR, SPIKE_MIN_HISTORY, SPIKE_SUSTAIN, SPIKE_WINDOW, STALL_STEPS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dense_outlier_check import FLUSH_EVERY, MODEL, build_models, load_batches, train_step  # noqa: E402
@@ -202,7 +202,12 @@ def judge_grad_spike(
     if incident is None:
         return Verdict("grad_spike", False, f"no grad_spike incident (gradient of {seeded} x{factor:g} from step {seed_step})", notes)
     names = [p["name"] for p in incident["parameters"]]
-    where = f"step {incident['step']} (ratio {incident['ratio']:.1f}), seeded from step {seed_step}"
+    total = f"{incident['ratio']:.1f}" if isinstance(incident.get("ratio"), (int, float)) else "unknown"
+    if incident.get("trigger") == "parameter":
+        rule = f"the parameter's own norm, {incident['sustained']} steps in a row; total ratio {total}"
+    else:
+        rule = f"ratio {total}"
+    where = f"step {incident['step']} ({rule}), seeded from step {seed_step}"
     notes.append(f"incident lists {len(names)} parameter(s): {names}")
     if len(incident.get("spike_steps", [])) > 1:
         notes.append(f"{incident['spike_count']} spike steps in all, first {incident['spike_steps'][:6]}")
@@ -240,13 +245,13 @@ def judge_stalled_weights(
     evidence: dict[str, Any], records: list[dict[str, Any]], seeded: str, freeze_step: int,
     window: int = WEIGHT_EVERY,
 ) -> Verdict:
-    """PASS when a `stalled_weights` incident starts at the first step 3 weight checks could show
-    the freeze, or up to `window` steps after, and its listed parameters include `seeded`.
+    """PASS when a `stalled_weights` incident lists `seeded` with an onset at the first step 3
+    weight checks could show the freeze, or up to `window` steps after.
 
-    Other parameters may be listed too (real bfloat16 runs always stall some RMSNorm weights) and
-    are printed. The detector builds ONE incident, at the first step any parameter is stalled,
-    and lists at most 20 of them in model order, so a freeze that comes after, or sits past the
-    twentieth, is not named even though the capture saw it. That is reported, not worked around.
+    The incident is dated at the first step any parameter stalled, and real bfloat16 runs stall
+    some RMSNorm weights before a seeded freeze can show. Each parameter is judged on its own
+    history, so the seeded one is looked for among the incident's `onsets`, and the step that
+    counts is its own onset, not the incident's.
     """
     expected = first_visible_stall(freeze_step)
     notes = [f"weights frozen from step {freeze_step}; 3 checks in a row could first show it at step {expected}"]
@@ -258,37 +263,49 @@ def judge_stalled_weights(
     incident = next((i for i in evidence["incidents"] if i["kind"] == "stalled_weights"), None)
     if incident is None:
         return Verdict("stalled_weights", False, f"no stalled_weights incident ({seeded} frozen from step {freeze_step})", notes)
-    names = list(incident["parameters"])
-    extras = [n for n in names if n != seeded]
+    # An incident from before onsets were recorded has one onset: its own step and parameters.
+    onsets = incident.get("onsets") or [
+        {"step": incident["step"], "parameters": incident["parameters"], "stalled": incident["stalled"]}
+    ]
     notes.append(
-        f"incident at step {incident['step']} lists {len(names)} of {incident['stalled']} stalled parameter(s)"
-        f" ({incident['with_gradients']} with a gradient)"
+        f"incident from step {incident['step']}: {incident.get('stalled_total', incident['stalled'])} stalled"
+        f" parameter(s) in all ({incident['with_gradients']} with a gradient), onsets at steps "
+        f"{[onset['step'] for onset in onsets]}"
     )
-    if extras:
-        label = "besides the seeded one" if seeded in names else "listed instead of the seeded one"
-        notes.append(f"{label} ({len(extras)}): {extras}")
+    for onset in onsets:
+        others = [n for n in onset["parameters"] if n != seeded]
+        if others:
+            trained = onset.get("trained_before")
+            notes.append(
+                f"step {onset['step']}: {onset['stalled']} parameter(s)"
+                + (f", {trained} of them changed at an earlier check" if trained is not None else "")
+                + f"; besides the seeded one ({len(others)} listed): {others}"
+            )
     optimizer = incident.get("optimizer", {})
     notes.append(
         f"optimizer evidence: {optimizer.get('state')}, {optimizer.get('not_held_count', 0)} stalled parameter(s) not held"
         if optimizer.get("state") == "known" else f"optimizer evidence: {optimizer}"
     )
-    where = f"step {incident['step']}"
-    if seeded not in names:
+    own = next((onset for onset in onsets if seeded in onset["parameters"]), None)
+    if own is None:
         why = ""
-        if incident["step"] < expected:
-            why = f": it began at step {incident['step']}, before the freeze could show, with other parameters"
-        elif incident["stalled"] > len(names):
-            why = f": {incident['stalled'] - len(names)} stalled parameters are not listed (the incident keeps 20)"
-        return Verdict("stalled_weights", False, f"stalled_weights at {where} does not list {seeded}{why}", notes)
-    if not expected <= incident["step"] <= expected + window:
+        unlisted = sum(onset["stalled"] - len(onset["parameters"]) for onset in onsets)
+        omitted = incident.get("onsets_omitted", 0)
+        if unlisted or omitted:
+            why = f": {unlisted} stalled parameter(s) and {omitted} onset(s) are not listed (an onset keeps 20 names)"
+        return Verdict("stalled_weights", False, f"stalled_weights from step {incident['step']} does not list {seeded}{why}", notes)
+    where = f"step {own['step']}"
+    if not expected <= own["step"] <= expected + window:
         return Verdict(
             "stalled_weights", False,
-            f"stalled_weights at {where} lists {seeded}, outside {expected} to {expected + window}", notes,
+            f"stalled_weights lists {seeded} at {where}, outside {expected} to {expected + window}", notes,
         )
+    others = sum(onset["stalled"] for onset in onsets) - 1
     return Verdict(
         "stalled_weights", True,
-        f"stalled_weights at {where} (first possible {expected}) lists {seeded}"
-        + (f", with {len(extras)} other parameter(s)" if extras else ""), notes,
+        f"stalled_weights lists {seeded} at {where} (first possible {expected})"
+        + (", after it changed at earlier checks" if own.get("trained_before") else "")
+        + (f", with {others} other parameter(s)" if others else ""), notes,
     )
 
 
@@ -324,7 +341,8 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
         share = gradient_share(model, name, batches)
         factor = max(100.0, factor_for(share))
         print(f"{name} holds {100 * share:.2f}% of the total gradient norm: x100 on it moves the total x{total_ratio(100, share):.2f}"
-              f" (the detector fires at x{SPIKE_FACTOR:g}); using x{factor:g}, which moves it x{total_ratio(factor, share):.1f}")
+              f" (the total rule fires at x{SPIKE_FACTOR:g}); using x{factor:g}, which moves it x{total_ratio(factor, share):.1f}."
+              f" --factor 100 tests the one-parameter rule instead")
     scale = GradientScale(seeded, factor) if case == "grad_spike" else None
     jsonl = out / f"{case}.jsonl"
     out.mkdir(parents=True)
@@ -360,9 +378,6 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
     for note in verdict.notes:
         print(f"  {note}")
     print(f"{'PASS' if verdict.passed else 'FAIL'}: {verdict.summary}")
-    if not verdict.passed and case == "stalled_weights" and dtype == torch.bfloat16:
-        print("  bfloat16 weights near 1.0 do not move at this learning rate, so other parameters stall first; "
-              "--dtype float32 leaves them out")
     print(f"Capture: {jsonl}\n")
     return verdict
 
@@ -398,7 +413,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("a CUDA GPU is required; use --toy to check the script on CPU")
     cases = CASES if args.case == "both" else (args.case,)
     for case in cases:
-        need = args.seed_step + 1 if case == "grad_spike" else first_visible_stall(args.freeze_step) + 1
+        # A spike in one parameter is known once it has lasted SPIKE_SUSTAIN recorded steps.
+        need = args.seed_step + SPIKE_SUSTAIN if case == "grad_spike" else first_visible_stall(args.freeze_step) + 1
         if args.steps and args.steps < need:
             parser.error(f"--steps {args.steps} ends before {case} can be seen; it needs at least {need}")
 

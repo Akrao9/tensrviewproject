@@ -164,6 +164,9 @@ pub struct Progress {
     /// when it last moved.
     work: Option<i64>,
     work_moved: Instant,
+    /// Where the process's threads were at its last heartbeat, when its work had stood still
+    /// long enough for it to say (see `Heartbeat` in the SDK). Kept after the heartbeats stop.
+    stack: Option<Value>,
     pauses: HashMap<String, Pauses>,
     created: Instant,
     attempt: i64,
@@ -189,6 +192,7 @@ impl Progress {
             heartbeat_interval: 0.0,
             work: None,
             work_moved: now,
+            stack: None,
             pauses: HashMap::new(),
             created: now,
             attempt: 0,
@@ -380,6 +384,7 @@ impl Progress {
             heartbeat_interval: seconds(&carry["heartbeat_interval_seconds"])?.clamp(0.0, 3600.0),
             work: carry["work"].as_i64(),
             work_moved: ago(now, seconds(&carry["work_still_seconds"])?),
+            stack: entry.get("stack").filter(|stack| stack.is_object()).cloned(),
             pauses,
             created: ago(now, seconds(&carry["age_seconds"])?),
             attempt: entry["attempt"].as_i64()?,
@@ -514,11 +519,21 @@ impl Watchdog {
 
     /// A heartbeat from the rank's own process: it is alive, in `phase`. Leaving a phase other
     /// than training records how long it lasted.
-    pub fn heartbeat(&self, key: &Key, phase: &str, interval_seconds: f64, work: Option<i64>, now: Instant) {
+    pub fn heartbeat(
+        &self,
+        key: &Key,
+        phase: &str,
+        interval_seconds: f64,
+        work: Option<i64>,
+        stack: Option<Value>,
+        now: Instant,
+    ) {
         self.with(key, now, |p| {
             if work.is_some() && work != p.work {
                 p.work_moved = now;
             }
+            // The newest word wins: a beat with no stack says the rank is working again.
+            p.stack = stack;
             if work.is_some() {
                 p.work = work;
             }
@@ -649,7 +664,7 @@ pub fn run_status(
                 }
                 _ => None,
             };
-            json!({
+            let mut entry = json!({
                 "rank": rank,
                 "phase": p.phase,
                 "phase_seconds": (now.saturating_duration_since(p.phase_since).as_secs_f64() * 10.0).round() / 10.0,
@@ -664,7 +679,11 @@ pub fn run_status(
                     Stream::Dropped => "dropped",
                 },
                 "state": state.as_str(),
-            })
+            });
+            if let Some(stack) = &p.stack {
+                entry["stack"] = stack.clone();
+            }
+            entry
         })
         .collect();
     // Pauses the ranks reported, merged: the longest of each phase, for sizing the threshold.
@@ -717,12 +736,74 @@ pub fn run_status(
 /// is making progress, `rank_silent` when some are silent, lost or never connected while
 /// others go on. These are observations of the stream the server receives; the cause is
 /// not known, and a hang is only ever suspected from the stream alone.
+/// Where a stopped rank's main thread was, from the stack its process sent: `stuck_at` in
+/// `sdk/src/tensorquill/evidence.py`, which is the reference.
+fn stuck_at(rank: &Value) -> Option<Value> {
+    let stack = rank["stack"].as_object()?;
+    let main = stack
+        .get("threads")?
+        .as_array()?
+        .iter()
+        .find(|thread| thread["main"] == true)?;
+    let frames: Vec<&Value> = main["frames"]
+        .as_array()?
+        .iter()
+        .filter(|frame| frame.is_object() && frame["file"].is_string())
+        .collect();
+    let brief = |frame: &Value| {
+        json!({
+            "function": frame["function"].as_str().unwrap_or("?"),
+            "file": frame["file"],
+            "line": frame["line"],
+        })
+    };
+    let own = |frame: &Value| frame["own"] == true;
+    let library = |frame: &Value| {
+        let file = frame["file"].as_str().unwrap_or_default();
+        file.contains("site-packages")
+            || file.contains("dist-packages")
+            || file.contains("/lib/python")
+            || file.starts_with('<')
+    };
+    let mut place = brief(frames.first()?);
+    place["rank"] = rank["rank"].clone();
+    if let Some(caller) = frames.iter().skip(1).find(|frame| !library(frame) && !own(frame)) {
+        place["caller"] = brief(caller);
+    }
+    if let Some(frame) = frames.iter().find(|frame| own(frame)) {
+        place["in_tensorquill"] = brief(frame);
+    }
+    for key in ["unchanged_seconds", "still_seconds"] {
+        if stack.get(key).is_some_and(Value::is_number) {
+            place[key] = stack[key].clone();
+        }
+    }
+    Some(place)
+}
+
 pub fn incidents(status: &Value) -> Vec<Value> {
     let summary = status["summary"].as_str().unwrap_or_default();
     if summary != "stalled" && summary != "degraded" {
         return Vec::new();
     }
-    let ranks: &[Value] = status["ranks"].as_array().map_or(&[], Vec::as_slice);
+    let full: &[Value] = status["ranks"].as_array().map_or(&[], Vec::as_slice);
+    let places: Vec<Value> = full
+        .iter()
+        .filter(|rank| matches!(rank["state"].as_str(), Some("silent" | "lost" | "unresponsive")))
+        .filter_map(stuck_at)
+        .collect();
+    // The stacks stay in the status's `ranks`; an incident carries `stuck_at` instead.
+    let without: Vec<Value> = full
+        .iter()
+        .map(|rank| {
+            let mut rank = rank.clone();
+            if let Some(fields) = rank.as_object_mut() {
+                fields.remove("stack");
+            }
+            rank
+        })
+        .collect();
+    let ranks: &[Value] = &without;
     let state = |rank: &Value| rank["state"].as_str().unwrap_or_default().to_owned();
     let stopped: Vec<&Value> = ranks
         .iter()
@@ -753,6 +834,9 @@ pub fn incidents(status: &Value) -> Vec<Value> {
         "world_size": status["world_size"],
         "missing_ranks": status["missing_ranks"],
     });
+    if !places.is_empty() {
+        incident["stuck_at"] = json!(places);
+    }
     if summary == "stalled" {
         incident["kind"] = json!("job_stalled");
         incident["step"] = json!(newest);
@@ -772,6 +856,85 @@ pub fn incidents(status: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stopped_ranks_stack_becomes_stuck_at_the_way_python_reads_it() {
+        // The same cases as `test_watchdog.py`: Python's `stuck_at` is the reference.
+        let site = "/venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py";
+        let frame = |function: &str, file: &str, line: i64| json!({"function": function, "file": file, "line": line});
+        let stack = |frames: Vec<Value>| {
+            json!({"still_seconds": 140.0, "unchanged_seconds": 95.0, "threads": [
+                {"name": "loader", "main": false, "frames": [frame("get", "/job/data.py", 3)]},
+                {"name": "MainThread", "main": true, "frames": frames},
+            ]})
+        };
+        let rank = |rank: i64, state: &str, stack: Value| json!({"rank": rank, "state": state, "severity": "warning", "last_step": 9, "stack": stack});
+        let status =
+            |ranks: Vec<Value>| json!({"summary": "stalled", "ranks": ranks, "missing_ranks": [], "written_at_ms": 7});
+        let mut own = frame(
+            "replica_spread",
+            "/venv/lib/python3.12/site-packages/tensorquill/distributed.py",
+            150,
+        );
+        own["own"] = json!(true);
+        let hit = &incidents(&status(vec![
+            rank(
+                0,
+                "silent",
+                stack(vec![
+                    frame("all_reduce", site, 2940),
+                    frame("train_step", "/job/train.py", 88),
+                ]),
+            ),
+            rank(1, "unresponsive", Value::Null),
+            rank(
+                2,
+                "silent",
+                stack(vec![
+                    frame("all_gather", site, 3100),
+                    own,
+                    frame("loop", "/job/tensorquill/run.py", 7),
+                ]),
+            ),
+            rank(3, "active", stack(vec![frame("step", "/job/train.py", 1)])),
+        ]))[0];
+        assert_eq!(
+            hit["stuck_at"],
+            json!([
+                {"rank": 0, "function": "all_reduce", "file": site, "line": 2940, "still_seconds": 140.0, "unchanged_seconds": 95.0,
+                 "caller": {"function": "train_step", "file": "/job/train.py", "line": 88}},
+                {"rank": 2, "function": "all_gather", "file": site, "line": 3100, "still_seconds": 140.0, "unchanged_seconds": 95.0,
+                 "caller": {"function": "loop", "file": "/job/tensorquill/run.py", "line": 7},
+                 "in_tensorquill": {"function": "replica_spread", "file": "/venv/lib/python3.12/site-packages/tensorquill/distributed.py", "line": 150}},
+            ])
+        );
+        assert!(hit["ranks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|rank| rank.get("stack").is_none()));
+        // A stack that is not one gives no `stuck_at`, and nothing else changes.
+        for bad in [
+            json!("frames"),
+            json!([]),
+            json!({}),
+            json!({"threads": "x"}),
+            json!({"threads": [{"main": true}]}),
+            json!({"threads": [{"main": true, "frames": []}]}),
+            json!({"threads": [{"main": true, "frames": [{"line": 3}, 7]}]}),
+            json!({"threads": [{"main": false, "frames": [{"file": "a.py"}]}]}),
+            json!({"threads": [{"main": 1, "frames": [{"file": "a.py"}]}]}),
+        ] {
+            let hit = &incidents(&status(vec![rank(0, "silent", bad)]))[0];
+            assert!(hit.get("stuck_at").is_none(), "{hit}");
+        }
+        // Names and numbers that are not: `?` for the function, the seconds left out.
+        let odd = json!({"still_seconds": true, "unchanged_seconds": "9", "threads": [{"main": true, "frames": [{"file": "a.py", "function": 7}]}]});
+        assert_eq!(
+            incidents(&status(vec![rank(0, "silent", odd)]))[0]["stuck_at"],
+            json!([{"rank": 0, "function": "?", "file": "a.py", "line": null}])
+        );
+    }
 
     #[test]
     fn a_status_is_read_as_incidents_the_way_python_reads_it() {
@@ -1038,18 +1201,18 @@ mod tests {
         let dog = Watchdog::new(config(60));
         dog.stream_opened(&key(0), t0);
         dog.batch(&key(0), 1, Some(49), Some(1), at(t0, 1));
-        dog.heartbeat(&key(0), "train", 15.0, None, at(t0, 2));
+        dog.heartbeat(&key(0), "train", 15.0, None, None, at(t0, 2));
         // Evaluation starts; nothing steps for four minutes but the heartbeats go on.
-        dog.heartbeat(&key(0), "eval", 15.0, None, at(t0, 10));
+        dog.heartbeat(&key(0), "eval", 15.0, None, None, at(t0, 10));
         for second in (25..250).step_by(15) {
-            dog.heartbeat(&key(0), "eval", 15.0, None, at(t0, second));
+            dog.heartbeat(&key(0), "eval", 15.0, None, None, at(t0, second));
         }
         assert_eq!(states(&dog, at(t0, 250)), ["paused"]);
         assert_eq!(summary(&dog, at(t0, 250)), "active");
         assert_eq!(rank_field(&dog, at(t0, 250), "phase"), "eval");
         assert_eq!(rank_field(&dog, at(t0, 250), "severity"), Value::Null);
         // Training resumes: the pause is on record and sizes a threshold.
-        dog.heartbeat(&key(0), "train", 15.0, None, at(t0, 250));
+        dog.heartbeat(&key(0), "train", 15.0, None, None, at(t0, 250));
         dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 251));
         let status = &dog.statuses(at(t0, 252), true)["run"];
         assert_eq!(status["pauses"]["eval"]["count"], 1);
@@ -1065,7 +1228,7 @@ mod tests {
         dog.stream_opened(&key(0), t0);
         dog.batch(&key(0), 1, Some(49), Some(1), at(t0, 1));
         for second in (5..400).step_by(15) {
-            dog.heartbeat(&key(0), "train", 15.0, None, at(t0, second));
+            dog.heartbeat(&key(0), "train", 15.0, None, None, at(t0, second));
         }
         // The process is alive and says it is training, yet no step: a suspected hang.
         assert_eq!(states(&dog, at(t0, 100)), ["silent"]);
@@ -1090,7 +1253,7 @@ mod tests {
         let dog = Watchdog::new(config(60));
         dog.stream_opened(&key(0), t0);
         dog.batch(&key(0), 1, Some(49), Some(1), at(t0, 1));
-        dog.heartbeat(&key(0), "train", 15.0, None, at(t0, 5));
+        dog.heartbeat(&key(0), "train", 15.0, None, None, at(t0, 5));
         // A frozen process: no step and, past three intervals, no heartbeat either.
         assert_eq!(states(&dog, at(t0, 70)), ["unresponsive"]);
         assert_eq!(summary(&dog, at(t0, 70)), "stalled");
@@ -1106,7 +1269,7 @@ mod tests {
         let dog = Watchdog::new(config(60));
         dog.stream_opened(&key(0), t0);
         for second in (5..2000).step_by(15) {
-            dog.heartbeat(&key(0), "train", 15.0, Some(0), at(t0, second));
+            dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, second));
         }
         assert_eq!(states(&dog, at(t0, 1500)), ["starting"]);
         assert_eq!(summary(&dog, at(t0, 1500)), "active");
@@ -1141,7 +1304,7 @@ mod tests {
         // No work reported, or no sign of it: paused up to the limit, then a suspected hang.
         let dog = new();
         for second in (10..900).step_by(15) {
-            dog.heartbeat(&key(0), "eval", 15.0, Some(7), at(t0, second));
+            dog.heartbeat(&key(0), "eval", 15.0, Some(7), None, at(t0, second));
         }
         assert_eq!(states(&dog, at(t0, 300)), ["paused"]);
         assert_eq!(states(&dog, at(t0, 500)), ["paused"]);
@@ -1149,14 +1312,14 @@ mod tests {
         // Work that keeps moving (an evaluation batch per beat) is not limited.
         let dog = new();
         for (n, second) in (10..5000).step_by(15).enumerate() {
-            dog.heartbeat(&key(0), "eval", 15.0, Some(7 + n as i64), at(t0, second));
+            dog.heartbeat(&key(0), "eval", 15.0, Some(7 + n as i64), None, at(t0, second));
         }
         assert_eq!(states(&dog, at(t0, 4900)), ["paused"]);
         // Work that moved and then stopped is a stuck evaluation, whatever the limit.
         let dog = new();
         for (n, second) in (10..400).step_by(15).enumerate() {
             let work = if second < 100 { 7 + n as i64 } else { 12 };
-            dog.heartbeat(&key(0), "eval", 15.0, Some(work), at(t0, second));
+            dog.heartbeat(&key(0), "eval", 15.0, Some(work), None, at(t0, second));
         }
         assert_eq!(states(&dog, at(t0, 399)), ["silent"]);
     }
@@ -1164,6 +1327,30 @@ mod tests {
     /// The status as a file holds it: written as JSON and read back.
     fn as_file(status: &Value) -> Value {
         serde_json::from_slice(&serde_json::to_vec_pretty(status).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_stalled_ranks_stack_is_kept_until_it_works_again_and_over_a_restart() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(9), Some(1), at(t0, 1));
+        dog.heartbeat(&key(0), "train", 15.0, Some(10), None, at(t0, 5));
+        assert_eq!(rank_field(&dog, at(t0, 6), "stack"), Value::Null);
+        let stack = json!({"still_seconds": 61.0, "unchanged_seconds": 0.0, "threads": [
+            {"name": "MainThread", "main": true, "frames": [{"file": "train.py", "line": 7, "function": "step"}]},
+        ]});
+        dog.heartbeat(&key(0), "train", 15.0, Some(10), Some(stack.clone()), at(t0, 70));
+        // The heartbeats stop: the rank is unresponsive and still says where it was.
+        assert_eq!(states(&dog, at(t0, 200)), ["unresponsive"]);
+        assert_eq!(rank_field(&dog, at(t0, 200), "stack"), stack);
+        let before = dog.statuses(at(t0, 200), true)["run"].clone();
+        let now = Instant::now();
+        let fresh = restarted(&before, 60, now);
+        assert_eq!(rank_field(&fresh, now, "stack"), stack);
+        // A beat with no stack is the rank at work again.
+        dog.heartbeat(&key(0), "train", 15.0, Some(11), None, at(t0, 210));
+        assert_eq!(rank_field(&dog, at(t0, 211), "stack"), Value::Null);
     }
 
     /// A new server, started `now`, takes up `status` (a file the old server wrote).
@@ -1258,11 +1445,11 @@ mod tests {
         let dog = Watchdog::new(config(60)); // pause limit 600 s
         dog.stream_opened(&key(0), t0);
         dog.batch(&key(0), 1, Some(49), Some(1), at(t0, 1));
-        dog.heartbeat(&key(0), "checkpoint", 15.0, None, at(t0, 2));
-        dog.heartbeat(&key(0), "train", 15.0, None, at(t0, 62)); // a 60 s checkpoint, on record
-        dog.heartbeat(&key(0), "eval", 15.0, None, at(t0, 100));
+        dog.heartbeat(&key(0), "checkpoint", 15.0, None, None, at(t0, 2));
+        dog.heartbeat(&key(0), "train", 15.0, None, None, at(t0, 62)); // a 60 s checkpoint, on record
+        dog.heartbeat(&key(0), "eval", 15.0, None, None, at(t0, 100));
         for second in (115..250).step_by(15) {
-            dog.heartbeat(&key(0), "eval", 15.0, None, at(t0, second));
+            dog.heartbeat(&key(0), "eval", 15.0, None, None, at(t0, second));
         }
         let before = dog.statuses(at(t0, 250), true)["run"].clone();
         assert_eq!(states(&dog, at(t0, 250)), ["paused"]);
@@ -1276,9 +1463,9 @@ mod tests {
         // Its sender and heartbeats come back: still paused (an evaluation that has run 165 s of
         // 600), not silent. Training resumes and the pause is measured without the outage.
         fresh.stream_opened(&key(0), now);
-        fresh.heartbeat(&key(0), "eval", 15.0, None, at(now, 15));
+        fresh.heartbeat(&key(0), "eval", 15.0, None, None, at(now, 15));
         assert_eq!(states(&fresh, at(now, 16)), ["paused"]);
-        fresh.heartbeat(&key(0), "train", 15.0, None, at(now, 30));
+        fresh.heartbeat(&key(0), "train", 15.0, None, None, at(now, 30));
         let status = &fresh.statuses(at(now, 31), true)["run"];
         assert_eq!(status["pauses"]["eval"]["count"], 1);
         assert_eq!(status["pauses"]["eval"]["max_seconds"], 180.0);

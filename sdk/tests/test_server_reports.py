@@ -360,6 +360,13 @@ def test_reports_that_cannot_be_used_and_why(tmp_path):
     assert state["state"] == "unusable" and "does not cover stalled_weights" in state["reason"]
     evidence, summary = look(stream, tmp_path)
     assert evidence["detection"]["source"] == "python" and "an older server wrote it" in summary
+
+    # A report from a server with every kind but the rules of before Nov 16, 2026: gradients judged
+    # by their total alone, stalled weights named at the first onset only.
+    state = with_report(lambda report: report["thresholds"].pop("spike_sustain"))
+    assert state["state"] == "unusable" and "without the per-parameter gradient and stalled-weight rules" in state["reason"]
+    evidence, summary = look(stream, tmp_path)
+    assert evidence["detection"]["source"] == "python" and "an older server wrote it" in summary
     assert differences(reference(records), [i for i in evidence["incidents"] if i["kind"] in PORTED]) == []
 
     assert with_report(lambda r: r.update(rank=3))["state"] == "unusable"

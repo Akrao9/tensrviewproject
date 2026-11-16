@@ -99,6 +99,13 @@ impl Default for IngestConfig {
     }
 }
 
+/// A heartbeat larger than this keeps its phase and work and loses its stack.
+const MAX_HEARTBEAT_STACK_BYTES: usize = 64 * 1024;
+
+fn kept_stack(stack: Option<serde_json::Value>, heartbeat_bytes: usize) -> Option<serde_json::Value> {
+    stack.filter(|stack| stack.is_object() && heartbeat_bytes <= MAX_HEARTBEAT_STACK_BYTES)
+}
+
 #[derive(Deserialize)]
 struct Heartbeat {
     run_id: String,
@@ -110,6 +117,9 @@ struct Heartbeat {
     /// Steps committed plus evaluation batches, so a pause that is working can be told from one that is stuck.
     #[serde(default)]
     work: Option<i64>,
+    /// Where the process's threads are, sent once its work has stood still for a while.
+    #[serde(default)]
+    stack: Option<serde_json::Value>,
 }
 
 fn default_phase() -> String {
@@ -531,12 +541,21 @@ impl Ingest {
     }
 
     /// A heartbeat from a rank's own process.
-    pub fn heartbeat(&self, run_id: &str, rank: i32, phase: &str, interval_seconds: f64, work: Option<i64>) {
+    pub fn heartbeat(
+        &self,
+        run_id: &str,
+        rank: i32,
+        phase: &str,
+        interval_seconds: f64,
+        work: Option<i64>,
+        stack: Option<serde_json::Value>,
+    ) {
         self.watchdog.heartbeat(
             &(run_id.to_string(), rank),
             phase,
             interval_seconds,
             work,
+            stack,
             Instant::now(),
         );
     }
@@ -614,7 +633,7 @@ impl Ingest {
                 "pauses": status["pauses"],
                 "abandoned": status["abandoned"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
-                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone())).collect::<Vec<_>>()
+                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object())).collect::<Vec<_>>()
                 }),
             })
             .to_string();
@@ -828,8 +847,9 @@ impl FlightService for IngestService {
     async fn do_get(&self, _: Request<Ticket>) -> Reply<Self::DoGetStream> {
         unimplemented()
     }
-    /// `heartbeat`: `{"run_id", "rank", "phase", "interval_seconds"}`, sent by the training
-    /// process's own thread every few seconds, whether or not it is stepping.
+    /// `heartbeat`: `{"run_id", "rank", "phase", "interval_seconds", "work", "stack"}`, sent by
+    /// the training process's own thread every few seconds, whether or not it is stepping.
+    /// `work` and `stack` are optional.
     async fn do_action(&self, request: Request<Action>) -> Reply<Self::DoActionStream> {
         let action = request.into_inner();
         if action.r#type != "heartbeat" {
@@ -844,12 +864,16 @@ impl FlightService for IngestService {
             return Err(Status::invalid_argument("bad run_id or rank in the heartbeat"));
         }
         let phase: String = beat.phase.chars().take(40).collect();
+        // A stack is what the sender says it is, so it is kept only as a JSON object of a
+        // bounded size: it goes into the status file as it came.
+        let stack = kept_stack(beat.stack, action.body.len());
         self.ingest.heartbeat(
             &beat.run_id,
             beat.rank,
             &phase,
             beat.interval_seconds.unwrap_or(0.0),
             beat.work,
+            stack,
         );
         let reply = arrow_flight::Result { body: "{}".into() };
         Ok(Response::new(futures::stream::once(async move { Ok(reply) }).boxed()))
@@ -874,6 +898,18 @@ fn status_refresh_due(elapsed: Duration, status_refresh: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_heartbeats_stack_is_kept_only_as_an_object_of_a_bounded_size() {
+        let stack = serde_json::json!({"threads": []});
+        assert_eq!(
+            kept_stack(Some(stack.clone()), MAX_HEARTBEAT_STACK_BYTES),
+            Some(stack.clone())
+        );
+        assert_eq!(kept_stack(Some(stack), MAX_HEARTBEAT_STACK_BYTES + 1), None);
+        assert_eq!(kept_stack(Some(serde_json::json!("x".repeat(10))), 100), None);
+        assert_eq!(kept_stack(None, 100), None);
+    }
 
     #[test]
     fn status_refresh_due_absorbs_tick_jitter_without_short_circuiting_tests() {

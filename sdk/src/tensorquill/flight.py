@@ -29,6 +29,10 @@ BATCH_BYTES = 4 * 1024 * 1024
 BACKOFF_BASE = 0.1
 BACKOFF_CAP = 30.0
 HEARTBEAT_SECONDS = 15.0
+STACK_SECONDS = 60.0  # no work for this long: the heartbeat carries where each thread is
+STACK_FRAMES = 40  # frames kept of the main thread, innermost first
+STACK_OTHER_FRAMES = 4  # and of each other thread
+STACK_THREADS = 8  # at most 68 frames in all: under 10 KB a rank in the server's status file
 CLOSE_TIMEOUT = 5.0
 POLL_SECONDS = 0.2
 ENDPOINT_ENV = "TENSORQUILL_ENDPOINT"
@@ -597,6 +601,37 @@ def send_file(
 # --- The hook used by `tensorquill.init` ------------------------------------------------
 
 
+_PACKAGE = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
+
+def thread_stacks() -> list[dict[str, Any]]:
+    """Where each Python thread of this process is now, the main thread first and the calling
+    thread and TensorQuill's own left out: `{"name", "main", "frames"}` with frames innermost
+    first as `{"file", "line", "function"}`, with `"own": True` on a frame of TensorQuill's
+    own code. File names, line numbers and function names only:
+    no source text is read (the file system may be what hangs) and no local values are taken."""
+    main = threading.main_thread().ident
+    names = {t.ident: t.name for t in threading.enumerate()}
+    me = threading.get_ident()
+    threads = []
+    for ident, frame in sys._current_frames().items():
+        name = names.get(ident, f"thread-{ident}")
+        if ident == me or name.startswith("tensorquill-"):
+            continue
+        keep = STACK_FRAMES if ident == main else STACK_OTHER_FRAMES
+        frames = []
+        while frame is not None and len(frames) < keep:
+            code = frame.f_code
+            entry = {"file": code.co_filename[-200:], "line": frame.f_lineno, "function": code.co_name[:80]}
+            if code.co_filename.startswith(_PACKAGE):
+                entry["own"] = True
+            frames.append(entry)
+            frame = frame.f_back
+        threads.append({"name": name[:80], "main": ident == main, "frames": frames})
+    threads.sort(key=lambda t: (not t["main"], t["name"]))
+    return threads[:STACK_THREADS]
+
+
 class Heartbeat:
     """Tells the server, from a thread of its own, that this rank's process is alive and which
     phase it is in, whether or not it is stepping.
@@ -605,7 +640,13 @@ class Heartbeat:
     heartbeats go on, its phase is not `train`) from one that is stuck in training (its
     heartbeats go on, its phase is `train`, no step arrives) and from a frozen or vanished
     process (the heartbeats stop). The thread never raises into training and never prints:
-    the sender reports a failing connection. A forked child does nothing."""
+    the sender reports a failing connection. A forked child does nothing.
+
+    When the work counter has not moved for `stack_seconds`, each beat also carries where the
+    process's threads are (`thread_stacks`) and for how long the main thread has been at that
+    same place, so a silent rank is reported with the call it is stuck in. A main thread that
+    hangs while holding the interpreter lock stops this thread too: that rank reads as
+    `unresponsive` and has no stack."""
 
     def __init__(
         self,
@@ -616,10 +657,16 @@ class Heartbeat:
         token: str | None = None,
         tls_root_certs: bytes | str | os.PathLike[str] | None = None,
         interval: float = HEARTBEAT_SECONDS,
+        stack_seconds: float | None = STACK_SECONDS,
     ) -> None:
         import pyarrow.flight  # noqa: F401  fail at init, as the sender does, when pyarrow is missing
 
         self.interval = interval
+        self.stack_seconds = stack_seconds
+        self._work: int | None = None
+        self._work_moved = time.monotonic()
+        self._place: Any = None  # the main thread's frames at the last look, and since when
+        self._place_since = 0.0
         self.phase = "train"
         self.counter: Any = None  # a callable returning the work done so far (steps + ticks)
         self._location = _location(endpoint)
@@ -671,6 +718,9 @@ class Heartbeat:
                            "interval_seconds": self.interval}
                 if self.counter is not None:
                     payload["work"] = int(self.counter())
+                    stack = self._stalled_stack(payload["work"])
+                    if stack is not None:
+                        payload["stack"] = stack
                 body = json.dumps(payload).encode()
                 for _ in client.do_action(
                     flight.Action("heartbeat", body), flight.FlightCallOptions(headers=headers, timeout=10.0)
@@ -680,6 +730,29 @@ class Heartbeat:
             except BaseException:  # noqa: BLE001  a missed beat is the server's to notice
                 client = None
             self._changed.wait(self.interval)
+
+
+    def _stalled_stack(self, work: int) -> dict[str, Any] | None:
+        """The threads' stacks once `work` has stood still for `stack_seconds`, else None."""
+        now = time.monotonic()
+        if work != self._work:
+            self._work, self._work_moved, self._place = work, now, None
+            return None
+        still = now - self._work_moved
+        if not self.stack_seconds or still < self.stack_seconds:
+            return None
+        try:
+            threads = thread_stacks()
+        except Exception:  # noqa: BLE001  a beat without a stack is still a beat
+            return None
+        place = next((t["frames"] for t in threads if t["main"]), None)
+        if place != self._place:
+            self._place, self._place_since = place, now
+        return {
+            "still_seconds": round(still, 1),
+            "unchanged_seconds": round(now - self._place_since, 1),
+            "threads": threads,
+        }
 
 
 class StreamingSink:
@@ -711,6 +784,7 @@ def attach(
     tls_root_certs: bytes | str | os.PathLike[str] | None = None,
     world_size: int | None = None,
     heartbeat_seconds: float | None = HEARTBEAT_SECONDS,
+    stack_seconds: float | None = STACK_SECONDS,
 ) -> Any:
     """Start streaming `sink`'s file when `endpoint` or `TENSORQUILL_ENDPOINT` is set;
     otherwise return `sink` unchanged, with no socket opened and `pyarrow` not imported."""
@@ -736,6 +810,7 @@ def attach(
     heartbeat = None
     if heartbeat_seconds:
         heartbeat = Heartbeat(
-            endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs, interval=heartbeat_seconds
+            endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs, interval=heartbeat_seconds,
+            stack_seconds=stack_seconds,
         )
     return StreamingSink(sink, sender, heartbeat)

@@ -403,6 +403,7 @@ class Session:
         # under small updates. Apple MPS has no float64, so there only float32 norms are kept.
         self._exact_weights = self.device.type != "mps"
         self._prev_weight: torch.Tensor | None = None
+        self._weight_dtypes: dict[str, int] = {}
         self._spread: torch.Tensor | None = None
         self._counts = {
             name: torch.zeros(spec.n_experts, dtype=torch.int64, device=self.device)
@@ -415,7 +416,7 @@ class Session:
         self._ring_act = torch.zeros(every, n_layers, _SEEN + 1, **f32)
         self._ring_grad = torch.zeros(every, *self._grad.shape, **f32)
         self._ring_grad_seen: list[bool] = []
-        self._ring_weight_seen: list[Any] = []  # False, or the weight check's optimizer ownership
+        self._ring_weight_seen: list[Any] = []  # False, or the weight check's optimizer ownership and dtypes
         # Squared total gradient norm reported by gradient clipping this step (summed over
         # calls, for models clipped in several groups), and its ring.
         self._clip = torch.zeros((), **f32)
@@ -705,13 +706,19 @@ class Session:
         dtype = torch.float64 if self._exact_weights else torch.float32
         current = torch.zeros(n_params, dtype=dtype, device=self._grad.device)
         groups: dict[tuple[torch.device, torch.dtype], list[tuple[int, torch.Tensor]]] = {}
+        dtypes: dict[str, int] = {}
         for index, param in enumerate(self._params):
             data = param.detach()
             if type(data) is not torch.Tensor:
                 data = unwrap_local(data)
+            name = str(data.dtype).removeprefix("torch.")
+            dtypes[name] = dtypes.get(name, 0) + 1
             if data.numel() == 0:
                 continue
             groups.setdefault((data.device, data.dtype), []).append((index, data))
+        # How many trainable parameters have each dtype: a weight that never changes means
+        # something else in bf16 or fp16, where a small update rounds away, than in float32.
+        self._weight_dtypes = dtypes
         for (_, param_dtype), items in groups.items():
             out = dtype if self._exact_weights else (
                 torch.float32 if param_dtype in _LOW_PRECISION else None
@@ -868,7 +875,9 @@ class Session:
             self._ring_grad[row].copy_(self._grad)
             self._grad.zero_()
         self._ring_grad_seen.append(self._grads_recorded)
-        self._ring_weight_seen.append(self._optimizer_ownership() if weights_checked else False)
+        self._ring_weight_seen.append(
+            {"ownership": self._optimizer_ownership(), "dtypes": self._weight_dtypes} if weights_checked else False
+        )
         if self._clip_recorded:
             self._ring_clip[row].copy_(self._clip)
             self._clip.zero_()
@@ -1143,7 +1152,8 @@ class Session:
                     name: row[2] for name, row in zip(self.param_names, grad[i])
                 }
                 if isinstance(weight_seen[i], dict):
-                    record["optimizer_ownership"] = weight_seen[i]
+                    record["optimizer_ownership"] = weight_seen[i]["ownership"]
+                    record["weight_dtypes"] = weight_seen[i]["dtypes"]
                 if self.param_names and grad[i][0][3] >= 0:
                     record["weights_unchanged"] = [
                         name for name, row in zip(self.param_names, grad[i]) if row[3] > 0
@@ -1283,6 +1293,7 @@ def init(
     replica_every: int = WEIGHT_EVERY,
     replica_projection: bool = True,
     heartbeat_seconds: float | None = 15.0,
+    stack_seconds: float | None = 60.0,
     probe: Any = None,
     probe_every: int = PROBE_EVERY,
     scaler: Any = None,
@@ -1335,6 +1346,10 @@ def init(
             many seconds that the process is alive and in which phase (see
             `session.phase`), whether or not it is stepping, so the server can tell
             evaluation or a checkpoint from a hang. `None` turns it off.
+        stack_seconds: when no step and no `session.tick()` has come for this many seconds,
+            each heartbeat also carries where the process's Python threads are (file, line
+            and function names; no source text and no values), so a rank reported silent
+            comes with the call it is stuck in. `None` turns it off.
         probe: a fixed batch to run through the model every `probe_every` steps, for
             activation histograms per block and attention statistics: a tensor (called as
             `model(batch)`), a mapping of keyword inputs (`model(**batch)`), or a callable
@@ -1375,7 +1390,8 @@ def init(
     from .flight import attach  # a no-op unless endpoint= or TENSORQUILL_ENDPOINT is set
 
     sink = attach(
-        sink, run.run_id, run.rank, endpoint, world_size=_world_size(), heartbeat_seconds=heartbeat_seconds
+        sink, run.run_id, run.rank, endpoint, world_size=_world_size(), heartbeat_seconds=heartbeat_seconds,
+        stack_seconds=stack_seconds,
     )
     return Session(
         model,

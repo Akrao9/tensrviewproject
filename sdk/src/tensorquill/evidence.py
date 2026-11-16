@@ -16,6 +16,7 @@ import math
 import os
 import re
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -46,6 +47,12 @@ OVERLOAD_WINDOW = 50
 SPIKE_FACTOR = 5.0
 SPIKE_WINDOW = 50
 SPIKE_MIN_HISTORY = 10
+# A single parameter's gradient norm at SPIKE_FACTOR times its own median is ordinary: on healthy
+# Granite 3.0 1B captures recorded on GPUs on Nov 15, 2026 (six of them, the rule chosen on two) it
+# happened 277 to 473 times in 650 steps of 218 parameters, twice in a row 2 to 15 times, and three
+# times in a row never, while every seeded fault held it from its seeded step on. So a
+# parameter is reported on its own only when it stays there this many recorded steps in a row.
+SPIKE_SUSTAIN = 3
 # Activation detectors compare each watched module with its own history, because trained
 # LLMs carry large outliers by design: on healthy Granite the largest value in middle
 # blocks was 740-840 times the standard deviation. Healthy Granite (650 steps, 24 blocks)
@@ -59,6 +66,7 @@ ACT_DEAD_RISE = 0.25  # zero fraction above its baseline, as a recent median
 # A parameter is reported as not updating once its weights are exactly unchanged on this
 # many weight checks in a row while it has a gradient. Checks run every 50 steps by default.
 STALL_STEPS = 3
+STALL_ONSETS = 20  # onsets listed in one incident; `onsets_omitted` counts the rest
 # Loss scaling (first guesses): GradScaler skips a few steps in a row at the start while it
 # halves its initial 65,536 scale, so only a longer run of skips, or a scale below 1 (the
 # gradients overflow even unscaled), is reported.
@@ -236,26 +244,67 @@ def scalar_context(
     return context
 
 
+class _Baseline:
+    """A parameter's last `window` gradient norms that were not part of an excursion, with
+    their lowest value kept beside them: a norm below `factor` times the lowest cannot reach
+    `factor` times the median, so most steps need no median at all."""
+
+    __slots__ = ("values", "low", "count", "start")
+
+    def __init__(self) -> None:
+        self.values: deque[float] = deque()
+        self.low = math.inf
+        self.count = 0  # recorded steps in a row at or above factor times the median
+        self.start: dict[str, Any] | None = None  # the first of them
+
+    def keep(self, norm: float, window: int) -> None:
+        self.values.append(norm)
+        if norm < self.low:
+            self.low = norm
+        if len(self.values) > window and self.values.popleft() <= self.low:
+            self.low = min(self.values)
+
+
 def detect_grad_spikes(
     records: list[dict[str, Any]],
     *,
     factor: float = SPIKE_FACTOR,
     window: int = SPIKE_WINDOW,
     min_history: int = SPIKE_MIN_HISTORY,
+    sustain: int = SPIKE_SUSTAIN,
 ) -> dict[str, Any] | None:
     """Return the first gradient-norm spike and the parameters that spiked most, or None.
 
-    Each parameter's norm is compared with its own median over the same window, so the
-    report names where the spike is, not only that the total jumped. Without per-parameter
-    norms (router-only capture) no parameter is named. The total is the pre-clipping
-    `clip_grad_norm` whenever the run clips, since per-parameter norms are read after
-    clipping, and `grad_norm` otherwise. `rising_since` is
-    the first step in the window at which that parameter was already above half the
-    spike factor, which points at where a spike started when it builds over several steps.
+    Two rules, and the incident is the first one either of them establishes (the total's,
+    when both do on the same record). Once reported it is not replaced or dated again.
+
+    The total: a step whose total gradient norm is at least `factor` times its median over
+    the previous `window` recorded steps. Each parameter's norm is then compared with its own
+    median over the same window, so the report names where the spike is, not only that the
+    total jumped. `rising_since` is the first step in the window at which that parameter was
+    already above half the spike factor, which points at where a spike started when it builds
+    over several steps.
+
+    One parameter (`"trigger": "parameter"`): a parameter whose own norm stays at least
+    `factor` times its own median for `sustain` recorded steps in a row, whatever the total
+    does. A small parameter cannot move the total (one holding 0.2% of it, times 100, moves
+    it 1.02 times), and a single step that high is ordinary noise, so the rule asks for it to
+    last; the incident is dated at the first of those steps and is established `sustain - 1`
+    recorded steps later, unless the total has spiked by then, in which case that incident
+    already names the parameter with `rising_since`. Norms that are part of such an
+    excursion stay out of that parameter's median, so an excursion that lasts is still
+    measured against what came before it. `grad_norm`, `baseline` and `ratio` are the
+    total's at the step the incident is dated at.
+
+    Without per-parameter norms (router-only capture) no parameter is named and only the
+    total is judged. The total is the pre-clipping `clip_grad_norm` whenever the run clips,
+    since per-parameter norms are read after clipping, and `grad_norm` otherwise.
     """
     totals: list[float] = []
     per_param: dict[str, list[tuple[int, float]]] = {}
-    spikes: list[dict[str, Any]] = []
+    baselines: dict[str, _Baseline] = {}
+    first: dict[str, Any] | None = None
+    spikes: list[int] = []
     # One series for the whole run. When the run clips, the pre-clipping norm is used:
     # the per-parameter norms are read after clipping, so a clipped spike stays flat there.
     key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
@@ -266,32 +315,61 @@ def detect_grad_spikes(
         if total is None:
             continue
         step = int(record["step"])
-        if len(totals) >= min_history:
-            baseline = _median(totals[-window:])
-            if baseline > 0 and total >= factor * baseline:
-                spikes.append(
-                    {
-                        "step": step,
-                        "grad_norm": total,
-                        "baseline": baseline,
-                        "ratio": total / baseline,
-                        "parameters": _spiking_parameters(record, per_param, factor, window),
-                    }
-                )
+        baseline = _median(totals[-window:]) if len(totals) >= min_history else None
+        if baseline is not None and baseline > 0 and total >= factor * baseline:
+            spikes.append(step)
+            if first is None:
+                first = {
+                    "step": step,
+                    "grad_norm": total,
+                    "baseline": baseline,
+                    "ratio": total / baseline,
+                    "parameters": _spiking_parameters(record, per_param, factor, window),
+                }
         totals.append(total)
+        lasted: list[dict[str, Any]] = []
         for name, value in record.get("grad_norms", {}).items():
             norm = _finite(value)
-            if norm is not None:
-                per_param.setdefault(name, []).append((step, norm))
-    if not spikes:
+            if norm is None:
+                continue
+            per_param.setdefault(name, []).append((step, norm))
+            own = baselines.get(name)
+            if own is None:
+                own = baselines[name] = _Baseline()
+            if len(own.values) >= min_history and norm >= factor * own.low:
+                usual = _median(list(own.values))
+                if usual > 0 and norm >= factor * usual:
+                    if own.count == 0:
+                        own.start = {
+                            "step": step, "total": total, "total_baseline": baseline,
+                            "parameter": {"name": name, "grad_norm": norm, "baseline": usual,
+                                          "ratio": norm / usual, "rising_since": step},
+                        }
+                    own.count += 1
+                    if own.count == sustain and own.start is not None:
+                        lasted.append(own.start)
+                    continue
+            own.count = 0
+            own.keep(norm, window)
+        if lasted and first is None:
+            # Usually every excursion that lasts to this record began on the same step; if
+            # not, the incident is the earliest, with the parameters that began there.
+            began = min(start["step"] for start in lasted)
+            starts = [start for start in lasted if start["step"] == began]
+            parameters = sorted((start["parameter"] for start in starts), key=lambda p: (-p["ratio"], p["name"]))
+            usual = starts[0]["total_baseline"]
+            first = {
+                "step": began,
+                "grad_norm": starts[0]["total"],
+                "baseline": usual,
+                "ratio": starts[0]["total"] / usual if usual else None,
+                "parameters": parameters[:10],
+                "trigger": "parameter",
+                "sustained": sustain,
+            }
+    if first is None:
         return None
-    first = spikes[0]
-    return {
-        "kind": "grad_spike",
-        **first,
-        "spike_count": len(spikes),
-        "spike_steps": [spike["step"] for spike in spikes[:20]],
-    }
+    return {"kind": "grad_spike", **first, "spike_count": len(spikes), "spike_steps": spikes[:20]}
 
 
 def _spiking_parameters(
@@ -400,6 +478,44 @@ def read_watchdog(source: str | Path | Mapping[str, Any] | None) -> dict[str, An
     return document
 
 
+def _library_file(name: str) -> bool:
+    return "site-packages" in name or "dist-packages" in name or "/lib/python" in name or name.startswith("<")
+
+
+def stuck_at(rank: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Where a stopped rank's main thread was at its last heartbeat, from the stack its process
+    sent (see `Heartbeat`): the innermost frame, the nearest frame that is not a library's
+    (`caller`), for how long the stack had not changed, and whether the call was reached
+    through one of TensorQuill's own functions (`in_tensorquill`). None when the rank sent no stack. It is where Python was; a call into
+    C or CUDA shows as the Python line that made it."""
+    stack = rank.get("stack")
+    threads = stack.get("threads") if isinstance(stack, Mapping) else None
+    if not isinstance(threads, list):
+        return None
+    frames = next((t.get("frames") for t in threads if isinstance(t, Mapping) and t.get("main") is True), None)
+    if not isinstance(frames, list):
+        return None
+    frames = [f for f in frames if isinstance(f, Mapping) and isinstance(f.get("file"), str)]
+    if not frames:
+        return None
+
+    def brief(frame: Mapping[str, Any]) -> dict[str, Any]:
+        name = frame.get("function")
+        return {"function": name if isinstance(name, str) else "?", "file": frame["file"], "line": frame.get("line")}
+
+    place: dict[str, Any] = {"rank": rank.get("rank"), **brief(frames[0])}
+    own = next((f for f in frames if f.get("own") is True), None)
+    caller = next((f for f in frames[1:] if not _library_file(f["file"]) and f.get("own") is not True), None)
+    if caller is not None:
+        place["caller"] = brief(caller)
+    if own is not None:
+        place["in_tensorquill"] = brief(own)
+    for key in ("unchanged_seconds", "still_seconds"):
+        if isinstance(stack.get(key), (int, float)) and not isinstance(stack[key], bool):
+            place[key] = stack[key]
+    return place
+
+
 def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     """Turn the server's progress status into incidents.
 
@@ -408,10 +524,16 @@ def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str
     These are observations of the stream the server receives, and the cause is not known:
     a hang, a long evaluation or checkpoint pause, a crashed launcher and a dead telemetry
     sender all look the same. The server's `--silent-seconds` is the pause it tolerates.
+    `stuck_at` lists, for each stopped rank whose process sent its stack, where its main
+    thread was (see `stuck_at`); it narrows the cause and does not change the assessment.
+    The stacks themselves stay in the status file: an incident's `ranks` are without them.
     """
     if not status or status.get("summary") not in ("stalled", "degraded"):
         return []
-    ranks = list(status.get("ranks", ()))
+    full = list(status.get("ranks", ()))
+    places = [place for place in map(stuck_at, (r for r in full if r.get("state") in ("silent", "lost", "unresponsive")))
+              if place is not None]
+    ranks = [{k: v for k, v in r.items() if k != "stack"} for r in full]
     stopped = [r for r in ranks if r.get("state") in ("silent", "lost", "unresponsive")]
     # Never "confirmed" from the stream alone: that takes a second source (see build_evidence).
     if any(r.get("state") in ("silent", "unresponsive") for r in stopped):
@@ -430,6 +552,8 @@ def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str
         "critical_seconds": status.get("critical_seconds"),
         "world_size": status.get("world_size"),
     }
+    if places:
+        common["stuck_at"] = places
     if status["summary"] == "stalled":
         return [{
             "kind": "job_stalled",
@@ -464,23 +588,40 @@ def _optimizer_evidence(ownership: Mapping[str, Any] | None, stalled: list[str])
 def detect_stalled_weights(
     records: list[dict[str, Any]], *, steps: int = STALL_STEPS
 ) -> dict[str, Any] | None:
-    """Return the first step where parameters with a gradient stopped changing, or None.
+    """Return the parameters with a gradient that stopped changing, and when each did, or None.
 
     Uses `weights_unchanged`, which the capture sets when a parameter's float64 norm is
     exactly what it was at the previous weight check. Equal norms are strong evidence
-    but not proof that the weights are equal, so this is a warning: it is reported once
-    that holds on `steps` checks in a row while the parameter's gradient is finite and
-    non-zero, and it says whether an optimizer that stepped holds the parameters
-    (`optimizer`: `known` with the stalled parameters no optimizer holds, or `unknown`
-    with the reason, for DeepSpeed, Megatron, FSDP1, `auto_step=False` or captures that
-    did not record it). A stalled parameter that no optimizer holds is the likely cause. Steps with a non-finite gradient norm are skipped,
-    because mixed-precision loss scaling skips those optimizer steps on purpose. Captures
-    without `weights_unchanged` (older files, or Apple MPS) are not checked: a float32 norm
-    stays the same while bf16 weights change by a few elements.
+    but not proof that the weights are equal, so this is a warning: a parameter is reported
+    once that holds on `steps` checks in a row while its gradient is finite and non-zero.
+
+    There is one incident, dated at the first step any parameter stalled; `step`,
+    `parameters`, `stalled` and `optimizer` describe that first onset. Every parameter is
+    judged on its own history, so one that stalls later is named too: `onsets` lists each
+    step at which parameters first stalled, with the parameters (those that had changed at
+    an earlier check first), how many had (`trained_before`), and the optimizer evidence for
+    them; `stalled_total` counts every parameter that stalled at any step. A parameter that has never changed since the first check and one that trained and
+    then stopped are different findings: with bf16 or fp16 weights and no float32 master
+    copy, an update smaller than the weight's spacing rounds away from the first step (norm
+    weights near 1.0 at a small learning rate), while a parameter that trained and then
+    stopped was frozen during the run. `weight_dtypes` (how many trainable parameters have
+    each dtype, when the capture recorded it) says which precision that is.
+
+    `optimizer` says whether an optimizer that stepped holds the parameters: `known` with
+    the stalled parameters no optimizer holds, or `unknown` with the reason, for DeepSpeed,
+    Megatron, FSDP1, `auto_step=False` or captures that did not record it. A stalled
+    parameter that no optimizer holds is the likely cause. Steps with a non-finite gradient
+    norm are skipped, because mixed-precision loss scaling skips those optimizer steps on
+    purpose. Captures without `weights_unchanged` (older files, or Apple MPS) are not
+    checked: a float32 norm stays the same while bf16 weights change by a few elements.
     """
     streak: dict[str, int] = {}
+    changed: set[str] = set()  # seen changing at some weight check
+    reported: set[str] = set()
+    onsets: list[dict[str, Any]] = []
     first: dict[str, Any] | None = None
     stalled_steps = 0
+    onset_steps = 0
     for record in sorted(records, key=lambda r: r["step"]):
         unchanged = record.get("weights_unchanged")
         if unchanged is None:
@@ -498,6 +639,20 @@ def detect_stalled_weights(
         stalled = [name for name, count in streak.items() if count >= steps]
         if stalled:
             stalled_steps += 1
+            new = [name for name in stalled if name not in reported]
+            if new:
+                reported.update(new)
+                onset_steps += 1
+                trained = [name for name in new if name in changed]
+                listed = trained + [name for name in new if name not in changed]
+                if len(onsets) < STALL_ONSETS:
+                    onsets.append({
+                        "step": int(record["step"]),
+                        "parameters": listed[:20],
+                        "stalled": len(new),
+                        "trained_before": len(trained),
+                        "optimizer": _optimizer_evidence(record.get("optimizer_ownership"), new),
+                    })
             if first is None:
                 first = {
                     "kind": "stalled_weights",
@@ -508,8 +663,15 @@ def detect_stalled_weights(
                     "consecutive": steps,
                     "optimizer": _optimizer_evidence(record.get("optimizer_ownership"), stalled),
                 }
+                dtypes = record.get("weight_dtypes")
+                if isinstance(dtypes, dict) and dtypes:
+                    first["weight_dtypes"] = dtypes
+        changed.update(name for name in grads if name not in unchanged_set)
     if first is not None:
         first["stalled_steps"] = stalled_steps
+        first["stalled_total"] = len(reported)
+        first["onsets"] = onsets
+        first["onsets_omitted"] = onset_steps - len(onsets)
     return first
 
 
@@ -1097,6 +1259,11 @@ def read_server_report(
     if unknown or stored is None:
         return result("unusable", "the stored parts are not named by attempt and step, so the report cannot be dated", report)
     applied = report.get("thresholds") or {}
+    if applied.get("spike_sustain") != SPIKE_SUSTAIN:
+        # A server from before Nov 16, 2026 judged gradients by their total alone and named
+        # stalled weights at the first onset only: its report is not what this version gives.
+        return result("unusable", "the server's report was made without the per-parameter gradient and stalled-weight"
+                      " rules (an older server wrote it)", report)
     asked = {"overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
              "starve_window": starve_window, "starve_ratio": starve_ratio}
     differing = [name for name, value in asked.items() if applied.get(name) != value]
@@ -2406,6 +2573,37 @@ def _how_stopped(rank: Mapping[str, Any]) -> str:
     return f"its heartbeats continue and it says it is in phase `{rank.get('phase', 'train')}`"
 
 
+def _where(frame: Mapping[str, Any]) -> str:
+    name = str(frame.get("file", "?")).replace("\\", "/").rsplit("/", 1)[-1]
+    return f"`{frame.get('function', '?')}` ({name}:{frame.get('line', '?')})"
+
+
+def _describe_stuck(incident: Mapping[str, Any]) -> str:
+    """One sentence on where the stopped ranks' main threads were, ranks at the same place together."""
+    places = incident.get("stuck_at") or ()
+    groups: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
+    for place in places:
+        groups.setdefault((place.get("function"), place.get("file"), place.get("line")), []).append(place)
+    parts = []
+    for members in list(groups.values())[:2]:
+        first = members[0]
+        ranks = ", ".join(str(m.get("rank")) for m in members[:8])
+        text = f"rank{'s' if len(members) != 1 else ''} {ranks}: main thread in {_where(first)}"
+        if first.get("caller"):
+            text += f", called from {_where(first['caller'])}"
+        if first.get("in_tensorquill"):
+            text += f", reached through TensorQuill's {_where(first['in_tensorquill'])}"
+        held = min((m["unchanged_seconds"] for m in members if isinstance(m.get("unchanged_seconds"), (int, float))),
+                   default=None)
+        if held is not None:
+            text += f", unchanged for {held:.0f} s"
+        parts.append(text)
+    if not parts:
+        return ""
+    more = len(groups) - len(parts)
+    return " Last stack: " + "; ".join(parts) + (f"; and {more} other place{'s' if more != 1 else ''}" if more > 0 else "") + "."
+
+
 def _describe_stream(incident: Mapping[str, Any]) -> str:
     assessment = str(incident.get("assessment", "suspected_hang")).replace("_", " ")
     corroboration = incident.get("corroborated_by")
@@ -2415,6 +2613,7 @@ def _describe_stream(incident: Mapping[str, Any]) -> str:
     tail += "]"
     if corroboration == "collective_hang":
         tail = " PyTorch's Flight Recorder shows a stuck collective." + tail
+    tail = _describe_stuck(incident) + tail
     if incident["kind"] == "job_stalled":
         ranks = incident["ranks"]
         quiet = max((r.get("seconds_since_progress") or 0 for r in ranks), default=0)
@@ -2439,6 +2638,21 @@ def _describe_stream(incident: Mapping[str, Any]) -> str:
 def _describe(incident: Mapping[str, Any]) -> str | None:
     kind = incident["kind"]
     if kind == "grad_spike":
+        if incident.get("trigger") == "parameter":
+            top = incident["parameters"][0]
+            others = len(incident["parameters"]) - 1
+            ratio = incident.get("ratio")
+            total = (
+                f"the total norm, {incident['grad_norm']:.3g}, was {ratio:.1f}× its median"
+                if isinstance(ratio, (int, float)) else f"the total norm was {incident['grad_norm']:.3g}"
+            )
+            return (
+                f"Gradient spike in one parameter from step {incident['step']}: {top['name']} at"
+                f" {top['ratio']:.0f}× its own median, and still at {SPIKE_FACTOR:g}× or more"
+                f" {incident['sustained']} recorded steps in a row"
+                + (f" ({others} more parameter{'s' if others > 1 else ''} from the same step)" if others > 0 else "")
+                + f"; {total}, so the total alone did not show it"
+            )
         where = ""
         if incident["parameters"]:
             top = incident["parameters"][0]
@@ -2457,6 +2671,9 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         names = ", ".join(incident["parameters"][:3])
         extra = incident["stalled"] - min(3, incident["stalled"])
         optimizer = incident.get("optimizer") or {"state": "unknown", "reason": "not recorded by this capture"}
+        dtypes = incident.get("weight_dtypes") or {}
+        low = sorted(name for name in dtypes if name in ("bfloat16", "float16"))
+        precision = f"the weights are {' and '.join(low)}, so check" if low and len(low) == len(dtypes) else "so check"
         if optimizer["state"] != "known":
             held = f"; whether an optimizer holds them is unknown ({optimizer['reason']})"
         elif optimizer["not_held_count"] == incident["stalled"]:
@@ -2465,15 +2682,40 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             held = f"; no optimizer holds {optimizer['not_held_count']} of them, the likely cause for those"
         else:
             held = (
-                "; an optimizer holds all of them, so check for updates too small for the weight"
+                f"; an optimizer holds all of them, {precision} for updates too small for the weight"
                 " dtype (bf16) or a zero learning rate"
+            )
+        onsets = incident.get("onsets") or []
+        since = ""
+        if onsets:
+            trained = onsets[0].get("trained_before", 0)
+            since = (
+                "; none of them has changed since the first weight check" if trained == 0
+                else f"; {trained} of them had changed at an earlier check"
+            )
+        later = ""
+        if len(onsets) > 1:
+            parts = []
+            for onset in onsets[1:4]:
+                shown = ", ".join(onset["parameters"][:2])
+                rest = onset["stalled"] - min(2, onset["stalled"])
+                was = (
+                    "after changing at earlier checks" if onset["trained_before"] == onset["stalled"]
+                    else "never seen changing" if onset["trained_before"] == 0
+                    else f"{onset['trained_before']} after changing at earlier checks"
+                )
+                parts.append(f"step {onset['step']}: {shown}{f', and {rest} more' if rest > 0 else ''} ({was})")
+            more_onsets = len(onsets) - 4 + int(incident.get("onsets_omitted") or 0)
+            later = (
+                ". Stalled later, each parameter on its own history: " + "; ".join(parts)
+                + (f"; and {more_onsets} more onset{'s' if more_onsets > 1 else ''}" if more_onsets > 0 else "")
             )
         return (
             f"Weights possibly not updating from step {incident['step']}: {incident['stalled']} of"
             f" {incident['with_gradients']} parameters with gradients had a float64 norm that did not change for"
             f" {incident['consecutive']} weight checks in a row ({names}{f', and {extra} more' if extra > 0 else ''})"
-            f"{held}; {incident['stalled_steps']} step{'s' if incident['stalled_steps'] != 1 else ''} affected."
-            " Equal norms do not prove the weights are equal"
+            f"{since}{held}; {incident['stalled_steps']} step{'s' if incident['stalled_steps'] != 1 else ''} affected"
+            f"{later}. Equal norms do not prove the weights are equal"
         )
     if kind == "activation_spike":
         top = incident["modules"][0]

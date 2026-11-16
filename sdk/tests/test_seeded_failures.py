@@ -170,11 +170,54 @@ def test_stalled_weights_judge_accepts_extras_but_needs_the_seeded_name():
 
 def test_stalled_weights_judge_names_why_a_stall_is_missing():
     early = sf.judge_stalled_weights(stall(199, ["n1"]), [], "w", 100)
-    assert not early.passed and "before the freeze could show" in early.summary
+    assert not early.passed and early.summary == "stalled_weights from step 199 does not list w"
     cut = sf.judge_stalled_weights(stall(249, ["n"] * 20, stalled=29), [], "w", 100)
-    assert not cut.passed and "9 stalled parameters are not listed" in cut.summary
+    assert not cut.passed and "9 stalled parameter(s) and 0 onset(s) are not listed" in cut.summary
     none = sf.judge_stalled_weights({"incidents": []}, [], "w", 100)
     assert not none.passed and none.summary.startswith("no stalled_weights incident")
+
+
+def with_onsets(first_step, *onsets, omitted=0):
+    """A `stalled_weights` incident that began at `first_step`, with (step, names, trained_before) onsets."""
+    evidence = stall(first_step, onsets[0][1])
+    evidence["incidents"][0].update(
+        onsets=[{"step": step, "parameters": list(names), "stalled": len(names), "trained_before": trained}
+                for step, names, trained in onsets],
+        stalled_total=sum(len(names) for _, names, _ in onsets), onsets_omitted=omitted,
+    )
+    return evidence
+
+
+def test_stalled_weights_judge_reads_the_seeded_parameters_own_onset():
+    # The incident began at step 199 with weights that never moved; the seeded one stalled at 249.
+    verdict = sf.judge_stalled_weights(with_onsets(199, (199, ["n1", "n2"], 0), (249, ["w"], 1)), [], "w", 100)
+    assert verdict.passed, verdict.summary
+    assert "lists w at step 249" in verdict.summary and "after it changed at earlier checks" in verdict.summary
+    assert "with 2 other parameter(s)" in verdict.summary
+    assert any("step 199: 2 parameter(s), 0 of them changed at an earlier check" in note for note in verdict.notes)
+
+
+@pytest.mark.parametrize("step, passed", [(199, False), (249, True), (299, True), (349, False)])
+def test_stalled_weights_judge_window_is_on_the_onset_not_on_the_incident(step, passed):
+    evidence = with_onsets(149, (149, ["n1"], 0), (step, ["w"], 1)) if step != 149 else with_onsets(149, (149, ["w"], 0))
+    verdict = sf.judge_stalled_weights(evidence, [], "w", 100)
+    assert verdict.passed is passed
+    if not passed:
+        assert f"lists w at step {step}, outside 249 to 299" in verdict.summary
+
+
+def test_stalled_weights_judge_says_when_onsets_were_left_out():
+    verdict = sf.judge_stalled_weights(with_onsets(199, (199, ["n1"], 0), omitted=3), [], "w", 100)
+    assert not verdict.passed and "0 stalled parameter(s) and 3 onset(s) are not listed" in verdict.summary
+
+
+def test_grad_spike_judge_reads_an_incident_raised_by_one_parameter():
+    evidence = spike(250, names=("a",), count=0)
+    evidence["incidents"][0].update(trigger="parameter", sustained=3, ratio=1.02)
+    verdict = sf.judge_grad_spike(evidence, [], "a", 250, 100.0)
+    assert verdict.passed and "the parameter's own norm, 3 steps in a row; total ratio 1.0" in verdict.summary
+    evidence["incidents"][0]["ratio"] = None  # no history for the total yet
+    assert "total ratio unknown" in sf.judge_grad_spike(evidence, [], "a", 250, 100.0).summary
 
 
 def test_unchanged_streak_start_reads_the_capture_not_the_incident():
@@ -310,12 +353,48 @@ def test_with_bfloat16_weights_the_capture_sees_the_freeze_whatever_the_incident
     stalled = incident(bfloat16_stall["evidence"], "stalled_weights")
     assert stalled["stalled"] >= 2 and any("norm" in name for name in stalled["parameters"])  # the background
     assert stalled["optimizer"]["state"] == "known"
+    assert stalled["weight_dtypes"] == {"bfloat16": len(records[0]["grad_norms"])}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="detect_stalled_weights keeps ONE incident, from the first step anything is stalled (199, the RMSNorm "
-           "weights), and lists 20 of them at most; a parameter that stalls later is not named",
-)
 def test_with_bfloat16_weights_the_incident_names_the_seeded_parameter(bfloat16_stall):
+    # Until Nov 16, 2026 this was a strict xfail: one incident, from the first step anything stalled
+    # (199, the RMSNorm weights), named what stalled then and nothing that stalled later.
     assert bfloat16_stall["code"] == 0, bfloat16_stall["text"]
+    stalled = incident(bfloat16_stall["evidence"], "stalled_weights")
+    assert stalled["step"] == 199 and SEEDED not in stalled["parameters"]  # the incident still begins with the background
+    first, own = stalled["onsets"][0], next(o for o in stalled["onsets"] if SEEDED in o["parameters"])
+    assert first["step"] == 199 and first["trained_before"] == 0 and all("norm" in n for n in first["parameters"])
+    assert (own["step"], own["parameters"], own["stalled"], own["trained_before"]) == (249, [SEEDED], 1, 1)
+    assert own["optimizer"] == {"state": "known", "not_held": [], "not_held_count": 0, "held_count": 1}
+    assert stalled["stalled_total"] == sum(o["stalled"] for o in stalled["onsets"]) and stalled["onsets_omitted"] == 0
+    summary = tensorquill.incident_summary(bfloat16_stall["evidence"])
+    assert f"step 249: {SEEDED} (after changing at earlier checks)" in summary
+    assert "none of them has changed since the first weight check" in summary and "the weights are bfloat16" in summary
+
+
+@pytest.fixture(scope="module")
+def small_spike(tmp_path_factory):
+    pytest.importorskip("transformers")
+    out = tmp_path_factory.mktemp("x100") / "out"
+    code, text = run_main(out, "--case", "grad_spike", "--factor", "100")
+    records, evidence = evidence_of(out, "grad_spike")
+    return {"code": code, "text": text, "records": records, "evidence": evidence}
+
+
+def test_x100_on_one_small_parameter_is_reported_although_the_total_does_not_move(small_spike):
+    # The case as first specified. Until Nov 16, 2026 nothing was reported: only the total was judged.
+    assert small_spike["code"] == 0, small_spike["text"]
+    spike_incident = incident(small_spike["evidence"], "grad_spike")
+    assert (spike_incident["step"], spike_incident["trigger"], spike_incident["sustained"]) == (250, "parameter", 3)
+    assert [p["name"] for p in spike_incident["parameters"]] == [SEEDED]
+    assert 50 < spike_incident["parameters"][0]["ratio"] < 200 and spike_incident["parameters"][0]["rising_since"] == 250
+    assert spike_incident["ratio"] < 1.5 and spike_incident["spike_count"] == 0  # the total stayed where it was
+    assert "Gradient spike in one parameter from step 250" in tensorquill.incident_summary(small_spike["evidence"])
+
+
+def test_x100_is_not_reported_before_it_has_lasted_three_steps(small_spike):
+    records = small_spike["records"]
+    for last, found in ((250, False), (251, False), (252, True)):
+        prefix = [r for r in records if r["step"] <= last]
+        kinds = [i["kind"] for i in tensorquill.build_evidence(prefix)["incidents"]]
+        assert ("grad_spike" in kinds) is found, last

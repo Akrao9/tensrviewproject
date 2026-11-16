@@ -315,6 +315,164 @@ def test_a_resume_takes_back_the_incidents_of_the_steps_it_rolled_back(tmp_path)
     assert stream.server.terminate() == 0
 
 
+def one_parameter(steps: int = 400) -> list[dict]:
+    """What only a parameter's own history shows. Gradients: `small` holds about 0.2% of the
+    total norm and is 100 times its size from step 250, which moves the total 1.02 times; before
+    that it is 40 times its size for one step and for two steps in a row, which is ordinary
+    (the two are still inside its window at step 250, and must not be in its median);
+    `a_tiny` is 60 times its size from the same step, so the two are listed by ratio, not by
+    name; `other` is high for exactly three steps much later, after the incident is already made.
+    Weights, checked every 10 steps: `norm_a` and `norm_b` never change (low-precision weights
+    near 1.0), `frozen` trains and then stops at step 200, `late` stops at step 300,
+    `flicker` is unchanged on two checks at a time, never three, and `a_idle` never changes but
+    has no gradient until step 200, so it stalls on the same check as `frozen` and is listed
+    after it although it comes first in the record."""
+    out = []
+    for step in range(steps):
+        norms = {"a_idle": 0.3 * wobble(step, 9) if step >= 200 else 0.0, "a_tiny": 0.01 * wobble(step, 10),
+                 # No two of `small`'s norms are equal, and of the two that the excursion at steps 230
+                 # and 231 would push out of its window one is low and one high, so letting the
+                 # excursion into the median changes the median at step 250.
+                 "big": 10.0 * wobble(step, 1), "small": 0.02 * wobble(step, 27) * (1 + step / 9973), "other": 0.5 * wobble(step, 3),
+                 "norm_a": 0.1 * wobble(step, 4), "norm_b": 0.1 * wobble(step, 5), "frozen": 1.0 * wobble(step, 6),
+                 "late": 1.0 * wobble(step, 7), "flicker": 1.0 * wobble(step, 8)}
+        if step == 60 or step in (230, 231) or step >= 250:
+            norms["small"] *= 40.0 if step < 250 else 100.0
+        if step >= 250:
+            norms["a_tiny"] *= 60.0
+        if 330 <= step < 333:
+            norms["other"] *= 30.0
+        values = {"grad_norms": norms, "grad_norm": math.sqrt(sum(v * v for v in norms.values()))}
+        if step % 4 != 2:  # logged on most steps: not on step 250, where the spike is dated, but on 252, which makes it
+            values["scalars"] = {"train/loss": 3.0 - step / 1000}
+        if step % 10 == 9:
+            unchanged = ["a_idle", "norm_a", "norm_b"]
+            if step >= 200:
+                unchanged.append("frozen")
+            if step >= 300:
+                unchanged.append("late")
+            if step % 30 != 29:
+                unchanged.append("flicker")
+            if step > 9:  # the first check has nothing to compare with
+                values["weights_unchanged"] = unchanged
+            values["optimizer_ownership"] = {"state": "known", "unheld": ["late"], "unheld_count": 1}
+            values["weight_dtypes"] = {"bfloat16": 10}
+        out.append(record(step, **values))
+    return out
+
+
+def test_the_one_parameter_fixture_shows_what_the_totals_cannot():
+    records = one_parameter()
+    by_kind = {i["kind"]: i for i in reference(records)}
+    assert set(by_kind) == {"grad_spike", "stalled_weights"}
+    spike = by_kind["grad_spike"]
+    assert (spike["step"], spike["trigger"], spike["sustained"]) == (250, "parameter", 3)
+    assert [p["name"] for p in spike["parameters"]] == ["small", "a_tiny"] and spike["parameters"][0]["rising_since"] == 250
+    assert 80 < spike["parameters"][0]["ratio"] < 125 and 48 < spike["parameters"][1]["ratio"] < 75
+    assert spike["ratio"] < 1.3 and spike["spike_count"] == 0
+    # The logged values are those of the step the incident is dated at, not of the step that made it.
+    assert "scalars" not in spike  # nothing was logged on step 250
+    # Not before it has lasted three recorded steps, and never for the one- and two-step excursions.
+    assert [i["kind"] for i in reference(records[:252])] == ["stalled_weights"]
+    assert [i["step"] for i in reference(records[:253]) if i["kind"] == "grad_spike"] == [250]
+    stalled = by_kind["stalled_weights"]
+    assert (stalled["step"], stalled["parameters"], stalled["stalled"]) == (39, ["norm_a", "norm_b"], 2)
+    assert stalled["weight_dtypes"] == {"bfloat16": 10}
+    assert [(o["step"], o["parameters"], o["trained_before"]) for o in stalled["onsets"]] == [
+        (39, ["norm_a", "norm_b"], 0), (229, ["frozen", "a_idle"], 1), (329, ["late"], 1)]
+    assert stalled["onsets"][2]["optimizer"] == {"state": "known", "not_held": ["late"], "not_held_count": 1, "held_count": 0}
+    assert stalled["onsets"][1]["optimizer"]["not_held_count"] == 0
+    assert (stalled["stalled_total"], stalled["onsets_omitted"]) == (5, 0)  # `flicker` never makes three in a row
+
+
+def test_one_parameters_spike_and_each_stall_onset_match_python_after_every_stretch(tmp_path):
+    records = one_parameter()
+    stream = Stream(tmp_path, *FAST)
+    sent = 0
+    # Stretches that end inside each excursion, on the step that establishes the incident and the
+    # one before it, between two onsets, and after the later three-step excursion.
+    for upto in (40, 61, 231, 233, 240, 251, 252, 253, 300, 331, 334, 400):
+        document = stream.send(records[sent:upto])
+        sent = upto
+        assert differences(reference(records[:upto]), document["incidents"]) == [], f"after {upto} steps"
+    assert document["thresholds"]["spike_sustain"] == 3
+    assert document["rebuilds"] == 1
+    assert stream.server.terminate() == 0
+
+
+def test_a_restart_inside_an_excursion_and_between_onsets_changes_nothing(tmp_path):
+    # The server stops with `small` two steps into its excursion and one stall onset reported: the
+    # replay has to rebuild the run of high steps, the median it is measured against (which the
+    # excursion's own norms stay out of) and which parameters were already listed.
+    records = one_parameter()
+    stream = Stream(tmp_path, *FAST)
+    before = stream.send(records[:252])
+    assert [i["kind"] for i in before["incidents"]] == ["stalled_weights"]
+    stream.restart()
+    after = stream.send(records[252:400])
+    assert differences(reference(records), after["incidents"]) == []
+    assert [i["step"] for i in after["incidents"] if i["kind"] == "grad_spike"] == [250]
+    assert stream.server.terminate() == 0
+
+
+def test_a_parameter_is_judged_from_its_eleventh_recorded_step(tmp_path):
+    # Ten norms are the history the rule asks for, so an excursion from step 10 is dated at step 10.
+    records = [
+        record(step, grad_norms={"big": 10.0 * wobble(step), "small": 0.02 * wobble(step, 2) * (100.0 if step >= 10 else 1.0)},
+               grad_norm=10.0 * wobble(step))
+        for step in range(20)
+    ]
+    spike = next(i for i in reference(records) if i["kind"] == "grad_spike")
+    assert (spike["step"], spike["trigger"], spike["baseline"]) == (10, "parameter", pytest.approx(10.0, rel=0.11))
+    stream = Stream(tmp_path, *FAST)
+    for upto in (12, 13, 20):
+        document = stream.send(records[len(stream.sent):upto])
+        assert differences(reference(records[:upto]), document["incidents"]) == [], f"after {upto} steps"
+    assert stream.server.terminate() == 0
+
+
+def test_excursions_that_last_to_the_same_record_from_different_steps_give_the_earliest(tmp_path):
+    # `a` is high from step 30 but has no gradient on step 31; `b` is high from step 31. Both have
+    # lasted three recorded steps at step 33: the incident is step 30 and names `a` alone.
+    records = []
+    for step in range(40):
+        norms = {"big": 10.0 * wobble(step), "b": 0.02 * wobble(step, 1) * (90.0 if step >= 31 else 1.0),
+                 "a": 0.02 * wobble(step, 2) * (50.0 if step >= 30 else 1.0)}
+        if step == 31:
+            del norms["a"]
+        records.append(record(step, grad_norms=norms, grad_norm=10.0 * wobble(step), scalars={"loss": float(step)}))
+    spike = next(i for i in reference(records) if i["kind"] == "grad_spike")
+    assert (spike["step"], [p["name"] for p in spike["parameters"]]) == (30, ["a"])
+    # Dated at step 30 and made at step 33: the logged values are step 30's.
+    assert spike["scalars"]["loss"] == {"value": 30.0, "median_before": 14.5}
+    assert reference(records[:33]) == []
+    stream = Stream(tmp_path, *FAST)
+    for upto in (33, 34, 40):
+        document = stream.send(records[len(stream.sent):upto])
+        assert differences(reference(records[:upto]), document["incidents"]) == [], f"after {upto} steps"
+    assert stream.server.terminate() == 0
+
+
+def test_more_onsets_than_an_incident_lists_are_counted(tmp_path):
+    # 25 parameters stop one after another, one per weight check: 20 onsets are listed, 5 counted.
+    names = [f"w{i:02}" for i in range(25)]
+    records = []
+    for step in range(300):
+        values = {"grad_norms": {name: 1.0 for name in names}, "grad_norm": 5.0}
+        if step % 5 == 4 and step > 4:
+            values["weights_unchanged"] = [name for i, name in enumerate(names) if step >= 100 + 5 * i]
+        records.append(record(step, **values))
+    stalled = next(i for i in reference(records) if i["kind"] == "stalled_weights")
+    assert (len(stalled["onsets"]), stalled["onsets_omitted"], stalled["stalled_total"]) == (20, 5, 25)
+    assert [o["parameters"] for o in stalled["onsets"][:2]] == [["w00"], ["w01"]]
+    assert all(o["trained_before"] == 1 and o["optimizer"]["state"] == "unknown" for o in stalled["onsets"])
+    stream = Stream(tmp_path, *FAST)
+    for upto in (120, 215, 300):
+        document = stream.send(records[len(stream.sent):upto])
+        assert differences(reference(records[:upto]), document["incidents"]) == [], f"after {upto} steps"
+    assert stream.server.terminate() == 0
+
+
 def moe_edges(steps: int = 30) -> list[dict]:
     """Two MoE rules the long run does not reach: a top-k router that collapses before it
     has a baseline (attributed by share), and dead experts with no expert overloaded."""
