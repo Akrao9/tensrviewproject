@@ -320,6 +320,7 @@ CHECK_SETS: dict[str, list[dict]] = {
     "probes, all failed": probed(fail_at=tuple(range(0, 60, 10))),
     "probes, too few": probed(steps=30),
     "probes, too few and one failed": probed(steps=30, fail_at=(20,)),
+    "a probe whose error is not text": [{"run_id": "r", "step": 0, "ts": 0.0, "probe": {"error": {"code": 3, "why": [1, 2]}}}],
 }
 
 
@@ -327,7 +328,7 @@ CHECK_SETS: dict[str, list[dict]] = {
 def test_both_paths_say_the_same_about_what_was_checked(name):
     assert both(CHECK_SETS[name]) == []
     evidence = tensorquill.build_evidence(CHECK_SETS[name], detectors="rust")
-    degraded = "failed" in name or "too few" in name
+    degraded = "failed" in name or "too few" in name or "error" in name
     assert evidence["run_state"]["state"] == ("degraded" if degraded else "healthy")
 
 

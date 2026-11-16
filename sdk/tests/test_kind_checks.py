@@ -200,6 +200,9 @@ def test_a_failed_probe_reads_degraded_and_says_which_kinds_it_leaves_unjudged()
     assert every["kind_checks"]["attention_uniform"]["records"] == 0
     assert all(values(every)[kind] == "unavailable" for kind in ATTENTION) and every["run_state"]["state"] == "degraded"
     assert every["not_checked"][0]["reason"].startswith("6 of 6 probes failed, the first at step 0")
+    # An error that is not text is written as compact JSON, as the server writes it.
+    odd = [{"run_id": "r", "step": 0, "ts": 0.0, "probe": {"error": {"code": 3}}}]
+    assert tensorquill.build_evidence(odd)["not_checked"][0]["reason"] == '1 of 1 probe failed, the first at step 0: {"code":3}'
 
 
 def test_too_few_probes_to_judge_are_unavailable_under_their_own_entry():

@@ -998,7 +998,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " the recorded steps were judged and nothing was found, for the kinds listed under `kinds.checked`"
             " only. A kind under `kinds.not_configured` was never looked for, because the capture does not record"
             " what it needs; one under `kinds.unavailable` was asked for and could not be judged, and makes the"
-            " state degraded. A not_checked entry or an unknown rank means that part was not judged."
+            " state degraded. When the answer has no `kinds` (a run folder, or a file from an older version), what"
+            " was checked is not stated: do not infer it. A not_checked entry or an unknown rank means that part"
+            " was not judged."
             " For a run folder the incidents are grouped across ranks; `rank` keeps one rank's."
         ),
         "inputSchema": {

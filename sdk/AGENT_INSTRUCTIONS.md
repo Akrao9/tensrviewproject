@@ -81,6 +81,8 @@ A kind the tools mark `unclassified` is one this version does not know. The run 
 
 The summary's line "N of 32 kinds checked" is the count. Say it when you report that nothing was found.
 
+`kinds` is there for one rank's capture or evidence file. A run folder's answer, and a file written by an older version, have no `kinds` and no count. Then what was checked is not stated: say so, and do not infer it from the incidents that are listed.
+
 A check listed under `not_checked` was not made, and each entry gives the reason. It is not a finding of "nothing wrong". Every unavailable kind is named by one of these entries, or by the reason `no_status`.
 
 - Never write "no problem with X" when the check for X is listed there. Write "X was not checked" and give the reason.

@@ -958,7 +958,7 @@ def detect_attention_anomalies(
             "check": "probe",
             "kinds": list(ATTN_KINDS),
             "reason": f"{failed} of {asked} probe{'s' if asked != 1 else ''} failed, the first at step {step}:"
-                      f" {error if isinstance(error, str) else json.dumps(error)}",
+                      f" {error if isinstance(error, str) else json.dumps(error, separators=(',', ':'))}",
             "step": step,
         })
     return [found[kind] for kind in ATTN_KINDS if kind in found]
