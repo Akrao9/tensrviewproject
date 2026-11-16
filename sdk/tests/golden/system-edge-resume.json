@@ -1,0 +1,10 @@
+{
+"case":"system edge resume",
+"incidents":[],
+"not_checked":[
+{"check":"resume_lr","rank":0,"reason":"no learning rate recorded in the resumed attempt","step":30}
+],
+"records":{"count":65,"sha256":"a3f5e10d38c62a63c98cc67191f51e95820cc7967726924bdb43c4b614d5a344"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"checks":["resume_lr"],"code":"not_checked","detail":"not checked: resume_lr","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

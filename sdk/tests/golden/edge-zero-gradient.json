@@ -1,0 +1,8 @@
+{
+"case":"edge zero-gradient",
+"incidents":[],
+"not_checked":[],
+"records":{"count":6,"sha256":"587808116e9cd0bc11a130b22c1ccbad4baa9ad6bc386d23f4de2439dc8ba222"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

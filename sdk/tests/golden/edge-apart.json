@@ -1,0 +1,10 @@
+{
+"case":"edge apart",
+"incidents":[
+{"class":"invariant","kind":"replica_drift","parameters":{"w1":{"norm_spread":0.0,"projection_spread":3e-06,"sum_spread":0.0}},"step":3,"tolerance":1e-06}
+],
+"not_checked":[],
+"records":{"count":6,"sha256":"0db594d82e02c13daff27b4ee06c58798e926d659aa7ea963a1a4bebda2113d1"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: replica_drift","kinds":["replica_drift"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

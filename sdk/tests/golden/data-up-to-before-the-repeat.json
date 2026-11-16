@@ -1,0 +1,8 @@
+{
+"case":"data, up to before the repeat",
+"incidents":[],
+"not_checked":[],
+"records":{"count":12,"sha256":"f42dbe9c7820ee44fe60bbf051285f513f9978a684b6a075ed7c0d49f48c52fc"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

@@ -1,0 +1,12 @@
+{
+"case":"resumes, 3 attempts written",
+"incidents":[
+{"changes":[{"attempt":2,"basis":"same_step","equals_first_lr":true,"expected_lr":[0.001,0.0001],"first_lr":[1e-05,1.0000000000000002e-06],"previous_attempt":1,"rank":0,"resumed_lr":[1e-05,1.0000000000000002e-06],"step":100}],"class":"observation","kind":"resume_lr_change","note":"an observation: some restarts change the schedule on purpose","resumes":1,"scalars":{"train/loss":{"median_before":1.9355,"value":1.92}},"step":100}
+],
+"not_checked":[
+{"check":"resume_lr","expected_lr":[0.00101,0.00010100000000000002],"rank":0,"reason":"the earlier attempts ended before the resume step, so the learning rate cannot be compared at the same step; a schedule that changes there looks the same","resumed_lr":[0.0005,5e-05],"step":200}
+],
+"records":{"count":250,"sha256":"2a6d33fa0abc0b4e62449d5565313e2b3d4269f029cabe324d697918ddd341d2"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"checks":["resume_lr"],"code":"not_checked","detail":"not checked: resume_lr","state":"degraded"},{"code":"observations","detail":"1 observation listed, not counted as failures: resume_lr_change","kinds":["resume_lr_change"],"state":"healthy"}],"state":"degraded"},
+"samples":[]
+}

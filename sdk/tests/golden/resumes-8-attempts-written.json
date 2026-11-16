@@ -1,0 +1,14 @@
+{
+"case":"resumes, 8 attempts written",
+"incidents":[
+{"class":"invariant","kind":"repeated_steps","repeated":120,"scalars":{"train/loss":{"median_before":null,"value":2.08}},"step":0,"steps":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]},
+{"changes":[{"attempt":2,"basis":"same_step","equals_first_lr":true,"expected_lr":[0.001,0.0001],"first_lr":[1e-05,1.0000000000000002e-06],"previous_attempt":1,"rank":0,"resumed_lr":[1e-05,1.0000000000000002e-06],"step":100},{"attempt":7,"basis":"same_step","equals_first_lr":false,"expected_lr":[0.00021,2.1000000000000002e-05],"first_lr":[1e-05,1.0000000000000002e-06],"previous_attempt":2,"rank":0,"resumed_lr":[0.001,0.0001],"step":120},{"attempt":4,"basis":"extrapolated","equals_first_lr":true,"expected_lr":[0.0005,5e-05],"first_lr":[1e-05,1.0000000000000002e-06],"previous_attempt":3,"rank":0,"resumed_lr":[1e-05,1.0000000000000002e-06],"step":230}],"class":"observation","kind":"resume_lr_change","note":"an observation: some restarts change the schedule on purpose","resumes":3,"scalars":{"train/loss":{"median_before":2.0054999999999996,"value":1.98}},"step":100}
+],
+"not_checked":[
+{"check":"resume_lr","expected_lr":[0.00101,0.00010100000000000002],"rank":0,"reason":"the earlier attempts ended before the resume step, so the learning rate cannot be compared at the same step; a schedule that changes there looks the same","resumed_lr":[0.0005,5e-05],"step":200},
+{"check":"resume_lr","rank":0,"reason":"no learning rate recorded in the resumed attempt","step":220}
+],
+"records":{"count":430,"sha256":"785fed51235f2a5749ff0ca8d78bc641b65d9c62651b3ab9894572a96b31e33d"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: repeated_steps","kinds":["repeated_steps"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"checks":["resume_lr"],"code":"not_checked","detail":"not checked: resume_lr","state":"degraded"},{"code":"observations","detail":"1 observation listed, not counted as failures: resume_lr_change","kinds":["resume_lr_change"],"state":"healthy"}],"state":"unhealthy"},
+"samples":[]
+}

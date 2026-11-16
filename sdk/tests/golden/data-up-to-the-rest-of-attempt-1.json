@@ -1,0 +1,11 @@
+{
+"case":"data, up to the rest of attempt 1",
+"incidents":[
+{"class":"invariant","kind":"data_stalled","reason":"no_batch","scalars":{"train/loss":{"median_before":1.9955,"value":1.98}},"step":30,"through_step":32},
+{"batches_compared":3,"class":"invariant","epoch":2,"kind":"epoch_order_repeated","previous_epoch":1,"previous_sampler_epoch":0,"sampler_epoch":0,"scalars":{"train/loss":{"median_before":2.0004999999999997,"value":1.99}},"shuffle":true,"step":20,"through_step":22}
+],
+"not_checked":[],
+"records":{"count":60,"sha256":"c8d6029aa25142ab25a2b6720d0f40bf67d437513ef4a192fb23072b1f0ecd4c"},
+"run_state":{"reasons":[{"code":"incidents","detail":"2 incidents listed: data_stalled, epoch_order_repeated","kinds":["data_stalled","epoch_order_repeated"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

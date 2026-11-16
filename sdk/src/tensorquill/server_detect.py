@@ -2,7 +2,8 @@
 
 The server binary judges one rank's rows read from an Arrow stream and prints the report it
 would write as that rank's `incidents.json`. `server_report` is the Python side: records in,
-that report out. `build_evidence(..., detectors="rust")` takes its incidents from it.
+that report out. `build_evidence(..., detectors="rust")` takes its incidents from it, and
+passes its own threshold options on as the server's one `--thresholds` JSON object.
 
 Needs `pyarrow` (the `flight` extra) and the binary: on `PATH`, or named by
 `TENSORQUILL_SERVER_BIN`.
@@ -66,6 +67,7 @@ def records_stream(records: Iterable[Mapping[str, Any]]) -> bytes:
 def server_report(
     records: Iterable[Mapping[str, Any]],
     *,
+    thresholds: Mapping[str, Any] | None = None,
     binary: str | os.PathLike[str] | None = None,
     timeout: float | None = 300.0,
 ) -> dict[str, Any]:
@@ -74,20 +76,37 @@ def server_report(
 
     Pass every attempt of the rank (`load_records(..., all_attempts=True)`): the detectors
     compare a resume with what it replaced. Records of a second rank or run are refused.
+
+    `thresholds` are the detector options, sent as the one JSON object `--thresholds` takes:
+    `overload_threshold`, `drift_tolerance`, `starve_window`, `starve_ratio` and `top_k` (None,
+    a number, or a number per router name). A key left out keeps the server's default, and
+    the report's own `thresholds` lists what was applied. An unknown key or a value the
+    server refuses raises `ValueError`.
+
     Raises `RuntimeError` when the binary or `pyarrow` is missing, or the binary fails.
     """
     records = list(records)
     if not records:
         raise ValueError("no records to judge")
     chosen = server_binary(binary)
+    command = [chosen, "detect"]
+    if thresholds is not None:
+        try:
+            command += ["--thresholds", json.dumps(dict(thresholds), allow_nan=False)]
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"the thresholds cannot be sent as JSON: {error}") from error
     try:
-        done = subprocess.run([chosen, "detect"], input=records_stream(records), capture_output=True, timeout=timeout)
+        done = subprocess.run(command, input=records_stream(records), capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(f"{chosen} detect did not finish in {timeout:g} s") from error
     if done.returncode != 0:
         message = done.stderr.decode("utf-8", "replace").strip() or f"exit status {done.returncode}"
+        if "invalid value" in message and "--thresholds" in message:
+            # The server names the key and why: an option the caller chose, not a failure of the binary.
+            refused = message.split("for '--thresholds <JSON>':", 1)[-1].split("\n", 1)[0].strip()
+            raise ValueError(f"the Rust detectors refuse these thresholds: {refused}")
         if "unrecognized subcommand" in message or "unexpected argument" in message:
-            message += " (this tensorquill-server is too old to have `detect`: rebuild it)"
+            message += " (this tensorquill-server is too old to have `detect` or `--thresholds`: rebuild it)"
         raise RuntimeError(f"{chosen} detect failed: {message}")
     try:
         report = json.loads(done.stdout)

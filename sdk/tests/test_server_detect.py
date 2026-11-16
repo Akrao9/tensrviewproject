@@ -4,7 +4,10 @@ The Rust path runs `tensorquill-server detect` on the records in hand and takes 
 of the server's kinds from its report; everything else in the evidence is still made in
 Python. Both paths must give the same evidence: incidents, `not_checked` and the run state
 compared as the server parity tests compare them (numbers to 1e-12, a NaN as `null`), the rest
-exactly. The two places where they differ on purpose are pinned at the end.
+exactly. The two places where they differ on purpose are pinned further down.
+
+The five threshold options go to the Rust rules as the server's one `--thresholds` JSON
+object. `CASES` stays at the defaults; the options have their own table (`OPTIONS`).
 
 Needs `pyarrow` (the `flight` extra) and the server binary
 (`cargo build --manifest-path server/Cargo.toml`, or `TENSORQUILL_SERVER_BIN`).
@@ -32,7 +35,24 @@ from test_flight_e2e import BINARY  # noqa: E402
 from test_server_detectors import differences, edges, everything, moe_edges, one_parameter, record, wobble  # noqa: E402
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
-FIXTURES = Path(__file__).resolve().parents[2] / "experiments" / "moe-bakeoff" / "artifacts"
+BAKEOFF = Path(__file__).resolve().parents[2] / "experiments" / "moe-bakeoff"
+
+
+def gate_fixtures() -> dict[str, list[dict]]:
+    """The seven Gate 1 fixtures' records, made by the bake-off's own generator. Its
+    `artifacts` folder is not in the repository, so nothing here reads it. Empty when the
+    experiment is not in this checkout."""
+    if not (BAKEOFF / "generate.py").exists():
+        return {}
+    sys.path.insert(0, str(BAKEOFF))
+    try:
+        import generate
+    finally:
+        sys.path.remove(str(BAKEOFF))
+    return {name: fixture.records() for name, fixture in generate.BY_NAME.items()}
+
+
+GATE_FIXTURES = gate_fixtures()
 JUDGED = ("incidents", "not_checked", "run_state")
 
 
@@ -41,10 +61,10 @@ def binary(monkeypatch):
     monkeypatch.setenv(BINARY_ENV, str(BINARY))
 
 
-def both(records) -> list[str]:
-    """Where the Rust path's evidence differs from the Python path's."""
-    python = tensorquill.build_evidence(records)
-    rust = tensorquill.build_evidence(records, detectors="rust")
+def both(records, **options) -> list[str]:
+    """Where the Rust path's evidence differs from the Python path's, both given `options`."""
+    python = tensorquill.build_evidence(records, **options)
+    rust = tensorquill.build_evidence(records, detectors="rust", **options)
     assert "detectors" not in python and rust.pop("detectors") == "rust"
     found = [d for key in JUDGED for d in differences(python.get(key, []), rust.get(key, []), key)]
 
@@ -130,9 +150,9 @@ def test_the_rust_path_gives_the_python_paths_evidence(name):
     assert both(CASES[name]) == []
 
 
-@pytest.mark.parametrize("fixture", sorted(p.name for p in FIXTURES.iterdir() if (p / f"{p.name}.jsonl").exists()))
+@pytest.mark.parametrize("fixture", sorted(GATE_FIXTURES))
 def test_the_gate_1_fixtures_give_the_same_evidence(fixture):
-    records = tensorquill.load_records(FIXTURES / fixture / f"{fixture}.jsonl", all_attempts=True)
+    records = GATE_FIXTURES[fixture]
     assert both(records) == []
     assert tensorquill.build_evidence(records, detectors="rust")["incidents"], "every fixture has a planted failure"
 
@@ -175,13 +195,199 @@ def test_attempts_out_of_order_in_the_input_are_read_oldest_first_as_a_store_hol
 # --- what the Rust path refuses -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("option", [
-    {"overload_threshold": 0.5}, {"drift_tolerance": 1e-3}, {"starve_window": 10}, {"starve_ratio": 0.5}, {"top_k": 2},
+# --- the five options, through `--thresholds` -------------------------------------------------
+
+OPTIONS: list[dict] = (
+    [{"overload_threshold": v} for v in (0.0, 0.2, 0.5, 0.9)]
+    + [{"drift_tolerance": v} for v in (0.0, 1e-3, 0.5)]
+    + [{"starve_window": v} for v in (1, 10, 20)]
+    + [{"starve_ratio": v} for v in (0.0, 0.5, 0.9)]
+    + [{"top_k": v} for v in (1, 2, 3, 8)]
+    + [{"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": 2}]
+)
+
+
+def option_sets() -> dict[str, list[dict]]:
+    """The record sets these options can change: the ones with MoE counts or a replica spread."""
+    sets = dict(CASES)
+    sets.update({f"fixture {name}": records for name, records in GATE_FIXTURES.items()})
+    return {name: records for name, records in sets.items() if any(r.get("moe") or r.get("replica_spread") for r in records)}
+
+
+OPTION_SETS = option_sets()
+_usual: dict[str, list] = {}
+
+
+def moves_python(name: str, **options) -> bool:
+    """Whether the options change the incidents Python reports on this record set."""
+    if name not in _usual:
+        _usual[name] = tensorquill.build_evidence(OPTION_SETS[name])["incidents"]
+    return tensorquill.build_evidence(OPTION_SETS[name], **options)["incidents"] != _usual[name]
+
+
+def test_the_option_sets_hold_the_data_the_options_judge():
+    assert len(OPTION_SETS) >= 8, sorted(OPTION_SETS)
+    recorded = {k for records in OPTION_SETS.values() for r in records for k in (r.get("moe_top_k") or {}).values()}
+    # Top-1 routers for the share rule, top-k of three or more for the baseline rule, and a
+    # recorded value on every row for an override to stand against.
+    assert 1 in recorded and any(k >= 3 for k in recorded), recorded
+    assert any(r.get("replica_spread") for records in OPTION_SETS.values() for r in records)
+
+
+@pytest.mark.parametrize("option", OPTIONS, ids=lambda o: ",".join(f"{k}={v}" for k, v in o.items()))
+def test_an_option_reaches_the_rust_rules_and_gives_pythons_result(option):
+    moved = []
+    for name, records in OPTION_SETS.items():
+        assert both(records, **option) == [], name
+        if moves_python(name, **option):
+            moved.append(name)
+    # Without this the test would pass with the option ignored on both sides.
+    assert moved, "this value changes no incident on any record set"
+
+
+# One router of a record set, and a value for it other than the one recorded on every row,
+# chosen because the override moves an incident there.
+ONE_ROUTER = {
+    "everything": ("a", 2),
+    "moe edges": ("early", 1),
+    "fixture unseen-3": ("layers.11.router", 2),
+    "fixture unseen-4": ("layers.08.router", 3),
+    "fixture unseen-6": ("layers.03.router", 8),
+}
+
+
+@pytest.mark.parametrize("name", ONE_ROUTER)
+def test_a_top_k_for_one_router_stands_against_the_value_recorded_on_every_row(name):
+    records = OPTION_SETS[name]
+    target, override = ONE_ROUTER[name]
+    recorded = {
+        router: {r["moe_top_k"][router] for r in records if router in (r.get("moe_top_k") or {})}
+        for router in {router for r in records for router in (r.get("moe") or {})}
+    }
+    assert recorded[target] and override not in recorded[target], "the override must differ from what the rows carry"
+    option = {"top_k": {target: override, "not-a-router": 5}}
+    assert both(records, **option) == []
+    assert moves_python(name, **option), "this override changes no incident, so the test would pass with it ignored"
+    evidence = tensorquill.build_evidence(records, detectors="rust", **option)
+    assert evidence["top_k"][target] == override and "not-a-router" not in evidence["top_k"]
+    # Every other router keeps what its rows recorded.
+    others = [router for router in recorded if router != target]
+    assert others and all(evidence["top_k"][router] == max(recorded[router], default=1) for router in others)
+
+
+def test_the_report_lists_the_thresholds_it_applied():
+    usual = server_report(everything())["thresholds"]
+    assert (usual["overload_threshold"], usual["drift_tolerance"], usual["starve_window"], usual["starve_ratio"]) == (0.35, 1e-6, 50, 0.1)
+    assert usual["top_k"] is None
+    assert server_report(everything(), thresholds={})["thresholds"] == usual  # every key left out
+    asked = {"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": {"r1": 2}}
+    applied = server_report(everything(), thresholds=asked)["thresholds"]
+    assert {name: applied[name] for name in asked} == asked
+    assert {name: value for name, value in applied.items() if name not in asked} == {
+        name: value for name, value in usual.items() if name not in asked
+    }
+    # The drift incident says which tolerance it was judged by.
+    drift = [i for i in server_report(everything(), thresholds={"drift_tolerance": 0.0})["incidents"] if i["kind"] == "replica_drift"]
+    assert drift and drift[0]["tolerance"] == 0.0
+
+
+@pytest.mark.parametrize("option, reason", [
+    ({"starve_window": 0}, "starve_window must be at least 1"),
+    ({"top_k": 0}, "top_k must be at least 1"),
+    ({"top_k": {"r1": 0}}, "top_k must be at least 1"),
+    ({"overload_threshold": -0.1}, "overload_threshold must be a finite number of at least 0"),
+    ({"drift_tolerance": -1.0}, "drift_tolerance must be"),
+    ({"starve_ratio": float("nan")}, "cannot be sent as JSON"),
+    ({"overload_threshold": float("inf")}, "cannot be sent as JSON"),
 ])
-def test_other_thresholds_are_refused_because_the_rust_rules_take_none(option):
-    with pytest.raises(ValueError, match=next(iter(option))):
+def test_values_the_rust_rules_refuse_raise_value_error_with_the_reason(option, reason):
+    with pytest.raises(ValueError, match=reason):
         tensorquill.build_evidence(moe_edges(), detectors="rust", **option)
-    tensorquill.build_evidence(moe_edges(), **option)  # the Python path still takes them
+
+
+def test_an_unknown_threshold_key_is_refused_by_name():
+    with pytest.raises(ValueError, match="unknown field `overload_treshold`"):
+        server_report(moe_edges(), thresholds={"overload_treshold": 0.5})
+    with pytest.raises(ValueError, match="unknown field `spike_factor`"):  # listed in a report, but not an option
+        server_report(moe_edges(), thresholds={"spike_factor": 4.0})
+
+
+def test_thresholds_are_compared_to_one_part_in_1e12_in_case_json_text_moves_a_last_place():
+    # A precaution: no run has shown a value come back changed.
+    from tensorquill.evidence import _same_threshold
+
+    assert both(moe_edges(), overload_threshold=0.1 + 0.2, drift_tolerance=1e-6 * 3, starve_ratio=1 / 3) == []
+    assert _same_threshold(0.35, 0.35) and _same_threshold(0.35, 0.35000000000000003) and _same_threshold(1, 1.0)
+    assert not _same_threshold(0.35, 0.5) and not _same_threshold(0.35, None) and not _same_threshold(None, 0.35)
+    assert _same_threshold(None, None) and _same_threshold({"a": 2}, {"a": 2}) and _same_threshold(50, 50)
+    assert not _same_threshold(2, None) and not _same_threshold({"a": 2}, {"a": 3}) and not _same_threshold(50, 20)
+
+
+def test_a_server_started_with_thresholds_applies_them_and_a_reader_asking_for_the_same_finds_it_current(tmp_path):
+    from tensorquill.evidence import read_server_report
+    from test_server_detectors import FAST, Stream
+
+    asked = {"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": 2}
+    records = everything()
+
+    def reference(upto):
+        return [i for i in tensorquill.build_evidence(records[:upto], **asked)["incidents"] if i["kind"] in SERVER_KINDS]
+
+    assert reference(300) != [i for i in tensorquill.build_evidence(records)["incidents"] if i["kind"] in SERVER_KINDS]
+    stream = Stream(tmp_path, *FAST, "--thresholds", json.dumps(asked))
+    sent = 0
+    for upto in (60, 130, 200):  # each stretch is appended to the detectors the server holds
+        document = stream.send(records[sent:upto])
+        sent = upto
+        assert differences(reference(upto), document["incidents"]) == [], f"after {upto} steps"
+    assert {name: document["thresholds"][name] for name in asked} == asked and document["rebuilds"] == 1
+    stream.restart()  # the new server rebuilds from its store, with the thresholds it was started with
+    document = stream.send(records[200:])
+    assert differences(reference(300), document["incidents"]) == []
+    assert {name: document["thresholds"][name] for name in asked} == asked
+
+    folder = stream.incidents_file.parent
+    assert read_server_report(folder, **asked)["state"] == "current"
+    look = read_server_report(folder)
+    assert look["state"] == "other_thresholds"
+    assert "top_k 2 where None was asked for" in look["reason"] and "overload_threshold 0.5 where 0.35" in look["reason"]
+    assert read_server_report(folder, **{**asked, "top_k": {"r1": 2}})["state"] == "other_thresholds"
+    assert stream.server.terminate() == 0
+
+    # The watcher takes the server's incidents when it asks for the same values, and runs
+    # the Python detectors when it asks for others.
+    from test_server_reports import look
+
+    evidence, _ = look(stream, tmp_path / "same", **asked)
+    assert (evidence["detection"]["source"], evidence["detection"]["state"]) == ("server", "current")
+    assert differences(reference(300), [i for i in evidence["incidents"] if i["kind"] in SERVER_KINDS]) == []
+    evidence, _ = look(stream, tmp_path / "usual")
+    assert (evidence["detection"]["source"], evidence["detection"]["state"]) == ("python", "other_thresholds")
+    # (A logged NaN is in these incidents, so they are compared by kind and step.)
+    usual = tensorquill.build_evidence(records)["incidents"]
+    assert [(i["kind"], i["step"]) for i in evidence["incidents"]] == [(i["kind"], i["step"]) for i in usual]
+    assert [(i["kind"], i["step"]) for i in usual] != [(i["kind"], i["step"]) for i in reference(300)]
+
+
+def test_the_server_refuses_bad_thresholds_before_it_listens_or_reads(tmp_path):
+    store = tmp_path / "store"
+    for arguments in (
+        ["--store", str(store), "--thresholds", '{"bogus": 1}'],
+        ["detect", "--thresholds", '{"bogus": 1}'],
+        ["--thresholds", '{"bogus": 1}', "detect"],  # the option is taken before the subcommand too
+        ["detect", "--thresholds", "[0.5]"],
+        ["detect", "--thresholds", "0.5"],
+        ["detect", "--thresholds", "null"],
+    ):
+        done = subprocess.run([str(BINARY), *arguments], input=b"", capture_output=True, timeout=30)
+        assert done.returncode == 2, arguments
+        assert b"--thresholds" in done.stderr and (b"unknown field `bogus`" in done.stderr or b"expected a JSON object" in done.stderr)
+        assert done.stdout == b""
+    assert not store.exists()
+    # Before the subcommand, a good value is applied, not dropped.
+    stream = __import__("tensorquill.server_detect", fromlist=["records_stream"]).records_stream(moe_edges())
+    done = subprocess.run([str(BINARY), "--thresholds", '{"starve_window": 7}', "detect"], input=stream, capture_output=True, timeout=30)
+    assert done.returncode == 0 and json.loads(done.stdout)["thresholds"]["starve_window"] == 7
 
 
 def test_an_unknown_engine_and_a_missing_binary_say_so(monkeypatch, tmp_path):
@@ -252,10 +458,24 @@ def test_the_command_line_takes_the_incidents_from_rust(tmp_path):
     assert plain.stdout.replace("python.json", "X").replace(" nan ", " not finite ") == rust.stdout.replace("rust.json", "X")
 
 
-@pytest.mark.parametrize("extra", [("--watch",), ("--rank", "all"), ("--top-k", "2")])
+def test_the_command_lines_thresholds_go_to_rust(tmp_path):
+    capture = tmp_path / "run.jsonl"
+    capture.write_text("".join(json.dumps(r) + "\n" for r in everything()), encoding="utf-8")
+    options = ("--top-k", "2", "--overload-threshold", "0.5")
+    plain = run_cli(str(capture), "-o", str(tmp_path / "python.json"), *options)
+    rust = run_cli(str(capture), "-o", str(tmp_path / "rust.json"), "--detectors", "rust", *options)
+    assert plain.returncode == 0 and rust.returncode == 0, rust.stderr
+    python_evidence = json.loads((tmp_path / "python.json").read_text(encoding="utf-8"))
+    written = json.loads((tmp_path / "rust.json").read_text(encoding="utf-8"))
+    assert written.pop("detectors") == "rust" and written["overload_threshold"] == 0.5 and set(written["top_k"].values()) == {2}
+    assert differences(python_evidence, written, "evidence") == []
+    assert python_evidence["incidents"] != tensorquill.build_evidence(everything())["incidents"]
+
+
+@pytest.mark.parametrize("extra", [("--watch",), ("--rank", "all")])
 def test_the_command_line_refuses_what_the_rust_path_cannot_do(tmp_path, extra):
     capture = tmp_path / "run.jsonl"
     capture.write_text("".join(json.dumps(r) + "\n" for r in moe_edges()), encoding="utf-8")
     done = run_cli(str(capture), "--detectors", "rust", *extra)
     assert done.returncode == 2, done.stdout
-    assert "rust" in done.stderr.lower() or "top_k" in done.stderr
+    assert "rust" in done.stderr.lower()

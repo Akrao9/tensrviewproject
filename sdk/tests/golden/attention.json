@@ -1,0 +1,12 @@
+{
+"case":"attention",
+"incidents":[
+{"affected":1,"affected_probes":3,"class":"anomaly","confirmed_step":119,"kind":"attention_collapse","modules":[{"baseline":0.4,"baseline_probes":5,"heads":4,"module":"blk2","ratio":0.3,"value":0.12}],"probes":13,"scalars":{"train/loss":{"median_before":2.3,"value":2.4}},"step":109},
+{"affected":1,"affected_probes":3,"class":"anomaly","confirmed_step":69,"kind":"attention_uniform","modules":[{"baseline":0.35,"baseline_probes":5,"heads":4,"module":"blk1","rise":0.6489999999999999,"value":0.9989999999999999}],"probes":13,"scalars":{"train/loss":{"median_before":2.3,"value":2.3}},"step":59},
+{"affected":1,"affected_probes":6,"class":"anomaly","confirmed_step":99,"kind":"attention_logit_growth","modules":[{"baseline":11.6,"baseline_probes":5,"heads":4,"module":"blk3","ratio":2.637931034482759,"value":30.6}],"probes":13,"scalars":{"train/loss":{"median_before":2.3,"value":2.5}},"step":89}
+],
+"not_checked":[],
+"records":{"count":140,"sha256":"b67603c4a2e0c46564d4051064889e3cf8aa46841ead71d18dc4102232d47106"},
+"run_state":{"reasons":[{"code":"incidents","detail":"3 incidents listed: attention_collapse, attention_uniform, attention_logit_growth","kinds":["attention_collapse","attention_uniform","attention_logit_growth"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}
