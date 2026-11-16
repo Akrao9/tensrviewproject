@@ -75,7 +75,10 @@ A kind the tools mark `unclassified` is one this version does not know. The run 
 A check listed under `not_checked` was not made, and each entry gives the reason. It is not a finding of "nothing wrong".
 
 - Never write "no problem with X" when the check for X is listed there. Write "X was not checked" and give the reason.
-- An empty incident list means "no failure found" only when `run_state` is `healthy`.
+- An empty incident list is not by itself "no failure found". Read the reasons under `run_state`:
+  - `healthy` means every expected source was current and nothing was found.
+  - `degraded` for the single reason `no_status` is the best a local capture or evidence file can read, because it has no progress status from the server. The recorded steps were judged and nothing was found; whether the job is still making progress was not watched. Say both.
+  - Any other reason means part of the picture is missing. Say which part.
 - A rank listed as unknown has a report that is not current. Nothing is known about incidents on it, and it is never counted as clean. Say which ranks are unknown.
 - A capture holds only what the job recorded. If `get_series` says a name is not there, that value was not captured.
 

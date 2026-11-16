@@ -189,6 +189,9 @@ class Source:
         if held is not None and stamp is not None and held[0] == stamp:
             return held[1]
         value = make()
+        if isinstance(key, tuple) and key[0] == "records":  # one rank's step records at a time
+            for other in [k for k in self._kept if isinstance(k, tuple) and k[0] == "records"]:
+                del self._kept[other]
         self._kept[key] = (stamp, value)
         return value
 
@@ -627,7 +630,8 @@ def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
     wanted = arguments.get("id")
     if not isinstance(wanted, str) or not wanted:
         raise ToolError("`id` is required: the id of an incident, as list_incidents gives it (for example grad_spike@310).")
-    opened = source.open(_integer(arguments, "rank", minimum=0))
+    rank = _integer(arguments, "rank", minimum=0)
+    opened = source.open(rank)
     entries = _entries(opened)
     entry = next((e for e in entries if e["id"] == wanted), None)
     if entry is None:
@@ -651,6 +655,13 @@ def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
             "on_ranks": _ranges(ranks), "rank_count": len(ranks), "on_all_judged_ranks": group.get("on_all_judged_ranks"),
             "numbers_differ": group.get("numbers_differ"), "numbers_are_from_rank": group.get("incident_rank"),
         }
+        if rank is not None and rank not in ranks:
+            answer["ranks"]["note"] = f"rank {rank} is not among the ranks that show this incident"
+        elif rank is not None and rank != group.get("incident_rank"):
+            answer["ranks"]["note"] = (
+                f"the numbers below are rank {group.get('incident_rank')}'s, not rank {rank}'s: one rank's incident is"
+                " kept for each group of ranks (get_series with rank= reads any rank's own values)"
+            )
     elif entry.get("run_level"):
         answer["ranks"] = {"on_ranks": "the run as a whole"}
     answer["incident"] = incident
@@ -977,8 +988,11 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "Call this first. Lists what TensorQuill's detectors found in the run: each incident's id, kind, class"
             " (invariant, anomaly or observation), first step and `where` (the MoE layer and router with expert"
             " numbers, or the parameters or modules it names), in the order the evidence lists them. Also gives the"
-            " run state with its reasons, what was not checked, and a text summary. An empty list means no failure"
-            " only when the run state is healthy and nothing is listed under not_checked or as an unknown rank."
+            " run state with its reasons, what was not checked, and a text summary. An empty list is not by itself"
+            " \"no failure\": read the run state's reasons. With no incidents, a state of healthy, or of degraded"
+            " for the one reason no_status (a local file has no progress status, so stalls are not watched), means"
+            " the recorded steps were judged and nothing was found. A not_checked entry or an unknown rank means"
+            " that part was not judged."
             " For a run folder the incidents are grouped across ranks; `rank` keeps one rank's."
         ),
         "inputSchema": {
@@ -1112,10 +1126,15 @@ def _text(payload: Any) -> str:
 
 def _largest(value: Any, path: str, found: list[tuple[int, str, Any, Any]], parent: Any = None, key: Any = None) -> int:
     """The length of `value` as JSON, noting in `found` every part that can be cut: a list of
-    more than four items, a map of more than sixteen plain values, a string of more than 256."""
+    more than four items, a string of more than 256 characters, and a map of more than sixteen
+    entries unless one entry is most of it (then that entry is what to cut)."""
     if isinstance(value, dict):
-        size = 2 + sum(len(json.dumps(k)) + 2 + _largest(v, f"{path}.{k}" if path else str(k), found, value, k) for k, v in value.items())
-        if parent is not None and len(value) > 16 and not any(isinstance(v, (dict, list)) for v in value.values()):
+        sizes = [
+            len(json.dumps(k)) + 2 + _largest(v, f"{path}.{k}" if path else str(k), found, value, k)
+            for k, v in value.items()
+        ]
+        size = 2 + sum(sizes)
+        if parent is not None and len(value) > 16 and max(sizes) <= size / 2:
             found.append((size, path, parent, key))
         return size
     if isinstance(value, list):
@@ -1132,7 +1151,7 @@ def _largest(value: Any, path: str, found: list[tuple[int, str, Any, Any]], pare
 def fit(payload: dict[str, Any], fits: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
     """`payload`, cut until `fits` accepts it: the largest list, map or string loses its last
     quarter, again and again, and `truncated` says what is shown of each. The original is not
-    changed."""
+    changed. A `ToolError` when nothing is left to cut."""
     if fits(payload):
         return payload
     payload = copy.deepcopy(payload)
@@ -1158,7 +1177,10 @@ def fit(payload: dict[str, Any], fits: Callable[[dict[str, Any]], bool]) -> dict
             keep, unit = max(len(value) * 3 // 4, 4), "items"
             parent[key] = value[:keep]
         cut[path] = (keep, cut[path][1] if path in cut else len(value), unit)
-    return {"error": "the answer is too long to send and could not be shortened further", "truncated": notes}
+    raise ToolError(
+        f"the answer is longer than {MAX_ANSWER_BYTES} bytes and could not be shortened further"
+        + (f" (already cut: {'; '.join(notes)[:1000]})" if notes else "") + "."
+    )
 
 
 def call_tool(source: Source, request_id: Any, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -1242,7 +1264,7 @@ def handle_line(source: Source, line: bytes) -> bytes | None:
     except ValueError as error:
         return _line(_error(None, PARSE_ERROR, f"Parse error: the line is not JSON ({error})."))
     try:
-        if isinstance(message, list):  # a batch, which revision 2025-03-26 lets a client send
+        if isinstance(message, list):  # a batch, which revision 2025-03-26 lets a client send (the cap is per answer)
             if not message:
                 return _line(_error(None, INVALID_REQUEST, "An empty batch."))
             replies = [reply for reply in (handle(source, item) for item in message) if reply is not None]

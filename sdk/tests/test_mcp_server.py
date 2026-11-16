@@ -444,20 +444,29 @@ def test_a_10_000_step_run_gives_bounded_answers_and_a_spike_between_points_is_s
 
 def test_a_fat_incident_and_a_long_list_are_cut_with_a_note_of_where(start, tmp_path):
     names = [f"encoder.layers.{i}.attention.self.query.weight" for i in range(5_000)]
+    drift = {"kind": "replica_drift", "step": 20, "tolerance": 1e-6, "parameters": {
+        name: {"norm_spread": 0.25, "sum_spread": 0.5, "projection_spread": 0.125} for name in names[:2_000]}}
     stalled = {"kind": "stalled_weights", "step": 12, "parameters": names, "stalled": len(names), "with_gradients": 5_000,
                "consecutive": 3, "stalled_steps": 3, "stalled_total": len(names), "onsets": [], "onsets_omitted": 0}
     many = [{**SPIKE, "step": step, "parameters": [{**SPIKE["parameters"][0], "name": name} for name in names[:40]]}
             for step in range(3_000)]
     fat = tmp_path / "fat.json"
-    fat.write_text(json.dumps({"schema_version": 1, "incidents": [stalled, *many], "samples": []}))
+    fat.write_text(json.dumps({"schema_version": 1, "incidents": [stalled, *many, drift], "samples": []}))
     client = start(fat)
     found = client.call("get_incident", id="stalled_weights@12")
     assert found["where"] == {"parameters": names[:12], "parameters_count": 5_000}
     kept = found["incident"]["parameters"]
     assert kept == names[:len(kept)] and 0 < len(kept) < 5_000 and found["incident"]["stalled"] == 5_000
     assert found["truncated"] == [f"incident.parameters: {len(kept)} of 5000 items shown"]
+    # A map of small maps, as replica drift lists its parameters, is cut the same way.
+    drifted = client.call("get_incident", id="replica_drift@20")
+    spreads = drifted["incident"]["parameters"]
+    assert 100 < len(spreads) < 2_000 and list(spreads) == names[:len(spreads)]
+    assert spreads[names[0]] == {"norm_spread": 0.25, "sum_spread": 0.5, "projection_spread": 0.125}
+    assert drifted["truncated"] == [f"incident.parameters: {len(spreads)} of 2000 entries shown"]
+    assert drifted["where"] == {"parameters": names[:12], "parameters_count": 2_000}
     listed = client.call("list_incidents")
-    assert listed["incident_count"] == 3_001 and listed["incidents_omitted"] == 2_951
+    assert listed["incident_count"] == 3_002 and listed["incidents_omitted"] == 2_952
     assert [i["id"] for i in listed["incidents"][:3]] == ["stalled_weights@12", "grad_spike@0", "grad_spike@1"]
     assert any(note.startswith("summary: ") for note in listed["truncated"])
     most = client.call("list_incidents", limit=200)
@@ -477,7 +486,8 @@ def test_fit_cuts_the_largest_part_and_leaves_the_original_alone():
     assert cut["small"] == [1, 2, 3] and cut["big"] == list(range(len(cut["big"])))
     assert f"big: {len(cut['big'])} of 4000 items shown" in cut["truncated"]
     assert f"nested.rows[0].n: {len(cut['nested']['rows'][0]['n'])} of 900 items shown" in cut["truncated"]
-    assert mcp_server.fit({"a": 1}, lambda _: False)["error"].startswith("the answer is too long")
+    with pytest.raises(mcp_server.ToolError, match="could not be shortened further"):
+        mcp_server.fit({"a": 1}, lambda _: False)
 
 
 # --- A run folder with two ranks ------------------------------------------------------------
@@ -513,6 +523,8 @@ def test_the_all_ranks_status_of_a_two_rank_run_folder(start, store):
     assert [i["id"] for i in only["incidents"]] == ["grad_spike@40", "resume_lr_change@30"] and only["rank"]["judged"] is True
     found = client.call("get_incident", id="grad_spike@40")
     assert found["ranks"] == {"on_ranks": "0-1", "rank_count": 2, "on_all_judged_ranks": True, "numbers_differ": True, "numbers_are_from_rank": 0}
+    assert "rank 0's, not rank 1's" in client.call("get_incident", id="grad_spike@40", rank=1)["ranks"]["note"]
+    assert "rank 0 is not among the ranks" in client.call("get_incident", id="non_finite@55", rank=0)["ranks"]["note"]
     assert found["incident"]["grad_norm"] == 9.0 and found["look_next"][0]["arguments"] == {"name": "blocks.1.weight", "kind": "parameter"}
     # The parts made by hand are empty: the error says the parts or pyarrow, and the server goes on.
     assert re.search("stored parts|pyarrow", client.error("get_series", name="blocks.1.weight", rank=1))
