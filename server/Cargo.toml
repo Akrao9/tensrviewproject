@@ -4,6 +4,19 @@ version = "0.0.1"
 edition = "2021"
 description = "Self-hosted ingest server for TensorQuill: Arrow Flight DoPut in, partitioned Parquet out."
 license = "Apache-2.0 OR MIT"
+keywords = ["pytorch", "observability", "arrow-flight", "parquet", "training"]
+categories = ["development-tools::profiling", "network-programming"]
+# No `readme`, `repository` or `homepage` yet: there is no server README, and the project owner
+# chooses the URLs at first publish. Licenses are listed so `cargo package` ships them.
+include = [
+    "src/**/*.rs",
+    "tests/**/*.rs",
+    "examples/**/*.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+]
 
 [dependencies]
 arrow = "60.1.0"

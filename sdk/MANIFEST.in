@@ -1,0 +1,7 @@
+# The sdist carries the package source, the licenses and the README, and nothing else.
+# setuptools would otherwise add tests/test*.py without tests/conftest.py and
+# tests/flight_fake_server.py, which would not run, and several tests read fixtures
+# from ../experiments, which is outside the sdist.
+prune tests
+prune examples
+global-exclude __pycache__ *.py[cod]
