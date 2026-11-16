@@ -27,6 +27,9 @@ class TensorQuillCallback(L.Callback):
       optimizer step, summed over gradient-accumulation microbatches (Lightning has
       already divided each by `accumulate_grad_batches`, so the sum is their mean). It
       stays a tensor on the device, with no sync. `loss_name=None` turns this off.
+    - **Data wait.** The host time spent in `next()` on the training `DataLoader`, which
+      Lightning calls before it moves the batch to the device, is recorded as `data_wait`
+      (`tensorquill.datawait`). `data_wait=False` turns it off.
 
     Other keyword arguments go to `tensorquill.init`, for example `routers=`, `capture=`
     or `probe=`.
@@ -48,6 +51,7 @@ class TensorQuillCallback(L.Callback):
         if scaler is not None:
             kwargs.setdefault("scaler", scaler)
         kwargs.setdefault("start_step", trainer.global_step)
+        kwargs.setdefault("data_wait", True)
         self.session = init(pl_module, run_id=run_id, **kwargs)
 
     def on_before_backward(self, trainer: L.Trainer, pl_module: L.LightningModule, loss: Any) -> None:

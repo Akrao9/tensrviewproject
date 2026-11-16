@@ -53,7 +53,7 @@ class Watch:
         self.session.log({self.loss_name: self._loss})
 
 
-def watch_accelerator(session: Session, *, loss_name: str | None = "train/loss") -> Watch:
+def watch_accelerator(session: Session, *, loss_name: str | None = "train/loss", data_wait: bool = True) -> Watch:
     """Record what goes through any `Accelerator` for `session`'s model, until the session
     or the returned `Watch` is closed.
 
@@ -66,6 +66,10 @@ def watch_accelerator(session: Session, *, loss_name: str | None = "train/loss")
       tensor on the device, with no sync. `loss_name=None` turns this off.
       Every loss passed to `backward` counts, so with two models trained through
       Accelerate in one process, turn it off and call `session.log` yourself.
+    - **Data wait.** The host time spent fetching batches from the `DataLoader` inside
+      each prepared `DataLoaderShard` is recorded as `data_wait`
+      (`session.watch_loaders()`, see `tensorquill.datawait`). The timer stops before
+      Accelerate moves the batch to the device. `data_wait=False` turns it off.
 
     It wraps `Accelerator.clip_grad_norm_` and `Accelerator.backward` for the whole
     process while something is watched, and restores them afterwards. Call it before or after `accelerator.prepare`.
@@ -77,6 +81,8 @@ def watch_accelerator(session: Session, *, loss_name: str | None = "train/loss")
         Accelerator.clip_grad_norm_ = _clip_grad_norm  # type: ignore[method-assign]
         Accelerator.backward = _backward  # type: ignore[method-assign]
     _active.append(watch)
+    if data_wait:
+        session.watch_loaders()
     close = session.close
 
     def close_and_unwatch() -> None:

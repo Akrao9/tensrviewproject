@@ -20,6 +20,14 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .evidence_system import (
+    SYSTEM_KINDS,
+    describe_system,
+    detect_memory_imbalance,
+    detect_system_incidents,
+    latest_memory,
+)
+
 OVERLOAD_THRESHOLD = 0.35
 DRIFT_TOLERANCE = 1e-6
 # An expert is starved when its share of a router's assignments, summed over the last
@@ -1121,6 +1129,7 @@ class _Tail:
 SERVER_KINDS = (
     "moe_imbalance", "starved_experts", "grad_spike", "stalled_weights", "repeated_steps", "loss_scale_trouble",
     "resume_lr_change", "activation_spike", "activation_drift", "dead_activations", "non_finite", "replica_drift",
+    *SYSTEM_KINDS,
 )
 # How long a watcher waits for the server's report to cover the newest stored part before
 # it calls the report stale and works the incidents out itself. Measured with 64 ranks on an
@@ -1818,8 +1827,14 @@ def _incident_identity(incident: Mapping[str, Any]) -> str:
         parts = [incident.get("reason")]
     elif kind == "replica_drift":
         parts = sorted(incident.get("parameters") or ())
-    elif kind in ("repeated_steps", "resume_lr_change"):
+    elif kind in ("repeated_steps", "resume_lr_change", "memory_growth", "memory_pressure", "allocator_retries"):
         parts = []
+    elif kind == "hardware_errors":
+        parts = sorted(incident.get("xid") or ())
+    elif kind == "gpu_throttled":
+        parts = sorted(str(r) for r in incident.get("reasons") or ())
+    elif kind == "input_starvation":
+        parts = [incident.get("rule")]
     else:
         parts = {k: v for k, v in incident.items() if k != "scalars"}
     return json.dumps([kind, step, parts], sort_keys=True, default=str)
@@ -1928,6 +1943,10 @@ def _all_ranks_evidence(
     else:  # a status from a server that did not write the list yet
         stream_incidents = detect_watchdog_incidents(status)
     run_incidents = list(stream_incidents)
+    # Cross-rank, so only here: each rank's report carries its latest memory reading.
+    imbalance = detect_memory_imbalance({n: looks[n]["report"].get("memory") for n in judged})
+    if imbalance is not None:
+        run_incidents.append(imbalance)
     not_checked: list[dict[str, Any]] = []
 
     def newest_ts() -> float | None:
@@ -2394,6 +2413,7 @@ def build_evidence(
     non_finite_hit = detect_non_finite(records)
     if non_finite_hit is not None:
         incidents.append(non_finite_hit)
+    incidents.extend(detect_system_incidents(records, not_checked))
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
     stream_incidents = detect_watchdog_incidents(status)
     incidents.extend(stream_incidents)
@@ -2418,6 +2438,7 @@ def build_evidence(
 
     run_id = records[0].get("run_id") if records else None
     trends = weight_norm_trends(records)
+    memory = latest_memory(records)
     return {
         "schema_version": 1,
         "run_id": run_id,
@@ -2432,6 +2453,7 @@ def build_evidence(
         "samples": samples,
         **({"not_checked": not_checked} if not_checked else {}),
         **({"weight_trends": trends} if trends else {}),
+        **({"memory": memory} if memory else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
         **({"traincheck": traincheck_summary} if traincheck_summary else {}),
         **({"watchdog": {k: status[k] for k in (
@@ -2821,7 +2843,7 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             f" {len(incident['parameters'])} parameters (tolerance {incident['tolerance']:g})"
         )
         return text + (f", {bad} with NaN or Inf weights on some replica" if bad else "")
-    return None
+    return describe_system(incident)
 
 
 def incident_summary(evidence: Mapping[str, Any]) -> str:

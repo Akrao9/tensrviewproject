@@ -32,9 +32,11 @@ from torch.optim.optimizer import (
     register_optimizer_step_pre_hook,
 )
 
+from . import datawait
 from .distributed import FINGERPRINT_WIDTH, replica_spread, unwrap_local
 from .probe import ProbeState, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink
+from .system import SystemReadings
 from .tracker import RunInfo, _world_size, resolve_run
 
 STATS = ("mean", "std", "abs_max", "zero_frac")
@@ -330,6 +332,8 @@ class Session:
         probe_every: int = PROBE_EVERY,
         scaler: Any = None,
         replica_params: Any = None,
+        system: bool = False,
+        data_wait: bool = False,
     ) -> None:
         if hasattr(model, "_orig_mod"):
             raise ValueError("call tensorquill.init(model) before torch.compile(model)")
@@ -479,6 +483,15 @@ class Session:
         if beat is not None:
             beat.counter = lambda: self._steps_committed + self._ticks
         self._error: BaseException | None = None
+        # GPU memory and NVML readings once per flush (system.py), and the host time spent
+        # waiting for batches (datawait.py). Both off unless asked for.
+        self._system = SystemReadings(self.device) if system else None
+        self._data_timing = False
+        self._data_thread = threading.get_ident()
+        self._fetching = False
+        self._pending_data_wait = 0.0
+        self._last_step_clock: float | None = None
+        self._ring_data: list[tuple[float, float | None] | None] = []
         # Bounded, as TensorBoard's SummaryWriter is (`max_queue=10`): if the sink falls
         # behind, for example on a stalled network filesystem, training waits for it
         # instead of holding every unwritten step in memory. No step is dropped.
@@ -505,6 +518,8 @@ class Session:
                 register_optimizer_step_pre_hook(self._before_optimizer_step),
                 register_optimizer_step_post_hook(self._after_optimizer_step),
             ]
+        if data_wait:
+            self.watch_loaders()
 
     # ---- training-loop side -------------------------------------------------------
 
@@ -902,6 +917,13 @@ class Session:
         self._pending_lr = None
         self._ring_scalars.append(self._pending_scalars)
         self._ring_amp.append(self._pending_amp)
+        if self._data_timing:
+            clock = time.perf_counter()
+            last, self._last_step_clock = self._last_step_clock, clock
+            self._ring_data.append((self._pending_data_wait, None if last is None else clock - last))
+            self._pending_data_wait = 0.0
+        else:
+            self._ring_data.append(None)
         self._pending_amp = {}
         self._pending_scalars = {}
         self._next_step = current + 1
@@ -947,6 +969,7 @@ class Session:
             self._ring_weight_seen = []
             self._ring_clip_seen = []
             self._ring_spread_seen = []
+            self._ring_data = []
             self._raise_worker_error()
         n = len(self._steps)
         if n == 0:
@@ -984,6 +1007,9 @@ class Session:
         self._ring_amp = []
         probes = self._ring_probe
         steps, lrs, stamps = self._steps, self._ring_lr, self._ring_ts
+        waits, self._ring_data = self._ring_data, []
+        # Host-side allocator counters: no GPU work, no sync (system.py).
+        system = self._system.flush() if self._system is not None else None
         self._ring_ts = []
         self._steps = []
         self._ring_lr = []
@@ -995,7 +1021,7 @@ class Session:
         self._ring_spread_seen = []
         block = (
             steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
-            spread_seen, scalars, probes, stamps, amps,
+            spread_seen, scalars, probes, stamps, amps, waits, system,
         )
         try:
             self._queue.put_nowait(block)
@@ -1027,6 +1053,28 @@ class Session:
         for you. Cheap: it only adds one to a counter."""
         self._ticks += 1
 
+    def watch_loaders(self) -> None:
+        """Record the host time this thread spends in `next()` on any PyTorch `DataLoader`
+        during training, as `data_wait` on each step, until the session closes. See
+        `tensorquill.datawait`. `init(..., data_wait=True)` calls it."""
+        if self._closed:
+            raise RuntimeError("the session is closed")
+        self._start_data_timing()
+        datawait.watch(self)
+
+    def time_data(self, iterable: Any) -> "datawait.TimedData":
+        """`for batch in session.time_data(loader):` records the host time spent fetching each
+        batch, as `data_wait` on each step. Move the batch to the device after this, outside
+        the timer. For loops whose loader is not a PyTorch `DataLoader`; with one,
+        `watch_loaders()` does the same without changing the loop."""
+        return datawait.TimedData(iterable, self)
+
+    def _start_data_timing(self) -> None:
+        if not self._data_timing:
+            self._data_timing = True
+            self._pending_data_wait = 0.0
+            self._last_step_clock = None
+
     @contextlib.contextmanager
     def phase(self, name: str) -> Iterator[None]:
         """`with session.phase("eval"): ...` marks a stretch with no training steps, and goes
@@ -1044,6 +1092,7 @@ class Session:
         if self._closed:
             return
         self._closed = True
+        datawait.unwatch(self)
         for handle in self._optimizer_handles:
             handle.remove()
         _unwatch_clipping(self)
@@ -1071,16 +1120,27 @@ class Session:
             raise RuntimeError("the TensorQuill writer thread failed") from error
 
     def _drain(self) -> None:
-        while True:
-            item = self._queue.get()
-            if item is None:
-                return
-            if self._error is not None:
-                continue
-            try:
-                self._sink.write(self._decode(*item))
-            except BaseException as error:  # noqa: BLE001
-                self._error = error
+        try:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    return
+                if self._error is not None:
+                    continue
+                if self._system is not None:
+                    # NVML is read here, on the writer thread. A failure is written as a note
+                    # in the record (system.py) and never stops the writer, which would stop training.
+                    try:
+                        item = (*item[:-1], self._system.write(item[-1] or {}))
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    self._sink.write(self._decode(*item))
+                except BaseException as error:  # noqa: BLE001
+                    self._error = error
+        finally:
+            if self._system is not None:
+                self._system.close()
 
     def _decode(
         self,
@@ -1098,6 +1158,8 @@ class Session:
         probes: list[dict[str, Any] | None] | None = None,
         stamps: list[float] | None = None,
         amps: list[dict[str, Any]] | None = None,
+        waits: list[tuple[float, float | None] | None] | None = None,
+        system: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
         split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
@@ -1167,6 +1229,10 @@ class Session:
                 record["grad_scale"] = amps[i]["grad_scale"]
             if scalars is not None and scalars[i]:
                 record["scalars"] = scalars[i]
+            if waits is not None and waits[i] is not None:
+                record["data_wait"] = waits[i][0]
+                if waits[i][1] is not None:
+                    record["step_time"] = waits[i][1]
             if probes is not None and probes[i] is not None:
                 record["probe"] = probes[i]
             if spread_rows is not None and spread_seen[i]:
@@ -1183,6 +1249,8 @@ class Session:
                     name: _router_stats(row_counts) for name, row_counts in step_moe.items()
                 }
             records.append(record)
+        if system and records:
+            records[-1]["system"] = system
         return records
 
 
@@ -1299,6 +1367,8 @@ def init(
     scaler: Any = None,
     replica_params: Any = None,
     endpoint: str | None = None,
+    system: bool = False,
+    data_wait: bool = False,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -1373,6 +1443,16 @@ def init(
         clip_norm: record the total gradient norm that `torch.nn.utils.clip_grad_norm_`
             returns for this model's parameters, as `clip_grad_norm`, in any capture mode.
             Free when you clip anyway, and enough for gradient-spike detection.
+        system: at each flush, add the CUDA caching allocator's counters (allocated,
+            reserved and peak bytes, allocation retries and OOMs; host-side, no sync) and,
+            on the writer thread, NVML's temperature, SM clock, power, ECC counters,
+            throttle reasons and Xid events (`pip install nvidia-ml-py`) to the block's
+            last record as `system`. A reading that cannot be taken is written once as
+            unavailable. Off by default until its cost is measured on a GPU. See `system.py`.
+        data_wait: record the host time this thread spends in `next()` on PyTorch
+            `DataLoader`s during training as `data_wait`, with `step_time`, on each step
+            (`session.watch_loaders()`). The Hugging Face and Lightning callbacks turn it
+            on. For other loaders wrap them: `session.time_data(loader)`.
     """
     mode = capture if capture is not None else ("routers" if routers else "full")
     if mode not in CAPTURE_MODES:
@@ -1412,4 +1492,6 @@ def init(
         probe_every=probe_every,
         scaler=scaler,
         replica_params=replica_params,
+        system=system,
+        data_wait=data_wait,
     )

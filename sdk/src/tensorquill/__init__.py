@@ -34,6 +34,7 @@ from .evidence import (
     load_records,
     routing_colors,
 )
+from .evidence_system import detect_memory_imbalance, detect_system_incidents, latest_memory
 from .sink import JsonlSink, MemorySink, Sink
 from .tracker import RunInfo, resolve_run
 
@@ -53,6 +54,8 @@ __all__ = [
     "detect_activation_anomalies",
     "detect_grad_spikes",
     "detect_loss_scale_trouble",
+    "detect_memory_imbalance",
+    "detect_system_incidents",
     "scalar_context",
     "detect_repeated_steps",
     "detect_resume_lr_changes",
@@ -66,6 +69,7 @@ __all__ = [
     "first_incident",
     "incident_summary",
     "init",
+    "latest_memory",
     "load_records",
     "parameter_fingerprints",
     "replica_spread",

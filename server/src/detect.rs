@@ -57,6 +57,9 @@ use serde_json::{json, Value};
 
 use crate::storage::{Error, Storage};
 
+mod system;
+use system::{System, SystemColumns};
+
 // The same values as the constants of the same names in evidence.py.
 pub const OVERLOAD_THRESHOLD: f64 = 0.35;
 pub const STARVE_WINDOW: usize = 50;
@@ -86,8 +89,11 @@ pub const SCALE_FLOOR: f64 = 1.0;
 pub const DRIFT_TOLERANCE: f64 = 1e-6;
 pub const RESUME_LR_TOLERANCE: f64 = 1e-6;
 
-/// The incident kinds this module can report, in the order `build_evidence` lists them.
-pub const PORTED: [&str; 12] = [
+/// The incident kinds this module can report, in the order `build_evidence` lists them, but
+/// that the GPU memory, NVML and data-wait kinds (`detect/system.rs`) come between
+/// `non_finite` and `replica_drift`, as in [`RankDetectors::incidents`]. Python's
+/// cross-rank `memory_imbalance` is not here: the detectors see one rank at a time.
+pub const PORTED: [&str; 18] = [
     "moe_imbalance",
     "starved_experts",
     "grad_spike",
@@ -100,6 +106,12 @@ pub const PORTED: [&str; 12] = [
     "dead_activations",
     "non_finite",
     "replica_drift",
+    "memory_growth",
+    "memory_pressure",
+    "allocator_retries",
+    "hardware_errors",
+    "gpu_throttled",
+    "input_starvation",
 ];
 /// The kinds only `python -m tensorquill` reports: their sources never reach the server.
 pub const NOT_PORTED: [&str; 3] = ["collective_hang", "collective_desync", "traincheck_violation"];
@@ -123,6 +135,14 @@ pub fn thresholds() -> Value {
         "scale_floor": SCALE_FLOOR,
         "drift_tolerance": DRIFT_TOLERANCE,
         "resume_lr_tolerance": RESUME_LR_TOLERANCE,
+        "memory_growth_readings": system::MEMORY_GROWTH_READINGS,
+        "memory_growth_fraction": system::MEMORY_GROWTH_FRACTION,
+        "memory_growth_bytes": system::MEMORY_GROWTH_BYTES,
+        "memory_reserved_fraction": system::MEMORY_RESERVED_FRACTION,
+        "throttle_reported": system::THROTTLE_REPORTED,
+        "input_window": system::INPUT_WINDOW,
+        "input_share": system::INPUT_SHARE,
+        "input_rise": system::INPUT_RISE,
     })
 }
 
@@ -2003,6 +2023,7 @@ pub struct RankDetectors {
     activations: Activations,
     non_finite: NonFinite,
     replica_drift: ReplicaDrift,
+    system: System,
     attempts: Attempts,
     scalars: Scalars,
     last_step: Option<i64>,
@@ -2026,6 +2047,7 @@ impl RankDetectors {
     /// were rolled back by a later attempt: only `pass`, which reads every attempt, sees them.
     fn read(&mut self, batch: &RecordBatch, cutoff: i64, mut pass: Option<&mut AttemptPass>) {
         let Some(columns) = Columns::new(batch) else { return };
+        let system_columns = SystemColumns::new(batch);
         for row in 0..batch.num_rows() {
             let step = columns.steps.value(row);
             match pass.as_deref_mut() {
@@ -2083,6 +2105,12 @@ impl RankDetectors {
                     for (_, incident, _) in self.activations.found.iter_mut().skip(before.1) {
                         incident["scalars"] = context.clone();
                     }
+                }
+            }
+            let new = self.system.row(self.attempt, step, &system_columns, row);
+            if new != 0 {
+                if let Some(context) = self.scalars.context(&columns, row) {
+                    self.system.attach(new, &context);
                 }
             }
             self.scalars.row(&columns, row);
@@ -2156,8 +2184,15 @@ impl RankDetectors {
         self.attempts.incidents(false, &mut out);
         self.activations.incidents(&mut out);
         out.extend(self.non_finite.first.clone());
+        self.system.incidents(&mut out);
         out.extend(self.replica_drift.first.clone());
         out
+    }
+
+    /// The rank's latest GPU memory reading, or null: what Python's all-ranks view compares
+    /// across ranks for `memory_imbalance`.
+    pub fn memory(&self) -> Value {
+        self.system.memory()
     }
 
     /// What was not checked, in the shape of the `not_checked` list in Python's evidence:
@@ -2177,6 +2212,7 @@ impl RankDetectors {
             }),
         ];
         out.extend(self.attempts.not_checked.iter().cloned());
+        self.system.not_checked(&mut out);
         out
     }
 }

@@ -420,6 +420,7 @@ impl Ingest {
             "not_checked": detectors.not_checked(),
             "thresholds": crate::detect::thresholds(),
             "moe_flagged": detectors.moe_flagged(),
+            "memory": detectors.memory(),
             "incidents": detectors.incidents(),
         });
         if let Err(error) = self.storage.write_incidents(&key.0, key.1, &document).await {
