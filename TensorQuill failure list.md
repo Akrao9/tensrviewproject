@@ -168,7 +168,7 @@ Built since Nov 13, 2026:
 Remaining priorities in order of value for effort:
 
 1. **Run the cross-GPU detector on two CUDA GPUs over NCCL** (`sdk/examples/replica_check.py`, entries 1 and 2).
-2. **Run the dense-model outlier and probe benchmark on a GPU** (`sdk/examples/dense_outlier_check.py`, entries 7 and 8) and add attention-entropy / logit-growth detector rules once real failure traces are collected.
+2. **Dense-model outlier and probe benchmark on a GPU: done Nov 15, 2026** (A100, SmolLM2-360M, `sdk/examples/dense_outlier_check.py`, entries 7 and 8): the activation detector finds the seeded growth of the largest channels at its step, and the probe shows the next block's attention going uniform (entropy share 0.34 to 1.00, largest logit 12.09 to 0.91). Still open: attention-entropy / logit-growth detector rules, now with one real trace to start from.
 3. ~~Record `GradScaler` skipped steps and scale factor~~ (entry 10): done Nov 14, 2026; check the thresholds on a real fp16 run.
 
 TrainCheck (OSDI '25) already catches entries 1 and 4 by checking invariants, such as "replicated weights match" and "`step()` changes the parameters". It is the closest prior work for these two entries and should be added to the competitor check.

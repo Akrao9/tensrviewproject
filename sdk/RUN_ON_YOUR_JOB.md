@@ -16,7 +16,7 @@ Add extras in the same way when you need them: `sdk[lightning]`, `sdk[huggingfac
 
 | Your model | Call | Cost measured on Granite |
 | --- | --- | --- |
-| MoE model | `tensorquill.init(model, routers={...})`: router-only, the default | +0.02% to +0.78% on an RTX PRO 6000; +1.1% to +1.3% on an A100 |
+| MoE model | `tensorquill.init(model, routers={...})`: router-only, the default | +0.02% to +0.78% on an RTX PRO 6000; +1.1% to +1.3% on an A100 at one commit and +0.4% to +0.95% at a later one |
 | MoE model, while debugging | add `capture="full"` | about +4% |
 | Dense model | `tensorquill.init(model)`: full capture | about +4% on Granite; not measured on a dense model |
 
