@@ -2511,6 +2511,113 @@ def _all_ranks_run_state(evidence: Mapping[str, Any], looks: Mapping[int, Mappin
                      not_checked=not_checked, unknown_ranks=unknown, judged_ranks=judged)
 
 
+def _all_ranks_source(source: str | Path) -> Path:
+    """The run folder the all-ranks view looks at; `ValueError` for a file or one rank's folder."""
+    source = Path(source)
+    if source.exists() and not source.is_dir():
+        raise ValueError(f"rank='all' needs a run folder in a server's store (runs/<run_id>), not the file {source}")
+    if _own_rank(source) is not None:
+        raise ValueError(f"{source} is one rank's folder; rank='all' needs the run folder that holds the rank=<n> folders")
+    return source
+
+
+def _all_ranks_status_file(source: Path, watchdog: Any) -> Path:
+    return Path(watchdog) if isinstance(watchdog, (str, Path)) else _watchdog_beside(source) or source / "watchdog.json"
+
+
+def _look_at_ranks(
+    source: Path,
+    status: Mapping[str, Any] | None,
+    memory: dict[int, _RankMemory],
+    thresholds: Mapping[str, Any],
+    report_grace: float,
+) -> tuple[dict[int, Path], dict[int, dict[str, Any]], tuple[Any, ...], tuple[Any, ...]]:
+    """One look at every rank of a run folder: its `rank=<n>` folders, each rank's look
+    (`_rank_look`), and the two keys the watcher compares with what it last wrote: every
+    rank's own, and the same with a rank inside its wait held at the key it had when last
+    current. `memory` is what the watcher keeps about each rank between looks, updated here;
+    an empty one is a first look."""
+    folders = _discover_rank_folders(source)
+    absent = _ranks_without_folder(folders, status)
+    numbers = sorted({*folders, *absent})
+    for gone in set(memory) - set(numbers):
+        del memory[gone]
+    now = time.monotonic()
+    looks: dict[int, dict[str, Any]] = {}
+    full: list[tuple[int, Any]] = []
+    calm: list[tuple[int, Any]] = []
+    for number in numbers:
+        held = memory.setdefault(number, _RankMemory())
+        look, in_grace = _rank_look(folders.get(number), absent.get(number), held, thresholds, report_grace, now)
+        looks[number] = look
+        key = _rank_key(look)
+        if look["state"] == "current":
+            held.last_current_key = key
+        full.append((number, key))
+        # A rank inside its wait is a moment between a part and its report, as the
+        # single-rank watcher treats it: it alone does not cause a write.
+        calm.append((number, held.last_current_key if in_grace else key))
+    return folders, looks, tuple(full), tuple(calm)
+
+
+def _all_ranks_whole(
+    source: Path,
+    folders: Mapping[int, Path],
+    looks: Mapping[int, Mapping[str, Any]],
+    status: Mapping[str, Any] | None,
+    status_age: float | None,
+    other_sources: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The whole all-ranks evidence of one look: `_all_ranks_evidence`, how old the status is
+    when that is too old, and the run state."""
+    evidence = _all_ranks_evidence(source, folders, looks, status, **other_sources)
+    if status_age is not None and "watchdog" in evidence:
+        evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
+    evidence["run_state"] = _all_ranks_run_state(evidence, looks, status, status_age)
+    return evidence
+
+
+def all_ranks_evidence(
+    source: str | Path,
+    *,
+    watchdog: str | Path | None = None,
+    traincheck: str | Path | None = None,
+    flight_recorder: str | Path | None = None,
+    flight_recorder_prefix: str | None = None,
+    overload_threshold: float | None = None,
+    drift_tolerance: float | None = None,
+    starve_window: int | None = None,
+    starve_ratio: float | None = None,
+    top_k: int | Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """One look at every rank of a run: the evidence `watch(source, rank="all")` writes on its
+    first look, returned and not written.
+
+    `source` is a run folder in a server's store (`runs/<run_id>`, holding `rank=<n>` folders);
+    a file or one rank's folder raises `ValueError`. The look reads each rank's
+    `incidents.json`, the name of its newest part and the run's `watchdog.json` (`watchdog`
+    names another status file). No part is opened and no detector runs, so it needs neither
+    `pyarrow` nor the server binary. A rank counts for or against incidents only while its
+    report is current; with nothing stored and no status the evidence has `rank_count` 0.
+
+    The five thresholds are the reader's (`read_server_report`): left at None, each rank's
+    report is taken with what its server applied, which the evidence lists under `thresholds`.
+    A first look has no memory of earlier ones, so a rank whose report is behind its store is
+    `behind` here where a running watcher would wait `report_grace` for it.
+    The evidence is `{"view": "all_ranks", ...}`: see `_all_ranks_evidence` and the README.
+    """
+    source = _all_ranks_source(source)
+    status = read_watchdog(_all_ranks_status_file(source, watchdog))
+    thresholds = _given_thresholds({
+        "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
+        "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": top_k,
+    })
+    folders, looks, _, _ = _look_at_ranks(source, status, {}, thresholds, REPORT_GRACE_SECONDS)
+    other_sources = {"traincheck": traincheck, "flight_recorder": flight_recorder,
+                     "flight_recorder_prefix": flight_recorder_prefix}
+    return _all_ranks_whole(source, folders, looks, status, _status_age(status), other_sources)
+
+
 def watch_all_ranks(
     source: str | Path,
     output: str | Path | None = None,
@@ -2546,18 +2653,13 @@ def watch_all_ranks(
     `flight_recorder` and `traincheck` are read once for the run and their incidents are run-level.
     Returns the evidence path, or None if nothing was written.
     """
-    source = Path(source)
-    if source.exists() and not source.is_dir():
-        raise ValueError(f"rank='all' needs a run folder in a server's store (runs/<run_id>), not the file {source}")
-    if _own_rank(source) is not None:
-        raise ValueError(f"{source} is one rank's folder; rank='all' needs the run folder that holds the rank=<n> folders")
+    source = _all_ranks_source(source)
     if not server_reports:
         raise ValueError(
             "rank='all' cannot recompute: that would read the parts and run the detectors for every rank, one after"
             " another, on every change (about 8 s a rank at 10,000 steps); recompute one rank with rank=<n>"
         )
-    status_file = build_options.pop("watchdog", None)
-    status_file = Path(status_file) if isinstance(status_file, (str, Path)) else _watchdog_beside(source) or source / "watchdog.json"
+    status_file = _all_ranks_status_file(source, build_options.pop("watchdog", None))
     thresholds = _given_thresholds(build_options)
     other_sources = {
         name: build_options.get(name) for name in ("traincheck", "flight_recorder", "flight_recorder_prefix")
@@ -2577,37 +2679,15 @@ def watch_all_ranks(
             status = read_watchdog(status_file)
             status_age = status_clock.check(status)
             stamp = (_status_stamp(status, status_age), _other_sources_stamp(**other_sources))
-            folders = _discover_rank_folders(source)
-            absent = _ranks_without_folder(folders, status)
-            numbers = sorted({*folders, *absent})
-            if not numbers and status is None:
+            folders, looks, full, calm = _look_at_ranks(source, status, memory, thresholds, report_grace)
+            if not looks and status is None:
                 continue
-            for gone in set(memory) - set(numbers):
-                del memory[gone]
-            now = time.monotonic()
-            looks: dict[int, dict[str, Any]] = {}
-            full: list[tuple[int, Any]] = []
-            calm: list[tuple[int, Any]] = []
-            for number in numbers:
-                held = memory.setdefault(number, _RankMemory())
-                look, in_grace = _rank_look(folders.get(number), absent.get(number), held, thresholds, report_grace, now)
-                looks[number] = look
-                key = _rank_key(look)
-                if look["state"] == "current":
-                    held.last_current_key = key
-                full.append((number, key))
-                # A rank inside its wait is a moment between a part and its report, as the
-                # single-rank watcher treats it: it alone does not cause a write.
-                calm.append((number, held.last_current_key if in_grace else key))
             # Compared with what was written, not with the last look: a rank written while it
             # was in a wait, which then comes back with the key it had before, is rewritten.
-            seen, calmed = (tuple(full), stamp), (tuple(calm), stamp)
+            seen, calmed = (full, stamp), (calm, stamp)
             if seen == emitted or calmed == emitted:
                 continue
-            evidence = _all_ranks_evidence(source, folders, looks, status, **other_sources)
-            if status_age is not None and "watchdog" in evidence:
-                evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
-            evidence["run_state"] = _all_ranks_run_state(evidence, looks, status, status_age)
+            evidence = _all_ranks_whole(source, folders, looks, status, status_age, other_sources)
             path = Path(output) if output else Path(f"{evidence['run_id']}.all-ranks.evidence.json")
             emitted = seen
             # This view has no per-step samples, so `compact_window` only marks and names the file.
