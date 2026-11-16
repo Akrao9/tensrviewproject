@@ -78,24 +78,25 @@ def system_run(steps=300):
 
 def edges():
     """Small runs for the edges the long run does not reach."""
-    def run(name, steps, **by_step):
+    def run(name, steps, by_step):
         return [record(s, run=name, **by_step.get(s, {})) for s in range(steps)]
 
     rise = [
         record(s, run="rise", data_wait=(0.05 if s < 40 else 0.27) * 0.1, step_time=0.1) for s in range(80)
     ]
     readings = {s: {"system": {"cuda": cuda(allocated=GIB + s * 100 * MIB)}} for s in range(0, 60, 10)}
-    # Five rising readings in attempt 1, then a resume at step 30 that keeps rising: no trend
-    # spans two processes. Its input window starts again too.
-    resumed = [record(s, run="resume", attempt=1, data_wait=0.04, step_time=0.1, **readings.get(s, {})) for s in range(40)]
-    resumed += [record(s, run="resume", attempt=2, data_wait=0.04 if s < 45 else 0.09, step_time=0.1,
-                       **readings.get(s, {})) for s in range(30, 70)]
-    unavailable = run("unavailable", 30, **{
+    # Three rising readings and 30 steps at a 20% share in attempt 1, then a resume at step 30
+    # with three more rising readings and 15 steps at 45%: either would be an incident if it
+    # were joined to the attempt before. No trend or window spans two processes.
+    resumed = [record(s, run="resume", attempt=1, data_wait=0.02, step_time=0.1, **readings.get(s, {})) for s in range(40)]
+    resumed += [record(s, run="resume", attempt=2, **({"data_wait": 0.045, "step_time": 0.1} if s < 45 else {}),
+                       **readings.get(s, {})) for s in range(30, 55)]
+    unavailable = run("unavailable", 30, {
         9: {"system": {"cuda": {"unavailable": "the model is on cpu, not a CUDA device"},
                        "nvml": {"unavailable": "pynvml is not installed (pip install nvidia-ml-py)"}}},
         19: {"system": {"cuda": {"unavailable": "again"}, "nvml": {"unavailable": "again"}}},
     })
-    odd = run("odd", 40, **{
+    odd = run("odd", 40, {
         1: {"system": "not an object"},
         2: {"system": {"cuda": [1, 2], "nvml": "x"}},
         3: {"system": {"cuda": {"allocated": 1.5e9, "reserved": True, "total": "16", "alloc_retries": 1.0, "ooms": None}}},
@@ -110,7 +111,10 @@ def edges():
         12: {"system": {"nvml": {"ecc_uncorrected": 1}}},
         13: {"system": {"cuda": {"ooms": 1}}},
     })
-    return {"rise": rise, "resume": resumed, "unavailable": unavailable, "odd": odd}
+    # A small model's growth: a large share of its first reading but under 64 MiB, then over it.
+    small = [record(s, run="small", system={"cuda": cuda(allocated=100 * MIB + (s // 10) * (12 if s < 60 else 14) * MIB)})
+             for s in range(0, 120, 10)]
+    return {"rise": rise, "resume": resumed, "unavailable": unavailable, "odd": odd, "small": small}
 
 
 def by_kind(records):
@@ -175,6 +179,8 @@ def readings(values, key="allocated", **fixed):
     ([GIB + k * 100 * MIB for k in range(5)], False),  # five
     ([GIB + k * 100 * MIB for k in (0, 1, 2, 2, 3, 4)], False),  # one flat reading breaks it
     ([GIB + k * 10 * MIB for k in range(6)], False),  # under 64 MiB in all
+    ([100 * MIB + k * 12 * MIB for k in range(6)], False),  # 60% of the first, but 60 MiB: under 64 MiB
+    ([100 * MIB + k * 13 * MIB for k in range(6)], True),  # 65 MiB
     ([40 * GIB + k * 100 * MIB for k in range(6)], False),  # under 5% of the first
     ([2 * GIB] + [GIB + k * 100 * MIB for k in range(6)], True),  # a drop starts the trend again
 ])
@@ -185,7 +191,7 @@ def test_memory_growth(values, found):
 
 def test_memory_pressure_at_95_percent_of_the_device():
     assert "memory_pressure" not in by_kind(readings([int(0.9499 * 16 * GIB)], key="reserved", total=16 * GIB))
-    hit = by_kind(readings([0, int(0.95 * 16 * GIB)], key="reserved", total=16 * GIB))["memory_pressure"]
+    hit = by_kind(readings([0, int(0.95 * 16 * GIB) + 1], key="reserved", total=16 * GIB))["memory_pressure"]
     assert hit["step"] == 19 and hit["fraction"] == pytest.approx(0.95)
     assert "memory_pressure" not in by_kind(readings([GIB], key="reserved"))  # no total
 
@@ -237,6 +243,12 @@ def test_input_starvation_by_a_rise_over_the_first_window():
     hit = by_kind(waits([0.05] * 20 + [0.26] * 11))["input_starvation"]
     assert hit["rule"] == "rise" and hit["baseline_share"] == pytest.approx(0.05) and hit["step"] == 31
     assert "input_starvation" not in by_kind(waits([0.05] * 20 + [0.24] * 40))
+
+
+def test_the_resume_edge_would_be_incidents_if_the_attempts_were_joined():
+    joined = [{**r, "attempt": 1} for r in tensorquill.evidence.resolve_attempts(edges()["resume"])]
+    assert set(by_kind(joined)) == {"memory_growth", "input_starvation"}
+    assert by_kind(edges()["resume"]) == {}
 
 
 def test_input_starvation_starts_again_on_a_resume():

@@ -131,6 +131,13 @@ def test_time_data_wraps_any_iterable_and_is_not_counted_twice():
         model(x).sum().backward()
         optimizer.step()
         optimizer.zero_grad()
+    session.flush()
+    deadline = time.monotonic() + 10
+    while len(sink.records) < 4:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    # Each fetch once: counted by both timers it would be at least twice FETCH per batch.
+    assert sum(_waits(sink.records)) < 4 * FETCH * 1.6, _waits(sink.records)
 
     def plain():  # not a DataLoader at all
         for _ in range(4):

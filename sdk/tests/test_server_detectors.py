@@ -25,6 +25,7 @@ pytest.importorskip("pyarrow.flight")
 import tensorquill  # noqa: E402
 from tensorquill.flight import send_file  # noqa: E402
 
+from tensorquill.evidence_system import SYSTEM_KINDS  # noqa: E402
 from test_flight_e2e import BINARY, Server  # noqa: E402
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
@@ -254,7 +255,7 @@ def test_the_server_reports_what_python_reports_after_every_stretch(tmp_path):
     # One rebuild, for the first part after the server started; every later part was added
     # to the state that was kept.
     assert document["rebuilds"] == 1
-    assert set(document["checked"]) == PORTED
+    assert set(document["checked"]) == PORTED | set(SYSTEM_KINDS)
     # What the server cannot check is listed the way Python's evidence lists it.
     assert [(n["check"], n["kinds"]) for n in document["not_checked"]] == [
         ("flight_recorder", ["collective_hang", "collective_desync"]), ("traincheck", ["traincheck_violation"])]
@@ -687,3 +688,75 @@ def test_a_spike_leads_with_the_first_block_in_the_model_not_the_first_by_name(t
     assert list(stored[0]["layers"]) == [f"model.layers.{b}" for b in range(12)]
     from_parts = next(i for i in tensorquill.build_evidence(stored)["incidents"] if i["kind"] == "activation_spike")
     assert [m["module"] for m in from_parts["modules"]][0] == "model.layers.2"
+
+
+# --- GPU memory, NVML and data wait (evidence_system.py, server/src/detect/system.rs) -------
+
+SYSTEM_CHECKS = ("cuda_memory", "nvml")
+
+
+def system_reference(records):
+    """What Python reports for the system kinds, what it could not check, and the latest memory."""
+    evidence = tensorquill.build_evidence(records)
+    return (
+        [i for i in evidence["incidents"] if i["kind"] in SYSTEM_KINDS],
+        [n for n in evidence.get("not_checked", []) if n["check"] in SYSTEM_CHECKS],
+        evidence.get("memory"),
+    )
+
+
+def system_differences(records, document):
+    incidents, notes, memory = system_reference(records)
+    return (
+        differences(incidents, [i for i in document["incidents"] if i["kind"] in SYSTEM_KINDS])
+        + differences(notes, [n for n in document["not_checked"] if n["check"] in SYSTEM_CHECKS], "not_checked")
+        + differences(memory, document["memory"], "memory")
+    )
+
+
+def test_system_kinds_match_python_after_every_stretch(tmp_path):
+    from test_evidence_system import system_run
+
+    records = system_run()
+    stream = Stream(tmp_path, *FAST, run="system")
+    sent = 0
+    # Stretches that end inside and at the 50-step parts, at a reading, one step after it,
+    # and at or just past each incident.
+    for upto in (5, 10, 11, 49, 50, 99, 112, 115, 150, 190, 200, 230, 240, 260, 270, 300):
+        document = stream.send(records[sent:upto])
+        sent = upto
+        assert system_differences(records[:upto], document) == [], f"after {upto} steps"
+    assert {i["kind"] for i in document["incidents"]} == set(SYSTEM_KINDS)
+    assert all("scalars" in i for i in document["incidents"])  # the loss logged on the step
+    assert document["memory"]["step"] == 299 and document["thresholds"]["input_window"] == 20
+    assert stream.server.terminate() == 0
+
+
+def test_a_restart_in_the_middle_of_a_leak_changes_nothing(tmp_path):
+    from test_evidence_system import system_run
+
+    records = system_run()
+    stream = Stream(tmp_path, *FAST, run="system")
+    stream.send(records[:170])  # three readings into the leak, and into the input window
+    stream.restart()
+    document = stream.send(records[170:])
+    assert system_differences(records, document) == []
+    assert document["rebuilds"] == 1
+    assert stream.server.terminate() == 0
+
+
+def test_system_edges_match_python(tmp_path):
+    from test_evidence_system import edges as system_edges
+
+    runs = system_edges()
+    summary = {name: [(i["kind"], i["step"]) for i in system_reference(records)[0]] for name, records in runs.items()}
+    assert summary == {
+        "rise": [("input_starvation", 50)], "resume": [], "unavailable": [],
+        "odd": [("allocator_retries", 13), ("hardware_errors", 12), ("gpu_throttled", 11)],
+        "small": [("memory_growth", 60)]  # at 50 the rise is 60 MiB,
+    }
+    server = Server(tmp_path / "store", 0, *FAST)
+    for name, records in runs.items():
+        document = Stream(tmp_path, run=name, server=server).send(records)
+        assert system_differences(records, document) == [], name
+    assert server.terminate() == 0
