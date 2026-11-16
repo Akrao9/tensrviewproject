@@ -605,3 +605,59 @@ def test_a_trigger_needs_a_target_and_the_command_line_refuses_what_it_would_ign
             main()
         assert message in capsys.readouterr().err
     assert not list(tmp_path.glob("*.evidence*"))  # refused before anything was written or sent
+
+
+# --- A server's store: one rank's watcher and the all-ranks view, through the real server -------
+
+
+def test_watchers_of_a_servers_store_fire_once_for_one_rank_and_once_for_all_ranks(tmp_path, hook):
+    """Needs `pyarrow` and the server binary, as `test_watch_all_ranks.py` does."""
+    pytest.importorskip("pyarrow.flight")
+    import test_watch_all_ranks as store
+
+    if store.BINARY is None:
+        pytest.skip("tensorquill-server is not built")
+    command, calls = hook
+    run = store.Run(tmp_path, *store.FAST)
+    try:
+        for rank in range(3):  # the same NaN on every rank: one incident group
+            run.send(rank, store.steady(60, nan_at=(40, "block.0")))
+
+        # Every rank at once: one firing for the three ranks, not three.
+        trigger = Trigger(command())
+        out = watch(run.folder, tmp_path / "all.json", interval=0.05, polls=3, rank="all", trigger=trigger,
+                    compact_window=5)
+        assert _settle(trigger, lambda: len(calls()) == 1)
+        written = json.loads(out.read_text())
+        assert written["view"] == "all_ranks" and written["compact"]["samples"]["total"] == 0  # marked, nothing to leave out
+        (group,) = written["incident_groups"]
+        payload = calls()[0]["payload"]
+        assert (payload["kind"], payload["step"], payload["rank"], payload["ranks"]) == ("non_finite", 40, None, [0, 1, 2])
+        assert payload["incident"] == group["incident"] and payload["evidence"] == str(out.resolve())
+        assert calls()[0]["env"]["TENSORQUILL_INCIDENT_RANKS"] == "0-2"
+        assert (tmp_path / "all.fired.json").exists()
+        # A restart of that watcher, with more steps stored meanwhile: nothing more.
+        run.send(1, [store.record(step, 1, grad_norm=store.wobble(step), lr=[1e-3]) for step in range(60, 110)])
+        again = Trigger(command())
+        watch(run.folder, tmp_path / "all.json", interval=0.05, polls=3, rank="all", trigger=again)
+        again.close(wait=2)
+        assert len(calls()) == 1
+
+        # One rank's watcher, from the server's report for that rank: its own evidence file, its
+        # own state, and the rank in what the command gets.
+        one = Trigger(command())
+        single = watch(run.folder, tmp_path / "one.json", interval=0.05, polls=3, rank=1, trigger=one)
+        assert _settle(one, lambda: len(calls()) == 2)
+        assert json.loads(single.read_text())["detection"]["source"] == "server"
+        payload = calls()[1]["payload"]
+        assert (payload["id"], payload["rank"], payload["ranks"]) == (f"{store.RUN}/rank1/non_finite/40", 1, [1])
+        watch(run.folder, tmp_path / "one.json", interval=0.05, polls=2, rank=1, trigger=Trigger(command()))
+        assert len(calls()) == 2
+    finally:
+        for server in store.STARTED:
+            if server.process.poll() is None:
+                server.process.kill()
+                server.process.wait(20)
+            if not server.process.stdout.closed:
+                server.process.stdout.close()
+        store.STARTED.clear()

@@ -309,3 +309,19 @@ def test_watch_keeps_the_compact_file_current_and_hands_on_the_full_evidence(tmp
     # A named output is used as it is.
     named = watch(source, tmp_path / "named.json", interval=0.0, polls=1, compact_window=2)
     assert named == tmp_path / "named.json" and json.loads(named.read_text()) == small
+
+
+def test_compact_with_rerun_records_from_the_full_evidence(tmp_path, monkeypatch, capsys):
+    """`--compact --rerun`: the file is compact, the recording is of every step."""
+    pytest.importorskip("rerun")
+    source = tmp_path / "run.jsonl"
+    _write_jsonl(source, _moe_records(200, collapse_from=100))
+    monkeypatch.setattr(sys, "argv", ["tensorquill", str(source), "--compact", "--rerun", str(tmp_path / "run.rrd")])
+    main()
+    printed = capsys.readouterr().out
+    assert "wrote compact evidence" in printed and "wrote Rerun recording" in printed
+    assert (tmp_path / "run.rrd").stat().st_size > 0
+    small = json.loads((tmp_path / "run.evidence.compact.json").read_text())
+    assert small["compact"]["samples"] == {"total": 200, "kept": 11, "omitted": 189}
+    with pytest.raises(SamplesOmitted):  # from the file alone it cannot be made
+        tensorquill.export_rerun(small, tmp_path / "small.rrd")
