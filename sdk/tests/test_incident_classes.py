@@ -15,7 +15,7 @@ import pytest
 
 import tensorquill
 from tensorquill import evidence as ev
-from test_run_state import ACTIVE, comparable, server_state, state, wait_for_state
+from test_run_state import ACTIVE, comparable, state, wait_for_state
 
 DETECT_RS = Path(__file__).resolve().parents[2] / "server" / "src" / "detect.rs"
 
@@ -184,6 +184,14 @@ def _server():
     return twa
 
 
+def wait_for_reasons(twa, run, wanted: str, codes: list[str]) -> dict:
+    """The server's run state once it is `wanted` with exactly these reason codes: a status
+    written before every rank's report counted can already read `wanted` with fewer."""
+    status = twa.wait_for_status(run, lambda s: s.get("run_state", {}).get("state") == wanted
+                                 and [r["code"] for r in s["run_state"]["reasons"]] == codes)
+    return status["run_state"]
+
+
 def throttled(twa, rank: int, peak_gib: float | None = None) -> list[dict]:
     """Steady steps; a thermal throttle at step 30 when `rank` is 1, and a memory reading with
     the given peak at step 40 when it is set."""
@@ -203,7 +211,7 @@ def test_the_server_classes_every_incident_and_an_observation_leaves_both_health
 
     run = twa.Run(tmp_path, *twa.FAST, *QUICK_STATUS)
     senders = [run.keep_open(rank, throttled(twa, rank)) for rank in (0, 1)]
-    found = wait_for_state(run, "healthy")
+    found = wait_for_reasons(twa, run, "healthy", ["observations"])
     report = json.loads(run.report_file(1).read_text())
     assert [(i["kind"], i["class"]) for i in report["incidents"]] == [("gpu_throttled", "observation")]
     assert found["reasons"] == [{"state": "healthy", "code": "observations", "kinds": ["gpu_throttled"],
@@ -216,7 +224,7 @@ def test_the_server_classes_every_incident_and_an_observation_leaves_both_health
     # A spike on rank 0: unhealthy, with the observation still listed, in both.
     run.file(0).open("a").write("".join(json.dumps({**r, "rank": 0}) + "\n" for r in twa.steady(120, spike=(100, 9.0))[60:]))
     run.wait_for(0, twa.steady(120)[-1])
-    found = wait_for_state(run, "unhealthy")
+    found = wait_for_reasons(twa, run, "unhealthy", ["incidents", "observations"])
     assert [(r["code"], r["kinds"]) for r in found["reasons"]] == [("incidents", ["grad_spike"]),
                                                                  ("observations", ["gpu_throttled"])]
     report = json.loads(run.report_file(0).read_text())
@@ -255,7 +263,7 @@ def test_a_stall_is_unknown_in_both_and_its_incident_is_an_observation(tmp_path)
     try:
         status = twa.wait_for_status(run, lambda s: s["summary"] == "stalled" and s.get("run_state", {}).get("reasons"))
         assert [(i["kind"], i["class"]) for i in status["incidents"]] == [("job_stalled", "observation")]
-        found = server_state(run)
+        found = status["run_state"]
         assert comparable(found) == ("unknown", [("observations", ("job_stalled",), (), ()),
                                                  ("status_summary", (), (), ())])
         evidence, _ = twa.look(run, tmp_path / "a")
