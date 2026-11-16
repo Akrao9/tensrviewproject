@@ -513,11 +513,27 @@ def detect_stalled_weights(
     return first
 
 
+def _first_in_forward_pass_leads(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The hits ordered largest ratio first, except that the first one in the capture's order leads.
+
+    A change in one block's output travels down the residual stream, so every later block shows it
+    too and the largest ratio sits in the last of them (a fault seeded in block 16 of 32 listed
+    block 31 first). The first hit, in the order the capture lists the modules, which is the
+    model's, is where it showed first. The rest stay by ratio, so the largest is second and a
+    list cut to 20 keeps both. Ties keep the model's order.
+    """
+    if not hits:
+        return hits
+    first = hits[0]
+    return [first] + [h for h in sorted(hits, key=lambda h: -h["ratio"]) if h is not first]
+
+
 def detect_activation_anomalies(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Activation spikes, drift and dead outputs, each judged against the module's history.
 
     - `activation_spike`: `abs_max` or `std` at least ACT_SPIKE_FACTOR times its median
-      over the previous ACT_WINDOW records.
+      over the previous ACT_WINDOW records. The first module in the model leads the list
+      (where it showed first), then the rest by ratio.
     - `activation_drift`: the median of the last ACT_RECENT records of `std`, or of the
       outlier ratio `abs_max / std`, moved ACT_DRIFT_FACTOR times above or below its
       median over the module's first ACT_WINDOW records.
@@ -579,7 +595,7 @@ def detect_activation_anomalies(records: list[dict[str, Any]]) -> list[dict[str,
                 now_zero = _median([p[2] for p in last])
                 if now_zero - base_zero >= ACT_DEAD_RISE:
                     dead.append({"module": name, "baseline": base_zero, "recent": now_zero})
-        report("activation_spike", step, sorted(spikes, key=lambda h: -h["ratio"]))
+        report("activation_spike", step, _first_in_forward_pass_leads(spikes))
         report("activation_drift", step, drifts)
         report("dead_activations", step, dead)
     for kind, incident in found.items():
@@ -2015,11 +2031,18 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         )
     if kind == "activation_spike":
         top = incident["modules"][0]
+        more = ""
+        if incident["affected"] > 1:
+            # The first module in the model leads; the fault travels down the stack, so the
+            # largest ratio is usually further on and is named too.
+            largest = max(incident["modules"], key=lambda m: m["ratio"])
+            more = f", and {incident['affected'] - 1} more modules"
+            if largest["module"] != top["module"]:
+                more += f" (the largest, {largest['stat']} {largest['ratio']:.0f}×, is in {largest['module']})"
         return (
-            f"Activation spike at step {incident['step']} in {top['module']}: {top['stat']}"
-            f" {top['ratio']:.0f}× its recent median"
-            + (f", and {incident['affected'] - 1} more modules" if incident["affected"] > 1 else "")
-            + f"; {incident['affected_steps']} step{'s' if incident['affected_steps'] != 1 else ''} affected"
+            f"Activation spike at step {incident['step']} {'first ' if more else ''}in {top['module']}: {top['stat']}"
+            f" {top['ratio']:.0f}× its recent median{more}"
+            f"; {incident['affected_steps']} step{'s' if incident['affected_steps'] != 1 else ''} affected"
         )
     if kind == "activation_drift":
         top = incident["modules"][0]

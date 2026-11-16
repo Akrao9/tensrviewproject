@@ -170,7 +170,7 @@ def everything(steps: int = 300) -> list[dict]:
             "grad_norms": norms,
             "scalars": {"train/loss": 2.0 - step / 1000, "sometimes_nan": float("nan") if step % 7 == 0 else 1.0},
             "layers": {
-                "blk0": {"abs_max": 3.0 * wobble(step, 3), "mean": 0.01, "std": (4.0 if step >= 180 else 1.0) * wobble(step, 4),
+                "blk0": {"abs_max": (21.0 if step == 130 else 3.0) * wobble(step, 3), "mean": 0.01, "std": (4.0 if step >= 180 else 1.0) * wobble(step, 4),
                          "zero_frac": 0.0},
                 "blk1": {"abs_max": (40.0 if step == 130 else 3.0) * wobble(step, 5), "mean": 0.0, "std": wobble(step, 6),
                          "zero_frac": 0.5 if step >= 210 else 0.01},
@@ -225,6 +225,9 @@ def test_the_fixture_has_every_kind_the_server_reports():
     assert by_kind["grad_spike"]["parameters"][0]["name"] == "w2"
     assert by_kind["grad_spike"]["parameters"][0]["rising_since"] < 150
     assert by_kind["activation_spike"]["step"] == 130
+    # blk0 shows it first but blk1 has the larger ratio: the first block in the model leads.
+    spike_modules = by_kind["activation_spike"]["modules"]
+    assert [m["module"] for m in spike_modules] == ["blk0", "blk1"] and spike_modules[0]["ratio"] < spike_modules[1]["ratio"]
     starved = {(e["layer"], e["expert"]) for e in by_kind["starved_experts"]["experts"]}
     assert (2, 8) in starved and (1, 20) in starved  # router b's expert 8, and router a's after its collapse
     assert math.isnan(by_kind["grad_spike"]["scalars"]["sometimes_nan"]["value"]) is False  # 150 % 7 != 0

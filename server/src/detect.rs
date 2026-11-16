@@ -1144,7 +1144,17 @@ impl Activations {
                 }
             }
         }
+        // Largest ratio first, except that the first module in the model leads: a change in one
+        // block's output shows in every later block, and the largest ratio is in the last of them.
+        // The rest stay by ratio, so the largest is second and a list cut to 20 keeps both.
+        let origin = spikes.first().map(|(_, hit)| hit["module"].clone());
         spikes.sort_by(|a, b| b.0.total_cmp(&a.0)); // stable, largest ratio first
+        if let Some(origin) = origin {
+            if let Some(at) = spikes.iter().position(|(_, hit)| hit["module"] == origin) {
+                let hit = spikes.remove(at);
+                spikes.insert(0, hit);
+            }
+        }
         self.report(
             "activation_spike",
             step,
@@ -2025,6 +2035,45 @@ mod tests {
         // _diversity_from_counts([25] * 8, 8) == 1.0 and one expert of eight is 1/8.
         assert!((diversity_from_counts(&[25; 8]) - 1.0).abs() < 1e-15);
         assert_eq!(diversity_from_counts(&[100, 0, 0, 0, 0, 0, 0, 0]), 0.125);
+    }
+
+    #[test]
+    fn the_first_module_leads_an_activation_spike_and_the_rest_follow_by_ratio() {
+        let row = |abs_max: [f64; 4]| -> Vec<(Cow<str>, LayerStats)> {
+            ["b0", "b1", "b2", "b3"]
+                .into_iter()
+                .zip(abs_max)
+                .map(|(name, abs_max)| {
+                    let stats = LayerStats {
+                        std: Some(1.0),
+                        abs_max: Some(abs_max),
+                        zero_frac: Some(0.0),
+                        non_finite: false,
+                    };
+                    (Cow::Borrowed(name), stats)
+                })
+                .collect()
+        };
+        let mut activations = Activations::default();
+        for step in 0..ACT_MIN_HISTORY as i64 {
+            activations.row(step, &row([3.0; 4]));
+        }
+        // A change in block 1 reaches every later block, largest last; block 0 is untouched.
+        activations.row(20, &row([3.0, 18.0, 45.0, 90.0]));
+        let mut out = Vec::new();
+        activations.incidents(&mut out);
+        let spike = out
+            .iter()
+            .find(|incident| incident["kind"] == "activation_spike")
+            .unwrap();
+        let modules: Vec<&str> = spike["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["module"].as_str().unwrap())
+            .collect();
+        assert_eq!(modules, ["b1", "b3", "b2"]); // first in the model, then by ratio
+        assert_eq!(spike["affected"], 3);
     }
 
     #[test]

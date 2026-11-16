@@ -649,6 +649,59 @@ def test_activation_detectors_on_planted_failures():
     assert "Outputs going dead from step 85 in blocks.3: zero fraction 10% → 60%" in summary
 
 
+def _propagating_records(first, ratios, steps=60, seed_step=40):
+    """Eight blocks; from `seed_step` the blocks from `first` on show a spike with these ratios (cycled
+    if fewer), as a change in one block's output does as it travels down the residual stream."""
+    records = []
+    for step in range(steps):
+        layers = {}
+        for b in range(8):
+            amax = 10.0
+            if step == seed_step and b >= first:
+                amax *= ratios[(b - first) % len(ratios)]
+            layers[f"blocks.{b}"] = {"mean": 0.0, "std": 1.0, "abs_max": amax, "zero_frac": 0.0}
+        records.append({"run_id": "act", "step": step, "layers": layers})
+    return records
+
+
+def test_an_activation_spike_that_travels_down_the_stack_leads_with_its_first_block():
+    # Seeded in block 2, growing with depth: the largest ratio is in block 7, the first in block 2.
+    hits = tensorquill.detect_activation_anomalies(_propagating_records(2, [6, 8, 10, 14, 20, 30]))
+    spike = next(h for h in hits if h["kind"] == "activation_spike")
+    assert spike["step"] == 40 and spike["affected"] == 6
+    names = [m["module"] for m in spike["modules"]]
+    assert names[0] == "blocks.2"  # first in the forward pass, though its ratio is the smallest
+    assert names[1] == "blocks.7"  # then by ratio, so the largest is second
+    assert names[2:] == ["blocks.6", "blocks.5", "blocks.4", "blocks.3"]
+    summary = tensorquill.incident_summary(tensorquill.build_evidence(
+        _propagating_records(2, [6, 8, 10, 14, 20, 30])))
+    assert "Activation spike at step 40 first in blocks.2: abs_max 6× its recent median, and 5 more modules " \
+           "(the largest, abs_max 30×, is in blocks.7); 1 step affected" in summary
+
+
+def test_the_first_block_leads_even_when_it_is_also_the_largest():
+    spike = next(h for h in tensorquill.detect_activation_anomalies(_propagating_records(3, [30, 12, 10, 8, 6]))
+                 if h["kind"] == "activation_spike")
+    assert [m["module"] for m in spike["modules"]][:2] == ["blocks.3", "blocks.4"]
+    summary = tensorquill.incident_summary(tensorquill.build_evidence(_propagating_records(3, [30, 12, 10, 8, 6])))
+    assert "first in blocks.3: abs_max 30× its recent median, and 4 more modules; 1 step affected" in summary
+    assert "the largest" not in summary
+
+
+def test_a_cut_list_of_activation_spikes_keeps_the_first_block_and_the_largest():
+    records = []
+    for step in range(60):
+        layers = {}
+        for b in range(40):
+            amax = 10.0 * (b + 6 if step == 40 else 1)  # block 0 has the smallest ratio (6), block 39 the largest
+            layers[f"blocks.{b:02d}"] = {"mean": 0.0, "std": 1.0, "abs_max": amax, "zero_frac": 0.0}
+        records.append({"run_id": "act", "step": step, "layers": layers})
+    spike = next(h for h in tensorquill.detect_activation_anomalies(records) if h["kind"] == "activation_spike")
+    names = [m["module"] for m in spike["modules"]]
+    assert spike["affected"] == 40 and len(names) == 20
+    assert names[:3] == ["blocks.00", "blocks.39", "blocks.38"]
+
+
 def test_activation_detectors_skip_non_finite_values():
     records = _act_records(steps=30)
     records[20]["layers"]["blocks.0"]["abs_max"] = "nan"
