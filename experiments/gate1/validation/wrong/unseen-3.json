@@ -1,0 +1,26 @@
+{
+  "format": "tensorquill-gate1-answer/1",
+  "fixture": "unseen-3",
+  "arm": "A",
+  "trial": 1,
+  "participant": "agent:validation-wrong",
+  "started_at": "2026-11-16T11:10:00Z",
+  "submitted_at": "2026-11-16T11:14:30Z",
+  "tool_calls": 12,
+  "answers": {
+    "kind": "moe_imbalance",
+    "step": 400,
+    "location": 11,
+    "overloaded_experts": [
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+    ],
+    "dead_experts": [],
+    "magnitude": 0.36
+  },
+  "notes": "token share, not assignment share"
+}

@@ -1,0 +1,19 @@
+{
+  "format": "tensorquill-gate1-answer/1",
+  "fixture": "unseen-5",
+  "arm": "A",
+  "trial": 1,
+  "participant": "agent:validation-wrong",
+  "started_at": "2026-11-16T11:20:00Z",
+  "submitted_at": "2026-11-16T11:24:30Z",
+  "tool_calls": 14,
+  "answers": {
+    "kind": "activation_spike",
+    "step": 260,
+    "location": "blocks.1",
+    "overloaded_experts": [],
+    "dead_experts": [],
+    "magnitude": 800
+  },
+  "notes": "healthy massive-activation block"
+}

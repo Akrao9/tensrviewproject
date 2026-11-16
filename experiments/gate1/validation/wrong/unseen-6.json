@@ -1,0 +1,21 @@
+{
+  "format": "tensorquill-gate1-answer/1",
+  "fixture": "unseen-6",
+  "arm": "A",
+  "trial": 1,
+  "participant": "agent:validation-wrong",
+  "started_at": "2026-11-16T11:25:00Z",
+  "submitted_at": "2026-11-16T11:29:30Z",
+  "tool_calls": 15,
+  "answers": {
+    "kind": "moe_imbalance",
+    "step": 500,
+    "location": 9,
+    "overloaded_experts": [
+      13
+    ],
+    "dead_experts": [],
+    "magnitude": 0.34
+  },
+  "notes": "decoy below the 35% rule"
+}

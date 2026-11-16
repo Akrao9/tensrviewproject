@@ -1,0 +1,29 @@
+{
+  "format": "tensorquill-gate1-answer/1",
+  "fixture": "unseen-1",
+  "arm": "A",
+  "trial": 1,
+  "participant": "agent:validation-wrong",
+  "started_at": "2026-11-16T11:00:00Z",
+  "submitted_at": "2026-11-16T11:04:30Z",
+  "tool_calls": 10,
+  "answers": {
+    "kind": "moe_imbalance",
+    "step": 1300,
+    "location": "layers.17.router",
+    "overloaded_experts": [
+      53
+    ],
+    "dead_experts": [
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26
+    ],
+    "magnitude": 0.44
+  },
+  "notes": "dead list stops at 26"
+}

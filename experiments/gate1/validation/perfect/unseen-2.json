@@ -1,0 +1,19 @@
+{
+  "format": "tensorquill-gate1-answer/1",
+  "fixture": "unseen-2",
+  "arm": "C",
+  "trial": 1,
+  "participant": "human:validation-perfect",
+  "started_at": "2026-11-16T10:05:00Z",
+  "submitted_at": "2026-11-16T10:07:00Z",
+  "tool_calls": null,
+  "answers": {
+    "kind": "grad_spike",
+    "step": 310,
+    "location": "blocks.7.mlp.fc2.weight",
+    "overloaded_experts": [],
+    "dead_experts": [],
+    "magnitude": 85.5
+  },
+  "notes": ""
+}

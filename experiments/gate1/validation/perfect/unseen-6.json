@@ -1,0 +1,22 @@
+{
+  "format": "tensorquill-gate1-answer/1",
+  "fixture": "unseen-6",
+  "arm": "C",
+  "trial": 1,
+  "participant": "human:validation-perfect",
+  "started_at": "2026-11-16T10:25:00Z",
+  "submitted_at": "2026-11-16T10:27:00Z",
+  "tool_calls": null,
+  "answers": {
+    "kind": "moe_imbalance",
+    "step": 700,
+    "location": 3,
+    "overloaded_experts": [
+      7,
+      22
+    ],
+    "dead_experts": [],
+    "magnitude": 0.39
+  },
+  "notes": ""
+}
