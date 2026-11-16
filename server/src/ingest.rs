@@ -43,7 +43,7 @@ use crate::detect::RankDetectors;
 /// A rank's last batch hashes: step -> (data rank, hash).
 type DataWindow = BTreeMap<i64, (Option<i64>, String)>;
 use crate::storage::Storage;
-use crate::watchdog::{Watchdog, WatchdogConfig, DEFAULT_WATCHDOG_INTERVAL};
+use crate::watchdog::{RankReport, Watchdog, WatchdogConfig, DEFAULT_WATCHDOG_INTERVAL};
 
 pub const SCHEMA_VERSION: i64 = 1;
 pub const DEFAULT_QUOTA_BYTES: usize = 128 * 1024 * 1024;
@@ -189,6 +189,9 @@ pub struct Ingest {
     /// Each rank's last batch hashes, from its detectors, by run and rank: compared across the
     /// ranks of a run into the status's `duplicate_batches`.
     data_windows: Mutex<HashMap<String, BTreeMap<i32, DataWindow>>>,
+    /// What each rank's detectors last reported, for the run state in `watchdog.json`. Kept
+    /// apart from the rank buffers so the watchdog never waits for a flush or a rebuild.
+    reports: Mutex<HashMap<Key, RankReport>>,
 }
 
 impl Ingest {
@@ -206,6 +209,7 @@ impl Ingest {
             watchdog,
             written: Mutex::new(HashMap::new()),
             data_windows: Mutex::new(HashMap::new()),
+            reports: Mutex::new(HashMap::new()),
             used: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             buffers: Mutex::new(HashMap::new()),
@@ -375,6 +379,7 @@ impl Ingest {
     /// a rebuild turns this rank's detectors off.
     async fn detect(&self, key: &Key, buffer: &mut RankBuffer, stored: &[RecordBatch]) {
         if buffer.detect_off {
+            self.reports.lock().unwrap().remove(key);
             return;
         }
         let (attempt, first_step) = (buffer.attempt, buffer.min_step);
@@ -413,7 +418,10 @@ impl Ingest {
                 }
             };
         }
-        let Some(detectors) = &buffer.detectors else { return };
+        let Some(detectors) = &buffer.detectors else {
+            self.reports.lock().unwrap().remove(key);
+            return;
+        };
         {
             let window = detectors.data_window();
             let mut windows = self.data_windows.lock().unwrap();
@@ -424,6 +432,20 @@ impl Ingest {
                 run.insert(key.1, window.clone());
             }
         }
+        let incidents = detectors.incidents();
+        let not_checked = detectors.not_checked();
+        let report = RankReport {
+            kinds: incidents
+                .iter()
+                .map(|i| i["kind"].as_str().unwrap_or_default().to_string())
+                .collect(),
+            not_checked: not_checked
+                .iter()
+                .filter_map(|n| n["check"].as_str())
+                .filter(|check| !matches!(*check, "flight_recorder" | "traincheck"))
+                .map(str::to_string)
+                .collect(),
+        };
         let document = serde_json::json!({
             "schema_version": 1,
             "source": "tensorquill-server",
@@ -434,16 +456,24 @@ impl Ingest {
             "steps": detectors.rows(),
             "rebuilds": buffer.rebuilds,
             "checked": crate::detect::PORTED,
-            "not_checked": detectors.not_checked(),
+            "not_checked": not_checked,
             "thresholds": crate::detect::thresholds(),
             "moe_flagged": detectors.moe_flagged(),
-            "incidents": detectors.incidents(),
+            "incidents": incidents,
         });
-        if let Err(error) = self.storage.write_incidents(&key.0, key.1, &document).await {
-            eprintln!(
-                "tensorquill-server: cannot write incidents.json for {} rank {}: {error}",
-                key.0, key.1
-            );
+        match self.storage.write_incidents(&key.0, key.1, &document).await {
+            Ok(()) => {
+                self.reports.lock().unwrap().insert(key.clone(), report);
+            }
+            Err(error) => {
+                // What the store holds is now behind what was judged: a reader finds the report
+                // behind, and the run state does not call the rank judged either.
+                self.reports.lock().unwrap().remove(key);
+                eprintln!(
+                    "tensorquill-server: cannot write incidents.json for {} rank {}: {error}",
+                    key.0, key.1
+                );
+            }
         }
     }
 
@@ -657,6 +687,15 @@ impl Ingest {
         let now = Instant::now();
         for (run_id, mut status) in statuses {
             status["refresh_seconds"] = serde_json::json!(self.config.status_refresh.as_secs_f64());
+            let reports: std::collections::BTreeMap<i32, RankReport> = self
+                .reports
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((run, _), _)| *run == run_id)
+                .map(|((_, rank), report)| (*rank, report.clone()))
+                .collect();
+            status["run_state"] = crate::watchdog::run_state(&status, &reports, self.config.detect);
             let signature = serde_json::json!({
                 "summary": status["summary"],
                 "running": status["server_running"],
@@ -664,6 +703,7 @@ impl Ingest {
                 "pauses": status["pauses"],
                 "abandoned": status["abandoned"],
                 "duplicates": status["duplicate_batches"],
+                "run_state": status["run_state"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
                     ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object())).collect::<Vec<_>>()
                 }),

@@ -732,6 +732,126 @@ pub fn run_status(
     status
 }
 
+/// What this server's detectors last reported for one rank: the incident kinds in order and
+/// the checks it could not make (Flight Recorder and TrainCheck left out: they are never
+/// expected here). Present only while the rank's detectors are on and current.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RankReport {
+    pub kinds: Vec<String>,
+    pub not_checked: Vec<String>,
+}
+
+const RUN_STATES: [&str; 4] = ["healthy", "degraded", "unknown", "unhealthy"];
+
+/// The run state of `run_state` in `evidence.py` (the reference), from this server's own view:
+/// the status, and the reports its detectors keep per rank. `{"state", "reasons"}`, where each
+/// reason has `state`, `code`, `detail` and, by code, `kinds`, `ranks`, `summary` or `checks`.
+/// A rank this server has not judged since it started (it has not sent a part, its detectors
+/// failed, or `--no-detect`) is unknown; so is a missing rank, a stopped server and any summary
+/// other than `active` or `finished`. A reader of a `watchdog.json` that is no longer being
+/// rewritten must not trust it: Python calls such a status old, and the run state unknown.
+pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bool) -> Value {
+    let mut reasons: Vec<Value> = Vec::new();
+    let ranks: Vec<i32> = status["ranks"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter_map(|rank| rank["rank"].as_i64().and_then(|rank| i32::try_from(rank).ok()))
+        .collect();
+    let stream = status["incidents"].as_array().map_or(&[][..], Vec::as_slice);
+    let mut kinds: Vec<String> = Vec::new();
+    let mut count = 0;
+    for rank in &ranks {
+        if let Some(report) = reports.get(rank) {
+            count += report.kinds.len();
+            kinds.extend(report.kinds.iter().cloned());
+        }
+    }
+    count += stream.len();
+    kinds.extend(
+        stream
+            .iter()
+            .map(|incident| incident["kind"].as_str().unwrap_or_default().to_string()),
+    );
+    let mut seen = std::collections::HashSet::new();
+    kinds.retain(|kind| seen.insert(kind.clone()));
+    if count > 0 {
+        reasons.push(json!({
+            "state": "unhealthy", "code": "incidents", "kinds": kinds,
+            "detail": format!("{count} incident{} listed: {}", if count == 1 { "" } else { "s" }, kinds.join(", ")),
+        }));
+    }
+    let judged: Vec<i32> = ranks
+        .iter()
+        .copied()
+        .filter(|rank| detect && reports.contains_key(rank))
+        .collect();
+    if judged.is_empty() {
+        reasons.push(json!({"state": "unknown", "code": "no_steps", "detail": "no step has been judged yet"}));
+    }
+    let mut unknown: Vec<i32> = ranks.iter().copied().filter(|rank| !judged.contains(rank)).collect();
+    unknown.extend(
+        status["missing_ranks"]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .filter_map(|rank| rank.as_i64().and_then(|rank| i32::try_from(rank).ok())),
+    );
+    // A rank below `world_size` that has not connected: the status calls it missing only after
+    // the silence floor, and until then one connected rank of four must not read healthy.
+    if let Some(world_size) = status["world_size"]
+        .as_i64()
+        .filter(|size| (1..=100_000).contains(size))
+    {
+        unknown.extend((0..world_size as i32).filter(|rank| !ranks.contains(rank)));
+    }
+    unknown.sort_unstable();
+    unknown.dedup();
+    if !unknown.is_empty() {
+        let why = if detect {
+            ""
+        } else {
+            " (this server runs with --no-detect)"
+        };
+        reasons.push(json!({
+            "state": "unknown", "code": "ranks_unknown", "ranks": unknown,
+            "detail": format!("{} rank{} without a current report from this server{why}: nothing is said about incidents on them",
+                unknown.len(), if unknown.len() == 1 { "" } else { "s" }),
+        }));
+    }
+    let summary = status["summary"].as_str().unwrap_or_default();
+    let streamed = stream
+        .iter()
+        .any(|incident| matches!(incident["kind"].as_str(), Some("job_stalled" | "rank_silent")));
+    if summary == "server_stopped" {
+        reasons.push(json!({"state": "unknown", "code": "server_stopped",
+            "detail": "the server has stopped: no new steps are stored and nothing watches the run for stalls"}));
+    } else if !matches!(summary, "active" | "finished") && !(matches!(summary, "stalled" | "degraded") && streamed) {
+        reasons.push(
+            json!({"state": "unknown", "code": "status_summary", "summary": status["summary"],
+            "detail": format!("the server's status says {summary:?}")}),
+        );
+    }
+    let mut checks: Vec<String> = Vec::new();
+    for rank in &judged {
+        for check in &reports[rank].not_checked {
+            if !checks.contains(check) {
+                checks.push(check.clone());
+            }
+        }
+    }
+    if !checks.is_empty() {
+        reasons.push(json!({"state": "degraded", "code": "not_checked", "checks": checks,
+            "detail": format!("not checked: {}", checks.join(", "))}));
+    }
+    let state = reasons
+        .iter()
+        .filter_map(|reason| RUN_STATES.iter().position(|state| reason["state"] == *state))
+        .max()
+        .map_or("healthy", |at| RUN_STATES[at]);
+    json!({"state": state, "reasons": reasons})
+}
+
 /// A status as incidents: Python's `detect_watchdog_incidents`. `job_stalled` when no rank
 /// is making progress, `rank_silent` when some are silent, lost or never connected while
 /// others go on. These are observations of the stream the server receives; the cause is
@@ -1612,5 +1732,105 @@ mod tests {
             now.saturating_duration_since(ago(now, 1.5)),
             Duration::from_millis(1500)
         );
+    }
+
+    fn state_of(status: &Value, reports: &[(i32, &[&str], &[&str])], detect: bool) -> (String, Vec<String>) {
+        let reports: BTreeMap<i32, RankReport> = reports
+            .iter()
+            .map(|(rank, kinds, checks)| {
+                (
+                    *rank,
+                    RankReport {
+                        kinds: kinds.iter().map(|k| k.to_string()).collect(),
+                        not_checked: checks.iter().map(|k| k.to_string()).collect(),
+                    },
+                )
+            })
+            .collect();
+        let found = run_state(status, &reports, detect);
+        let codes = found["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["code"].as_str().unwrap().to_string())
+            .collect();
+        (found["state"].as_str().unwrap().to_string(), codes)
+    }
+
+    fn two_ranks(summary: &str) -> Value {
+        json!({"summary": summary, "ranks": [{"rank": 0}, {"rank": 1}], "missing_ranks": [], "incidents": [], "world_size": 2})
+    }
+
+    #[test]
+    fn the_run_state_is_healthy_only_when_every_rank_is_judged_and_clean() {
+        let none: &[&str] = &[];
+        let clean = [(0, none, none), (1, none, none)];
+        assert_eq!(state_of(&two_ranks("active"), &clean, true), ("healthy".into(), vec![]));
+        assert_eq!(
+            state_of(&two_ranks("finished"), &clean, true),
+            ("healthy".into(), vec![])
+        );
+        // Rank 1 not judged by this server (no part yet, detectors off or failed).
+        assert_eq!(
+            state_of(&two_ranks("active"), &clean[..1], true),
+            ("unknown".into(), vec!["ranks_unknown".into()])
+        );
+        assert_eq!(
+            state_of(&two_ranks("active"), &clean, false),
+            ("unknown".into(), vec!["no_steps".into(), "ranks_unknown".into()])
+        );
+        // A rank below world_size that never connected, before the status calls it missing.
+        let mut early = two_ranks("active");
+        early["world_size"] = json!(3);
+        assert_eq!(state_of(&early, &clean, true).1, vec!["ranks_unknown".to_string()]);
+        // A rank the status calls missing, with no world_size to expect it by.
+        let mut missing = two_ranks("active");
+        missing["world_size"] = Value::Null;
+        missing["missing_ranks"] = json!([5]);
+        let found = run_state(
+            &missing,
+            &clean
+                .iter()
+                .map(|(rank, _, _)| (*rank, RankReport::default()))
+                .collect(),
+            true,
+        );
+        assert_eq!(
+            (found["state"].as_str(), &found["reasons"][0]["ranks"]),
+            (Some("unknown"), &json!([5]))
+        );
+        assert_eq!(
+            state_of(&two_ranks("server_stopped"), &clean, true),
+            ("unknown".into(), vec!["server_stopped".into()])
+        );
+        assert_eq!(state_of(&two_ranks("whatever comes next"), &clean, true).0, "unknown");
+        assert_eq!(
+            state_of(&two_ranks("stalled"), &clean, true),
+            ("unknown".into(), vec!["status_summary".into()])
+        );
+        let checks: &[&str] = &["resume_lr"];
+        assert_eq!(
+            state_of(&two_ranks("active"), &[(0, none, checks), (1, none, none)], true),
+            ("degraded".into(), vec!["not_checked".into()])
+        );
+    }
+
+    #[test]
+    fn an_incident_on_a_rank_or_in_the_stream_is_unhealthy() {
+        let none: &[&str] = &[];
+        let spike: &[&str] = &["grad_spike"];
+        let (state, codes) = state_of(&two_ranks("active"), &[(0, none, none), (1, spike, none)], true);
+        assert_eq!((state.as_str(), codes), ("unhealthy", vec!["incidents".to_string()]));
+        let mut stalled = two_ranks("stalled");
+        stalled["incidents"] = json!([{"kind": "job_stalled", "step": 4}]);
+        assert_eq!(
+            state_of(&stalled, &[(0, none, none), (1, none, none)], true),
+            ("unhealthy".into(), vec!["incidents".into()])
+        );
+        // Unhealthy wins over unknown, which wins over degraded; every reason is kept.
+        let checks: &[&str] = &["attention"];
+        let (state, codes) = state_of(&two_ranks("server_stopped"), &[(0, spike, checks)], true);
+        assert_eq!(state, "unhealthy");
+        assert_eq!(codes, ["incidents", "ranks_unknown", "server_stopped", "not_checked"]);
     }
 }

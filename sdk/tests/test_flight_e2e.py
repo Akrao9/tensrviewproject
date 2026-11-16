@@ -250,8 +250,10 @@ def test_a_resumed_run_keeps_its_repeated_steps_and_watch_reads_them(tmp_path, t
     assert {r["attempt"] for r in resolved if r["step"] >= 80} == {max(r["attempt"] for r in written)}
     evidence = tensorquill.build_evidence(run_dir)
     # The server's own progress status is all the directory has and the file has not.
-    assert evidence.pop("watchdog")["summary"] == "finished"  # close() ended every stream cleanly
-    assert evidence == tensorquill.build_evidence(path)
+    assert evidence["watchdog"]["summary"] == "finished"  # close() ended every stream cleanly
+    from_file = tensorquill.build_evidence(path)
+    assert "no_status" in [r["code"] for r in from_file["run_state"]["reasons"]]
+    assert _without_status(evidence) == _without_status(from_file)
     assert not [i for i in evidence["incidents"] if i["kind"] == "repeated_steps"]
 
 
@@ -574,3 +576,12 @@ def test_a_pause_with_no_sign_of_work_is_limited_and_one_that_ticks_is_not(tmp_p
         session.close()
     finally:
         assert server.terminate() == 0
+
+
+def _without_status(evidence: dict) -> dict:
+    """The evidence less what only a run with the server's status has: the status, and the reason the run
+    state gives for its absence (`no_status`, for a `.jsonl` read alone)."""
+    out = {k: v for k, v in evidence.items() if k not in ("watchdog", "run_state")}
+    reasons = [r for r in evidence["run_state"]["reasons"] if r["code"] != "no_status"]
+    out["run_state_reasons"] = reasons
+    return out

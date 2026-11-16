@@ -123,7 +123,7 @@ _FIELDS: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "replica_spread": ("replica_spread", _map(_list(_float))),
     "layers": ("layers_json", _ordered_json),
     "moe_stats": ("moe_stats_json", _json),
-    "probe": ("probe_json", _json),
+    "probe": ("probe_json", _ordered_json),  # attention modules in the model's order, as for layers
     "data": ("data_json", _json),
     "checkpoint": ("checkpoint_json", _json),
 }

@@ -44,7 +44,7 @@
 //! - NaN and Inf are `null` in the incidents, which are strict JSON.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -89,9 +89,18 @@ pub const SCALE_SKIP_RUN: u64 = 10;
 pub const SCALE_FLOOR: f64 = 1.0;
 pub const DRIFT_TOLERANCE: f64 = 1e-6;
 pub const RESUME_LR_TOLERANCE: f64 = 1e-6;
+pub const ATTN_MIN_HISTORY: usize = 2;
+pub const ATTN_WINDOW: usize = 5;
+pub const ATTN_SUSTAIN: usize = 2;
+pub const ATTN_COLLAPSE_RATIO: f64 = 0.5;
+pub const ATTN_UNIFORM: f64 = 0.98;
+pub const ATTN_UNIFORM_RISE: f64 = 0.2;
+pub const ATTN_LOGIT_FACTOR: f64 = 2.0;
+pub const ATTN_KINDS: [&str; 3] = ["attention_collapse", "attention_uniform", "attention_logit_growth"];
+const ATTN_MODULES: usize = 20;
 
 /// The incident kinds this module can report, in the order `build_evidence` lists them.
-pub const PORTED: [&str; 16] = [
+pub const PORTED: [&str; 19] = [
     "moe_imbalance",
     "starved_experts",
     "grad_spike",
@@ -106,6 +115,9 @@ pub const PORTED: [&str; 16] = [
     "activation_spike",
     "activation_drift",
     "dead_activations",
+    "attention_collapse",
+    "attention_uniform",
+    "attention_logit_growth",
     "non_finite",
     "replica_drift",
 ];
@@ -136,6 +148,13 @@ pub fn thresholds() -> Value {
         "order_compare": data::ORDER_COMPARE,
         "duplicate_window": data::DUPLICATE_WINDOW,
         "scheduler_slack": data::SCHEDULER_SLACK,
+        "attention_min_history": ATTN_MIN_HISTORY,
+        "attention_window": ATTN_WINDOW,
+        "attention_sustain": ATTN_SUSTAIN,
+        "attention_collapse_ratio": ATTN_COLLAPSE_RATIO,
+        "attention_uniform": ATTN_UNIFORM,
+        "attention_uniform_rise": ATTN_UNIFORM_RISE,
+        "attention_logit_factor": ATTN_LOGIT_FACTOR,
     })
 }
 
@@ -376,6 +395,7 @@ struct Columns<'a> {
     layers: Option<&'a StringArray>,
     data: Option<&'a StringArray>,
     checkpoint: Option<&'a StringArray>,
+    probe: Option<&'a StringArray>,
 }
 
 impl<'a> Columns<'a> {
@@ -408,6 +428,7 @@ impl<'a> Columns<'a> {
             layers: column(batch, "layers_json"),
             data: column(batch, "data_json"),
             checkpoint: column(batch, "checkpoint_json"),
+            probe: column(batch, "probe_json"),
         })
     }
 }
@@ -1356,6 +1377,351 @@ impl Activations {
     }
 }
 
+// --- attention_collapse, attention_uniform, attention_logit_growth -------------------------
+
+/// Numbers in a JSON list as `_finite` reads them; anything but a list reads as no numbers.
+#[derive(Default)]
+struct Numbers(Vec<Option<f64>>);
+
+impl<'de> Deserialize<'de> for Numbers {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct NumbersVisitor;
+        impl<'de> Visitor<'de> for NumbersVisitor {
+            type Value = Numbers;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Numbers, A::Error> {
+                let mut out = Vec::new();
+                while let Some(Number(number)) = seq.next_element()? {
+                    out.push(number);
+                }
+                Ok(Numbers(out))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Numbers, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Numbers::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Numbers, E> {
+                Ok(Numbers::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Numbers, E> {
+                Ok(Numbers::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Numbers, E> {
+                Ok(Numbers::default())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Numbers, E> {
+                Ok(Numbers::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Numbers, E> {
+                Ok(Numbers::default())
+            }
+            fn visit_unit<E>(self) -> Result<Numbers, E> {
+                Ok(Numbers::default())
+            }
+        }
+        deserializer.deserialize_any(NumbersVisitor)
+    }
+}
+
+/// Python's `_attention_values`: one attention module's mean finite entropy share (fsum over
+/// the heads in order), its largest finite logit, and how many heads had a finite share.
+#[derive(Default)]
+struct AttentionStats {
+    share: Option<f64>,
+    logit: Option<f64>,
+    heads: usize,
+}
+
+impl<'de> Deserialize<'de> for AttentionStats {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct StatsVisitor;
+        impl<'de> Visitor<'de> for StatsVisitor {
+            type Value = AttentionStats;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<AttentionStats, A::Error> {
+                // A key given twice keeps its last value, as `json.loads` does.
+                let (mut shares, mut logits) = (Vec::new(), Vec::new());
+                while let Some(Key(key)) = map.next_key()? {
+                    match key.as_ref() {
+                        "entropy_share" => shares = map.next_value::<Numbers>()?.0.into_iter().flatten().collect(),
+                        "max_logit" => logits = map.next_value::<Numbers>()?.0.into_iter().flatten().collect(),
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AttentionStats {
+                    share: (!shares.is_empty()).then(|| fsum(shares.iter().copied()) / shares.len() as f64),
+                    logit: logits.iter().copied().reduce(f64::max),
+                    heads: shares.len(),
+                })
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<AttentionStats, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(AttentionStats::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<AttentionStats, E> {
+                Ok(AttentionStats::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<AttentionStats, E> {
+                Ok(AttentionStats::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<AttentionStats, E> {
+                Ok(AttentionStats::default())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<AttentionStats, E> {
+                Ok(AttentionStats::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<AttentionStats, E> {
+                Ok(AttentionStats::default())
+            }
+            fn visit_unit<E>(self) -> Result<AttentionStats, E> {
+                Ok(AttentionStats::default())
+            }
+        }
+        deserializer.deserialize_any(StatsVisitor)
+    }
+}
+
+/// What the attention rules read of a probe: its attention modules in order, or nothing when
+/// the probe failed (`error`) or recorded no attention. Histograms and maps are skipped unread.
+#[derive(Default)]
+struct Probe<'a> {
+    error: bool,
+    attention: Option<Members<'a, AttentionStats>>,
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Probe<'a> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ProbeVisitor<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for ProbeVisitor<'a> {
+            type Value = Probe<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Probe<'a>, A::Error> {
+                let mut probe = Probe::default();
+                while let Some(Key(key)) = map.next_key()? {
+                    match key.as_ref() {
+                        "error" => {
+                            probe.error = true;
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                        // Not an object: the probe is not read at all, as Python skips it.
+                        "attention" => probe.attention = Some(map.next_value()?),
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(probe)
+            }
+        }
+        deserializer.deserialize_map(ProbeVisitor(PhantomData))
+    }
+}
+
+/// Where a run of probes meeting one rule began.
+#[derive(Clone)]
+struct Onset {
+    value: f64,
+    baseline: f64,
+    baseline_probes: usize,
+    heads: usize,
+    scalars: Option<Value>,
+}
+
+/// Python's `_AttentionSeries`: a module's share or logit, its baseline of probes that met no
+/// rule, and per kind the run of probes in a row meeting it (last probe index, length, onset).
+#[derive(Default)]
+struct AttentionSeries {
+    baseline: VecDeque<f64>,
+    runs: Vec<(&'static str, usize, usize, Onset)>,
+}
+
+#[derive(Default)]
+struct AttentionModule {
+    share: AttentionSeries,
+    logit: AttentionSeries,
+    seen: usize,
+}
+
+fn attention_hit(kind: &str, value: f64, base: f64) -> bool {
+    match kind {
+        "attention_collapse" => base > 0.0 && value <= ATTN_COLLAPSE_RATIO * base,
+        "attention_uniform" => value >= ATTN_UNIFORM && value - base >= ATTN_UNIFORM_RISE,
+        _ => base > 0.0 && value >= ATTN_LOGIT_FACTOR * base,
+    }
+}
+
+/// Python's `detect_attention_anomalies`, a probe at a time.
+#[derive(Default)]
+struct Attention {
+    modules: Named<AttentionModule>,
+    probe_steps: Vec<i64>,
+    /// The most probes any module has been seen on.
+    most: usize,
+    /// The incident of each kind, by its place in `ATTN_KINDS`.
+    found: [Option<Value>; 3],
+    /// The probe steps that are part of a confirmed run, per kind.
+    affected: [BTreeSet<i64>; 3],
+    scratch: Vec<f64>,
+}
+
+impl Attention {
+    fn row(&mut self, step: i64, columns: &Columns, row: usize, scalars: &mut Scalars) {
+        let Some(text) = text(columns.probe, row) else { return };
+        let Ok(probe) = serde_json::from_str::<Probe>(text) else {
+            return;
+        };
+        let Some(Members(attention)) = probe.attention.filter(|_| !probe.error) else {
+            return;
+        };
+        if attention.is_empty() {
+            return;
+        }
+        let index = self.probe_steps.len();
+        self.probe_steps.push(step);
+        let mut confirmed: [Vec<Value>; 3] = Default::default();
+        let mut onset_scalars: [Option<Value>; 3] = Default::default();
+        let mut context: Option<Option<Value>> = None;
+        for (position, (name, stats)) in attention.iter().enumerate() {
+            let module = self.modules.slot(position, name);
+            module.seen += 1;
+            self.most = self.most.max(module.seen);
+            for (series, value, kinds) in [
+                (&mut module.share, stats.share, &ATTN_KINDS[..2]),
+                (&mut module.logit, stats.logit, &ATTN_KINDS[2..]),
+            ] {
+                let Some(value) = value else {
+                    series.runs.clear();
+                    continue;
+                };
+                if series.baseline.len() < ATTN_MIN_HISTORY {
+                    series.baseline.push_back(value);
+                    continue;
+                }
+                self.scratch.clear();
+                self.scratch.extend(series.baseline.iter().copied());
+                let base = median(&mut self.scratch);
+                let mut flagged = false;
+                for &kind in kinds {
+                    let at = ATTN_KINDS
+                        .iter()
+                        .position(|known| *known == kind)
+                        .expect("a known kind");
+                    let run = series.runs.iter().position(|(known, ..)| *known == kind);
+                    if !attention_hit(kind, value, base) {
+                        if let Some(run) = run {
+                            series.runs.remove(run);
+                        }
+                        continue;
+                    }
+                    flagged = true;
+                    let (mut length, mut onset) = match run {
+                        Some(run) if series.runs[run].1 + 1 == index => {
+                            (series.runs[run].2, series.runs[run].3.clone())
+                        }
+                        _ => (
+                            0,
+                            Onset {
+                                value,
+                                baseline: base,
+                                baseline_probes: series.baseline.len(),
+                                heads: stats.heads,
+                                scalars: None,
+                            },
+                        ),
+                    };
+                    if length == 0 {
+                        // What was logged on the first probe of the run, as Python reads it
+                        // for the incident's step; worked out once per probe.
+                        onset.scalars = context.get_or_insert_with(|| scalars.context(columns, row)).clone();
+                    }
+                    length += 1;
+                    match run {
+                        Some(run) => series.runs[run] = (kind, index, length, onset.clone()),
+                        None => series.runs.push((kind, index, length, onset.clone())),
+                    }
+                    if length >= ATTN_SUSTAIN {
+                        self.affected[at].extend(&self.probe_steps[index + 1 - length..=index]);
+                    }
+                    if length == ATTN_SUSTAIN {
+                        let mut hit = json!({"module": name, "value": onset.value, "baseline": onset.baseline});
+                        if kind == "attention_uniform" {
+                            hit["rise"] = json!(onset.value - onset.baseline);
+                        } else {
+                            hit["ratio"] = json!(onset.value / onset.baseline);
+                        }
+                        hit["baseline_probes"] = json!(onset.baseline_probes);
+                        hit["heads"] = json!(onset.heads);
+                        // Every run confirmed on this probe began on the same probe.
+                        onset_scalars[at] = onset.scalars.clone();
+                        confirmed[at].push(hit);
+                    }
+                }
+                if !flagged {
+                    series.baseline.push_back(value);
+                    if series.baseline.len() > ATTN_WINDOW {
+                        series.baseline.pop_front();
+                    }
+                }
+            }
+        }
+        for (at, (mut hits, scalars)) in confirmed.into_iter().zip(onset_scalars).enumerate() {
+            if self.found[at].is_some() || hits.is_empty() {
+                continue;
+            }
+            let affected = hits.len();
+            hits.truncate(ATTN_MODULES);
+            let mut incident = json!({
+                "kind": ATTN_KINDS[at],
+                "step": self.probe_steps[index + 1 - ATTN_SUSTAIN],
+                "confirmed_step": step,
+                "modules": hits,
+                "affected": affected,
+            });
+            if let Some(scalars) = scalars {
+                incident["scalars"] = scalars;
+            }
+            self.found[at] = Some(incident);
+        }
+    }
+
+    fn incidents(&self, out: &mut Vec<Value>) {
+        for (at, incident) in self.found.iter().enumerate() {
+            if let Some(incident) = incident {
+                let mut incident = incident.clone();
+                incident["affected_probes"] = json!(self.affected[at].len());
+                incident["probes"] = json!(self.probe_steps.len());
+                out.push(incident);
+            }
+        }
+    }
+
+    fn not_checked(&self) -> Option<Value> {
+        let needed = ATTN_MIN_HISTORY + ATTN_SUSTAIN;
+        (!self.probe_steps.is_empty() && self.most < needed).then(|| {
+            json!({
+                "check": "attention",
+                "kinds": ATTN_KINDS,
+                "reason": format!(
+                    "{} probe{} recorded attention; a layer is judged against its own first {} and a change must hold on {} probes in a row, so {} are needed",
+                    self.most,
+                    if self.most == 1 { "" } else { "s" },
+                    ATTN_MIN_HISTORY,
+                    ATTN_SUSTAIN,
+                    needed,
+                ),
+            })
+        })
+    }
+}
+
 // --- stalled_weights -----------------------------------------------------------------------
 
 /// Python's `_optimizer_evidence`: whether an optimizer that stepped holds the stalled
@@ -2027,6 +2393,7 @@ pub struct RankDetectors {
     stalled: Stalled,
     loss_scale: LossScale,
     activations: Activations,
+    attention: Attention,
     non_finite: NonFinite,
     replica_drift: ReplicaDrift,
     attempts: Attempts,
@@ -2076,6 +2443,7 @@ impl RankDetectors {
             self.stalled.row(step, &columns, row);
             self.loss_scale.row(step, &columns, row);
             self.activations.row(step, layers);
+            self.attention.row(step, &columns, row, &mut self.scalars);
             self.non_finite.row(step, &columns, row, layers);
             self.replica_drift.row(step, &columns, row);
             let after = self.reported();
@@ -2200,6 +2568,7 @@ impl RankDetectors {
         self.resumes.incidents(&mut out);
         self.data.incidents(&mut out);
         self.activations.incidents(&mut out);
+        self.attention.incidents(&mut out);
         out.extend(self.non_finite.first.clone());
         out.extend(self.replica_drift.first.clone());
         out
@@ -2223,6 +2592,7 @@ impl RankDetectors {
         ];
         out.extend(self.attempts.not_checked.iter().cloned());
         out.extend(self.resumes.not_checked().cloned());
+        out.extend(self.attention.not_checked());
         out
     }
 
@@ -2378,6 +2748,40 @@ mod tests {
                 .map(|(_, stats)| (stats.std, stats.non_finite))
                 .collect::<Vec<_>>(),
             [(Some(1.0), true), (None, true), (None, false)]
+        );
+    }
+
+    #[test]
+    fn a_probe_reads_its_attention_in_order_and_skips_the_rest() {
+        let text = r#"{"histograms":{"b":{"counts":[1]}},"attention":{"z":{"entropy_share":[0.25,"nan",0.75,true],
+            "max_logit":["-inf",3,2.5],"map":[[0.1]]},"a":{"entropy_share":"x","max_logit":{}},"m":[1,2]}}"#;
+        let probe: Probe = serde_json::from_str(text).unwrap();
+        let Members(attention) = probe.attention.unwrap();
+        assert_eq!(
+            attention.iter().map(|(name, _)| name.as_ref()).collect::<Vec<_>>(),
+            ["z", "a", "m"]
+        );
+        let z = &attention[0].1;
+        // NaN left out; true reads as 1 as Python's `_finite` reads it: (0.25 + 0.75 + 1) / 3.
+        assert_eq!((z.share, z.logit, z.heads), (Some(2.0 / 3.0), Some(3.0), 3));
+        assert_eq!(
+            (attention[1].1.share, attention[1].1.logit, attention[2].1.heads),
+            (None, None, 0)
+        );
+        let failed: Probe = serde_json::from_str(r#"{"error":"RuntimeError: x","attention":{}}"#).unwrap();
+        assert!(failed.error);
+        assert!(serde_json::from_str::<Probe>(r#"{"attention":[1]}"#).is_err());
+        // skipped, as Python skips it
+    }
+
+    #[test]
+    fn attention_rules_at_their_edges() {
+        assert!(attention_hit("attention_collapse", 0.2, 0.4) && !attention_hit("attention_collapse", 0.21, 0.4));
+        assert!(!attention_hit("attention_collapse", 0.0, 0.0));
+        assert!(attention_hit("attention_uniform", 0.98, 0.5) && !attention_hit("attention_uniform", 0.979, 0.5));
+        assert!(!attention_hit("attention_uniform", 0.99, 0.875));
+        assert!(
+            attention_hit("attention_logit_growth", 20.0, 10.0) && !attention_hit("attention_logit_growth", 19.9, 10.0)
         );
     }
 }

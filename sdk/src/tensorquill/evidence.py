@@ -65,6 +65,22 @@ ACT_MIN_HISTORY = 10
 ACT_DRIFT_FACTOR = 3.0  # recent median of std or abs_max/std vs the first ACT_WINDOW records
 ACT_RECENT = 10
 ACT_DEAD_RISE = 0.25  # zero fraction above its baseline, as a recent median
+# Attention rules over the probe's per-head statistics (`probe=`, every `probe_every` steps,
+# 1,000 by default). Probes are sparse, so each attention module (a block's attention call) is
+# judged against the median of its own last ATTN_WINDOW earlier probes that showed nothing,
+# from its ATTN_MIN_HISTORY-th probe on, and a change counts only when it holds on ATTN_SUSTAIN
+# probes in a row (dated at the first). With the defaults nothing can be reported before a
+# module's fourth probe. Calibrated on SmolLM2-360M fine-tunes (seeded and healthy probes)
+# and on tiny Llamas trained from scratch on CPU; see the plan's decision of Nov 16, 2026.
+ATTN_MIN_HISTORY = 2
+ATTN_WINDOW = 5
+ATTN_SUSTAIN = 2
+ATTN_COLLAPSE_RATIO = 0.5  # the layer's mean entropy share at or below this times its baseline
+ATTN_UNIFORM = 0.98  # the layer's mean entropy share at or above this (1.0 is uniform) ...
+ATTN_UNIFORM_RISE = 0.2  # ... having risen at least this much above its baseline
+ATTN_LOGIT_FACTOR = 2.0  # the layer's largest pre-softmax logit at or above this times its baseline
+ATTN_KINDS = ("attention_collapse", "attention_uniform", "attention_logit_growth")
+ATTN_MODULES = 20  # modules listed in one incident; `affected` counts them all
 # A parameter is reported as not updating once its weights are exactly unchanged on this
 # many weight checks in a row while it has a gradient. Checks run every 50 steps by default.
 STALL_STEPS = 3
@@ -775,6 +791,150 @@ def detect_activation_anomalies(records: list[dict[str, Any]]) -> list[dict[str,
     return list(found.values())
 
 
+def _attention_values(stats: Any) -> tuple[float | None, float | None, int]:
+    """One attention module's probe statistics as the rules read them: the mean of its heads'
+    finite `entropy_share` (math.fsum over the heads, in order), the largest finite `max_logit`,
+    and how many heads had a finite share. NaN shares (rows all masked or invalid) and the
+    `-inf` logit of a head with no visible score are left out; with none left, None."""
+    if not isinstance(stats, dict):
+        return None, None, 0
+    shares = [v for v in (_finite(x) for x in stats.get("entropy_share") or ()) if v is not None] \
+        if isinstance(stats.get("entropy_share"), list) else []
+    logits = [v for v in (_finite(x) for x in stats.get("max_logit") or ()) if v is not None] \
+        if isinstance(stats.get("max_logit"), list) else []
+    share = math.fsum(shares) / len(shares) if shares else None
+    return share, (max(logits) if logits else None), len(shares)
+
+
+class _AttentionSeries:
+    """One attention module's share or logit: its baseline and, per kind, the run of probes
+    in a row that met the kind's rule (the global index of its last probe and its first one)."""
+
+    __slots__ = ("baseline", "runs")
+
+    def __init__(self) -> None:
+        self.baseline: deque[float] = deque()
+        self.runs: dict[str, tuple[int, int, dict[str, Any]]] = {}
+
+
+def _attention_hit(kind: str, value: float, base: float) -> bool:
+    if kind == "attention_collapse":
+        return base > 0 and value <= ATTN_COLLAPSE_RATIO * base
+    if kind == "attention_uniform":
+        return value >= ATTN_UNIFORM and value - base >= ATTN_UNIFORM_RISE
+    return base > 0 and value >= ATTN_LOGIT_FACTOR * base
+
+
+def detect_attention_anomalies(
+    records: list[dict[str, Any]], *, not_checked: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    """Attention entropy collapse, uniform attention and logit growth, from the probe's records.
+
+    Each attention module (a block's attention call, named as the probe names it) is judged
+    against its own earlier probes: the median of its last ATTN_WINDOW probes that met no rule,
+    once it has ATTN_MIN_HISTORY of them. A rule must hold on ATTN_SUSTAIN probes in a row,
+    counted over every probe that recorded attention (a probe without the module breaks the
+    run), and the incident is dated at the first of them.
+
+    - `attention_collapse`: the layer's mean entropy share at most ATTN_COLLAPSE_RATIO times its
+      baseline (attention concentrating on few keys, as in Zhai et al. 2023).
+    - `attention_uniform`: the mean entropy share at least ATTN_UNIFORM and at least
+      ATTN_UNIFORM_RISE above its baseline: attention that had structure spreads evenly over
+      every key, as after a seeded outlier upstream. A layer that was near uniform from the
+      start is never reported.
+    - `attention_logit_growth`: the largest pre-softmax logit at least ATTN_LOGIT_FACTOR times
+      its baseline.
+
+    One incident per kind: the step of the first probe, the probe that confirmed it, the
+    modules whose run started there (in the probe's order, at most ATTN_MODULES), how many,
+    and how many probes were part of a confirmed run in all. With probes but too few for any
+    module to be judged and confirmed, `not_checked` gets an `attention` entry saying so.
+    """
+    shares: dict[str, _AttentionSeries] = {}
+    logits: dict[str, _AttentionSeries] = {}
+    found: dict[str, dict[str, Any]] = {}
+    affected: dict[str, set[int]] = {}
+    probe_steps: list[int] = []
+    most = 0  # the most probes any module has been seen on
+    seen: dict[str, int] = {}
+    for record in sorted(records, key=lambda r: r["step"]):
+        probe = record.get("probe")
+        attention = probe.get("attention") if isinstance(probe, dict) and "error" not in probe else None
+        if not isinstance(attention, dict) or not attention:
+            continue
+        index = len(probe_steps)
+        step = int(record["step"])
+        probe_steps.append(step)
+        confirmed: dict[str, list[dict[str, Any]]] = {}
+        for module, stats in attention.items():
+            share, logit, heads = _attention_values(stats)
+            seen[module] = seen.get(module, 0) + 1
+            most = max(most, seen[module])
+            for series_of, value, kinds in (
+                (shares, share, ("attention_collapse", "attention_uniform")),
+                (logits, logit, ("attention_logit_growth",)),
+            ):
+                series = series_of.setdefault(module, _AttentionSeries())
+                if value is None:
+                    series.runs.clear()
+                    continue
+                if len(series.baseline) < ATTN_MIN_HISTORY:
+                    series.baseline.append(value)
+                    continue
+                base = _median(list(series.baseline))
+                flagged = False
+                for kind in kinds:
+                    if not _attention_hit(kind, value, base):
+                        series.runs.pop(kind, None)
+                        continue
+                    flagged = True
+                    last, length, onset = series.runs.get(kind, (-2, 0, {}))
+                    if last != index - 1:
+                        length, onset = 0, {
+                            "step": step, "value": value, "baseline": base, "baseline_probes": len(series.baseline),
+                            "heads": heads,
+                        }
+                    length += 1
+                    series.runs[kind] = (index, length, onset)
+                    if length >= ATTN_SUSTAIN:
+                        steps = affected.setdefault(kind, set())
+                        steps.update(probe_steps[index - length + 1 : index + 1])
+                    if length == ATTN_SUSTAIN:
+                        hit = {"module": module, "value": onset["value"], "baseline": onset["baseline"]}
+                        if kind == "attention_uniform":
+                            hit["rise"] = onset["value"] - onset["baseline"]
+                        else:
+                            hit["ratio"] = onset["value"] / onset["baseline"]
+                        hit.update(baseline_probes=onset["baseline_probes"], heads=onset["heads"])
+                        confirmed.setdefault(kind, []).append(hit)
+                if not flagged:
+                    series.baseline.append(value)
+                    if len(series.baseline) > ATTN_WINDOW:
+                        series.baseline.popleft()
+        for kind, hits in confirmed.items():
+            if kind not in found:
+                found[kind] = {
+                    "kind": kind,
+                    "step": probe_steps[index - ATTN_SUSTAIN + 1],
+                    "confirmed_step": step,
+                    "modules": hits[:ATTN_MODULES],
+                    "affected": len(hits),
+                }
+    for kind, incident in found.items():
+        incident["affected_probes"] = len(affected[kind])
+        incident["probes"] = len(probe_steps)
+    needed = ATTN_MIN_HISTORY + ATTN_SUSTAIN
+    if not_checked is not None and probe_steps and most < needed:
+        not_checked.append({
+            "check": "attention",
+            "kinds": list(ATTN_KINDS),
+            "reason": f"{most} probe{'s' if most != 1 else ''} recorded attention; a layer is judged against its own"
+                      f" first {ATTN_MIN_HISTORY} and a change must hold on {ATTN_SUSTAIN} probes in a row, so"
+                      f" {needed} are needed",
+        })
+    return [found[kind] for kind in ATTN_KINDS if kind in found]
+
+
 def detect_loss_scale_trouble(
     records: list[dict[str, Any]], *, run: int = SCALE_SKIP_RUN, floor: float = SCALE_FLOOR
 ) -> dict[str, Any] | None:
@@ -1131,7 +1291,7 @@ class _Tail:
 SERVER_KINDS = (
     "moe_imbalance", "starved_experts", "grad_spike", "stalled_weights", "repeated_steps", "loss_scale_trouble",
     "resume_lr_change", "resume_data_mismatch", "resume_incomplete", "data_stalled", "epoch_order_repeated",
-    "activation_spike", "activation_drift", "dead_activations", "non_finite", "replica_drift",
+    "activation_spike", "activation_drift", "dead_activations", *ATTN_KINDS, "non_finite", "replica_drift",
 )
 # How long a watcher waits for the server's report to cover the newest stored part before
 # it calls the report stale and works the incidents out itself. Measured with 64 ranks on an
@@ -1348,7 +1508,7 @@ def _report_evidence(
     )
     incidents.extend(i for i in record_incidents if i.get("kind") == "replica_drift")
     applied = report.get("thresholds") or {}
-    return {
+    evidence = {
         "schema_version": 1,
         "run_id": report.get("run_id"),
         "overload_threshold": applied.get("overload_threshold", OVERLOAD_THRESHOLD),
@@ -1365,6 +1525,119 @@ def _report_evidence(
             "silent_floor_seconds", "critical_seconds",
         ) if k in status}} if status else {}),
     }
+    evidence["run_state"] = _per_rank_run_state(evidence, status, _status_age(status), steps_judged=bool(report.get("steps")))
+    return evidence
+
+
+# --- One run state -----------------------------------------------------------------------
+#
+# `evidence["run_state"]`: one word for the whole picture, with every reason behind it.
+#   healthy    every expected source is current and no incident is listed
+#   degraded   an optional monitor is unavailable (a check listed in `not_checked`, or no
+#              progress status at all, so stalls are not watched)
+#   unknown    required evidence is stale or missing: no steps judged, a server report that is
+#              not current, ranks without a current report, an old status, a stopped server,
+#              or a status this version does not recognise
+#   unhealthy  an incident is listed (incidents are never closed, so it stays so)
+# The worst reason wins. `healthy` is only what is left when nothing at all was found
+# against it, and every status summary or report state not named here reads `unknown`.
+RUN_STATES = ("healthy", "degraded", "unknown", "unhealthy")
+_STATUS_HEALTHY = ("active", "finished")
+_STREAM_KINDS = ("job_stalled", "rank_silent")
+
+
+def _reason(state: str, code: str, detail: str, **extra: Any) -> dict[str, Any]:
+    return {"state": state, "code": code, **extra, "detail": detail}
+
+
+def run_state(
+    *,
+    incidents: Iterable[Mapping[str, Any]],
+    steps_judged: bool,
+    status: Mapping[str, Any] | None,
+    status_age: float | None = None,
+    not_checked: Iterable[Mapping[str, Any]] = (),
+    detection: Mapping[str, Any] | None = None,
+    unknown_ranks: Mapping[int, str] | None = None,
+    judged_ranks: Iterable[int] = (),
+) -> dict[str, Any]:
+    """The run's state from what the evidence holds: `{"state", "reasons"}`.
+
+    `status` is the server's whole `watchdog.json` (None when there is none) and `status_age`
+    how long ago it was last written when that is too long (`_status_age`). `detection` is the
+    evidence's `detection` (where the incidents came from), `unknown_ranks` the ranks whose
+    reports are not current with why and `judged_ranks` those that are (the all-ranks view).
+    A rank the status expects (`missing_ranks`, or below `world_size`) that is neither listed in
+    it nor judged is unknown too: the status calls a rank missing only after its silence floor,
+    and until then a run of one connected rank out of four would otherwise read healthy. Codes are stable: `incidents`;
+    `no_steps`, `report_not_current`, `ranks_unknown`, `status_old`, `server_stopped`,
+    `status_summary`; `no_status`, `not_checked`.
+    """
+    reasons: list[dict[str, Any]] = []
+    incidents = list(incidents)
+    if incidents:
+        kinds = list(dict.fromkeys(str(i.get("kind")) for i in incidents))
+        reasons.append(_reason("unhealthy", "incidents", f"{len(incidents)} incident{'s' if len(incidents) != 1 else ''}"
+                               f" listed: {', '.join(kinds)}", kinds=kinds))
+    if not steps_judged:
+        reasons.append(_reason("unknown", "no_steps", "no step has been judged yet"))
+    if detection is not None and detection.get("source") == "server" and detection.get("state") != "current":
+        reasons.append(_reason("unknown", "report_not_current",
+                               f"the incidents are from the server's last current report: {detection.get('reason')}"))
+    unknown = dict(unknown_ranks or {})
+    if status is not None:
+        judged = set(judged_ranks)
+        listed = {r.get("rank") for r in status.get("ranks") or () if isinstance(r, Mapping)}
+        world_size = status.get("world_size")
+        expected = {r for r in status.get("missing_ranks") or () if isinstance(r, int) and not isinstance(r, bool)}
+        if isinstance(world_size, int) and not isinstance(world_size, bool) and 0 < world_size <= MAX_EXPECTED_RANKS:
+            expected |= set(range(world_size)) - listed
+        for rank in sorted(expected - judged):
+            unknown.setdefault(rank, "the server's status expects it and it has not connected")
+    if unknown:
+        ranks = sorted(unknown)
+        reasons.append(_reason("unknown", "ranks_unknown", f"{len(ranks)} rank{'s' if len(ranks) != 1 else ''} without"
+                               f" a current report ({_rank_ranges(ranks, 8)}): nothing is said about incidents on"
+                               " them", ranks=ranks))
+    if status is None:
+        reasons.append(_reason("degraded", "no_status", "no progress status (the server's watchdog.json): whether the"
+                               " job is still making progress is not checked"))
+    else:
+        summary = status.get("summary")
+        streamed = any(i.get("kind") in _STREAM_KINDS for i in incidents)
+        if summary == "server_stopped":
+            reasons.append(_reason("unknown", "server_stopped", "the server has stopped: no new steps are stored and"
+                                   " nothing watches the run for stalls"))
+        elif status_age is not None:
+            reasons.append(_reason("unknown", "status_old", f"the server's status was last written {status_age:.0f} s"
+                                   " ago: nothing is watching the run for stalls"))
+        if summary not in (*_STATUS_HEALTHY, "server_stopped") and not (summary in ("stalled", "degraded") and streamed):
+            reasons.append(_reason("unknown", "status_summary", f"the server's status says {summary!r}",
+                                   summary=summary))
+    checks = [item for item in not_checked if isinstance(item, Mapping)]
+    if checks:
+        names = list(dict.fromkeys(str(item.get("check")) for item in checks))
+        reasons.append(_reason("degraded", "not_checked", f"not checked: {', '.join(names)}", checks=names))
+    state = max((r["state"] for r in reasons), key=RUN_STATES.index, default="healthy")
+    return {"state": state, "reasons": reasons}
+
+
+def run_state_line(evidence: Mapping[str, Any]) -> str | None:
+    """`Run state: <state>` with the reasons that decide it, for the CLI; None without one."""
+    found = evidence.get("run_state")
+    if not isinstance(found, Mapping):
+        return None
+    state = found.get("state")
+    deciding = [r["detail"] for r in found.get("reasons") or () if r.get("state") == state]
+    return f"Run state: {state}" + (f" ({'; '.join(deciding)})" if deciding else "")
+
+
+def _per_rank_run_state(evidence: Mapping[str, Any], status: Mapping[str, Any] | None,
+                        status_age: float | None, steps_judged: bool) -> dict[str, Any]:
+    return run_state(
+        incidents=evidence.get("incidents", ()), steps_judged=steps_judged, status=status, status_age=status_age,
+        not_checked=evidence.get("not_checked", ()), detection=evidence.get("detection"),
+    )
 
 
 def _status_age(status: Mapping[str, Any] | None) -> float | None:
@@ -1661,6 +1934,8 @@ def watch(
                 path = Path(output) if output else default_evidence_path(source, tail.records)
             if status_age is not None and "watchdog" in evidence:
                 evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
+            judged = bool(report_look["report"].get("steps")) if report_look is not None else bool(tail.records)
+            evidence["run_state"] = _per_rank_run_state(evidence, status, status_age, steps_judged=judged)
             emitted = seen
             emitted_grace = grace_key
             written = write_evidence(evidence, path)
@@ -1823,6 +2098,8 @@ def _incident_identity(incident: Mapping[str, Any]) -> str:
     elif kind in ("activation_spike", "activation_drift", "dead_activations"):
         # In the model's order: the first block named is where it started.
         parts = [[m.get("module"), m.get("stat")] for m in incident.get("modules") or ()]
+    elif kind in ATTN_KINDS:
+        parts = [incident.get("confirmed_step"), [m.get("module") for m in incident.get("modules") or ()]]
     elif kind == "non_finite":
         parts = [list(incident.get("layers") or ()), list(incident.get("gradients") or ())]
     elif kind == "loss_scale_trouble":
@@ -1991,6 +2268,21 @@ def _all_ranks_evidence(
     }
 
 
+def _all_ranks_run_state(evidence: Mapping[str, Any], looks: Mapping[int, Mapping[str, Any]],
+                         status: Mapping[str, Any] | None, status_age: float | None) -> dict[str, Any]:
+    """The run state of the all-ranks view: every judged rank's incidents and the run's, the
+    ranks that are not judged (with their states), and what was not checked on any rank."""
+    judged = set(evidence.get("judged_ranks", ()))
+    incidents = [group["incident"] for group in evidence.get("incident_groups", ())]
+    incidents += list(evidence.get("run_incidents", ()))
+    not_checked = [*evidence.get("not_checked", ()), *(item for entry in evidence.get("ranks", ())
+                                                        for item in entry.get("not_checked", ()))]
+    unknown = {n: f"{look['state']}: {look['reason']}" for n, look in looks.items() if n not in judged}
+    steps = any((looks[n].get("report") or {}).get("steps") for n in judged)
+    return run_state(incidents=incidents, steps_judged=steps, status=status, status_age=status_age,
+                     not_checked=not_checked, unknown_ranks=unknown, judged_ranks=judged)
+
+
 def watch_all_ranks(
     source: str | Path,
     output: str | Path | None = None,
@@ -2086,6 +2378,7 @@ def watch_all_ranks(
             evidence = _all_ranks_evidence(source, folders, looks, status, **other_sources)
             if status_age is not None and "watchdog" in evidence:
                 evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
+            evidence["run_state"] = _all_ranks_run_state(evidence, looks, status, status_age)
             path = Path(output) if output else Path(f"{evidence['run_id']}.all-ranks.evidence.json")
             emitted = seen
             written = write_evidence(evidence, path)
@@ -2411,6 +2704,7 @@ def build_evidence(
         if data_hit is not None:
             incidents.append(data_hit)
     incidents.extend(detect_activation_anomalies(records))
+    incidents.extend(detect_attention_anomalies(records, not_checked=not_checked))
     non_finite_hit = detect_non_finite(records)
     if non_finite_hit is not None:
         incidents.append(non_finite_hit)
@@ -2438,7 +2732,7 @@ def build_evidence(
 
     run_id = records[0].get("run_id") if records else None
     trends = weight_norm_trends(records)
-    return {
+    evidence = {
         "schema_version": 1,
         "run_id": run_id,
         "layer_count": len(routers),
@@ -2459,6 +2753,8 @@ def build_evidence(
             "silent_floor_seconds", "critical_seconds",
         ) if k in status}} if status else {}),
     }
+    evidence["run_state"] = _per_rank_run_state(evidence, status, _status_age(status), steps_judged=bool(records))
+    return evidence
 
 
 def first_incident(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -2655,6 +2951,27 @@ def _describe_stream(incident: Mapping[str, Any]) -> str:
     )
 
 
+def _describe_attention(incident: Mapping[str, Any]) -> str:
+    """An attention incident, with how few probes it rests on."""
+    kind, top = incident["kind"], incident["modules"][0]
+    more = f", and {incident['affected'] - 1} more modules" if incident["affected"] > 1 else ""
+    if kind == "attention_collapse":
+        what = (f"Attention entropy collapse at step {incident['step']} in {top['module']}: mean entropy share"
+                f" {top['value']:.2f}, {top['ratio']:.2f}× its earlier probes ({top['baseline']:.2f})")
+    elif kind == "attention_uniform":
+        what = (f"Attention gone uniform at step {incident['step']} in {top['module']}: mean entropy share"
+                f" {top['baseline']:.2f} → {top['value']:.2f} (1.0 is uniform over every key)")
+    else:
+        what = (f"Attention logit growth at step {incident['step']} in {top['module']}: largest logit"
+                f" {top['value']:.3g}, {top['ratio']:.2g}× its earlier probes ({top['baseline']:.3g})")
+    probes = incident["affected_probes"]
+    return (
+        f"{what}{more}; held on the probe at step {incident['confirmed_step']} too ({probes} probe"
+        f"{'s' if probes != 1 else ''} affected, each layer judged against {top['baseline_probes']} earlier"
+        " probe" + ("s" if top["baseline_probes"] != 1 else "") + " of the fixed probe batch)"
+    )
+
+
 def _describe(incident: Mapping[str, Any]) -> str | None:
     kind = incident["kind"]
     if kind == "grad_spike":
@@ -2767,6 +3084,8 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             f" {top['baseline']:.0%} → {top['recent']:.0%}"
             + (f", and {incident['affected'] - 1} more modules" if incident["affected"] > 1 else "")
         )
+    if kind in ATTN_KINDS:
+        return _describe_attention(incident)
     if kind == "repeated_steps":
         return (
             f"Repeated step numbers from step {incident['step']}: {incident['repeated']} steps"
@@ -3415,10 +3734,12 @@ def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     shown: list[str] = []
 
     def report(evidence: dict[str, Any], path: Path) -> None:
-        summary = incident_summary(evidence)
-        if [summary] != shown:
-            shown[:] = [summary]
+        summary, state = incident_summary(evidence), run_state_line(evidence)
+        if [summary, state] != shown:
+            shown[:] = [summary, state]
             print(summary)
+            if state:
+                print(state)
         print(f"updated {path}" if args.watch else f"wrote evidence -> {path}", flush=True)
 
     if args.watch:
@@ -3532,10 +3853,12 @@ def main() -> None:
             if args.rank is None and not announced_rank and len(_rank_dirs(args.input)) > 1:
                 announced_rank = True
                 print("several ranks here; reading rank 0 (choose another with --rank N, or every rank with --rank all)")
-            summary = incident_summary(evidence)
-            if [summary] != shown:
-                shown[:] = [summary]
+            summary, state = incident_summary(evidence), run_state_line(evidence)
+            if [summary, state] != shown:
+                shown[:] = [summary, state]
                 print(summary)
+                if state:
+                    print(state)
             print(f"updated {path}", flush=True)
 
         print(f"watching {args.input} every {args.interval:g} s; Ctrl-C to stop", flush=True)
@@ -3558,6 +3881,7 @@ def main() -> None:
     )
     out_json = write_evidence(evidence, args.output or default_evidence_path(args.input, records))
     print(incident_summary(evidence))
+    print(run_state_line(evidence))
     print(f"wrote evidence -> {out_json}")
     if args.rerun is not None:
         export_rerun(evidence, args.rerun, records=resolve_attempts(records))

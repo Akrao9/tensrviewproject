@@ -25,6 +25,7 @@ import pyarrow.parquet as pq  # noqa: E402
 
 import tensorquill  # noqa: E402
 from tensorquill.flight import offset_path, read_offset, row_to_record  # noqa: E402
+from test_flight_e2e import _without_status  # noqa: E402
 
 
 def _server_binary() -> Path | None:
@@ -306,13 +307,13 @@ def test_the_command_reads_the_rank_it_is_asked_for_and_rank_0_by_default(clean_
     for rank in (1, 0):
         out, evidence = _cli(cluster, "--rank", str(rank))
         assert "several ranks here" not in out
-        assert evidence.pop("watchdog")["summary"] == "finished"
-        assert evidence == mine[rank]
+        assert evidence["watchdog"]["summary"] == "finished"
+        assert _without_status(evidence) == _without_status(mine[rank])
 
     out, evidence = _cli(cluster)  # no --rank: the command's own default
     assert "several ranks here; reading rank 0" in out
-    assert evidence.pop("watchdog")["summary"] == "finished"
-    assert evidence == mine[0]
+    assert evidence["watchdog"]["summary"] == "finished"
+    assert _without_status(evidence) == _without_status(mine[0])
 
 
 # --- One rank is killed while the other keeps stepping ----------------------------------------
