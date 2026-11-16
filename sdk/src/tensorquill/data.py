@@ -340,7 +340,7 @@ def checkpoint_manifest(state: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def files_manifest(names: Iterable[str]) -> dict[str, Any]:
-    """A manifest from the file names in a Hugging Face `Trainer` checkpoint folder."""
+    """A manifest from the file names in a Hugging Face `Trainer` or Accelerate checkpoint folder."""
     components: dict[str, dict[str, Any]] = {}
     for name in sorted(names):
         lower = name.lower()
@@ -348,7 +348,10 @@ def files_manifest(names: Iterable[str]) -> dict[str, Any]:
             "optimizer" if lower.startswith("optimizer") else
             "scheduler" if lower.startswith("scheduler") else
             "scaler" if lower.startswith("scaler") else
-            "rng" if lower.startswith("rng_state") else
+            "rng" if lower.startswith(("rng_state", "random_states")) else
+            # The Trainer resumes its data from the step and epoch in trainer_state.json;
+            # Accelerate saves its samplers' and loaders' states.
+            "data" if lower == "trainer_state.json" or lower.startswith(("sampler", "dl_state_dict")) else
             "model" if lower.endswith((".safetensors", ".bin")) and ("model" in lower) else
             None
         )

@@ -30,7 +30,9 @@ from test_flight_e2e import BINARY, Server  # noqa: E402
 pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
 
 ATTEMPT_KINDS = {"repeated_steps", "resume_lr_change"}  # these need more than one attempt
-PORTED = {
+# Read from the `data` and `checkpoint` fields; their own fixtures are in test_data_server.py.
+DATA_KINDS = {"resume_data_mismatch", "resume_incomplete", "data_stalled", "epoch_order_repeated"}
+PORTED = DATA_KINDS | {
     "moe_imbalance", "starved_experts", "grad_spike", "stalled_weights", "loss_scale_trouble", "activation_spike",
     "activation_drift", "dead_activations", "non_finite", "replica_drift",
 } | ATTEMPT_KINDS
@@ -212,7 +214,7 @@ def everything(steps: int = 300) -> list[dict]:
 
 def test_the_fixture_has_every_kind_the_server_reports():
     found = reference(everything())
-    assert {i["kind"] for i in found} == PORTED - ATTEMPT_KINDS
+    assert {i["kind"] for i in found} == PORTED - ATTEMPT_KINDS - DATA_KINDS
     by_kind = {i["kind"]: i for i in found}
     assert (by_kind["stalled_weights"]["step"], by_kind["stalled_weights"]["parameters"]) == (245, ["w2"])
     assert by_kind["stalled_weights"]["optimizer"] == {"state": "known", "not_held": ["w2"], "not_held_count": 1, "held_count": 0}
@@ -250,7 +252,7 @@ def test_the_server_reports_what_python_reports_after_every_stretch(tmp_path):
         assert document["moe_flagged"] == flagged(records[:upto]), f"after {upto} steps"
         assert document["steps"] == upto and document["source"] == "tensorquill-server"
         kinds_seen.append(len(expected))
-    assert kinds_seen[0] == 0 and kinds_seen[-1] == len(PORTED - ATTEMPT_KINDS)  # nothing early, everything by the end
+    assert kinds_seen[0] == 0 and kinds_seen[-1] == len(PORTED - ATTEMPT_KINDS - DATA_KINDS)  # nothing early, everything by the end
     # One rebuild, for the first part after the server started; every later part was added
     # to the state that was kept.
     assert document["rebuilds"] == 1

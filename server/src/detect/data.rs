@@ -200,7 +200,7 @@ impl EpochOrder {
         }
         let needed = ORDER_MIN_BATCHES.min(previous.count);
         let distinct = self.current.iter().any(|hash| *hash != self.current[0]);
-        if needed >= 2 && position + 1 >= needed && distinct {
+        if position + 1 >= needed && distinct {
             let mut incident = json!({
                 "kind": "epoch_order_repeated",
                 "step": self.first,

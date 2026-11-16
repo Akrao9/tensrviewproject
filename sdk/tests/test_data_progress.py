@@ -171,6 +171,14 @@ def test_a_resume_with_a_batch_never_drawn_differs_at_the_same_step_and_is_unkno
     assert (hit["changes"][0]["basis"], hit["changes"][0]["finding"], hit["changes"][0]["matched_step"]) == ("lookup", "repeated", 0)
 
 
+def test_a_later_attempt_rolls_back_what_it_replaced_before_the_next_resume_is_judged():
+    # Attempt 2 resumed at 10 and stopped at 14, so attempt 1's batches from 10 on are no longer
+    # the run's history: attempt 3, resumed at 20 with attempt 1's batch for 20, cannot be judged.
+    hit, skipped = data_changes(run(1, range(30)) + run(2, range(10, 15), tag=lambda s: f"b-{s}") + run(3, range(20, 25)))
+    assert [(c["step"], c["finding"]) for c in hit["changes"]] == [(10, "differs")]
+    assert [s["step"] for s in skipped] == [20]
+
+
 def test_a_restart_of_the_numbering_and_a_run_without_data_are_not_judged():
     assert data_changes(run(1, range(20)) + run(2, range(0, 5), tag=lambda s: 99)) == (None, [])
     plain = [rec(s, 1) for s in range(10)] + [rec(s, 2) for s in range(5, 10)]
@@ -403,8 +411,10 @@ def test_lightning_and_nested_checkpoints_are_read_by_shape():
     assert manifest["components"]["data"]["keys"] == ["loops"]
     assert manifest["components"]["rng"]["keys"] == ["training.rng"]
     assert manifest["counters"] == {"epoch": 3, "global_step": 120} and manifest["other"] == ["hyper_parameters"]
-    assert list(files_manifest(["optimizer.pt", "scheduler.pt", "rng_state_0.pth", "model.safetensors", "trainer_state.json"])["components"]) == [
-        "model", "optimizer", "scheduler", "rng"]
+    assert list(files_manifest(["optimizer.pt", "scheduler.pt", "rng_state_0.pth", "model.safetensors", "trainer_state.json",
+                                "config.json"])["components"]) == ["model", "optimizer", "scheduler", "rng", "data"]
+    assert list(files_manifest(["pytorch_model.bin", "optimizer.bin", "random_states_0.pkl", "sampler.bin", "scaler.pt"])[
+        "components"]) == ["model", "optimizer", "scaler", "rng", "data"]  # Accelerate's save_state
 
 
 def test_a_resumed_session_records_whether_its_optimizer_came_back(tmp_path):

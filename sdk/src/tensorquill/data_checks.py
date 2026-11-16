@@ -109,7 +109,7 @@ def detect_epoch_order_repeated(records: list[dict[str, Any]]) -> dict[str, Any]
     Steps that drew batches with an `epoch` are read; a pass is compared with the one
     numbered just before it, position by position from its start, up to `ORDER_COMPARE`
     positions. It is reported once `min(ORDER_MIN_BATCHES, length of the previous pass)`
-    positions (at least two) matched with no mismatch, among them two different batches (a
+    positions matched with no mismatch, among them two different batches (so at least two; a
     loader that draws one batch over and over is `data_stalled`). A pass recorded with
     `shuffle` False is meant to keep its order and is not compared.
     """
@@ -148,7 +148,7 @@ def detect_epoch_order_repeated(records: list[dict[str, Any]]) -> dict[str, Any]
             equal = False
             continue
         needed = min(ORDER_MIN_BATCHES, previous_count)
-        if needed >= 2 and position + 1 >= needed and len(set(current)) > 1:
+        if position + 1 >= needed and len(set(current)) > 1:
             return {
                 "kind": "epoch_order_repeated",
                 "step": first,

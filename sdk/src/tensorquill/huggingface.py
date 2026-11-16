@@ -7,6 +7,7 @@ the same callback.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -62,7 +63,14 @@ class TensorQuillCallback(TrainerCallback):
             kwargs.setdefault("scaler", scaler)
         kwargs.setdefault("start_step", state.global_step)
         self.session = init(model, run_id=run_id, **kwargs)
-        self._watch = watch_accelerator(self.session, loss_name=self.loss_name)
+        self._watch = watch_accelerator(self.session, loss_name=self.loss_name, checkpoints=False)
+        if state.global_step > 0:
+            # Resumed: the Trainer loaded `checkpoint-<global_step>` (or the folder it was given).
+            given = getattr(args, "resume_from_checkpoint", None)
+            folder = Path(given) if isinstance(given, str) and Path(given).is_dir() else (
+                Path(args.output_dir) / f"checkpoint-{state.global_step}")
+            if folder.is_dir():
+                self.session.checkpoint_files(folder, event="load")
 
     # `Trainer` has no event before an evaluation or a save, only after. But its flow callback
     # sets `control.should_evaluate` / `should_save` at the end of the step or epoch, just
@@ -93,6 +101,10 @@ class TensorQuillCallback(TrainerCallback):
     def on_save(self, args: Any, state: Any, control: Any, **_: Any) -> None:
         if self.session is not None:
             self.session.set_phase("train")
+            # The Trainer has just written `checkpoint-<global_step>` under the output folder.
+            folder = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+            if folder.is_dir():
+                self.session.checkpoint_files(folder, event="save")
 
     def on_train_end(self, args: Any, state: Any, control: Any, **_: Any) -> None:
         self.close()

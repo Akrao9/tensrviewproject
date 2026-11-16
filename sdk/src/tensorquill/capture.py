@@ -32,7 +32,15 @@ from torch.optim.optimizer import (
     register_optimizer_step_pre_hook,
 )
 
-from .data import DataStep, WatchedLoader, checkpoint_manifest, data_fields, optimizer_entries, optimizer_step_value
+from .data import (
+    DataStep,
+    WatchedLoader,
+    checkpoint_manifest,
+    data_fields,
+    files_manifest,
+    optimizer_entries,
+    optimizer_step_value,
+)
 from .distributed import FINGERPRINT_WIDTH, replica_spread, unwrap_local
 from .probe import ProbeState, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink
@@ -868,11 +876,24 @@ class Session:
         `after_step`); a load with the next step, the first of the resumed run. The detectors
         then say what a resume did not restore.
         """
+        self._record_manifest(checkpoint_manifest(state), event)
+
+    def checkpoint_files(self, folder: str | Path, *, event: str = "save") -> None:
+        """`checkpoint` for a checkpoint folder, as the Hugging Face `Trainer` and Accelerate's
+        `save_state` write: the components are read from the file names (`optimizer.pt`,
+        `scheduler.pt`, `scaler.pt`, `rng_state*.pth` or `random_states_*.pkl`, the model's
+        weights, `trainer_state.json` or `sampler*.bin` for the data position). No file is opened."""
+        try:
+            names = [entry.name for entry in Path(folder).iterdir()]
+        except OSError:
+            return
+        self._record_manifest(files_manifest(names), event)
+
+    def _record_manifest(self, manifest: dict[str, Any], event: str) -> None:
         if self._closed:
             raise RuntimeError("the session is closed")
         if event not in ("save", "load"):
             raise ValueError('event must be "save" or "load"')
-        manifest = checkpoint_manifest(state)
         last = self._next_step - 1 if self._steps_committed else None
         if event == "save":
             manifest["after_step"] = last
