@@ -1,0 +1,10 @@
+{
+"case":"data edge short-epochs",
+"incidents":[
+{"batches_compared":2,"class":"invariant","epoch":2,"kind":"epoch_order_repeated","previous_epoch":1,"previous_sampler_epoch":null,"sampler_epoch":null,"shuffle":true,"step":4,"through_step":5}
+],
+"not_checked":[],
+"records":{"count":6,"sha256":"93a42fb8527d1a45e37006b4e839823278b950ed0cf610c697c42f1658525e69"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: epoch_order_repeated","kinds":["epoch_order_repeated"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

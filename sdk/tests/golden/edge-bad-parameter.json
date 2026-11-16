@@ -1,0 +1,10 @@
+{
+"case":"edge bad-parameter",
+"incidents":[
+{"class":"invariant","gradients":["w2"],"kind":"non_finite","layers":[],"step":5}
+],
+"not_checked":[],
+"records":{"count":8,"sha256":"22f3a56489600d53ee7b3f19477b01b97d5c572741ce3c8892ea0ae78d457b20"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: non_finite","kinds":["non_finite"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

@@ -1,0 +1,8 @@
+{
+"case":"data edge one-batch-epochs",
+"incidents":[],
+"not_checked":[],
+"records":{"count":3,"sha256":"f64c565909cb6cbde8a98d812f895b18456cd6f2cf6bc7a58752b5f432b51842"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

@@ -1,0 +1,10 @@
+{
+"case":"attention, the first probes",
+"incidents":[],
+"not_checked":[
+{"check":"attention","kinds":["attention_collapse","attention_uniform","attention_logit_growth"],"reason":"3 probes recorded attention; a layer is judged against its own first 2 and a change must hold on 2 probes in a row, so 4 are needed"}
+],
+"records":{"count":30,"sha256":"63db62395842d9ea45b84f2c10d0315fea5e6201544da3adc80b137c76883c4d"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"checks":["attention"],"code":"not_checked","detail":"not checked: attention","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

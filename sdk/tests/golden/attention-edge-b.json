@@ -1,0 +1,10 @@
+{
+"case":"attention edge b",
+"incidents":[
+{"affected":1,"affected_probes":2,"class":"anomaly","confirmed_step":59,"kind":"attention_collapse","modules":[{"baseline":0.4,"baseline_probes":3,"heads":4,"module":"f","ratio":0.3,"value":0.12}],"probes":10,"scalars":{"train/loss":{"median_before":2.3,"value":2.0}},"step":49}
+],
+"not_checked":[],
+"records":{"count":110,"sha256":"15d656f52f7f7232d3e1d7c5c98c083e6fc7d29c52c7b33e6137acb8b86a16b8"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: attention_collapse","kinds":["attention_collapse"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

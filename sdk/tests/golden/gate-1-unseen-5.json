@@ -1,0 +1,10 @@
+{
+"case":"gate 1 unseen-5",
+"incidents":[
+{"affected":1,"affected_steps":4,"class":"anomaly","kind":"activation_spike","modules":[{"baseline":9.981143813876251,"module":"blocks.13","ratio":95.83806839210054,"stat":"abs_max","value":956.5735434656633}],"scalars":{"loss":{"median_before":1.8839306162296223,"value":1.8958398895384958}},"step":260}
+],
+"not_checked":[],
+"records":{"count":400,"sha256":"ccffe667dc813c65b240059715807209ffadff0acb6d38a0d3337ce5a306d400"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: activation_spike","kinds":["activation_spike"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

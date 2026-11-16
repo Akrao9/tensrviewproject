@@ -427,7 +427,7 @@ An empty `incidents` list means "no incidents" only in a report that covers what
 | `stale` | Still behind after that wait: the server was restarted with `--no-detect`, its detectors failed for this rank, or it died between storing a part and reporting on it | Reads the parts and runs the detectors here, and says the report stops at step X while the store holds step Y |
 | `missing` | Parts, and no report: `--no-detect`, or a server from before its detectors | The same, at once if no report was ever seen |
 | `unusable` | A report for another run or rank, from a server with fewer kinds, ahead of the store, or beside parts whose names carry no steps | The same, at once |
-| `other_thresholds` | `--overload-threshold` or `--top-k` here differ from what the server applied | The same, at once |
+| `other_thresholds` | `--overload-threshold` or `--top-k` here differ from what the server applied (its own are set with `tensorquill-server --thresholds`) | The same, at once |
 | `unreadable` | The file could not be read or parsed on this look | Waits like `behind` |
 
 Each evidence file says which happened under `detection` (`source` is `server` or `python`, with `state`, `reason`, and the steps and attempts compared), and the summary's last line says it in words. Evidence built from a report has no `samples`, `weight_trends`, `layer_count` or `router_names`: per-step data stays in the parts. `--recompute` ignores the report and gives them, at the cost above.
@@ -457,15 +457,44 @@ In Python it is `tensorquill.build_evidence(records, detectors="rust")`, and `te
 - **What it needs:** the binary, on `PATH` or named by `TENSORQUILL_SERVER_BIN`, and `pyarrow` (the `flight` extra). The records travel as an Arrow stream in the schema the sender uses.
 - **What comes from Rust:** the incidents of the 25 per-rank kinds, with their scalars, and the `not_checked` entries. The evidence then carries `"detectors": "rust"`.
 - **What is still made in Python:** the per-step MoE `samples`, the weight trends, the run state, and the kinds read from other files (the server's status, TrainCheck, the Flight Recorder).
+- **Thresholds:** the five options of `build_evidence` (`overload_threshold`, `drift_tolerance`, `starve_window`, `starve_ratio`, `top_k`) go to the Rust rules, so `--overload-threshold` and `--top-k` work with `--detectors rust`. See "Detector thresholds" below.
 - **Limits:**
   - The default is still `detectors="python"`.
-  - The Rust rules take no options, so `--top-k` and any threshold other than the default are refused.
   - It reads one rank once: `--watch` and `--rank all` are refused.
   - A binary built from other thresholds than the SDK's, or one that lacks any of the 25 kinds, is refused.
 - **Checked** in `tests/test_server_detect.py`: both paths give the same evidence on 57 record sets and on the seven Gate 1 fixtures. The record sets plant every one of the 25 kinds and every kind of `not_checked` entry, and include resumes and restarts written a stretch at a time and the edge cases of the server parity tests. Run by hand on the seven GPU captures of Nov 15, 2026, they agree too.
 - **Two differences, both pinned by a test:**
   - A step written twice within one attempt is reported by both, but Rust attaches the scalars logged at its second writing and Python those of its first. The server's own store never holds such rows.
   - Attempts out of order in the input are read oldest first, as a store holds them; Python reads a file in the order written.
+
+### Detector thresholds
+
+The Rust detectors take their options as one JSON object, `--thresholds`, on the server and on `detect`:
+
+```sh
+tensorquill-server --store /var/lib/tensorquill --thresholds '{"overload_threshold": 0.5, "top_k": 2}'
+tensorquill-server detect --thresholds '{"starve_window": 20}' < rows.arrow
+```
+
+| Key | Default | What it sets |
+| --- | --- | --- |
+| `overload_threshold` | `0.35` | The base assignment-share threshold for top-1 and top-2 routers |
+| `drift_tolerance` | `1e-6` | The relative spread between replicas above which a parameter has drifted |
+| `starve_window` | `50` | How many samples of a router the starved check sums over |
+| `starve_ratio` | `0.1` | An expert is starved below this fraction of an even share of that window |
+| `top_k` | `null` | Experts chosen per token: `null` is what the run recorded, a number applies to every router, and an object gives a number per router name |
+
+- **A key left out keeps its default**, so `{}` and no argument are the same.
+- **Refused, with exit status 2 before the server listens or `detect` reads its input:** an unknown key, anything that is not a JSON object, a value of the wrong type, a negative number, and a `starve_window` or `top_k` below 1.
+- **Only these five are options.** A report lists every other rule's constant under `thresholds` too, but those cannot be set.
+- **Every report says what was applied.** `incidents.json` and the output of `detect` list the five values under `thresholds`, and a `replica_drift` incident carries the tolerance it was judged by.
+- **A reader uses the report only when it asks for the same five values.** `python -m tensorquill STORE --watch --top-k 2` uses the report of a server started with `"top_k": 2`; before, any `--top-k` made the reader recompute in Python. A reader that asks for other values gets `other_thresholds` and recomputes.
+- **Two gaps in that, both open:**
+  - The Python command line has flags for two of the five, `--overload-threshold` and `--top-k`. A server started with another `drift_tolerance`, `starve_window` or `starve_ratio` can be matched through `watch(...)` in Python but not from the command line, where `--watch` then recomputes at the defaults.
+  - `--rank all` refuses `--top-k`, so every rank of a server started with a `top_k` reads `other_thresholds` there. Checked by hand on a one-rank store.
+- **From Python**, `build_evidence(..., detectors="rust")` sends its own options this way, and `server_report(records, thresholds={...})` takes the object directly. A value the Rust rules refuse raises `ValueError` with the server's reason.
+- **Checked** in `tests/test_server_detect.py`: 17 option values and one combination of all five, each on the eight record sets that hold MoE counts or a replica spread, give the same evidence on both paths, and each changes at least one incident in Python, so an ignored option would fail. A per-router `top_k` is tested on five record sets against the value recorded on every row. A live server started with thresholds matches Python across three appended stretches and a restart, and a watcher asking for the same values takes its report while one asking for the defaults recomputes.
+- **Not re-timed:** the 64-rank detector benchmark has not been rerun with the options in place.
 
 ## Data progress and checkpoints
 

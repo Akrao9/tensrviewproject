@@ -78,6 +78,8 @@ pub struct IngestConfig {
     pub status_refresh: Duration,
     /// Whether the detectors run over each stored part and `incidents.json` is written (see `detect`).
     pub detect: bool,
+    /// The options those detectors apply (`--thresholds`), echoed in every report.
+    pub thresholds: Arc<crate::detect::Thresholds>,
     /// A run whose ranks have all been disconnected or finished for this long is abandoned: its
     /// status stops being refreshed and a restarted server does not take it up again. Zero never
     /// gives a run up.
@@ -97,6 +99,7 @@ impl Default for IngestConfig {
             watchdog_interval: DEFAULT_WATCHDOG_INTERVAL,
             status_refresh: DEFAULT_WATCHDOG_INTERVAL * 3,
             detect: true,
+            thresholds: Arc::default(),
             abandon_after: crate::watchdog::DEFAULT_ABANDON,
         }
     }
@@ -398,9 +401,14 @@ impl Ingest {
             // The first part since this server started, or rows that are not a plain
             // continuation (a new attempt, an older attempt's rows sent late): rebuild
             // from everything stored, which includes this part.
-            let replayed = std::panic::AssertUnwindSafe(crate::detect::replay(&self.storage, &key.0, key.1))
-                .catch_unwind()
-                .await;
+            let replayed = std::panic::AssertUnwindSafe(crate::detect::replay(
+                &self.storage,
+                &key.0,
+                key.1,
+                &self.config.thresholds,
+            ))
+            .catch_unwind()
+            .await;
             buffer.rebuilds += 1;
             buffer.detectors = match replayed {
                 Ok(Ok(detectors)) => Some(detectors),

@@ -1,0 +1,10 @@
+{
+"case":"system edge rise",
+"incidents":[
+{"baseline_share":0.05000000000000001,"class":"anomaly","kind":"input_starvation","median_data_wait":0.027000000000000003,"median_share":0.27,"median_step_time":0.1,"rule":"rise","step":50,"window":20}
+],
+"not_checked":[],
+"records":{"count":80,"sha256":"c0d2e18139391cce675e905315d065ab47d6ec0c475d4a3791b8951e0839600d"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: input_starvation","kinds":["input_starvation"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

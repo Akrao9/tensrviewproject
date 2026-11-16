@@ -1,0 +1,14 @@
+{
+"case":"system, 230 steps",
+"incidents":[
+{"allocated":5342494720,"allocated_first":4293918720,"bytes_per_step":20971520.0,"class":"anomaly","first_step":139,"kind":"memory_growth","readings":6,"scalars":{"train/loss":{"median_before":0.46961947626841244,"value":0.3765690376569038}},"step":189,"steps_to_total":564.45,"total":17179869184},
+{"allocated":6181355520,"class":"observation","fraction":0.9562499999883585,"kind":"memory_pressure","reserved":16428249907,"scalars":{"train/loss":{"median_before":0.39690306411671694,"value":0.35842293906810035}},"step":229,"total":17179869184},
+{"baseline_share":0.1005,"class":"anomaly","kind":"input_starvation","median_data_wait":0.033124000000000015,"median_share":0.3660000000000001,"median_step_time":0.1005,"rule":"share","scalars":{"train/loss":{"median_before":0.7433235294117648,"value":0.6687500000000001}},"step":110,"window":20}
+],
+"not_checked":[
+{"check":"nvml","kinds":["hardware_errors"],"metric":"xid","reason":"NVMLError_NotSupported: Not Supported","step":9}
+],
+"records":{"count":230,"sha256":"82804f2fff79835d34fd78068fd0d6b971ae734ae18f9d5fee184143a27931ec"},
+"run_state":{"reasons":[{"code":"incidents","detail":"2 incidents listed: memory_growth, input_starvation","kinds":["memory_growth","input_starvation"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"checks":["nvml"],"code":"not_checked","detail":"not checked: nvml","state":"degraded"},{"code":"observations","detail":"1 observation listed, not counted as failures: memory_pressure","kinds":["memory_pressure"],"state":"healthy"}],"state":"unhealthy"},
+"samples":[]
+}

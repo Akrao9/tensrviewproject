@@ -1,0 +1,8 @@
+{
+"case":"data edge kept-order",
+"incidents":[],
+"not_checked":[],
+"records":{"count":8,"sha256":"20f579d7a945a8cdc859c56f63ccb1420a52a5accdd4a7a6092ada055328672b"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

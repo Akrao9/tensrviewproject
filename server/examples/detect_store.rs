@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use serde::de::IgnoredAny;
-use tensorquill_server::detect::{replay, RankDetectors, PORTED};
+use tensorquill_server::detect::{replay, RankDetectors, Thresholds, PORTED};
 use tensorquill_server::storage::{Error, Storage};
 
 fn ms(duration: Duration) -> f64 {
@@ -72,9 +72,11 @@ async fn main() -> Result<(), Error> {
         return Err("usage: detect_store <store> <run_id> (--rank <n> | --bench)".into());
     };
     let storage = Storage::from_url(store)?;
+    // The benchmark measures the rules at their usual values.
+    let thresholds = std::sync::Arc::new(Thresholds::default());
     if mode == "--rank" {
         let rank: i32 = rest.first().ok_or("--rank needs a number")?.parse()?;
-        let detectors = replay(&storage, run_id, rank).await?;
+        let detectors = replay(&storage, run_id, rank, &thresholds).await?;
         let document = serde_json::json!({
             "run_id": run_id,
             "rank": rank,
@@ -97,7 +99,7 @@ async fn main() -> Result<(), Error> {
     let scratch_dir = tempfile::tempdir()?;
     let scratch = Storage::from_url(scratch_dir.path().to_str().ok_or("bad scratch path")?)?;
 
-    let mut detectors: Vec<RankDetectors> = ranks.iter().map(|_| RankDetectors::new()).collect();
+    let mut detectors: Vec<RankDetectors> = ranks.iter().map(|_| RankDetectors::new(&thresholds)).collect();
     let (mut detect, mut write, mut decode, mut read, mut report) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut rows, mut steps_per_flush) = (0usize, 0usize);
@@ -161,7 +163,7 @@ async fn main() -> Result<(), Error> {
 
     // Rebuilding from the store, as after a restart: one rank, then all of them at once.
     let started = Instant::now();
-    let one = replay(&storage, run_id, ranks[0]).await?;
+    let one = replay(&storage, run_id, ranks[0], &thresholds).await?;
     println!(
         "replay of one rank ({} steps): {:.0} ms",
         one.rows(),
@@ -170,9 +172,11 @@ async fn main() -> Result<(), Error> {
     let started = Instant::now();
     let mut tasks = Vec::new();
     for rank in ranks.clone() {
-        let (storage, run_id) = (storage.clone(), run_id.clone());
+        let (storage, run_id, thresholds) = (storage.clone(), run_id.clone(), thresholds.clone());
         tasks.push(tokio::spawn(async move {
-            replay(&storage, &run_id, rank).await.map(|detectors| detectors.rows())
+            replay(&storage, &run_id, rank, &thresholds)
+                .await
+                .map(|detectors| detectors.rows())
         }));
     }
     let mut replayed = 0;

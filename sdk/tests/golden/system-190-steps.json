@@ -1,0 +1,13 @@
+{
+"case":"system, 190 steps",
+"incidents":[
+{"allocated":5342494720,"allocated_first":4293918720,"bytes_per_step":20971520.0,"class":"anomaly","first_step":139,"kind":"memory_growth","readings":6,"scalars":{"train/loss":{"median_before":0.46961947626841244,"value":0.3765690376569038}},"step":189,"steps_to_total":564.45,"total":17179869184},
+{"baseline_share":0.1005,"class":"anomaly","kind":"input_starvation","median_data_wait":0.033124000000000015,"median_share":0.3660000000000001,"median_step_time":0.1005,"rule":"share","scalars":{"train/loss":{"median_before":0.7433235294117648,"value":0.6687500000000001}},"step":110,"window":20}
+],
+"not_checked":[
+{"check":"nvml","kinds":["hardware_errors"],"metric":"xid","reason":"NVMLError_NotSupported: Not Supported","step":9}
+],
+"records":{"count":190,"sha256":"ad784c345c0df99b7dca240ff06aa6e0fed8f3546505f7d026ac80e4392c9611"},
+"run_state":{"reasons":[{"code":"incidents","detail":"2 incidents listed: memory_growth, input_starvation","kinds":["memory_growth","input_starvation"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"checks":["nvml"],"code":"not_checked","detail":"not checked: nvml","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}

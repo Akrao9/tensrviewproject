@@ -1,0 +1,14 @@
+{
+"case":"system edge odd",
+"incidents":[
+{"alloc_retries":null,"class":"observation","kind":"allocator_retries","ooms":1,"step":13},
+{"class":"invariant","ecc_uncorrected":1,"ecc_uncorrected_at_start":0,"kind":"hardware_errors","step":12,"xid":[]},
+{"class":"observation","kind":"gpu_throttled","power_limit_w":null,"power_w":null,"reasons":["hw_power_brake"],"sm_clock_mhz":null,"step":11,"temperature_c":1.0}
+],
+"not_checked":[
+{"check":"nvml","kinds":["gpu_throttled"],"metric":"throttle","reason":"5","step":6}
+],
+"records":{"count":40,"sha256":"5570407ac6bbe222ffda6e36b2e2f4c52500c6953ca824d10ee177a53b517713"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: hardware_errors","kinds":["hardware_errors"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"},{"checks":["nvml"],"code":"not_checked","detail":"not checked: nvml","state":"degraded"},{"code":"observations","detail":"2 observations listed, not counted as failures: allocator_retries, gpu_throttled","kinds":["allocator_retries","gpu_throttled"],"state":"healthy"}],"state":"unhealthy"},
+"samples":[]
+}

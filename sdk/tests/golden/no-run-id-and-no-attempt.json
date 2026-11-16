@@ -1,0 +1,8 @@
+{
+"case":"no run id and no attempt",
+"incidents":[],
+"not_checked":[],
+"records":{"count":30,"sha256":"c1447df6f7b04901a915861a942df1285eccfe0df228b4bd984f93d342709c78"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

@@ -1,9 +1,11 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use tensorquill_server::detect::Thresholds;
 use tensorquill_server::ingest::{Ingest, IngestConfig, DEFAULT_FLUSH_STEPS, DEFAULT_QUOTA_BYTES};
 use tensorquill_server::server::{check_bind, serve, Tls};
 use tensorquill_server::storage::{Error, Storage, StoreOptions};
@@ -63,6 +65,13 @@ struct Args {
     /// Do not run the detectors over stored parts or write rank=<rank>/incidents.json.
     #[arg(long)]
     no_detect: bool,
+    /// Detector thresholds as one JSON object, for the server's detectors and for `detect`. Keys:
+    /// overload_threshold (0.35), drift_tolerance (1e-6), starve_window (50), starve_ratio (0.1) and
+    /// top_k (null: what the run recorded; a number for every router, or an object of router name
+    /// to number). A key left out keeps the default shown. Refused: an unknown key, a negative or
+    /// non-finite number, a window or top_k below 1. Every report lists the values applied.
+    #[arg(long, global = true, value_name = "JSON", value_parser = Thresholds::parse)]
+    thresholds: Option<Thresholds>,
     /// How long a failing request to S3 or GCS is retried before the stream is told the store is unavailable
     /// (the sender keeps its rows and tries again). Also bounds how long SIGTERM waits for a failing store.
     #[arg(long, default_value_t = 30.0)]
@@ -86,10 +95,11 @@ enum Command {
 }
 
 /// `tensorquill-server detect`: the report goes to standard output as one line of JSON.
-fn detect(input: Option<PathBuf>) -> Result<(), Error> {
+fn detect(input: Option<PathBuf>, thresholds: &Arc<Thresholds>) -> Result<(), Error> {
+    use tensorquill_server::detect::detect_stream;
     let report = match input.filter(|path| path.as_os_str() != "-") {
-        Some(path) => tensorquill_server::detect::detect_stream(std::io::BufReader::new(std::fs::File::open(path)?)),
-        None => tensorquill_server::detect::detect_stream(std::io::stdin().lock()),
+        Some(path) => detect_stream(std::io::BufReader::new(std::fs::File::open(path)?), thresholds),
+        None => detect_stream(std::io::stdin().lock(), thresholds),
     }?;
     println!("{report}");
     Ok(())
@@ -141,6 +151,7 @@ async fn run(args: Args) -> Result<(), Error> {
         watchdog_interval: Duration::from_secs_f64(args.watchdog_seconds),
         status_refresh: Duration::from_secs_f64(args.watchdog_seconds * 3.0),
         detect: !args.no_detect,
+        thresholds: Arc::new(args.thresholds.unwrap_or_default()),
         abandon_after: Duration::from_secs_f64(args.abandon_hours * 3600.0),
     };
     let options = StoreOptions {
@@ -180,7 +191,7 @@ async fn run(args: Args) -> Result<(), Error> {
 async fn main() -> ExitCode {
     let mut args = Args::parse();
     let outcome = match args.command.take() {
-        Some(Command::Detect { input }) => detect(input),
+        Some(Command::Detect { input }) => detect(input, &Arc::new(args.thresholds.take().unwrap_or_default())),
         None => run(args).await,
     };
     match outcome {

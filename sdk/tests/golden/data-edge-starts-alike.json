@@ -1,0 +1,8 @@
+{
+"case":"data edge starts-alike",
+"incidents":[],
+"not_checked":[],
+"records":{"count":8,"sha256":"cc6ec619fff8d4e30ca1a3259ceaa3c21d99584d635f3bfb1f79b51bbf0da89f"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

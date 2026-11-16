@@ -1,0 +1,8 @@
+{
+"case":"data edge skipped-epoch",
+"incidents":[],
+"not_checked":[],
+"records":{"count":4,"sha256":"27f172e05b010114784c49b6bfb2536c3d9c79ffbc149c6f48f483783dc83691"},
+"run_state":{"reasons":[{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"degraded"},
+"samples":[]
+}

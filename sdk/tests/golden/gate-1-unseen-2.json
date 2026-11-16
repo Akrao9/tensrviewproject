@@ -1,0 +1,10 @@
+{
+"case":"gate 1 unseen-2",
+"incidents":[
+{"baseline":1.3637735901021435,"class":"anomaly","grad_norm":13.209140679629277,"kind":"grad_spike","parameters":[{"baseline":0.1543334792542903,"grad_norm":13.143998594885522,"name":"blocks.7.mlp.fc2.weight","ratio":85.16621706706022,"rising_since":308}],"ratio":9.685728463652051,"scalars":{"loss":{"median_before":1.8509682151772893,"value":3.2253832667503004}},"spike_count":1,"spike_steps":[310],"step":310}
+],
+"not_checked":[],
+"records":{"count":400,"sha256":"ec3f0b03f6dd43029fdcc200128c522380e0b9229b75b73a02e05b4958e932a4"},
+"run_state":{"reasons":[{"code":"incidents","detail":"1 incident listed: grad_spike","kinds":["grad_spike"],"state":"unhealthy"},{"code":"no_status","detail":"no progress status (the server's watchdog.json): whether the job is still making progress is not checked","state":"degraded"}],"state":"unhealthy"},
+"samples":[]
+}
