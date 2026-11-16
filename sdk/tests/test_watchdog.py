@@ -1,5 +1,6 @@
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -253,3 +254,307 @@ def test_watch_sees_a_warning_become_critical_with_no_new_records(tmp_path):
 
     tensorquill.evidence.watch(path, tmp_path / "out.json", interval=0.01, polls=4, on_update=on_update, watchdog=status)
     assert seen == ["warning", "critical"]
+
+
+def _write_rank_part(run: Path, rank: int, steps: range, *, extra: dict | None = None) -> None:
+    pq = pytest.importorskip("pyarrow.parquet")
+    import pyarrow as pa
+    from tensorquill.flight import records_to_batch
+
+    attempt = run / f"rank={rank}" / "attempt=1"
+    attempt.mkdir(parents=True, exist_ok=True)
+    records = [
+        {
+            "run_id": run.name,
+            "rank": rank,
+            "attempt": 1,
+            "step": s,
+            "schema_version": 1,
+            "grad_norm": 1.0,
+            "moe": {"r": [10, 10]},
+            **(extra or {}),
+        }
+        for s in steps
+    ]
+    pq.write_table(
+        pa.Table.from_batches([records_to_batch(records)]),
+        attempt / f"part-{steps.start:08d}-{steps.stop - 1:08d}.parquet",
+    )
+
+
+def _write_current_report(run: Path, rank: int, last_step: int, steps: int) -> None:
+    from tensorquill import evidence as ev
+
+    folder = run / f"rank={rank}"
+    report = {
+        "schema_version": 1,
+        "source": "tensorquill-server",
+        "run_id": run.name,
+        "rank": rank,
+        "attempt": 1,
+        "last_step": last_step,
+        "steps": steps,
+        "rebuilds": 0,
+        "thresholds": {
+            "overload_threshold": ev.OVERLOAD_THRESHOLD,
+            "drift_tolerance": ev.DRIFT_TOLERANCE,
+            "starve_window": ev.STARVE_WINDOW,
+            "starve_ratio": ev.STARVE_RATIO,
+        },
+        "checked": list(ev.SERVER_KINDS),
+        "not_checked": [
+            {"check": "flight_recorder", "reason": "not given"},
+            {"check": "traincheck", "reason": "not given"},
+        ],
+        "incidents": [],
+    }
+    (folder / "incidents.json").write_text(json.dumps(report))
+
+
+def _write_stuck_fr_dumps(dumps: Path) -> bool:
+    try:
+        __import__("torch.distributed.flight_recorder.components.builder")
+    except Exception:
+        return False
+    import pickle
+
+    def entry(i, seq, state="completed"):
+        return {
+            "profiling_name": "nccl:all_reduce",
+            "state": state,
+            "process_group": ("0", "default_pg"),
+            "input_sizes": [[4]],
+            "output_sizes": [[4]],
+            "input_dtypes": "float32",
+            "output_dtypes": "float32",
+            "collective_seq_id": str(seq),
+            "p2p_seq_id": "0",
+            "time_created_ns": 0,
+            "frames": [],
+            "record_id": i,
+            "is_p2p": False,
+        }
+
+    dumps.mkdir(parents=True, exist_ok=True)
+    for rank, entries in ((0, [entry(0, 1), entry(1, 2, "started")]), (1, [entry(0, 1)])):
+        (dumps / f"nccl_trace_rank_{rank}").write_bytes(pickle.dumps({
+            "entries": entries,
+            "version": "2.8",
+            "pg_config": {"0": {"name": "0", "desc": "default_pg", "ranks": "[0, 1]"}},
+        }))
+    return True
+
+
+def test_watch_surfaces_watchdog_and_external_sources_during_report_grace(tmp_path, monkeypatch):
+    from tensorquill import evidence as ev
+
+    now = time.time()
+    run = tmp_path / "runs" / "r"
+    _write_rank_part(run, 0, range(0, 5), extra={"ts": now - 10})
+    _write_current_report(run, 0, 4, 5)
+    status = run / "watchdog.json"
+    status.write_text(json.dumps(_status("active", [_rank(0, "active", 4)])))
+    tc_file = tmp_path / "violations_summary.json"
+    fr_dir = tmp_path / "fr_dumps"
+    fr_dir.mkdir()
+    has_fr = False
+
+    seen: list[tuple[str, list[str]]] = []
+    poll_count = 0
+    real_read_watchdog = ev.read_watchdog
+
+    def step_hooks(path):
+        nonlocal poll_count, has_fr
+        poll_count += 1
+        if poll_count == 3:
+            # Server still hasn't caught up on incidents.json (e.g. restarted with --no-detect),
+            # but the job stalls -> must emit immediately without waiting out report_grace.
+            status.write_text(json.dumps(_status("stalled", [_rank(0, "silent", 4, 900.0, beat=2.0, severity="critical")])))
+        elif poll_count == 4:
+            # Later-written TrainCheck summary with no incidents.json or watchdog.json change.
+            tc_file.write_text(json.dumps({
+                "distinct_invariants_violated": 1,
+                "first_violation_step": 3,
+                "violations": [{"display_name": "grad_norm_bounds", "first_step": 3, "last_step": 3, "occurrences": 1}],
+            }))
+        elif poll_count == 5:
+            # Later-written Flight Recorder dump triggers a fresh emit via seen signature too.
+            has_fr = _write_stuck_fr_dumps(fr_dir)
+            if not has_fr:
+                (fr_dir / "dump_rank_0").write_bytes(b"new-dump")
+        return real_read_watchdog(path)
+
+    monkeypatch.setattr(ev, "read_watchdog", step_hooks)
+
+    def on_update(evidence, _out):
+        seen.append((evidence["detection"]["state"], [i["kind"] for i in evidence["incidents"]]))
+        if len(seen) == 1:
+            # Make incidents.json "behind" while inside the long 3600 s grace window; poll 2 changes nothing else.
+            _write_rank_part(run, 0, range(5, 10), extra={"ts": now - 5})
+
+    ev.watch(
+        run,
+        tmp_path / "out.json",
+        interval=0.0,
+        polls=5,
+        report_grace=3600.0,
+        traincheck=tc_file,
+        flight_recorder=fr_dir,
+        on_update=on_update,
+    )
+    expected_poll5 = ["job_stalled", "traincheck_violation", "collective_hang"] if has_fr else ["job_stalled", "traincheck_violation"]
+    assert seen == [
+        ("current", []),
+        ("behind", ["job_stalled"]),
+        ("behind", ["job_stalled", "traincheck_violation"]),
+        ("behind", expected_poll5),
+    ]
+    latest = json.loads((tmp_path / "out.json").read_text())
+    if has_fr:
+        [stall] = [i for i in latest["incidents"] if i["kind"] == "job_stalled"]
+        assert stall["assessment"] == "confirmed_hang" and stall["corroborated_by"] == "collective_hang"
+    else:
+        assert any(item.get("check") == "flight_recorder" for item in latest.get("not_checked", []))
+
+    # Same on the Python tail path: once stalled and emitted, later Flight Recorder dumps trigger a new emit.
+    monkeypatch.setattr(ev, "read_watchdog", real_read_watchdog)
+    jsonl = tmp_path / "run.rank0.jsonl"
+    jsonl.write_text("".join(json.dumps({"run_id": "r", "rank": 0, "step": s, "grad_norm": 1.0, "ts": now - 10 + s}) + "\n" for s in range(5)))
+    py_fr = tmp_path / "py_fr"
+    py_fr.mkdir()
+    py_status = tmp_path / "py_watchdog.json"
+    py_status.write_text(json.dumps(_status("stalled", [_rank(0, "silent", 4, 900.0, beat=2.0, severity="critical")])))
+    py_seen: list[list[str]] = []
+
+    def py_update(evidence, _out):
+        py_seen.append([i["kind"] for i in evidence["incidents"]])
+        if len(py_seen) == 1:
+            if not _write_stuck_fr_dumps(py_fr):
+                (py_fr / "dump_rank_0").write_bytes(b"new-dump")
+
+    ev.watch(jsonl, tmp_path / "py_out.json", interval=0.0, polls=3, watchdog=py_status, flight_recorder=py_fr, on_update=py_update)
+    assert len(py_seen) == 2
+    if has_fr:
+        assert py_seen == [["job_stalled"], ["job_stalled", "collective_hang"]]
+
+
+def test_watch_at_t0_handles_late_ranks_without_latching_or_mixing(tmp_path, monkeypatch, capsys):
+    import functools
+    import sys
+    from tensorquill import evidence as ev
+
+    # 1) CLI --watch starts before rank=0 flushes (only rank=1 exists), then rank=0 arrives and falls back to Python.
+    run = tmp_path / "runs" / "r"
+    _write_rank_part(run, 1, range(0, 5))
+    poll = 0
+    real_stamp = ev._other_sources_stamp
+
+    def advance_ranks(**kw):
+        nonlocal poll
+        poll += 1
+        if poll == 2:
+            _write_rank_part(run, 0, range(0, 3))
+        elif poll == 3:
+            _write_rank_part(run, 0, range(3, 10))
+        return real_stamp(**kw)
+
+    monkeypatch.setattr(ev, "_other_sources_stamp", advance_ranks)
+    real_watch = ev.watch
+    monkeypatch.setattr(ev, "watch", functools.partial(real_watch, polls=3))
+    out = tmp_path / "cli.evidence.json"
+    monkeypatch.setattr(sys, "argv", ["tensorquill", str(run), "--watch", "--interval", "0", "-o", str(out)])
+    ev.main()
+    evidence = json.loads(out.read_text())
+    assert [s["step"] for s in evidence["samples"]] == list(range(10))
+    assert "several ranks here; reading rank 0" in capsys.readouterr().out
+
+    # Undo test patches before Subtests 2 & 3.
+    monkeypatch.setattr(ev, "watch", real_watch)
+    monkeypatch.setattr(ev, "_other_sources_stamp", real_stamp)
+
+    # 2) rank=0 flushes first with a current report; rank=1 arrives on poll 2; poll 3 goes stale -> Tail reads rank=0 only.
+    run2 = tmp_path / "runs" / "r2"
+    _write_rank_part(run2, 0, range(0, 4))
+    _write_current_report(run2, 0, 3, 4)
+    poll2 = 0
+    real_read_report = ev.read_server_report
+
+    def spawn_rank1_and_stale(folder, **kw):
+        nonlocal poll2
+        poll2 += 1
+        if poll2 == 2:
+            _write_rank_part(run2, 1, range(0, 4))
+        elif poll2 == 3:
+            _write_rank_part(run2, 0, range(4, 8))
+        return real_read_report(folder, **kw)
+
+    monkeypatch.setattr(ev, "read_server_report", spawn_rank1_and_stale)
+    out2 = tmp_path / "cli2.evidence.json"
+    real_watch(run2, out2, interval=0.0, polls=3, report_grace=0.0, default_rank=0)
+    ev2 = json.loads(out2.read_text())
+    assert ev2["detection"]["source"] == "python"
+    assert [s["step"] for s in ev2["samples"]] == list(range(8))
+
+    # 3) Direct watch(run, rank=None) without default_rank does NOT stay latched on rank=1 when rank=0 appears.
+    monkeypatch.setattr(ev, "read_server_report", real_read_report)
+    run3 = tmp_path / "runs" / "r3"
+    _write_rank_part(run3, 1, range(0, 4))
+    _write_current_report(run3, 1, 3, 4)
+
+    def add_rank0_after_first(_ev, _out):
+        _write_rank_part(run3, 0, range(0, 4))
+
+    with pytest.raises(ValueError, match="pass rank="):
+        real_watch(run3, tmp_path / "direct.json", interval=0.0, polls=2, on_update=add_rank0_after_first)
+
+
+def test_watch_status_clock_skew_uses_monotonic_time(tmp_path, monkeypatch):
+    from tensorquill import evidence as ev
+
+    path = tmp_path / "run.rank0.jsonl"
+    path.write_text("".join(json.dumps({"run_id": "r", "rank": 0, "step": s, "grad_norm": 1.0}) + "\n" for s in range(3)))
+    status_file = tmp_path / "watchdog.json"
+
+    # Server clock 1 h behind watcher clock: poll 1 looks stale by wall clock, then a refresh clears staleness.
+    base_ms = int((time.time() - 3600.0) * 1000)
+    status_file.write_text(json.dumps({
+        **_status("active", [_rank(0, "active", 2)]),
+        "server_running": True,
+        "refresh_seconds": 5.0,
+        "written_at_ms": base_ms,
+    }))
+    ages: list[float | None] = []
+
+    def on_update_behind(evidence, _out):
+        ages.append(evidence["watchdog"].get("not_written_for_seconds"))
+        if len(ages) == 1:
+            status_file.write_text(json.dumps({
+                **_status("active", [_rank(0, "active", 2)]),
+                "server_running": True,
+                "refresh_seconds": 5.0,
+                "written_at_ms": base_ms + 5000,
+            }))
+
+    ev.watch(path, tmp_path / "out_behind.json", interval=0.0, polls=2, on_update=on_update_behind, watchdog=status_file)
+    assert ages[0] is not None and ages[0] > 3000.0
+    assert ages[1] is None
+
+    # Server clock 1 h ahead of watcher clock (negative wall age): monotonic elapsed catches hang anyway.
+    status_file.write_text(json.dumps({
+        **_status("active", [_rank(0, "active", 2)]),
+        "server_running": True,
+        "refresh_seconds": 1.0,
+        "written_at_ms": int((time.time() + 3600.0) * 1000),
+    }))
+    mono_times = iter([100.0, 105.0, 105.0])
+    monkeypatch.setattr(ev.time, "monotonic", lambda: next(mono_times, 105.0))
+    ages.clear()
+    ev.watch(
+        path,
+        tmp_path / "out_ahead.json",
+        interval=0.0,
+        polls=2,
+        on_update=lambda e, _: ages.append(e["watchdog"].get("not_written_for_seconds")),
+        watchdog=status_file,
+    )
+    assert ages == [None, 5.0]

@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import io
 import logging
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +55,7 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
     config = JobConfig().parse_args(arguments)
     try:
         details, version = read_dir(config)
-    except (AssertionError, ValueError, OSError) as error:
+    except (AssertionError, EOFError, OSError, ValueError, pickle.UnpicklingError) as error:
         raise ValueError(f"no readable Flight Recorder dumps in {directory}: {error}") from error
 
     # The analyzer reports what it finds through a logger that prints to the console;

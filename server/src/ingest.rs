@@ -541,6 +541,7 @@ impl Ingest {
     }
 
     async fn write_statuses(&self, statuses: std::collections::BTreeMap<String, serde_json::Value>) {
+        let now = Instant::now();
         for (run_id, mut status) in statuses {
             status["refresh_seconds"] = serde_json::json!(self.config.status_refresh.as_secs_f64());
             let signature = serde_json::json!({
@@ -554,14 +555,17 @@ impl Ingest {
             })
             .to_string();
             let fresh = self.written.lock().unwrap().get(&run_id).is_some_and(|(written, at)| {
-                *written == signature && (status["summary"] == "finished" || at.elapsed() < self.config.status_refresh)
+                *written == signature
+                    && (status["summary"] == "finished"
+                        || !status_refresh_due(now.saturating_duration_since(*at), self.config.status_refresh))
             });
             if fresh {
                 continue;
             }
+            let started = Instant::now();
             match self.storage.write_status(&run_id, &status).await {
                 Ok(()) => {
-                    self.written.lock().unwrap().insert(run_id, (signature, Instant::now()));
+                    self.written.lock().unwrap().insert(run_id, (signature, started));
                 }
                 Err(error) => eprintln!("tensorquill-server: cannot write the watchdog status of {run_id}: {error}"),
             }
@@ -790,5 +794,32 @@ impl FlightService for IngestService {
     }
     async fn do_exchange(&self, _: Request<Streaming<FlightData>>) -> Reply<Self::DoExchangeStream> {
         unimplemented()
+    }
+}
+
+/// Returns whether a cached watchdog status older than `elapsed` should be rewritten.
+///
+/// Subtracts a small fraction of `status_refresh` (capped at 500 ms) so sub-second timer and
+/// write-latency jitter on discrete watchdog ticks does not defer a 30 s refresh to 40 s.
+fn status_refresh_due(elapsed: Duration, status_refresh: Duration) -> bool {
+    let margin = (status_refresh / 10).min(Duration::from_millis(500));
+    elapsed >= status_refresh.saturating_sub(margin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_refresh_due_absorbs_tick_jitter_without_short_circuiting_tests() {
+        let thirty = Duration::from_secs(30);
+        assert!(!status_refresh_due(Duration::from_secs(20), thirty));
+        assert!(status_refresh_due(Duration::from_millis(29_999), thirty));
+        assert!(status_refresh_due(thirty, thirty));
+
+        let short = Duration::from_millis(150);
+        assert!(!status_refresh_due(Duration::from_millis(10), short));
+        assert!(status_refresh_due(Duration::from_millis(140), short));
+        assert!(status_refresh_due(Duration::from_millis(200), short));
     }
 }

@@ -957,17 +957,31 @@ REPORT_GRACE_SECONDS = 30.0
 STATUS_STALE_FACTOR = 2.0
 
 
-def _rank_folder(source: Path, rank: int | None) -> Path | None:
-    """The `rank=<n>` folder that `source` and `rank` name in a server's store, if any."""
+def _own_rank(source: Path) -> int | None:
     if not source.is_dir():
         return None
     key, _, value = source.resolve().name.partition("=")
-    if key == "rank" and value.isdecimal():
-        return source if rank is None or int(value) == rank else None
+    return int(value) if key == "rank" and value.isdecimal() else None
+
+
+def _rank_dirs(source: Path) -> list[Path]:
+    """All `rank=*` directories directly under `source`, unless `source` is itself one."""
+    if not source.is_dir() or _own_rank(source) is not None:
+        return []
+    return [path for path in source.glob("rank=*") if path.is_dir()]
+
+
+def _rank_folder(source: Path, rank: int | None, dirs: list[Path] | None = None) -> Path | None:
+    """The `rank=<n>` folder that `source` and `rank` name in a server's store, if any."""
+    if not source.is_dir():
+        return None
+    own = _own_rank(source)
+    if own is not None:
+        return source if rank is None or own == rank else None
     if rank is not None:
         folder = source / f"rank={rank}"
         return folder if folder.is_dir() else None
-    folders = [path for path in source.glob("rank=*") if path.is_dir()]
+    folders = _rank_dirs(source) if dirs is None else dirs
     return folders[0] if len(folders) == 1 else None
 
 
@@ -1157,12 +1171,135 @@ def _status_age(status: Mapping[str, Any] | None) -> float | None:
     return age if age > STATUS_STALE_FACTOR * refresh else None
 
 
+class _StatusAgeTracker:
+    """Track `watchdog.json` staleness across polls without trusting cross-host wall clocks alone.
+
+    On poll 1, when clocks agree, this matches `_status_age`. Once `written_at_ms` advances
+    during watching, or fails to advance for `STATUS_STALE_FACTOR * refresh_seconds` of local
+    monotonic time, staleness comes from `time.monotonic()` directly.
+    """
+
+    def __init__(self) -> None:
+        self._written: int | float | None = None
+        self._seen_at: float | None = None
+        self._observed_live = False
+
+    def check(self, status: Mapping[str, Any] | None) -> float | None:
+        if not status:
+            return None
+        written, refresh = status.get("written_at_ms"), status.get("refresh_seconds")
+        if (
+            status.get("server_running") is not True
+            or status.get("summary") == "finished"
+            or not isinstance(written, (int, float))
+            or not isinstance(refresh, (int, float))
+            or refresh <= 0
+        ):
+            self._written = None
+            self._seen_at = None
+            self._observed_live = False
+            return None
+        now = time.monotonic()
+        if self._written is None:
+            self._written = written
+            self._seen_at = now
+            self._observed_live = False
+        elif written != self._written:
+            self._written = written
+            self._seen_at = now
+            self._observed_live = True
+        assert self._seen_at is not None
+        mono_age = now - self._seen_at
+        stale_after = STATUS_STALE_FACTOR * refresh
+        if self._observed_live:
+            return mono_age if mono_age > stale_after else None
+        if mono_age > stale_after:
+            return mono_age
+        return _status_age(status)
+
+
+def _status_stamp(status: Mapping[str, Any] | None, status_age: float | None) -> Any:
+    return status and (
+        status["summary"],
+        tuple(status.get("missing_ranks", ())),
+        json.dumps(status.get("pauses", {}), sort_keys=True),
+        status.get("recommended_silent_seconds"),
+        tuple(
+            (r.get("rank"), r.get("state"), r.get("last_step"), r.get("severity"), r.get("phase"))
+            for r in status["ranks"]
+        ),
+        status_age is not None,
+    )
+
+
+def _grace_alert_key(status: Mapping[str, Any] | None, status_age: float | None, other_stamp: Any) -> Any:
+    """Status/external-source changes that should surface immediately during `--report-grace`:
+    stalls, silent/missing ranks, stopped/stale server status, and TrainCheck/FR updates, while
+    ignoring routine `last_step` bumps on a healthy status."""
+    incidents = (
+        status["incidents"]
+        if status and isinstance(status.get("incidents"), list)
+        else (detect_watchdog_incidents(status) if status else [])
+    )
+    summary = status.get("summary") if status and status.get("summary") in ("stalled", "degraded", "server_stopped") else None
+    return (
+        summary,
+        tuple(status.get("missing_ranks", ())) if status else (),
+        json.dumps(incidents, sort_keys=True),
+        status_age is not None,
+        other_stamp,
+    )
+
+
+def _stat_key(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _other_sources_stamp(
+    *,
+    traincheck: str | Path | None,
+    flight_recorder: str | Path | None,
+    flight_recorder_prefix: str | None,
+) -> tuple[Any, Any]:
+    """Lightweight stat signature for TrainCheck and Flight Recorder inputs."""
+    tc_key: Any = None
+    if traincheck is not None:
+        path = Path(traincheck)
+        if path.is_dir():
+            files = sorted([*path.glob("violations_summary.json"), *path.glob("*/violations_summary.json")])
+            tc_key = ("dir", tuple((str(f), _stat_key(f)) for f in files))
+        elif path.is_file():
+            tc_key = ("file", _stat_key(path))
+        else:
+            tc_key = ("missing",)
+    fr_key: Any = None
+    if flight_recorder is not None:
+        directory = Path(flight_recorder)
+        if directory.is_dir():
+            try:
+                files = sorted(
+                    p for p in directory.rglob("*")
+                    if p.is_file() and (flight_recorder_prefix is None or flight_recorder_prefix in p.name)
+                )
+                fr_key = ("dir", tuple((str(p.relative_to(directory)), _stat_key(p)) for p in files))
+            except OSError:
+                fr_key = ("error",)
+        else:
+            fr_key = ("missing",)
+    return (tc_key, fr_key)
+
+
 def watch(
     source: str | Path,
     output: str | Path | None = None,
     *,
     interval: float = 2.0,
     rank: int | None = None,
+    default_rank: int | None = None,
     polls: int | None = None,
     on_update: Any = None,
     server_reports: bool = True,
@@ -1183,12 +1320,16 @@ def watch(
     `samples`. When the report is missing or unusable, or has not caught up with the stored
     parts `report_grace` seconds after it was last current, the parts are read and the
     detectors run here, as they do for a `.jsonl` file; that is repeated over the whole run
-    at every change.
+    at every change. While waiting for a report inside `report_grace`, status updates and
+    external sources (`flight_recorder`, `traincheck`) still trigger fresh writes from the
+    last current report. `default_rank`, when set alongside `rank=None`, locks onto that
+    rank if a watched run directory ends up holding more than one `rank=*` folder.
     `evidence["detection"]` says which happened and why. `server_reports=False` always
     works the incidents out here.
     """
     source = Path(source)
-    tail = _Tail(source, rank)
+    picked_rank = rank
+    tail = _Tail(source, picked_rank)
     written: Path | None = None
     done = 0
     status_file = build_options.pop("watchdog", None)
@@ -1204,20 +1345,52 @@ def watch(
     folder: Path | None = None
     waiting_since: float | None = None
     was_current = False
+    last_current_report: dict[str, Any] | None = None
     emitted: Any = None
+    emitted_grace: Any = None
+    status_clock = _StatusAgeTracker()
     try:
         while polls is None or done < polls:
             if done:
                 time.sleep(interval)
             done += 1
+            # A hung job writes no new records, so the server's status file and any local
+            # external sources are read on every poll, even while waiting on --report-grace.
+            status = read_watchdog(status_file) if status_file is not None else None
+            status_age = status_clock.check(status)
+            stamp = _status_stamp(status, status_age)
+            other_stamp = _other_sources_stamp(**other_sources)
+
+            dirs = _rank_dirs(source) if picked_rank is None else None
+            if picked_rank is None and default_rank is not None and dirs is not None:
+                world_size = status.get("world_size") if status else None
+                if len(dirs) > 1 or (dirs and isinstance(world_size, int) and world_size > 1):
+                    picked_rank = default_rank
+                    if any(r.get("rank", 0) != picked_rank for r in tail.records):
+                        emitted = None
+                        emitted_grace = None
+                        tail = _Tail(source, picked_rank)
+                    else:
+                        tail.rank = picked_rank
+                    dirs = None
+            new_folder = _rank_folder(source, picked_rank, dirs) if server_reports else None
+            if new_folder != folder:
+                if folder is not None and picked_rank is not None:
+                    emitted = None
+                    emitted_grace = None
+                waiting_since, was_current, last_current_report = None, False, None
+            folder = new_folder
+
             look: dict[str, Any] | None = None
-            if server_reports:
-                folder = folder or _rank_folder(source, rank)
+            report_look: dict[str, Any] | None = None
+            in_grace = False
             if folder is not None:
                 look = read_server_report(folder, **thresholds)
                 if look["state"] == "current":
                     waiting_since, was_current = None, True
-                elif look["state"] in ("missing", "behind", "unreadable") and was_current:
+                    last_current_report = look["report"]
+                    report_look = look
+                elif look["state"] in ("missing", "behind", "unreadable") and was_current and last_current_report is not None:
                     # A part is stored first and reported on a moment later, so these are
                     # normal for that moment. The wait is counted from the last look that
                     # found the report current, not from the newest part: a report that
@@ -1225,44 +1398,52 @@ def watch(
                     # A watcher that has not seen a current report yet does not wait at all.
                     waiting_since = time.monotonic() if waiting_since is None else waiting_since
                     if time.monotonic() - waiting_since < report_grace:
-                        continue
-                    if look["state"] == "behind":
+                        in_grace = True
+                        report_look = {**look, "report": last_current_report}
+                    elif look["state"] == "behind":
                         look["state"] = "stale"
-            # A hung job writes no new records, so the server's status file is also watched.
-            # It is rewritten every few seconds; only a change of verdict, of a rank's state
-            # or of the ranks missing is worth a new evidence file.
-            status = read_watchdog(status_file) if status_file is not None else None
-            status_age = _status_age(status)
-            stamp = status and (
-                status["summary"], tuple(status.get("missing_ranks", ())),
-                json.dumps(status.get("pauses", {}), sort_keys=True), status.get("recommended_silent_seconds"),
-                tuple((r.get("rank"), r.get("state"), r.get("last_step"), r.get("severity"), r.get("phase"))
-                      for r in status["ranks"]),
-                status_age is not None,
-            )
-            if look is not None and look["state"] == "current":
-                report = look["report"]
-                seen = ("server", report["attempt"], report.get("last_step"), report.get("steps"),
-                        report.get("rebuilds"), stamp)
-                if seen == emitted:
+            grace_key = _grace_alert_key(status, status_age, other_stamp)
+            if report_look is not None:
+                report = report_look["report"]
+                seen = (
+                    "server",
+                    report["attempt"],
+                    report.get("last_step"),
+                    report.get("steps"),
+                    report.get("rebuilds"),
+                    stamp,
+                    other_stamp,
+                )
+                if seen == emitted or (in_grace and grace_key == emitted_grace):
                     continue
-                evidence = _report_evidence(folder, look, status, **other_sources)
+                evidence = _report_evidence(folder, report_look, status, **other_sources)
                 run_id = str(report.get("run_id") or source.name)
                 path = Path(output) if output else Path(f"{run_id}.evidence.json")
             else:
                 grown = tail.poll()
-                seen = ("python", look and look["state"], stamp)
+                if picked_rank is None and default_rank is not None:
+                    ranks_seen = {int(r.get("rank", 0)) for r in tail.records}
+                    if len(ranks_seen) > 1:
+                        picked_rank = default_rank
+                        tail = _Tail(source, picked_rank)
+                        grown = tail.poll()
+                        folder = _rank_folder(source, picked_rank) if server_reports else None
+                        emitted = None
+                        emitted_grace = None
+                        waiting_since, was_current, last_current_report = None, False, None
+                seen = ("python", look and look["state"], stamp, other_stamp)
                 if not tail.records or (not grown and seen == emitted):
                     continue
                 evidence = build_evidence(
                     tail.records, **{**build_options, **({"watchdog": status_file} if status_file else {})}
                 )
                 if look is not None:
-                    evidence["detection"] = _detection(look, "python", rank)
+                    evidence["detection"] = _detection(look, "python", picked_rank)
                 path = Path(output) if output else default_evidence_path(source, tail.records)
             if status_age is not None and "watchdog" in evidence:
                 evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
             emitted = seen
+            emitted_grace = grace_key
             written = write_evidence(evidence, path)
             if on_update is not None:
                 on_update(evidence, written)
@@ -2372,8 +2553,10 @@ def main() -> None:
     args = parser.parse_args()
 
     rank = args.rank
+    announced_rank = False
     if rank is None and args.input.is_dir() and len(list(args.input.glob("rank=*"))) > 1:
         rank = 0  # the detectors read one rank's steps
+        announced_rank = True
         print("several ranks here; reading rank 0 (choose another with --rank)")
     if args.watch:
         if args.rerun is not None:
@@ -2381,6 +2564,10 @@ def main() -> None:
         shown: list[str] = []
 
         def report(evidence: dict[str, Any], path: Path) -> None:
+            nonlocal announced_rank
+            if args.rank is None and not announced_rank and len(_rank_dirs(args.input)) > 1:
+                announced_rank = True
+                print("several ranks here; reading rank 0 (choose another with --rank)")
             summary = incident_summary(evidence)
             if [summary] != shown:
                 shown[:] = [summary]
@@ -2389,7 +2576,8 @@ def main() -> None:
 
         print(f"watching {args.input} every {args.interval:g} s; Ctrl-C to stop", flush=True)
         watch(
-            args.input, args.output, interval=args.interval, rank=rank, on_update=report,
+            args.input, args.output, interval=args.interval, rank=rank,
+            default_rank=0 if rank is None else None, on_update=report,
             server_reports=not args.recompute, report_grace=args.report_grace,
             overload_threshold=args.overload_threshold, top_k=args.top_k,
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
