@@ -46,6 +46,8 @@ pub const SCHEMA_VERSION: i64 = 1;
 pub const DEFAULT_QUOTA_BYTES: usize = 128 * 1024 * 1024;
 pub const DEFAULT_FLUSH_STEPS: usize = 500;
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+/// Parts written at once by the timed flush and at shutdown.
+const FLUSH_CONCURRENCY: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct IngestConfig {
@@ -146,6 +148,12 @@ struct RankBuffer {
     /// Set when a rebuild panicked: the same rows would panic again at every part, each
     /// time after reading the whole rank, so this rank is left alone until a restart.
     detect_off: bool,
+    /// Set when writing the buffer as a part failed. A `PUT` that reports failure may have
+    /// stored the object (a timeout after the store committed it), so the buffer takes no more
+    /// rows until a write of it succeeds: the retry is then the same part under the same name,
+    /// which replaces the earlier one, and no second, overlapping part with other bounds can
+    /// be left beside it. The sender keeps the refused rows and sends them again.
+    sealed: bool,
 }
 
 pub struct Ingest {
@@ -263,6 +271,9 @@ impl Ingest {
         };
         let (batch, first, last) = keep_new_rows(key, batch, watermark)?;
         if batch.num_rows() > 0 {
+            if buffer.sealed {
+                self.flush(key, buffer).await?;
+            }
             if buffer
                 .batches
                 .first()
@@ -298,7 +309,8 @@ impl Ingest {
     async fn flush(&self, key: &Key, buffer: &mut RankBuffer) -> Result<(), Status> {
         let mut stored = Vec::new();
         if !buffer.batches.is_empty() {
-            self.storage
+            let written = self
+                .storage
                 .write_part(
                     &key.0,
                     key.1,
@@ -307,8 +319,12 @@ impl Ingest {
                     buffer.min_step,
                     buffer.max_step,
                 )
-                .await
-                .map_err(|error| Status::unavailable(format!("cannot write to the store: {error}")))?;
+                .await;
+            if let Err(error) = written {
+                buffer.sealed = true;
+                return Err(Status::unavailable(format!("cannot write to the store: {error}")));
+            }
+            buffer.sealed = false;
             self.used.fetch_sub(buffer.bytes, Ordering::SeqCst);
             stored = std::mem::take(&mut buffer.batches);
             buffer.rows = 0;
@@ -402,19 +418,23 @@ impl Ingest {
         self.flush(key, &mut buffer).await
     }
 
-    /// Writes every buffer whose oldest row has waited `flush_interval`.
+    /// Writes every buffer whose oldest row has waited `flush_interval`. Ranks are written
+    /// concurrently (up to `FLUSH_CONCURRENCY`): on an object store each write is a round
+    /// trip, and 64 of them one after another would take longer than the interval.
     pub async fn flush_due(&self) {
-        for (key, buffer) in self.all_buffers() {
-            let mut buffer = buffer.lock().await;
-            if buffer
-                .since
-                .is_some_and(|since| since.elapsed() >= self.config.flush_interval)
-            {
-                if let Err(status) = self.flush(&key, &mut buffer).await {
-                    eprintln!("tensorquill-server: {}", status.message());
+        futures::stream::iter(self.all_buffers())
+            .for_each_concurrent(FLUSH_CONCURRENCY, |(key, buffer)| async move {
+                let mut buffer = buffer.lock().await;
+                if buffer
+                    .since
+                    .is_some_and(|since| since.elapsed() >= self.config.flush_interval)
+                {
+                    if let Err(status) = self.flush(&key, &mut buffer).await {
+                        eprintln!("tensorquill-server: {}", status.message());
+                    }
                 }
-            }
-        }
+            })
+            .await;
     }
 
     /// Runs `flush_due` until the returned task is aborted.
@@ -430,17 +450,20 @@ impl Ingest {
         })
     }
 
-    /// Refuses new batches and writes everything buffered. Called on `SIGTERM`.
+    /// Refuses new batches and writes everything buffered. Called on `SIGTERM`. Ranks are
+    /// written concurrently, so the time taken does not grow with the number of ranks; with
+    /// a failing store it is bounded by the store's retry time, not multiplied by the ranks.
     pub async fn shutdown(&self) -> Result<(), Status> {
         self.closed.store(true, Ordering::SeqCst);
-        let mut result = Ok(());
-        for (key, buffer) in self.all_buffers() {
-            let mut buffer = buffer.lock().await;
-            if let Err(status) = self.flush(&key, &mut buffer).await {
-                result = Err(status);
-            }
-        }
-        result
+        let results: Vec<Result<(), Status>> = futures::stream::iter(self.all_buffers())
+            .map(|(key, buffer)| async move {
+                let mut buffer = buffer.lock().await;
+                self.flush(&key, &mut buffer).await
+            })
+            .buffer_unordered(FLUSH_CONCURRENCY)
+            .collect()
+            .await;
+        results.into_iter().collect::<Result<Vec<_>, _>>().map(|_| ())
     }
 
     /// Stops acknowledging on a stream that has ended, which also lets its response end.

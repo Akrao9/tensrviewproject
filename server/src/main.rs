@@ -6,7 +6,7 @@ use std::time::Duration;
 use clap::Parser;
 use tensorquill_server::ingest::{Ingest, IngestConfig, DEFAULT_FLUSH_STEPS, DEFAULT_QUOTA_BYTES};
 use tensorquill_server::server::{check_bind, serve, Tls};
-use tensorquill_server::storage::{Error, Storage};
+use tensorquill_server::storage::{Error, Storage, StoreOptions};
 use tokio::net::TcpListener;
 
 /// Self-hosted TensorQuill ingest: Arrow Flight DoPut in, partitioned Parquet out.
@@ -61,6 +61,10 @@ struct Args {
     /// Do not run the detectors over stored parts or write rank=<rank>/incidents.json.
     #[arg(long)]
     no_detect: bool,
+    /// How long a failing request to S3 or GCS is retried before the stream is told the store is unavailable
+    /// (the sender keeps its rows and tries again). Also bounds how long SIGTERM waits for a failing store.
+    #[arg(long, default_value_t = 30.0)]
+    store_retry_seconds: f64,
 }
 
 async fn terminated() {
@@ -99,7 +103,10 @@ async fn run(args: Args) -> Result<(), Error> {
         status_refresh: Duration::from_secs_f64(args.watchdog_seconds * 3.0),
         detect: !args.no_detect,
     };
-    let ingest = Ingest::new(Storage::from_url(&args.store)?, config);
+    let options = StoreOptions {
+        retry_timeout: Duration::from_secs_f64(args.store_retry_seconds),
+    };
+    let ingest = Ingest::new(Storage::open(&args.store, std::env::vars(), &options)?, config);
     let listener = TcpListener::bind(args.listen).await?;
     // Scripts and tests that ask for port 0 read the real address from this line.
     println!("tensorquill-server listening on {}", listener.local_addr()?);

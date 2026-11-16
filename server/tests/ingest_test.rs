@@ -15,6 +15,7 @@ use arrow_flight::{Action, FlightClient, FlightData, FlightDescriptor, PutResult
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::local::LocalFileSystem;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use tensorquill_server::ingest::{Ingest, IngestConfig, DEFAULT_FLUSH_STEPS, DEFAULT_QUOTA_BYTES};
@@ -37,8 +38,17 @@ struct TestServer {
 /// A server in this process, storing under `root`.
 async fn start(root: &Path, config: IngestConfig, token: Option<&str>) -> TestServer {
     let store = LocalFileSystem::new_with_prefix(root).unwrap();
-    let ingest = Ingest::new(Storage::new(Arc::new(store), "".into()), config);
+    start_on(Arc::new(store), config, token).await
+}
+
+/// A server in this process, storing in `store`.
+async fn start_on(store: Arc<dyn ObjectStore>, config: IngestConfig, token: Option<&str>) -> TestServer {
+    let ingest = Ingest::new(Storage::new(store, "".into()), config);
     ingest.spawn_flusher();
+    serve_ingest(ingest, token).await
+}
+
+async fn serve_ingest(ingest: Arc<Ingest>, token: Option<&str>) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
     let (stop, stopped) = oneshot::channel::<()>();
@@ -868,4 +878,425 @@ async fn a_heartbeat_names_the_phase_and_a_bad_one_is_refused() {
     ] {
         assert!(flight.do_action(action).await.is_err());
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Object-store behaviour that differs from local disk: a write that reports failure, latency,
+// the listings a restart costs. `TestStore` is an in-memory store with knobs.
+
+mod store {
+    use std::fmt;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures::future::BoxFuture;
+    use futures::stream::BoxStream;
+    use futures::FutureExt;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{
+        CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+
+    #[derive(Default)]
+    pub struct Knobs {
+        /// Every request waits this long first, as a round trip to a remote store would.
+        pub delay_ms: AtomicU64,
+        /// The next this-many writes fail.
+        pub fail_puts: AtomicUsize,
+        /// A failing write is stored first: it landed, and the reply was lost.
+        pub commit_failed_puts: AtomicBool,
+        pub puts: AtomicUsize,
+        pub lists: AtomicUsize,
+        pub gets: AtomicUsize,
+        pub range_gets: AtomicUsize,
+        pub in_flight: AtomicUsize,
+        pub max_in_flight: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    pub struct TestStore {
+        pub inner: Arc<InMemory>,
+        pub knobs: Arc<Knobs>,
+    }
+
+    impl fmt::Debug for Knobs {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "Knobs")
+        }
+    }
+
+    impl TestStore {
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(InMemory::new()),
+                knobs: Arc::new(Knobs::default()),
+            })
+        }
+
+        async fn wait(&self) {
+            let millis = self.knobs.delay_ms.load(Ordering::SeqCst);
+            if millis > 0 {
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+            }
+        }
+    }
+
+    impl fmt::Display for TestStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "TestStore")
+        }
+    }
+
+    impl ObjectStore for TestStore {
+        fn put_opts<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> BoxFuture<'async_trait, object_store::Result<PutResult>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            async move {
+                self.knobs.puts.fetch_add(1, Ordering::SeqCst);
+                let now = self.knobs.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.knobs.max_in_flight.fetch_max(now, Ordering::SeqCst);
+                self.wait().await;
+                let fail = self
+                    .knobs
+                    .fail_puts
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                    .is_ok();
+                let result = if fail {
+                    if self.knobs.commit_failed_puts.load(Ordering::SeqCst) {
+                        let _ = self.inner.put_opts(location, payload, opts).await;
+                    }
+                    Err(object_store::Error::Generic {
+                        store: "TestStore",
+                        source: "injected failure".into(),
+                    })
+                } else {
+                    self.inner.put_opts(location, payload, opts).await
+                };
+                self.knobs.in_flight.fetch_sub(1, Ordering::SeqCst);
+                result
+            }
+            .boxed()
+        }
+
+        fn put_multipart_opts<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 Path,
+            opts: PutMultipartOptions,
+        ) -> BoxFuture<'async_trait, object_store::Result<Box<dyn MultipartUpload>>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.inner.put_multipart_opts(location, opts)
+        }
+
+        fn get_opts<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 Path,
+            options: GetOptions,
+        ) -> BoxFuture<'async_trait, object_store::Result<GetResult>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            async move {
+                if matches!(options.range, Some(GetRange::Suffix(_) | GetRange::Bounded(_))) {
+                    self.knobs.range_gets.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    self.knobs.gets.fetch_add(1, Ordering::SeqCst);
+                }
+                self.wait().await;
+                self.inner.get_opts(location, options).await
+            }
+            .boxed()
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.knobs.lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        fn list_with_delimiter<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            prefix: Option<&'life1 Path>,
+        ) -> BoxFuture<'async_trait, object_store::Result<ListResult>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            async move {
+                self.knobs.lists.fetch_add(1, Ordering::SeqCst);
+                self.wait().await;
+                self.inner.list_with_delimiter(prefix).await
+            }
+            .boxed()
+        }
+
+        fn copy_opts<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            from: &'life1 Path,
+            to: &'life2 Path,
+            options: CopyOptions,
+        ) -> BoxFuture<'async_trait, object_store::Result<()>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.inner.copy_opts(from, to, options)
+        }
+    }
+}
+
+use store::TestStore;
+
+/// The part names stored in `store`, in order.
+async fn names_in(store: &TestStore) -> Vec<String> {
+    let mut names: Vec<String> = store
+        .inner
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|object| object.location.extension() == Some("parquet"))
+        .map(|object| object.location.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every stored step of every part in `store`, in part order.
+async fn steps_in(store: &TestStore) -> Vec<i64> {
+    let mut steps = Vec::new();
+    for name in names_in(store).await {
+        let bytes = store
+            .inner
+            .get(&object_store::path::Path::from(name))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        for batch in ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .unwrap()
+            .build()
+            .unwrap()
+        {
+            let batch = batch.unwrap();
+            let column = batch
+                .column_by_name("step")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            steps.extend(column.values().iter().copied());
+        }
+    }
+    steps
+}
+
+/// Writes a part every 50 steps, nothing else.
+fn every_50() -> IngestConfig {
+    IngestConfig {
+        flush_steps: 50,
+        ..manual()
+    }
+}
+
+#[tokio::test]
+async fn a_put_that_failed_after_landing_cannot_leave_an_overlapping_part() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let server = start_on(store.clone(), every_50(), None).await;
+    for rank in [0, 1] {
+        // The write of steps 0-49 lands, then the store reports failure: no acknowledgement, and the
+        // rows stay buffered, so the buffer takes nothing else until a write of it succeeds.
+        store.knobs.fail_puts.store(1, Ordering::SeqCst);
+        store.knobs.commit_failed_puts.store(true, Ordering::SeqCst);
+        let mut put = open(&server, rank).await;
+        put.send(batch(rank, 0..50), 500).await;
+        assert_eq!(put.ack().await, Err(Code::Unavailable));
+        let mut put = open(&server, rank).await;
+        if rank == 0 {
+            // The sender comes back with the next rows: the earlier part is written again, with
+            // the same name, before they are taken.
+            put.send(batch(rank, 50..100), 1000).await;
+            assert_eq!(put.ack().await, Ok(1000));
+        } else {
+            // It resends from its last acknowledged offset: the same rows, which are acknowledged
+            // once the retried part is stored, then the next ones.
+            put.send(batch(rank, 0..50), 500).await;
+            assert_eq!(put.ack().await, Ok(500));
+            put.send(batch(rank, 50..100), 1000).await;
+            assert_eq!(put.ack().await, Ok(1000));
+        }
+    }
+    let names = names_in(&store).await;
+    assert_eq!(
+        names,
+        [
+            "runs/run-a/rank=0/attempt=0/part-00000000-00000049.parquet",
+            "runs/run-a/rank=0/attempt=0/part-00000050-00000099.parquet",
+            "runs/run-a/rank=1/attempt=0/part-00000000-00000049.parquet",
+            "runs/run-a/rank=1/attempt=0/part-00000050-00000099.parquet",
+        ]
+    );
+    // Every step once: no duplicate rows beside the rewritten part.
+    let mut steps = steps_in(&store).await;
+    steps.sort();
+    assert_eq!(steps.len(), 200);
+    assert_eq!(
+        steps[..100].iter().sum::<i64>() + steps[100..].iter().sum::<i64>(),
+        2 * (0..100).sum::<i64>()
+    );
+    steps.dedup();
+    assert_eq!(steps.len(), 100);
+}
+
+#[tokio::test]
+async fn nothing_is_acknowledged_before_the_put_succeeds_and_the_quota_stays_held() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    store.knobs.fail_puts.store(2, Ordering::SeqCst);
+    let server = start_on(store.clone(), every_50(), None).await;
+    let mut put = open(&server, 0).await;
+    put.send(batch(0, 0..50), 500).await;
+    assert_eq!(put.ack().await, Err(Code::Unavailable));
+    assert!(names_in(&store).await.is_empty());
+    let held = server.ingest.buffered_bytes();
+    assert!(
+        held > 0,
+        "the rows are still buffered and still count against the quota"
+    );
+    // A second failure changes nothing; the third write goes through.
+    let mut put = open(&server, 0).await;
+    put.send(batch(0, 0..50), 500).await;
+    assert_eq!(put.ack().await, Err(Code::Unavailable));
+    assert_eq!(server.ingest.buffered_bytes(), held);
+    let mut put = open(&server, 0).await;
+    put.send(batch(0, 0..50), 500).await;
+    assert_eq!(put.ack().await, Ok(500));
+    assert_eq!(server.ingest.buffered_bytes(), 0);
+    assert_eq!(steps_in(&store).await, (0..50).collect::<Vec<_>>());
+}
+
+/// 32 ranks with one 10-step batch each, buffered and not yet written.
+async fn buffered_ranks(server: &TestServer, ranks: i32) -> Vec<Put> {
+    let mut puts = Vec::new();
+    for rank in 0..ranks {
+        let mut put = open(server, rank).await;
+        put.send(batch(rank, 0..10), 100).await;
+        puts.push(put);
+    }
+    until("every batch is buffered", || server.ingest.buffered_bytes() > 0).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    puts
+}
+
+#[tokio::test]
+async fn ranks_are_written_concurrently_so_a_slow_store_does_not_serialise_them() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    store.knobs.delay_ms.store(100, Ordering::SeqCst);
+    // No background flusher: the timed flush is driven by hand.
+    let config = IngestConfig {
+        flush_interval: Duration::from_millis(50),
+        detect: false,
+        ..manual()
+    };
+    let ingest = Ingest::new(Storage::new(store.clone(), "".into()), config.clone());
+    let server = serve_ingest(ingest, None).await;
+    let puts = buffered_ranks(&server, 32).await;
+    let started = std::time::Instant::now();
+    server.ingest.flush_due().await;
+    let timed = started.elapsed();
+    assert_eq!(names_in(&store).await.len(), 32);
+    // 32 writes of 100 ms one after another would take 3.2 s.
+    assert!(timed < Duration::from_millis(1500), "{timed:?}");
+    assert!(store.knobs.max_in_flight.load(Ordering::SeqCst) >= 8);
+    drop(puts);
+
+    // The same at shutdown, and with a store that fails every write: the time is one retry
+    // period for all ranks together, not one per rank, and the rows stay buffered.
+    let store = TestStore::new();
+    store.knobs.delay_ms.store(100, Ordering::SeqCst);
+    store.knobs.fail_puts.store(10_000, Ordering::SeqCst);
+    let ingest = Ingest::new(
+        Storage::new(store.clone(), "".into()),
+        IngestConfig {
+            detect: false,
+            ..manual()
+        },
+    );
+    let server = serve_ingest(ingest, None).await;
+    let puts = buffered_ranks(&server, 32).await;
+    let started = std::time::Instant::now();
+    assert!(server.ingest.shutdown().await.is_err());
+    let stopped = started.elapsed();
+    assert!(stopped < Duration::from_millis(1500), "{stopped:?}");
+    assert!(server.ingest.buffered_bytes() > 0);
+    assert!(names_in(&store).await.is_empty());
+    drop(puts);
+}
+
+#[tokio::test]
+async fn a_restart_costs_one_listing_and_one_footer_read_per_rank() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let config = IngestConfig {
+        detect: false,
+        ..every_50()
+    };
+    {
+        let server = start_on(store.clone(), config.clone(), None).await;
+        for rank in 0..64 {
+            let mut put = open(&server, rank).await;
+            for first in [0, 50, 100] {
+                put.send(batch(rank, first..first + 50), 1000).await;
+                put.ack().await.unwrap();
+            }
+        }
+    }
+    assert_eq!(names_in(&store).await.len(), 64 * 3);
+    // A new server knows nothing: each rank's first batch reads its watermark.
+    let (lists, range_gets, gets) = (&store.knobs.lists, &store.knobs.range_gets, &store.knobs.gets);
+    lists.store(0, Ordering::SeqCst);
+    range_gets.store(0, Ordering::SeqCst);
+    gets.store(0, Ordering::SeqCst);
+    let server = start_on(store.clone(), config, None).await;
+    for rank in 0..64 {
+        let mut put = open(&server, rank).await;
+        put.send(batch(rank, 150..200), 2000).await;
+        assert_eq!(put.ack().await, Ok(2000));
+    }
+    assert_eq!(lists.load(Ordering::SeqCst), 64, "one listing of the attempt per rank");
+    assert_eq!(
+        range_gets.load(Ordering::SeqCst),
+        64,
+        "one suffix read of the newest part per rank"
+    );
+    assert_eq!(gets.load(Ordering::SeqCst), 0, "no part is read whole");
 }
