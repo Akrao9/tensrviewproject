@@ -482,9 +482,10 @@ def test_after_a_restart_without_detection_the_rank_that_sent_again_is_stale_and
     assert entry(seen[0], 1)["detection"]["state"] == "current" and seen[0]["clean_ranks"] == [0, 1, 2, 3]
     final = json.loads(out.read_text())
     summary = incident_summary(final)
-    # The new server's status knows only the rank that reconnected: no world size, no other rank.
-    status = wait_for_status(run, lambda s: [r["rank"] for r in s["ranks"]] == [1])
-    assert status["world_size"] is None and status["missing_ranks"] == []
+    # The new server took the run up from the old one's status, so it knows the other ranks and the
+    # world size although only rank 1 reconnected (the watchdog's state survives a restart).
+    status = wait_for_status(run, lambda s: [r["rank"] for r in s["ranks"]] == [0, 1, 2, 3])
+    assert status["world_size"] == 4 and status["missing_ranks"] == []
     # Ranks 0, 2 and 3 have stored parts and a current report: they are current, whatever the status
     # does not know about them, and they are not "never reporting".
     assert final["ranks_by_state"] == {"current": [0, 2, 3], "stale": [1]}

@@ -244,12 +244,14 @@ def test_after_a_kill_the_report_stands_and_the_status_is_called_old(tmp_path, m
         assert evidence["watchdog"]["not_written_for_seconds"] > 0
         assert "The server's status was last written" in summary and "Nothing is watching this run for stalls" in summary
 
-        # A new server, and the rank has not reconnected: nothing changes on disk, and the
-        # old report is still current for what is stored.
+        # A new server takes the run up from the dead one's status, before any rank has reconnected
+        # (the watchdog's state survives a restart): it rewrites the status at once, so the reader is
+        # no longer told that nothing is watching, and the old report is still current for what is stored.
         stream.server = Server(stream.store, 0, *FAST, *QUICK_STATUS)
         time.sleep(0.5)
         evidence, summary = look(stream, tmp_path)
-        assert evidence["detection"]["state"] == "current" and "The server's status was last written" in summary
+        assert evidence["detection"]["state"] == "current" and "The server's status was last written" not in summary
+        assert evidence["watchdog"]["summary"] == "active"
     finally:
         sender.close(0.0)
 
