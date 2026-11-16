@@ -163,20 +163,38 @@ def start(tmp_path):
         client.kill()
 
 
+def gate_1_fixtures() -> dict:
+    """The seven Gate 1 fixtures, from the bake-off's own generator: each has `records()` and
+    the planted `answer`, which is written out there and never read from the detectors. The
+    experiment's `artifacts` folder is not in the repository, so nothing here reads it. Empty
+    when the experiment is not in this checkout (an sdist has only the package)."""
+    if not (BAKEOFF / "generate.py").exists():
+        return {}
+    sys.path.insert(0, str(BAKEOFF))
+    try:
+        import generate
+    finally:
+        sys.path.remove(str(BAKEOFF))
+    return dict(generate.BY_NAME)
+
+
+FIXTURES = gate_1_fixtures()
+
+
 @pytest.fixture(scope="module")
 def gate1(tmp_path_factory):
-    """The seven Gate 1 fixtures and their answer key, made as `experiments/moe-bakeoff`
-    makes them. Its `artifacts/` folder is not in the repository, so they are made here."""
-    if not (BAKEOFF / "generate.py").exists():
-        pytest.skip("experiments/moe-bakeoff is not beside the SDK (an sdist has only the package)")
+    """Each fixture's capture, written as the SDK writes one, and the planted answers:
+    `(folder, {name: answer})`, with the capture at `<folder>/<name>/<name>.jsonl`."""
+    if not FIXTURES:
+        pytest.skip("experiments/moe-bakeoff is not beside the SDK")
+    assert sorted(FIXTURES) == GATE_1
     out = tmp_path_factory.mktemp("gate1")
-    subprocess.run(
-        [sys.executable, str(BAKEOFF / "generate.py"), str(out), "--no-rerun"],
-        check=True, env=child_env(), capture_output=True, timeout=300,
-    )
-    key = json.loads((out / "answer-key.json").read_text(encoding="utf-8"))
-    assert sorted(key) == GATE_1
-    return out, key
+    for name, fixture in FIXTURES.items():
+        (out / name).mkdir()
+        sink = tensorquill.JsonlSink(out / name / f"{name}.jsonl")
+        sink.write(fixture.records())
+        sink.close()
+    return out, {name: fixture.answer for name, fixture in FIXTURES.items()}
 
 
 # --- Records and stores made by hand -------------------------------------------------------
@@ -370,15 +388,18 @@ def diagnose(client: Client) -> dict:
 
 @pytest.mark.parametrize("name", GATE_1)
 def test_a_scripted_client_recovers_each_gate_1_answer_through_the_four_tools(name, gate1, start):
-    out, key = gate1
+    out, answers = gate1
     client = start(out / name / f"{name}.jsonl")
-    assert diagnose(client) == key[name]["answer"]
+    assert diagnose(client) == answers[name]
     assert client.close() == 0
 
 
 def test_an_evidence_file_answers_from_what_is_written_and_reads_series_beside_it(gate1, start, tmp_path):
-    out, key = gate1
-    # Beside its capture, as the command line writes it: the parameter's series is there.
+    out, _ = gate1
+    for name in ("unseen-2", "seeded"):  # what `python -m tensorquill <name>.jsonl` writes beside the capture
+        evidence = ev.build_evidence(ev.load_records(out / name / f"{name}.jsonl", all_attempts=True))
+        (out / name / f"{name}.evidence.json").write_text(json.dumps(evidence), encoding="utf-8")
+    # Beside its capture: the parameter's series is there.
     client = start(out / "unseen-2" / "unseen-2.evidence.json")
     listed = client.call("list_incidents")
     assert listed["source"]["kind"] == "evidence" and [i["id"] for i in listed["incidents"]] == ["grad_spike@310"]
