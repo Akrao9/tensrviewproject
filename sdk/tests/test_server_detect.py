@@ -348,9 +348,12 @@ def test_a_server_started_with_thresholds_applies_them_and_a_reader_asking_for_t
 
     folder = stream.incidents_file.parent
     assert read_server_report(folder, **asked)["state"] == "current"
-    look = read_server_report(folder)
+    # The reader's rule since Nov 16, 2026 (`test_reader_thresholds.py`): one that gives no
+    # threshold takes the server's, and only one it gives that differs is refused.
+    assert read_server_report(folder)["state"] == "current"
+    look = read_server_report(folder, overload_threshold=0.35, top_k=3)
     assert look["state"] == "other_thresholds"
-    assert "top_k 2 where None was asked for" in look["reason"] and "overload_threshold 0.5 where 0.35" in look["reason"]
+    assert "top_k 2 where 3 was asked for" in look["reason"] and "overload_threshold 0.5 where 0.35" in look["reason"]
     assert read_server_report(folder, **{**asked, "top_k": {"r1": 2}})["state"] == "other_thresholds"
     assert stream.server.terminate() == 0
 
@@ -361,10 +364,13 @@ def test_a_server_started_with_thresholds_applies_them_and_a_reader_asking_for_t
     evidence, _ = look(stream, tmp_path / "same", **asked)
     assert (evidence["detection"]["source"], evidence["detection"]["state"]) == ("server", "current")
     assert differences(reference(300), [i for i in evidence["incidents"] if i["kind"] in SERVER_KINDS]) == []
-    evidence, _ = look(stream, tmp_path / "usual")
+    evidence, _ = look(stream, tmp_path / "none given")
+    assert (evidence["detection"]["source"], evidence["detection"]["state"]) == ("server", "current")
+    other = {**asked, "starve_window": 50}  # one of its own that differs; the other four stay the server's
+    evidence, _ = look(stream, tmp_path / "another", starve_window=50)
     assert (evidence["detection"]["source"], evidence["detection"]["state"]) == ("python", "other_thresholds")
     # (A logged NaN is in these incidents, so they are compared by kind and step.)
-    usual = tensorquill.build_evidence(records)["incidents"]
+    usual = tensorquill.build_evidence(records, **other)["incidents"]
     assert [(i["kind"], i["step"]) for i in evidence["incidents"]] == [(i["kind"], i["step"]) for i in usual]
     assert [(i["kind"], i["step"]) for i in usual] != [(i["kind"], i["step"]) for i in reference(300)]
 
