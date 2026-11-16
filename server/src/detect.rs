@@ -34,6 +34,13 @@
 //!   read when the excursion begins and kept with it. An incident, once made, is never
 //!   replaced or dated again, so a prefix and the whole run agree on it.
 //!
+//! - *The per-step MoE samples.* Python lists a sample for every record and every router the
+//!   run ever recorded, sized by the most experts that router ever had. A stream learns both
+//!   only at its end, so the judged samples are kept as the rows are read and the list is
+//!   completed when it is written ([`MoeSamples`]). Only `tensorquill-server detect --samples`
+//!   keeps them: the server holds a rank's detectors for the whole run, and its report says
+//!   how many samples were flagged ([`RankDetectors::moe_flagged`]) and no more.
+//!
 //! Three things differ from Python by design:
 //!
 //! - A value that does not fit its column's type travels in `extra_json` and reads as
@@ -53,7 +60,8 @@ use std::sync::Arc;
 use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray, MapArray, StringArray};
 use arrow::record_batch::RecordBatch;
 use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde::Deserialize;
+use serde::ser::{SerializeSeq, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::storage::{Error, Storage};
@@ -826,6 +834,9 @@ struct Router {
     recent_tokens: i64,
     /// Where this router was last found in `moe_stats_json`.
     stats_at: usize,
+    /// The most experts any of its recorded counts had: the size of the sample it is given
+    /// on a step that recorded nothing for it (Python's `_router_sizes`).
+    largest: usize,
 }
 
 impl Router {
@@ -880,7 +891,9 @@ impl Router {
     }
 
     /// Python's `_mark_starved` for one sample: the experts whose share of the trailing
-    /// `window` samples is below `ratio` of an even share, with that share.
+    /// `window` samples is below `ratio` of an even share, with that share. None while the
+    /// window is not full or holds too few tokens to judge (the sample then has no
+    /// `starved_shares`), which is not the same as a full window with nobody starved.
     fn starved(
         &mut self,
         counts: &Arc<[i64]>,
@@ -888,7 +901,7 @@ impl Router {
         dead: &[usize],
         window: usize,
         ratio: f64,
-    ) -> Vec<(usize, f64)> {
+    ) -> Option<Vec<(usize, f64)>> {
         if self.recent_sums.len() != counts.len() {
             self.recent.clear();
             self.recent_sums = vec![0; counts.len()];
@@ -909,15 +922,60 @@ impl Router {
         let even = 1.0 / counts.len() as f64;
         let window_tokens = self.recent_tokens as f64;
         if self.recent.len() < window || window_tokens * even < STARVE_MIN_EXPECTED {
-            return Vec::new();
+            return None;
         }
-        self.recent_sums
-            .iter()
-            .enumerate()
-            .filter(|(index, total)| **total as f64 / window_tokens < ratio * even && !dead.contains(&(index + 1)))
-            .map(|(index, total)| (index + 1, *total as f64 / window_tokens))
-            .collect()
+        Some(
+            self.recent_sums
+                .iter()
+                .enumerate()
+                .filter(|(index, total)| **total as f64 / window_tokens < ratio * even && !dead.contains(&(index + 1)))
+                .map(|(index, total)| (index + 1, *total as f64 / window_tokens))
+                .collect(),
+        )
     }
+}
+
+/// The rule a sample's `overloaded` list was made by, as Python's `overload_rule`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(tag = "rule", rename_all = "snake_case")]
+enum OverloadRule {
+    /// Top-1 and top-2: an expert's share of the assignments above `threshold`.
+    Share { threshold: f64 },
+    /// Top-3 and higher: diversity below `drop` times the router's baseline, and an
+    /// expert's fraction of tokens up by `jump`.
+    DiversityDrop { drop: f64, jump: f64 },
+    /// Top-3 and higher before there is a baseline, with dead experts: share above `threshold`.
+    Collapse { threshold: f64 },
+}
+
+/// One router on one step as it was judged: what Python's sample loop in `build_evidence`
+/// and `_mark_starved` put in `samples`. Kept only for `tensorquill-server detect --samples`.
+struct Sample {
+    router: usize,
+    counts: Arc<[i64]>,
+    tokens: i64,
+    /// None for counts that sum to zero: a missing sample, which no rule read.
+    judged: Option<Judged>,
+}
+
+struct Judged {
+    diversity: f64,
+    overloaded: Vec<usize>,
+    dead: Vec<usize>,
+    rule: OverloadRule,
+    /// The starved experts with their share of the window, or None while the window
+    /// could not be judged.
+    starved: Option<Vec<(usize, f64)>>,
+}
+
+/// The samples of a whole run, in the order the rows were read.
+#[derive(Default)]
+struct Kept {
+    /// Each row that counts, as (step, where its samples start in `samples`), whether or
+    /// not it recorded any router.
+    rows: Vec<(i64, usize)>,
+    /// The routers each row recorded, in layer order within the row.
+    samples: Vec<Sample>,
 }
 
 #[derive(Default)]
@@ -937,10 +995,16 @@ struct Moe {
     last_flagged_step: Option<i64>,
     present: Vec<Option<usize>>,
     scratch: Vec<f64>,
+    /// The per-step samples, when they were asked for. The server never asks: it keeps a
+    /// rank's detectors for the whole run, and the samples grow with every step.
+    kept: Option<Kept>,
 }
 
 impl Moe {
     fn row(&mut self, step: i64, columns: &Columns, row: usize, options: &Thresholds) {
+        if let Some(kept) = &mut self.kept {
+            kept.rows.push((step, kept.samples.len()));
+        }
         if let Some(top_k) = &columns.moe_top_k {
             for entry in top_k.row(row) {
                 if top_k.values.is_null(entry) {
@@ -998,6 +1062,11 @@ impl Moe {
         let stats: Option<Members<RouterStats>> =
             text(columns.moe_stats, row).and_then(|text| serde_json::from_str(text).ok());
         let offsets = counts.values.value_offsets();
+        for (router, entry) in self.routers.iter_mut().zip(&self.present) {
+            if let Some(entry) = entry {
+                router.largest = router.largest.max((offsets[entry + 1] - offsets[*entry]) as usize);
+            }
+        }
         let mut router_counts: Vec<i64> = Vec::new();
         for index in 0..self.routers.len() {
             let Some(entry) = self.present[index] else { continue };
@@ -1011,7 +1080,16 @@ impl Moe {
             }));
             let tokens: i64 = router_counts.iter().sum();
             if tokens <= 0 {
-                continue; // a missing sample: nothing is judged and no window moves
+                // A missing sample: nothing is judged and no window moves.
+                if let Some(kept) = &mut self.kept {
+                    kept.samples.push(Sample {
+                        router: index,
+                        counts: Arc::from(&router_counts[..]),
+                        tokens,
+                        judged: None,
+                    });
+                }
+                continue;
             }
             let router = &mut self.routers[index];
             let experts = router_counts.len();
@@ -1028,10 +1106,15 @@ impl Moe {
             });
             let diversity = recorded.unwrap_or_else(|| diversity_from_counts(&router_counts));
             let share = |count: &i64| *count as f64 / tokens as f64;
+            let mut rule = OverloadRule::DiversityDrop {
+                drop: DIVERSITY_DROP,
+                jump: OVERLOAD_JUMP,
+            };
             let mut overloaded: Vec<usize> = if router.top_k >= 3 {
                 router.jump_overloaded(&router_counts, tokens, diversity, &mut self.scratch)
             } else {
                 let threshold = effective_overload_threshold(experts, tokens, options.overload_threshold);
+                rule = OverloadRule::Share { threshold };
                 (1..=experts)
                     .filter(|expert| share(&router_counts[expert - 1]) > threshold)
                     .collect()
@@ -1047,6 +1130,7 @@ impl Moe {
                 let mean = 1.0 / experts as f64;
                 let se = (mean * (1.0 - mean) / tokens as f64).sqrt();
                 let threshold = (2.0 * mean).max(mean + 3.0 * se);
+                rule = OverloadRule::Collapse { threshold };
                 overloaded = (1..=experts)
                     .filter(|expert| share(&router_counts[expert - 1]) > threshold)
                     .collect();
@@ -1074,8 +1158,24 @@ impl Moe {
                 }));
             }
             let starved = router.starved(&shared, tokens, &dead, options.starve_window, options.starve_ratio);
-            for (expert, window_share) in starved {
-                self.starved.entry((index + 1, expert)).or_insert((step, window_share));
+            for (expert, window_share) in starved.iter().flatten() {
+                self.starved
+                    .entry((index + 1, *expert))
+                    .or_insert((step, *window_share));
+            }
+            if let Some(kept) = &mut self.kept {
+                kept.samples.push(Sample {
+                    router: index,
+                    counts: shared,
+                    tokens,
+                    judged: Some(Judged {
+                        diversity,
+                        overloaded,
+                        dead,
+                        rule,
+                        starved,
+                    }),
+                });
             }
         }
     }
@@ -1102,6 +1202,104 @@ impl Moe {
             incident["scalars"] = scalars.clone();
         }
         out.push(incident);
+    }
+}
+
+/// The per-step MoE samples of a run, as `build_evidence` lists them under `samples`: every
+/// row that counts, in step order, times every router the run recorded, in layer order.
+/// A router that a step recorded nothing for, or only zeros, has a sample marked `missing`.
+///
+/// Python builds these with the whole run in hand. Here the judged samples are kept as the
+/// rows are read and the rest is filled in when the run is written out: which routers
+/// exist and how many experts each has is only known at the end.
+pub struct MoeSamples<'a> {
+    moe: &'a Moe,
+    kept: &'a Kept,
+}
+
+#[derive(Serialize)]
+struct SampleOut<'a> {
+    step: i64,
+    layer: usize,
+    router: &'a str,
+    routed_tokens: i64,
+    counts: &'a [i64],
+    diversity: Option<f64>,
+    overloaded: &'a [usize],
+    dead: &'a [usize],
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    missing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overload_rule: Option<OverloadRule>,
+    starved: Experts<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    starved_shares: Option<Shares<'a>>,
+}
+
+/// The starved experts of a sample, as a list of expert numbers.
+struct Experts<'a>(&'a [(usize, f64)]);
+
+impl Serialize for Experts<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|(expert, _)| expert))
+    }
+}
+
+/// The same experts as an object of expert number to its share of the window.
+struct Shares<'a>(&'a [(usize, f64)]);
+
+impl Serialize for Shares<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(expert, share)| (expert.to_string(), share)))
+    }
+}
+
+impl MoeSamples<'_> {
+    /// How many samples there are: rows that count times routers.
+    pub fn len(&self) -> usize {
+        self.kept.rows.len() * self.moe.routers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Serialize for MoeSamples<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (routers, rows, samples) = (&self.moe.routers, &self.kept.rows, &self.kept.samples);
+        let zeros = vec![0_i64; routers.iter().map(|router| router.largest).max().unwrap_or(0)];
+        // Python sorts the records by step, and a stable sort keeps a step written twice in
+        // the order it was written.
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_by_key(|row| rows[*row].0);
+        let mut seq = serializer.serialize_seq(Some(self.len()))?;
+        for row in order {
+            let (step, start) = rows[row];
+            let end = rows.get(row + 1).map_or(samples.len(), |next| next.1);
+            let mut recorded = samples[start..end].iter().peekable();
+            for (index, router) in routers.iter().enumerate() {
+                let sample = recorded.next_if(|sample| sample.router == index);
+                let judged = sample.and_then(|sample| sample.judged.as_ref());
+                let starved = judged.and_then(|judged| judged.starved.as_deref());
+                seq.serialize_element(&SampleOut {
+                    step,
+                    layer: index + 1,
+                    router: &router.name,
+                    routed_tokens: sample.map_or(0, |sample| sample.tokens),
+                    // A router the step did not record gets zeros for its largest size.
+                    counts: sample.map_or(&zeros[..router.largest], |sample| &sample.counts),
+                    diversity: judged.map(|judged| judged.diversity),
+                    overloaded: judged.map_or(&[], |judged| &judged.overloaded),
+                    dead: judged.map_or(&[], |judged| &judged.dead),
+                    missing: judged.is_none(),
+                    overload_rule: judged.map(|judged| judged.rule),
+                    starved: Experts(starved.unwrap_or(&[])),
+                    starved_shares: starved.map(Shares),
+                })?;
+            }
+        }
+        seq.end()
     }
 }
 
@@ -2603,6 +2801,22 @@ impl RankDetectors {
         }
     }
 
+    /// Detectors that also keep every MoE sample they judge ([`samples`](Self::samples)).
+    /// For a run read once from start to end, as `tensorquill-server detect --samples`
+    /// reads it: the samples take memory for every step, so the server does not keep them.
+    pub fn with_samples(thresholds: &Arc<Thresholds>) -> Self {
+        let mut detectors = Self::new(thresholds);
+        detectors.moe.kept = Some(Kept::default());
+        detectors
+    }
+
+    /// The per-step MoE samples, if these detectors keep them. They serialize as the
+    /// `samples` list of `build_evidence`.
+    pub fn samples(&self) -> Option<MoeSamples<'_>> {
+        let kept = self.moe.kept.as_ref()?;
+        Some(MoeSamples { moe: &self.moe, kept })
+    }
+
     /// The options these detectors apply.
     pub fn thresholds(&self) -> &Thresholds {
         &self.thresholds
@@ -2882,6 +3096,11 @@ pub async fn replay(
 /// and within an attempt in the order they were recorded, as stored parts are. A batch
 /// without an `attempt` column is attempt 0, and one without a `step` column is ignored.
 pub fn judge(rank: i32, batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Result<RankDetectors, String> {
+    judge_with(RankDetectors::new(thresholds), rank, batches)
+}
+
+/// [`judge`] with detectors made by the caller, which have read nothing yet.
+fn judge_with(mut detectors: RankDetectors, rank: i32, batches: &[RecordBatch]) -> Result<RankDetectors, String> {
     // Each batch cut where the attempt changes, so every piece belongs to one attempt.
     let mut pieces: Vec<(i64, RecordBatch)> = Vec::new();
     let mut first_steps: BTreeMap<i64, i64> = BTreeMap::new();
@@ -2914,7 +3133,6 @@ pub fn judge(rank: i32, batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -
         }
     }
     let cutoffs = resolve(&first_steps);
-    let mut detectors = RankDetectors::new(thresholds);
     let mut pass = AttemptPass::new(rank, &first_steps);
     for (attempt, piece) in &pieces {
         let Some(cutoff) = cutoffs.get(attempt).copied() else {
@@ -2953,6 +3171,41 @@ pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64)
 /// SDK sends, and its [`report`] out. Rows of a second run or rank are refused, because the
 /// detectors judge one rank's steps.
 pub fn detect_stream(input: impl std::io::Read, thresholds: &Arc<Thresholds>) -> Result<Value, String> {
+    let (run_id, rank, detectors) = detect_rows(input, RankDetectors::new(thresholds))?;
+    Ok(report(&run_id, rank, &detectors, 0))
+}
+
+/// `tensorquill-server detect --samples`: the same [`report`] written to `out` as one JSON
+/// object with one more key, `samples`: the per-step MoE samples `build_evidence` lists
+/// ([`MoeSamples`]). They are written as they are made, never held as one document: a long
+/// MoE run has tens of megabytes of them.
+pub fn detect_stream_samples(
+    input: impl std::io::Read,
+    thresholds: &Arc<Thresholds>,
+    out: impl std::io::Write,
+) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct WithSamples<'a> {
+        #[serde(flatten)]
+        report: &'a Value,
+        samples: MoeSamples<'a>,
+    }
+    let (run_id, rank, detectors) = detect_rows(input, RankDetectors::with_samples(thresholds))?;
+    let report = report(&run_id, rank, &detectors, 0);
+    let samples = detectors.samples().expect("these detectors keep their samples");
+    serde_json::to_writer(
+        out,
+        &WithSamples {
+            report: &report,
+            samples,
+        },
+    )
+    .map_err(|error| format!("cannot write the report: {error}"))
+}
+
+/// Reads one rank's rows from an Arrow IPC stream into `detectors`: whose rows they are, and
+/// the detectors after the last row.
+fn detect_rows(input: impl std::io::Read, detectors: RankDetectors) -> Result<(String, i32, RankDetectors), String> {
     let reader = arrow::ipc::reader::StreamReader::try_new(input, None)
         .map_err(|error| format!("the input is not an Arrow IPC stream: {error}"))?;
     let batches = reader
@@ -2988,8 +3241,8 @@ pub fn detect_stream(input: impl std::io::Read, thresholds: &Arc<Thresholds>) ->
     let Some((run_id, rank)) = whose else {
         return Err("the stream holds no rows".to_string());
     };
-    let detectors = judge(rank, &batches, thresholds)?;
-    Ok(report(&run_id, rank, &detectors, 0))
+    let detectors = judge_with(detectors, rank, &batches)?;
+    Ok((run_id, rank, detectors))
 }
 
 #[cfg(test)]
@@ -3219,6 +3472,224 @@ mod tests {
             checks.contains(&"flight_recorder") && checks.contains(&"traincheck"),
             "{checks:?}"
         );
+    }
+
+    /// A row with MoE counts: its attempt, its step, and its routers with their counts.
+    type MoeRow<'a> = (i64, i64, Vec<(&'a str, Vec<i64>)>);
+
+    /// One rank's rows with MoE counts. Every router carries `top_k` on every row, as the
+    /// SDK writes it.
+    fn moe_rows(rows: &[MoeRow], top_k: i32) -> RecordBatch {
+        use arrow::array::{Int32Builder, Int64Builder, ListBuilder, MapBuilder, StringBuilder};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let mut counts = MapBuilder::new(None, StringBuilder::new(), ListBuilder::new(Int64Builder::new()));
+        let mut chosen = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        for (_, _, routers) in rows {
+            for (name, values) in routers {
+                counts.keys().append_value(name);
+                counts.values().append_value(values.iter().copied().map(Some));
+                chosen.keys().append_value(name);
+                chosen.values().append_value(top_k);
+            }
+            counts.append(true).unwrap();
+            chosen.append(true).unwrap();
+        }
+        let (counts, chosen) = (counts.finish(), chosen.finish());
+        let schema = Schema::new(vec![
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("rank", DataType::Int32, false),
+            Field::new("attempt", DataType::Int64, false),
+            Field::new("step", DataType::Int64, false),
+            Field::new("moe_counts", counts.data_type().clone(), true),
+            Field::new("moe_top_k", chosen.data_type().clone(), true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|_| "run"))),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|_| 0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
+                Arc::new(counts),
+                Arc::new(chosen),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The samples `detect --samples` writes for these rows, and the rest of its report.
+    fn samples_of(batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> (Vec<Value>, Value) {
+        let mut out = Vec::new();
+        detect_stream_samples(&stream(batches)[..], thresholds, &mut out).unwrap();
+        let mut report: Value = serde_json::from_slice(&out).unwrap();
+        let samples = report.as_object_mut().unwrap().remove("samples").unwrap();
+        (samples.as_array().unwrap().clone(), report)
+    }
+
+    #[test]
+    fn samples_list_every_row_and_router_and_mark_what_a_step_did_not_record() {
+        let rows = [
+            (1, 0, vec![("a", vec![9000, 1000])]),
+            (1, 1, vec![]), // a step that recorded no router
+            // `a` recorded with nothing routed, and `b` seen for the first time.
+            (1, 2, vec![("a", vec![0, 0, 0]), ("b", vec![5000, 5000])]),
+        ];
+        let (samples, _) = samples_of(&[moe_rows(&rows, 1)], &usual());
+        // Two experts and 10,000 tokens: 1.5 times an even share, 0.75, is the largest of the three bounds.
+        let missing = |step: i64, layer: usize, router: &str, experts: usize| {
+            json!({
+                "step": step, "layer": layer, "router": router, "routed_tokens": 0, "counts": vec![0; experts],
+                "diversity": null, "overloaded": [], "dead": [], "missing": true, "starved": [],
+            })
+        };
+        let expected = vec![
+            json!({
+                "step": 0, "layer": 1, "router": "a", "routed_tokens": 10000, "counts": [9000, 1000],
+                "diversity": diversity_from_counts(&[9000, 1000]), "overloaded": [1], "dead": [],
+                "overload_rule": {"rule": "share", "threshold": 0.75}, "starved": [],
+            }),
+            // `b` exists in the run, so the steps before it appeared list it too.
+            missing(0, 2, "b", 2),
+            // `a` is given the most experts it ever recorded, three, where a step left it out,
+            missing(1, 1, "a", 3),
+            missing(1, 2, "b", 2),
+            // and the counts it recorded where they sum to nothing.
+            missing(2, 1, "a", 3),
+            json!({
+                "step": 2, "layer": 2, "router": "b", "routed_tokens": 10000, "counts": [5000, 5000],
+                "diversity": diversity_from_counts(&[5000, 5000]), "overloaded": [], "dead": [],
+                "overload_rule": {"rule": "share", "threshold": 0.75}, "starved": [],
+            }),
+        ];
+        assert_eq!(samples.len(), expected.len());
+        for (found, wanted) in samples.iter().zip(&expected) {
+            assert_eq!(found, wanted, "step {} router {}", wanted["step"], wanted["router"]);
+        }
+        assert!((diversity_from_counts(&[9000, 1000]) - 0.692).abs() < 1e-3);
+        // As text, the keys come in the order Python's samples have them.
+        let mut out = Vec::new();
+        detect_stream_samples(&stream(&[moe_rows(&rows, 1)])[..], &usual(), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let first = r#""samples":[{"step":0,"layer":1,"router":"a","routed_tokens":10000,"counts":[9000,1000],"diversity":0.69"#;
+        assert!(text.contains(first), "{text}");
+        let second = r#""overloaded":[1],"dead":[],"overload_rule":{"rule":"share","threshold":0.75},"starved":[]},{"step":0,"layer":2,"router":"b","routed_tokens":0,"counts":[0,0],"diversity":null,"overloaded":[],"dead":[],"missing":true,"starved":[]}"#;
+        assert!(text.contains(second), "{text}");
+    }
+
+    #[test]
+    fn a_sample_says_who_is_starved_only_once_its_window_could_be_judged() {
+        let thresholds = Arc::new(Thresholds::parse(r#"{"starve_window": 2}"#).unwrap());
+        // Expert 4 gets 1 token in 3,001 on every step: far below a tenth of an even share.
+        let rows: Vec<_> = (0..3)
+            .map(|step| (1, step, vec![("a", vec![1000, 1000, 1000, 1])]))
+            .collect();
+        let (samples, report) = samples_of(&[moe_rows(&rows, 1)], &thresholds);
+        assert_eq!(samples.len(), 3);
+        // One sample is not a window of two: nothing is said, which is not "nobody is starved".
+        assert_eq!(samples[0]["starved"], json!([]));
+        assert!(samples[0].get("starved_shares").is_none());
+        for sample in &samples[1..] {
+            assert_eq!(sample["starved"], json!([4]));
+            assert_eq!(sample["starved_shares"], json!({"4": 2.0 / 6002.0}));
+        }
+        // The incident is made from the same judgement.
+        let starved = &report["incidents"][0];
+        assert_eq!(
+            (&starved["kind"], &starved["step"]),
+            (&json!("starved_experts"), &json!(1))
+        );
+        assert_eq!(starved["experts"][0]["window_share"], json!(2.0 / 6002.0));
+
+        // A full window with nobody starved has the key, empty.
+        let even: Vec<_> = (0..2).map(|step| (1, step, vec![("a", vec![1000, 1000])])).collect();
+        let (samples, _) = samples_of(&[moe_rows(&even, 1)], &thresholds);
+        assert!(samples[0].get("starved_shares").is_none());
+        assert_eq!(samples[1]["starved_shares"], json!({}));
+    }
+
+    #[test]
+    fn a_sample_names_the_rule_its_overloaded_experts_were_found_by() {
+        // Top-4, where no expert can be far above an even share: judged against the router's own past.
+        let mut rows: Vec<_> = (0..12)
+            .map(|step| (1, step, vec![("a", vec![2500, 2500, 2500, 2500])]))
+            .collect();
+        rows.push((1, 12, vec![("a", vec![9700, 100, 100, 100])]));
+        let (samples, report) = samples_of(&[moe_rows(&rows, 4)], &usual());
+        let drop = json!({"rule": "diversity_drop", "drop": DIVERSITY_DROP, "jump": OVERLOAD_JUMP});
+        assert!(samples.iter().all(|sample| sample["overload_rule"] == drop));
+        assert!(samples[..12].iter().all(|sample| sample["overloaded"] == json!([])));
+        assert_eq!(samples[12]["overloaded"], json!([1]));
+        assert_eq!(report["incidents"][0]["step"], 12);
+        assert_eq!(report["moe_flagged"], json!({"samples": 1, "last_step": 12}));
+
+        // Before there is a baseline, a top-4 router with dead experts is attributed by share:
+        // above twice an even share, which here is the larger bound.
+        let collapsed = [(1, 0, vec![("a", vec![9000, 1000, 0, 0])])];
+        let (samples, _) = samples_of(&[moe_rows(&collapsed, 4)], &usual());
+        assert_eq!(
+            samples[0]["overload_rule"],
+            json!({"rule": "collapse", "threshold": 0.5})
+        );
+        assert_eq!(
+            (&samples[0]["overloaded"], &samples[0]["dead"]),
+            (&json!([1]), &json!([3, 4]))
+        );
+    }
+
+    #[test]
+    fn samples_cover_the_rows_that_count_in_step_order() {
+        // Attempt 2 resumes at step 2: what attempt 1 wrote there and after was rolled back.
+        let token = |attempt: i64, step: i64| vec![("a", vec![1000 * attempt + step, 500])];
+        let first: Vec<_> = (0..4).map(|step| (1, step, token(1, step))).collect();
+        let second: Vec<_> = (2..5).map(|step| (2, step, token(2, step))).collect();
+        let (samples, report) = samples_of(&[moe_rows(&first, 1), moe_rows(&second, 1)], &usual());
+        let read: Vec<(i64, i64)> = samples
+            .iter()
+            .map(|sample| (sample["step"].as_i64().unwrap(), sample["counts"][0].as_i64().unwrap()))
+            .collect();
+        assert_eq!(read, [(0, 1000), (1, 1001), (2, 2002), (3, 2003), (4, 2004)]);
+        assert_eq!(report["steps"], 5);
+
+        // A step written twice in one attempt has two samples, in the order they were written.
+        let twice = [
+            (1, 0, token(1, 0)),
+            (1, 1, token(1, 1)),
+            (1, 1, token(3, 1)),
+            (1, 2, token(1, 2)),
+        ];
+        let (samples, _) = samples_of(&[moe_rows(&twice, 1)], &usual());
+        let read: Vec<i64> = samples
+            .iter()
+            .map(|sample| sample["counts"][0].as_i64().unwrap())
+            .collect();
+        assert_eq!(read, [1000, 1001, 3001, 1002]);
+    }
+
+    #[test]
+    fn samples_are_kept_only_when_asked_and_the_servers_report_never_has_them() {
+        let rows: Vec<_> = (0..20)
+            .map(|step| (1, step, vec![("a", vec![9000, 1000]), ("b", vec![10, 10, 10])]))
+            .collect();
+        let batches = [moe_rows(&rows, 1)];
+        // What the server keeps for a rank: no samples, however long the run.
+        let server = judge(0, &batches, &usual()).unwrap();
+        assert!(server.samples().is_none() && server.moe.kept.is_none());
+        let plain = report("run", 0, &server, 0);
+        assert!(plain.get("samples").is_none());
+        assert_eq!(detect_stream(&stream(&batches)[..], &usual()).unwrap(), plain);
+
+        let (samples, with_samples) = samples_of(&batches, &usual());
+        assert_eq!(samples.len(), 20 * 2);
+        // Every other key of the report is the same, in name and value.
+        assert_eq!(with_samples, plain);
+        let kept = judge_with(RankDetectors::with_samples(&usual()), 0, &batches).unwrap();
+        assert_eq!(kept.samples().unwrap().len(), 40);
+        assert_eq!(serde_json::to_value(kept.samples().unwrap()).unwrap(), json!(samples));
+
+        // Rows with no MoE column at all: the key is there, and empty.
+        let (samples, report) = samples_of(&[key_rows(&steps("run", 0, 1, 0..5))], &usual());
+        assert!(samples.is_empty());
+        assert_eq!(report["steps"], 5);
     }
 
     #[test]

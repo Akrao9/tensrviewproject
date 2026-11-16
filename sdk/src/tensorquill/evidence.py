@@ -2704,65 +2704,17 @@ def _check_other_sources(
     return traincheck_summary, recorder_summary
 
 
-def build_evidence(
-    source: str | Path | Iterable[Mapping[str, Any]],
-    *,
-    rank: int | None = None,
-    overload_threshold: float = OVERLOAD_THRESHOLD,
-    drift_tolerance: float = DRIFT_TOLERANCE,
-    starve_window: int = STARVE_WINDOW,
-    starve_ratio: float = STARVE_RATIO,
-    top_k: int | Mapping[str, int] | None = None,
-    watchdog: str | Path | Mapping[str, Any] | None = None,
-    flight_recorder: str | Path | None = None,
-    flight_recorder_prefix: str | None = None,
-    traincheck: str | Path | None = None,
-    detectors: str = "python",
-    server_binary: str | os.PathLike[str] | None = None,
-) -> dict[str, Any]:
-    """Build viewer-neutral detector evidence from captured step records.
-
-    The detectors read one rank's steps. `rank` picks that rank out of a run directory or a
-    list of records; records of several ranks with no `rank` given raise `ValueError`,
-    because merged they repeat step numbers and give incidents that belong to neither rank.
-
-    `watchdog` is the server's `watchdog.json` (a path or the parsed document). A run directory
-    or one of its `rank=` folders automatically reads the run's status; its progress verdict
-    becomes `job_stalled` or `rank_silent`.
-    `flight_recorder` is a directory of PyTorch Flight Recorder dumps (one pickle per rank,
-    `flight_recorder_prefix` the common start of their names): PyTorch's analyzer runs over
-    them and its first problem becomes `collective_hang` or `collective_desync`. When the
-    analyzer is missing (PyTorch before 2.10) or the dumps cannot be read, the check is
-    listed under `not_checked` with the reason.
-    `traincheck` is TrainCheck's `violations_summary.json` (or its results directory):
-    the violated invariants become one `traincheck_violation` incident.
-
-    `top_k` overrides the experts-per-token recorded as `moe_top_k`, for captures made
-    before it was recorded: one value for every router, or a value per router name.
-    `overload_threshold` is the base assignment-share threshold for top-1 and top-2.
-    Top-3 and higher use a per-router baseline once ten unflagged samples are available.
-
-    `detectors="rust"` takes the incidents of the server's kinds (`SERVER_KINDS`) from the
-    Rust detectors, run here on the same records through `tensorquill-server detect`
-    (`server_binary`, else `TENSORQUILL_SERVER_BIN`, else the one on `PATH`; needs `pyarrow`).
-    The five options above go to it as one JSON object (`--thresholds`), and a value the
-    Rust rules refuse (a negative number, a window or `top_k` below 1) raises `ValueError`.
-    The per-step `samples`, the weight trends and the kinds read from other files are still
-    made here. The evidence then carries `"detectors": "rust"`.
-    """
-    if detectors not in ("python", "rust"):
-        raise ValueError(f"detectors must be 'python' or 'rust', not {detectors!r}")
-    every_attempt = load_records(source, rank=rank, all_attempts=True)
-    ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
-    if len(ranks) > 1:
-        raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
-    records = resolve_attempts(every_attempt)
-    router_sizes = _router_sizes(records)
+def _moe_samples(
+    records: list[dict[str, Any]],
+    router_sizes: Mapping[str, int],
+    router_top_k: Mapping[str, int],
+    overload_threshold: float,
+) -> list[dict[str, Any]]:
+    """The per-step MoE samples as the Python rules judge them: one for every record and
+    router, with the experts found overloaded or dead there. `_mark_starved` adds the starved
+    ones. The Rust detectors make the same list (`tensorquill-server detect --samples`)."""
     routers = list(router_sizes)
-    expert_count = max(router_sizes.values(), default=0)
-    router_top_k = _router_top_k(records, routers, top_k)
     history: dict[str, list[tuple[list[int], int, float]]] = {name: [] for name in routers}
-
     samples: list[dict[str, Any]] = []
     for record in sorted(records, key=lambda r: r["step"]):
         step = int(record["step"])
@@ -2840,8 +2792,68 @@ def build_evidence(
             else:
                 sample["overload_rule"] = rule
             samples.append(sample)
+    return samples
 
-    _mark_starved(samples, starve_window, starve_ratio)
+
+def build_evidence(
+    source: str | Path | Iterable[Mapping[str, Any]],
+    *,
+    rank: int | None = None,
+    overload_threshold: float = OVERLOAD_THRESHOLD,
+    drift_tolerance: float = DRIFT_TOLERANCE,
+    starve_window: int = STARVE_WINDOW,
+    starve_ratio: float = STARVE_RATIO,
+    top_k: int | Mapping[str, int] | None = None,
+    watchdog: str | Path | Mapping[str, Any] | None = None,
+    flight_recorder: str | Path | None = None,
+    flight_recorder_prefix: str | None = None,
+    traincheck: str | Path | None = None,
+    detectors: str = "python",
+    server_binary: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Build viewer-neutral detector evidence from captured step records.
+
+    The detectors read one rank's steps. `rank` picks that rank out of a run directory or a
+    list of records; records of several ranks with no `rank` given raise `ValueError`,
+    because merged they repeat step numbers and give incidents that belong to neither rank.
+
+    `watchdog` is the server's `watchdog.json` (a path or the parsed document). A run directory
+    or one of its `rank=` folders automatically reads the run's status; its progress verdict
+    becomes `job_stalled` or `rank_silent`.
+    `flight_recorder` is a directory of PyTorch Flight Recorder dumps (one pickle per rank,
+    `flight_recorder_prefix` the common start of their names): PyTorch's analyzer runs over
+    them and its first problem becomes `collective_hang` or `collective_desync`. When the
+    analyzer is missing (PyTorch before 2.10) or the dumps cannot be read, the check is
+    listed under `not_checked` with the reason.
+    `traincheck` is TrainCheck's `violations_summary.json` (or its results directory):
+    the violated invariants become one `traincheck_violation` incident.
+
+    `top_k` overrides the experts-per-token recorded as `moe_top_k`, for captures made
+    before it was recorded: one value for every router, or a value per router name.
+    `overload_threshold` is the base assignment-share threshold for top-1 and top-2.
+    Top-3 and higher use a per-router baseline once ten unflagged samples are available.
+
+    `detectors="rust"` takes the incidents of the server's kinds (`SERVER_KINDS`) from the
+    Rust detectors, run here on the same records through `tensorquill-server detect`
+    (`server_binary`, else `TENSORQUILL_SERVER_BIN`, else the one on `PATH`; needs `pyarrow`).
+    The five options above go to it as one JSON object (`--thresholds`), and a value the
+    Rust rules refuse (a negative number, a window or `top_k` below 1) raises `ValueError`.
+    The per-step `samples` come from that run too (`detect --samples`), so no MoE rule runs
+    here. The weight trends, the router names and sizes and the kinds read from other files
+    are still made here. The evidence then carries `"detectors": "rust"`.
+    """
+    if detectors not in ("python", "rust"):
+        raise ValueError(f"detectors must be 'python' or 'rust', not {detectors!r}")
+    every_attempt = load_records(source, rank=rank, all_attempts=True)
+    ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
+    if len(ranks) > 1:
+        raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
+    records = resolve_attempts(every_attempt)
+    router_sizes = _router_sizes(records)
+    routers = list(router_sizes)
+    expert_count = max(router_sizes.values(), default=0)
+    router_top_k = _router_top_k(records, routers, top_k)
+    samples: list[dict[str, Any]]
     incidents: list[dict[str, Any]]
     not_checked: list[dict[str, Any]]
     from_rust: list[dict[str, Any]] | None = None
@@ -2852,7 +2864,7 @@ def build_evidence(
             "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
             "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": _top_k_option(top_k),
         }
-        report = server_report(every_attempt, thresholds=asked, binary=server_binary)
+        report = server_report(every_attempt, thresholds=asked, binary=server_binary, samples=True)
         absent = [kind for kind in SERVER_KINDS if kind not in (report.get("checked") or ())]
         if absent:
             raise RuntimeError(
@@ -2862,11 +2874,19 @@ def build_evidence(
         expected = {**asked, "spike_sustain": SPIKE_SUSTAIN}
         differing = [name for name, value in expected.items() if not _same_threshold(value, applied.get(name))]
         if differing:
-            # The samples below are judged here and the incidents there: they must use one rule.
             raise RuntimeError(
                 "this tensorquill-server applies other thresholds than were asked for ("
                 + ", ".join(f"{name} {applied.get(name)!r}, here {expected[name]!r}" for name in differing)
                 + "): build the server from the same version"
+            )
+        # The samples are judged there too, by the rules that made the incidents.
+        samples = report["samples"]
+        named = [(s.get("layer"), s.get("router")) for s in samples[:len(routers)]]
+        if len(samples) != len(records) * len(routers) or named != list(enumerate(routers, 1)):
+            raise RuntimeError(
+                f"this tensorquill-server gave {len(samples)} MoE samples, for the routers"
+                f" {[name for _, name in named]}, where these {len(records)} records have the routers {routers}:"
+                " build the server from the same version"
             )
         from_rust = [dict(incident) for incident in report["incidents"]]
         incidents = [i for i in from_rust if i.get("kind") != "replica_drift"]
@@ -2877,6 +2897,8 @@ def build_evidence(
             if isinstance(item, dict) and item.get("check") not in ("flight_recorder", "traincheck")
         ]
     else:
+        samples = _moe_samples(records, router_sizes, router_top_k, overload_threshold)
+        _mark_starved(samples, starve_window, starve_ratio)
         incidents = []
         moe_hit = first_incident({"samples": samples})
         if moe_hit is not None:

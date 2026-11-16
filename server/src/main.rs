@@ -91,17 +91,30 @@ enum Command {
         /// The rows as an Arrow IPC stream in the schema the SDK sends, grouped by attempt
         /// (oldest first) and in recorded order; `-` or nothing reads standard input.
         input: Option<PathBuf>,
+        /// Add `samples` to the report: one entry for every step and MoE router, with its
+        /// counts and the experts the rules found overloaded, dead or starved there. The
+        /// server's own incidents.json never has them; for a long MoE run they are tens of MB.
+        #[arg(long)]
+        samples: bool,
     },
 }
 
 /// `tensorquill-server detect`: the report goes to standard output as one line of JSON.
-fn detect(input: Option<PathBuf>, thresholds: &Arc<Thresholds>) -> Result<(), Error> {
-    use tensorquill_server::detect::detect_stream;
-    let report = match input.filter(|path| path.as_os_str() != "-") {
-        Some(path) => detect_stream(std::io::BufReader::new(std::fs::File::open(path)?), thresholds),
-        None => detect_stream(std::io::stdin().lock(), thresholds),
-    }?;
-    println!("{report}");
+fn detect(input: Option<PathBuf>, samples: bool, thresholds: &Arc<Thresholds>) -> Result<(), Error> {
+    use std::io::Write;
+    use tensorquill_server::detect::{detect_stream, detect_stream_samples};
+    let input: Box<dyn std::io::Read> = match input.filter(|path| path.as_os_str() != "-") {
+        Some(path) => Box::new(std::io::BufReader::new(std::fs::File::open(path)?)),
+        None => Box::new(std::io::stdin().lock()),
+    };
+    if samples {
+        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+        detect_stream_samples(input, thresholds, &mut out)?;
+        writeln!(out)?;
+        out.flush()?;
+    } else {
+        println!("{}", detect_stream(input, thresholds)?);
+    }
     Ok(())
 }
 
@@ -191,7 +204,9 @@ async fn run(args: Args) -> Result<(), Error> {
 async fn main() -> ExitCode {
     let mut args = Args::parse();
     let outcome = match args.command.take() {
-        Some(Command::Detect { input }) => detect(input, &Arc::new(args.thresholds.take().unwrap_or_default())),
+        Some(Command::Detect { input, samples }) => {
+            detect(input, samples, &Arc::new(args.thresholds.take().unwrap_or_default()))
+        }
         None => run(args).await,
     };
     match outcome {
