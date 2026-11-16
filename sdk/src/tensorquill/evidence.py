@@ -1447,6 +1447,22 @@ def _newest_part(folder: Path) -> tuple[tuple[int, int] | None, Path | None, int
     return newest, Path(newest_path) if newest_path is not None else None, unknown
 
 
+def _top_k_option(top_k: int | Mapping[str, int] | None) -> int | dict[str, int] | None:
+    """`top_k` as it travels to the Rust detectors and comes back in a report's thresholds."""
+    if top_k is None or isinstance(top_k, int):
+        return top_k
+    return {str(name): int(k) for name, k in top_k.items()}
+
+
+def _same_threshold(asked: Any, applied: Any) -> bool:
+    """Whether a report applied the value asked for. A float that went to the server as JSON
+    text may come back one unit in the last place apart, which is the same threshold."""
+    numbers = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (asked, applied))
+    if numbers and (isinstance(asked, float) or isinstance(applied, float)):
+        return math.isclose(asked, applied, rel_tol=1e-12, abs_tol=0.0)
+    return bool(asked == applied)
+
+
 def read_server_report(
     folder: str | Path,
     *,
@@ -1466,7 +1482,8 @@ def read_server_report(
     Returns `{"state", "reason", "stored", "report"}`: `stored` is `(attempt, last step)`
     of the newest part or None, `report` the parsed file or None, and `state` one of
 
-    - `current`: the report covers every stored step and uses the thresholds asked for.
+    - `current`: the report covers every stored step and uses the thresholds asked for
+      (the server's own are set with `tensorquill-server --thresholds`).
     - `nothing_stored`: no parts and no report yet.
     - `missing`: parts, but no report (`--no-detect`, a server older than its detectors,
       or the moment between the first part and its report).
@@ -1516,11 +1533,13 @@ def read_server_report(
         return result("unusable", "the server's report was made without the per-parameter gradient and stalled-weight"
                       " rules (an older server wrote it)", report)
     asked = {"overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
-             "starve_window": starve_window, "starve_ratio": starve_ratio}
-    differing = [name for name, value in asked.items() if applied.get(name) != value]
-    if differing or top_k is not None:
+             "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": _top_k_option(top_k)}
+    # A server started with `--thresholds` lists what it applied, `top_k` among them (null: what
+    # the run recorded). A server from before that option has no `top_k` there, which reads the same.
+    differing = [name for name, value in asked.items() if not _same_threshold(value, applied.get(name))]
+    if differing:
         what = ", ".join(f"{name} {applied.get(name)!r} where {asked[name]!r} was asked for" for name in differing)
-        return result("other_thresholds", f"the server applied {what or 'the recorded top-k, not the one given here'}", report)
+        return result("other_thresholds", f"the server applied {what}", report)
     last_step = report.get("last_step")
     reported = (report["attempt"], last_step if isinstance(last_step, int) else -(2**63))
     where = f"step {last_step} of attempt {report['attempt']}"
@@ -2696,27 +2715,13 @@ def build_evidence(
     `detectors="rust"` takes the incidents of the server's kinds (`SERVER_KINDS`) from the
     Rust detectors, run here on the same records through `tensorquill-server detect`
     (`server_binary`, else `TENSORQUILL_SERVER_BIN`, else the one on `PATH`; needs `pyarrow`).
-    The Rust rules take no options, so any threshold or `top_k` other than the default raises
-    `ValueError`. The per-step `samples`, the weight trends and the kinds read from other
-    files are still made here. The evidence then carries `"detectors": "rust"`.
+    The five options above go to it as one JSON object (`--thresholds`), and a value the
+    Rust rules refuse (a negative number, a window or `top_k` below 1) raises `ValueError`.
+    The per-step `samples`, the weight trends and the kinds read from other files are still
+    made here. The evidence then carries `"detectors": "rust"`.
     """
     if detectors not in ("python", "rust"):
         raise ValueError(f"detectors must be 'python' or 'rust', not {detectors!r}")
-    if detectors == "rust":
-        changed = [
-            name for name, value, default in (
-                ("overload_threshold", overload_threshold, OVERLOAD_THRESHOLD),
-                ("drift_tolerance", drift_tolerance, DRIFT_TOLERANCE),
-                ("starve_window", starve_window, STARVE_WINDOW),
-                ("starve_ratio", starve_ratio, STARVE_RATIO),
-                ("top_k", top_k, None),
-            ) if value != default
-        ]
-        if changed:
-            raise ValueError(
-                f"the Rust detectors apply the default thresholds and the recorded top-k; {', '.join(changed)} "
-                "was given. Use detectors='python' for other values"
-            )
     every_attempt = load_records(source, rank=rank, all_attempts=True)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
@@ -2813,23 +2818,24 @@ def build_evidence(
     if detectors == "rust" and every_attempt:
         from .server_detect import server_report
 
-        report = server_report(every_attempt, binary=server_binary)
+        asked = {
+            "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
+            "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": _top_k_option(top_k),
+        }
+        report = server_report(every_attempt, thresholds=asked, binary=server_binary)
         absent = [kind for kind in SERVER_KINDS if kind not in (report.get("checked") or ())]
         if absent:
             raise RuntimeError(
                 f"this tensorquill-server does not check {', '.join(absent)} (an older one): build it from the same version"
             )
         applied = report.get("thresholds") or {}
-        asked = {
-            "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
-            "starve_window": starve_window, "starve_ratio": starve_ratio, "spike_sustain": SPIKE_SUSTAIN,
-        }
-        differing = [name for name, value in asked.items() if applied.get(name) != value]
+        expected = {**asked, "spike_sustain": SPIKE_SUSTAIN}
+        differing = [name for name, value in expected.items() if not _same_threshold(value, applied.get(name))]
         if differing:
             # The samples below are judged here and the incidents there: they must use one rule.
             raise RuntimeError(
-                "this tensorquill-server applies other thresholds than this SDK ("
-                + ", ".join(f"{name} {applied.get(name)!r}, here {asked[name]!r}" for name in differing)
+                "this tensorquill-server applies other thresholds than were asked for ("
+                + ", ".join(f"{name} {applied.get(name)!r}, here {expected[name]!r}" for name in differing)
                 + "): build the server from the same version"
             )
         from_rust = [dict(incident) for incident in report["incidents"]]
@@ -4041,7 +4047,7 @@ def main() -> None:
         default="python",
         help="rust: take the incidents of the server's kinds from the Rust detectors, run on this file through "
         "`tensorquill-server detect` (the binary on PATH or named by TENSORQUILL_SERVER_BIN; needs pyarrow). "
-        "One finished file or store at the default thresholds: not with --watch, --rank all or --top-k",
+        "One finished file or store, read once: not with --watch or --rank all",
     )
     args = parser.parse_args()
 

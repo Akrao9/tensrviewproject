@@ -192,46 +192,138 @@ pub fn with_classes(incidents: &mut [Value]) {
     }
 }
 
-/// The thresholds in force, written beside the incidents so a reader knows what was applied.
-pub fn thresholds() -> Value {
-    json!({
-        "overload_threshold": OVERLOAD_THRESHOLD,
-        "starve_window": STARVE_WINDOW,
-        "starve_ratio": STARVE_RATIO,
-        "diversity_drop": DIVERSITY_DROP,
-        "overload_jump": OVERLOAD_JUMP,
-        "spike_factor": SPIKE_FACTOR,
-        "spike_window": SPIKE_WINDOW,
-        "spike_sustain": SPIKE_SUSTAIN,
-        "activation_spike_factor": ACT_SPIKE_FACTOR,
-        "activation_drift_factor": ACT_DRIFT_FACTOR,
-        "activation_dead_rise": ACT_DEAD_RISE,
-        "stall_steps": STALL_STEPS,
-        "scale_skip_run": SCALE_SKIP_RUN,
-        "scale_floor": SCALE_FLOOR,
-        "drift_tolerance": DRIFT_TOLERANCE,
-        "resume_lr_tolerance": RESUME_LR_TOLERANCE,
-        "data_stall_steps": data::DATA_STALL_STEPS,
-        "order_min_batches": data::ORDER_MIN_BATCHES,
-        "order_compare": data::ORDER_COMPARE,
-        "duplicate_window": data::DUPLICATE_WINDOW,
-        "scheduler_slack": data::SCHEDULER_SLACK,
-        "attention_min_history": ATTN_MIN_HISTORY,
-        "attention_window": ATTN_WINDOW,
-        "attention_sustain": ATTN_SUSTAIN,
-        "attention_collapse_ratio": ATTN_COLLAPSE_RATIO,
-        "attention_uniform": ATTN_UNIFORM,
-        "attention_uniform_rise": ATTN_UNIFORM_RISE,
-        "attention_logit_factor": ATTN_LOGIT_FACTOR,
-        "memory_growth_readings": system::MEMORY_GROWTH_READINGS,
-        "memory_growth_fraction": system::MEMORY_GROWTH_FRACTION,
-        "memory_growth_bytes": system::MEMORY_GROWTH_BYTES,
-        "memory_reserved_fraction": system::MEMORY_RESERVED_FRACTION,
-        "throttle_reported": system::THROTTLE_REPORTED,
-        "input_window": system::INPUT_WINDOW,
-        "input_share": system::INPUT_SHARE,
-        "input_rise": system::INPUT_RISE,
-    })
+/// The experts-per-token override: one value for every router, or a value for each router named.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum TopK {
+    Every(i64),
+    Named(BTreeMap<String, i64>),
+}
+
+/// The detector options a run can set: `build_evidence`'s `overload_threshold`,
+/// `drift_tolerance`, `starve_window`, `starve_ratio` and `top_k`. The default is the value
+/// each rule has always applied. They arrive as one JSON object, on `tensorquill-server
+/// --thresholds` for the server's detectors and on `tensorquill-server detect --thresholds`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Thresholds {
+    /// The base assignment-share threshold for top-1 and top-2 routers.
+    pub overload_threshold: f64,
+    /// The relative spread between replicas above which a parameter has drifted.
+    pub drift_tolerance: f64,
+    /// How many samples of a router the starved check sums over.
+    pub starve_window: usize,
+    /// An expert is starved below this fraction of an even share of that window.
+    pub starve_ratio: f64,
+    /// Experts chosen per token, in place of the recorded `moe_top_k`.
+    pub top_k: Option<TopK>,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Self {
+            overload_threshold: OVERLOAD_THRESHOLD,
+            drift_tolerance: DRIFT_TOLERANCE,
+            starve_window: STARVE_WINDOW,
+            starve_ratio: STARVE_RATIO,
+            top_k: None,
+        }
+    }
+}
+
+impl Thresholds {
+    /// Reads the JSON object given on the command line. A key left out keeps its default
+    /// and `"top_k": null` means the recorded value. Refused: anything but an object, a key
+    /// that is not one of the five, a value of the wrong type, a number that is negative or
+    /// not finite, a window below 1 and a `top_k` below 1.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let value: Value = serde_json::from_str(text).map_err(|error| format!("not JSON: {error}"))?;
+        if !value.is_object() {
+            // A derived struct would also read an array, by position.
+            return Err(format!(
+                "expected a JSON object such as {{\"overload_threshold\": 0.5}}, got {value}"
+            ));
+        }
+        let thresholds: Self = serde_json::from_value(value).map_err(|error| error.to_string())?;
+        for (name, number) in [
+            ("overload_threshold", thresholds.overload_threshold),
+            ("drift_tolerance", thresholds.drift_tolerance),
+            ("starve_ratio", thresholds.starve_ratio),
+        ] {
+            if !number.is_finite() || number < 0.0 {
+                return Err(format!("{name} must be a finite number of at least 0, got {number}"));
+            }
+        }
+        if thresholds.starve_window < 1 {
+            return Err("starve_window must be at least 1".to_string());
+        }
+        let chosen: Vec<i64> = match &thresholds.top_k {
+            None => Vec::new(),
+            Some(TopK::Every(k)) => vec![*k],
+            Some(TopK::Named(each)) => each.values().copied().collect(),
+        };
+        if let Some(k) = chosen.into_iter().find(|k| *k < 1) {
+            return Err(format!("top_k must be at least 1, got {k}"));
+        }
+        Ok(thresholds)
+    }
+
+    /// The override for one router, if there is one.
+    fn top_k_for(&self, router: &str) -> Option<i64> {
+        match self.top_k.as_ref()? {
+            TopK::Every(k) => Some(*k),
+            TopK::Named(each) => each.get(router).copied(),
+        }
+    }
+
+    /// Every threshold the detectors apply, with these options in place: the `thresholds`
+    /// of a report, which a reader compares with the ones it asked for.
+    pub fn applied(&self) -> Value {
+        let top_k = match &self.top_k {
+            None => Value::Null,
+            Some(TopK::Every(k)) => json!(k),
+            Some(TopK::Named(each)) => json!(each),
+        };
+        json!({
+            "overload_threshold": self.overload_threshold,
+            "starve_window": self.starve_window,
+            "starve_ratio": self.starve_ratio,
+            "top_k": top_k,
+            "diversity_drop": DIVERSITY_DROP,
+            "overload_jump": OVERLOAD_JUMP,
+            "spike_factor": SPIKE_FACTOR,
+            "spike_window": SPIKE_WINDOW,
+            "spike_sustain": SPIKE_SUSTAIN,
+            "activation_spike_factor": ACT_SPIKE_FACTOR,
+            "activation_drift_factor": ACT_DRIFT_FACTOR,
+            "activation_dead_rise": ACT_DEAD_RISE,
+            "stall_steps": STALL_STEPS,
+            "scale_skip_run": SCALE_SKIP_RUN,
+            "scale_floor": SCALE_FLOOR,
+            "drift_tolerance": self.drift_tolerance,
+            "resume_lr_tolerance": RESUME_LR_TOLERANCE,
+            "data_stall_steps": data::DATA_STALL_STEPS,
+            "order_min_batches": data::ORDER_MIN_BATCHES,
+            "order_compare": data::ORDER_COMPARE,
+            "duplicate_window": data::DUPLICATE_WINDOW,
+            "scheduler_slack": data::SCHEDULER_SLACK,
+            "attention_min_history": ATTN_MIN_HISTORY,
+            "attention_window": ATTN_WINDOW,
+            "attention_sustain": ATTN_SUSTAIN,
+            "attention_collapse_ratio": ATTN_COLLAPSE_RATIO,
+            "attention_uniform": ATTN_UNIFORM,
+            "attention_uniform_rise": ATTN_UNIFORM_RISE,
+            "attention_logit_factor": ATTN_LOGIT_FACTOR,
+            "memory_growth_readings": system::MEMORY_GROWTH_READINGS,
+            "memory_growth_fraction": system::MEMORY_GROWTH_FRACTION,
+            "memory_growth_bytes": system::MEMORY_GROWTH_BYTES,
+            "memory_reserved_fraction": system::MEMORY_RESERVED_FRACTION,
+            "throttle_reported": system::THROTTLE_REPORTED,
+            "input_window": system::INPUT_WINDOW,
+            "input_share": system::INPUT_SHARE,
+            "input_rise": system::INPUT_RISE,
+        })
+    }
 }
 
 /// Python's `_median`: the middle value, or the mean of the middle two.
@@ -353,13 +445,13 @@ fn diversity_from_counts(counts: &[i64]) -> f64 {
     entropy.exp() / counts.len() as f64
 }
 
-fn effective_overload_threshold(experts: usize, tokens: i64) -> f64 {
+fn effective_overload_threshold(experts: usize, tokens: i64, base: f64) -> f64 {
     if experts <= 1 || tokens <= 0 {
         return 1.0;
     }
     let mean = 1.0 / experts as f64;
     let se = (mean * (1.0 - mean) / tokens as f64).sqrt();
-    OVERLOAD_THRESHOLD.max(1.5 * mean).max(mean + 3.0 * se)
+    base.max(1.5 * mean).max(mean + 3.0 * se)
 }
 
 fn dead_experts_significant(experts: usize, tokens: i64, overloaded: bool, dead: usize, diversity: f64) -> bool {
@@ -728,7 +820,7 @@ struct Router {
     window: VecDeque<(Arc<[i64]>, i64, f64)>,
     window_sums: Vec<i64>,
     window_total: i64,
-    /// The trailing `STARVE_WINDOW` samples, for the starved check.
+    /// The trailing `starve_window` samples, for the starved check.
     recent: VecDeque<(Arc<[i64]>, i64)>,
     recent_sums: Vec<i64>,
     recent_tokens: i64,
@@ -788,8 +880,15 @@ impl Router {
     }
 
     /// Python's `_mark_starved` for one sample: the experts whose share of the trailing
-    /// window is below `STARVE_RATIO` of an even share, with that share.
-    fn starved(&mut self, counts: &Arc<[i64]>, tokens: i64, dead: &[usize]) -> Vec<(usize, f64)> {
+    /// `window` samples is below `ratio` of an even share, with that share.
+    fn starved(
+        &mut self,
+        counts: &Arc<[i64]>,
+        tokens: i64,
+        dead: &[usize],
+        window: usize,
+        ratio: f64,
+    ) -> Vec<(usize, f64)> {
         if self.recent_sums.len() != counts.len() {
             self.recent.clear();
             self.recent_sums = vec![0; counts.len()];
@@ -800,7 +899,7 @@ impl Router {
         }
         self.recent_tokens += tokens;
         self.recent.push_back((Arc::clone(counts), tokens));
-        if self.recent.len() > STARVE_WINDOW {
+        if self.recent.len() > window {
             let (old, old_tokens) = self.recent.pop_front().expect("the window is not empty");
             for (sum, count) in self.recent_sums.iter_mut().zip(old.iter()) {
                 *sum -= count;
@@ -809,15 +908,13 @@ impl Router {
         }
         let even = 1.0 / counts.len() as f64;
         let window_tokens = self.recent_tokens as f64;
-        if self.recent.len() < STARVE_WINDOW || window_tokens * even < STARVE_MIN_EXPECTED {
+        if self.recent.len() < window || window_tokens * even < STARVE_MIN_EXPECTED {
             return Vec::new();
         }
         self.recent_sums
             .iter()
             .enumerate()
-            .filter(|(index, total)| {
-                **total as f64 / window_tokens < STARVE_RATIO * even && !dead.contains(&(index + 1))
-            })
+            .filter(|(index, total)| **total as f64 / window_tokens < ratio * even && !dead.contains(&(index + 1)))
             .map(|(index, total)| (index + 1, *total as f64 / window_tokens))
             .collect()
     }
@@ -843,13 +940,17 @@ struct Moe {
 }
 
 impl Moe {
-    fn row(&mut self, step: i64, columns: &Columns, row: usize) {
+    fn row(&mut self, step: i64, columns: &Columns, row: usize, options: &Thresholds) {
         if let Some(top_k) = &columns.moe_top_k {
             for entry in top_k.row(row) {
                 if top_k.values.is_null(entry) {
                     continue;
                 }
-                let (name, k) = (top_k.keys.value(entry), i64::from(top_k.values.value(entry)));
+                let name = top_k.keys.value(entry);
+                // An override stands against every recorded value, on this row and later ones.
+                let k = options
+                    .top_k_for(name)
+                    .unwrap_or_else(|| i64::from(top_k.values.value(entry)));
                 match self.index.get(name) {
                     Some(index) => self.routers[*index].top_k = k,
                     None => {
@@ -880,7 +981,7 @@ impl Moe {
                     self.index.insert(name.to_owned(), self.routers.len());
                     self.routers.push(Router {
                         name: name.to_owned(),
-                        top_k: self.top_k_ahead.remove(name).unwrap_or(1),
+                        top_k: options.top_k_for(name).or(self.top_k_ahead.remove(name)).unwrap_or(1),
                         ..Router::default()
                     });
                     self.present.push(None);
@@ -930,7 +1031,7 @@ impl Moe {
             let mut overloaded: Vec<usize> = if router.top_k >= 3 {
                 router.jump_overloaded(&router_counts, tokens, diversity, &mut self.scratch)
             } else {
-                let threshold = effective_overload_threshold(experts, tokens);
+                let threshold = effective_overload_threshold(experts, tokens, options.overload_threshold);
                 (1..=experts)
                     .filter(|expert| share(&router_counts[expert - 1]) > threshold)
                     .collect()
@@ -972,7 +1073,8 @@ impl Moe {
                     "dead": dead,
                 }));
             }
-            for (expert, window_share) in router.starved(&shared, tokens, &dead) {
+            let starved = router.starved(&shared, tokens, &dead, options.starve_window, options.starve_ratio);
+            for (expert, window_share) in starved {
                 self.starved.entry((index + 1, expert)).or_insert((step, window_share));
             }
         }
@@ -2059,7 +2161,7 @@ struct ReplicaDrift {
 }
 
 impl ReplicaDrift {
-    fn row(&mut self, step: i64, columns: &Columns, row: usize) {
+    fn row(&mut self, step: i64, columns: &Columns, row: usize, tolerance: f64) {
         let (Some(spreads), Some(numbers)) = (&columns.replica_spread, columns.replica_spread_values) else {
             return;
         };
@@ -2084,7 +2186,7 @@ impl ReplicaDrift {
             // A NaN or Inf weight on any replica makes the spread non-finite, which would
             // compare as no drift.
             let non_finite = !values.iter().all(|value| value.is_finite());
-            if !non_finite && !values.iter().any(|value| *value > DRIFT_TOLERANCE) {
+            if !non_finite && !values.iter().any(|value| *value > tolerance) {
                 continue;
             }
             let mut detail: serde_json::Map<String, Value> = ["norm_spread", "sum_spread", "projection_spread"]
@@ -2101,7 +2203,7 @@ impl ReplicaDrift {
             self.first = Some(json!({
                 "kind": "replica_drift",
                 "step": step,
-                "tolerance": DRIFT_TOLERANCE,
+                "tolerance": tolerance,
                 "parameters": diverged,
             }));
         }
@@ -2489,11 +2591,21 @@ pub struct RankDetectors {
     rows: u64,
     /// The newest attempt read.
     attempt: i64,
+    thresholds: Arc<Thresholds>,
 }
 
 impl RankDetectors {
-    pub fn new() -> Self {
-        Self::default()
+    /// Detectors that apply `thresholds`; `Thresholds::default()` gives each rule's usual value.
+    pub fn new(thresholds: &Arc<Thresholds>) -> Self {
+        Self {
+            thresholds: Arc::clone(thresholds),
+            ..Self::default()
+        }
+    }
+
+    /// The options these detectors apply.
+    pub fn thresholds(&self) -> &Thresholds {
+        &self.thresholds
     }
 
     /// Reads the rows of `batch` in order. The caller gives each row once, in step order,
@@ -2524,14 +2636,15 @@ impl RankDetectors {
             let layers: Option<Members<LayerStats>> =
                 text(columns.layers, row).and_then(|layers| serde_json::from_str(layers).ok());
             let layers = layers.as_ref().map_or(&[][..], |layers| &layers.0);
-            self.moe.row(step, &columns, row);
+            self.moe.row(step, &columns, row, &self.thresholds);
             self.gradients.row(step, &columns, row, &mut self.scalars);
             self.stalled.row(step, &columns, row);
             self.loss_scale.row(step, &columns, row);
             self.activations.row(step, layers);
             self.attention.row(step, &columns, row, &mut self.scalars);
             self.non_finite.row(step, &columns, row, layers);
-            self.replica_drift.row(step, &columns, row);
+            self.replica_drift
+                .row(step, &columns, row, self.thresholds.drift_tolerance);
             let after = self.reported();
             let wanted = [&self.attempts.repeated_context, &self.attempts.resume_context].map(|w| w.step == Some(step));
             if after != before || wanted != [false, false] {
@@ -2723,7 +2836,12 @@ pub fn resolve(first_steps: &BTreeMap<i64, i64>) -> BTreeMap<i64, i64> {
 /// attempt's rows resent late). The whole rank is read, not its last window, and the rows a
 /// later attempt rolled back are read too: a held baseline, the first incidents and the
 /// counts all reach back to the start, and a resume is compared with what it replaced.
-pub async fn replay(storage: &Storage, run_id: &str, rank: i32) -> Result<RankDetectors, Error> {
+pub async fn replay(
+    storage: &Storage,
+    run_id: &str,
+    rank: i32,
+    thresholds: &Arc<Thresholds>,
+) -> Result<RankDetectors, Error> {
     let parts = storage.rank_parts(run_id, rank).await?;
     let mut first_steps: BTreeMap<i64, i64> = BTreeMap::new();
     for part in &parts {
@@ -2744,7 +2862,7 @@ pub async fn replay(storage: &Storage, run_id: &str, rank: i32) -> Result<RankDe
         }
     }
     let cutoffs = resolve(&first_steps);
-    let mut detectors = RankDetectors::new();
+    let mut detectors = RankDetectors::new(thresholds);
     let mut pass = AttemptPass::new(rank, &first_steps);
     for part in &parts {
         let Some(cutoff) = cutoffs.get(&part.attempt).copied() else {
@@ -2763,7 +2881,7 @@ pub async fn replay(storage: &Storage, run_id: &str, rank: i32) -> Result<RankDe
 /// `tensorquill-server detect`. The rows must be grouped by attempt, oldest attempt first,
 /// and within an attempt in the order they were recorded, as stored parts are. A batch
 /// without an `attempt` column is attempt 0, and one without a `step` column is ignored.
-pub fn judge(rank: i32, batches: &[RecordBatch]) -> Result<RankDetectors, String> {
+pub fn judge(rank: i32, batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Result<RankDetectors, String> {
     // Each batch cut where the attempt changes, so every piece belongs to one attempt.
     let mut pieces: Vec<(i64, RecordBatch)> = Vec::new();
     let mut first_steps: BTreeMap<i64, i64> = BTreeMap::new();
@@ -2796,7 +2914,7 @@ pub fn judge(rank: i32, batches: &[RecordBatch]) -> Result<RankDetectors, String
         }
     }
     let cutoffs = resolve(&first_steps);
-    let mut detectors = RankDetectors::new();
+    let mut detectors = RankDetectors::new(thresholds);
     let mut pass = AttemptPass::new(rank, &first_steps);
     for (attempt, piece) in &pieces {
         let Some(cutoff) = cutoffs.get(attempt).copied() else {
@@ -2824,7 +2942,7 @@ pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64)
         "rebuilds": rebuilds,
         "checked": PORTED,
         "not_checked": detectors.not_checked(),
-        "thresholds": thresholds(),
+        "thresholds": detectors.thresholds().applied(),
         "moe_flagged": detectors.moe_flagged(),
         "memory": detectors.memory(),
         "incidents": detectors.incidents(),
@@ -2834,7 +2952,7 @@ pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64)
 /// `tensorquill-server detect`: one rank's rows in, as an Arrow IPC stream in the schema the
 /// SDK sends, and its [`report`] out. Rows of a second run or rank are refused, because the
 /// detectors judge one rank's steps.
-pub fn detect_stream(input: impl std::io::Read) -> Result<Value, String> {
+pub fn detect_stream(input: impl std::io::Read, thresholds: &Arc<Thresholds>) -> Result<Value, String> {
     let reader = arrow::ipc::reader::StreamReader::try_new(input, None)
         .map_err(|error| format!("the input is not an Arrow IPC stream: {error}"))?;
     let batches = reader
@@ -2870,7 +2988,7 @@ pub fn detect_stream(input: impl std::io::Read) -> Result<Value, String> {
     let Some((run_id, rank)) = whose else {
         return Err("the stream holds no rows".to_string());
     };
-    let detectors = judge(rank, &batches)?;
+    let detectors = judge(rank, &batches, thresholds)?;
     Ok(report(&run_id, rank, &detectors, 0))
 }
 
@@ -2928,6 +3046,106 @@ mod tests {
         out
     }
 
+    fn usual() -> Arc<Thresholds> {
+        Arc::default()
+    }
+
+    #[test]
+    fn thresholds_left_out_are_what_the_rules_always_applied() {
+        let usual = Thresholds::parse("{}").unwrap();
+        assert_eq!(usual, Thresholds::default());
+        assert_eq!(
+            (
+                usual.overload_threshold,
+                usual.drift_tolerance,
+                usual.starve_window,
+                usual.starve_ratio
+            ),
+            (0.35, 1e-6, 50, 0.1)
+        );
+        assert_eq!(usual.top_k, None);
+        let applied = usual.applied();
+        assert_eq!(applied["overload_threshold"], 0.35);
+        assert_eq!(applied["drift_tolerance"], 1e-6);
+        assert_eq!(
+            (&applied["starve_window"], &applied["starve_ratio"]),
+            (&json!(50), &json!(0.1))
+        );
+        assert_eq!(applied["top_k"], Value::Null);
+        // The rules with no option are listed as before.
+        assert_eq!(
+            (&applied["spike_sustain"], &applied["input_window"]),
+            (&json!(3), &json!(20))
+        );
+        // One key changes only itself, and a null top_k is the recorded value.
+        let one = Thresholds::parse(r#"{"starve_window": 10, "top_k": null}"#).unwrap();
+        let expected = Thresholds {
+            starve_window: 10,
+            ..Thresholds::default()
+        };
+        assert_eq!(one, expected);
+    }
+
+    #[test]
+    fn thresholds_take_each_of_the_five_keys_and_list_what_was_applied() {
+        let text = r#"{"overload_threshold": 1, "drift_tolerance": 0.001, "starve_window": 20,
+                       "starve_ratio": 0.25, "top_k": 2}"#;
+        let all = Thresholds::parse(text).unwrap();
+        assert_eq!(all.overload_threshold, 1.0); // a whole number is a number
+        assert_eq!((all.top_k_for("any"), all.top_k_for("other")), (Some(2), Some(2)));
+        let applied = all.applied();
+        for (name, value) in [
+            ("overload_threshold", json!(1.0)),
+            ("drift_tolerance", json!(0.001)),
+            ("starve_window", json!(20)),
+            ("starve_ratio", json!(0.25)),
+            ("top_k", json!(2)),
+        ] {
+            assert_eq!(applied[name], value, "{name}");
+        }
+        let named = Thresholds::parse(r#"{"top_k": {"layers.3.router": 8}}"#).unwrap();
+        assert_eq!(
+            (named.top_k_for("layers.3.router"), named.top_k_for("layers.4.router")),
+            (Some(8), None)
+        );
+        assert_eq!(named.applied()["top_k"], json!({"layers.3.router": 8}));
+        assert_eq!(RankDetectors::new(&Arc::new(named.clone())).thresholds(), &named);
+    }
+
+    #[test]
+    fn thresholds_refuse_what_they_cannot_apply() {
+        for (text, reason) in [
+            (r#"{"overload_treshold": 0.5}"#, "unknown field `overload_treshold`"),
+            (r#"{"spike_factor": 4}"#, "unknown field `spike_factor`"), // listed in a report, but not an option
+            ("[0.5]", "expected a JSON object"),
+            ("null", "expected a JSON object"),
+            ("0.5", "expected a JSON object"),
+            ("{", "not JSON"),
+            ("", "not JSON"),
+            (r#"{"overload_threshold": "0.5"}"#, "invalid type"),
+            (r#"{"overload_threshold": null}"#, "invalid type"),
+            (
+                r#"{"overload_threshold": -0.1}"#,
+                "overload_threshold must be a finite number of at least 0",
+            ),
+            (r#"{"drift_tolerance": -1e-9}"#, "drift_tolerance must be"),
+            (r#"{"starve_ratio": -1}"#, "starve_ratio must be"),
+            (r#"{"starve_window": 0}"#, "starve_window must be at least 1"),
+            (r#"{"starve_window": 2.5}"#, "invalid type"),
+            (r#"{"starve_window": -1}"#, "invalid value"),
+            (r#"{"top_k": 0}"#, "top_k must be at least 1, got 0"),
+            (r#"{"top_k": {"a": 2, "b": -1}}"#, "top_k must be at least 1, got -1"),
+            (r#"{"top_k": "two"}"#, "TopK"),
+            (r#"{"top_k": 2.5}"#, "TopK"),
+            (r#"{"top_k": [2]}"#, "TopK"),
+        ] {
+            let error = Thresholds::parse(text)
+                .err()
+                .unwrap_or_else(|| panic!("{text} was accepted"));
+            assert!(error.contains(reason), "{text}: {error}");
+        }
+    }
+
     fn steps(
         run: &'static str,
         rank: i32,
@@ -2943,7 +3161,7 @@ mod tests {
         let mut rows = steps("run", 0, 1, 0..40);
         rows.extend(steps("run", 0, 1, 30..50));
         rows.push(("run", 0, 1, 49));
-        let detectors = judge(0, &[key_rows(&rows)]).unwrap();
+        let detectors = judge(0, &[key_rows(&rows)], &usual()).unwrap();
         let incidents = detectors.incidents();
         assert_eq!(incidents.len(), 1, "{incidents:?}");
         assert_eq!(incidents[0]["kind"], "repeated_steps");
@@ -2951,7 +3169,7 @@ mod tests {
         assert_eq!(incidents[0]["repeated"], 11);
         assert_eq!(detectors.rows(), 61);
         // Rows in step order, as a store holds them, repeat nothing.
-        assert!(judge(0, &[key_rows(&steps("run", 0, 1, 0..60))])
+        assert!(judge(0, &[key_rows(&steps("run", 0, 1, 0..60))], &usual())
             .unwrap()
             .incidents()
             .is_empty());
@@ -2963,14 +3181,14 @@ mod tests {
         let first = key_rows(&steps("run", 0, 1, 0..30));
         let mut rest = steps("run", 0, 2, 20..40);
         rest.extend(steps("run", 0, 3, 0..10));
-        let detectors = judge(0, &[first.clone(), key_rows(&rest)]).unwrap();
+        let detectors = judge(0, &[first.clone(), key_rows(&rest)], &usual()).unwrap();
         let incidents = detectors.incidents();
         let repeated: Vec<&Value> = incidents.iter().filter(|i| i["kind"] == "repeated_steps").collect();
         assert_eq!(repeated.len(), 1, "{incidents:?}");
         assert_eq!(repeated[0]["repeated"], 10);
         assert_eq!((detectors.attempt(), detectors.last_step()), (3, Some(9)));
         // An older attempt after a newer one is refused, not read in the wrong order.
-        let error = judge(0, &[key_rows(&rest), first]).err().unwrap();
+        let error = judge(0, &[key_rows(&rest), first], &usual()).err().unwrap();
         assert!(error.contains("group the rows by attempt"), "{error}");
     }
 
@@ -2980,7 +3198,7 @@ mod tests {
             key_rows(&steps("run-a", 3, 7, 0..25)),
             key_rows(&steps("run-a", 3, 7, 25..40)),
         ];
-        let report = detect_stream(&stream(&batches)[..]).unwrap();
+        let report = detect_stream(&stream(&batches)[..], &usual()).unwrap();
         assert_eq!(report["source"], "tensorquill-server");
         assert_eq!((&report["run_id"], &report["rank"]), (&json!("run-a"), &json!(3)));
         assert_eq!(
@@ -2989,7 +3207,7 @@ mod tests {
         );
         assert_eq!(report["rebuilds"], 0);
         assert_eq!(report["checked"], json!(PORTED));
-        assert_eq!(report["thresholds"], thresholds());
+        assert_eq!(report["thresholds"], Thresholds::default().applied());
         assert_eq!(report["incidents"], json!([]));
         let checks: Vec<&str> = report["not_checked"]
             .as_array()
@@ -3006,16 +3224,16 @@ mod tests {
     #[test]
     fn detect_stream_refuses_what_it_cannot_judge() {
         let two_ranks = [key_rows(&steps("run", 0, 1, 0..5)), key_rows(&steps("run", 1, 1, 0..5))];
-        let error = detect_stream(&stream(&two_ranks)[..]).err().unwrap();
+        let error = detect_stream(&stream(&two_ranks)[..], &usual()).err().unwrap();
         assert!(error.contains("send one rank of one run"), "{error}");
         let two_runs = [
             key_rows(&steps("run", 0, 1, 0..5)),
             key_rows(&steps("other", 0, 1, 5..9)),
         ];
-        assert!(detect_stream(&stream(&two_runs)[..]).is_err());
-        let error = detect_stream(&stream(&[key_rows(&[])])[..]).err().unwrap();
+        assert!(detect_stream(&stream(&two_runs)[..], &usual()).is_err());
+        let error = detect_stream(&stream(&[key_rows(&[])])[..], &usual()).err().unwrap();
         assert!(error.contains("no rows"), "{error}");
-        let error = detect_stream(&b"{\"step\": 0}\n"[..]).err().unwrap();
+        let error = detect_stream(&b"{\"step\": 0}\n"[..], &usual()).err().unwrap();
         assert!(error.contains("not an Arrow IPC stream"), "{error}");
     }
 
