@@ -22,7 +22,9 @@ from __future__ import annotations
 import collections
 import hashlib
 import numbers
+import sys
 import warnings
+from array import array
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any
 
@@ -35,17 +37,25 @@ _COUNTER_KEYS = ("step", "global_step", "epoch", "iteration", "steps", "global_s
 _MAX_OTHER = 20
 
 
-def _int_bytes(values: list[Any]) -> bytes | None:
+def _int_bytes(values: Any) -> bytes | None:
+    """Little-endian int64, in one C loop (a Python loop over 1,024 indices took 0.6 ms)."""
     try:
-        return b"".join(int(v).to_bytes(8, "little", signed=True) for v in values)
+        packed = array("q", values)
     except (TypeError, ValueError, OverflowError):
         return None
+    if sys.byteorder == "big":
+        packed.byteswap()
+    return packed.tobytes()
 
 
 def identity_bytes(values: Any) -> bytes | None:
     """The bytes a batch's sample indices (or ids) are hashed from; None when there are none."""
     if values is None:
         return None
+    if isinstance(values, list) and values and type(values[0]) is int:
+        fast = _int_bytes(values)  # the common case: a batch sampler's list of indices
+        if fast is not None:
+            return fast
     if isinstance(values, torch.Tensor):
         values = values.detach().reshape(-1).tolist()
     elif isinstance(values, (str, bytes)) or not isinstance(values, Iterable):

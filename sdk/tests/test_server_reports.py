@@ -27,7 +27,7 @@ from tensorquill.evidence import incident_summary, read_server_report, watch  # 
 from tensorquill.flight import FlightSender, send_file  # noqa: E402
 
 from test_flight_e2e import BINARY, Server  # noqa: E402
-from test_server_detectors import FAST, PORTED, RUN, Stream, differences, everything, record, reference, wobble  # noqa: E402
+from test_server_detectors import DATA_KINDS, FAST, PORTED, RUN, Stream, differences, everything, record, reference, wobble  # noqa: E402
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
 
@@ -143,7 +143,7 @@ def test_the_incidents_of_a_current_report_are_python_s_and_the_summary_shows_th
     evidence, summary = look(stream, tmp_path)
     assert evidence["detection"]["source"] == "server"
     assert differences(reference(records), evidence["incidents"]) == []
-    assert {i["kind"] for i in evidence["incidents"]} == PORTED - {"repeated_steps", "resume_lr_change"}
+    assert {i["kind"] for i in evidence["incidents"]} == PORTED - {"repeated_steps", "resume_lr_change"} - DATA_KINDS
     # The MoE incident has no per-step samples behind it here, and is still described.
     assert "First sampled bad step 60  ·  Layer 01" in summary and "Overloaded: Expert 9, Expert 10" in summary
     assert "No incidents detected" not in summary

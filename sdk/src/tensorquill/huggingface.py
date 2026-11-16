@@ -66,10 +66,8 @@ class TensorQuillCallback(TrainerCallback):
         self._watch = watch_accelerator(self.session, loss_name=self.loss_name, checkpoints=False)
         if state.global_step > 0:
             # Resumed: the Trainer loaded `checkpoint-<global_step>` (or the folder it was given).
-            given = getattr(args, "resume_from_checkpoint", None)
-            folder = Path(given) if isinstance(given, str) and Path(given).is_dir() else (
-                Path(args.output_dir) / f"checkpoint-{state.global_step}")
-            if folder.is_dir():
+            folder = _checkpoint_folder(args, state, getattr(args, "resume_from_checkpoint", None))
+            if folder is not None:
                 self.session.checkpoint_files(folder, event="load")
 
     # `Trainer` has no event before an evaluation or a save, only after. But its flow callback
@@ -102,8 +100,8 @@ class TensorQuillCallback(TrainerCallback):
         if self.session is not None:
             self.session.set_phase("train")
             # The Trainer has just written `checkpoint-<global_step>` under the output folder.
-            folder = Path(args.output_dir) / f"checkpoint-{state.global_step}"
-            if folder.is_dir():
+            folder = _checkpoint_folder(args, state)
+            if folder is not None:
                 self.session.checkpoint_files(folder, event="save")
 
     def on_train_end(self, args: Any, state: Any, control: Any, **_: Any) -> None:
@@ -117,6 +115,18 @@ class TensorQuillCallback(TrainerCallback):
         if self.session is not None:
             session, self.session = self.session, None
             session.close()
+
+
+def _checkpoint_folder(args: Any, state: Any, given: Any = None) -> Path | None:
+    """The folder the `Trainer` saved to or resumed from: `given`, else `<output_dir>/checkpoint-<global_step>`."""
+    if isinstance(given, str) and Path(given).is_dir():
+        return Path(given)
+    output = getattr(args, "output_dir", None)
+    step = getattr(state, "global_step", None)
+    if output is None or step is None:
+        return None
+    folder = Path(output) / f"checkpoint-{step}"
+    return folder if folder.is_dir() else None
 
 
 def _shared_tracker_run_id() -> str | None:

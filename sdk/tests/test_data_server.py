@@ -189,6 +189,9 @@ def test_ranks_drawing_the_same_batch_show_in_the_runs_status(tmp_path):
         1: ranked(1, 1, range(30), lambda s: f"r0-{s}" if 10 <= s < 20 else f"r1-{s}")
            + ranked(1, 2, range(15, 40), lambda s: f"r1-{s}"),
         2: ranked(2, 1, range(40), lambda s: f"r0-{s}", share=0),
+        # Rank 3 records no data rank, like rank 1, and draws rank 1's batches at 30-34: its own
+        # number stands in, so the two are different shares and that is a duplicate too.
+        3: ranked(3, 1, range(40), lambda s: f"r1-{s}" if 30 <= s < 35 else f"r3-{s}"),
     }
     store = tmp_path / "store"
     server = Server(store, 0, *FAST, "--watchdog-seconds", "0.2")
@@ -197,13 +200,13 @@ def test_ranks_drawing_the_same_batch_show_in_the_runs_status(tmp_path):
         path.write_text("".join(json.dumps(r) + "\n" for r in records))
         assert send_file(path, server.endpoint, run_id, rank, timeout=30.0)
     expected = detect_duplicate_batches(resolve_attempts([r for records in ranks.values() for r in records]))
-    assert expected == {"kind": "duplicate_batches", "step": 10, "ranks": [0, 1, 2], "duplicated_steps": 5,
-                        "ranks_compared": [0, 1, 2]}
+    assert expected == {"kind": "duplicate_batches", "step": 10, "ranks": [0, 1, 2], "duplicated_steps": 10,
+                        "ranks_compared": [0, 1, 2, 3]}
     deadline = time.monotonic() + 15
     while True:
         try:
             status = json.loads((store / "runs" / run_id / "watchdog.json").read_text())
-            if status.get("duplicate_batches", {}).get("ranks_compared") == [0, 1, 2]:
+            if status.get("duplicate_batches", {}).get("ranks_compared") == [0, 1, 2, 3]:
                 break
         except (FileNotFoundError, ValueError):
             pass
