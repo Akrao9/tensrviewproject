@@ -59,11 +59,13 @@ def _waits(records):
     return [r.get("data_wait") for r in records]
 
 
-def _assert_fetch_timed(records, batches):
-    """Every fetch counted once and no move: the waits add up to `batches` fetches. A loader
+def _assert_fetch_timed(records, batches, fewest=None):
+    """Every fetch counted once and no move: the waits add up to `batches` fetches (at least
+    `fewest`, when the loader's fetch ahead may fall outside the last recorded step). A loader
     that fetches one batch ahead (Accelerate, Lightning) moves a fetch to the step before."""
     waits = [r["data_wait"] for r in records]
-    assert batches * FETCH * 0.9 <= sum(waits) < batches * (FETCH + MOVE / 2), waits
+    fewest = batches if fewest is None else fewest
+    assert fewest * FETCH * 0.9 <= sum(waits) < batches * (FETCH + MOVE / 2), waits
     times = [r.get("step_time") for r in records]
     assert times[0] is None and all(t >= w for t, w in zip(times[1:], waits[1:]))
 
@@ -312,8 +314,9 @@ def test_lightning_times_the_fetch_not_the_transfer(tmp_path, monkeypatch):
     trainer.fit(Module())
     assert [r["step"] for r in sink.records] == [0, 1, 2, 3]
     # Validation (sanity check and every 2 steps) fetches its own slow batches, in the eval
-    # phase; Lightning fetches one training batch ahead, so a fifth fetch lands in the last step.
-    _assert_fetch_timed(sink.records, 5)
+    # phase; Lightning fetches one training batch ahead, so a fifth fetch lands in the last step
+    # on macOS, and after it (not recorded) on Linux CI: four or five fetches, never a move.
+    _assert_fetch_timed(sink.records, 5, fewest=4)
 
 
 def test_another_wrapper_on_top_is_never_broken():
