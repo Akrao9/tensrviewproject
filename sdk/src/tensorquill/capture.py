@@ -429,8 +429,14 @@ class Session:
             for name, spec in (routers or {}).items()
         }
         # What a router's hook found wrong with its output, said once at the next step (`_commit`).
+        # A router with a problem is refused for the rest of the session: its counts leave no
+        # entry in any record written after that (`_decode`), and the first such record says
+        # why under `moe_refused`. Not per step: the guard reads shapes, so a short batch
+        # can let through a step it would refuse at full size, and that step's counts would
+        # be the same misread.
         self._router_problems: dict[str, list[str]] = {name: [] for name in self._routers}
         self._router_problems_said: set[str] = set()
+        self._router_refusals_written: set[str] = set()
         unknown = [name for name in self._routers if name not in modules]
         if unknown:
             raise ValueError(f"no such router modules: {unknown}")
@@ -1176,6 +1182,10 @@ class Session:
         waits, self._ring_wait = self._ring_wait, []
         # Host-side allocator counters: no GPU work, no sync (system.py).
         system = self._system.flush() if self._system is not None else None
+        # Read here, on the training thread, so the block is decided as it is queued.
+        refused = {name: found[0] for name, found in self._router_problems.items() if found}
+        announce = {name: why for name, why in refused.items() if name not in self._router_refusals_written}
+        self._router_refusals_written.update(announce)
         self._ring_ts = []
         self._steps = []
         self._ring_lr = []
@@ -1188,6 +1198,7 @@ class Session:
         block = (
             steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
             spread_seen, scalars, probes, stamps, amps, data_rows, checkpoints, waits, system,
+            refused, announce,
         )
         try:
             self._queue.put_nowait(block)
@@ -1329,6 +1340,8 @@ class Session:
         checkpoints: list[dict[str, Any] | None] | None = None,
         waits: list[tuple[float, float | None] | None] | None = None,
         system: dict[str, Any] | None = None,
+        refused: Mapping[str, str] | None = None,
+        announce: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
         split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
@@ -1349,7 +1362,8 @@ class Session:
         offset = 0
         for name, spec in self._routers.items():
             size = n * spec.n_experts
-            moe[name] = counts[offset : offset + size].reshape(n, spec.n_experts).tolist()
+            if not refused or name not in refused:
+                moe[name] = counts[offset : offset + size].reshape(n, spec.n_experts).tolist()
             offset += size
 
         records = []
@@ -1417,11 +1431,15 @@ class Session:
             if moe:
                 step_moe = {name: rows[i] for name, rows in moe.items()}
                 record["moe"] = step_moe
-                record["moe_top_k"] = {name: spec.top_k for name, spec in self._routers.items()}
+                record["moe_top_k"] = {name: spec.top_k for name, spec in self._routers.items() if name in moe}
                 record["moe_stats"] = {
                     name: _router_stats(row_counts) for name, row_counts in step_moe.items()
                 }
             records.append(record)
+        if announce and records:
+            # Once per router and session: the reason it is not counted, so a reader of the
+            # records (the evidence, the server) can say MoE was not checked for it.
+            records[0]["moe_refused"] = dict(announce)
         if system and records:
             records[-1]["system"] = system
         return records
