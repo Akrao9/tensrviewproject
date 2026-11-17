@@ -1760,6 +1760,56 @@ def _same_threshold(asked: Any, applied: Any) -> bool:
     return bool(asked == applied)
 
 
+def _threshold_text(value: Any) -> str:
+    if value is None:
+        return "what the run recorded"  # `top_k` left to the records
+    return json.dumps(dict(value), sort_keys=True) if isinstance(value, Mapping) else repr(value)
+
+
+def _off_default(values: Any) -> list[str]:
+    """`name value (default: D)` for each of the five thresholds in `values` that is not the default."""
+    values = values if isinstance(values, Mapping) else {}
+    return [
+        f"{name} {_threshold_text(values[name])} (default: {_threshold_text(THRESHOLD_DEFAULTS[name])})"
+        for name in THRESHOLD_NAMES
+        if name in values and not _same_threshold(values[name], THRESHOLD_DEFAULTS[name])
+    ]
+
+
+def thresholds_line(evidence: Mapping[str, Any]) -> str | None:
+    """One line that names every applied threshold that is not the default, with its value and
+    the default; None when all five are the defaults.
+
+    A reader of a server's report takes the thresholds the server applied (`read_server_report`),
+    so a run judged by other values than the defaults must say so wherever it is summarised.
+    It reads what the evidence lists as applied: `detection.thresholds` for one rank of a
+    server's store, whether the server judged or this process did, and `thresholds` in the
+    all-ranks view, or every set of `thresholds_by_rank` with its ranks when the judged ranks
+    differ. Evidence that lists none (a local file, whose options the caller typed) gives None.
+    """
+    if evidence.get("view") == ALL_RANKS_VIEW:
+        who = "the server applied"
+        sets = evidence.get("thresholds_by_rank")
+        if isinstance(sets, list) and len(sets) > 1:
+            named = []
+            for found in sets:
+                ranks = [r for r in found.get("ranks") or () if isinstance(r, int)]
+                off = _off_default(found.get("thresholds"))
+                if off:
+                    named.append(f"rank{'s' if len(ranks) != 1 else ''} {_rank_ranges(ranks, 8)}: {', '.join(off)}")
+            off = ["; ".join(named)] if named else []
+        else:
+            off = _off_default(evidence.get("thresholds"))
+    else:
+        detection = evidence.get("detection")
+        detection = detection if isinstance(detection, Mapping) else {}
+        who = "the server applied" if detection.get("source") == "server" else "the detectors ran here with"
+        off = _off_default(detection.get("thresholds"))
+    if not off:
+        return None
+    return f"Thresholds that are not the defaults: {who} {', '.join(off)}."
+
+
 def read_server_report(
     folder: str | Path,
     *,
@@ -3976,6 +4026,9 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
         if item["check"] != "resume_lr"
     ]
     notes += _source_lines(evidence)
+    applied = thresholds_line(evidence)  # only when a threshold applied is not the default
+    if applied:
+        notes.append(applied)
     if not lines:
         return "\n".join(["No incidents detected.", *notes])
     if evidence.get("layer_count"):
@@ -4118,6 +4171,9 @@ def _all_ranks_summary(evidence: Mapping[str, Any]) -> str:
         if item["check"] != "resume_lr"
     ]
     lines += _source_lines(evidence)
+    applied = thresholds_line(evidence)  # only when a threshold applied is not the default
+    if applied:
+        lines.append(applied)
     return "\n".join(lines)
 
 
