@@ -1,9 +1,11 @@
 """Dataloader wait time (`datawait.py`): what the timer counts and what it must not, through
 the explicit wrapper, `watch_loaders`, and the Accelerate, Hugging Face and Lightning adapters.
 
-Each slow dataset sleeps `FETCH` seconds per batch; each device move sleeps `MOVE`. A
-`data_wait` near `FETCH` and far below `FETCH + MOVE` shows the batch fetch is timed and the
-move to the device is not (a blocking move waits behind the GPU's queued work)."""
+Each slow dataset sleeps `FETCH` seconds per batch; each device move sleeps `MOVE`. Waits
+adding up to the fetches show the fetch is timed; a step spending at least its moves outside
+the wait (`step_time - data_wait`) shows the move to the device is not (a blocking move waits
+behind the GPU's queued work). Both hold however slow the machine: a load only lengthens a
+sleep, and adds to the time outside the wait."""
 
 from __future__ import annotations
 
@@ -59,15 +61,23 @@ def _waits(records):
     return [r.get("data_wait") for r in records]
 
 
-def _assert_fetch_timed(records, batches, fewest=None):
-    """Every fetch counted once and no move: the waits add up to `batches` fetches (at least
-    `fewest`, when the loader's fetch ahead may fall outside the last recorded step). A loader
-    that fetches one batch ahead (Accelerate, Lightning) moves a fetch to the step before."""
+def _assert_fetch_timed(records, batches, fewest=None, moves=1):
+    """Every fetch counted and no move: the waits add up to at least `fewest` fetches (default
+    `batches`; fewer when the loader's fetch ahead may fall outside the last recorded step), and
+    each step after the first spends at least its `moves` sleeps of `MOVE` outside the wait.
+
+    `step_time - data_wait` is the step's time outside `next()`. Each step sleeps `moves * MOVE`
+    after the loader hands the batch over, so that much is outside `next()` however slow the
+    runner, and a load can only add to it. A timer that also counted the move, or the whole
+    step, would leave only the step's own compute, a few milliseconds. The first record has no
+    `step_time` (no step ended before it) and is not checked this way."""
     waits = [r["data_wait"] for r in records]
     fewest = batches if fewest is None else fewest
-    assert fewest * FETCH * 0.9 <= sum(waits) < batches * (FETCH + MOVE / 2), waits
+    assert sum(waits) >= fewest * FETCH * 0.9, waits
     times = [r.get("step_time") for r in records]
-    assert times[0] is None and all(t >= w for t, w in zip(times[1:], waits[1:]))
+    assert times[0] is None and all(t is not None for t in times[1:]), times
+    outside = [t - w for t, w in zip(times[1:], waits[1:])]
+    assert all(o >= moves * MOVE for o in outside), (waits, outside)
 
 
 def test_off_by_default_and_the_dataloader_is_left_alone():
@@ -158,6 +168,7 @@ def test_time_data_wraps_any_iterable_and_is_not_counted_twice():
             yield torch.randn(1, 4)
 
     for x in session.time_data(plain()):
+        time.sleep(MOVE)
         model(x).sum().backward()
         optimizer.step()
         optimizer.zero_grad()
@@ -278,7 +289,7 @@ def test_hugging_face_trainer_records_the_wait(tmp_path, monkeypatch):
     data = Slow(16, item=_pair)
     transformers.Trainer(model=Model(), args=args, train_dataset=data, callbacks=[callback]).train()
     assert vars(_BaseDataLoaderIter)["__next__"] is not datawait._timed_next
-    _assert_fetch_timed(sink.records, 8)  # four steps of two microbatches
+    _assert_fetch_timed(sink.records, 8, moves=2)  # four steps of two microbatches
 
 
 def test_hugging_face_data_wait_can_be_turned_off(tmp_path):
