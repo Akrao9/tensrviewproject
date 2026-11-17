@@ -271,7 +271,7 @@ class Source:
 
         def build() -> dict[str, Any]:
             try:
-                return build_evidence([r for r in records if _rank_of(r) == rank])
+                return build_evidence([r for r in records if _rank_of(r) == rank], run_manifest=path)
             except (KeyError, TypeError, ValueError) as error:
                 raise ToolError(f"the detectors could not read the records in {path} ({error!r}).") from None
 
@@ -1042,7 +1042,8 @@ def compare_runs(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
     project = _text_argument(arguments, "project")
     rank = _integer(arguments, "rank", minimum=0)
     try:
-        return _compare.compare_runs(*wanted, source=folder, project=project, rank=rank, paths=False)
+        return _compare.compare_runs(*wanted, source=folder, project=project, rank=rank, paths=False,
+                                     read_parts=False)
     except (ValueError, OSError, RuntimeError) as error:
         # A run that is not there, a name that fits several runs (the message lists their IDs),
         # or records that cannot be read.
@@ -1195,7 +1196,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " `checked` there means that run looked, with enough history, and found none. `divergence`: where two"
             " runs part, which this version does not build. One rank of each run is read (`rank`, default the"
             " lowest); `incidents.other_ranks_not_compared` lists a run's ranks that were not read. Local files are"
-            " judged here; a run in a server's store is read from the server's report."
+            " judged here. A run in a server's store is read from the server's report and no part is opened; when"
+            " that report is not current the tool says so and compares nothing."
         ),
         "inputSchema": {
             "type": "object",

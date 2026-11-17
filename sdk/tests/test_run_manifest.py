@@ -412,6 +412,49 @@ def test_two_runs_of_one_project_are_told_apart_in_a_servers_store_by_every_read
         assert ev.all_ranks_evidence(folder)["run"] == block
 
 
+def test_a_manifest_too_large_for_a_stream_goes_without_its_config_or_not_at_all():
+    small = {"schema_version": 1, "project": "granite", "name": "baseline", "run_id": "r", "config": {"lr": 0.1}}
+    assert mf.manifest_to_send(small) == (small, None) and mf.manifest_to_send(None) == (None, None)
+    big = {**small, "config": {"vocabulary": ["token"] * 20_000}}
+    sent, said = mf.manifest_to_send(big)
+    assert sent == {**small, "config": {}, "config_left_out": True} and "no config" in said
+    assert big["config"]["vocabulary"], "the manifest itself is left as it was"
+    sent, said = mf.manifest_to_send({**small, "tags": ["t" * 100] * 1000})
+    assert sent is None and "is not sent" in said
+    # The sender's limit is under the server's, which measures the same text a little differently.
+    rust = (Path(__file__).resolve().parents[2] / "server" / "src" / "ingest.rs")
+    if rust.exists():  # an sdist has only the package
+        import re
+
+        found = re.search(r"pub const MANIFEST_MAX_BYTES: usize = (\d+) \* (\d+);", rust.read_text())
+        assert mf.MANIFEST_SEND_BYTES < int(found.group(1)) * int(found.group(2))
+
+
+def test_a_run_with_a_five_megabyte_config_still_streams_and_its_store_keeps_the_project_and_the_name(toy_moe, tmp_path, monkeypatch):
+    store = tmp_path / "store"
+    server = real_server(store)
+    config = {"lr": 0.01, "vocabulary": {f"token-{i}": "x" * 40 for i in range(100_000)}}
+    try:
+        with pytest.warns(RuntimeWarning, match="more than the 60,000 a stream carries"):
+            streamed(toy_moe, tmp_path, monkeypatch, server.endpoint, "big", project="granite", name="wide", config=config)
+        streamed(toy_moe, tmp_path, monkeypatch, server.endpoint, "small", project="granite", name="narrow",
+                 config={"lr": 0.1})
+    finally:
+        assert server.terminate() == 0
+    folder = store / "runs" / "big"
+    assert len(ev.load_records(folder)) == 10, "every record arrived"
+    stored = json.loads((folder / "run.json").read_text())
+    assert (stored["project"], stored["name"], stored["config"], stored["config_left_out"]) == ("granite", "wide", {}, True)
+    local = json.loads((tmp_path / "local" / "big.run.json").read_text())
+    assert len(local["config"]["vocabulary"]) == 100_000 and "config_left_out" not in local
+    assert ev.build_evidence(folder)["run"] == {"project": "granite", "name": "wide", "run_id": "big"}
+    # A config that is not known is not compared as if no key were set.
+    from_store = tensorquill.compare_runs("wide", "narrow", source=store)["setup"]
+    assert from_store["config_not_known"] == ["A"] and not [d for d in from_store["differs"] if d["field"].startswith("config.")]
+    from_local = tensorquill.compare_runs("wide", "narrow", source=tmp_path / "local")["setup"]
+    assert {"field": "config.lr", "values": {"A": 0.01, "B": 0.1}} in from_local["differs"] and "config_not_known" not in from_local
+
+
 def test_a_sender_older_than_the_manifest_still_streams_and_its_run_reads_as_uncategorized(toy_moe, tmp_path, monkeypatch):
     import tensorquill.flight as flight_module
 

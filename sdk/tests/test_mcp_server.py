@@ -849,6 +849,12 @@ def test_a_run_folder_lists_and_compares_the_runs_of_its_store(start, store):
         on_rank_1 = client.call("compare_runs", runs=["clean", RUN], rank=1)
         assert "non_finite" in [e["kind"] for e in on_rank_1["incidents"]["entries"]]
         assert on_rank_1["incidents"]["other_ranks_not_compared"] == {"B": [0]}
+    # A report that is behind its store is not current. The tool opens no part and runs no
+    # detector on a run folder, so it says so and compares nothing.
+    (other / "rank=0" / "attempt=1" / "part-60-99.parquet").write_bytes(b"")
+    refused = client.error("compare_runs", runs=["clean", RUN])
+    assert "one-rank rank 0 has no current report from its server: it is behind" in refused
+    assert client.call("list_runs")["count"] == 2
 
 
 def test_a_listing_of_many_runs_and_a_comparison_of_fat_runs_stay_within_the_size_cap(start, tmp_path):

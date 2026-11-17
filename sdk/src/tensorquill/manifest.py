@@ -39,6 +39,10 @@ PROJECT_FORBIDDEN = "/\\#?%:"
 MANIFEST_SUFFIX = ".run.json"  # local: <run_id>.run.json
 STORE_MANIFEST = "run.json"  # a server's store: runs/<run_id>/run.json
 METADATA_KEY = "run_manifest"  # the key in a Flight batch's app_metadata
+# The largest manifest sent on a stream, as JSON text. The server stores none over 64 KiB
+# (`MANIFEST_MAX_BYTES` in `server/src/ingest.rs`); this is below it, since the two write
+# numbers a little differently.
+MANIFEST_SEND_BYTES = 60_000
 _RANK_FILE = re.compile(r"^(?P<run_id>.+)\.rank\d+\.jsonl$")
 
 
@@ -175,6 +179,34 @@ def build_manifest(
         "run_id_source": run_id_source,
         "config": dict(config or {}),
     }
+
+
+def manifest_to_send(manifest: Mapping[str, Any] | None) -> tuple[dict[str, Any] | None, str | None]:
+    """The copy of the manifest that rides on a stream, and what was left out of it, if anything.
+
+    The manifest travels inside a batch's metadata, so it must stay small: a `config` holding a
+    whole vocabulary would otherwise go with the first batch of every stream, and the server
+    would drop it on arrival. Over `MANIFEST_SEND_BYTES` the copy goes without its `config`
+    (marked `config_left_out`), so the store still has the project and the name; if it is
+    still too large it is not sent. The local file always has everything.
+    """
+    if not manifest:
+        return None, None
+
+    def size(document: Mapping[str, Any]) -> int:
+        return len(json.dumps(document, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8"))
+
+    whole = dict(manifest)
+    full = size(whole)
+    if full <= MANIFEST_SEND_BYTES:
+        return whole, None
+    without = {**whole, "config": {}, "config_left_out": True}
+    if size(without) <= MANIFEST_SEND_BYTES:
+        return without, (f"the run manifest is {full:,} bytes with its config, more than the {MANIFEST_SEND_BYTES:,} a "
+                         "stream carries, so the server's copy has the project and the name and no config")
+    return None, (f"the run manifest is {size(without):,} bytes even without its config, more than the "
+                  f"{MANIFEST_SEND_BYTES:,} a stream carries, so it is not sent and the server's store has no manifest "
+                  "for this run")
 
 
 def local_manifest_path(records_file: str | Path, run_id: str) -> Path:

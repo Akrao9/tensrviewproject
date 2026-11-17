@@ -95,8 +95,11 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
     }
 
 
-def _open_store(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
-    from .evidence import _discover_rank_folders, _report_evidence, build_evidence, load_records, read_server_report, read_watchdog
+def _open_store(run: Mapping[str, Any], rank: int | None, read_parts: bool) -> dict[str, Any]:
+    from .evidence import (
+        _discover_rank_folders, _report_evidence, applied_thresholds, build_evidence, load_records,
+        read_server_report, read_watchdog,
+    )
 
     folder = Path(run["path"])
     folders = _discover_rank_folders(folder)
@@ -111,14 +114,24 @@ def _open_store(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
         evidence = _report_evidence(folders[picked], look, read_watchdog(folder / "watchdog.json"))
         last = look["report"].get("last_step")
         judged = "the server's report (incidents.json), with the thresholds the server applied; no part was read"
+    elif not read_parts:
+        raise _runs.RunLookupError(
+            f"run {run['run_id']} rank {picked} has no current report from its server: it is {look['state']} "
+            f"({look['reason']}). Nothing current to compare without reading its parts and judging them here, which "
+            f"`python -m tensorquill compare` does")
     else:
-        # The report cannot be used (see `read_server_report`), so the parts are read and judged here.
+        # The report cannot be used (see `read_server_report`), so the parts are read and judged
+        # here, as the watcher does: with the thresholds the server applied, when a report says
+        # them, so the incidents do not change with who judged them.
+        applied = applied_thresholds(look["report"]) if isinstance(look.get("report"), Mapping) else {}
         records = load_records(folder, rank=picked, all_attempts=True)
-        evidence = build_evidence(records, watchdog=folder / "watchdog.json", run_manifest=run.get("manifest") or {})
+        evidence = build_evidence(records, watchdog=folder / "watchdog.json", run_manifest=run.get("manifest") or {},
+                                  **applied)
         steps = [r["step"] for r in records if _is_step(r.get("step"))]
         last = max(steps) if steps else None
-        judged = (f"the Python detectors, here, on the stored parts with the default thresholds: the server's "
-                  f"report is {look['state']} ({look['reason']})")
+        judged = ("the Python detectors, here, on the stored parts, with "
+                  + ("the thresholds the server's last report applied" if applied else "the default thresholds")
+                  + f": the server's report is {look['state']} ({look['reason']})")
     return {
         "evidence": evidence, "last_step": last if _is_step(last) else None,
         "read_from": {"path": str(folder), "kind": "server store", "rank": picked, "ranks": sorted(folders),
@@ -151,11 +164,13 @@ def _open_evidence_file(path: Path, rank: int | None) -> dict[str, Any]:
 
 
 def open_run(wanted: str | Path, source: str | Path | None = None, project: str | None = None,
-             rank: int | None = None, *, paths: bool = True) -> dict[str, Any]:
+             rank: int | None = None, *, paths: bool = True, read_parts: bool = True) -> dict[str, Any]:
     """One run, ready to compare: its manifest, one rank's evidence and where both were read.
 
     `wanted` is a run ID or name at `source`, or (with `paths`) a path. The lookup at `source`
     comes first, so an ID never changes meaning because a file of that name appears.
+    `read_parts=False` refuses a run in a store whose report is not current, where the parts
+    would otherwise be opened and judged here.
     """
     source = Path(source) if source is not None else Path(_runs.DEFAULT_SOURCE)
     run: dict[str, Any] | None = None
@@ -165,9 +180,9 @@ def open_run(wanted: str | Path, source: str | Path | None = None, project: str 
             run = _runs.find_run(source, wanted, project)
         except FileNotFoundError as error:
             lookup_error = _runs.RunLookupError(str(error))
+        except _runs.AmbiguousRunName:  # several runs of that name: never guessed around
+            raise
         except _runs.RunLookupError as error:
-            if "fits" in str(error):  # several runs of that name: never guessed around
-                raise
             lookup_error = error
     if run is None:
         path = Path(wanted)
@@ -182,7 +197,7 @@ def open_run(wanted: str | Path, source: str | Path | None = None, project: str 
             raise _runs.RunLookupError(
                 f"{path} holds {len(found)} runs; name one by its ID or name with source={str(path)!r}")
         run = found[0]
-    opened = _open_local(run, rank) if run["source"] == "local" else _open_store(run, rank)
+    opened = _open_local(run, rank) if run["source"] == "local" else _open_store(run, rank, read_parts)
     return {"run_id": run["run_id"], "manifest": run.get("manifest"),
             "block": _manifest.run_block(run["run_id"], run.get("manifest")), **opened}
 
@@ -206,24 +221,29 @@ def compare_setup(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[st
                 differs.append({"field": field, "values": {label: value for (label, _), value in zip(known, values)}})
             else:
                 same.append(field)
-        configs = [m.get("config") if isinstance(m.get("config"), Mapping) else {} for _, m in known]
+    # A config that was too large for the stream is not in the store's copy of the manifest
+    # (`manifest.manifest_to_send`): not known, which is not the same as "no keys set".
+    config_unknown = [label for label, m in known if m.get("config_left_out")]
+    with_config = [(label, m) for label, m in known if label not in config_unknown]
+    same_config: list[str] = []
+    if len(with_config) > 1:
+        configs = [m.get("config") if isinstance(m.get("config"), Mapping) else {} for _, m in with_config]
         keys = sorted({str(key) for config in configs for key in config})
         for key in keys:
             values = [config.get(key) for config in configs]
-            missing = [label for (label, _), config in zip(known, configs) if key not in config]
+            missing = [label for (label, _), config in zip(with_config, configs) if key not in config]
             if missing or _differ(values):
                 differs.append({
                     "field": f"config.{key}",
-                    "values": {label: value for (label, _), value in zip(known, values)},
+                    "values": {label: value for (label, _), value in zip(with_config, values)},
                     **({"not_set_in": missing} if missing else {}),
                 })
         same_config = [key for key in keys if not any(d["field"] == f"config.{key}" for d in differs)]
-    else:
-        same_config = []
     return {
         "differs": differs,
         "same": same,
         "config_keys_same": same_config,
+        **({"config_not_known": config_unknown} if config_unknown else {}),
         # A run without a manifest says nothing of its setup; it is left out of the differences.
         "no_manifest": [label for label, run in zip(labels, opened) if not isinstance(run.get("manifest"), Mapping)],
     }
@@ -424,18 +444,20 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[
 
 
 def compare_runs(*runs: str | Path, source: str | Path | None = None, project: str | None = None,
-                 rank: int | None = None, paths: bool = True) -> dict[str, Any]:
+                 rank: int | None = None, paths: bool = True, read_parts: bool = True) -> dict[str, Any]:
     """Compare two or more runs and return the result (see the module's text). Nothing is written.
 
     Each of `runs` is a run ID or a name at `source` (default `tensorquill-out`), or a path.
     `project` narrows a name to one project. `rank` is the rank read of every run (default:
-    each run's lowest, rank 0). `paths=False` takes IDs and names only.
+    each run's lowest, rank 0). `paths=False` takes IDs and names only. `read_parts=False`
+    refuses a run in a server's store whose report is not current; otherwise its parts are read
+    and judged here.
     Raises `runs.RunLookupError` (a `ValueError`) for a run that is not found, a name that fits
     several runs, or fewer than two runs.
     """
     if len(runs) < 2:
         raise _runs.RunLookupError("compare needs at least two runs")
-    opened = [open_run(wanted, source, project, rank, paths=paths) for wanted in runs]
+    opened = [open_run(wanted, source, project, rank, paths=paths, read_parts=read_parts) for wanted in runs]
     seen: dict[tuple[str, str], int] = {}
     for index, run in enumerate(opened):
         key = (str(run["run_id"]), run["read_from"]["path"])
@@ -523,6 +545,9 @@ def summary_text(result: Mapping[str, Any]) -> str:
     lines.append(f"1. Setup: {len(setup['differs'])} difference{'s' if len(setup['differs']) != 1 else ''}")
     for item in setup["differs"]:
         lines.append(f"   {item['field']}: " + ", ".join(f"{label} {_value(value)}" for label, value in item["values"].items()))
+    if setup.get("config_not_known"):
+        lines.append(f"   the config of {', '.join(setup['config_not_known'])} was too large to send to its server and is "
+                     "not in the store: left out of the differences (the run's local manifest has it)")
     if setup["no_manifest"]:
         lines.append(f"   no run manifest for {', '.join(setup['no_manifest'])}: "
                      "its setup is not known and is left out of the differences")

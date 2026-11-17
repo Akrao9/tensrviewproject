@@ -228,7 +228,7 @@ def test_runs_and_compare_are_verbs_at_both_entry_points_whatever_is_on_disk(ent
 # --- Finding a run by ID or name --------------------------------------------------------------
 
 
-def test_an_id_wins_and_a_name_that_fits_several_runs_is_refused_with_their_ids(tmp_path):
+def test_an_id_wins_and_a_name_that_fits_several_runs_is_refused_with_their_ids(tmp_path, monkeypatch):
     folder = tmp_path / "out"
     local_run(folder, "run-1", project="granite", name="baseline")
     local_run(folder, "run-2", spiked("run-2"), project="granite", name="baseline")
@@ -251,10 +251,23 @@ def test_an_id_wins_and_a_name_that_fits_several_runs_is_refused_with_their_ids(
         tensorquill.compare_runs("run-3", "baseline", source=folder, project="llama")
     with pytest.raises(ValueError, match="at least two"):
         tensorquill.compare_runs("run-1", source=folder)
+    # Only the refusal itself stops the search: a path or a run whose own name holds the word
+    # "fits" is found as any other.
+    local_run(folder, "retrofits", spiked("retrofits"), project="llama", name="it fits 2 runs")
+    misfits = local_run(tmp_path / "misfits", "elsewhere", spiked("elsewhere"))
+    by_path = tensorquill.compare_runs(str(misfits), "run-3", source=folder)
+    assert [run["run_id"] for run in by_path["runs"]] == ["elsewhere", "run-3"]
+    with pytest.raises(runs_module.RunLookupError, match="no run with the ID or name") as missing:
+        tensorquill.compare_runs(str(tmp_path / "misfits" / "absent.jsonl"), "run-3", source=folder)
+    assert not isinstance(missing.value, runs_module.AmbiguousRunName)
+    with pytest.raises(runs_module.AmbiguousRunName):
+        runs_module.find_run(folder, "baseline")
     # A name that fits several runs is never taken for a path, even when one is there.
     write_capture(tmp_path / "baseline", dense(5, run="a-file"))
+    monkeypatch.chdir(tmp_path)
+    assert Path("baseline").is_file()
     with pytest.raises(ValueError, match="fits 3 runs"):
-        tensorquill.compare_runs(str(tmp_path / "baseline").replace(str(tmp_path) + os.sep, ""), "run-3", source=folder)
+        tensorquill.compare_runs("baseline", "run-3", source=folder)
 
 
 # --- Comparing: the setup ---------------------------------------------------------------------
@@ -572,5 +585,18 @@ def test_two_runs_in_a_real_servers_store_are_listed_and_compared_by_name(tmp_pa
     server_kinds = set(ev.SERVER_KINDS)
     pick = lambda result: {item["kind"]: item["looked"] for item in result["checked"]["differs"] if item["kind"] in server_kinds}  # noqa: E731
     assert pick(from_store) == pick(from_local) and pick(from_store)["grad_spike"] == {"A": "not_configured", "B": "checked"}
-    assert [(e["kind"], e["in"]) for e in from_store["incidents"]["entries"]] == [
-        (e["kind"], e["in"]) for e in from_local["incidents"]["entries"]]
+    brief = lambda result: [(e["kind"], e["in"], e["first_step"], e["where"], e["absent_from"])  # noqa: E731
+                            for e in result["incidents"]["entries"]]
+    assert brief(from_store) == brief(from_local) and brief(from_store)
+
+    # Without the server's report the parts are read and judged here: the same answer, and it
+    # says who judged. With `read_parts=False` (the MCP tool) the run is refused with the reason.
+    (store / "runs" / "run-2" / "rank=0" / "incidents.json").unlink()
+    judged_here = tensorquill.compare_runs("cheap", "debug", source=store)
+    assert "no part was read" in judged_here["runs"][0]["read_from"]["judged_by"]
+    assert "the Python detectors, here, on the stored parts" in judged_here["runs"][1]["read_from"]["judged_by"]
+    assert "the server's report is missing" in judged_here["runs"][1]["read_from"]["judged_by"]
+    assert brief(judged_here) == brief(from_local) and pick(judged_here) == pick(from_local)
+    assert judged_here["runs"][1]["last_step"] == 39
+    with pytest.raises(runs_module.RunLookupError, match="run-2 rank 0 has no current report from its server: it is missing"):
+        tensorquill.compare_runs("cheap", "debug", source=store, read_parts=False)

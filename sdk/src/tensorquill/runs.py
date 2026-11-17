@@ -44,7 +44,11 @@ _HEAD_BYTES = 1 << 20
 
 
 class RunLookupError(ValueError):
-    """A run named by ID or name was not found, or the name fits several runs."""
+    """A run named by ID or name was not found, or cannot be read for a comparison."""
+
+
+class AmbiguousRunName(RunLookupError):
+    """A name fits several runs. Never guessed around: the message lists their IDs."""
 
 
 # --- Finding the runs ---------------------------------------------------------------------
@@ -176,7 +180,7 @@ def find_run(source: str | Path, wanted: str, project: str | None = None,
 
     The run ID is the identity, so an exact ID wins whatever the project. A name is a label
     and may repeat: `project` narrows the search to one project, and a name that still fits
-    several runs raises `RunLookupError` with their IDs. A run kept both as local files and in
+    several runs raises `AmbiguousRunName` (a `RunLookupError`) with their IDs. A run kept both as local files and in
     a store under one folder is read from the local files, which hold every record.
     """
     runs = discover_runs(source) if runs is None else runs
@@ -191,7 +195,7 @@ def find_run(source: str | Path, wanted: str, project: str | None = None,
     if len(ids) > 1:
         listed = ", ".join(f"{run['run_id']} (project {block['project']})"
                            for run, block in sorted(named, key=lambda item: item[0]["run_id"]))
-        raise RunLookupError(
+        raise AmbiguousRunName(
             f"the name {wanted!r} fits {len(ids)} runs{within} at {source}: {listed}. "
             "A name is a label and may repeat; give the run ID."
         )
@@ -312,10 +316,9 @@ def _store_row(run: Mapping[str, Any]) -> dict[str, Any]:
     incidents += [i for i in view.get("run_incidents") or () if isinstance(i, Mapping)]
     row["incidents"] = _by_class(incidents)
     row["first_incident"] = _first(incidents)
-    # Until the all-ranks view carries `kind_checks`, the count is the lowest judged rank's.
-    if isinstance(view.get("kind_checks"), Mapping):
-        row["kinds_checked"] = _kinds_checked(view["kind_checks"])
-    elif judged:
+    # The all-ranks view does not say what was checked (plan row A6), so the count is the
+    # lowest judged rank's, and the row names that rank. When the view carries it, read it here.
+    if judged:
         # The rank's evidence as the watcher builds it from the report and the status: the
         # server's own values for its kinds and this reader's for the rest. No part is read.
         look = read_server_report(folder / f"rank={judged[0]}")
