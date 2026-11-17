@@ -709,8 +709,15 @@ class Trigger:
                     self._fired.add(_fired_key(rank, delivery["kind"], delivery["step"]))
             episode = document.get("episode")
             stalls = [d for d in deliveries if d["kind"] in STALL_KINDS]
-            if isinstance(episode, dict):
+            ids = {d.get("id") for d in deliveries}
+            if isinstance(episode, dict) and isinstance(episode.get("ranks", {}), dict) \
+                    and episode.get("delivery") in ids:
                 self._episode = episode
+            elif episode is not None:
+                # Its firing was removed from the file (to try a given-up stall again), or it is
+                # not an episode this version reads: no stall episode is open.
+                self._log(f"trigger: {self._state_path}: the stall episode it lists has no firing in it, or cannot be"
+                          " read; a stall may fire again")
             elif "episode" not in document and stalls:
                 # Written before episodes were kept (keyed by rank, kind and step, or by the run):
                 # its last stall is the open episode, with no baseline yet.

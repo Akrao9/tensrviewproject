@@ -684,6 +684,23 @@ def test_a_rank_that_recovered_ends_its_episode_and_another_ranks_later_stall_fi
     assert empty.look("stalled", _ranked(0, "silent", 9)) == 1
 
 
+def test_a_stall_whose_firing_is_removed_from_the_state_file_fires_again(tmp_path, hook, capsys):
+    """What the "given up" line tells the user to do: remove the incident from the state file."""
+    command, calls = hook
+    run = _Looks(tmp_path, command, calls)
+    assert run.look("stalled", _ranked(0, "silent", 99)) == 1
+    state = state_path_for(run.path)
+    document = json.loads(state.read_text())
+    assert document["episode"]["delivery"] == "r/rank0/job_stalled/99"
+    state.write_text(json.dumps({**document, "deliveries": []}))
+    assert run.look("stalled", _ranked(0, "silent", 99), restart=True) == 1
+    # An episode of a shape this version does not read: said, and a stall may fire; other kinds still fire.
+    broken = json.loads(state.read_text())
+    state.write_text(json.dumps({**broken, "deliveries": [], "episode": {"delivery": "x", "ranks": [1, 2]}}))
+    assert run.look("stalled", _ranked(0, "silent", 99), restart=True) == 1
+    assert "cannot be read; a stall may fire again" in capsys.readouterr().out
+
+
 def test_a_stall_named_at_warning_does_not_fire_again_at_critical_in_its_episode(tmp_path, hook):
     command, calls = hook
     run = _Looks(tmp_path, command, calls, kinds=["rank_silent", "job_stalled"])
