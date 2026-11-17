@@ -5,7 +5,7 @@
     python -m tensorquill store/runs/r --rank all --watch --webhook https://example.com/hooks/tensorquill
 
 **What fires.** An incident is new when its rank, kind and step have not fired before, and a
-stall when the run has had none fire (below). By
+stall when no stall episode of its run is open (below). By
 default the invariants (`evidence.INCIDENT_CLASSES`) fire, and so does a stall that has reached
 `critical`: a `job_stalled` or `rank_silent` incident (`STALL_KINDS`) whose `severity` is
 `critical`, whatever its `assessment`. `--fire-anomalies` adds the anomalies, whose thresholds
@@ -26,15 +26,34 @@ phase is `paused`, has none, and so cannot make a stall `critical`. A stall name
 `--fire-kind` fires at `warning` and not again when it becomes `critical`; one not named fires
 once, when it becomes `critical`.
 
-**One firing for one stall** (decided Nov 17, 2026). A stall is keyed by the run, not by rank,
-kind and step: the first stall of a run that fires is the only one. A silent rank whose job then
-stops altogether (`rank_silent`, then `job_stalled`) and a second rank that falls silent at an
-earlier step are the same event, and fire nothing more. (`wandb`'s `run.alert` holds an alert
-back by its title within a run in the same way, not by the step it was raised at.) What this
-rule does after a run recovers is not decided: a run that stalled, fired, stepped again and then
-stalls a second time fires nothing for the second stall, since its run has had one. Delete the
-state file to be told of it. A state file written before this rule is read under it: a stall
-it lists, of either kind, at any step, is the run's stall, so an upgrade does not fire again.
+**One firing for one stall episode** (the author's decision of Nov 17, 2026, in place of one
+firing a run, the same day: a job that recovers and hangs later is a new failure). A stall that
+fires opens an episode, kept in the state file with what each stopped rank had stored (its last
+step and its attempt) and the run's highest step. No stall fires while it is open. It ends when
+a stall is next listed and shows one of:
+
+- progress. For an episode opened by `job_stalled`, the run's step: any rank has stored a step
+  beyond the highest one stored when it fired (a lagging rank catching up below that does not
+  end it). For one opened by `rank_silent`, the stopped rank's own step: a rank of the episode
+  has stored a step beyond the one it stopped at. The ranks that go on stepping beside a silent
+  rank are not in its episode and do not end it, however many looks;
+- a new attempt: the `attempt` the server's status gives a rank of the episode differs from
+  the one it had. The server takes it from the new attempt's first stored batch, so a job
+  started again that hangs before it stores anything is not seen as one. A status that gives no
+  attempt says nothing.
+
+Then the next stall at `critical` fires again, under an id of its own. So a silent rank whose
+job then stops altogether (`rank_silent`, then `job_stalled`) is one episode. A rank that stops
+during an open episode joins it, at the step it stopped at; the episode goes on while a rank of
+it is still where it stopped, even if the first rank recovers, and ends once one of its ranks
+steps past its own step. A server restart is neither progress nor an attempt: the stall is not
+listed during the restored ranks' fresh window, and nothing is decided until it is. (`wandb`'s
+`run.alert` holds an alert back by its title and a wait time, not by the step it was raised at;
+`torch.distributed.elastic` counts a restart of the worker group as a new round.) The status is
+the only source: a watcher of a local file given a status with `watchdog=` reads the same
+fields from it, and the records' own `attempt` is not used. A state file written before episodes
+were kept (keyed by rank, kind and step, or by the run) loads: its last stall is the open
+episode, which takes the first stall it sees as its own without firing.
 
 **A lost connection.** A stall's `assessment` says what the server saw: `suspected_hang` when a
 stopped rank's stream is still open (it is connected and does not step), `lost_connection` when
@@ -165,9 +184,32 @@ def _step_key(step: Any) -> Any:
 
 
 def _fired_key(rank: Any, kind: Any, step: Any) -> tuple[Any, ...]:
-    """What a firing holds back: a stall, the run's next stall of either kind at any step (one
-    firing for one stall); any other incident, the same kind at the same step on the same rank."""
-    return ("stall",) if kind in STALL_KINDS else (rank, kind, step)
+    """What a firing of any incident but a stall holds back: the same kind at the same step on the
+    same rank. A stall is held back by its episode instead (`_Episodes`)."""
+    return (rank, kind, step)
+
+
+def _number(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _stopped(incident: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """The stopped ranks of a stall, by rank (as a string, the state file's key), with the last
+    step the server stored for each and its attempt (None when the status does not say)."""
+    found = {}
+    for entry in incident.get("ranks") or ():
+        if isinstance(entry, Mapping) and entry.get("state") in ("silent", "lost", "unresponsive"):
+            found[str(entry.get("rank"))] = {"last_step": _number(entry.get("last_step")),
+                                             "attempt": entry.get("attempt")}
+    return found
+
+
+def _run_step(incident: Mapping[str, Any]) -> int | None:
+    """The run's step in a stall: the highest step any rank has stored."""
+    steps = [_number(e.get("last_step")) for e in incident.get("ranks") or () if isinstance(e, Mapping)]
+    steps.append(_number(incident.get("newest_step")))
+    steps = [step for step in steps if step is not None]
+    return max(steps) if steps else None
 
 
 def _who(ranks: Iterable[Any]) -> str:
@@ -182,7 +224,7 @@ class Trigger:
 
     `watch(..., trigger=Trigger("my-command"))` calls `tick()` on every look and
     `look(evidence, path)` after every write; neither ever raises. Invariants fire, and a
-    stall at `critical` (`STALL_KINDS`), once a run; `anomalies` adds the anomalies, `kinds` any
+    stall at `critical` (`STALL_KINDS`), once an episode; `anomalies` adds the anomalies, `kinds` any
     kinds by name, a stall at `warning` among them. `state_path` replaces the state file beside
     the evidence. `compact_window` writes the compact evidence beside the full file at each look
     and hands that one over (the command line sets it). `log` gets each line this prints.
@@ -231,6 +273,10 @@ class Trigger:
         self._loaded = False
         self._deliveries: list[dict[str, Any]] = []
         self._fired: set[tuple[Any, ...]] = set()
+        # The stall episode that has fired and not ended (see the module's text), as the state
+        # file keeps it; None when a stall may fire.
+        self._episode: dict[str, Any] | None = None
+        self._stalls: list[Mapping[str, Any]] = []
         # Set: the evidence written is the full file, and this writes the compact one beside it.
         self.compact_window = compact_window
         self._compact_failed = False
@@ -356,6 +402,7 @@ class Trigger:
     def _collect(self, evidence: Mapping[str, Any], rank: int | None) -> list[dict[str, Any]]:
         """The incidents of `evidence` that the options let fire, each with the ranks it is on."""
         units = []
+        self._stalls = []
         if evidence.get("view") == ALL_RANKS_VIEW:
             for group in evidence.get("incident_groups") or ():
                 if isinstance(group, Mapping) and isinstance(group.get("incident"), Mapping):
@@ -364,6 +411,8 @@ class Trigger:
         else:
             shared = evidence.get("incidents") or ()
         for incident in shared:
+            if isinstance(incident, Mapping) and incident.get("kind") in STALL_KINDS:
+                self._stalls.append(incident)  # listed, whether or not it fires
             if isinstance(incident, Mapping):
                 units.append(self._unit(incident, [rank], {
                     "incident": incident, "kind": incident.get("kind"), "step": incident.get("step"),
@@ -373,35 +422,100 @@ class Trigger:
 
     def _enqueue(self) -> None:
         """A firing for each incident with a rank that has not fired before, for those ranks;
-        for a stall, once a run (`_fired_key`)."""
+        for a stall, once an episode (`_follow_episode`)."""
         targets = [name for name, given in (("command", self.command), ("webhook", self.webhook)) if given]
+        for stall in self._stalls:
+            self._follow_episode(stall)
         for unit in self._units:
-            new = [r for r in unit["ranks"] if _fired_key(r, unit["kind"], unit["step"]) not in self._fired]
-            if not new:
-                continue
+            if unit["kind"] in STALL_KINDS:
+                if self._episode is not None:
+                    continue  # the open episode's stall: fired already
+                new = list(unit["ranks"])
+            else:
+                new = [r for r in unit["ranks"] if _fired_key(r, unit["kind"], unit["step"]) not in self._fired]
+                if not new:
+                    continue
             numbers = [r for r in new if isinstance(r, int)]
             who = f"rank{'s' if len(numbers) != 1 else ''}{_rank_ranges(numbers).replace(' ', '')}" if numbers else "run"
+            delivery_id = f"{self._run_id}/{who}/{unit['kind']}/{unit['step']}"
+            taken = {d["id"] for d in self._deliveries}
+            if delivery_id in taken:  # a later stall episode at the same step: its own id, for receivers that drop repeats
+                delivery_id = next(f"{delivery_id}/{n}" for n in range(2, len(taken) + 3) if f"{delivery_id}/{n}" not in taken)
             self._deliveries.append({
-                "id": f"{self._run_id}/{who}/{unit['kind']}/{unit['step']}",
+                "id": delivery_id,
                 "kind": unit["kind"], "step": unit["step"], "ranks": new,
                 **({"assessment": unit["assessment"]} if unit["assessment"] is not None else {}),
                 "first_seen_ms": int(time.time() * 1000),
                 **{target: {"status": "pending", "attempts": 0} for target in targets},
             })
-            self._fired.update(_fired_key(r, unit["kind"], unit["step"]) for r in new)
+            if unit["kind"] in STALL_KINDS:
+                self._episode = self._open_episode(unit["incident"], delivery_id)
+            else:
+                self._fired.update(_fired_key(r, unit["kind"], unit["step"]) for r in new)
         self._save()
+
+    # --- Stall episodes ----------------------------------------------------------------------
+
+    @staticmethod
+    def _open_episode(incident: Mapping[str, Any], delivery_id: str | None) -> dict[str, Any]:
+        """The episode a stall that fires opens: what it was stopped at, to tell progress from."""
+        return {"kind": incident.get("kind"), "delivery": delivery_id, "run_step": _run_step(incident),
+                "ranks": _stopped(incident)}
+
+    def _follow_episode(self, stall: Mapping[str, Any]) -> None:
+        """End the open episode if `stall` shows progress or a new attempt since it opened, or
+        else take the ranks that have stopped since into it. Decided only when a stall is listed:
+        a stall that is not listed for a while (as for the window after a server restart) has
+        not ended for that."""
+        episode = self._episode
+        if episode is None:
+            return
+        stopped = _stopped(stall)
+        if episode.get("legacy"):
+            # From a state file that kept no baseline: the first stall seen is taken as the
+            # episode's, without firing (a stall listed in the file has fired).
+            self._episode = {**self._open_episode(stall, episode.get("delivery")), "adopted": True}
+            return
+        members = episode.setdefault("ranks", {})
+        for rank, now in stopped.items():
+            before = members.get(rank)
+            if before is not None and now["attempt"] is not None and before.get("attempt") is not None \
+                    and now["attempt"] != before["attempt"]:
+                self._episode = None  # a new attempt: the job was started again
+                return
+        if episode.get("kind") == "job_stalled":
+            # The run's step: the stall is over once any rank has stored a step beyond the
+            # highest one stored when it fired.
+            step, then = _run_step(stall), episode.get("run_step")
+            if step is not None and then is not None and step > then:
+                self._episode = None
+                return
+        else:
+            # `rank_silent`: each stopped rank's own step. The ranks that go on stepping beside
+            # it are not in the episode and do not end it.
+            for rank, now in stopped.items():
+                before = (members.get(rank) or {}).get("last_step")
+                if before is not None and now["last_step"] is not None and now["last_step"] > before:
+                    self._episode = None
+                    return
+        for rank, now in stopped.items():
+            members.setdefault(rank, now)  # a rank that stopped during the episode joins it
 
     def _unit_for(self, delivery: Mapping[str, Any]) -> dict[str, Any] | None:
         """The incident a firing is for, in the evidence last looked at; None once a resumed
-        run has rolled it back, and then nothing is sent for it. A stall's firing is for the
-        run's stall as it reads now: a try still to make for a `rank_silent` that has become a
-        `job_stalled` sends the `job_stalled` (under the firing's own id)."""
+        run has rolled it back, and then nothing is sent for it. A stall's firing is for its
+        episode's stall as it reads now: a try still to make for a `rank_silent` that has become a
+        `job_stalled` sends the `job_stalled` (under the firing's own id). A firing of an episode
+        that is over sends nothing more."""
+        if delivery["kind"] in STALL_KINDS:
+            # Only the open episode's firing has anything to send: an earlier episode is over.
+            if self._episode is None or self._episode.get("delivery") != delivery["id"]:
+                return None
+            return next((unit for unit in self._units if unit["kind"] in STALL_KINDS), None)
         ranks = set(delivery["ranks"])
         for unit in self._units:
             if unit["kind"] == delivery["kind"] and unit["step"] == delivery["step"] and ranks & set(unit["ranks"]):
                 return unit
-        if delivery["kind"] in STALL_KINDS:
-            return next((unit for unit in self._units if unit["kind"] in STALL_KINDS), None)
         return None
 
     # --- Making the tries ------------------------------------------------------------------
@@ -575,11 +689,21 @@ class Trigger:
                 raise ValueError("not a version this trigger reads")
             for delivery in deliveries:
                 delivery["step"] = _step_key(delivery["step"])
+                if delivery["kind"] in STALL_KINDS:
+                    continue
                 for rank in delivery["ranks"]:
-                    # A stall fired under the key of an earlier version is the run's stall now.
                     self._fired.add(_fired_key(rank, delivery["kind"], delivery["step"]))
+            episode = document.get("episode")
+            stalls = [d for d in deliveries if d["kind"] in STALL_KINDS]
+            if isinstance(episode, dict):
+                self._episode = episode
+            elif "episode" not in document and stalls:
+                # Written before episodes were kept (keyed by rank, kind and step, or by the run):
+                # its last stall is the open episode, with no baseline yet.
+                self._episode = {"legacy": True, "delivery": stalls[-1]["id"], "kind": stalls[-1]["kind"]}
         except (ValueError, KeyError, TypeError) as error:
             self._fired.clear()
+            self._episode = None
             self._log(f"trigger: {self._state_path} is not a state file this version reads ({error}): nothing"
                       " counts as fired, so the incidents listed now fire again")
             return
@@ -588,7 +712,8 @@ class Trigger:
     def _save(self) -> None:
         if self._state_path is None:
             return
-        document = {"version": STATE_VERSION, "evidence": str(self._evidence_path), "deliveries": self._deliveries}
+        document = {"version": STATE_VERSION, "evidence": str(self._evidence_path), "deliveries": self._deliveries,
+                    "episode": self._episode}
         text = json.dumps(document, indent=1, default=str) + "\n"
         if text == getattr(self, "_saved", None):
             return
@@ -615,7 +740,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--on-incident",
         metavar="COMMAND",
         help="with --watch: a shell command started once for each new incident (new: its rank, kind and step have "
-        "not fired before, and for a stall, once a run; kept in <evidence>.fired.json beside the evidence, so a "
+        "not fired before, and for a stall, once an episode: until the run steps past it or a new attempt; kept in <evidence>.fired.json beside the evidence, so a "
         "restarted watcher does not fire again). Turns on --compact: the full evidence is written as before and "
         "the compact file beside it is the one handed over. It gets the incident as JSON on standard input and "
         "TENSORQUILL_EVIDENCE (the compact evidence file), TENSORQUILL_INCIDENT_KIND, _CLASS, _STEP, _RANKS, "
@@ -650,7 +775,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="KIND",
         help="with --on-incident or --webhook: this kind fires too, whatever its class (repeat the option for more); "
         "the only way an observation fires, but for a stall: job_stalled and rank_silent fire with no option once "
-        "their severity is critical, and from their warning when named here (once a run, not again at critical)",
+        "their severity is critical, and from their warning when named here (once an episode, not again at critical)",
     )
 
 

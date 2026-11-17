@@ -2022,6 +2022,32 @@ mod tests {
     }
 
     #[test]
+    fn a_job_started_again_reads_stalled_until_its_new_attempt_stores_a_batch() {
+        // Pinned as it is, not as it must be (a follow-up, Nov 17, 2026): the server learns a new
+        // attempt only from its first stored batch (heartbeats carry no attempt). Until then a rank
+        // whose new process has connected is judged from the old attempt's last batch, so it reads
+        // silent and critical at once. The trigger does not fire for it: the status's `attempt` and
+        // `last_step` are still the old attempt's, the stall episode that already fired.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60)); // critical after 180 s
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 5));
+        dog.stream_ended(&key(0), false, at(t0, 6)); // killed
+        assert_eq!(rank_field(&dog, at(t0, 300), "severity"), "critical");
+        // Started again: a new process connects and beats, and has stored nothing yet.
+        dog.stream_opened(&key(0), at(t0, 400));
+        dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, 401));
+        assert_eq!(states(&dog, at(t0, 402)), ["silent"]);
+        assert_eq!(rank_field(&dog, at(t0, 402), "severity"), "critical");
+        assert_eq!(rank_field(&dog, at(t0, 402), "attempt"), 1);
+        // Its first batch, of attempt 2 and below the old highest step: active, attempt 2.
+        dog.batch(&key(0), 2, Some(29), Some(1), at(t0, 450));
+        assert_eq!(states(&dog, at(t0, 451)), ["active"]);
+        assert_eq!(rank_field(&dog, at(t0, 451), "attempt"), 2);
+        assert_eq!(rank_field(&dog, at(t0, 451), "last_step"), 99);
+    }
+
+    #[test]
     fn a_rank_whose_heartbeats_had_stopped_stays_unresponsive_after_its_window() {
         // A frozen process cannot reconnect: after its window it is not called a lost connection.
         let t0 = Instant::now();
