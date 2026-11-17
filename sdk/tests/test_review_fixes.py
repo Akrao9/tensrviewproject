@@ -40,6 +40,49 @@ def test_activation_checkpointing_does_not_double_count_routing(use_reentrant):
     assert sum(sink.records[0]["moe"]["router"]) == 16 * 2
 
 
+def _checkpointed_records(backend, use_reentrant, hooks):
+    """Records of three steps of `_Routed`, uncompiled (backend None) or compiled. Each step runs
+    two forwards before one backward, so a backward that replayed a hook's write would leave the
+    first forward's statistics, or count its tokens again."""
+    torch.manual_seed(0)
+    model = _Routed(use_reentrant)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    if hooks == "full":
+        kwargs = {"capture": "full", "layers": ["inner", "router"]}
+    else:
+        indices = (lambda out: out.detach().topk(2, dim=-1).indices) if hooks == "indices" else None
+        kwargs = {"routers": {"router": tensorquill.Router(4, top_k=2, indices=indices)}}
+    session = tensorquill.init(model, sink=sink, **kwargs)
+    runner = model if backend is None else torch.compile(model, backend=backend)
+    torch._dynamo.utils.counters.clear()
+    for _ in range(3):
+        a, b = (torch.randn(16, 8, requires_grad=use_reentrant) for _ in range(2))
+        (runner(a).sum() + runner(b).sum()).backward()
+        opt.step()
+        opt.zero_grad()
+    session.close()
+    assert dict(torch._dynamo.utils.counters["graph_break"]) == {}
+    return [{key: r.get(key) for key in ("step", "moe", "layers")} for r in sink.records]
+
+
+@pytest.mark.parametrize("hooks", ["routers", "indices", "full"])
+@pytest.mark.parametrize("use_reentrant", [True, False])
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_checkpointed_hooks_under_compile_record_what_eager_records(backend, use_reentrant, hooks):
+    # Under backend="eager" a checkpointed block holding a hooked module made backward() raise
+    # "modified by an inplace operation": the block's saved inputs include the hook's buffer.
+    compiled = _checkpointed_records(backend, use_reentrant, hooks)
+    eager = _checkpointed_records(None, use_reentrant, hooks)
+    assert [r["moe"] for r in compiled] == [r["moe"] for r in eager]
+    if hooks == "routers":
+        assert all(sum(r["moe"]["router"]) == 2 * 16 * 2 for r in compiled)
+    for got, want in zip(compiled, eager):
+        if want["layers"]:
+            for name, stats in want["layers"].items():
+                assert got["layers"][name] == pytest.approx(stats, rel=1e-5, abs=1e-7)
+
+
 def _two_part():
     model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 1))
     return model, [torch.optim.SGD(model[0].parameters(), lr=0.1), torch.optim.AdamW(model[1].parameters())]
