@@ -2881,6 +2881,318 @@ def _group_incidents(looks: Mapping[int, Mapping[str, Any]], judged: list[int]) 
     return out
 
 
+# --- What was checked, for the whole run --------------------------------------------------
+#
+# The all-ranks view carries `kind_checks` too: one entry for each of the 32 kinds, with the
+# same three values and the same `enough_history` as one rank's evidence, so `checked_counts`,
+# `kinds_by_value` and `kind_history` read it as they read a rank's. The rule (`run_kind_checks`):
+#
+#   1. Only judged ranks count (those whose report is current). A rank that is not judged is
+#      named beside the count (`unknown_ranks`) and is in no value: it is never "checked".
+#   2. For a kind read from one rank's step records (the server's 25), the worst judged rank
+#      gives the run's value: `unavailable` if any judged rank is, else `not_configured` if
+#      any is, else `checked`. So `checked` means checked on every judged rank, and "nothing
+#      found" for it is said of every judged rank. When the judged ranks differ, the entry
+#      lists them by value under `ranks`; a kind that is `not_configured` or `unavailable`
+#      for the run can so be checked, and even reported, on the ranks named there.
+#   3. History the same way: `enough_history` is false when any judged rank is short of it
+#      (`not_enough_history_ranks`), is left out when none is short and some rank's report
+#      does not say (`history_not_stated_ranks`; `kind_history` reads that as `not_stated`,
+#      never as enough), and is true only when every judged rank has enough. `records` is
+#      the fewest any judged rank has and `records_needed` the most any needs.
+#   4. `job_stalled`, `rank_silent` and the three file kinds belong to the run, not to a
+#      rank: they are `other_kind_checks` of the run's status (expected, since the source is
+#      a store) and of the files given.
+#   5. The two cross-rank kinds are judged for the run, by rule 2 over what each judged rank
+#      brings to the comparison, and need two ranks: `memory_imbalance` is `checked` when
+#      every judged rank's report has a peak memory reading and there are at least two;
+#      `duplicate_batches`, which the server compares and puts in its status, when every
+#      judged rank recorded `data` on some step, there are at least two, and a status was
+#      read (`unavailable` without one).
+#   6. When no rank is judged, or a judged rank's report has no usable `kind_checks` (a
+#      server older than the key wrote it), there is no run-level object and no count:
+#      `kind_checks_not_stated` says why and names the ranks. A count over the ranks that do
+#      say would read as the run's.
+#   7. `degraded` is as before and agrees with it: a judged rank's `not_checked` entry makes
+#      a kind `unavailable` on that rank, so for the run, and already degrades the run state.
+_CROSS_RANK_NEEDS = {
+    "duplicate_batches": "data (session.watch_loader) on every judged rank, at least two ranks, and the server's"
+                         " progress status (watchdog.json)",
+    "memory_imbalance": "system.cuda (system=True) on every judged rank, and at least two ranks",
+}
+_DATA_KIND = "data_stalled"  # a server kind judged from `data`: its `records` count the steps that carried it
+_MEMORY_KIND = "memory_pressure"  # a server kind judged from `system.cuda`
+# Kinds named in one part of the count line before the rest are counted.
+CHECKED_LINE_KINDS = 6
+
+
+def stated_kind_checks(report: Any) -> Mapping[str, Any] | None:
+    """A server report's `kind_checks` when it gives every one of the server's kinds one of
+    the three values, else None (a server older than the key wrote the report). The test
+    `_report_evidence` applies before it takes them."""
+    checks = report.get("kind_checks") if isinstance(report, Mapping) else None
+    if isinstance(checks, Mapping) and all(
+        isinstance(checks.get(kind), Mapping) and checks[kind].get("value") in KIND_CHECK_VALUES for kind in SERVER_KINDS
+    ):
+        return checks
+    return None
+
+
+def _worst_value(by_rank: Mapping[int, Mapping[str, Any]]) -> str:
+    """The worst judged rank's value: `KIND_CHECK_VALUES` is in that order, best first."""
+    return max((check["value"] for check in by_rank.values()), key=KIND_CHECK_VALUES.index)
+
+
+def _ranks_by_value(by_rank: Mapping[int, Mapping[str, Any]]) -> dict[str, list[int]]:
+    found: dict[str, list[int]] = {}
+    for value in KIND_CHECK_VALUES:
+        ranks = sorted(rank for rank, check in by_rank.items() if check["value"] == value)
+        if ranks:
+            found[value] = ranks
+    return found
+
+
+def _run_check(by_rank: Mapping[int, Mapping[str, Any]], needs: str) -> dict[str, Any]:
+    """One kind for the run from its entry on each judged rank (rules 2 and 3 above)."""
+    value = _worst_value(by_rank)
+    ranks = _ranks_by_value(by_rank)
+    stated = {rank: check.get("enough_history") for rank, check in by_rank.items()}
+    short = sorted(rank for rank, enough in stated.items() if enough is False)
+    silent = sorted(rank for rank, enough in stated.items() if not isinstance(enough, bool))
+    # Only what a checked rank says of its history is listed: the others have no rule running.
+    warming = [rank for rank in short if by_rank[rank]["value"] == "checked"]
+    not_stated = [rank for rank in silent if by_rank[rank]["value"] == "checked"]
+    seen = [check["records"] for check in by_rank.values() if isinstance(check.get("records"), int)]
+    needed = [check["records_needed"] for check in by_rank.values() if isinstance(check.get("records_needed"), int)]
+    first_unavailable = next((by_rank[rank] for rank in ranks.get("unavailable", ())), None)
+    return {
+        "value": value,
+        **({"enough_history": not short} if short or not silent else {}),
+        **({"records": min(seen)} if len(seen) == len(by_rank) else {}),
+        **({"records_needed": max(needed)} if len(needed) == len(by_rank) else {}),
+        "needs": needs,
+        **({key: first_unavailable.get(key) for key in ("check", "reason")} if first_unavailable is not None else {}),
+        **({"ranks": ranks} if len(ranks) > 1 else {}),
+        **({"not_enough_history_ranks": warming} if warming else {}),
+        **({"history_not_stated_ranks": not_stated} if not_stated else {}),
+    }
+
+
+def _cross_rank_check(kind: str, brings: Mapping[int, Mapping[str, Any]]) -> dict[str, Any]:
+    """A kind that compares ranks, from what each judged rank brings to the comparison
+    (rule 5): the worst rank gives the value, and one rank alone compares with nothing."""
+    check = {key: value for key, value in _run_check(brings, _CROSS_RANK_NEEDS[kind]).items()
+             if key not in ("records", "records_needed", "not_enough_history_ranks", "history_not_stated_ranks")}
+    if check["value"] == "checked" and len(brings) < 2:
+        check["value"] = "not_configured"
+    check["enough_history"] = check["value"] == "checked"
+    return {"value": check["value"], "enough_history": check["enough_history"],
+            **{key: value for key, value in check.items() if key not in ("value", "enough_history")}}
+
+
+def run_kind_checks(
+    rank_checks: Mapping[int, Mapping[str, Any]],
+    others: Mapping[str, Mapping[str, Any]],
+    *,
+    memory: Mapping[int, Any],
+    status: Mapping[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """`kind_checks` for a whole run (the rule is in the comment above).
+
+    `rank_checks` is each judged rank's `kind_checks` from its server's report
+    (`stated_kind_checks`; at least one rank), `others` the run's `other_kind_checks`,
+    `memory` each judged rank's latest memory reading (`memory` in its report) and `status`
+    the server's status or None.
+    """
+    checks: dict[str, dict[str, Any]] = {
+        kind: _run_check({rank: found[kind] for rank, found in rank_checks.items()}, INPUT_NEEDS[KIND_INPUTS[kind]])
+        for kind in SERVER_KINDS
+    }
+    checks.update({kind: dict(check) for kind, check in others.items()})
+
+    def brings(has: Any, kind: str) -> dict[int, dict[str, Any]]:
+        # A rank without the input is not configured for the comparison, unless its own
+        # report says the input could not be read.
+        found: dict[int, dict[str, Any]] = {}
+        for rank, own in rank_checks.items():
+            if has(rank):
+                found[rank] = {"value": "checked", "enough_history": True}
+            elif own[kind].get("value") == "unavailable":
+                found[rank] = {"value": "unavailable", "enough_history": False,
+                               "check": own[kind].get("check"), "reason": own[kind].get("reason")}
+            else:
+                found[rank] = {"value": "not_configured", "enough_history": False}
+        return found
+
+    def peak(rank: int) -> bool:
+        reading = memory.get(rank)
+        return isinstance(reading, Mapping) and _finite_number(reading.get("peak_allocated")) is not None
+
+    checks["memory_imbalance"] = _cross_rank_check("memory_imbalance", brings(peak, _MEMORY_KIND))
+    duplicates = _cross_rank_check(
+        "duplicate_batches", brings(lambda rank: bool(rank_checks[rank][_DATA_KIND].get("records")), _DATA_KIND))
+    if duplicates["value"] == "checked":
+        if status is None:
+            duplicates = {**_unavailable({"check": "status", "reason": _NO_STATUS}, enough_history=False,
+                                         needs=duplicates["needs"])}
+        else:
+            # The status carries the comparison only when it finds a duplicate, so this is what
+            # the ranks recorded, not proof that the server held every rank's batches.
+            duplicates["note"] = ("the server compares the ranks whose stores it has read since it started, and its"
+                                  " status names them only when it finds a duplicate")
+    checks["duplicate_batches"] = duplicates
+    return {kind: checks[kind] for kind in INCIDENT_CLASSES}
+
+
+def _all_ranks_kind_checks(
+    evidence: dict[str, Any],
+    looks: Mapping[int, Mapping[str, Any]],
+    status: Mapping[str, Any] | None,
+    *,
+    flight_recorder: bool,
+    traincheck: bool,
+) -> None:
+    """Put what was checked into the all-ranks evidence: `kind_checks` for the run, or
+    `kind_checks_not_stated` with why there is none, and on each judged rank's entry
+    `kind_counts`, the count of its own report's kinds (the server's 25)."""
+    judged = evidence["judged_ranks"]
+    stated = {n: found for n in judged if (found := stated_kind_checks(looks[n]["report"])) is not None}
+    for entry in evidence["ranks"]:
+        if entry["rank"] in stated:
+            entry["kind_counts"] = {**(checked_counts({"kind_checks": stated[entry["rank"]]}) or {}), "kinds": len(SERVER_KINDS)}
+    silent = [n for n in judged if n not in stated]
+    if not judged:
+        evidence["kind_checks_not_stated"] = {
+            "code": "no_judged_rank", "ranks": [],
+            "detail": "no rank is judged, so nothing is said about what was checked",
+        }
+        return
+    if silent:
+        evidence["kind_checks_not_stated"] = {
+            "code": "report_without_kind_checks", "ranks": silent,
+            "detail": f"the report of rank{'s' if len(silent) != 1 else ''} {_rank_ranges(silent, 8)} does not say what was"
+                      " checked (`kind_checks`: an older tensorquill-server wrote it), so the kinds are not counted for"
+                      " the run",
+        }
+        return
+    others = other_kind_checks(
+        status=status, status_expected=True, not_checked=evidence.get("not_checked", ()),
+        flight_recorder=flight_recorder, traincheck=traincheck,
+    )
+    evidence["kind_checks"] = run_kind_checks(
+        stated, others, memory={n: looks[n]["report"].get("memory") for n in judged}, status=status)
+
+
+def _all_ranks_reported(evidence: Mapping[str, Any]) -> dict[Any, set[int]]:
+    """The ranks that show an incident of each kind, from the incident groups."""
+    found: dict[Any, set[int]] = {}
+    for group in evidence.get("incident_groups") or ():
+        if isinstance(group, Mapping):
+            found.setdefault(group.get("kind"), set()).update(group.get("ranks") or ())
+    return found
+
+
+def _some(parts: list[str]) -> str:
+    """The first `CHECKED_LINE_KINDS` of them, and a count of the rest."""
+    rest = len(parts) - CHECKED_LINE_KINDS
+    return ", ".join(parts[:CHECKED_LINE_KINDS]) + (f", and {rest} more" if rest > 0 else "")
+
+
+def _on_ranks(ranks: Iterable[int]) -> str:
+    ranks = list(ranks)
+    return f"on rank{'s' if len(ranks) != 1 else ''} {_rank_ranges(ranks, 4)}"
+
+
+def all_ranks_checked_line(evidence: Mapping[str, Any]) -> str | None:
+    """The all-ranks summary's count line, or the line that says why there is no count; None
+    for evidence that says neither (an older version wrote it).
+
+    `7 of 32 kinds checked on both ranks, 1 of them without enough history yet (grad_spike 5
+    of 13 records on rank 1), 25 not configured, 1 of them checked on some ranks only
+    (stalled_weights on rank 0)`. A kind is counted as checked only when every judged rank
+    checked it; ranks are named wherever the judged ranks differ, and the ranks that are not
+    judged are named as not counted."""
+    counts = checked_counts(evidence)
+    if counts is None:
+        missing = evidence.get("kind_checks_not_stated")
+        if isinstance(missing, Mapping) and missing.get("code") != "no_judged_rank":  # then the first line says it
+            return f"What was checked is not stated: {missing.get('detail')}."
+        return None
+    checks, reported = evidence["kind_checks"], _all_ranks_reported(evidence)
+    judged, unknown = list(evidence.get("judged_ranks") or ()), list(evidence.get("unknown_ranks") or ())
+    if unknown:
+        where = (f"on the {len(judged)} judged rank{'s' if len(judged) != 1 else ''} of {len(judged) + len(unknown)}"
+                 f" (rank{'s' if len(unknown) != 1 else ''} {_rank_ranges(unknown, 4)} not judged, so not counted)")
+    else:
+        where = "on the only rank" if len(judged) == 1 else "on both ranks" if len(judged) == 2 else f"on all {len(judged)} ranks"
+    line = f"{counts['checked']} of {counts['kinds']} kinds checked {where}"
+
+    def differing(kind: str, value: str) -> str:
+        ranks = (checks[kind].get("ranks") or {}).get(value)
+        return f"{kind} {_on_ranks(ranks)}" if ranks else kind
+
+    if counts["not_enough_history"]:
+        each = []
+        for at, kind in enumerate(counts["not_enough_history_kinds"]):
+            seen, needed = checks[kind].get("records"), checks[kind].get("records_needed")
+            said = f"{kind} {seen} of {needed}" if seen is not None and needed is not None else kind
+            if at == 0 and " of " in said:
+                said += " records"
+            short = checks[kind].get("not_enough_history_ranks") or ()
+            if short and len(short) < len(judged):
+                said += f" {_on_ranks(short)}"
+            # Only an incident on a rank that is short of history is a faster rule's.
+            each.append(said + (" but reported by a faster rule" if reported.get(kind, set()) & set(short) else ""))
+        line += f", {counts['not_enough_history']} of them without enough history yet ({_some(each)})"
+    if counts["history_not_stated"]:
+        line += (f", {counts['history_not_stated']} of them with no word on their history on some rank (an older"
+                 " tensorquill-server wrote its report)")
+    line += f", {counts['not_configured']} not configured"
+    partly = [kind for kind in INCIDENT_CLASSES if isinstance(checks.get(kind), Mapping)
+              and checks[kind].get("value") == "not_configured" and (checks[kind].get("ranks") or {}).get("checked")]
+    if partly:
+        each = [differing(kind, "checked") + (", where it is reported" if reported.get(kind) else "") for kind in partly]
+        line += f", {len(partly)} of them checked on some ranks only ({_some(each)})"
+    if counts["unavailable"]:
+        line += f", {counts['unavailable']} unavailable ({_some([differing(k, 'unavailable') for k in counts['unavailable_kinds']])})"
+    return line
+
+
+def all_ranks_kinds(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The all-ranks evidence's `kind_checks` by value, as `kinds_by_value` gives one rank's,
+    with the ranks named as ranges wherever the judged ranks differ. None for evidence
+    without the key (see `kind_checks_not_stated` there).
+
+    - `checked`: checked on every judged rank with enough history. "Nothing found" is a
+      verdict for these only, and only for the judged ranks.
+    - `not_enough_history`: checked on every judged rank, still warming up on those under
+      `ranks` (all of them when there is no `ranks`).
+    - `not_configured` and `unavailable` are the worst judged rank's value, so a kind listed
+      there may be checked on other ranks: `differs_by_rank` gives each such kind's ranks by
+      value. An incident of such a kind stands for the ranks that show it.
+    - `judged_ranks` and `ranks_not_counted`: who the values are about, and who they are not.
+    """
+    found = kinds_by_value(evidence)
+    if found is None:
+        return None
+    checks, reported = evidence["kind_checks"], _all_ranks_reported(evidence)
+    judged = list(evidence.get("judged_ranks") or ())
+    for kind, entry in found["not_enough_history"].items():
+        short = checks[kind].get("not_enough_history_ranks") or ()
+        if short and len(short) < len(judged):
+            entry["ranks"] = _rank_ranges(short)
+        if reported.get(kind, set()) & set(short):
+            entry["reported"] = True
+    differs = {kind: {value: _rank_ranges(ranks) for value, ranks in check["ranks"].items()}
+               for kind, check in checks.items() if isinstance(check, Mapping) and isinstance(check.get("ranks"), Mapping)}
+    return {
+        **found,
+        **({"differs_by_rank": differs} if differs else {}),
+        "judged_ranks": _rank_ranges(judged),
+        "ranks_not_counted": _rank_ranges(evidence.get("unknown_ranks") or ()),
+    }
+
+
 def _all_ranks_evidence(
     source: Path,
     folders: Mapping[int, Path],
@@ -2972,7 +3284,7 @@ def _all_ranks_evidence(
         {"ranks": found["ranks"], "rank_ranges": _rank_ranges(found["ranks"]), "thresholds": found["thresholds"]}
         for found in judged_by.values()
     ]
-    return {
+    evidence = {
         "view": ALL_RANKS_VIEW,
         "view_version": ALL_RANKS_VIEW_VERSION,
         "run_id": run_ids[0] if run_ids else source.name,
@@ -3002,6 +3314,9 @@ def _all_ranks_evidence(
             "silent_floor_seconds", "critical_seconds",
         ) if k in status}} if status else {}),
     }
+    _all_ranks_kind_checks(evidence, looks, status, flight_recorder=flight_recorder is not None,
+                           traincheck=traincheck is not None)
+    return evidence
 
 
 def _all_ranks_run_state(evidence: Mapping[str, Any], looks: Mapping[int, Mapping[str, Any]],
@@ -4344,6 +4659,9 @@ def _all_ranks_summary(evidence: Mapping[str, Any]) -> str:
             f"Pauses the job reported: {seen}. A silence threshold of {recommended:.0f} s (twice the longest)"
             " would have tolerated them: set the server's --silent-seconds to it or more."
         )
+    checked = all_ranks_checked_line(evidence)
+    if checked:
+        lines.append(checked)
     lines += [
         f"Not checked ({item['check']}): {item['reason']}"
         for item in evidence.get("not_checked", ())
