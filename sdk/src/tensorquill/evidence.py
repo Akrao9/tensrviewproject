@@ -4375,6 +4375,13 @@ def _describe_stream(incident: Mapping[str, Any]) -> str:
     if corroboration == "collective_hang":
         tail = " PyTorch's Flight Recorder shows a stuck collective." + tail
     tail = _describe_stuck(incident) + tail
+    started_again = [r.get("rank") for r in incident.get("ranks", ()) if r.get("attempt_without_steps")]
+    if started_again:
+        # The server saw a new attempt in the heartbeats (the job was started again) that has stored
+        # no step yet: the step and the quiet time shown are the earlier attempt's.
+        tail = (f" Rank{'s' if len(started_again) != 1 else ''} {', '.join(str(r) for r in started_again[:8])}"
+                f" {'were' if len(started_again) != 1 else 'was'} started again (a new attempt) and"
+                " stored no step of it yet; the step shown is the earlier attempt's." + tail)
     if incident["kind"] == "job_stalled":
         ranks = incident["ranks"]
         quiet = max((r.get("seconds_since_progress") or 0 for r in ranks), default=0)

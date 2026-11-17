@@ -73,6 +73,20 @@
 //!
 //! A status without `restart` (an older server's) is not restored, and the run is watched
 //! afresh when a rank connects.
+//!
+//! # A job started again
+//!
+//! Each heartbeat names the session's attempt (from Nov 17, 2026; `attempt_seen`). A higher one
+//! than the rank's is the job started again, seen before the new attempt stores a step: the
+//! status shows the attempt at once and marks the rank `attempt_without_steps`, and the rank is
+//! judged as one before its first step, from that beat (`starting` for `--start-seconds`, then
+//! `silent`, critical `--critical-seconds` later; `reconnecting` for that window while its stream
+//! is not open), not from the earlier attempt's last batch. `last_step` stays the highest stored,
+//! of any attempt. The attempt's first batch ends that, and its first gap is measured from the
+//! beat. A beat of the same attempt (a reconnect) changes nothing; a beat of a lower attempt (a
+//! process of an earlier attempt still alive) is ignored; and an earlier attempt's rows sent late
+//! raise `last_step` without being progress. A beat that names no attempt (an older sender) is
+//! taken as before, and its new attempt is known from its first stored batch.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
@@ -221,6 +235,10 @@ pub struct Progress {
     /// one that was `unresponsive` stays so (a frozen process cannot reconnect, and is not a lost
     /// connection), and any other is judged as a dropped stream is.
     fresh: Option<(Instant, RankState)>,
+    /// A new attempt of the job, seen in the process's heartbeats, that has stored no batch yet:
+    /// since when. Until its first batch the rank is judged as one before its first step (the
+    /// start window), not from the earlier attempt's last batch.
+    attempt_since: Option<Instant>,
 }
 
 impl Progress {
@@ -247,7 +265,13 @@ impl Progress {
             world_size: None,
             restarted: None,
             fresh: None,
+            attempt_since: None,
         }
+    }
+
+    /// No batch stored to judge the rank by: none at all, or none of its current attempt.
+    fn no_batch(&self) -> bool {
+        self.last_step.is_none() || self.attempt_since.is_some()
     }
 
     /// `at`, or the restart if that is later: the start of every verdict clock.
@@ -280,7 +304,7 @@ impl Progress {
     /// because the server sees the counter once a beat.
     pub fn threshold(&self, config: &WatchdogConfig) -> f64 {
         let floor = config.silent_floor.as_secs_f64();
-        if self.last_step.is_none() {
+        if self.no_batch() {
             let step = median(&self.step_seconds).unwrap_or(0.0);
             return floor
                 .max(step * config.silent_factor)
@@ -292,7 +316,7 @@ impl Progress {
     /// No stored batch and a counter that has shown no training step: while its stream is open
     /// the rank is under `start_limit`, not under its threshold.
     fn before_its_first_step(&self) -> bool {
-        self.last_step.is_none() && !self.stepped
+        self.no_batch() && !self.stepped
     }
 
     /// When the rank last showed a sign of work: its counter moved or it changed its phase
@@ -324,7 +348,7 @@ impl Progress {
                 let frozen = self.last_heartbeat.is_some_and(|at| {
                     now.saturating_duration_since(self.from(at)).as_secs_f64() > self.stale_after(config)
                 });
-                if self.last_step.is_none() {
+                if self.no_batch() {
                     // Before the first batch there is no cadence of batches to judge by.
                     if frozen {
                         return RankState::Unresponsive;
@@ -396,7 +420,7 @@ impl Progress {
     fn quiet_seconds(&self, state: RankState, now: Instant) -> f64 {
         let since = match self.stream {
             Stream::Dropped => self.last_change,
-            Stream::Open if state == RankState::Silent && self.last_step.is_none() => {
+            Stream::Open if state == RankState::Silent && self.no_batch() => {
                 if self.stepped {
                     self.work_moved
                 } else {
@@ -442,6 +466,7 @@ impl Progress {
             "work": self.work,
             "work_still_seconds": before(self.work_moved),
             "stepped": self.stepped,
+            "attempt_without_steps": self.attempt_since.is_some(),
             "step_seconds": self.step_seconds.iter().copied().map(round3).collect::<Vec<_>>(),
             "gaps_seconds": self.gaps.iter().copied().map(round3).collect::<Vec<_>>(),
             "pauses": self.pauses.iter().map(|(phase, stats)| (phase.clone(), json!({
@@ -534,6 +559,8 @@ impl Progress {
             world_size,
             restarted: None,
             fresh: None,
+            // Absent from a status written before it was kept: the attempt has stored steps.
+            attempt_since: carry["attempt_without_steps"].as_bool().unwrap_or(false).then_some(now),
         })
         .map(|mut progress| {
             // A fresh window from the restart for every rank that was not finished (decided Nov 17,
@@ -677,6 +704,36 @@ impl Watchdog {
         });
     }
 
+    /// The attempt a heartbeat names (a sender from before Nov 17, 2026 names none). A higher
+    /// attempt than the rank's is the job started again: the status shows it at once, and the
+    /// rank gets the start window of a new rank from now (`start_limit`, then a warning, critical
+    /// `critical` later) until the attempt stores a batch, instead of reading silent and critical
+    /// from the earlier attempt's last batch. Its clocks start now (`restarted`), and a stream
+    /// still dropped is `reconnecting` for that window. The same attempt is a beat as any other,
+    /// whatever the stream did (a reconnect is not a new attempt). A lower one is a process of an
+    /// earlier attempt still beating: false, and the beat is not taken.
+    pub fn attempt_seen(&self, key: &Key, attempt: i64, now: Instant) -> bool {
+        let window = self.config.start_limit;
+        self.with(key, now, |p| {
+            if attempt <= p.attempt {
+                return attempt == p.attempt;
+            }
+            let known = p.attempt != 0 || p.last_step.is_some();
+            p.attempt = attempt;
+            if known {
+                p.attempt_since = Some(now);
+                p.restarted = Some(now);
+                p.fresh = Some((now.checked_add(window).unwrap_or(now), RankState::Lost));
+                p.stepped = false;
+                p.step_seconds.clear();
+                p.work = None;
+                p.work_moved = now;
+                p.stack = None;
+            }
+            true
+        })
+    }
+
     /// A heartbeat from the rank's own process: it is alive, in `phase`. Leaving a phase other
     /// than training records how long it lasted.
     pub fn heartbeat(
@@ -697,7 +754,7 @@ impl Watchdog {
                 let rise = count.saturating_sub(p.work.unwrap_or(0));
                 let training = p.phase == TRAIN && (p.work.is_some() || phase == TRAIN);
                 if rise > 0 && training {
-                    if p.last_step.is_none() {
+                    if p.no_batch() {
                         let elapsed = now.saturating_duration_since(p.work_moved).as_secs_f64();
                         p.step_seconds.push_back(elapsed / rise as f64);
                         if p.step_seconds.len() > GAPS_KEPT {
@@ -737,14 +794,26 @@ impl Watchdog {
             if world_size.is_some() {
                 p.world_size = world_size;
             }
+            if attempt < p.attempt {
+                // An earlier attempt's rows, sent late (by the process of a later attempt that found
+                // them unsent): kept, and not progress of the attempt the rank is in now.
+                if let Some(step) = new_last {
+                    p.last_step = Some(p.last_step.map_or(step, |last| last.max(step)));
+                }
+                return;
+            }
             if let Some(step) = new_last {
                 // The first gap is the time to the first batch: all there is to judge a slow job by
-                // until a second batch arrives (it holds the same number of steps).
-                let from = if p.last_step.is_some() {
+                // until a second batch arrives (it holds the same number of steps). For a new attempt,
+                // the time from its first heartbeat.
+                let from = if let Some(since) = p.attempt_since {
+                    since
+                } else if p.last_step.is_some() {
                     p.last_progress
                 } else {
                     p.created
                 };
+                p.attempt_since = None;
                 let gap = now.saturating_duration_since(from).as_secs_f64();
                 p.gaps.push_back(gap);
                 if p.gaps.len() > GAPS_KEPT {
@@ -855,6 +924,11 @@ pub fn run_status(
                 },
                 "state": state.as_str(),
             });
+            if p.attempt_since.is_some() {
+                // `attempt` is a new one, seen in its heartbeats; `last_step` and the time since
+                // progress are still the earlier attempt's.
+                entry["attempt_without_steps"] = json!(true);
+            }
             if let Some(stack) = &p.stack {
                 entry["stack"] = stack.clone();
             }
@@ -2037,12 +2111,12 @@ mod tests {
     }
 
     #[test]
-    fn a_job_started_again_reads_stalled_until_its_new_attempt_stores_a_batch() {
-        // Pinned as it is, not as it must be (a follow-up, Nov 17, 2026): the server learns a new
-        // attempt only from its first stored batch (heartbeats carry no attempt). Until then a rank
-        // whose new process has connected is judged from the old attempt's last batch, so it reads
-        // silent and critical at once. The trigger does not fire for it: the status's `attempt` and
-        // `last_step` are still the old attempt's, the stall episode that already fired.
+    fn a_job_started_again_by_a_sender_without_attempts_reads_stalled_until_it_stores_a_batch() {
+        // A sender from before Nov 17, 2026 names no attempt in its heartbeats: the server learns a
+        // new attempt only from its first stored batch. Until then a rank whose new process has
+        // connected is judged from the old attempt's last batch, so it reads silent and critical at
+        // once. The trigger does not fire for it: the status's `attempt` and `last_step` are still
+        // the old attempt's, the stall episode that already fired.
         let t0 = Instant::now();
         let dog = Watchdog::new(config(60)); // critical after 180 s
         dog.stream_opened(&key(0), t0);
@@ -2060,6 +2134,118 @@ mod tests {
         assert_eq!(states(&dog, at(t0, 451)), ["active"]);
         assert_eq!(rank_field(&dog, at(t0, 451), "attempt"), 2);
         assert_eq!(rank_field(&dog, at(t0, 451), "last_step"), 99);
+    }
+
+    #[test]
+    fn a_new_attempt_seen_in_its_heartbeats_gets_a_start_window_of_its_own() {
+        // config(60): floor 60 s, critical 180 s, start limit 600 s.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, 1));
+        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 5));
+        dog.stream_ended(&key(0), false, at(t0, 6)); // killed
+        assert_eq!(rank_field(&dog, at(t0, 300), "severity"), "critical");
+        // Started again: the new process's first beat comes before its stream is open.
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 400)));
+        dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, 400));
+        let status = &dog.statuses(at(t0, 401), true)["run"];
+        assert_eq!(
+            (
+                &status["ranks"][0]["attempt"],
+                &status["ranks"][0]["attempt_without_steps"]
+            ),
+            (&json!(2), &json!(true))
+        );
+        assert_eq!(status["ranks"][0]["state"], "reconnecting");
+        assert_eq!(status["ranks"][0]["last_step"], 99); // the earlier attempt's, as stored
+        assert!(status["incidents"].as_array().unwrap().is_empty());
+        // Its stream opens; it beats and takes no step: starting for the start limit from its first
+        // beat, a warning after it, critical 180 s later.
+        dog.stream_opened(&key(0), at(t0, 402));
+        for second in (415..1500).step_by(15) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, second));
+        }
+        assert_eq!(states(&dog, at(t0, 403)), ["starting"]);
+        assert_eq!(states(&dog, at(t0, 999)), ["starting"]);
+        assert_eq!(states(&dog, at(t0, 1001)), ["silent"]);
+        assert_eq!(rank_field(&dog, at(t0, 1001), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 1179), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 1181), "severity"), "critical");
+        // A reconnect of the same attempt, and a beat of the earlier attempt's process still alive,
+        // change nothing; the earlier attempt's rows sent late are kept and are not its progress.
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 1182)));
+        assert!(!dog.attempt_seen(&key(0), 1, at(t0, 1183)));
+        dog.batch(&key(0), 1, Some(120), Some(1), at(t0, 1184));
+        let status = &dog.statuses(at(t0, 1185), true)["run"];
+        assert_eq!(
+            (
+                &status["ranks"][0]["attempt"],
+                &status["ranks"][0]["attempt_without_steps"],
+                &status["ranks"][0]["last_step"]
+            ),
+            (&json!(2), &json!(true), &json!(120))
+        );
+        assert_eq!(status["ranks"][0]["severity"], "critical");
+        // Its first batch, below the old highest step: active, and judged by its batches from now.
+        dog.batch(&key(0), 2, Some(29), Some(1), at(t0, 1200));
+        let status = &dog.statuses(at(t0, 1201), true)["run"];
+        assert_eq!(status["ranks"][0]["state"], "active");
+        assert!(status["ranks"][0].get("attempt_without_steps").is_none());
+        // Its first gap is from its first beat (800 s), not from the earlier attempt's last batch.
+        assert_eq!(status["restart"][0]["gaps_seconds"], json!([5.0, 800.0]));
+    }
+
+    #[test]
+    fn a_new_attempt_without_steps_keeps_its_window_over_a_server_restart() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 5));
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 100)));
+        for second in (100..400).step_by(15) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, second));
+        }
+        let before = dog.statuses(at(t0, 400), true)["run"].clone();
+        assert_eq!(before["restart"][0]["attempt_without_steps"], true);
+        let now = Instant::now();
+        let fresh = restarted(&before, 60, now);
+        assert_eq!(rank_field(&fresh, now, "attempt_without_steps"), true);
+        // The same process reconnects: not a new attempt, and the start limit from the restart.
+        fresh.stream_opened(&key(0), now);
+        assert!(fresh.attempt_seen(&key(0), 2, at(now, 1)));
+        for second in (1..700).step_by(15) {
+            fresh.heartbeat(&key(0), "train", 15.0, Some(0), None, at(now, second));
+        }
+        assert_eq!(states(&fresh, at(now, 590)), ["starting"]);
+        assert_eq!(states(&fresh, at(now, 610)), ["silent"]);
+        // A status written before the field was kept restores as an attempt that has stored steps.
+        let mut older = before.clone();
+        older["restart"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("attempt_without_steps");
+        let fresh = restarted(&older, 60, now);
+        assert_eq!(rank_field(&fresh, now, "attempt_without_steps"), Value::Null);
+    }
+
+    #[test]
+    fn a_new_attempt_that_hangs_before_its_first_step_is_critical_2700_s_after_its_first_beat_by_default() {
+        let defaults = WatchdogConfig::default();
+        let t0 = Instant::now();
+        let dog = Watchdog::new(defaults);
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 5));
+        dog.stream_ended(&key(0), false, at(t0, 6));
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 4000)));
+        dog.stream_opened(&key(0), at(t0, 4001));
+        for second in (4000..7000).step_by(15) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, second));
+        }
+        assert_eq!(states(&dog, at(t0, 4000 + 1799)), ["starting"]);
+        assert_eq!(rank_field(&dog, at(t0, 4000 + 1801), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 4000 + 2699), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 4000 + 2701), "severity"), "critical");
     }
 
     #[test]

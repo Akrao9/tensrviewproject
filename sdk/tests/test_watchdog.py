@@ -681,3 +681,10 @@ def test_a_lost_rank_labels_the_stall_when_it_explains_it():
     assert "look the same to the server" not in text and "waiting for it" not in text
     hang = _text(detect_watchdog_incidents(_status("stalled", [_rank(0, "silent", 40, severity="critical")])))
     assert "can look the same from here" in hang and "lost connection" not in hang
+
+
+def test_a_rank_started_again_that_stored_no_step_says_so():
+    rank = {**_rank(0, "silent", 99, 2000.0, beat=3.0, severity="critical"), "attempt_without_steps": True}
+    text = _text(detect_watchdog_incidents(_status("stalled", [rank])))
+    assert "Rank 0 was started again (a new attempt) and stored no step of it yet; the step shown is the earlier attempt's." in text
+    assert "started again" not in _text(detect_watchdog_incidents(_status("stalled", [_rank(0, "silent", 99, 2000.0, severity="critical")])))

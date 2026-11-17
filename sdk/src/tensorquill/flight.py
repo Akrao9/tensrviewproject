@@ -686,7 +686,12 @@ class Heartbeat:
     process's threads are (`thread_stacks`) and for how long the main thread has been at that
     same place, so a silent rank is reported with the call it is stuck in. A main thread that
     hangs while holding the interpreter lock stops this thread too: that rank reads as
-    `unresponsive` and has no stack."""
+    `unresponsive` and has no stack.
+
+    Each beat also carries the session's `attempt` (the one its records carry), from the moment
+    the session hands over its work counter, and that beat goes at once. So the server knows a
+    job that was started again before the new attempt stores any step, and gives it a start
+    window of its own (see `watchdog.rs`). It is read once, so a beat costs nothing more."""
 
     def __init__(
         self,
@@ -708,7 +713,8 @@ class Heartbeat:
         self._place: Any = None  # the main thread's frames at the last look, and since when
         self._place_since = 0.0
         self.phase = "train"
-        self.counter: Any = None  # a callable returning the work done so far (steps + ticks)
+        self._counter: Any = None  # a callable returning the work done so far (steps + ticks)
+        self.attempt: int | None = None  # the session's attempt, once it has handed over its counter
         self._location = _location(endpoint)
         self._run_id = run_id
         self._rank = rank
@@ -724,6 +730,29 @@ class Heartbeat:
         self.sent = 0
         self._thread = threading.Thread(target=self._run, name=f"tensorquill-heartbeat-rank{rank}", daemon=True)
         self._thread.start()
+
+    @property
+    def counter(self) -> Any:
+        return self._counter
+
+    @counter.setter
+    def counter(self, counter: Any) -> None:
+        """Set by the session (`capture.py`) as it starts, just after it takes its attempt: the
+        attempt is read here, and the next beat is sent now rather than after an interval."""
+        self._counter = counter
+        if counter is not None:
+            self.attempt = self._take_attempt()
+            self._changed.set()
+
+    @staticmethod
+    def _take_attempt() -> int | None:
+        """The attempt of the session starting now: the last one `capture` gave out in this
+        process, which the session that sets the counter took a moment before."""
+        try:
+            from .capture import _last_attempt
+        except Exception:  # noqa: BLE001  a beat without an attempt is a beat as before
+            return None
+        return _last_attempt or None
 
     def set_phase(self, phase: str) -> None:
         """Name what the process is doing (`train`, `eval`, `checkpoint`, or any short word);
@@ -756,6 +785,8 @@ class Heartbeat:
                     client = flight.FlightClient(self._location, **kwargs)
                 payload = {"run_id": self._run_id, "rank": self._rank, "phase": self.phase,
                            "interval_seconds": self.interval}
+                if self.attempt is not None:
+                    payload["attempt"] = self.attempt
                 if self.counter is not None:
                     payload["work"] = int(self.counter())
                     stack = self._stalled_stack(payload["work"])

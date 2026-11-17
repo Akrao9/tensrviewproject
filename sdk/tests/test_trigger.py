@@ -1421,6 +1421,10 @@ import os, time
 import torch, tensorquill
 from torch import nn
 
+if os.environ.get("TQ_OLD_SENDER"):  # a sender from before Nov 17, 2026: no attempt in its heartbeats
+    import tensorquill.flight as _flight
+    _flight.Heartbeat._take_attempt = staticmethod(lambda: None)
+
 model = nn.Linear(8, 1)
 session = tensorquill.init(model, run_id=os.environ["TQ_RUN_ID"], every=10, heartbeat_seconds=0.5, stack_seconds=1.0)
 session._sink.sender._batch_seconds, session._sink.sender._backoff_cap = 0.25, 0.5
@@ -1758,3 +1762,98 @@ def test_a_new_attempt_that_hangs_before_it_passes_the_old_step_fires_again(tmp_
     assert payload["id"] != calls()[0]["payload"]["id"]
     assert [c["payload"]["kind"] for c in every_call() if c["payload"]["kind"] not in STALL_KINDS] in ([], ["repeated_steps"])
     assert "Traceback" not in printed
+
+
+
+def _restarted_job(tmp_path, command, calls, *, old_sender=False):
+    """A job that stalls and fires, is killed, and is started again (a new attempt) that hangs
+    before it stores a step. Silent after 2 s, critical 6 s later; a new attempt starts for 4 s.
+    Returns what the status and the stall firings said, and when the new attempt started."""
+    job = _RealJob(tmp_path, "restarted-job", "--silent-seconds", "2", "--silent-factor", "0", "--critical-seconds", "6",
+                   "--start-seconds", "4", "--watchdog-seconds", "0.2", "--flush-seconds", "0.3")
+    output = tmp_path / "all.json"
+    old = {"TQ_OLD_SENDER": "1"} if old_sender else {}
+    stalls = lambda: [c for c in calls() if c["payload"]["kind"] in STALL_KINDS]  # noqa: E731
+    try:
+        first = job.rank(0, 1, TQ_STEPS="100", **old)
+        job.until(lambda: (job.status().get("ranks") or [{}])[0].get("last_step") == 99, "the first attempt's steps")
+        old_attempt = job.status()["ranks"][0]["attempt"]
+        log = job.watcher(output, "--rank", "all", "--on-incident", command())
+        job.until(stalls, "the first firing", 90.0)
+        first.kill()
+        first.wait(20)
+        started = time.time()
+        second = job.rank(0, 1, TQ_STEPS="0", **old)  # a new session that never steps
+        seen = []
+        deadline = started + (25.0 if old_sender else 60.0)
+        while time.time() < deadline and len(stalls()) < 2:
+            status = job.status()
+            seen.append((time.time() - started, (status.get("ranks") or [{}])[0], len(stalls())))
+            time.sleep(0.1)
+        time.sleep(1.0)
+        assert second.poll() is None  # never touched
+        return {"old_attempt": old_attempt, "seen": seen, "stalls": stalls(), "started": started,
+                "status": job.status(), "printed": log.read_text()}
+    finally:
+        job.close()
+
+
+def test_a_job_started_again_that_hangs_before_its_first_stored_step_fires_after_its_start_window(tmp_path, hook):
+    """The heartbeats carry the attempt (Nov 17, 2026): the server sees the new attempt before it
+    stores anything and gives it the start window of a new rank; the status shows the attempt,
+    so the trigger's episode re-arms, and the hang fires once it is critical (4 + 6 s), not before."""
+    command, calls = hook
+    found = _restarted_job(tmp_path, command, calls)
+    new = [(t, r) for t, r, _ in found["seen"] if r.get("attempt") not in (None, found["old_attempt"])]
+    assert new, "the new attempt never showed in the status"
+    first_seen, rank = new[0]
+    assert rank["attempt_without_steps"] is True and rank["last_step"] == 99
+    assert first_seen < 4.0, first_seen  # from its first beat, sent as the session starts
+    # Not called stopped inside its start window: starting (or reconnecting) until it has passed.
+    assert all(r["state"] in ("starting", "reconnecting", "active") for t, r in new if t < first_seen + 3.5), new
+    assert not [n for t, r, n in found["seen"] if n > 1 and t < first_seen + 9.0], "fired inside the window"
+    first, again = found["stalls"]
+    assert again["payload"]["incident"]["ranks"][0]["attempt"] == rank["attempt"]
+    assert again["payload"]["incident"]["severity"] == "critical" and again["payload"]["id"] != first["payload"]["id"]
+    assert "started again (a new attempt) and stored no step of it yet" in again["payload"]["summary"]
+    assert "Traceback" not in found["printed"]
+
+
+def test_a_sender_without_attempts_in_its_heartbeats_still_streams_and_is_watched_as_before(tmp_path, hook):
+    """An older sender against this server: its beats name no attempt. It streams and fires as
+    before, and a job of it started again that hangs before storing a step is not seen as a new
+    attempt (as before Nov 17, 2026): no second firing."""
+    command, calls = hook
+    found = _restarted_job(tmp_path, command, calls, old_sender=True)
+    assert len(found["stalls"]) == 1
+    assert all(r.get("attempt") == found["old_attempt"] for _, r, _ in found["seen"])
+    assert not any(r.get("attempt_without_steps") for _, r, _ in found["seen"])
+    assert "Traceback" not in found["printed"]
+
+
+def test_the_heartbeat_names_the_attempt_the_sessions_records_carry(tmp_path):
+    """The beat's attempt must be the rows' attempt, or the server would see a new attempt on every
+    beat. Read where the session sets it, so a change to how `capture.py` hands over its counter
+    shows here."""
+    pytest.importorskip("pyarrow.flight")
+    import torch
+    from torch import nn
+
+    from tensorquill.flight import Heartbeat
+
+    beat = Heartbeat.__new__(Heartbeat)  # no thread, no connection: only the counter's setter
+    import threading
+    beat._changed, beat._counter, beat.attempt = threading.Event(), None, None
+    model = nn.Linear(4, 1)
+    sink = type("Sink", (), {"heartbeat": beat, "write": lambda self, r: rows.append(r), "close": lambda self: None,
+                             "flush": lambda self: None})()
+    rows: list = []
+    session = tensorquill.init(model, run_id="beat", sink=sink, every=1)
+    assert beat.attempt == session.attempt and beat._changed.is_set()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    model(torch.randn(2, 4)).sum().backward()
+    session.log({})
+    optimizer.step()
+    session.close()
+    records = [r for batch in rows for r in (batch if isinstance(batch, list) else [batch])]
+    assert records and {r["attempt"] for r in records} == {beat.attempt}
