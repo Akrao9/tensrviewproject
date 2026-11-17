@@ -3972,6 +3972,10 @@ def build_evidence(
     The per-step `samples` come from that run too (`detect --samples`), so no MoE rule runs
     here. The weight trends, the router names and sizes and the kinds read from other files
     are still made here. The evidence then carries `"detectors": "rust"`.
+
+    When one of the five options is not the default, the evidence lists all five as `thresholds`
+    (the name a server's report gives them), and `thresholds_line` names those that differ. At
+    the defaults there is no such key, so that evidence is what it was before the key.
     """
     if detectors not in ("python", "rust"):
         raise ValueError(f"detectors must be 'python' or 'rust', not {detectors!r}")
