@@ -930,7 +930,7 @@ State as of Nov 16, 2026.
     2. nanochat's `runcpu.sh` run. It needs its own environment (PyTorch 2.9.1, `rustbpe`, `kernels`, `tiktoken`), data shards and a tokenizer run; their sizes were not read.
     3. Both on two GPUs, with the runs of result 1.
   - *Open.*
-    - A guard in `capture.py` for a router output whose integer tensor cannot be indices (item 1). Not built.
+    - A guard in `capture.py` for a router output whose integer tensor cannot be indices (item 1). *Built Nov 17, 2026:* by default the hook takes an integer tensor as indices only when its size is a whole multiple of the tokens the router was called on, read from the shapes alone, so nothing depends on the data and it holds under `torch.compile`. A router that fails this is not counted, and the session warns once at the next step, naming the router and the two ways out (`Router(..., indices=...)`, or the inner module whose output is the logits). `sdk/tests/test_router_guard.py` (4 tests, a stand-in for nanoMoE's router; two of them fail without the guard); the whole suite passes with it (1,224 and 81). Open: such a router still writes zero counts each step instead of no entry; a router given an `indices=` function is not checked; nanoMoE itself was not run.
     - PyTorch 2.9 is inside `torch>=2.6` but no CI job runs it.
     - nanochat's own data loader is not a `DataLoader`, so the data kinds would read `not_configured` without an adapter.
     - No timing is to be taken from either while other builds run on the same machine.

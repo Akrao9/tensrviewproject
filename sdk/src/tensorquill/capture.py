@@ -143,8 +143,21 @@ def _stats_hook(buf: torch.Tensor, stat_idx: torch.Tensor, row: int) -> Callable
     return hook
 
 
+def _tokens(args: Any) -> int | None:
+    """How many tokens a router was called on: every dimension of its first tensor argument
+    but the last. None when that cannot be read from the shapes alone."""
+    x = args[0] if isinstance(args, (tuple, list)) and args else args
+    if not isinstance(x, torch.Tensor) or x.ndim < 2:
+        return None
+    width = x.shape[-1]
+    if type(width) is not int or width <= 0:
+        return None
+    total = x.numel()
+    return total // width if type(total) is int else None
+
+
 def _router_hook(
-    counts: torch.Tensor, expert_ids: torch.Tensor, spec: Router
+    counts: torch.Tensor, expert_ids: torch.Tensor, spec: Router, problems: list[str] | None = None
 ) -> Callable[..., None]:
     def hook(module: nn.Module, args: Any, output: Any) -> None:
         if _recomputing():
@@ -153,6 +166,20 @@ def _router_hook(
             idx = spec.indices(output)
         else:
             idx = _first_tensor(output, integer=True)
+            if idx is not None:
+                # An integer tensor in the output is taken as the chosen expert indices, one or
+                # `top_k` for each token. One that cannot be that (a router that returns
+                # per-expert token counts first, as nanoMoE's does) would be counted as indices
+                # and give wrong loads with no error. The shapes alone show it, so nothing here
+                # depends on the data; the session warns once and this router is not counted.
+                tokens, chosen = _tokens(args), idx.numel()
+                if tokens and type(chosen) is int and (chosen < tokens or chosen % tokens):
+                    if problems is not None and not problems:
+                        problems.append(
+                            f"its output's first integer tensor has shape {tuple(idx.shape)}, which is not expert "
+                            f"indices for the {tokens} tokens it was called on"
+                        )
+                    return
             if idx is None:
                 logits = _first_tensor(output, integer=False)
                 if logits is not None and logits.ndim >= 1 and logits.shape[-1] == spec.n_experts:
@@ -400,6 +427,9 @@ class Session:
             name: spec if isinstance(spec, Router) else Router(int(spec))
             for name, spec in (routers or {}).items()
         }
+        # What a router's hook found wrong with its output, said once at the next step (`_commit`).
+        self._router_problems: dict[str, list[str]] = {name: [] for name in self._routers}
+        self._router_problems_said: set[str] = set()
         unknown = [name for name in self._routers if name not in modules]
         if unknown:
             raise ValueError(f"no such router modules: {unknown}")
@@ -458,7 +488,7 @@ class Session:
         ]
         self._handles += [
             modules[name].register_forward_hook(
-                _router_hook(self._counts[name], self._expert_ids[name], spec)
+                _router_hook(self._counts[name], self._expert_ids[name], spec, self._router_problems[name])
             )
             for name, spec in self._routers.items()
         ]
@@ -975,6 +1005,16 @@ class Session:
     @torch.no_grad()
     def _commit(self, step: int | None) -> None:
         current = self._next_step if step is None else step
+        for name, found in self._router_problems.items():
+            if found and name not in self._router_problems_said:
+                self._router_problems_said.add(name)
+                warnings.warn(
+                    f"TensorQuill is not counting the router {name!r}: {found[0]}. Its expert loads are not "
+                    f"recorded. Pass routers={{{name!r}: tensorquill.Router(n_experts, top_k, indices=...)}} with a "
+                    "function that returns the chosen expert indices from its output, or name the module inside "
+                    "it whose output is the router's logits.",
+                    RuntimeWarning, stacklevel=3,
+                )
         if (
             not self._spread_recorded
             and self._replica_group is not None
