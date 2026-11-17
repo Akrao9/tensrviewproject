@@ -63,7 +63,7 @@ class Server:
 
 def stored_records(store: Path, run_id: str, rank: int = 0) -> list[dict]:
     parts = sorted((store / "runs" / run_id / f"rank={rank}").glob("attempt=*/part-*.parquet"))
-    return [row_to_record(row) for part in parts for row in pq.read_table(part).to_pylist()]
+    return [row_to_record(row) for part in parts for row in pq.read_table(part, partitioning=None).to_pylist()]
 
 
 def train(model: torch.nn.Module, session, steps: int, pause: float = 0.0) -> None:

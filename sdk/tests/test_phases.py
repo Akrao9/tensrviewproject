@@ -50,6 +50,7 @@ def test_phase_does_nothing_without_a_server():
 
 def test_the_huggingface_callback_marks_evaluation_and_checkpoints():
     pytest.importorskip("transformers")
+    pytest.importorskip("accelerate")  # the huggingface extra needs both
     from types import SimpleNamespace
 
     from tensorquill.huggingface import TensorQuillCallback

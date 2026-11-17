@@ -209,7 +209,7 @@ class Cluster:
 
     def stored(self, rank: int) -> list[dict]:
         parts = sorted((self.run_dir / f"rank={rank}").glob("attempt=*/part-*.parquet"))
-        return [row_to_record(row) for part in parts for row in pq.read_table(part).to_pylist()]
+        return [row_to_record(row) for part in parts for row in pq.read_table(part, partitioning=None).to_pylist()]
 
     def close(self) -> None:
         for started in self.ranks:

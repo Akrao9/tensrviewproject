@@ -1266,7 +1266,10 @@ def _read_part(path: Path) -> list[dict[str, Any]]:
         raise ImportError('reading Parquet parts needs pyarrow: pip install pyarrow') from error
     from .flight import row_to_record
 
-    return [row_to_record(row) for row in pq.read_table(path).to_pylist()]
+    # `partitioning=None`: the part's own columns only. Left to itself, pyarrow before 22 also
+    # reads `rank=<n>` and `attempt=<n>` out of the store's folder names, as dictionary
+    # columns that clash with the file's own `rank` and `attempt` (seen with pyarrow 21.0.0).
+    return [row_to_record(row) for row in pq.read_table(path, partitioning=None).to_pylist()]
 
 
 def write_evidence(evidence: Mapping[str, Any], path: str | Path) -> Path:

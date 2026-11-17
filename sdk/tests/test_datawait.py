@@ -254,6 +254,7 @@ def test_hugging_face_trainer_records_the_wait(tmp_path, monkeypatch):
 
 def test_hugging_face_data_wait_can_be_turned_off(tmp_path):
     transformers = pytest.importorskip("transformers")
+    pytest.importorskip("accelerate")  # the huggingface extra needs both
     from tensorquill.huggingface import TensorQuillCallback
 
     class Model(nn.Module):
