@@ -567,6 +567,190 @@ def test_one_stall_fires_once_when_its_kind_or_step_changes(tmp_path, hook):
             ("rank_silent", "warning")]
 
 
+def _ranked(rank, state, last_step, attempt=None, severity="critical"):
+    entry = _rank(rank, state, severity if state in ("silent", "lost", "unresponsive") else None, last_step)
+    return {**entry, **({"attempt": attempt} if attempt is not None else {})}
+
+
+class _Looks:
+    """A trigger fed made statuses, one look each, and the stall firings it made."""
+
+    def __init__(self, tmp_path, command, calls, name="e", **options):
+        self.path, self.command, self.calls, self.options = tmp_path / f"{name}.evidence.json", command, calls, options
+        self.trigger = Trigger(command(), **options)
+
+    def look(self, summary, *ranks, restart=False):
+        if restart:  # the watcher started again: what it knows is the state file
+            self.trigger = Trigger(self.command(), **self.options)
+        found = detect_watchdog_incidents(_status(summary, *ranks))
+        state = state_path_for(self.path)
+        before = len(json.loads(state.read_text())["deliveries"]) if state.exists() else 0
+        self.trigger.look({"run_id": "r", "incidents": found}, self.path, rank=0)
+        self.trigger.close(wait=10)
+        return len(self.trigger.deliveries) - before
+
+    def fired(self):
+        assert _settle(self.trigger, lambda: all(d["command"]["status"] == "done" for d in self.trigger.deliveries))
+        return [(c["payload"]["kind"], c["payload"]["step"]) for c in self.calls()]
+
+
+def test_a_stall_episode_ends_when_the_run_steps_past_it_and_the_next_stall_fires(tmp_path, hook):
+    """Nov 17, 2026, the author's rule: one firing for one stall episode; progress re-arms it."""
+    command, calls = hook
+    run = _Looks(tmp_path, command, calls)
+    assert run.look("stalled", _ranked(0, "silent", 99, 7), _ranked(1, "silent", 97, 7)) == 1
+    for _ in range(3):  # the same stall, looked at again and by a restarted watcher
+        assert run.look("stalled", _ranked(0, "silent", 99, 7), _ranked(1, "silent", 97, 7)) == 0
+    assert run.look("stalled", _ranked(0, "silent", 99, 7), _ranked(1, "silent", 97, 7), restart=True) == 0
+    # A lagging rank's late rows raise its own step, not the run's: the same episode.
+    assert run.look("stalled", _ranked(0, "silent", 99, 7), _ranked(1, "silent", 98, 7)) == 0
+    # The run steps past the step it stalled at, and stalls again at critical: a new episode.
+    assert run.look("active", _ranked(0, "active", 150, 7), _ranked(1, "active", 150, 7)) == 0
+    assert run.look("stalled", _ranked(0, "silent", 200, 7), _ranked(1, "silent", 200, 7)) == 1
+    assert run.look("stalled", _ranked(0, "silent", 200, 7), _ranked(1, "silent", 200, 7), restart=True) == 0
+    assert run.fired() == [("job_stalled", 99), ("job_stalled", 200)]
+    ids = [d["id"] for d in run.trigger.deliveries]
+    assert ids == ["r/rank0/job_stalled/99", "r/rank0/job_stalled/200"]
+    # A stall at warning in between does not fire, and does not end the episode either.
+    assert run.look("stalled", _ranked(0, "silent", 200, 7, "warning"), _ranked(1, "silent", 200, 7, "warning")) == 0
+
+
+def test_a_new_attempt_re_arms_the_episode_and_a_missing_attempt_is_no_change(tmp_path, hook):
+    """A job started again hangs before it passes the step it stalled at: the status's `attempt`
+    has changed (the server keeps it from the first batch of the new attempt), so it fires again,
+    at the same step, under an id of its own."""
+    command, calls = hook
+    run = _Looks(tmp_path, command, calls)
+    assert run.look("stalled", _ranked(0, "lost", 99, 1700000000)) == 1
+    assert run.look("stalled", _ranked(0, "lost", 99)) == 0  # a status that does not say: no change
+    assert run.look("stalled", _ranked(0, "silent", 99, 1700000900)) == 1
+    assert run.fired() == [("job_stalled", 99), ("job_stalled", 99)]
+    assert [d["id"] for d in run.trigger.deliveries] == ["r/rank0/job_stalled/99", "r/rank0/job_stalled/99/2"]
+
+
+def test_a_staggered_restart_does_not_fire_the_old_stall_of_a_rank_not_yet_started_again(tmp_path, hook):
+    """A job of two ranks stalls and fires; it is started again, and rank 0's new attempt is seen a
+    look before rank 1's. Rank 1, still stopped exactly as it was, does not fire again: a new
+    attempt ends an episode only when no rank of it is still where it stopped. Once both are
+    started again, a hang of the new attempts fires."""
+    command, calls = hook
+    run = _Looks(tmp_path, command, calls)
+    assert run.look("stalled", _ranked(0, "silent", 99, 1), _ranked(1, "lost", 99, 1)) == 1
+    starting = {**_ranked(0, "starting", 99, 2)}
+    assert run.look("degraded", starting, _ranked(1, "lost", 99, 1)) == 0
+    assert run.look("degraded", starting, _ranked(1, "lost", 99, 1)) == 0
+    # Both started again, below the old step; then the new attempts hang.
+    assert run.look("active", _ranked(0, "active", 99, 2), _ranked(1, "active", 99, 2)) == 0
+    assert run.look("stalled", _ranked(0, "silent", 99, 2), _ranked(1, "silent", 99, 2)) == 1
+    assert run.fired() == [("job_stalled", 99), ("job_stalled", 99)]
+
+
+def test_a_silent_rank_beside_stepping_ranks_is_one_episode_and_a_rank_that_joins_it_too(tmp_path, hook):
+    """`rank_silent` is judged by the stopped rank's own step: the ranks that go on stepping do
+    not end it, however many looks. A rank that stops during the episode joins it."""
+    command, calls = hook
+    run = _Looks(tmp_path, command, calls)
+    for newest in range(90, 300, 10):
+        fired = run.look("degraded", _ranked(0, "active", newest), _ranked(1, "silent", 40), _ranked(2, "active", newest))
+        assert fired == (1 if newest == 90 else 0)
+    # Rank 2 falls silent too: it joins. Rank 1 then recovers while rank 2 is still critical:
+    # rank 1 stored a step beyond the one it stalled at, so the episode is over, and rank 2's
+    # stall fires, once.
+    assert run.look("degraded", _ranked(0, "active", 300), _ranked(1, "silent", 40), _ranked(2, "silent", 290)) == 0
+    assert run.look("degraded", _ranked(0, "active", 310), _ranked(1, "active", 310), _ranked(2, "silent", 290)) == 1
+    # The job then stops with rank 2 still at 290: that episode, no second firing.
+    assert run.look("stalled", _ranked(0, "silent", 320), _ranked(1, "silent", 320), _ranked(2, "silent", 290)) == 0
+    # Rank 2 steps past 290 and the job stalls again: a new episode.
+    assert run.look("stalled", _ranked(0, "silent", 400), _ranked(1, "silent", 400), _ranked(2, "silent", 400)) == 1
+    assert run.fired() == [("rank_silent", 40), ("rank_silent", 290), ("job_stalled", 400)]
+
+    # The case the author named: a silent rank that becomes a stalled job, with the silent rank
+    # where it stopped, is one episode, however far the others had stepped meanwhile.
+    other = _Looks(tmp_path, command, calls, name="other")
+    before = len(calls())
+    assert other.look("degraded", _ranked(0, "active", 90), _ranked(1, "silent", 40)) == 1
+    assert other.look("degraded", _ranked(0, "active", 500), _ranked(1, "silent", 40)) == 0
+    assert other.look("stalled", _ranked(0, "silent", 520), _ranked(1, "silent", 40)) == 0
+    assert _settle(other.trigger, lambda: len(calls()) == before + 1)
+
+
+def test_a_rank_that_recovered_ends_its_episode_and_another_ranks_later_stall_fires(tmp_path, hook):
+    """Rank 1 stalls and fires, recovers and steps on (it is no longer in the stall); later rank 2
+    stalls. Rank 1's progress, read from the stall's `other_ranks`, ended its episode: rank 2's
+    stall fires. A rank of the episode that is only `reconnecting` (a server restart) has not
+    stepped, and ends nothing. A stall that fired before any step was stored ends on the first."""
+    command, calls = hook
+    run = _Looks(tmp_path, command, calls)
+    assert run.look("degraded", _ranked(0, "active", 90), _ranked(1, "silent", 40), _ranked(2, "active", 90)) == 1
+    # Rank 2 stops while rank 1 is only reconnecting: it joins, nothing ends, nothing fires.
+    assert run.look("degraded", _ranked(0, "active", 120), _ranked(1, "reconnecting", 40), _ranked(2, "silent", 110)) == 0
+    # Rank 1 steps on: its episode is over, and rank 2's stall, critical, fires.
+    assert run.look("degraded", _ranked(0, "active", 150), _ranked(1, "active", 150), _ranked(2, "silent", 110)) == 1
+    assert run.look("degraded", _ranked(0, "active", 160), _ranked(1, "active", 160), _ranked(2, "silent", 110)) == 0
+    assert run.fired() == [("rank_silent", 40), ("rank_silent", 110)]
+    again = _Looks(tmp_path, command, calls, name="again")
+    before = len(calls())
+    assert again.look("degraded", _ranked(0, "active", 90), _ranked(1, "silent", 40), _ranked(2, "active", 90)) == 1
+    assert again.look("degraded", _ranked(0, "active", 150), _ranked(1, "active", 150), _ranked(2, "active", 150)) == 0
+    assert again.look("degraded", _ranked(0, "active", 300), _ranked(1, "active", 300), _ranked(2, "silent", 200)) == 1
+    assert _settle(again.trigger, lambda: len(calls()) == before + 2)
+    # Nothing stored when it fired (`last_step` null): the first stored step is progress.
+    empty = _Looks(tmp_path, command, calls, name="empty")
+    assert empty.look("stalled", _ranked(0, "silent", None)) == 1
+    assert empty.look("stalled", _ranked(0, "silent", None)) == 0
+    assert empty.look("stalled", _ranked(0, "silent", 9)) == 1
+
+
+def test_a_stall_whose_firing_is_removed_from_the_state_file_fires_again(tmp_path, hook, capsys):
+    """What the "given up" line tells the user to do: remove the incident from the state file."""
+    command, calls = hook
+    run = _Looks(tmp_path, command, calls)
+    assert run.look("stalled", _ranked(0, "silent", 99)) == 1
+    state = state_path_for(run.path)
+    document = json.loads(state.read_text())
+    assert document["episode"]["delivery"] == "r/rank0/job_stalled/99"
+    state.write_text(json.dumps({**document, "deliveries": []}))
+    assert run.look("stalled", _ranked(0, "silent", 99), restart=True) == 1
+    # An episode of a shape this version does not read: said, and a stall may fire; other kinds still fire.
+    broken = json.loads(state.read_text())
+    state.write_text(json.dumps({**broken, "deliveries": [], "episode": {"delivery": "x", "ranks": [1, 2]}}))
+    assert run.look("stalled", _ranked(0, "silent", 99), restart=True) == 1
+    assert "cannot be read; a stall may fire again" in capsys.readouterr().out
+
+
+def test_a_stall_named_at_warning_does_not_fire_again_at_critical_in_its_episode(tmp_path, hook):
+    command, calls = hook
+    run = _Looks(tmp_path, command, calls, kinds=["rank_silent", "job_stalled"])
+    assert run.look("degraded", _ranked(0, "active", 90), _ranked(1, "silent", 40, severity="warning")) == 1
+    assert run.look("degraded", _ranked(0, "active", 95), _ranked(1, "silent", 40)) == 0
+    assert run.look("stalled", _ranked(0, "silent", 95), _ranked(1, "silent", 40)) == 0
+    assert run.fired() == [("rank_silent", 40)]
+
+
+def test_state_files_of_both_earlier_keys_load_and_their_stall_is_the_open_episode(tmp_path, hook):
+    """A file keyed by rank, kind and step (before Nov 17, 2026) and one keyed by the run (Nov 17)
+    hold no episode: the first stall seen is taken as theirs, without firing; progress re-arms it.
+    Of two firings with tries left, only the episode's is sent."""
+    command, calls = hook
+    for name, ids in (("per-rank", ["r/rank0/rank_silent/40", "r/rank0/rank_silent/30"]),
+                      ("per-run", ["r/rank0/rank_silent/40"])):
+        run = _Looks(tmp_path, command, calls, name=name)
+        before = len(calls())
+        deliveries = [{"id": i, "kind": "rank_silent", "step": int(i.rsplit("/", 1)[1]), "ranks": [0],
+                       "first_seen_ms": 1, "command": {"status": "failed", "attempts": 1}} for i in ids]
+        state_path_for(run.path).write_text(json.dumps({"version": 1, "evidence": str(run.path), "deliveries": deliveries}))
+        run.trigger = Trigger(command(), retry_seconds=0.0)
+        assert run.look("stalled", _ranked(0, "silent", 99), _ranked(1, "silent", 30)) == 0
+        _settle(run.trigger, lambda: all(d["command"]["status"] in ("done", "gave_up") for d in run.trigger.deliveries[-1:]), 5)
+        # The retry left is made once, for the stall as it reads now, under the last firing's id;
+        # an earlier firing's is not.
+        sent = [c["payload"]["id"] for c in calls()[before:]]
+        assert sent == [ids[-1]], sent
+        assert run.look("stalled", _ranked(0, "silent", 99), _ranked(1, "silent", 30)) == 0
+        assert run.look("stalled", _ranked(0, "silent", 150), _ranked(1, "silent", 150)) == 1
+        assert json.loads(state_path_for(run.path).read_text())["episode"]["run_step"] == 150
+
+
 def test_a_state_file_of_the_earlier_key_still_loads_and_its_stall_does_not_fire_again(tmp_path, hook):
     """A `fired.json` written before Nov 17, 2026 holds a stall under (rank, kind, step); read
     now, it is the run's stall, and the stall it becomes fires nothing."""
@@ -1231,10 +1415,15 @@ def test_a_real_rank_that_stops_stepping_starts_the_command_once_when_the_server
 
 # One rank. It steps `TQ_STEPS` times, or until the file `TQ_STOP` exists, and then stops stepping
 # without closing: its process, its stream and its heartbeats go on, as those of a hung job do.
+# With `TQ_RESUME`, once that file exists it takes `TQ_MORE` more steps and stops again.
 _RANK_UNTIL = """
 import os, time
 import torch, tensorquill
 from torch import nn
+
+if os.environ.get("TQ_OLD_SENDER"):  # a sender from before Nov 17, 2026: no attempt in its heartbeats
+    import tensorquill.flight as _flight
+    _flight.Heartbeat._take_attempt = staticmethod(lambda: None)
 
 model = nn.Linear(8, 1)
 session = tensorquill.init(model, run_id=os.environ["TQ_RUN_ID"], every=10, heartbeat_seconds=0.5, stack_seconds=1.0)
@@ -1254,6 +1443,18 @@ while step % 10:
     session.log({"train/loss": torch.tensor(0.0)})
     step += 1
 print("stopped stepping", flush=True)
+resume = os.environ.get("TQ_RESUME")
+if resume:
+    while not os.path.exists(resume):
+        time.sleep(0.05)
+    for _ in range(int(os.environ["TQ_MORE"])):
+        optimizer.zero_grad()
+        loss = model(torch.randn(16, 8)).pow(2).mean()
+        loss.backward()
+        session.log({"train/loss": loss})
+        optimizer.step()
+        time.sleep(0.01)
+    print("stopped stepping again", flush=True)
 
 def stuck_here():
     while True:
@@ -1475,6 +1676,13 @@ def test_a_restart_gives_a_restored_rank_a_fresh_window_before_it_can_fire(tmp_p
         job.until(calls, "the command after the window", 60.0)
         time.sleep(1.5)
         assert rank.poll() is None  # the training process was never touched
+        # A server restart alone is not progress and not a new attempt: the episode stays open.
+        # Restarted again, past the window and the critical time, nothing more fires.
+        again = job.restart_server()
+        job.until(lambda: job.status().get("written_at_ms", 0) > again * 1000 and
+                  job.status()["ranks"][0]["severity"] == "critical", "critical again after the second restart", 60.0)
+        time.sleep(2.0)
+        assert len(calls()) == 1
         printed = log.read_text()
     finally:
         job.close()
@@ -1483,3 +1691,177 @@ def test_a_restart_gives_a_restored_rank_a_fresh_window_before_it_can_fire(tmp_p
     assert (call["payload"]["kind"], incident["severity"], incident["assessment"]) == ("job_stalled", "critical", "suspected_hang")
     assert incident["written_at_ms"] - restarted_ms >= 11_000  # critical 12 s after the restart
     assert "Traceback" not in printed
+
+
+
+def test_a_real_job_that_steps_past_its_stall_and_stalls_again_fires_again(tmp_path, hook):
+    """One firing for one stall episode, with a real server: the rank stalls (fires once over
+    many looks), steps past the step it stalled at, stalls again, and fires again."""
+    command, calls = hook
+    job = _RealJob(tmp_path, "stall-twice", *_QUICK_STALL)
+    output, resume = tmp_path / "one.json", tmp_path / "resume"
+    try:
+        job.rank(0, 1, TQ_STEPS="100", TQ_RESUME=str(resume), TQ_MORE="100")
+        job.until(lambda: (job.status().get("ranks") or [{}])[0].get("last_step") == 99, "the first 100 steps")
+        log = job.watcher(output, "--on-incident", command())
+        job.until(calls, "the first firing", 90.0)
+        seen = {job.status().get("written_at_ms")}
+        job.until(lambda: seen.add(job.status().get("written_at_ms")) or len(seen) >= 6, "more writes of the status")
+        assert len(calls()) == 1
+        resume.touch()
+        job.until(lambda: job.status()["ranks"][0]["last_step"] == 199, "100 more steps")
+        job.until(lambda: len(calls()) == 2, "the second firing", 90.0)
+        time.sleep(1.5)
+        printed = log.read_text()
+    finally:
+        job.close()
+    assert [(c["payload"]["kind"], c["payload"]["step"], c["payload"]["incident"]["severity"]) for c in calls()] == [
+        ("job_stalled", 99, "critical"), ("job_stalled", 199, "critical")]
+    state = json.loads(state_path_for(output).read_text())
+    assert [d["step"] for d in state["deliveries"]] == [99, 199] and state["episode"]["run_step"] == 199
+    assert "Traceback" not in printed
+
+
+def test_a_new_attempt_that_hangs_before_it_passes_the_old_step_fires_again(tmp_path, hook):
+    """The job is killed and started again (a new attempt), resumes below the step it stalled
+    at and hangs there. The status's `attempt` changes with the new attempt's first stored batch:
+    nothing fires before that (the rank reads stalled from the old attempt's last batch while its
+    new process has stored nothing), and the new stall fires once."""
+    command, every_call = hook
+    # The new attempt numbers its steps from 0 again, which `repeated_steps` (an invariant) reports
+    # on its own: only the stalls are counted here.
+    calls = lambda: [c for c in every_call() if c["payload"]["kind"] in STALL_KINDS]  # noqa: E731
+    job = _RealJob(tmp_path, "attempts", *_QUICK_STALL)
+    output = tmp_path / "all.json"
+    try:
+        first = job.rank(0, 1, TQ_STEPS="100")
+        job.until(lambda: (job.status().get("ranks") or [{}])[0].get("last_step") == 99, "the first attempt's steps")
+        old_attempt = job.status()["ranks"][0]["attempt"]
+        log = job.watcher(output, "--rank", "all", "--on-incident", command())
+        job.until(calls, "the first firing", 90.0)
+        first.kill()
+        first.wait(20)
+        time.sleep(1.0)
+        job.rank(0, 1, TQ_STEPS="30")  # a new session: a new attempt, which stops at step 29
+        new_attempt = job.until(lambda: (lambda a: a if a != old_attempt else None)(job.status()["ranks"][0]["attempt"]),
+                                "the new attempt's first stored batch")
+        assert len(calls()) == 1, "fired before the new attempt stored a step"
+        job.until(lambda: len(calls()) == 2, "the new attempt's stall", 90.0)
+        seen = {job.status().get("written_at_ms")}
+        job.until(lambda: seen.add(job.status().get("written_at_ms")) or len(seen) >= 5, "more writes of the status")
+        time.sleep(1.0)
+        status, printed = job.status(), log.read_text()
+    finally:
+        job.close()
+    assert len(calls()) == 2
+    (rank,) = status["ranks"]
+    assert rank["attempt"] == new_attempt and rank["last_step"] == 99  # the highest stored step, of the old attempt
+    payload = calls()[1]["payload"]
+    assert (payload["kind"], payload["incident"]["severity"]) == ("job_stalled", "critical")
+    assert payload["incident"]["ranks"][0]["attempt"] == new_attempt
+    assert payload["id"] != calls()[0]["payload"]["id"]
+    assert [c["payload"]["kind"] for c in every_call() if c["payload"]["kind"] not in STALL_KINDS] in ([], ["repeated_steps"])
+    assert "Traceback" not in printed
+
+
+
+def _restarted_job(tmp_path, command, calls, *, old_sender=False, view="all"):
+    """A job that stalls and fires, is killed, and is started again (a new attempt) that hangs
+    before it stores a step. Silent after 2 s, critical 6 s later; a new attempt starts for 4 s.
+    Returns what the status and the stall firings said, and when the new attempt started."""
+    job = _RealJob(tmp_path, "restarted-job", "--silent-seconds", "2", "--silent-factor", "0", "--critical-seconds", "6",
+                   "--start-seconds", "4", "--watchdog-seconds", "0.2", "--flush-seconds", "0.3")
+    output = tmp_path / "all.json"
+    old = {"TQ_OLD_SENDER": "1"} if old_sender else {}
+    stalls = lambda: [c for c in calls() if c["payload"]["kind"] in STALL_KINDS]  # noqa: E731
+    try:
+        first = job.rank(0, 1, TQ_STEPS="100", **old)
+        job.until(lambda: (job.status().get("ranks") or [{}])[0].get("last_step") == 99, "the first attempt's steps")
+        old_attempt = job.status()["ranks"][0]["attempt"]
+        log = job.watcher(output, *(("--rank", "all") if view == "all" else ()), "--on-incident", command())
+        job.until(stalls, "the first firing", 90.0)
+        first.kill()
+        first.wait(20)
+        started = time.time()
+        second = job.rank(0, 1, TQ_STEPS="0", **old)  # a new session that never steps
+        seen = []
+        deadline = started + (25.0 if old_sender else 60.0)
+        while time.time() < deadline and len(stalls()) < 2:
+            status = job.status()
+            seen.append((time.time() - started, (status.get("ranks") or [{}])[0], len(stalls())))
+            time.sleep(0.1)
+        time.sleep(1.0)
+        assert second.poll() is None  # never touched
+        return {"old_attempt": old_attempt, "seen": seen, "stalls": stalls(), "started": started,
+                "status": job.status(), "printed": log.read_text()}
+    finally:
+        job.close()
+
+
+@pytest.mark.parametrize("view", ["all", "one"])
+def test_a_job_started_again_that_hangs_before_its_first_stored_step_fires_after_its_start_window(tmp_path, hook, view):
+    """The heartbeats carry the attempt (Nov 17, 2026): the server sees the new attempt before it
+    stores anything and gives it the start window of a new rank; the status shows the attempt,
+    so the trigger's episode re-arms, and the hang fires once it is critical (4 + 6 s), not before.
+    The new process's stream opens only after the beat that names the attempt, so the rank never
+    reads as an open stream of the old attempt. With `--rank all` and with one rank's watcher."""
+    command, calls = hook
+    found = _restarted_job(tmp_path, command, calls, view=view)
+    # From the server's first status that shows the killed process's stream dropped on.
+    dropped = next(n for n, (_, r, _) in enumerate(found["seen"]) if r.get("stream") == "dropped")
+    gap = [(t, r) for t, r, _ in found["seen"][dropped:]
+           if r.get("stream") == "open" and r.get("attempt") == found["old_attempt"]]
+    assert not gap, gap[:3]
+    new = [(t, r) for t, r, _ in found["seen"] if r.get("attempt") not in (None, found["old_attempt"])]
+    assert new, "the new attempt never showed in the status"
+    first_seen, rank = new[0]
+    assert rank["attempt_without_steps"] is True and rank["last_step"] == 99
+    assert first_seen < 4.0, first_seen  # from its first beat, sent as the session starts
+    # Not called stopped inside its start window: starting (or reconnecting) until it has passed.
+    assert all(r["state"] in ("starting", "reconnecting", "active") for t, r in new if t < first_seen + 3.5), new
+    assert not [n for t, r, n in found["seen"] if n > 1 and t < first_seen + 9.0], "fired inside the window"
+    first, again = found["stalls"]
+    assert again["payload"]["incident"]["ranks"][0]["attempt"] == rank["attempt"]
+    assert again["payload"]["incident"]["severity"] == "critical" and again["payload"]["id"] != first["payload"]["id"]
+    assert "started again (a new attempt) and stored no step of it yet" in again["payload"]["summary"]
+    assert "Traceback" not in found["printed"]
+
+
+def test_a_sender_without_attempts_in_its_heartbeats_still_streams_and_is_watched_as_before(tmp_path, hook):
+    """An older sender against this server: its beats name no attempt. It streams and fires as
+    before, and a job of it started again that hangs before storing a step is not seen as a new
+    attempt (as before Nov 17, 2026): no second firing."""
+    command, calls = hook
+    found = _restarted_job(tmp_path, command, calls, old_sender=True)
+    assert len(found["stalls"]) == 1
+    assert all(r.get("attempt") == found["old_attempt"] for _, r, _ in found["seen"])
+    assert not any(r.get("attempt_without_steps") for _, r, _ in found["seen"])
+    assert "Traceback" not in found["printed"]
+
+
+def test_the_heartbeat_names_the_attempt_the_sessions_records_carry(tmp_path):
+    """The beat's attempt must be the rows' attempt, or the server would see a new attempt on every
+    beat. Read where the session sets it, so a change to how `capture.py` hands over its counter
+    shows here."""
+    pytest.importorskip("pyarrow.flight")
+    import torch
+    from torch import nn
+
+    from tensorquill.flight import Heartbeat
+
+    beat = Heartbeat.__new__(Heartbeat)  # no thread, no connection: only the counter's setter
+    import threading
+    beat._changed, beat._counter, beat.attempt = threading.Event(), None, None
+    model = nn.Linear(4, 1)
+    sink = type("Sink", (), {"heartbeat": beat, "write": lambda self, r: rows.append(r), "close": lambda self: None,
+                             "flush": lambda self: None})()
+    rows: list = []
+    session = tensorquill.init(model, run_id="beat", sink=sink, every=1)
+    assert beat.attempt == session.attempt and beat._changed.is_set()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    model(torch.randn(2, 4)).sum().backward()
+    session.log({})
+    optimizer.step()
+    session.close()
+    records = [r for batch in rows for r in (batch if isinstance(batch, list) else [batch])]
+    assert records and {r["attempt"] for r in records} == {beat.attempt}

@@ -672,6 +672,8 @@ def test_a_lost_rank_labels_the_stall_when_it_explains_it():
     assert _rule("degraded", (0, "active", 90), (1, "lost", 40), (2, "silent", 60)) == (
         "rank_silent", "suspected_hang", [1])
     assert _rule("stalled", (0, "silent", 40)) == ("job_stalled", "suspected_hang", None)
+    [silent] = detect_watchdog_incidents(_status("degraded", [_rank(0, "active", 90), _rank(2, "silent", 60, severity="critical")]))
+    assert silent["other_ranks"] == [{"rank": 0, "state": "active", "last_step": 90, "attempt": 1}]
     # The summary says it is not a hang, and names the lost rank; a suspected hang keeps its sentence.
     text = _text(detect_watchdog_incidents(_status("degraded", [_rank(0, "active", 90), _rank(1, "lost", 40, stream="dropped", severity="critical")])))
     assert "The connection of rank 1 dropped and did not come back: read as a lost connection, not a hang." in text
@@ -679,3 +681,10 @@ def test_a_lost_rank_labels_the_stall_when_it_explains_it():
     assert "look the same to the server" not in text and "waiting for it" not in text
     hang = _text(detect_watchdog_incidents(_status("stalled", [_rank(0, "silent", 40, severity="critical")])))
     assert "can look the same from here" in hang and "lost connection" not in hang
+
+
+def test_a_rank_started_again_that_stored_no_step_says_so():
+    rank = {**_rank(0, "silent", 99, 2000.0, beat=3.0, severity="critical"), "attempt_without_steps": True}
+    text = _text(detect_watchdog_incidents(_status("stalled", [rank])))
+    assert "Rank 0 was started again (a new attempt) and stored no step of it yet; the step shown is the earlier attempt's." in text
+    assert "started again" not in _text(detect_watchdog_incidents(_status("stalled", [_rank(0, "silent", 99, 2000.0, severity="critical")])))

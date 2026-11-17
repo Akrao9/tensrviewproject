@@ -568,6 +568,8 @@ def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str
     failure) and that explains the stall: every stopped rank is lost, or the whole job has
     stopped (`job_stalled`) and at least one rank is lost, since ranks of a job that stops
     together wait for the one that is gone (a collective cannot finish without it).
+    `rank_silent` also lists `other_ranks`: the ranks that are not stopped, each with its state,
+    last step and attempt, so a reader can tell that a rank which stopped has stepped on since.
     `suspected_hang` when a stopped rank is still connected and no lost rank explains it,
     a lost rank beside a silent one while other ranks step among them. `lost_ranks` names the
     lost ranks whenever there are any. `ranks_never_connected` when no rank stopped. The server
@@ -622,10 +624,15 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
         }]
     affected = [r for r in stopped]
     behind = [r["last_step"] for r in affected if r.get("last_step") is not None]
+    # The ranks that are not stopped, briefly: what a reader needs to tell that a rank which was
+    # silent has stepped on since (the trigger's stall episodes).
+    others = [{"rank": r.get("rank"), "state": r.get("state"), "last_step": r.get("last_step"), "attempt": r.get("attempt")}
+              for r in ranks if r.get("state") not in ("silent", "lost", "unresponsive")]
     return [{
         "kind": "rank_silent",
         "step": min(behind) if behind else max(steps, default=0),
         "ranks": affected,
+        "other_ranks": others,
         "missing_ranks": list(status.get("missing_ranks", ())),
         "newest_step": max(steps, default=0),
         **common,
@@ -4368,6 +4375,13 @@ def _describe_stream(incident: Mapping[str, Any]) -> str:
     if corroboration == "collective_hang":
         tail = " PyTorch's Flight Recorder shows a stuck collective." + tail
     tail = _describe_stuck(incident) + tail
+    started_again = [r.get("rank") for r in incident.get("ranks", ()) if r.get("attempt_without_steps")]
+    if started_again:
+        # The server saw a new attempt in the heartbeats (the job was started again) that has stored
+        # no step yet: the step and the quiet time shown are the earlier attempt's.
+        tail = (f" Rank{'s' if len(started_again) != 1 else ''} {', '.join(str(r) for r in started_again[:8])}"
+                f" {'were' if len(started_again) != 1 else 'was'} started again (a new attempt) and"
+                " stored no step of it yet; the step shown is the earlier attempt's." + tail)
     if incident["kind"] == "job_stalled":
         ranks = incident["ranks"]
         quiet = max((r.get("seconds_since_progress") or 0 for r in ranks), default=0)

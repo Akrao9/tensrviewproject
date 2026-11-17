@@ -128,6 +128,10 @@ struct Heartbeat {
     /// Where the process's threads are, sent once its work has stood still for a while.
     #[serde(default)]
     stack: Option<serde_json::Value>,
+    /// The session's attempt, as its rows carry it (senders from Nov 17, 2026 on): a higher one
+    /// than the rank's is the job started again, seen before it stores a step.
+    #[serde(default)]
+    attempt: Option<i64>,
 }
 
 fn default_phase() -> String {
@@ -641,6 +645,13 @@ impl Ingest {
         }
     }
 
+    /// The attempt a heartbeat names (see `Watchdog::attempt_seen`): false for a process of an
+    /// earlier attempt still beating, whose beat is then not taken.
+    pub fn attempt_seen(&self, run_id: &str, rank: i32, attempt: i64) -> bool {
+        self.watchdog
+            .attempt_seen(&(run_id.to_string(), rank), attempt, Instant::now())
+    }
+
     /// A heartbeat from a rank's own process.
     pub fn heartbeat(
         &self,
@@ -973,9 +984,9 @@ impl FlightService for IngestService {
     async fn do_get(&self, _: Request<Ticket>) -> Reply<Self::DoGetStream> {
         unimplemented()
     }
-    /// `heartbeat`: `{"run_id", "rank", "phase", "interval_seconds", "work", "stack"}`, sent by
-    /// the training process's own thread every few seconds, whether or not it is stepping.
-    /// `work` and `stack` are optional.
+    /// `heartbeat`: `{"run_id", "rank", "phase", "interval_seconds", "work", "stack", "attempt"}`,
+    /// sent by the training process's own thread every few seconds, whether or not it is
+    /// stepping. `work`, `stack` and `attempt` are optional (an older sender sends no `attempt`).
     async fn do_action(&self, request: Request<Action>) -> Reply<Self::DoActionStream> {
         let action = request.into_inner();
         if action.r#type != "heartbeat" {
@@ -993,14 +1004,19 @@ impl FlightService for IngestService {
         // A stack is what the sender says it is, so it is kept only as a JSON object of a
         // bounded size: it goes into the status file as it came.
         let stack = kept_stack(beat.stack, action.body.len());
-        self.ingest.heartbeat(
-            &beat.run_id,
-            beat.rank,
-            &phase,
-            beat.interval_seconds.unwrap_or(0.0),
-            beat.work,
-            stack,
-        );
+        let taken = beat
+            .attempt
+            .is_none_or(|attempt| self.ingest.attempt_seen(&beat.run_id, beat.rank, attempt));
+        if taken {
+            self.ingest.heartbeat(
+                &beat.run_id,
+                beat.rank,
+                &phase,
+                beat.interval_seconds.unwrap_or(0.0),
+                beat.work,
+                stack,
+            );
+        }
         let reply = arrow_flight::Result { body: "{}".into() };
         Ok(Response::new(futures::stream::once(async move { Ok(reply) }).boxed()))
     }
