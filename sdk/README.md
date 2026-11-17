@@ -575,7 +575,7 @@ python -m tensorquill run.jsonl --watch --compact --compact-window 20
 
   The 1 MB line holds up to a window of 28 steps.
 
-  These were measured before the evidence said what was checked. `kind_checks` adds 3.0 KB to every file: measured again as compact JSON, the same run gives 197,570 bytes at a window of 5, 24,541 at 0 and 6,495 with no samples, and the 1 MB line still holds up to 28 steps.
+  These were measured before the evidence said what was checked. `kind_checks` adds 3.0 KB to every file: measured again as compact JSON, the same run gives 197,570 bytes at a window of 5, 24,541 at 0 and 6,495 with no samples, and the 1 MB line still holds up to 28 steps. With `enough_history` and `records_needed` (added Nov 16, 2026) the key is 4.2 KB as compact JSON, 1.2 KB more (4,239 bytes against 3,023 on a router-only run); the three sizes were not measured again.
 
 **The trigger.** With `--watch`, `--on-incident COMMAND` starts a command and `--webhook URL` posts JSON, once for each new incident. Nothing is started or sent without one of the two.
 

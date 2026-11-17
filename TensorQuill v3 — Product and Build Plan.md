@@ -813,6 +813,7 @@ State as of Nov 16, 2026.
     - `enough_history` holds a count against a fixed number. It does not follow each parameter's, module's or router's own history, or a rule that started over at a new attempt.
     - The slowest rule against the fastest is the author's to confirm (see above). Going back changes six numbers.
     - The Gate 1 fixtures are 4 to 31 records long, so their summaries now carry the clause, and four of them show `moe_imbalance` as reported by a faster rule. If the preregistration fixes what each arm is shown, that is a change to note there.
+    - `kind_checks` is 4.2 KB as compact JSON in every evidence file and report, where it was 3.0 KB (4,239 bytes against 3,023 on a router-only run). The compact-evidence sizes in `sdk/README.md` were not measured again.
     - The all-ranks view still does not carry `kind_checks` (A6). The title of "Four open choices settled" and the build table still say item 2 is not built; this entry changes no other.
   - *Not run:* Linux; a GPU or a real job; the Gate 1 harness with an agent; the 64-rank detector benchmark; a server older than the field against this reader, beyond a report with the field taken out in a test.
 - [x] **Four open choices settled (decided by the author Nov 16, 2026; items 1, 2 and 4 not built, item 3 not re-timed).** The side sessions had left four choices open. Each claim about the code below was read the same day; nothing was run.
