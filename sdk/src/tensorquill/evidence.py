@@ -1726,7 +1726,9 @@ def kinds_by_value(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     - `checked`: the kinds whose rule ran with enough history. "Nothing found" is a verdict
       for these only.
     - `not_enough_history`: the kinds that are checked and still warming up, each with its
-      `records` and `records_needed`. Their rule could not have fired yet.
+      `records` and `records_needed`. Their slowest rule could not have fired yet. One that
+      is among the incidents all the same, found by a rule of the kind that needs fewer
+      records, has `"reported": true`: the incident stands.
     - `not_configured`, and `unavailable` with each kind's reason.
     - `history_not_stated`, only when there are any: checked kinds of a file written before
       `enough_history`. They are not listed as checked, because the file does not say.
@@ -1737,10 +1739,12 @@ def kinds_by_value(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     listed = [(kind, check) for kind, check in checks.items() if isinstance(check, Mapping)]
     history = {kind: kind_history(check) for kind, check in listed}
     not_stated = [kind for kind, _ in listed if history[kind] == "not_stated"]
+    reported = _reported_kinds(evidence)
     return {
         "checked": [kind for kind, _ in listed if history[kind] == "enough"],
         "not_enough_history": {
-            kind: {key: check[key] for key in ("records", "records_needed") if key in check}
+            kind: {**{key: check[key] for key in ("records", "records_needed") if key in check},
+                   **({"reported": True} if kind in reported else {})}
             for kind, check in listed if history[kind] == "not_enough"
         },
         "not_configured": [kind for kind, check in listed if check.get("value") == "not_configured"],
@@ -1749,23 +1753,31 @@ def kinds_by_value(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _reported_kinds(evidence: Mapping[str, Any]) -> set[Any]:
+    incidents = evidence.get("incidents")
+    return {i.get("kind") for i in incidents if isinstance(i, Mapping)} if isinstance(incidents, (list, tuple)) else set()
+
+
 def checked_line(evidence: Mapping[str, Any]) -> str | None:
     """`9 of 32 kinds checked, 2 of them without enough history yet (grad_spike 5 of 13
     records, ...), 21 not configured, 2 unavailable (...)`, for the summary; None for
     evidence that does not say what was checked. The part about history is there only when a
-    checked kind is still warming up, or when the file does not say."""
+    checked kind is still warming up, or when the file does not say. A warming-up kind that
+    is among the incidents is marked "but reported by a faster rule", so the line is not read
+    against the incident."""
     counts = checked_counts(evidence)
     if counts is None:
         return None
     line = f"{counts['checked']} of {counts['kinds']} kinds checked"
     if counts["not_enough_history"]:
-        checks = evidence["kind_checks"]
+        checks, reported = evidence["kind_checks"], _reported_kinds(evidence)
         each = []
-        for kind in counts["not_enough_history_kinds"]:
+        for at, kind in enumerate(counts["not_enough_history_kinds"]):
             seen, needed = checks[kind].get("records"), checks[kind].get("records_needed")
-            each.append(f"{kind} {seen} of {needed}" if seen is not None and needed is not None else kind)
-        if " of " in each[0]:
-            each[0] += " records"
+            said = f"{kind} {seen} of {needed}" if seen is not None and needed is not None else kind
+            if at == 0 and " of " in said:
+                said += " records"
+            each.append(said + (" but reported by a faster rule" if kind in reported else ""))
         line += f", {counts['not_enough_history']} of them without enough history yet ({', '.join(each)})"
     if counts["history_not_stated"]:
         line += f", {counts['history_not_stated']} of them with no word on their history (an older version wrote this)"

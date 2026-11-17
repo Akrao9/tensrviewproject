@@ -630,10 +630,19 @@ def test_a_kind_can_report_through_a_faster_rule_before_it_has_enough_history():
     check = evidence["kind_checks"]["loss_scale_trouble"]
     assert (check["records"], check["records_needed"], check["enough_history"]) == (1, 10, False)
     assert evidence["run_state"]["state"] == "unhealthy"
+    # The incident stands, and the line and the listing say so beside the count.
+    assert ev.checked_line(evidence) == (
+        "2 of 32 kinds checked, 1 of them without enough history yet"
+        " (loss_scale_trouble 1 of 10 records but reported by a faster rule), 30 not configured"
+    )
+    assert ev.kinds_by_value(evidence)["not_enough_history"] == {
+        "loss_scale_trouble": {"records": 1, "records_needed": 10, "reported": True},
+    }
     # The total's gradient spike needs eleven records, the kind thirteen.
     spiked = tensorquill.build_evidence(_each([{"grad_norm": 1.0}] * 10 + [{"grad_norm": 80.0}]))
     assert [i["kind"] for i in spiked["incidents"]] == ["grad_spike"] and "trigger" not in spiked["incidents"][0]
     assert spiked["kind_checks"]["grad_spike"]["enough_history"] is False
+    assert "(grad_spike 11 of 13 records but reported by a faster rule)" in ev.checked_line(spiked)
 
 
 def test_starved_experts_needs_the_window_the_run_was_judged_with():
