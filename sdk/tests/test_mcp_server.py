@@ -824,6 +824,18 @@ def test_list_runs_gives_the_runs_beside_this_one_by_project(start, kept):
     assert "takes no argument named 'path'" in client.error("list_runs", path=str(kept))
 
 
+def test_list_runs_does_not_count_a_file_of_several_ranks_as_one(start, tmp_path):
+    folder = tmp_path / "tensorquill-out"
+    labelled(folder, "run-1", dense(60, run="run-1"), project="granite", name="baseline")
+    both = [r for pair in zip(dense(60, run="both"), dense(60, run="both", rank=1)) for r in pair]
+    write_capture(folder / "both.jsonl", both)  # a file with a name of its own, holding ranks 0 and 1
+    client = start(folder / "run-1.rank0.jsonl")
+    rows = {row["run_id"]: row for row in client.call("list_runs")["runs"]}
+    assert (rows["both"]["ranks"], rows["both"]["rank_count"]) == ([0, 1], None)
+    assert "both.jsonl has a name of its own" in rows["both"]["rank_count_not_known"]
+    assert rows["run-1"]["rank_count"] == 1 and "rank_count_not_known" not in rows["run-1"]
+
+
 def test_compare_runs_takes_ids_and_names_and_says_what_was_checked_before_the_incidents(start, kept):
     client = start(kept / "run-2.rank0.evidence.json")
     result = client.call("compare_runs", runs=["run-1", "after-the-fix"])
