@@ -83,6 +83,37 @@ def test_checkpointed_hooks_under_compile_record_what_eager_records(backend, use
                 assert got["layers"][name] == pytest.approx(stats, rel=1e-5, abs=1e-7)
 
 
+def _step_before_backward_records(backend, use_reentrant):
+    torch.manual_seed(0)
+    model = _Routed(use_reentrant)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(
+        model, sink=sink, capture="full", layers=["router"], routers={"router": tensorquill.Router(4, top_k=2)}
+    )
+    runner = model if backend is None else torch.compile(model, backend=backend)
+    for _ in range(2):
+        loss = runner(torch.randn(16, 8, requires_grad=use_reentrant)).sum()
+        opt.step()  # ends a step, which zeroes the buffers the forward's checkpointed block took as inputs
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+    session.close()
+    return [{key: r.get(key) for key in ("step", "moe", "layers")} for r in sink.records]
+
+
+@pytest.mark.parametrize("use_reentrant", [True, False])
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_a_step_between_a_checkpointed_forward_and_its_backward_under_compile(backend, use_reentrant):
+    compiled = _step_before_backward_records(backend, use_reentrant)
+    eager = _step_before_backward_records(None, use_reentrant)
+    assert [r["moe"] for r in compiled] == [r["moe"] for r in eager]
+    for got, want in zip(compiled, eager):
+        assert (got["layers"] is None) == (want["layers"] is None)
+        for name, stats in (want["layers"] or {}).items():
+            assert got["layers"][name] == pytest.approx(stats, rel=1e-5, abs=1e-7)
+
+
 def _two_part():
     model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 1))
     return model, [torch.optim.SGD(model[0].parameters(), lr=0.1), torch.optim.AdamW(model[1].parameters())]

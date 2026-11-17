@@ -301,9 +301,11 @@ def _router_hook(
 # at trace time; a replayed write would count the same tokens twice.
 #
 # So on a real buffer the write keeps the buffer's version (nothing differentiable reads it) and
-# is skipped while the autograd engine runs, as `_recomputing()` does in eager mode. Under
-# AOTAutograd (aot_eager, Inductor) the body is traced on fake tensors instead and adds exactly
-# the operations the hook added before, so those graphs are unchanged.
+# is skipped while the autograd engine runs, as `_recomputing()` does in eager mode. `_commit`
+# keeps the versions too when it zeroes the buffers, for an optimizer step taken between a
+# forward and its backward. Under AOTAutograd (aot_eager, Inductor) the body is traced on fake
+# tensors instead and adds exactly the operations the hook added before, so those graphs are
+# unchanged.
 
 
 def _real(buf: torch.Tensor) -> bool:
@@ -311,13 +313,27 @@ def _real(buf: torch.Tensor) -> bool:
     return type(buf) is torch.Tensor
 
 
+def _restore_versions(tensors: Sequence[torch.Tensor], versions: Sequence[int]) -> None:
+    """Set each tensor's autograd version back, what `torch.autograd._unsafe_preserve_version_counter`
+    does on exit. Private API, so best effort: without it the version stays bumped, as before."""
+    try:
+        torch._C._autograd._unsafe_set_version_counter(tuple(tensors), tuple(versions))
+    except Exception:  # noqa: BLE001
+        try:  # older releases take one tensor at a time
+            for tensor, version in zip(tensors, versions):
+                torch._C._autograd._unsafe_set_version_counter(tensor, version)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 @torch.compiler.allow_in_graph
 def _add_compiled(counts: torch.Tensor, hits: torch.Tensor) -> None:
     if not _real(counts):
         counts.add_(hits)
     elif torch._C._current_graph_task_id() == -1:
-        with torch.autograd._unsafe_preserve_version_counter(counts):
-            counts.add_(hits)
+        version = counts._version
+        counts.add_(hits)
+        _restore_versions((counts,), (version,))
 
 
 @torch.compiler.allow_in_graph
@@ -325,8 +341,9 @@ def _set_row_compiled(buf: torch.Tensor, row: int, stats: torch.Tensor) -> None:
     if not _real(buf):
         buf[row] = stats
     elif torch._C._current_graph_task_id() == -1:
-        with torch.autograd._unsafe_preserve_version_counter(buf):
-            buf[row] = stats
+        version = buf._version
+        buf[row] = stats
+        _restore_versions((buf,), (version,))
 
 
 def _mark_static(buf: torch.Tensor) -> None:
@@ -1199,6 +1216,9 @@ class Session:
             self._record_weights()
         row = len(self._steps)
         has_act = self._act.numel() > 0
+        # The buffers the forward hooks write; their versions are kept over the zeroing below.
+        hooked = ([self._act] if has_act else []) + self._counts_list
+        hooked_versions = [buf._version for buf in hooked]
         if has_act and self._grads_recorded:
             torch._foreach_copy_((self._ring_act[row], self._ring_grad[row]), (self._act, self._grad))
             torch._foreach_zero_((self._act, self._grad))
@@ -1226,6 +1246,8 @@ class Session:
                 [ring[row] for ring in self._ring_counts_list], self._counts_list
             )
             torch._foreach_zero_(self._counts_list)
+        if hooked:
+            _restore_versions(hooked, hooked_versions)
         self._grads_recorded = False
         self._spread_recorded = 0
         probe_due = self._cadence_probe()
