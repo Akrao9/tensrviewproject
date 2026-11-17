@@ -40,9 +40,10 @@ a stall is next listed and shows one of:
   stepping beside a silent rank are not in its episode and do not end it, however many looks.
   A rank that stored nothing when it fired ends it with its first stored step;
 - a new attempt: the `attempt` the server's status gives a rank of the episode differs from
-  the one it had. The server takes it from the new attempt's first stored batch, so a job
-  started again that hangs before it stores anything is not seen as one. A status that gives no
-  attempt says nothing.
+  the one it had, and no rank of the episode is still stopped exactly as it was (its step and
+  attempt), since the ranks of a job started again come back a look or more apart. The server
+  learns a new attempt from the process's heartbeats, before it stores any step (and from its
+  stored rows, for a sender older than that). A status that gives no attempt says nothing.
 
 Then the next stall at `critical` fires again, under an id of its own. So a silent rank whose
 job then stops altogether (`rank_silent`, then `job_stalled`) is one episode. A rank that stops
@@ -493,10 +494,14 @@ class Trigger:
         # Every rank the stall says something of: stopped, and (for `rank_silent`) the others, so
         # a rank of the episode that has recovered is seen stepping on.
         seen = {**_others(stall), **stopped}
+        # A rank of the episode still stopped exactly as it was (its step and attempt): the job
+        # is not started again for it yet, as when ranks of a restarted job start a look apart.
+        unchanged = any(rank in members and members[rank].get("last_step") == now["last_step"]
+                        and members[rank].get("attempt") == now["attempt"] for rank, now in stopped.items())
         for rank, now in seen.items():
             before = members.get(rank)
-            if before is not None and now["attempt"] is not None and before.get("attempt") is not None \
-                    and now["attempt"] != before["attempt"]:
+            if not unchanged and before is not None and now["attempt"] is not None \
+                    and before.get("attempt") is not None and now["attempt"] != before["attempt"]:
                 self._episode = None  # a new attempt: the job was started again
                 return
         if episode.get("kind") == "job_stalled":

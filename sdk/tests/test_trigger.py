@@ -628,6 +628,23 @@ def test_a_new_attempt_re_arms_the_episode_and_a_missing_attempt_is_no_change(tm
     assert [d["id"] for d in run.trigger.deliveries] == ["r/rank0/job_stalled/99", "r/rank0/job_stalled/99/2"]
 
 
+def test_a_staggered_restart_does_not_fire_the_old_stall_of_a_rank_not_yet_started_again(tmp_path, hook):
+    """A job of two ranks stalls and fires; it is started again, and rank 0's new attempt is seen a
+    look before rank 1's. Rank 1, still stopped exactly as it was, does not fire again: a new
+    attempt ends an episode only when no rank of it is still where it stopped. Once both are
+    started again, a hang of the new attempts fires."""
+    command, calls = hook
+    run = _Looks(tmp_path, command, calls)
+    assert run.look("stalled", _ranked(0, "silent", 99, 1), _ranked(1, "lost", 99, 1)) == 1
+    starting = {**_ranked(0, "starting", 99, 2)}
+    assert run.look("degraded", starting, _ranked(1, "lost", 99, 1)) == 0
+    assert run.look("degraded", starting, _ranked(1, "lost", 99, 1)) == 0
+    # Both started again, below the old step; then the new attempts hang.
+    assert run.look("active", _ranked(0, "active", 99, 2), _ranked(1, "active", 99, 2)) == 0
+    assert run.look("stalled", _ranked(0, "silent", 99, 2), _ranked(1, "silent", 99, 2)) == 1
+    assert run.fired() == [("job_stalled", 99), ("job_stalled", 99)]
+
+
 def test_a_silent_rank_beside_stepping_ranks_is_one_episode_and_a_rank_that_joins_it_too(tmp_path, hook):
     """`rank_silent` is judged by the stopped rank's own step: the ranks that go on stepping do
     not end it, however many looks. A rank that stops during the episode joins it."""
