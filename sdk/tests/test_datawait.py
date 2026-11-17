@@ -112,12 +112,18 @@ def test_only_the_sessions_thread_and_the_train_phase_count():
     other.join()
     with session.phase("eval"):
         list(DataLoader(Slow(4), batch_size=1))  # an evaluation loader
-    for x in DataLoader(torch.randn(2, 4), batch_size=1):
+    batches_in, spent = iter(DataLoader(torch.randn(2, 4), batch_size=1)), []
+    for _ in range(2):
+        start = time.perf_counter()
+        x = next(batches_in)
+        spent.append(time.perf_counter() - start)
         model(x).sum().backward()
         optimizer.step()
         optimizer.zero_grad()
     session.close()
-    assert all(w < FETCH for w in _waits(sink.records)), _waits(sink.records)
+    # Each step's wait is inside this loop's own next(); the eight slow fetches above, if they
+    # counted, would add at least 8 * FETCH to the first step's.
+    assert all(w <= s for w, s in zip(_waits(sink.records), spent)), (_waits(sink.records), spent)
 
 
 def test_time_data_wraps_any_iterable_and_is_not_counted_twice():
@@ -128,7 +134,11 @@ def test_time_data_wraps_any_iterable_and_is_not_counted_twice():
     loader = DataLoader(Slow(4), batch_size=1)
     timed = session.time_data(loader)
     assert len(timed) == 4 and timed.dataset is loader.dataset
-    for x in timed:  # a DataLoader inside the wrapper, with watch_loaders on too
+    batches_in, spent = iter(timed), []  # a DataLoader inside the wrapper, with watch_loaders on too
+    for _ in range(4):
+        start = time.perf_counter()
+        x = next(batches_in)
+        spent.append(time.perf_counter() - start)
         time.sleep(MOVE)
         model(x).sum().backward()
         optimizer.step()
@@ -138,8 +148,9 @@ def test_time_data_wraps_any_iterable_and_is_not_counted_twice():
     while len(sink.records) < 4:
         assert time.monotonic() < deadline
         time.sleep(0.005)
-    # Each fetch once: counted by both timers it would be at least twice FETCH per batch.
-    assert sum(_waits(sink.records)) < 4 * FETCH * 1.6, _waits(sink.records)
+    # Each fetch once: counted by both timers, a wait would be about twice the time this loop
+    # itself spent in that next().
+    assert all(w <= s for w, s in zip(_waits(sink.records), spent)), (_waits(sink.records), spent)
 
     def plain():  # not a DataLoader at all
         for _ in range(4):
@@ -172,18 +183,36 @@ def test_two_sessions_and_a_closed_one():
 
 
 def test_with_loader_workers():
+    """A worker fetches ahead (two batches by default) while the loop runs the step before, so
+    a batch can be waiting when the loop asks for it and that `data_wait` is near zero: the loop
+    did not wait. What one worker cannot do is hand over batch `k` sooner than `k` fetches after
+    the loader started, so the waits make up whatever the loop's own time does not cover."""
     model = _model()
     sink = tensorquill.MemorySink()
-    session = tensorquill.init(model, sink=sink, every=4, run_id="dw", data_wait=True)
+    session = tensorquill.init(model, sink=sink, every=8, run_id="dw", data_wait=True)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-    for x in DataLoader(Slow(4), batch_size=1, num_workers=1):
+    batches = 8
+    started = time.perf_counter()
+    batches_in = iter(DataLoader(Slow(batches), batch_size=1, num_workers=1))
+    asked, handed = [], []  # this loop's own stopwatch around each next()
+    for _ in range(batches):
+        asked.append(time.perf_counter())
+        x = next(batches_in)
+        handed.append(time.perf_counter())
         model(x).sum().backward()
         optimizer.step()
         optimizer.zero_grad()
     session.close()
-    # One worker that sleeps per batch: the loop waits for nearly all of it (the first
-    # batch also waits for the worker to start).
-    assert all(w >= FETCH * 0.5 for w in _waits(sink.records)), _waits(sink.records)
+    waits = _waits(sink.records)
+    assert len(waits) == batches
+    # Each wait is inside the loop's own next(), and is measured: a timer that is not running
+    # reads zero, while a real next() through a worker's queue always takes some time.
+    assert all(0 < w <= h - a for w, a, h in zip(waits, asked, handed)), waits
+    # The worker fetches one batch at a time, each at least FETCH, so the last batch is handed
+    # over no sooner than `batches * FETCH` after `started`. Until then the loop was either in
+    # next(), counted in the waits, or busy outside it: building the iterator and its steps.
+    busy = (asked[0] - started) + sum(a - h for h, a in zip(handed, asked[1:]))
+    assert sum(waits) >= batches * FETCH * 0.9 - busy, (waits, busy)
 
 
 # --- adapters ------------------------------------------------------------------------------
