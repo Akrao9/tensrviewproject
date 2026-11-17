@@ -12,7 +12,10 @@ default in every rank here.
 
 from __future__ import annotations
 
+import json
 import os
+import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -25,6 +28,7 @@ pytest.importorskip("pyarrow.flight")
 import tensorquill  # noqa: E402
 from tensorquill.evidence import detect_watchdog_incidents, read_watchdog  # noqa: E402
 from tensorquill.evidence import _describe_stream  # noqa: E402
+from test_trigger import HOOK  # noqa: E402
 from test_two_ranks_e2e import BINARY, Server  # noqa: E402
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
@@ -185,3 +189,65 @@ def test_a_real_rank_that_is_slow_to_its_first_step_and_its_first_batch_is_never
     finally:
         job.close()
     assert job.said == [("starting", None), ("silent", "warning"), ("starting", None), ("active", None)]
+
+
+def test_a_real_rank_that_never_takes_a_step_starts_the_command_once_when_it_is_critical(tmp_path):
+    """The two rules together, which were built apart: the bound on `starting` makes a rank stuck
+    before its first step a stall, and a stall at `critical` fires the trigger with no
+    `--fire-kind`. `python -m tensorquill <run folder> --watch --rank all --on-incident COMMAND`
+    beside a real server and a real process that never steps: nothing starts while the stall is a
+    warning, and the command starts once when the server calls it critical. No batch is ever
+    stored, so the run folder holds the server's status and no part."""
+    script, calls_log, output = tmp_path / "hook.py", tmp_path / "hook.log", tmp_path / "all.json"
+    script.write_text(HOOK)
+    command = " ".join(shlex.quote(str(part)) for part in (sys.executable, script, calls_log))
+
+    def calls() -> list[dict]:
+        return [json.loads(line) for line in calls_log.read_text().splitlines()] if calls_log.exists() else []
+
+    job = _Job(tmp_path, ("--silent-seconds", "1", "--start-seconds", "3", "--critical-seconds", "4"),
+               before=3600.0, steps=0, step_seconds=0.0)
+    watcher = watcher_log = None
+    try:
+        job.until(lambda rank: rank.get("state") == "starting", "the rank's stream")
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("TENSORQUILL_TOKEN", "TENSORQUILL_TLS_CA", "MLFLOW_RUN_ID", "TORCHELASTIC_RUN_ID")}
+        watcher_log = (tmp_path / "watcher.log").open("w")
+        watcher = subprocess.Popen(
+            [sys.executable, "-m", "tensorquill", str(job.status_file.parent), "--watch", "--interval", "0.2",
+             "--rank", "all", "-o", str(output), "--on-incident", command],
+            cwd=tmp_path, env={**clean, "PYTHONPATH": str(SRC)}, stdout=watcher_log, stderr=subprocess.STDOUT,
+            # A process started from a background shell job inherits SIGINT as ignored.
+            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
+        )
+
+        def stall() -> dict:
+            """The stall in the evidence the watcher last wrote, or an empty dict."""
+            try:
+                listed = json.loads(output.read_text()).get("run_incidents") or ()
+            except (OSError, ValueError):
+                return {}
+            return next((i for i in listed if i["kind"] == "job_stalled"), {})
+
+        job.until(lambda rank: stall().get("severity") == "warning", "the stall at warning in the watcher's evidence")
+        assert calls() == []  # a warning starts nothing
+        job.until(lambda rank: stall().get("severity") == "critical", "the stall at critical in the watcher's evidence")
+        job.until(lambda rank: len(calls()) >= 1, "the command", seconds=30.0)
+        time.sleep(1.5)  # more looks at the same critical stall start nothing more
+        assert watcher.poll() is None, "the watcher ended"
+        assert not list((job.store / "runs" / RUN_ID).rglob("*.parquet"))
+    finally:
+        if watcher is not None:
+            watcher.send_signal(signal.SIGINT)
+            try:
+                watcher.wait(30)
+            except subprocess.TimeoutExpired:
+                watcher.kill()
+                watcher.wait(20)
+        if watcher_log is not None:
+            watcher_log.close()
+        job.close()
+    (call,) = calls()
+    payload = call["payload"]
+    assert (payload["kind"], payload["step"], payload["incident"]["severity"]) == ("job_stalled", 0, "critical")
+    assert payload["incident"]["assessment"] == "suspected_hang"

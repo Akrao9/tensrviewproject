@@ -93,6 +93,9 @@ def one_look(folder: Path, out: Path, **options) -> dict:
 
 def cli(*args: str, cwd: Path) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k != "TENSORQUILL_TOKEN"}
+    # `--detectors rust` looks for the binary in the environment or on PATH; a local run that names
+    # neither still has the one this file was collected with.
+    env.setdefault("TENSORQUILL_SERVER_BIN", str(BINARY))
     return subprocess.run([sys.executable, "-m", "tensorquill", *args], cwd=cwd, env=env, capture_output=True,
                           text=True, timeout=120)
 
