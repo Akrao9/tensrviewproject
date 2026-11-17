@@ -83,9 +83,10 @@
 //! `silent`, critical `--critical-seconds` later; `reconnecting` for that window while its stream
 //! is not open), not from the earlier attempt's last batch. `last_step` stays the highest stored,
 //! of any attempt. The attempt's first batch ends that, and its first gap is measured from the
-//! beat. A beat of the same attempt (a reconnect) changes nothing; a beat of a lower attempt (a
-//! process of an earlier attempt still alive) is ignored; and an earlier attempt's rows sent late
-//! raise `last_step` without being progress. A beat that names no attempt (an older sender) is
+//! beat. A beat of the same attempt (a reconnect) changes nothing. While the new attempt has
+//! stored nothing, a beat of a lower attempt (a process of an earlier attempt still alive) is
+//! ignored and an earlier attempt's rows sent late raise `last_step` without being progress; at
+//! other times a lower attempt is taken as before (a restart on a host whose clock is behind). A beat that names no attempt (an older sender) is
 //! taken as before, and its new attempt is known from its first stored batch.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -710,15 +711,22 @@ impl Watchdog {
     /// `critical` later) until the attempt stores a batch, instead of reading silent and critical
     /// from the earlier attempt's last batch. Its clocks start now (`restarted`), and a stream
     /// still dropped is `reconnecting` for that window. The same attempt is a beat as any other,
-    /// whatever the stream did (a reconnect is not a new attempt). A lower one is a process of an
-    /// earlier attempt still beating: false, and the beat is not taken. The SDK sends this beat
+    /// whatever the stream did (a reconnect is not a new attempt). A lower one, while the new
+    /// attempt has stored nothing, is a process of an earlier attempt still beating: false, and the
+    /// beat is not taken; at any other time it is taken as a beat that names no attempt. The SDK sends this beat
     /// before its stream's first connection; a stream opened before it (a sender that waited
     /// longer than its hold) is judged from the earlier attempt's last batch until it comes.
     pub fn attempt_seen(&self, key: &Key, attempt: i64, now: Instant) -> bool {
         let window = self.config.start_limit;
         self.with(key, now, |p| {
-            if attempt <= p.attempt {
-                return attempt == p.attempt;
+            if attempt < p.attempt {
+                // While a new attempt has stored nothing, a lower one is a process of an earlier
+                // attempt still beating: not taken. Otherwise it is taken as a beat with no attempt
+                // was before (a host whose clock is behind gives a restart a lower number).
+                return p.attempt_since.is_none();
+            }
+            if attempt == p.attempt {
+                return true;
             }
             let known = p.attempt != 0 || p.last_step.is_some();
             p.attempt = attempt;
@@ -799,9 +807,9 @@ impl Watchdog {
             if world_size.is_some() {
                 p.world_size = world_size;
             }
-            if attempt < p.attempt {
+            if attempt < p.attempt && p.attempt_since.is_some() {
                 // An earlier attempt's rows, sent late (by the process of a later attempt that found
-                // them unsent): kept, and not progress of the attempt the rank is in now.
+                // them unsent, before that attempt stores any): kept, and not its progress.
                 if let Some(step) = new_last {
                     p.last_step = Some(p.last_step.map_or(step, |last| last.max(step)));
                 }
@@ -2220,6 +2228,28 @@ mod tests {
         assert_eq!(states(&dog, at(t0, 431 + 61)), ["lost"]);
         assert_eq!(rank_field(&dog, at(t0, 431 + 61), "severity"), "warning");
         assert_eq!(rank_field(&dog, at(t0, 431 + 181), "severity"), "critical");
+    }
+
+    #[test]
+    fn a_restart_with_a_lower_attempt_number_is_watched_as_before() {
+        // A job restarted on a host whose clock is behind: its attempt sorts below the stored one.
+        // It is not seen as a new attempt before it stores a step, and its beats and batches are
+        // taken as those of a sender that names no attempt: it is active as it steps.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1_000, Some(99), Some(1), at(t0, 5));
+        dog.stream_ended(&key(0), false, at(t0, 6));
+        dog.stream_opened(&key(0), at(t0, 400));
+        for (n, second) in (400..700).step_by(15).enumerate() {
+            assert!(dog.attempt_seen(&key(0), 900, at(t0, second)));
+            dog.heartbeat(&key(0), "train", 15.0, Some(n as i64 * 10), None, at(t0, second));
+            dog.batch(&key(0), 900, Some(n as i64 * 10), Some(1), at(t0, second));
+        }
+        let status = &dog.statuses(at(t0, 700), true)["run"];
+        assert_eq!(status["ranks"][0]["state"], "active");
+        assert_eq!(status["ranks"][0]["attempt"], 900);
+        assert!(status["incidents"].as_array().unwrap().is_empty());
     }
 
     #[test]
