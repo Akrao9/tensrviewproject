@@ -5,8 +5,12 @@
     import tensorquill
     tensorquill.list_runs("tensorquill-out", project="granite")
 
-One row a run: its name, run ID, run state, last step, incidents by class, the first incident,
-how many kinds were checked, and its start time. A run is found by its files:
+One row a run: its name, run ID, run state, how many ranks, last step, incidents by class, the
+first incident, how many kinds were checked, and its start time. For a run of several ranks
+the row is the whole run's, by the all-ranks view's rules: the incidents of every rank whose
+report or evidence file is current, and a kind counted as checked only when every such rank
+checked it. A rank without one is unknown (the run state says so), never clean. A run is
+found by its files:
 
 - local files, as `tensorquill.init` writes them: `<run_id>.rank<N>.jsonl`, with the manifest
   `<run_id>.run.json` beside them and, once `python -m tensorquill <file>` has run, the
@@ -16,7 +20,8 @@ how many kinds were checked, and its start time. A run is found by its files:
 
 The listing reads the manifest and the small evidence or report files only. It never opens a
 Parquet part and never runs a detector, so a local run whose evidence file was never written
-is listed with its state unknown and a note saying how to write it. Of a `.jsonl` file it
+is listed with its state unknown and a note saying how to write it. A local run of several
+ranks reads each rank's evidence file. Of a `.jsonl` file it
 reads the first line and the last one (for the run ID, the start time and the last step).
 
 A run without a manifest (every run recorded before the manifest existed) is listed under
@@ -256,6 +261,8 @@ def _local_row(run: Mapping[str, Any]) -> dict[str, Any]:
     if not files:
         row["evidence"] = {"state": "no_records", "detail": "the manifest is written and no rank has written a record yet"}
         return row
+    if len(files) > 1:
+        return _local_all_ranks_row(files, row)
     rank = min(files)
     records = files[rank]
     first, last = _first_record(records), _last_record(records)
@@ -292,6 +299,89 @@ def _local_row(run: Mapping[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _read_evidence_file(records: Path) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """A rank's evidence file beside its `.jsonl` file, and what the row says of it."""
+    path = records.with_suffix(".evidence.json")
+    try:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+        written = path.stat().st_mtime
+    except FileNotFoundError:
+        return None, {"state": "missing", "detail": f"no evidence file beside {records.name}"}
+    except (OSError, ValueError) as error:
+        return None, {"state": "unreadable", "path": str(path), "detail": str(error)}
+    if not isinstance(evidence, dict):
+        return None, {"state": "unreadable", "path": str(path), "detail": "not a JSON object"}
+    try:
+        stale = written < records.stat().st_mtime
+    except OSError:
+        stale = False
+    return evidence, {"state": "older_than_records" if stale else "current", "path": str(path)}
+
+
+def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any]) -> dict[str, Any]:
+    """A local run of several ranks: every rank's evidence file, put together by the
+    all-ranks view's rules (`combine_rank_evidence`). No record is judged here: a rank without
+    an evidence file is unknown, never clean."""
+    from .evidence import _rank_ranges, combine_rank_evidence
+
+    per_rank: dict[int, dict[str, Any]] = {}
+    unknown: dict[int, str] = {}
+    looks: dict[int, dict[str, Any]] = {}
+    steps: list[int] = []
+    for number in sorted(files):
+        records = files[number]
+        last = _last_record(records)
+        step = (last or {}).get("step")
+        if isinstance(step, int) and not isinstance(step, bool):
+            steps.append(step)
+        evidence, look = _read_evidence_file(records)
+        looks[number] = look
+        if evidence is None:
+            unknown[number] = f"{look['state']}: {look['detail']}"
+        else:
+            per_rank[number] = {**evidence, "last_step": step if isinstance(step, int) else None}
+    if steps:
+        row["last_step"] = max(steps)
+    first = _first_record(files[min(files)])
+    row["started_from_records"] = _iso((first or {}).get("ts"))
+    stale = [n for n, look in looks.items() if look["state"] == "older_than_records"]
+    if not per_rank:
+        row["evidence"] = {"state": "missing", "judged_ranks": 0, "unknown_ranks": len(files),
+                           "detail": f"no evidence file beside any of its {len(files)} ranks' .jsonl files: write each "
+                                     f"with python -m tensorquill <the rank's .jsonl file>, as for {files[min(files)].name}"}
+        return row
+    combined = combine_rank_evidence(per_rank, unknown_ranks=unknown)
+    state = "ranks_unknown" if unknown else "older_than_records" if stale else "current"
+    notes = []
+    if unknown:
+        notes.append(f"rank{'s' if len(unknown) != 1 else ''} {_rank_ranges(sorted(unknown), 8)} "
+                     f"{'have' if len(unknown) != 1 else 'has'} no evidence file (write it with python -m tensorquill "
+                     f"<the rank's .jsonl file>), so nothing is said about incidents there")
+    if stale:
+        notes.append(f"the records of rank{'s' if len(stale) != 1 else ''} {_rank_ranges(stale, 8)} have grown since "
+                     "their evidence files were written; the row is as of those files")
+    row["evidence"] = {
+        "state": state, "from": "each rank's evidence file", "judged_ranks": len(per_rank), "unknown_ranks": len(unknown),
+        **({"detail": "; ".join(notes)} if notes else {}),
+    }
+    _all_ranks_cells(row, combined)
+    return row
+
+
+def _all_ranks_cells(row: dict[str, Any], view: Mapping[str, Any]) -> None:
+    """The run state, incidents and kinds checked of a run of several ranks, from the
+    all-ranks view or `combine_rank_evidence`: the whole run's, with no rank named."""
+    row["run_state"] = (view.get("run_state") or {}).get("state")
+    incidents = [group["incident"] for group in view.get("incident_groups") or () if isinstance(group.get("incident"), Mapping)]
+    incidents += [i for i in view.get("run_incidents") or () if isinstance(i, Mapping)]
+    row["incidents"] = _by_class(incidents)
+    row["first_incident"] = _first(incidents)
+    row["ranks_with_incidents"] = list(view.get("ranks_with_incidents") or ())
+    row["kinds_checked"] = _kinds_checked(view.get("kind_checks"))
+    if row["kinds_checked"] is None and isinstance(view.get("kind_checks_not_stated"), Mapping):
+        row["kinds_not_stated"] = view["kind_checks_not_stated"].get("detail")
+
+
 def _store_row(run: Mapping[str, Any]) -> dict[str, Any]:
     """From each rank's `incidents.json`, the names of the newest parts and `watchdog.json`."""
     from .evidence import _report_evidence, all_ranks_evidence, read_server_report, read_watchdog
@@ -308,16 +398,21 @@ def _store_row(run: Mapping[str, Any]) -> dict[str, Any]:
     row["evidence"] = {"state": "current" if judged and not view.get("unknown_ranks") else "ranks_unknown",
                        "from": "each rank's incidents.json and the run's watchdog.json",
                        "judged_ranks": len(judged), "unknown_ranks": len(view.get("unknown_ranks") or ())}
-    row["run_state"] = (view.get("run_state") or {}).get("state")
     last = view.get("last_step")
     if isinstance(last, Mapping):
         row["last_step"] = last.get("max")
+    if len(row["ranks"]) > 1:
+        # What was checked for the whole run, by the all-ranks rule: a kind is checked only
+        # when every judged rank checked it.
+        _all_ranks_cells(row, view)
+        return row
+    row["run_state"] = (view.get("run_state") or {}).get("state")
     incidents = [group["incident"] for group in view.get("incident_groups") or () if isinstance(group.get("incident"), Mapping)]
     incidents += [i for i in view.get("run_incidents") or () if isinstance(i, Mapping)]
     row["incidents"] = _by_class(incidents)
     row["first_incident"] = _first(incidents)
-    # The all-ranks view does not say what was checked (plan row A6), so the count is the
-    # lowest judged rank's, and the row names that rank. When the view carries it, read it here.
+    # One rank: the count is that rank's own evidence, as before the all-ranks view said what
+    # was checked, and the row names the rank.
     if judged:
         # The rank's evidence as the watcher builds it from the report and the status: the
         # server's own values for its kinds and this reader's for the rest. No part is read.
@@ -348,6 +443,7 @@ def run_row(run: Mapping[str, Any]) -> dict[str, Any]:
         "kinds_checked": None,
     }
     row.update(_local_row(run) if run["source"] == "local" else _store_row(run))
+    row["rank_count"] = len(row.get("ranks") or ())
     if row["started"] is None:
         row["started"] = row.get("started_from_records")
     row.pop("started_from_records", None)
@@ -384,6 +480,7 @@ def _cells(row: Mapping[str, Any]) -> list[str]:
         str(row["name"]),
         str(row["run_id"]),
         str(row.get("run_state") or "?"),
+        str(row.get("rank_count") or "?"),
         "?" if row.get("last_step") is None else str(row["last_step"]),
         _incidents_text(row),
         f"{first['kind']} at step {first['step']}" if first else ("-" if row.get("incidents") is not None else "?"),
@@ -395,7 +492,7 @@ def _cells(row: Mapping[str, Any]) -> list[str]:
 def listing_text(rows: list[Mapping[str, Any]], source: str | Path, project: str | None = None) -> str:
     if not rows:
         return f"no runs at {source}" + (f" in project {project!r}" if project is not None else "")
-    header = ["name", "run ID", "state", "last step", "incidents", "first incident", "kinds checked", "started (UTC)"]
+    header = ["name", "run ID", "state", "ranks", "last step", "incidents", "first incident", "kinds checked", "started (UTC)"]
     lines: list[str] = []
     notes: list[str] = []
     projects: dict[str, list[Mapping[str, Any]]] = {}

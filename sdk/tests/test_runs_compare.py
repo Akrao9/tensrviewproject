@@ -19,6 +19,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -478,23 +479,158 @@ def test_the_seeded_runs_are_found_by_name_in_one_folder_and_the_command_writes_
 # --- Comparing: which rank, and where it was read ------------------------------------------------
 
 
-def test_a_run_of_many_ranks_is_read_on_rank_0_and_says_the_others_were_not_compared(tmp_path):
+def test_a_run_of_many_ranks_is_compared_on_every_rank_and_rank_reads_one(tmp_path):
     folder = tmp_path / "out"
     local_run(folder, "one", project="p", name="one")
     local_run(folder, "two", dense(60, run="two"), project="p", name="two")
     local_run(folder, "two", dense(60, run="two", rank=1, spike=(40, "blocks.1.weight", 60.0)), rank=1)
     result = tensorquill.compare_runs("one", "two", source=folder)
-    assert result["runs"][1]["read_from"]["rank"] == 0 and result["runs"][1]["read_from"]["ranks"] == [0, 1]
-    assert result["incidents"]["entries"] == [] and result["incidents"]["other_ranks_not_compared"] == {"B": [1]}
-    assert "rank 0 of 2" in result["summary"] and "incidents on other ranks were not compared: B ranks 1" in result["summary"]
-    assert "(A rank 0, B rank 0)" in result["summary"]
+    read = result["runs"][1]["read_from"]
+    assert (read["rank"], read["ranks"], read["all_ranks"], read["judged_ranks"], read["unknown_ranks"]) == (
+        None, [0, 1], True, [0, 1], [])
+    assert (result["runs"][0]["rank_count"], result["runs"][1]["rank_count"]) == (1, 2)
+    # The spike on rank 1 is not missed, and the entry says which rank shows it.
+    (entry,) = result["incidents"]["entries"]
+    assert (entry["kind"], entry["in"], entry["first_step"], entry["ranks"], entry["absent_from"]) == (
+        "grad_spike", ["B"], {"B": 40}, {"B": [1]}, {"A": "checked"})
+    assert "other_ranks_not_compared" not in result["incidents"]
+    assert result["checked"]["ranks_read"] == {"A": 0, "B": None} and result["checked"]["all_ranks_read"] == {"B": [0, 1]}
+    assert "all 2 ranks from" in result["summary"] and "first at B step 40 (on rank 1)" in result["summary"]
+    assert "(A rank 0, B ranks 0-1)" in result["summary"]
+    # One rank against two: part 4 compares no rank, and says why.
+    assert result["divergence"]["state"] == "ranks_differ" and result["divergence"]["ranks"] == {"A": [0], "B": [0, 1]}
+    assert "A has rank 0 where B has ranks 0-1" in result["divergence"]["detail"]
+
+    # `rank=` reads that one rank, as before.
     with pytest.raises(ValueError, match="no rank 3"):
         tensorquill.compare_runs("one", "two", source=folder, rank=3)
+    on_zero = tensorquill.compare_runs("one", "two", source=folder, rank=0)
+    assert on_zero["runs"][1]["read_from"]["rank"] == 0 and on_zero["runs"][1]["read_from"]["ranks"] == [0, 1]
+    assert on_zero["incidents"]["entries"] == [] and on_zero["incidents"]["other_ranks_not_compared"] == {"B": [1]}
+    assert "rank 0 of 2" in on_zero["summary"] and "incidents on other ranks were not compared: B ranks 1" in on_zero["summary"]
     # Rank 1, asked for: the run with one rank is still read on the rank it has.
     on_one = tensorquill.compare_runs("one", "two", source=folder, rank=1)
     assert [run["read_from"]["rank"] for run in on_one["runs"]] == [0, 1]
     assert [(e["kind"], e["in"]) for e in on_one["incidents"]["entries"]] == [("grad_spike", ["B"])]
+    assert "ranks" not in on_one["incidents"]["entries"][0]
     assert on_one["incidents"]["other_ranks_not_compared"] == {"B": [0]}
+
+
+def drifted(run: str, rank: int, start: int = 70, steps: int = 120) -> list[dict]:
+    """`dense` steps whose third block's gradient norm is five times larger from `start` on."""
+    out = dense(steps, run=run, rank=rank)
+    for record in out[start:]:
+        record["grad_norms"]["blocks.2.weight"] *= 5.0
+        record["grad_norm"] = math.sqrt(sum(v * v for v in record["grad_norms"].values()))
+    return out
+
+
+def test_where_two_runs_of_several_ranks_part_is_asked_rank_by_rank_and_the_earliest_is_named(tmp_path):
+    folder = tmp_path / "out"
+    for rank in (0, 1):
+        local_run(folder, "a", dense(120, run="a", rank=rank), rank=rank, project="p", name="a")
+        local_run(folder, "b", drifted("b", rank) if rank == 1 else dense(120, run="b", rank=rank), rank=rank,
+                  project="p", name="b")
+    result = tensorquill.compare_runs("a", "b", source=folder)
+    part = result["divergence"]
+    # Rank 0 of A against rank 0 of B, and rank 1 against rank 1; nothing made across ranks.
+    assert part["ranks_compared"] == [0, 1] and part["by_rank"] == [
+        {"rank": 0, "answer": "no_divergence"},
+        {"rank": 1, "answer": "diverged", "step": 70, "series": "grad_norms/blocks.2.weight"}]
+    assert (part["state"], part["rank"], part["divergence"]["step"], part["divergence"]["series"]) == (
+        "diverged", 1, 70, "grad_norms/blocks.2.weight")
+    assert part["detail"].startswith("on rank 1, earliest of the 1 of 2 ranks that part: The runs part at step 70")
+    assert part["lines"].startswith("On rank 1: ") and part["labels"] == {"a": "A", "b": "B"}
+    assert all(entry["status"] != "agrees" for entry in part["series"].values()) and part["series_agreeing"] > 0
+    json.dumps(result, allow_nan=False)
+    # The incident the drift sets off is on rank 1 only.
+    (entry,) = result["incidents"]["entries"]
+    assert (entry["kind"], entry["in"], entry["ranks"]) == ("grad_spike", ["B"], {"B": [1]})
+
+    # Both ranks part: the earliest is named, whichever rank it is on.
+    for rank in (0, 1):
+        local_run(folder, "f", drifted("f", rank, start=70 if rank == 0 else 90), rank=rank, project="p", name="f")
+    both = tensorquill.compare_runs("a", "f", source=folder)["divergence"]
+    assert (both["state"], both["rank"], both["divergence"]["step"]) == ("diverged", 0, 70)
+    assert [(item["rank"], item.get("step")) for item in both["by_rank"]] == [(0, 70), (1, 90)]
+    assert both["detail"].startswith("on rank 0, earliest of the 2 of 2 ranks that part")
+
+    # A rank with no record yet: never read as a run of fewer ranks, and named as not compared.
+    local_run(folder, "g", dense(120, run="g"), project="p", name="g")
+    (folder / "g.rank1.jsonl").write_text("")
+    local_run(folder, "h", dense(120, run="h"), project="p", name="h")
+    one_rank = tensorquill.compare_runs("h", "g", source=folder)["divergence"]
+    assert one_rank["state"] == "ranks_differ" and one_rank["ranks"] == {"A": [0], "B": [0, 1]}
+    early = tensorquill.compare_runs("a", "g", source=folder)
+    assert early["runs"][1]["read_from"]["unknown_ranks"] == [1] and early["incidents"]["other_ranks_not_compared"] == {"B": [1]}
+    part = early["divergence"]
+    assert (part["state"], part["ranks_compared"], part["ranks_without_records"]) == ("no_divergence", [0], {1: ["B"]})
+    assert "Not compared: rank 1, with no step records yet in rank 1: B." in part["detail"]
+    json.dumps(early, allow_nan=False)
+
+    # The same runs: no rank parts, so no divergence; a rank without an answer makes it no answer.
+    for rank in (0, 1):
+        local_run(folder, "c", dense(120, run="c", rank=rank), rank=rank, project="p", name="c")
+        local_run(folder, "d", dense(120 if rank == 0 else 20, run="d", rank=rank), rank=rank, project="p", name="d")
+    same = tensorquill.compare_runs("a", "c", source=folder)["divergence"]
+    assert same["state"] == "no_divergence" and same["detail"].startswith("no divergence on any of the 2 ranks compared")
+    short = tensorquill.compare_runs("a", "d", source=folder)["divergence"]
+    assert short["state"] == "no_answer" and [item["answer"] for item in short["by_rank"]] == ["no_divergence", "no_answer"]
+    assert short["rank"] == 1 and short["by_rank"][1]["reason"] and "no answer on rank 1 of the 2 compared" in short["detail"]
+
+
+def cuda(peak: float) -> dict:
+    return {"cuda": {"allocated": int(peak) // 2, "reserved": int(peak), "peak_allocated": int(peak), "total": 80_000_000_000}}
+
+
+def test_a_kind_is_checked_for_a_run_of_several_ranks_only_when_every_rank_checked_it(tmp_path):
+    folder = tmp_path / "out"
+    for rank, peak in ((0, 2e9), (1, 2e10)):  # rank 1 holds ten times the memory
+        records = [{**r, "system": cuda(peak)} for r in dense(60, run="c", rank=rank)]
+        local_run(folder, "c", records, rank=rank, project="p", name="c")
+    local_run(folder, "e", [{**r, "system": cuda(2e9)} for r in dense(60, run="e")], project="p", name="e")
+    local_run(folder, "e", dense(60, run="e", rank=1), rank=1)  # rank 1 records no memory
+    result = tensorquill.compare_runs("c", "e", source=folder)
+    differs = {item["kind"]: item for item in result["checked"]["differs"]}
+    # Memory pressure is checked on rank 0 of E only, so not for the run: the ranks say where.
+    assert differs["memory_pressure"]["looked"] == {"A": "checked", "B": "not_configured"}
+    assert differs["memory_pressure"]["ranks"] == {"B": {"checked": [0], "not_configured": [1]}}
+    assert differs["memory_imbalance"]["looked"] == {"A": "checked", "B": "not_configured"}
+    assert "memory_pressure: checked (60 records) in A; not configured (checked on rank 0, not configured on rank 1) in B" in (
+        result["summary"])
+    # The imbalance is the run's own incident: no rank of its own here.
+    (entry,) = result["incidents"]["entries"]
+    assert (entry["kind"], entry["in"], entry["absent_from"]) == ("memory_imbalance", ["A"], {"B": "not_configured"})
+    assert "ranks" not in entry
+    # One local run of several ranks: no server compared the batches, so not looked for.
+    assert result["runs"][0]["read_from"]["judged_by"].startswith("the Python detectors, here")
+    assert "duplicate_batches" not in differs
+
+
+def test_the_listing_reads_every_ranks_evidence_file_and_a_rank_without_one_is_unknown(tmp_path):
+    folder = tmp_path / "out"
+    local_run(folder, "two", dense(60, run="two"), project="p", name="two", evidence=True)
+    rank1 = local_run(folder, "two", dense(60, run="two", rank=1, spike=(40, "blocks.1.weight", 60.0)), rank=1)
+    local_run(folder, "one", dense(60, run="one"), project="p", name="one", evidence=True)
+    rows = {row["run_id"]: row for row in tensorquill.list_runs(folder)}
+    row = rows["two"]
+    assert (row["rank_count"], row["ranks"], row["run_state"], row["incidents"]) == (2, [0, 1], "unknown", {})
+    assert row["evidence"]["state"] == "ranks_unknown" and (row["evidence"]["judged_ranks"], row["evidence"]["unknown_ranks"]) == (1, 1)
+    assert "rank 1 has no evidence file" in row["evidence"]["detail"]
+    # As the note says: the command line on rank 1's file writes rank 1's own evidence beside it.
+    written = cli(str(rank1), cwd=tmp_path)
+    assert written.returncode == 0, written.stderr
+    assert "grad_spike" in json.loads(rank1.with_suffix(".evidence.json").read_text())["incidents"][0]["kind"]
+    row = {r["run_id"]: r for r in tensorquill.list_runs(folder)}["two"]
+    assert (row["run_state"], row["incidents"], row["first_incident"], row["ranks_with_incidents"]) == (
+        "unhealthy", {"anomaly": 1}, {"kind": "grad_spike", "step": 40}, [1])
+    assert row["evidence"]["state"] == "current" and "rank" not in row["kinds_checked"] and row["kinds_checked"]["of"] == 32
+    # A run of one rank is listed as before, with its rank count.
+    one = rows["one"]
+    assert (one["rank_count"], one["ranks"], one["evidence"]["rank"], one["evidence"]["state"]) == (1, [0], 0, "current")
+    assert "ranks_with_incidents" not in one
+    text = runs_module.listing_text(tensorquill.list_runs(folder), folder)
+    assert "ranks" in text.splitlines()[1] and "grad_spike at step 40" in text
 
 
 def test_a_capture_that_is_still_being_written_is_compared_on_its_whole_lines_and_says_so(tmp_path):
@@ -554,6 +690,132 @@ def test_runs_given_as_paths_a_store_read_from_its_report_and_a_report_that_cann
     assert not isinstance(failed.value, AssertionError)
 
 
+def checks(**without_history: bool) -> dict:
+    """A report's `kind_checks`: every server kind checked with enough history; a kind given
+    here has no `enough_history` at all (a rank that does not say)."""
+    return {kind: {"value": "checked", **({} if kind in without_history else {"enough_history": True}),
+                   "records": 60, "records_needed": 13, "needs": "steps"} for kind in ev.SERVER_KINDS}
+
+
+def ranked_store(root: Path, runs: dict[str, dict[int, tuple[list[dict], dict | None]]]) -> Path:
+    """A server's store written by hand, each run with several ranks: each rank's current report
+    (with `kind_checks` when given) and one part that is not Parquet at all, and the status."""
+    for run_id, ranks in runs.items():
+        folder = root / "runs" / run_id
+        for rank, (incidents, kind_checks) in ranks.items():
+            parts = folder / f"rank={rank}" / "attempt=1"
+            parts.mkdir(parents=True)
+            (parts / "part-0-59.parquet").write_bytes(b"this is not a Parquet file")
+            written = {**report(rank, incidents), "run_id": run_id, **({"kind_checks": kind_checks} if kind_checks else {})}
+            (folder / f"rank={rank}" / "incidents.json").write_text(json.dumps(written))
+            assert ev.read_server_report(folder / f"rank={rank}")["state"] == "current"
+        (folder / "watchdog.json").write_text(json.dumps({
+            "schema_version": 1, "summary": "finished", "world_size": len(ranks),
+            "ranks": [{"rank": rank, "state": "finished", "last_step": 59} for rank in ranks],
+        }))
+        (folder / "run.json").write_text(json.dumps({"run_id": run_id, "project": "granite", "name": f"name-{run_id}"}))
+    return root
+
+
+def test_runs_of_several_ranks_in_a_store_are_compared_and_listed_from_the_all_ranks_view(tmp_path):
+    store = ranked_store(tmp_path / "store", {
+        "run-1": {0: ([], checks()), 1: ([], checks(non_finite=False))},
+        "run-2": {0: ([], checks()), 1: ([SPIKE, NOT_FINITE], checks())},
+    })
+    before_tree = tree(tmp_path)
+    result = tensorquill.compare_runs("run-1", "run-2", source=store)
+    assert all(run["read_from"]["all_ranks"] and run["read_from"]["ranks"] == [0, 1] for run in result["runs"])
+    assert all(run["read_from"]["judged_by"].startswith("the all-ranks view") and "no part was read" in run["read_from"]["judged_by"]
+               for run in result["runs"])
+    assert [run["last_step"] for run in result["runs"]] == [59, 59]
+    entries = {e["kind"]: e for e in result["incidents"]["entries"]}
+    assert set(entries) == {"grad_spike", "non_finite"} and all(e["ranks"] == {"B": [1]} for e in entries.values())
+    assert entries["grad_spike"]["absent_from"] == {"A": "checked"}
+    # Rank 1 of A does not say whether non_finite had enough history: A's silence is not a "none".
+    assert entries["non_finite"]["absent_from"] == {"A": "history_not_stated"}
+    assert "A checked this kind on every rank, and some rank does not say whether it had enough history" in result["summary"]
+    (differs,) = result["checked"]["differs"]
+    assert (differs["kind"], differs["looked"]) == ("non_finite", {"A": "history_not_stated", "B": "checked"})
+    # A store's parts are read for part 4, and these are not Parquet: it answers with why.
+    assert result["divergence"]["state"] == "no_records" and "rank 0" in result["divergence"]["detail"]
+    assert tensorquill.compare_runs("run-1", "run-2", source=store, read_parts=False)["divergence"]["state"] == "not_read"
+    assert tree(tmp_path) == before_tree, "compare_runs writes nothing"
+
+    rows = {row["run_id"]: row for row in tensorquill.list_runs(store)}
+    assert (rows["run-2"]["rank_count"], rows["run-2"]["incidents"], rows["run-2"]["ranks_with_incidents"]) == (
+        2, {"anomaly": 1, "invariant": 1}, [1])
+    # What was checked is the whole run's, by the all-ranks rule, and names no rank.
+    assert "rank" not in rows["run-2"]["kinds_checked"] and rows["run-2"]["kinds_checked"]["of"] == 32
+    view = ev.all_ranks_evidence(store / "runs" / "run-2")
+    assert rows["run-2"]["kinds_checked"] == runs_module._kinds_checked(view["kind_checks"])
+    assert rows["run-2"]["run_state"] == view["run_state"]["state"] == "unhealthy"
+    assert rows["run-1"]["run_state"] == ev.all_ranks_evidence(store / "runs" / "run-1")["run_state"]["state"]
+
+    # The view written to a file by the watcher is a run too, read as it stands.
+    saved = tmp_path / "all.json"
+    ev.write_evidence(view, saved)
+    from_file = tensorquill.compare_runs("run-1", saved, source=store)
+    assert from_file["runs"][1]["read_from"]["kind"] == "evidence file" and from_file["runs"][1]["read_from"]["all_ranks"]
+    assert [(e["kind"], e["ranks"]) for e in from_file["incidents"]["entries"]] == [
+        (e["kind"], e["ranks"]) for e in result["incidents"]["entries"]]
+    with pytest.raises(ValueError, match="all-ranks view; to read rank 1 alone"):
+        tensorquill.compare_runs("run-1", saved, source=store, rank=1)
+
+
+def test_a_rank_whose_report_is_not_current_is_named_and_judged_from_its_parts_only_when_they_can_be_read(tmp_path, monkeypatch):
+    # Reports from before `kind_checks`: what was checked is not stated for the run, and says why.
+    store = ranked_store(tmp_path / "store", {
+        "run-1": {0: ([], None), 1: ([], None)},
+        "run-2": {0: ([], None), 1: ([SPIKE], None), 2: ([NOT_FINITE], None)},
+    })
+    behind = store / "runs" / "run-2" / "rank=1" / "attempt=1" / "part-60-99.parquet"
+    behind.write_bytes(b"not Parquet either")
+    # No pyarrow, as in the base install: every path that would open a part answers with why.
+    monkeypatch.setitem(sys.modules, "pyarrow", None)
+    monkeypatch.setitem(sys.modules, "pyarrow.parquet", None)
+
+    for read_parts in (False, True):
+        result = tensorquill.compare_runs("run-1", "run-2", source=store, read_parts=read_parts)
+        read = result["runs"][1]["read_from"]
+        assert (read["judged_ranks"], read["unknown_ranks"], read["ranks"]) == ([0, 2], [1], [0, 1, 2])
+        assert result["incidents"]["other_ranks_not_compared"] == {"B": [1]}
+        # The spike on rank 1 is not known; the non-finite layer on rank 2 is.
+        assert [(e["kind"], e["ranks"]) for e in result["incidents"]["entries"]] == [("non_finite", {"B": [2]})]
+        assert "2 of 3 ranks (rank 1 not judged)" in result["summary"]
+        assert result["runs"][1]["run_state"] == "unhealthy"
+        assert result["checked"]["not_said_by"] == ["A", "B"] and "does not say what was checked" in result["checked"]["not_said_why"]["B"]
+        assert result["divergence"]["state"] in ("not_read", "ranks_differ")
+    # Asked to read the parts, the rank's could not be: it stays unknown, and the reason says so.
+    assert "judged_here" not in read and "reading Parquet parts needs pyarrow" in read["unknown_why"][1]
+    assert read["unknown_why"][1].startswith("behind")
+    found = ev.all_ranks_evidence(store / "runs" / "run-2")
+    assert found["unknown_ranks"] == [1]
+
+    # Every rank unknown: nothing current to compare, refused with the reason.
+    (store / "runs" / "run-2" / "rank=0" / "attempt=1" / "part-60-99.parquet").write_bytes(b"x")
+    (store / "runs" / "run-2" / "rank=2" / "attempt=1" / "part-60-99.parquet").write_bytes(b"x")
+    with pytest.raises(runs_module.RunLookupError, match="no rank with a current report from its server"):
+        tensorquill.compare_runs("run-1", "run-2", source=store, read_parts=False)
+    judged_nowhere = tensorquill.compare_runs("run-1", "run-2", source=store)  # tries the parts, and cannot read them
+    assert judged_nowhere["runs"][1]["read_from"]["judged_ranks"] == [] and judged_nowhere["runs"][1]["run_state"] == "unknown"
+    reasons = judged_nowhere["runs"][1]["read_from"]["unknown_ranks"]
+    assert reasons == [0, 1, 2]
+
+    rows = {row["run_id"]: row for row in tensorquill.list_runs(store)}
+    assert rows["run-1"]["kinds_checked"] is None and "older tensorquill-server" in rows["run-1"]["kinds_not_stated"]
+
+    # One rank folder where the status expects two: both readers count two ranks, and the
+    # rank that stored nothing is unknown, not clean.
+    lone = ranked_store(tmp_path / "lone", {"run-3": {0: ([], None)}})
+    status = lone / "runs" / "run-3" / "watchdog.json"
+    status.write_text(json.dumps({**json.loads(status.read_text()), "world_size": 2}))
+    (row,) = tensorquill.list_runs(lone)
+    assert (row["rank_count"], row["run_state"]) == (2, "unknown")
+    opened = cmp.open_run("run-3", lone, read_parts=False)
+    assert (opened["read_from"]["ranks"], opened["read_from"]["judged_ranks"], opened["read_from"]["unknown_ranks"]) == ([0, 1], [0], [1])
+    assert "world_size is 2" in opened["read_from"]["unknown_why"][1]
+
+
 def test_two_runs_in_a_real_servers_store_are_listed_and_compared_by_name(tmp_path, toy_moe, monkeypatch):
     pytest.importorskip("pyarrow.flight")
     import test_flight_e2e as e2e
@@ -606,3 +868,66 @@ def test_two_runs_in_a_real_servers_store_are_listed_and_compared_by_name(tmp_pa
     assert judged_here["runs"][1]["last_step"] == 39
     with pytest.raises(runs_module.RunLookupError, match="run-2 rank 0 has no current report from its server: it is missing"):
         tensorquill.compare_runs("cheap", "debug", source=store, read_parts=False)
+
+
+def test_runs_of_two_ranks_streamed_to_a_real_server_are_compared_on_every_rank_as_their_local_files_are(tmp_path):
+    pytest.importorskip("pyarrow.flight")
+    import test_flight_e2e as e2e
+    from tensorquill.flight import send_file
+
+    if e2e.BINARY is None:
+        pytest.skip("tensorquill-server is not built")
+    local = tmp_path / "local"
+    sent: dict[tuple[str, int], tuple[Path, int]] = {}
+    for rank in (0, 1):
+        sent["a", rank] = (local_run(local, "a", dense(120, run="a", rank=rank), rank=rank, project="granite", name="a"), 119)
+        sent["b", rank] = (local_run(local, "b", drifted("b", rank) if rank == 1 else dense(120, run="b", rank=rank),
+                                     rank=rank, project="granite", name="b"), 119)
+    store = tmp_path / "store"
+    server = e2e.Server(store, 0, "--flush-steps", "50", "--flush-seconds", "0.2", "--watchdog-seconds", "0.2")
+    try:
+        for (run_id, rank), (path, last) in sent.items():
+            assert send_file(path, server.endpoint, run_id, rank, timeout=30.0)
+        deadline = time.monotonic() + 20
+        for (run_id, rank), (_, last) in sent.items():
+            while (look := ev.read_server_report(store / "runs" / run_id / f"rank={rank}"))["state"] != "current" or (
+                    look["report"].get("last_step") != last):
+                assert time.monotonic() < deadline, f"the server did not report on {run_id} rank {rank}: {look['reason']}"
+                time.sleep(0.05)
+    finally:
+        assert server.terminate() == 0
+
+    rows = {row["run_id"]: row for row in tensorquill.list_runs(store)}
+    assert [(rows[r]["rank_count"], rows[r]["last_step"]) for r in ("a", "b")] == [(2, 119), (2, 119)]
+    assert rows["b"]["ranks_with_incidents"] == [1] and rows["b"]["first_incident"]["kind"] == "grad_spike"
+    assert rows["a"]["ranks_with_incidents"] == [] and "rank" not in rows["b"]["kinds_checked"]
+    assert rows["b"]["kinds_checked"] == runs_module._kinds_checked(ev.all_ranks_evidence(store / "runs" / "b")["kind_checks"])
+
+    from_store = tensorquill.compare_runs("a", "b", source=store)
+    from_local = tensorquill.compare_runs("a", "b", source=local)
+    assert all(run["read_from"]["all_ranks"] and run["read_from"]["judged_ranks"] == [0, 1] for run in from_store["runs"])
+    brief = lambda result: [(e["kind"], e["in"], e["first_step"], e["where"], e["ranks"], e["absent_from"])  # noqa: E731
+                            for e in result["incidents"]["entries"]]
+    # The server's reports and the detectors here find the same incident, on the same rank.
+    assert brief(from_store) == brief(from_local) and [e[4] for e in brief(from_store)] == [{"B": [1]}]
+    server_kinds = set(ev.SERVER_KINDS)
+    pick = lambda result: {i["kind"]: i["looked"] for i in result["checked"]["differs"] if i["kind"] in server_kinds}  # noqa: E731
+    assert pick(from_store) == pick(from_local)
+    # Part 4 reads the stored parts rank by rank and gives what the local files give.
+    for result in (from_store, from_local):
+        part = result["divergence"]
+        assert (part["state"], part["rank"], part["divergence"]["step"], part["divergence"]["series"]) == (
+            "diverged", 1, 70, "grad_norms/blocks.2.weight")
+        assert [(item["rank"], item["answer"]) for item in part["by_rank"]] == [(0, "no_divergence"), (1, "diverged")]
+
+    # Rank 1's report gone: the command line judges that rank from its parts, the tool does not.
+    (store / "runs" / "b" / "rank=1" / "incidents.json").unlink()
+    judged_here = tensorquill.compare_runs("a", "b", source=store)
+    read = judged_here["runs"][1]["read_from"]
+    assert (read["judged_ranks"], read["unknown_ranks"], read["judged_here"]) == ([0, 1], [], [1])
+    assert "the Python detectors judged their stored parts here" in read["judged_by"]
+    assert brief(judged_here) == brief(from_local)
+    not_read = tensorquill.compare_runs("a", "b", source=store, read_parts=False)
+    assert not_read["runs"][1]["read_from"]["unknown_ranks"] == [1] and not_read["incidents"]["entries"] == []
+    assert not_read["incidents"]["other_ranks_not_compared"] == {"B": [1]}
+    assert not_read["runs"][1]["read_from"]["unknown_why"][1].startswith("missing")

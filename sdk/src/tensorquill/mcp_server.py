@@ -1010,7 +1010,8 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
 # --- Other runs -----------------------------------------------------------------------------
 
 _ROW_KEYS = ("project", "name", "run_id", "group", "tags", "has_manifest", "source", "started", "run_state", "last_step",
-             "incidents", "first_incident", "kinds_checked", "ranks", "evidence")
+             "incidents", "first_incident", "kinds_checked", "ranks", "evidence", "rank_count", "ranks_with_incidents",
+             "kinds_not_stated")
 
 
 def _text_argument(arguments: Mapping[str, Any], name: str) -> str | None:
@@ -1197,7 +1198,11 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " and its small evidence or report files only, and runs no detector: a local run whose evidence file was"
             " never written has `run_state` null and `evidence.state` \"missing\", which is not \"clean\". A run"
             " with `has_manifest` false was recorded before runs had a project, and is listed under"
-            " `uncategorized` with its run ID as its name."
+            " `uncategorized` with its run ID as its name. `rank_count` is how many ranks the run has. For a run of"
+            " several ranks the row is the whole run's, by the all-ranks rules: the incidents of every judged rank"
+            " (`ranks_with_incidents` names them), and a kind counts as checked only when every judged rank checked"
+            " it. A rank without a current report or evidence file is unknown (`evidence.unknown_ranks`), never"
+            " clean; `kinds_not_stated` says why there is no count."
         ),
         "inputSchema": {
             "type": "object",
@@ -1223,10 +1228,17 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " `checked` there means that run looked, with enough history, and found none. `divergence`: for two"
             " paired runs, the first step and the layer or parameter where they part (`state` `diverged`), or"
             " `no_divergence`, or `no_answer` with the reason in `detail` (runs that never agreed early); any other"
-            " `state` says why it was not asked, such as a run in a server's store. One rank of each run is read (`rank`, default the"
-            " lowest); `incidents.other_ranks_not_compared` lists a run's ranks that were not read. Local files are"
-            " judged here. A run in a server's store is read from the server's report and no part is opened; when"
-            " that report is not current the tool says so and compares nothing."
+            " `state` says why it was not asked, such as a run in a server's store or runs whose ranks differ"
+            " (`ranks_differ`). Every rank of each run is read: its incidents come from all of its ranks (an entry's"
+            " `ranks` names the ranks that show it), and in `checked` a kind is `checked` for the run only when every"
+            " judged rank checked it with enough history (`history_not_stated`: some rank does not say). For two runs"
+            " of several ranks, `divergence` compares each rank with the same rank of the other run and gives the"
+            " earliest, with its `rank` and every rank's answer in `by_rank`. `rank` reads that one rank of every run"
+            " instead. `incidents.other_ranks_not_compared` lists a run's ranks whose incidents are not in the answer:"
+            " those not read, or, when every rank is read, those without a current report (not clean). Local files"
+            " are judged here. A run in a server's store is read from the server's reports and no part is opened; a"
+            " rank whose report is not current is unknown, and when no rank's is, the tool says so and compares"
+            " nothing."
         ),
         "inputSchema": {
             "type": "object",
@@ -1234,7 +1246,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
                 "runs": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": MAX_COMPARED,
                          "description": "Run IDs or names, as list_runs gives them. The first is A, the second B."},
                 "project": {"type": "string", "description": "Look names up in this project only."},
-                "rank": {"type": "integer", "minimum": 0, "description": "The rank read of every run (default: each run's lowest)."},
+                "rank": {"type": "integer", "minimum": 0, "description": "Read this one rank of every run (default: every rank)."},
             },
             "required": ["runs"],
             "additionalProperties": False,
