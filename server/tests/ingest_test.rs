@@ -1334,7 +1334,7 @@ async fn a_run_with_a_silent_rank(server: &TestServer) -> (Put, Put) {
 }
 
 #[tokio::test]
-async fn a_killed_servers_silent_rank_and_incident_survive_a_restart_with_their_clock() {
+async fn a_killed_servers_silent_rank_gets_a_fresh_window_and_keeps_the_quiet_time_it_shows() {
     let dir = tempfile::tempdir().unwrap();
     let old = start(dir.path(), watch_config(400), None).await;
     let (_rank0, _rank1) = a_run_with_a_silent_rank(&old).await;
@@ -1351,13 +1351,13 @@ async fn a_killed_servers_silent_rank_and_incident_survive_a_restart_with_their_
 
     let new = start(dir.path(), watch_config(400), None).await;
     assert_eq!(new.ingest.restore_watchdog().await.unwrap(), 1);
-    // The first status after the restart, with no sender reconnected: the stall is still there,
-    // with the quiet time it had (not reset, and not grown by the outage).
+    // The first status after the restart, with no sender reconnected: every rank has a fresh
+    // window from the restart (decided Nov 17, 2026), so no stall yet; the quiet time it shows is
+    // the one it had (not reset, and not grown by the outage).
     let status = &new.ingest.watchdog_statuses()[RUN];
-    assert_eq!(status["summary"], "degraded");
-    assert_eq!(status["incidents"][0]["kind"], "rank_silent");
-    assert_eq!(status["incidents"][0]["assessment"], "suspected_hang");
-    assert_eq!(status["ranks"][1]["state"], "silent"); // held as it was while its sender comes back
+    assert_eq!(status["summary"], "active");
+    assert!(status["incidents"].as_array().unwrap().is_empty(), "{status}");
+    assert_eq!(status["ranks"][1]["state"], "reconnecting");
     assert_eq!(status["ranks"][1]["stream"], "dropped");
     assert_eq!(status["ranks"][1]["last_step"], 49);
     assert_eq!(status["ranks"][0]["last_step"], before["ranks"][0]["last_step"]);
@@ -1367,15 +1367,14 @@ async fn a_killed_servers_silent_rank_and_incident_survive_a_restart_with_their_
         "{quiet_before} -> {quiet_after}"
     );
     assert_eq!(status["world_size"], 2);
-    // The file now says the new server is watching, with the incident in it.
+    // The file now says the new server is watching.
     new.ingest.write_watchdog().await;
     let after = read_status(dir.path());
     assert_eq!(after["server_running"], true);
-    assert_eq!(after["incidents"][0]["kind"], "rank_silent");
     assert!(after["written_at_ms"].as_i64() > before["written_at_ms"].as_i64());
 
-    // The silent rank's sender returns with nothing new: silent, from its old last progress. The
-    // other rank's batch makes it active again.
+    // The silent rank's sender returns with nothing new: silent again once its window from the
+    // restart has passed. The other rank's batch makes it active again.
     let _rank1 = open(&new, 1).await;
     until("rank 1 silent again", || rank_states(&new)[1].1 == "silent").await;
     let mut rank0 = open(&new, 0).await;
@@ -1390,7 +1389,7 @@ async fn a_killed_servers_silent_rank_and_incident_survive_a_restart_with_their_
 }
 
 #[tokio::test]
-async fn a_clean_stop_says_server_stopped_and_a_restart_brings_the_stall_back() {
+async fn a_clean_stop_says_server_stopped_and_the_stall_comes_back_after_the_fresh_window() {
     let dir = tempfile::tempdir().unwrap();
     let old = start(dir.path(), watch_config(400), None).await;
     let (_rank0, _rank1) = a_run_with_a_silent_rank(&old).await;
@@ -1410,12 +1409,21 @@ async fn a_clean_stop_says_server_stopped_and_a_restart_brings_the_stall_back() 
     let status = &new.ingest.watchdog_statuses()[RUN];
     assert_eq!(
         (status["summary"].as_str(), status["server_running"].as_bool()),
-        (Some("degraded"), Some(true))
+        (Some("active"), Some(true))
     );
-    assert_eq!(status["incidents"][0]["kind"], "rank_silent");
-    assert_eq!(status["ranks"][1]["state"], "silent");
+    assert_eq!(status["ranks"][1]["state"], "reconnecting");
+    // No sender comes back: after the window both ranks are lost and the run is stalled.
+    until("the stall back", || {
+        new.ingest.watchdog_statuses()[RUN]["summary"] == "stalled"
+    })
+    .await;
+    let status = &new.ingest.watchdog_statuses()[RUN];
+    assert_eq!(
+        (&status["incidents"][0]["kind"], &status["incidents"][0]["assessment"]),
+        (&serde_json::json!("job_stalled"), &serde_json::json!("lost_connection"))
+    );
     new.ingest.write_watchdog().await;
-    assert_eq!(read_status(dir.path())["summary"], "degraded");
+    assert_eq!(read_status(dir.path())["summary"], "stalled");
 }
 
 #[tokio::test]
@@ -1516,10 +1524,11 @@ impl Drop for Reaped {
     }
 }
 
-/// The real binary, killed with SIGKILL: its last file stays, and the next one takes the run up.
+/// The real binary, killed with SIGKILL: its last file stays, and the next one takes the run up
+/// with a fresh window for its rank.
 #[cfg(unix)]
 #[tokio::test]
-async fn the_binary_killed_with_sigkill_resumes_the_stall_it_was_watching() {
+async fn the_binary_killed_with_sigkill_takes_its_run_up_with_a_fresh_window() {
     use std::io::{BufRead, BufReader};
     let dir = tempfile::tempdir().unwrap();
     let launch = || {
@@ -1582,10 +1591,12 @@ async fn the_binary_killed_with_sigkill_resumes_the_stall_it_was_watching() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // The first file the new server wrote already carries the incident, with the old clock.
+    // The first file the new server wrote has no stall: the rank has a fresh window from the
+    // restart (decided Nov 17, 2026). It shows the quiet time it had.
     assert_eq!(first["server_running"], true, "{first}");
-    assert_eq!(first["summary"], "stalled");
-    assert_eq!(first["incidents"][0]["kind"], "job_stalled");
+    assert_eq!(first["summary"], "active");
+    assert_eq!(first["incidents"], serde_json::json!([]));
+    assert_eq!(first["ranks"][0]["state"], "reconnecting");
     assert_eq!(first["ranks"][0]["last_step"], 9);
     let quiet = first["ranks"][0]["seconds_since_progress"].as_f64().unwrap();
     assert!(

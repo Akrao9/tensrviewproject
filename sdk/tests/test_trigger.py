@@ -118,7 +118,7 @@ def test_a_planted_failure_in_a_growing_file_starts_the_command_once(tmp_path, h
         "event": "incident", "version": 1, "id": "r/rank0/non_finite/30", "attempt": 1,
         "sent_at_ms": payload["sent_at_ms"], "run_id": "r", "evidence": str(out.resolve()),
         "run_state": "unhealthy", "kind": "non_finite", "class": "invariant", "step": 30, "rank": 0, "ranks": [0],
-        "new_ranks": [0], "summary": "NaN or Inf at step 30 in <total>", "incident": incident,
+        "new_ranks": [0], "assessment": None, "summary": "NaN or Inf at step 30 in <total>", "incident": incident,
     }
     # The command inherits the watcher's environment, so a `TENSORQUILL_*` variable the watcher
     # itself was started with (CI's server job sets `TENSORQUILL_SERVER_BIN`) is there unchanged.
@@ -129,6 +129,7 @@ def test_a_planted_failure_in_a_growing_file_starts_the_command_once(tmp_path, h
         "TENSORQUILL_INCIDENT_ID": "r/rank0/non_finite/30", "TENSORQUILL_INCIDENT_KIND": "non_finite",
         "TENSORQUILL_INCIDENT_CLASS": "invariant", "TENSORQUILL_INCIDENT_STEP": "30",
         "TENSORQUILL_INCIDENT_RANKS": "0", "TENSORQUILL_INCIDENT_SUMMARY": "NaN or Inf at step 30 in <total>",
+        "TENSORQUILL_INCIDENT_ASSESSMENT": "",
     }
     printed = capsys.readouterr().out
     assert "trigger: non_finite at step 30 (rank 0): started the command (pid " in printed
@@ -198,9 +199,58 @@ def test_the_command_line_wakes_the_command_with_no_human_step(tmp_path, hook):
     (call,) = calls()
     assert call["payload"]["kind"] == "non_finite" and call["payload"]["step"] == 30
     assert call["env"]["TENSORQUILL_EVIDENCE"] == str((tmp_path / "run.evidence.compact.json").resolve())
+    # `--compact` given: the watcher writes the compact file alone, as before the trigger turned it on.
+    assert not (tmp_path / "run.evidence.json").exists() and "hands over the compact evidence" not in printed
     assert "trigger: each new incident fires the command once; firing: invariants, a stall at critical\n" in printed
     assert "trigger: non_finite at step 30 (rank 0): started the command" in printed
     assert "Traceback" not in printed
+
+
+def test_a_trigger_turns_on_the_compact_evidence_and_the_full_file_is_still_written(tmp_path, hook, capsys):
+    """Nov 17, 2026: `--on-incident` or `--webhook` with no `--compact` writes the full file as
+    before and hands over the compact one beside it; with `--compact` the watcher writes the
+    compact file alone, as it always has, and that one is handed over."""
+    command, calls = hook
+    source = tmp_path / "run.jsonl"
+    _write(source, _with(_records(range(40)), 30, **NAN))
+
+    # Through the Python API with the option the command line passes.
+    trigger = Trigger(command(), compact_window=5)
+    out = watch(source, interval=0.0, polls=3, trigger=trigger)
+    trigger.close(wait=20)
+    assert out == tmp_path / "run.evidence.json" and "compact" not in json.loads(out.read_text())
+    compact = tmp_path / "run.evidence.compact.json"
+    assert json.loads(compact.read_text())["compact"]["window"] == 5
+    (call,) = calls()
+    assert call["env"]["TENSORQUILL_EVIDENCE"] == call["payload"]["evidence"] == str(compact.resolve())
+    assert state_path_for(out).exists()  # the same state file as before, for the full name and the compact one
+
+    # A compact file that cannot be written: said once, and the full file is handed over.
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "e.evidence.compact.json").mkdir()  # a directory where the file would go
+    failing = Trigger(command(), compact_window=5, state_path=tmp_path / "b.fired.json")
+    evidence = {"run_id": "r", "incidents": [{"kind": "non_finite", "step": 3, "layers": [], "gradients": []}]}
+    for _ in range(2):
+        failing.look(evidence, blocked / "e.evidence.json", rank=0)
+    failing.close(wait=20)
+    assert calls()[-1]["payload"]["evidence"] == str((blocked / "e.evidence.json").resolve())
+    assert capsys.readouterr().out.count("could not be written") == 1
+
+    # The command line: the option is set by the trigger alone, and said at the start.
+    from tensorquill.trigger import from_args, add_arguments
+    import argparse
+    for given, expected in (([], 5), (["--compact"], None)):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--watch", action="store_true")
+        parser.add_argument("--compact", action="store_true")
+        parser.add_argument("--compact-window", type=int)
+        add_arguments(parser)
+        args = parser.parse_args(["--watch", "--webhook", "http://127.0.0.1:9/x", *given])
+        args.compact_window = 5 if args.compact else args.compact_window
+        assert from_args(args, parser).compact_window == expected
+    printed = capsys.readouterr().out
+    assert printed.count("hands over the compact evidence") == 1
 
 
 # --- What fires -------------------------------------------------------------------------------
@@ -458,33 +508,84 @@ def test_only_a_stopped_rank_makes_a_stall_critical_so_a_declared_pause_cannot_f
     # And the rank beside the paused one that stays silent until it is critical does: the stall
     # is that rank's, which is in training and not in a declared pause.
     assert fired(_status("degraded", paused, _rank(1, "silent", "critical"))) == (["critical"], 1)
-    # Whatever the assessment: a rank whose stream dropped and stayed away.
+    # That was the run's stall: a later one, of another kind and step, does not fire again
+    # (one firing for one stall), whatever its assessment.
     lost = _status("stalled", _rank(0, "lost", "critical", 55))
     assert [i["assessment"] for i in detect_watchdog_incidents(lost)] == ["lost_connection"]
-    assert fired(lost) == (["critical"], 2)
-    assert _settle(trigger, lambda: len(calls()) == 2)
+    assert fired(lost) == (["critical"], 1)
+    assert _settle(trigger, lambda: len(calls()) == 1)
 
 
-def test_a_stall_that_changes_its_kind_or_step_is_another_incident_and_fires_again(tmp_path, hook):
-    """What the key (rank, kind, step) does not hold back: pinned so a change to it is seen.
-    Both are one hang, seen twice."""
+def test_one_stall_fires_once_when_its_kind_or_step_changes(tmp_path, hook):
+    """One firing for one stall (Nov 17, 2026): a stall is keyed by its run. Under the key of
+    rank, kind and step this hang fired three times."""
     command, calls = hook
     path = tmp_path / "e.evidence.json"
     trigger = Trigger(command())
-
-    def look(status, wanted):
+    looks = [
+        # Rank 1 is silent at step 40 and critical while rank 0 goes on: `rank_silent`.
+        _status("degraded", _rank(0, "active", None, 90), _rank(1, "silent", "critical", 40), _rank(2, "active", None, 90)),
+        # Rank 2 falls silent further back, still at warning: the incident's step moves to it.
+        _status("degraded", _rank(0, "active", None, 95), _rank(1, "silent", "critical", 40), _rank(2, "silent", "warning", 30)),
+        # Then rank 0 stops too: the job is stalled, already critical on its first look.
+        _status("stalled", _rank(0, "silent", "warning", 99), _rank(1, "silent", "critical", 40), _rank(2, "silent", "warning", 30)),
+    ]
+    for status in looks:
         trigger.look({"run_id": "r", "incidents": detect_watchdog_incidents(status)}, path, rank=0)
-        assert _settle(trigger, lambda: len(calls()) == wanted)
+        assert _settle(trigger, lambda: len(calls()) == 1)
         trigger.close(wait=5)
         trigger.tick()
+    time.sleep(0.3)
+    assert _stall_calls(calls) == [("rank_silent", 40, "critical")]
+    assert [d["kind"] for d in json.loads(state_path_for(path).read_text())["deliveries"]] == ["rank_silent"]
+    # A restarted watcher on the stalled job: nothing either.
+    again = Trigger(command())
+    again.look({"run_id": "r", "incidents": detect_watchdog_incidents(looks[-1])}, path, rank=0)
+    again.close(wait=1)
+    assert len(calls()) == 1 and len(again.deliveries) == 1
 
-    # Rank 1 is silent at step 40 and critical while rank 0 goes on: `rank_silent`.
-    look(_status("degraded", _rank(0, "active", None, 90), _rank(1, "silent", "critical", 40), _rank(2, "active", None, 90)), 1)
-    # Rank 2 falls silent further back, still at warning: the incident's step moves to it.
-    look(_status("degraded", _rank(0, "active", None, 95), _rank(1, "silent", "critical", 40), _rank(2, "silent", "warning", 30)), 2)
-    # Then rank 0 stops too: the job is stalled, already critical on its first look.
-    look(_status("stalled", _rank(0, "silent", "warning", 99), _rank(1, "silent", "critical", 40), _rank(2, "silent", "warning", 30)), 3)
-    assert _stall_calls(calls) == [("rank_silent", 40, "critical"), ("rank_silent", 30, "critical"), ("job_stalled", 99, "critical")]
+    # The converse: `rank_silent` named fires at warning, and the `job_stalled` it becomes is
+    # not fired at critical. In the all-ranks view as well (the stall is the run's).
+    for name, evidence_of in (("one", lambda found: {"run_id": "q", "incidents": found}),
+                              ("all", lambda found: {"run_id": "q", "view": "all_ranks", "incident_groups": [],
+                                                     "run_incidents": found})):
+        before = len(calls())
+        named = Trigger(command(), kinds=["rank_silent"], state_path=tmp_path / f"{name}.fired.json")
+        warning = _status("degraded", _rank(0, "active", None, 90), _rank(1, "silent", "warning", 40))
+        stalled = _status("stalled", _rank(0, "silent", "critical", 90), _rank(1, "silent", "critical", 40))
+        for status in (warning, stalled, stalled):
+            named.look(evidence_of(detect_watchdog_incidents(status)), tmp_path / f"{name}.json", rank=0)
+            assert _settle(named, lambda: len(calls()) == before + 1)
+            named.close(wait=5)
+        time.sleep(0.3)
+        assert [(c["payload"]["kind"], c["payload"]["incident"]["severity"]) for c in calls()[before:]] == [
+            ("rank_silent", "warning")]
+
+
+def test_a_state_file_of_the_earlier_key_still_loads_and_its_stall_does_not_fire_again(tmp_path, hook):
+    """A `fired.json` written before Nov 17, 2026 holds a stall under (rank, kind, step); read
+    now, it is the run's stall, and the stall it becomes fires nothing."""
+    command, calls = hook
+    path = tmp_path / "e.evidence.json"
+    written = {"version": 1, "evidence": str(path), "deliveries": [
+        {"id": "r/rank0/rank_silent/40", "kind": "rank_silent", "step": 40, "ranks": [0], "first_seen_ms": 1,
+         "command": {"status": "done", "attempts": 1, "exit_status": 0, "at_ms": 1}},
+        {"id": "r/rank0/non_finite/12", "kind": "non_finite", "step": 12, "ranks": [0], "first_seen_ms": 1,
+         "command": {"status": "done", "attempts": 1, "exit_status": 0, "at_ms": 1}},
+    ]}
+    state_path_for(path).write_text(json.dumps(written))
+    trigger = Trigger(command())
+    stalled = _status("stalled", _rank(0, "silent", "critical", 90), _rank(1, "silent", "critical", 40))
+    evidence = {"run_id": "r", "incidents": [
+        *detect_watchdog_incidents(stalled), {"kind": "non_finite", "step": 12, "layers": [], "gradients": []},
+        {"kind": "non_finite", "step": 14, "layers": [], "gradients": []},
+    ]}
+    trigger.look(evidence, path, rank=0)
+    assert _settle(trigger, lambda: len(calls()) == 1)
+    trigger.close(wait=5)
+    # Only the NaN at a step that had not fired: the old key holds for every other kind.
+    assert [(c["payload"]["kind"], c["payload"]["step"]) for c in calls()] == [("non_finite", 14)]
+    assert [d["id"] for d in trigger.deliveries] == ["r/rank0/rank_silent/40", "r/rank0/non_finite/12", "r/rank0/non_finite/14"]
 
 
 def test_a_critical_stall_in_a_status_that_is_no_longer_written_still_fires(tmp_path, hook):
@@ -679,8 +780,9 @@ def test_the_webhook_posts_the_incident_as_json_once(tmp_path, receiver, capsys)
     body = strict(request["body"])
     assert sorted(body) == sorted([
         "event", "version", "id", "attempt", "sent_at_ms", "run_id", "evidence", "run_state", "kind", "class", "step",
-        "rank", "ranks", "new_ranks", "summary", "incident",
+        "rank", "ranks", "new_ranks", "assessment", "summary", "incident",
     ])
+    assert body["assessment"] is None  # a stall's label; an invariant has none
     assert (body["event"], body["version"], body["id"], body["attempt"]) == ("incident", 1, "r/rank0/non_finite/30", 1)
     assert (body["run_id"], body["kind"], body["class"], body["step"]) == ("r", "non_finite", "invariant", 30)
     assert (body["rank"], body["ranks"], body["new_ranks"], body["run_state"]) == (0, [0], [0], "unhealthy")
@@ -1036,7 +1138,9 @@ def test_a_real_rank_that_stops_stepping_starts_the_command_once_when_the_server
         return next((i for i in listed if i["kind"] == "job_stalled"), None)
 
     def fired(name: str) -> list[dict]:
-        return [c["payload"] for c in calls() if c["payload"]["evidence"] == str(outputs[name].resolve())]
+        # The command line's trigger hands over the compact file, written beside the full one.
+        handed = outputs[name].with_name(outputs[name].stem + ".compact.json")
+        return [c["payload"] for c in calls() if c["payload"]["evidence"] == str(handed.resolve())]
 
     def deliveries(name: str) -> list[dict]:
         path = state_path_for(outputs[name])
@@ -1113,3 +1217,264 @@ def test_a_real_rank_that_stops_stepping_starts_the_command_once_when_the_server
         for log in logs:
             log.close()
         server.kill()
+
+
+# --- Nov 17, 2026: one firing for one stall, a lost connection, and a fresh window at a restart --
+#
+# Real training processes beside a real `tensorquill-server`, watched by `python -m tensorquill`
+# as a user starts it. Needs `pyarrow` and the server binary, as `test_two_ranks_e2e.py` does.
+
+# One rank. It steps `TQ_STEPS` times, or until the file `TQ_STOP` exists, and then stops stepping
+# without closing: its process, its stream and its heartbeats go on, as those of a hung job do.
+_RANK_UNTIL = """
+import os, time
+import torch, tensorquill
+from torch import nn
+
+model = nn.Linear(8, 1)
+session = tensorquill.init(model, run_id=os.environ["TQ_RUN_ID"], every=10, heartbeat_seconds=0.5, stack_seconds=1.0)
+session._sink.sender._batch_seconds, session._sink.sender._backoff_cap = 0.25, 0.5
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+stop, steps, step = os.environ.get("TQ_STOP"), int(os.environ.get("TQ_STEPS", "0")), 0
+while (os.path.exists(stop) is False) if stop else step < steps:
+    optimizer.zero_grad()
+    loss = model(torch.randn(16, 8)).pow(2).mean()
+    loss.backward()
+    session.log({"train/loss": loss})
+    optimizer.step()
+    step += 1
+    time.sleep(0.01)
+# Steps leave the device ten at a time: the last ones are flushed before the stop.
+while step % 10:
+    session.log({"train/loss": torch.tensor(0.0)})
+    step += 1
+print("stopped stepping", flush=True)
+
+def stuck_here():
+    while True:
+        time.sleep(0.2)
+
+stuck_here()
+"""
+
+
+class _RealJob:
+    """A real server and real ranks of one run, and the command-line watchers of it."""
+
+    def __init__(self, tmp_path: Path, run_id: str, *flags: str) -> None:
+        pytest.importorskip("pyarrow.flight")
+        import test_two_ranks_e2e as e2e
+
+        if e2e.BINARY is None:
+            pytest.skip("tensorquill-server is not built")
+        self.e2e, self.tmp, self.run_id, self.flags = e2e, tmp_path, run_id, flags
+        self.store, self.work = tmp_path / "store", tmp_path / "work"
+        self.work.mkdir()
+        self.status_file = self.store / "runs" / run_id / "watchdog.json"
+        self.env = {k: v for k, v in os.environ.items()
+                    if k not in ("TENSORQUILL_TOKEN", "TENSORQUILL_TLS_CA", "MLFLOW_RUN_ID", "TORCHELASTIC_RUN_ID")}
+        self.env["PYTHONPATH"] = str(SRC)
+        self.processes: list[subprocess.Popen] = []
+        self.logs: list = []
+        self.servers = [e2e.Server(self.store, 0, *flags)]
+
+    @property
+    def server(self):
+        return self.servers[-1]
+
+    def restart_server(self) -> float:
+        """SIGKILL the server and start another on the same port and store; the time it started."""
+        port = self.server.port
+        self.server.kill()
+        started = time.time()
+        self.servers.append(self.e2e.Server(self.store, port, *self.flags))
+        return started
+
+    def rank(self, rank: int, world: int, **env: str) -> subprocess.Popen:
+        log = (self.tmp / f"rank{rank}.log").open("w")
+        self.logs.append(log)
+        process = subprocess.Popen(
+            [sys.executable, "-c", _RANK_UNTIL], cwd=self.work, stdout=log, stderr=subprocess.STDOUT,
+            env={**self.env, "RANK": str(rank), "LOCAL_RANK": str(rank), "WORLD_SIZE": str(world),
+                 "TENSORQUILL_ENDPOINT": self.server.endpoint, "TQ_RUN_ID": self.run_id, "PYTHONUNBUFFERED": "1", **env},
+        )
+        self.processes.append(process)
+        return process
+
+    def watcher(self, output: Path, *options: str) -> Path:
+        log_path = self.tmp / f"watcher-{len(self.logs)}.log"
+        log = log_path.open("w")
+        self.logs.append(log)
+        self.processes.append(subprocess.Popen(
+            [sys.executable, "-m", "tensorquill", str(self.status_file.parent), "--watch", "--interval", "0.2",
+             "-o", str(output), *options],
+            cwd=self.tmp, env=self.env, stdout=log, stderr=subprocess.STDOUT,
+            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
+        ))
+        return log_path
+
+    def status(self) -> dict:
+        return tensorquill.evidence.read_watchdog(self.status_file) or {}
+
+    @staticmethod
+    def until(ready, what: str, seconds: float = 60.0):
+        deadline = time.monotonic() + seconds
+        while True:
+            found = ready()
+            if found:
+                return found
+            assert time.monotonic() < deadline, f"timed out waiting for {what}"
+            time.sleep(0.05)
+
+    def close(self) -> None:
+        for process in self.processes:
+            if process.poll() is None:
+                if process.args[:3] == [sys.executable, "-m", "tensorquill"]:
+                    process.send_signal(signal.SIGINT)
+                    try:
+                        process.wait(20)
+                        continue
+                    except subprocess.TimeoutExpired:
+                        pass
+                process.kill()
+                process.wait(20)
+        for server in self.servers:
+            if server.process.poll() is None:
+                server.kill()
+        for log in self.logs:
+            log.close()
+
+
+# Silent after 2 s without a step, critical after 6 s; the status is looked at every 0.2 s and an
+# unchanged one is written again every 0.6 s.
+_QUICK_STALL = ("--silent-seconds", "2", "--silent-factor", "0", "--critical-seconds", "6",
+                "--watchdog-seconds", "0.2", "--flush-seconds", "0.3")
+
+
+def test_a_silent_rank_that_becomes_a_stalled_job_fires_once_through_the_webhook(tmp_path, receiver):
+    """One firing for one stall, through `--rank all --watch --webhook`, which turns on the
+    compact evidence: the webhook names the compact file, and the full file is written as before."""
+    hooked = receiver()
+    job = _RealJob(tmp_path, "silent-then-stalled", *_QUICK_STALL)
+    output = tmp_path / "all.json"
+    compact = tmp_path / "all.compact.json"
+    stop = tmp_path / "stop-rank1"
+    try:
+        job.rank(0, 2, TQ_STEPS="100")  # stops after 100 steps
+        job.rank(1, 2, TQ_STOP=str(stop))  # steps until told to stop
+        job.until(lambda: len(job.status().get("ranks", ())) == 2 and all(
+            r["last_step"] is not None for r in job.status()["ranks"]), "both ranks' first stored steps")
+        log = job.watcher(output, "--rank", "all", "--webhook", hooked.url)
+        # Rank 0 is silent and then critical while rank 1 steps: `rank_silent`, posted once.
+        job.until(lambda: hooked.requests, "the post for the silent rank", 90.0)
+        assert job.status()["summary"] == "degraded"
+        stop.touch()
+        # Rank 1 stops too: the job is stalled, and already critical (rank 0 is).
+        def stalled():
+            try:
+                listed = json.loads(output.read_text()).get("run_incidents") or ()
+            except (OSError, ValueError):
+                return None
+            return next((i for i in listed if i["kind"] == "job_stalled" and i["severity"] == "critical"), None)
+
+        job.until(stalled, "the stalled job at critical in the full evidence", 90.0)
+        seen = {job.status().get("written_at_ms")}
+        job.until(lambda: seen.add(job.status().get("written_at_ms")) or len(seen) >= 5, "more writes of the status")
+        time.sleep(1.0)
+        printed = log.read_text()
+    finally:
+        job.close()
+    (request,) = hooked.requests  # once for the stall, not again when it became a stalled job
+    body = json.loads(request["body"])
+    assert (body["kind"], body["incident"]["severity"], body["assessment"]) == ("rank_silent", "critical", "suspected_hang")
+    assert body["evidence"] == str(compact.resolve())
+    full, small = json.loads(output.read_text()), json.loads(compact.read_text())
+    assert "compact" not in full and full["view"] == "all_ranks" and small["compact"]["samples"]["total"] == 0
+    assert [i["kind"] for i in full["run_incidents"]] == ["job_stalled"]
+    (delivery,) = json.loads(state_path_for(output).read_text())["deliveries"]
+    assert delivery["kind"] == "rank_silent"
+    assert "hands over the compact evidence" in printed and printed.count("posted to the webhook") == 1
+    assert "Traceback" not in printed
+
+
+def test_a_rank_killed_mid_run_reads_as_a_lost_connection_and_fires_once(tmp_path, hook):
+    """An out-of-memory kill, as the stream sees it: rank 1 is killed with SIGKILL while rank 0
+    goes on living and waits (as it would in a collective). The stall is a lost connection, in
+    Rust's incidents and Python's alike, and the command is started once with that label."""
+    command, calls = hook
+    job = _RealJob(tmp_path, "killed", *_QUICK_STALL)
+    output = tmp_path / "all.json"
+    try:
+        job.rank(0, 2, TQ_STEPS="100")
+        victim = job.rank(1, 2, TQ_STEPS="100")
+        job.until(lambda: len(job.status().get("ranks", ())) == 2 and all(
+            r["last_step"] == 99 for r in job.status()["ranks"]), "both ranks' last steps stored")
+        log = job.watcher(output, "--rank", "all", "--on-incident", command())
+        victim.kill()  # SIGKILL: no clean end of the stream
+        victim.wait(20)
+        job.until(calls, "the command", 90.0)
+        status = job.until(lambda: job.status() if job.status().get("incidents") and
+                           job.status()["incidents"][0]["severity"] == "critical" else None, "a critical status")
+        seen = {job.status().get("written_at_ms")}
+        job.until(lambda: seen.add(job.status().get("written_at_ms")) or len(seen) >= 4, "more writes of the status")
+        time.sleep(1.0)
+        printed = log.read_text()
+    finally:
+        job.close()
+    # Rust wrote the status's incidents; Python reads the same status to the same incidents.
+    assert detect_watchdog_incidents(status) == json.loads(json.dumps(status["incidents"]))
+    (stall,) = status["incidents"]
+    assert (stall["kind"], stall["assessment"], stall["lost_ranks"]) == ("job_stalled", "lost_connection", [1])
+    assert {r["rank"]: r["state"] for r in stall["ranks"]} == {0: "silent", 1: "lost"}
+    (call,) = calls()
+    payload, env = call["payload"], call["env"]
+    assert (payload["kind"], payload["assessment"], payload["step"]) == ("job_stalled", "lost_connection", 99)
+    assert env["TENSORQUILL_INCIDENT_ASSESSMENT"] == "lost_connection"
+    assert "read as a lost connection, not a hang" in payload["summary"] and "out-of-memory kill" in payload["summary"]
+    assert env["TENSORQUILL_EVIDENCE"] == str((tmp_path / "all.compact.json").resolve())
+    assert printed.count("trigger: job_stalled (lost connection) at step 99 (the run): started the command") == 1
+    assert "Traceback" not in printed
+
+
+def test_a_restart_gives_a_restored_rank_a_fresh_window_before_it_can_fire(tmp_path, hook):
+    """A rank hung for 8 s (a warning; critical at 12 s) when the server is killed and started
+    again. Under the rule before Nov 17, 2026 it was critical about 4 s after the restart and
+    fired; now its window starts at the restart: silent 3 s after it, critical 12 s after it."""
+    command, calls = hook
+    job = _RealJob(tmp_path, "restarted", "--silent-seconds", "3", "--silent-factor", "0", "--critical-seconds", "12",
+                   "--watchdog-seconds", "0.2", "--flush-seconds", "0.3")
+    output = tmp_path / "one.json"
+    try:
+        rank = job.rank(0, 1, TQ_STEPS="100")
+        job.until(lambda: (job.status().get("ranks") or [{}])[0].get("last_step") == 99, "the rank's last step stored")
+        log = job.watcher(output, "--on-incident", command())
+        job.until(lambda: (job.status().get("ranks") or [{}])[0].get("severity") == "warning", "the warning", 30.0)
+        job.until(lambda: job.status()["ranks"][0]["seconds_since_progress"] >= 8.0, "8 s of quiet", 30.0)
+        assert job.status()["ranks"][0]["severity"] == "warning" and calls() == []
+        restarted = job.restart_server()
+        restarted_ms = restarted * 1000
+        # The first statuses of the new server: no stopped rank, no incident, the quiet time kept.
+        first = job.until(lambda: job.status() if job.status().get("written_at_ms", 0) > restarted_ms else None,
+                          "the new server's first status")
+        assert first["summary"] == "active" and first["incidents"] == [], first
+        assert first["ranks"][0]["state"] in ("reconnecting", "active")
+        assert first["ranks"][0]["seconds_since_progress"] >= 8.0
+        # Nothing fires inside the window and the warning that follows it: 9 s after the restart
+        # (the old rule fired at about 4 s), nothing has started.
+        while time.time() < restarted + 9.0:
+            assert calls() == [], "fired inside the fresh window"
+            time.sleep(0.1)
+        silent = job.status()["ranks"][0]
+        assert (silent["state"], silent["severity"]) == ("silent", "warning"), silent
+        # After it, the command starts, once.
+        job.until(calls, "the command after the window", 60.0)
+        time.sleep(1.5)
+        assert rank.poll() is None  # the training process was never touched
+        printed = log.read_text()
+    finally:
+        job.close()
+    (call,) = calls()
+    incident = call["payload"]["incident"]
+    assert (call["payload"]["kind"], incident["severity"], incident["assessment"]) == ("job_stalled", "critical", "suspected_hang")
+    assert incident["written_at_ms"] - restarted_ms >= 11_000  # critical 12 s after the restart
+    assert "Traceback" not in printed

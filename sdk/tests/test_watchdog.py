@@ -29,7 +29,9 @@ def test_a_stalled_job_and_a_silent_rank_become_incidents():
                                              "expert_count": 0, "router_names": []})
     assert "Job stalled after step 149" in summary and "its connection dropped and did not return" in summary
     assert "Flight Recorder shows a stuck collective" not in summary
-    assert hit["severity"] == "warning" and hit["assessment"] == "suspected_hang"
+    # The job stopped as a whole and rank 1 is gone: read as a lost connection (Nov 17, 2026).
+    assert hit["severity"] == "warning" and hit["assessment"] == "lost_connection" and hit["lost_ranks"] == [1]
+    assert "read as a lost connection, not a hang" in summary and "still connected are most likely waiting" in summary
 
     degraded = _status("degraded", [_rank(0, "active", 400), _rank(1, "silent", 349, 900.0)], missing=[2], world_size=3)
     [hit] = detect_watchdog_incidents(degraded)
@@ -651,3 +653,29 @@ def test_a_stall_before_the_first_stored_batch_is_said_as_that():
     # A job with one rank past its first batch is a stall after that step, as before.
     [hit] = detect_watchdog_incidents(_status("stalled", [_rank(0, "silent", 49, 700.0), hung | {"rank": 1}]))
     assert "Job stalled after step 49" in said(hit)
+
+
+def _rule(summary, *ranks):
+    [hit] = detect_watchdog_incidents(_status(summary, [_rank(r, state, step, severity="critical") for r, state, step in ranks]))
+    return hit["kind"], hit["assessment"], hit.get("lost_ranks")
+
+
+def test_a_lost_rank_labels_the_stall_when_it_explains_it():
+    """The same cases as `a_lost_rank_labels_the_stall_when_it_explains_it` in `watchdog.rs`."""
+    # One rank OOM-killed, the others blocked in a collective waiting for it: the job stopped.
+    assert _rule("stalled", (0, "silent", 40), (1, "lost", 40), (2, "unresponsive", 40)) == (
+        "job_stalled", "lost_connection", [1])
+    # Every stopped rank lost while the rest step.
+    assert _rule("degraded", (0, "active", 90), (1, "lost", 40)) == ("rank_silent", "lost_connection", [1])
+    # A lost rank beside an unrelated silent one while another steps: the silent one is not
+    # waiting for the lost one, so it is a suspected hang, and the lost rank is still named.
+    assert _rule("degraded", (0, "active", 90), (1, "lost", 40), (2, "silent", 60)) == (
+        "rank_silent", "suspected_hang", [1])
+    assert _rule("stalled", (0, "silent", 40)) == ("job_stalled", "suspected_hang", None)
+    # The summary says it is not a hang, and names the lost rank; a suspected hang keeps its sentence.
+    text = _text(detect_watchdog_incidents(_status("degraded", [_rank(0, "active", 90), _rank(1, "lost", 40, stream="dropped", severity="critical")])))
+    assert "The connection of rank 1 dropped and did not come back: read as a lost connection, not a hang." in text
+    assert "out-of-memory kill" in text and "[critical, lost connection]" in text
+    assert "look the same to the server" not in text and "waiting for it" not in text
+    hang = _text(detect_watchdog_incidents(_status("stalled", [_rank(0, "silent", 40, severity="critical")])))
+    assert "can look the same from here" in hang and "lost connection" not in hang

@@ -269,14 +269,17 @@ def test_the_watchdog_state_in_s3_survives_a_killed_server(tmp_path, bucket):
         time.sleep(3.0)  # an outage longer than the floor, and than the bound below
 
         server = Server(tmp_path, bucket, prefix, *watching)
-        # Nobody has reconnected. The first status the new server writes already has the incident, with
-        # the old quiet time: not reset, and not grown by the outage.
+        # Nobody has reconnected. The first status the new server writes gives the rank a fresh window
+        # from the restart (decided Nov 17, 2026): no stall yet, and the old quiet time shown, not
+        # reset and not grown by the outage. After the window the stall is back, a lost connection.
         after = wait_for(
             "the new server's first status", lambda: (lambda s: s if s["written_at_ms"] > before["written_at_ms"] else None)(bucket.json(key))
         )
-        assert after["server_running"] is True and after["summary"] == "stalled"
-        assert after["incidents"][0]["kind"] == "job_stalled" and after["ranks"][0]["last_step"] == 59
+        assert after["server_running"] is True and after["summary"] == "active" and after["incidents"] == []
+        assert after["ranks"][0]["state"] == "reconnecting" and after["ranks"][0]["last_step"] == 59
         assert quiet_before <= after["ranks"][0]["seconds_since_progress"] < quiet_before + 1.5
+        again = wait_for("the stall back", lambda: (lambda s: s if s["summary"] == "stalled" else None)(bucket.json(key)))
+        assert (again["incidents"][0]["kind"], again["incidents"][0]["assessment"]) == ("job_stalled", "lost_connection")
         # A sender comes back and the run is active again.
         write_steps(path, run, 0, range(60, 120))
         sender = FlightSender(path, server.grpc, run, 0)
