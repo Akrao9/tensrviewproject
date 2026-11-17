@@ -170,15 +170,18 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
 
 def _open_store(run: Mapping[str, Any], rank: int | None, read_parts: bool) -> dict[str, Any]:
     from .evidence import (
-        _discover_rank_folders, _report_evidence, applied_thresholds, build_evidence, load_records,
-        read_server_report, read_watchdog,
+        _discover_rank_folders, _ranks_without_folder, _report_evidence, applied_thresholds, build_evidence,
+        load_records, read_server_report, read_watchdog,
     )
 
     folder = Path(run["path"])
     folders = _discover_rank_folders(folder)
     if not folders:
         raise _runs.RunLookupError(f"run {run['run_id']} at {folder} has no rank=<n> folder yet: nothing to compare")
-    if rank is None and len(folders) > 1:
+    # Several ranks, as the all-ranks view counts them: the folders, and the ranks the server's
+    # status expects that stored nothing (unknown, never clean).
+    expected = _ranks_without_folder(folders, read_watchdog(folder / "watchdog.json")) if rank is None else {}
+    if rank is None and len(folders) + len(expected) > 1:
         return _open_store_all_ranks(run, folder, folders, read_parts)
     picked = rank if rank in folders else min(folders) if rank is None or len(folders) == 1 else None
     if picked is None:
@@ -693,25 +696,37 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
     The answer is the earliest divergence over the ranks (the lowest rank on a tie), with the
     keys one rank's answer has, read from that rank; `no_divergence` only when every rank
     says so; else `no_answer`, naming the ranks without one. `by_rank` has each rank's answer
-    in brief.
+    in brief: a rank without an answer carries its reason when it is not the chosen rank's.
     """
     from .divergence import divergence_summary, first_divergence
     from .evidence import load_records
 
-    sets = []
+    # Each run's step records by rank, and its ranks: all of them, whether or not a rank has
+    # records yet, so that a run of two ranks is never taken for a run of one.
+    paths: list[dict[int, str]] = []
+    sets: list[list[int]] = []
     for run in opened:
         records = run["records"]
-        sets.append(sorted(records["ranks"]) if records.get("rank") is None else [records["rank"]])
+        own = dict(records["ranks"]) if records.get("rank") is None else {records["rank"]: records["path"]}
+        paths.append(own)
+        listed = run["read_from"].get("ranks") if records.get("rank") is None else None
+        sets.append(sorted(set(listed or ()) | set(own)))
     if sets[0] != sets[1]:
         return {"state": "ranks_differ", "ranks": {labels[0]: sets[0], labels[1]: sets[1]},
                 "detail": f"where the two runs part compares each rank with the same rank of the other run, and {labels[0]} "
                           f"has {_rank_text(sets[0])} where {labels[1]} has {_rank_text(sets[1])}: with other ranks a rank reads another share of the data, so no rank is "
                           "compared"}
+    without = {rank: [label for label, own in zip(labels, paths) if rank not in own] for rank in sets[0]}
+    without = {rank: missing for rank, missing in without.items() if missing}
+    compared = [rank for rank in sets[0] if rank not in without]
+    if not compared:
+        return {"state": "no_records", "ranks_without_records": without,
+                "detail": "where the two runs part needs both runs' step records of a rank, and no rank has them in both"}
     answers: dict[int, dict[str, Any]] = {}
     summaries: dict[int, str] = {}
-    for rank in sets[0]:
+    for rank in compared:
         try:
-            pair = [load_records(run["records"]["ranks"][rank], rank=rank) for run in opened]
+            pair = [load_records(own[rank], rank=rank) for own in paths]
         except (OSError, ValueError, ImportError) as error:  # ImportError: a store's parts need pyarrow
             return {"state": "no_records", "detail": f"the step records of rank {rank} could not be read for where the runs "
                                                      f"part ({error})"}
@@ -743,14 +758,17 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
         picked = min(answers)
         state = "no_divergence"
         detail = f"no divergence on any of the {len(answers)} ranks compared; rank {picked}: {answers[picked]['reason']}"
+    if without:
+        detail += (f" Not compared: {_rank_text(sorted(without))}, with no step records yet in "
+                   + "; ".join(f"rank {rank}: {' and '.join(missing)}" for rank, missing in sorted(without.items())[:8]) + ".")
     chosen = answers[picked]
     brief = []
     for rank, found in answers.items():
         item: dict[str, Any] = {"rank": rank, "answer": found["answer"]}
         if found["answer"] == "diverged":
             item.update(step=(found.get("divergence") or {}).get("step"), series=(found.get("divergence") or {}).get("series"))
-        elif found["answer"] == "no_answer":
-            item["reason"] = found["reason"]
+        elif found["answer"] == "no_answer" and (rank == picked or found["reason"] != chosen["reason"]):
+            item["reason"] = found["reason"]  # the same paragraph as the chosen rank's is given once
         brief.append(item)
     return {
         "state": state, "detail": detail,
@@ -758,6 +776,7 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
         "labels": {"a": labels[0], "b": labels[1]},
         **{key: value for key, value in chosen.items() if key not in ("answer", "reason")},
         "ranks_compared": sorted(answers),
+        **({"ranks_without_records": without} if without else {}),
         "by_rank": brief,
     }
 

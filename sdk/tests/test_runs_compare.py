@@ -555,6 +555,19 @@ def test_where_two_runs_of_several_ranks_part_is_asked_rank_by_rank_and_the_earl
     assert [(item["rank"], item.get("step")) for item in both["by_rank"]] == [(0, 70), (1, 90)]
     assert both["detail"].startswith("on rank 0, earliest of the 2 of 2 ranks that part")
 
+    # A rank with no record yet: never read as a run of fewer ranks, and named as not compared.
+    local_run(folder, "g", dense(120, run="g"), project="p", name="g")
+    (folder / "g.rank1.jsonl").write_text("")
+    local_run(folder, "h", dense(120, run="h"), project="p", name="h")
+    one_rank = tensorquill.compare_runs("h", "g", source=folder)["divergence"]
+    assert one_rank["state"] == "ranks_differ" and one_rank["ranks"] == {"A": [0], "B": [0, 1]}
+    early = tensorquill.compare_runs("a", "g", source=folder)
+    assert early["runs"][1]["read_from"]["unknown_ranks"] == [1] and early["incidents"]["other_ranks_not_compared"] == {"B": [1]}
+    part = early["divergence"]
+    assert (part["state"], part["ranks_compared"], part["ranks_without_records"]) == ("no_divergence", [0], {1: ["B"]})
+    assert "Not compared: rank 1, with no step records yet in rank 1: B." in part["detail"]
+    json.dumps(early, allow_nan=False)
+
     # The same runs: no rank parts, so no divergence; a rank without an answer makes it no answer.
     for rank in (0, 1):
         local_run(folder, "c", dense(120, run="c", rank=rank), rank=rank, project="p", name="c")
@@ -604,7 +617,10 @@ def test_the_listing_reads_every_ranks_evidence_file_and_a_rank_without_one_is_u
     assert (row["rank_count"], row["ranks"], row["run_state"], row["incidents"]) == (2, [0, 1], "unknown", {})
     assert row["evidence"]["state"] == "ranks_unknown" and (row["evidence"]["judged_ranks"], row["evidence"]["unknown_ranks"]) == (1, 1)
     assert "rank 1 has no evidence file" in row["evidence"]["detail"]
-    ev.write_evidence(ev.build_evidence(rank1), rank1.with_suffix(".evidence.json"))
+    # As the note says: the command line on rank 1's file writes rank 1's own evidence beside it.
+    written = cli(str(rank1), cwd=tmp_path)
+    assert written.returncode == 0, written.stderr
+    assert "grad_spike" in json.loads(rank1.with_suffix(".evidence.json").read_text())["incidents"][0]["kind"]
     row = {r["run_id"]: r for r in tensorquill.list_runs(folder)}["two"]
     assert (row["run_state"], row["incidents"], row["first_incident"], row["ranks_with_incidents"]) == (
         "unhealthy", {"anomaly": 1}, {"kind": "grad_spike", "step": 40}, [1])
@@ -787,6 +803,17 @@ def test_a_rank_whose_report_is_not_current_is_named_and_judged_from_its_parts_o
 
     rows = {row["run_id"]: row for row in tensorquill.list_runs(store)}
     assert rows["run-1"]["kinds_checked"] is None and "older tensorquill-server" in rows["run-1"]["kinds_not_stated"]
+
+    # One rank folder where the status expects two: both readers count two ranks, and the
+    # rank that stored nothing is unknown, not clean.
+    lone = ranked_store(tmp_path / "lone", {"run-3": {0: ([], None)}})
+    status = lone / "runs" / "run-3" / "watchdog.json"
+    status.write_text(json.dumps({**json.loads(status.read_text()), "world_size": 2}))
+    (row,) = tensorquill.list_runs(lone)
+    assert (row["rank_count"], row["run_state"]) == (2, "unknown")
+    opened = cmp.open_run("run-3", lone, read_parts=False)
+    assert (opened["read_from"]["ranks"], opened["read_from"]["judged_ranks"], opened["read_from"]["unknown_ranks"]) == ([0, 1], [0], [1])
+    assert "world_size is 2" in opened["read_from"]["unknown_why"][1]
 
 
 def test_two_runs_in_a_real_servers_store_are_listed_and_compared_by_name(tmp_path, toy_moe, monkeypatch):
