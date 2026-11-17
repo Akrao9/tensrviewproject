@@ -250,12 +250,13 @@ class Trigger:
         rank a one-rank evidence is of (the all-ranks view names its own). Never raises."""
         try:
             self._evidence_path = Path(path).resolve()
-            if self.compact_window is not None:
-                self._evidence_path = self._write_compact(evidence, self._evidence_path)
             if not self._loaded:
                 if self._state_path is None:
+                    # From the file the watcher wrote, so the name is the one it always was.
                     self._state_path = state_path_for(self._evidence_path)
                 self._load()
+            if self.compact_window is not None:
+                self._evidence_path = self._write_compact(evidence, self._evidence_path)
             self._run_id = str(evidence.get("run_id") or self._evidence_path.name)
             found = evidence.get("run_state")
             self._run_state = found.get("state") if isinstance(found, Mapping) else None

@@ -224,6 +224,11 @@ def test_a_trigger_turns_on_the_compact_evidence_and_the_full_file_is_still_writ
     (call,) = calls()
     assert call["env"]["TENSORQUILL_EVIDENCE"] == call["payload"]["evidence"] == str(compact.resolve())
     assert state_path_for(out).exists()  # the same state file as before, for the full name and the compact one
+    # A name without `.json` (`-o out.txt`): the state file is still `out.txt.fired.json`, as before.
+    named = Trigger(command(), compact_window=5)
+    named.look({"run_id": "r", "incidents": []}, tmp_path / "out.txt", rank=0)
+    assert (tmp_path / "out.txt.fired.json").exists() and (tmp_path / "out.compact.txt").exists()
+    assert not list(tmp_path.glob("out.compact*.fired.json"))
 
     # A compact file that cannot be written: said once, and the full file is handed over.
     blocked = tmp_path / "blocked"
