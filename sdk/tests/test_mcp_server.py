@@ -535,11 +535,16 @@ def test_the_all_ranks_status_of_a_two_rank_run_folder(start, store):
         (1, "current", True, ["grad_spike", "resume_lr_change", "non_finite"]),
     ]
     assert status["watchdog"]["summary"] == "finished" and "Common to all 2 judged ranks" in status["summary"]
+    # These reports are an older server's, without `kind_checks`: what was checked is not counted.
+    assert "kinds" not in status and status["kinds_not_stated"]["code"] == "report_without_kind_checks"
+    assert status["kinds_not_stated"]["ranks"] == [0, 1] and " kinds checked" not in status["summary"]
+    assert "What was checked is not stated" in status["summary"]
     assert client.call("get_all_ranks_status", rank=1)["rank"]["detection"]["report_last_step"] == 59
     assert "rank 7 is not in this run" in client.error("get_all_ranks_status", rank=7)
 
     listed = client.call("list_incidents")
     assert listed["incidents"] == status["incidents"] and listed["ranks"] == status["ranks"]
+    assert "kinds" not in listed and listed["kinds_not_stated"] == status["kinds_not_stated"]
     only = client.call("list_incidents", rank=0)
     assert [i["id"] for i in only["incidents"]] == ["grad_spike@40", "resume_lr_change@30"] and only["rank"]["judged"] is True
     found = client.call("get_incident", id="grad_spike@40")
@@ -550,6 +555,45 @@ def test_the_all_ranks_status_of_a_two_rank_run_folder(start, store):
     # The parts made by hand are empty: the error says the parts or pyarrow, and the server goes on.
     assert re.search("stored parts|pyarrow", client.error("get_series", name="blocks.1.weight", rank=1))
     assert client.request("ping")["result"] == {}
+
+
+def test_the_all_ranks_status_says_what_was_checked_for_the_run_and_never_counts_an_unknown_rank(start, store):
+    """`kinds` over the protocol: rank 0 recorded weights and rank 1 did not, so the kind is not
+    checked for the run and both ranks are named; then rank 0 falls behind and is in no value."""
+    def with_checks(rank: int, **carried: int) -> None:
+        path = store / f"rank={rank}" / "incidents.json"
+        counts = {**dict.fromkeys(ev.INPUT_NEEDS, 0), "steps": 60, "grad_total": 60, "numbers": 60, **carried}
+        document = {**json.loads(path.read_text()), "not_checked": [], "kind_checks": ev.kind_checks(counts, [])}
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+    with_checks(0, weight_check=12)
+    with_checks(1)
+    client = start(store)
+    status = client.call("get_all_ranks_status")
+    kinds = status["kinds"]
+    assert "kinds_not_stated" not in status
+    assert kinds["checked"] == ["grad_spike", "repeated_steps", "non_finite", "job_stalled", "rank_silent"]
+    assert "stalled_weights" in kinds["not_configured"]
+    assert kinds["differs_by_rank"] == {"stalled_weights": {"checked": "0", "not_configured": "1"}}
+    assert (kinds["judged_ranks"], kinds["ranks_not_counted"]) == ("0-1", "")
+    assert [row["kinds"] for row in status["per_rank"]] == [
+        {"checked": 4, "not_enough_history": 0, "not_configured": 21, "unavailable": 0},
+        {"checked": 3, "not_enough_history": 0, "not_configured": 22, "unavailable": 0},
+    ]
+    assert status["summary"].splitlines()[-1] == (
+        "5 of 32 kinds checked on both ranks, 27 not configured, 1 of them checked on some ranks only"
+        " (stalled_weights on rank 0)"
+    )
+    assert client.call("list_incidents")["kinds"] == kinds
+    assert client.call("get_all_ranks_status", rank=0)["rank"]["kind_counts"]["checked"] == 4
+    # Rank 0, the one that recorded weights, stores a part its report does not cover.
+    (store / "rank=0" / "attempt=1" / "part-60-79.parquet").write_bytes(b"")
+    after = client.call("get_all_ranks_status")["kinds"]
+    assert (after["judged_ranks"], after["ranks_not_counted"]) == ("1", "0")
+    assert "differs_by_rank" not in after and "stalled_weights" in after["not_configured"]
+    described = next(tool["description"] for tool in mcp_server.TOOLS if tool["name"] == "get_all_ranks_status")
+    for word in ("kinds.checked", "kinds.differs_by_rank", "kinds.ranks_not_counted", "kinds_not_stated"):
+        assert word in described
 
 
 def test_a_rank_whose_report_is_not_current_is_unknown_and_never_clean(start, store):

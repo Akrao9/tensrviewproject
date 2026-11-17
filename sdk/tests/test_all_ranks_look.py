@@ -83,6 +83,16 @@ def test_the_public_look_is_what_the_watcher_writes_first(tmp_path):
     assert ours["view"] == "all_ranks" and ours["judged_ranks"] == [0, 1, 2, 3] and ours["unknown_ranks"] == [4]
     assert [(g["kind"], g["ranks"]) for g in ours["incident_groups"]] == [("grad_spike", [3]), ("non_finite", [1, 2])]
     assert ours["run_state"]["state"] == "unhealthy" and ours["thresholds"] == ev.THRESHOLD_DEFAULTS
+    # What was checked is in the look too, made from the reports alone: ranks 1 and 2 recorded a
+    # layer and the others did not, and rank 4, which is not judged, is in no list.
+    assert ours["kind_checks"]["activation_spike"]["ranks"] == {"checked": [1, 2], "not_configured": [0, 3]}
+    assert ours["kind_checks"]["activation_spike"]["value"] == "not_configured"
+    line = ev.incident_summary(ours).splitlines()[-1]
+    assert "(rank 4 not judged, so not counted)" in line
+    # One record with a layer is not enough for the rule: "checked on ranks 1-2" says so too.
+    assert "activation_spike on ranks 1-2 without enough history yet" in line
+    assert mcp_server.all_ranks_kinds(ours)["differs_by_rank"]["activation_spike"] == {
+        "checked": "1-2", "not_configured": "0, 3", "not_enough_history": "1-2"}
     # It takes a path as text too, and gives a fresh document each time.
     again = all_ranks_evidence(str(run.folder))
     assert again is not all_ranks_evidence(run.folder) and again["incident_groups"] == ours["incident_groups"]

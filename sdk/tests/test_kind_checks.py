@@ -676,3 +676,406 @@ def test_a_file_from_before_the_field_is_never_read_as_enough_history(tmp_path):
     )
     # A current file with every checked kind past its warm-up says nothing more than the count.
     assert ev.checked_line(evidence) == "3 of 32 kinds checked, 29 not configured"
+
+
+# --- The all-ranks view: what was checked for the whole run ---------------------------------
+#
+# `--rank all`, `all_ranks_evidence` and `get_all_ranks_status` read each rank's report and run
+# no detector, so the run's `kind_checks` is made from the ranks' own. The rule these tests hold
+# (`run_kind_checks` in evidence.py):
+#   - only judged ranks count, and a rank that is not judged is named and is in no value;
+#   - a kind's value is its worst judged rank's, so `checked` means every judged rank, and the
+#     ranks are listed by value wherever they differ;
+#   - history the same way: short on one rank is short for the run, with that rank named;
+#   - a judged rank whose report does not say what was checked means no count at all;
+#   - `unavailable` on one rank is `unavailable` for the run, and the run is `degraded`.
+# The stores are written by hand, with each rank's `kind_checks` as the Python table gives it
+# (test_server_detect.py holds the server's to the same values); test_watch_all_ranks.py has
+# the same cases through the real server.
+
+HAND_RUN = "handrun"
+WEIGHTS = {"weights_unchanged": [], "grad_norms": {"w": 1.0}}
+CUDA = {"system": {"cuda": {"allocated": 1 << 30, "reserved": 2 << 30, "peak_allocated": 3 << 30, "total": 16 << 30}}}
+PROBE_FAILED = {"check": "probe", "kinds": list(ATTENTION), "reason": "1 of 3 probes failed, the first at step 20: boom"}
+FINISHED = "finished"
+
+
+def steps(count: int, **extra) -> list[dict]:
+    """Step records with a gradient norm and a learning rate; `extra` goes on every one (a
+    callable is given the step)."""
+    return [{"schema_version": 1, "run_id": HAND_RUN, "rank": 0, "attempt": 1, "step": step, "ts": float(step),
+             "grad_norm": 1.0, "lr": [1e-3], **{k: v(step) if callable(v) else v for k, v in extra.items()}}
+            for step in range(count)]
+
+
+def hand_report(rank: int, records: list[dict], not_checked: list[dict] = (), incidents: list[dict] = ()) -> dict:
+    """A rank's `incidents.json` as the server writes it for these records, by the Python tables."""
+    thresholds = {name.lower(): value for name, value in vars(ev).items()
+                  if name.isupper() and isinstance(value, (int, float)) and not isinstance(value, bool)}
+    return {
+        "schema_version": 1, "source": "tensorquill-server", "run_id": HAND_RUN, "rank": rank, "attempt": 1,
+        "last_step": records[-1]["step"], "steps": len(records), "rebuilds": 0, "checked": list(ev.SERVER_KINDS),
+        "thresholds": thresholds, "moe_flagged": {"samples": 0, "last_step": None}, "incidents": list(incidents),
+        "not_checked": list(not_checked), "memory": ev.latest_memory(records),
+        "kind_checks": ev.kind_checks(ev.input_counts(records), not_checked),
+    }
+
+
+def hand_store(tmp_path: Path, ranks: dict[int, list[dict]], *, status: str | None = FINISHED,
+               not_checked: dict[int, list[dict]] | None = None, incidents: dict[int, list[dict]] | None = None) -> Path:
+    """A run folder as `tensorquill-server` leaves it: for each rank a current report and one
+    part (only its name is read), and the run's status unless `status` is None."""
+    folder = tmp_path / "store" / "runs" / HAND_RUN
+    for rank, records in ranks.items():
+        parts = folder / f"rank={rank}" / "attempt=1"
+        parts.mkdir(parents=True)
+        (parts / f"part-0-{records[-1]['step']}.parquet").write_bytes(b"")
+        report = hand_report(rank, records, (not_checked or {}).get(rank, ()), (incidents or {}).get(rank, ()))
+        (folder / f"rank={rank}" / "incidents.json").write_text(json.dumps(report), encoding="utf-8")
+        look = ev.read_server_report(folder / f"rank={rank}")
+        assert look["state"] == "current", f"update `hand_report`: read_server_report now says {look['reason']}"
+    if status is not None:
+        (folder / "watchdog.json").write_text(json.dumps({
+            "schema_version": 1, "summary": status, "world_size": len(ranks),
+            "ranks": [{"rank": rank, "state": status, "last_step": records[-1]["step"]} for rank, records in ranks.items()],
+        }), encoding="utf-8")
+    return folder
+
+
+def change_report(folder: Path, rank: int, change) -> None:
+    path = folder / f"rank={rank}" / "incidents.json"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    change(report)
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+
+def fall_behind(folder: Path, rank: int) -> None:
+    """A part the rank's report does not cover: the rank is `behind`, so not judged."""
+    [part] = (folder / f"rank={rank}" / "attempt=1").glob("part-*.parquet")
+    last = int(part.stem.split("-")[2])
+    (part.parent / f"part-{last + 1}-{last + 20}.parquet").write_bytes(b"")
+
+
+def three_ways(folder: Path, tmp_path: Path, **options) -> tuple[dict, str, dict]:
+    """The view as the public look returns it, held equal to the file the watcher writes, with
+    its summary and `get_all_ranks_status`'s answer for the same folder."""
+    from tensorquill import mcp_server
+
+    ours = json.loads(json.dumps(ev.all_ranks_evidence(folder, **options)))
+    out = tmp_path / f"all-{len(list(tmp_path.glob('all-*.json')))}.json"
+    assert ev.watch(folder, out, rank="all", polls=1, interval=0.0, **options) == out
+    theirs = json.loads(out.read_text(encoding="utf-8"))
+    assert theirs.pop("written_at_ms") >= ours.pop("written_at_ms")
+    assert theirs == ours, "the watcher's file and the look differ"
+    status = mcp_server.get_all_ranks_status(mcp_server.Source(out), {})
+    if not options:  # the tool on the folder makes its own look, with no options
+        from_folder = mcp_server.get_all_ranks_status(mcp_server.Source(folder), {})
+        assert {k: v for k, v in status.items() if k != "source"} == {k: v for k, v in from_folder.items() if k != "source"}
+    assert status.get("summary") == ev.incident_summary(ours)
+    return ours, ev.incident_summary(ours), status
+
+
+def count_line(summary: str) -> str:
+    [line] = [line for line in summary.splitlines() if " kinds checked" in line]
+    return line
+
+
+def test_a_kind_checked_on_one_rank_only_is_not_checked_for_the_run_and_names_the_ranks(tmp_path):
+    folder = hand_store(tmp_path, {0: steps(60, **WEIGHTS), 1: steps(60)})
+    evidence, summary, status = three_ways(folder, tmp_path)
+    checks = evidence["kind_checks"]
+    assert list(checks) == list(ev.INCIDENT_CLASSES)
+    assert all(check["value"] in ev.KIND_CHECK_VALUES for check in checks.values())
+    # Rank 0 records weights and rank 1 does not: not the best rank's value, and both are named.
+    assert checks["stalled_weights"] == {
+        "value": "not_configured", "enough_history": False, "records": 0, "records_needed": 3,
+        "needs": "weights_unchanged with grad_norms (full capture)", "ranks": {"checked": [0], "not_configured": [1]},
+    }
+    # What both ranks record is checked, with the fewest records any rank has, and no rank list.
+    assert checks["grad_spike"] == checked(60, "grad_spike", "grad_norm or clip_grad_norm")
+    assert "ranks" not in checks["moe_imbalance"] and checks["moe_imbalance"]["value"] == "not_configured"
+    assert checks["job_stalled"] == {"value": "checked", "enough_history": True, "needs": STATUS_NEEDS}
+    counts = ev.checked_counts(evidence)
+    assert counts["checked"] + counts["not_configured"] + counts["unavailable"] == counts["kinds"] == 32
+    assert (counts["checked"], counts["unavailable"]) == (6, 0)
+    assert summary.splitlines()[-1] == count_line(summary) == (
+        "6 of 32 kinds checked on both ranks, 26 not configured, 1 of them checked on some ranks only"
+        " (stalled_weights on rank 0)"
+    )
+    # Per rank: each rank's own count of the server's 25 kinds shows who differs.
+    per_rank = {entry["rank"]: entry["kind_counts"] for entry in evidence["ranks"]}
+    assert (per_rank[0]["kinds"], per_rank[0]["checked"], per_rank[1]["checked"]) == (25, 5, 4)
+    assert evidence["run_state"]["state"] == "healthy"  # a kind that is not configured degrades nothing
+    kinds = status["kinds"]
+    assert "stalled_weights" in kinds["not_configured"] and "stalled_weights" not in kinds["checked"]
+    assert kinds["differs_by_rank"] == {"stalled_weights": {"checked": "0", "not_configured": "1"}}
+    assert (kinds["judged_ranks"], kinds["ranks_not_counted"]) == ("0-1", "")
+    assert [row["kinds"]["checked"] for row in status["per_rank"]] == [5, 4]
+    assert "kinds_not_stated" not in status
+
+
+def test_a_rank_that_is_not_judged_is_named_and_is_in_no_value(tmp_path):
+    # Rank 1 records weights, and its report is behind its store: what it says does not count.
+    folder = hand_store(tmp_path, {0: steps(60), 1: steps(60, **WEIGHTS)})
+    fall_behind(folder, 1)
+    evidence, summary, status = three_ways(folder, tmp_path)
+    assert (evidence["judged_ranks"], evidence["unknown_ranks"]) == ([0], [1])
+    checks = evidence["kind_checks"]
+    assert checks["stalled_weights"]["value"] == "not_configured" and "ranks" not in checks["stalled_weights"]
+    assert "kind_counts" in evidence["ranks"][0] and "kind_counts" not in evidence["ranks"][1]
+    for kind, check in checks.items():
+        named = [rank for ranks in (check.get("ranks") or {}).values() for rank in ranks]
+        named += [*check.get("not_enough_history_ranks", ()), *check.get("history_not_stated_ranks", ())]
+        assert 1 not in named, f"{kind} counts rank 1, which is not judged"
+    assert count_line(summary) == (
+        "6 of 32 kinds checked on the 1 judged rank of 2 (rank 1 not judged, so not counted), 26 not configured"
+    )
+    assert (status["kinds"]["judged_ranks"], status["kinds"]["ranks_not_counted"]) == ("0", "1")
+    assert evidence["run_state"]["state"] == "unknown"
+
+    # The other way round: the judged rank records weights, so the kind is checked, for that rank.
+    other = hand_store(tmp_path / "other", {0: steps(60, **WEIGHTS), 1: steps(60)})
+    fall_behind(other, 1)
+    evidence, summary, _ = three_ways(other, tmp_path)
+    assert evidence["kind_checks"]["stalled_weights"]["value"] == "checked"
+    assert count_line(summary).startswith("7 of 32 kinds checked on the 1 judged rank of 2 (rank 1 not judged")
+
+
+def test_no_judged_rank_means_no_count(tmp_path):
+    folder = hand_store(tmp_path, {0: steps(60), 1: steps(60)})
+    fall_behind(folder, 0)
+    fall_behind(folder, 1)
+    evidence, summary, status = three_ways(folder, tmp_path)
+    assert "kind_checks" not in evidence and evidence["kind_checks_not_stated"]["code"] == "no_judged_rank"
+    assert " kinds checked" not in summary and "kinds" not in status
+    assert status["kinds_not_stated"]["code"] == "no_judged_rank"
+    assert ev.checked_counts(evidence) is None and ev.all_ranks_kinds(evidence) is None
+
+
+def test_a_rank_short_of_history_makes_the_kind_short_for_the_run_and_is_named(tmp_path):
+    folder = hand_store(tmp_path, {0: steps(60), 1: steps(5)})
+    evidence, summary, status = three_ways(folder, tmp_path)
+    checks = evidence["kind_checks"]
+    assert checks["grad_spike"] == {
+        "value": "checked", "enough_history": False, "records": 5, "records_needed": 13,
+        "needs": "grad_norm or clip_grad_norm", "not_enough_history_ranks": [1],
+    }
+    assert ev.kind_history(checks["grad_spike"]) == "not_enough"
+    assert ev.kind_history(checks["non_finite"]) == "enough" and checks["non_finite"]["records"] == 5
+    assert count_line(summary) == (
+        "6 of 32 kinds checked on both ranks, 1 of them without enough history yet (grad_spike 5 of 13 records on"
+        " rank 1), 26 not configured"
+    )
+    kinds = status["kinds"]
+    assert kinds["not_enough_history"] == {"grad_spike": {"records": 5, "records_needed": 13, "ranks": "1"}}
+    assert "grad_spike" not in kinds["checked"] and evidence["run_state"]["state"] == "healthy"
+
+    # Short on every rank: no rank differs, so none is named.
+    both = hand_store(tmp_path / "both", {0: steps(5), 1: steps(7)})
+    evidence, summary, status = three_ways(both, tmp_path)
+    assert evidence["kind_checks"]["grad_spike"]["not_enough_history_ranks"] == [0, 1]
+    assert "(grad_spike 5 of 13 records)" in count_line(summary)
+    assert status["kinds"]["not_enough_history"] == {"grad_spike": {"records": 5, "records_needed": 13}}
+
+
+def test_a_kind_checked_on_some_ranks_only_says_when_those_ranks_are_still_warming_up(tmp_path):
+    # Ranks 0 and 1 record weights, rank 0 on two steps only (the rule needs three); rank 2 records none.
+    twice = steps(60, weights_unchanged=lambda step: [] if step < 2 else None, grad_norms={"w": 1.0})
+    folder = hand_store(tmp_path, {0: twice, 1: steps(60, **WEIGHTS), 2: steps(60)})
+    evidence, summary, status = three_ways(folder, tmp_path)
+    check = evidence["kind_checks"]["stalled_weights"]
+    assert (check["value"], check["ranks"]) == ("not_configured", {"checked": [0, 1], "not_configured": [2]})
+    assert check["not_enough_history_ranks"] == [0]
+    assert "(stalled_weights on ranks 0-1 without enough history yet on rank 0)" in count_line(summary)
+    assert status["kinds"]["differs_by_rank"]["stalled_weights"] == {
+        "checked": "0-1", "not_configured": "2", "not_enough_history": "0"}
+    # Short on every rank that checks it: no rank among them differs, so none is named twice.
+    both = hand_store(tmp_path / "both", {0: twice, 1: steps(60)})
+    _, summary, status = three_ways(both, tmp_path)
+    assert "(stalled_weights on rank 0 without enough history yet)" in count_line(summary)
+    assert status["kinds"]["differs_by_rank"]["stalled_weights"]["not_enough_history"] == "0"
+
+    def strip(report):
+        for item in report["kind_checks"].values():
+            del item["enough_history"]
+
+    older = hand_store(tmp_path / "older", {0: steps(60, **WEIGHTS), 1: steps(60)})
+    change_report(older, 0, strip)
+    _, summary, status = three_ways(older, tmp_path)
+    assert "(stalled_weights on rank 0 with no word on its history)" in count_line(summary)
+    assert status["kinds"]["differs_by_rank"]["stalled_weights"]["history_not_stated"] == "0"
+
+
+def test_an_incident_on_a_rank_with_enough_history_is_not_called_a_faster_rules(tmp_path):
+    spike = {"kind": "grad_spike", "step": 40, "grad_norm": 9.0, "baseline": 1.0, "ratio": 9.0, "parameters": [],
+             "spike_count": 1, "spike_steps": [40]}
+    early = {**spike, "step": 3, "spike_steps": [3]}
+    folder = hand_store(tmp_path, {0: steps(60), 1: steps(5)}, incidents={0: [spike]})
+    _, summary, status = three_ways(folder, tmp_path)
+    assert "faster rule" not in summary and "reported" not in status["kinds"]["not_enough_history"]["grad_spike"]
+    short = hand_store(tmp_path / "short", {0: steps(60), 1: steps(5)}, incidents={1: [early]})
+    _, summary, status = three_ways(short, tmp_path)
+    assert "grad_spike 5 of 13 records on rank 1 but reported by a faster rule" in count_line(summary)
+    assert status["kinds"]["not_enough_history"]["grad_spike"]["reported"] is True
+    # A kind the run does not count as checked, reported on the rank that does check it.
+    frozen = steps(60, weights_unchanged=["w"], grad_norms={"w": 1.0})
+    [stalled] = [i for i in ev.build_evidence(frozen)["incidents"] if i["kind"] == "stalled_weights"]
+    partly = hand_store(tmp_path / "partly", {0: frozen, 1: steps(60)}, incidents={0: [stalled]})
+    _, summary, _ = three_ways(partly, tmp_path)
+    assert "checked on some ranks only (stalled_weights on rank 0, where it is reported)" in count_line(summary)
+
+
+def test_unavailable_on_one_rank_is_unavailable_for_the_run_and_the_run_is_degraded(tmp_path):
+    probed = {"probe": {"attention": {"blk": {"entropy": 1.0, "max_entropy": 2.0, "max_logit": 1.0}}}}
+    folder = hand_store(tmp_path, {0: steps(60, **probed), 1: steps(60, **probed)}, not_checked={1: [PROBE_FAILED]})
+    evidence, summary, status = three_ways(folder, tmp_path)
+    for kind in ATTENTION:
+        check = evidence["kind_checks"][kind]
+        assert (check["value"], check["check"], check["reason"]) == ("unavailable", "probe", PROBE_FAILED["reason"])
+        assert check["ranks"] == {"checked": [0], "unavailable": [1]}
+    assert count_line(summary).endswith(
+        "3 unavailable (attention_collapse on rank 1, attention_uniform on rank 1, attention_logit_growth on rank 1)")
+    assert evidence["run_state"]["state"] == "degraded"
+    assert [r["code"] for r in evidence["run_state"]["reasons"] if r["state"] == "degraded"] == ["not_checked"]
+    assert status["kinds"]["unavailable"] == dict.fromkeys(ATTENTION, PROBE_FAILED["reason"])
+    assert status["kinds"]["differs_by_rank"]["attention_collapse"] == {"checked": "0", "unavailable": "1"}
+    # Without the failed probe the same store is healthy and nothing is unavailable.
+    clean = hand_store(tmp_path / "clean", {0: steps(60, **probed), 1: steps(60, **probed)})
+    evidence, _, _ = three_ways(clean, tmp_path)
+    assert ev.checked_counts(evidence)["unavailable"] == 0 and evidence["run_state"]["state"] == "healthy"
+    # Unavailable is worse than not configured: a rank that never probed does not soften it.
+    mixed = hand_store(tmp_path / "mixed", {0: steps(60), 1: steps(60, **probed)}, not_checked={1: [PROBE_FAILED]})
+    evidence, _, _ = three_ways(mixed, tmp_path)
+    assert evidence["kind_checks"]["attention_uniform"]["value"] == "unavailable"
+    assert evidence["kind_checks"]["attention_uniform"]["ranks"] == {"not_configured": [0], "unavailable": [1]}
+
+
+def test_a_report_that_does_not_say_what_was_checked_gives_no_count(tmp_path):
+    folder = hand_store(tmp_path, {0: steps(60), 1: steps(60)})
+    change_report(folder, 1, lambda report: report.pop("kind_checks"))
+    assert ev.read_server_report(folder / "rank=1")["state"] == "current"  # an older server's report is still read
+    evidence, summary, status = three_ways(folder, tmp_path)
+    assert "kind_checks" not in evidence and evidence["judged_ranks"] == [0, 1]
+    missing = evidence["kind_checks_not_stated"]
+    assert (missing["code"], missing["ranks"]) == ("report_without_kind_checks", [1])
+    assert " kinds checked" not in summary
+    assert summary.splitlines()[-1].startswith("What was checked is not stated: the report of rank 1 does not say")
+    assert "kinds" not in status and status["kinds_not_stated"] == missing
+    # The rank that does say keeps its own count; the one that does not has none.
+    assert "kind_counts" in evidence["ranks"][0] and "kind_counts" not in evidence["ranks"][1]
+    # A report that says it for only some of the server's kinds is not taken either.
+    change_report(folder, 0, lambda report: report["kind_checks"].pop("grad_spike"))
+    evidence, _, _ = three_ways(folder, tmp_path)
+    assert evidence["kind_checks_not_stated"]["ranks"] == [0, 1]
+
+
+def test_a_report_from_before_enough_history_is_never_read_as_enough(tmp_path):
+    def strip(report):
+        for check in report["kind_checks"].values():
+            del check["enough_history"]
+
+    folder = hand_store(tmp_path, {0: steps(60), 1: steps(60)})
+    change_report(folder, 1, strip)
+    evidence, summary, status = three_ways(folder, tmp_path)
+    checks = evidence["kind_checks"]
+    assert "enough_history" not in checks["grad_spike"] and checks["grad_spike"]["history_not_stated_ranks"] == [1]
+    assert ev.kind_history(checks["grad_spike"]) == "not_stated"
+    counts = ev.checked_counts(evidence)
+    assert (counts["checked"], counts["history_not_stated"], counts["not_enough_history"]) == (6, 4, 0)
+    assert "4 of them with no word on their history on some rank" in count_line(summary)
+    # Only the run's own two (the stall kinds, from the status) are listed as checked.
+    assert status["kinds"]["checked"] == list(STALLS)
+    assert status["kinds"]["history_not_stated"] == ["grad_spike", "repeated_steps", "resume_lr_change", "non_finite"]
+    # A rank that says "not enough" decides it, whatever the silent rank would have said.
+    short = hand_store(tmp_path / "short", {0: steps(5), 1: steps(60)})
+    change_report(short, 1, strip)
+    evidence, _, _ = three_ways(short, tmp_path)
+    assert evidence["kind_checks"]["grad_spike"]["enough_history"] is False
+    assert evidence["kind_checks"]["grad_spike"]["not_enough_history_ranks"] == [0]
+
+
+def test_the_stall_kinds_are_the_runs_and_a_store_without_its_status_is_degraded(tmp_path):
+    folder = hand_store(tmp_path, {0: steps(60), 1: steps(60)}, status=None)
+    evidence, summary, _ = three_ways(folder, tmp_path)
+    for kind in STALLS:
+        check = evidence["kind_checks"][kind]
+        assert (check["value"], check["check"], check["enough_history"]) == ("unavailable", "status", False)
+        assert "ranks" not in check
+    assert count_line(summary) == "4 of 32 kinds checked on both ranks, 26 not configured, 2 unavailable (job_stalled, rank_silent)"
+    assert evidence["run_state"]["state"] == "degraded"
+    assert [r["code"] for r in evidence["run_state"]["reasons"] if r["state"] == "degraded"] == ["no_status"]
+
+
+def test_the_file_kinds_are_the_runs(tmp_path):
+    folder = hand_store(tmp_path, {0: steps(60), 1: steps(60)})
+    evidence, _, _ = three_ways(folder, tmp_path, traincheck=tmp_path / "no-such-results.json")
+    check = evidence["kind_checks"]["traincheck_violation"]
+    assert (check["value"], check["check"]) == ("unavailable", "traincheck") and evidence["run_state"]["state"] == "degraded"
+    assert evidence["kind_checks"]["collective_hang"]["value"] == "not_configured"
+
+
+def test_the_memory_comparison_is_checked_only_when_every_judged_rank_is_in_it(tmp_path):
+    needs = "system.cuda (system=True) on every judged rank, and at least two ranks"
+    both = hand_store(tmp_path / "both", {0: steps(60, **CUDA), 1: steps(60, **CUDA)})
+    evidence, _, _ = three_ways(both, tmp_path)
+    assert evidence["kind_checks"]["memory_imbalance"] == {"value": "checked", "enough_history": True, "needs": needs}
+    one = hand_store(tmp_path / "one", {0: steps(60, **CUDA), 1: steps(60, **CUDA), 2: steps(60)})
+    evidence, summary, status = three_ways(one, tmp_path)
+    assert evidence["kind_checks"]["memory_imbalance"] == {
+        "value": "not_configured", "enough_history": False, "needs": needs, "ranks": {"checked": [0, 1], "not_configured": [2]},
+    }
+    assert "memory_imbalance on ranks 0-1" in count_line(summary)
+    assert status["kinds"]["differs_by_rank"]["memory_imbalance"] == {"checked": "0-1", "not_configured": "2"}
+    # One rank has nothing to be compared with.
+    alone = hand_store(tmp_path / "alone", {0: steps(60, **CUDA)})
+    evidence, summary, _ = three_ways(alone, tmp_path)
+    assert evidence["kind_checks"]["memory_imbalance"] == {"value": "not_configured", "enough_history": False, "needs": needs}
+    assert evidence["kind_checks"]["memory_pressure"]["value"] == "checked"
+    assert count_line(summary).startswith("9 of 32 kinds checked on the only rank, ")
+    # A rank whose memory could not be read is unavailable for the comparison, not unconfigured.
+    failed = {"check": "cuda", "kinds": ["memory_growth", "memory_pressure", "allocator_retries"], "reason": "no CUDA"}
+    broken = hand_store(tmp_path / "broken", {0: steps(60, **CUDA), 1: steps(60)}, not_checked={1: [failed]})
+    evidence, _, _ = three_ways(broken, tmp_path)
+    check = evidence["kind_checks"]["memory_imbalance"]
+    assert (check["value"], check["reason"], check["ranks"]) == ("unavailable", "no CUDA", {"checked": [0], "unavailable": [1]})
+
+
+def test_duplicate_batches_needs_data_on_every_judged_rank_and_the_servers_status(tmp_path):
+    data = {"data": lambda step: {"batch_hash": f"h{step}", "epoch": 0, "batch": step}}
+    both = hand_store(tmp_path / "both", {0: steps(60, **data), 1: steps(60, **data)})
+    evidence, _, _ = three_ways(both, tmp_path)
+    check = evidence["kind_checks"]["duplicate_batches"]
+    assert (check["value"], check["enough_history"]) == ("checked", True) and "only when it finds a duplicate" in check["note"]
+    # The server makes this comparison and its status carries the result: no status, no verdict.
+    silent = hand_store(tmp_path / "silent", {0: steps(60, **data), 1: steps(60, **data)}, status=None)
+    evidence, _, _ = three_ways(silent, tmp_path)
+    check = evidence["kind_checks"]["duplicate_batches"]
+    assert (check["value"], check["check"], check["enough_history"]) == ("unavailable", "status", False)
+    one = hand_store(tmp_path / "one", {0: steps(60, **data), 1: steps(60)})
+    evidence, _, _ = three_ways(one, tmp_path)
+    check = evidence["kind_checks"]["duplicate_batches"]
+    assert (check["value"], check["ranks"]) == ("not_configured", {"checked": [0], "not_configured": [1]})
+    alone = hand_store(tmp_path / "alone", {0: steps(60, **data)})
+    evidence, _, _ = three_ways(alone, tmp_path)
+    assert evidence["kind_checks"]["duplicate_batches"]["value"] == "not_configured"
+
+
+def test_the_count_line_stays_short_with_many_ranks_and_many_kinds(tmp_path):
+    full = {**WEIGHTS, **CUDA, "layers": {"blk": {"abs_max": 1.0, "mean": 0.0, "std": 1.0, "zero_frac": 0.0}},
+            "step_skipped": False, "replica_spread": {"w": 0.0}, "checkpoint": {"path": "x"}}
+    ranks = {rank: steps(60, **(full if rank % 2 else {})) for rank in range(16)}
+    evidence, summary, status = three_ways(hand_store(tmp_path, ranks), tmp_path)
+    line = count_line(summary)
+    assert "checked on some ranks only (stalled_weights on ranks 1, 3, 5, 7, and 4 more, " in line and ", and " in line
+    assert line.startswith("6 of 32 kinds checked on all 16 ranks, 26 not configured, ") and len(line) < 700
+    assert len(status["kinds"]["differs_by_rank"]) > ev.CHECKED_LINE_KINDS  # the listing has them all
+
+
+def test_one_ranks_evidence_and_its_count_are_what_they_were(tmp_path):
+    # The run-level object is the all-ranks view's alone: one rank of the same store reads as before.
+    folder = hand_store(tmp_path, {0: steps(60, **WEIGHTS), 1: steps(60)})
+    look = ev.read_server_report(folder / "rank=1")
+    one = ev._report_evidence(folder / "rank=1", look, ev.read_watchdog(folder / "watchdog.json"))
+    assert one["kind_checks"]["stalled_weights"] == checked(0, "stalled_weights", "weights_unchanged with grad_norms (full capture)", "not_configured")
+    assert "ranks" not in json.dumps(one["kind_checks"]) and "kind_checks_not_stated" not in one
+    assert ev.checked_line(one) == "6 of 32 kinds checked, 26 not configured"

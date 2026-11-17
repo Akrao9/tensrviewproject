@@ -42,6 +42,7 @@ from .evidence import (
     ALL_RANKS_VIEW,
     _discover_rank_folders,
     all_ranks_evidence,
+    all_ranks_kinds,
     build_evidence,
     incident_class,
     incident_summary,
@@ -475,6 +476,19 @@ def _not_checked(opened: Mapping[str, Any]) -> list[dict[str, Any]]:
     return listed + [{**item, "ranks": _ranges(item["ranks"])} for item in by_text.values()]
 
 
+def _kinds(opened: Mapping[str, Any], answer: dict[str, Any]) -> None:
+    """Put what "no incidents" covers into an answer, under `kinds`: the kinds that were looked
+    for with enough history, those still warming up, and those that could not be looked for.
+    For a run folder they are the run's (`all_ranks_kinds`), and when the view cannot say,
+    `kinds_not_stated` gives the reason in place of `kinds`."""
+    evidence = opened["evidence"]
+    kinds = all_ranks_kinds(evidence) if opened["shape"] == "all_ranks" else kinds_by_value(evidence)
+    if kinds is not None:
+        answer["kinds"] = kinds
+    elif isinstance(evidence.get("kind_checks_not_stated"), dict):
+        answer["kinds_not_stated"] = evidence["kind_checks_not_stated"]
+
+
 def _summary(evidence: Mapping[str, Any]) -> str | None:
     try:
         return incident_summary(evidence)
@@ -542,11 +556,7 @@ def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, An
     if len(entries) > limit:
         answer["incidents_omitted"] = len(entries) - limit
     answer["not_checked"] = _not_checked(opened)
-    kinds = kinds_by_value(evidence)
-    if kinds is not None:
-        # What "no incidents" covers: the kinds that were looked for with enough history, those
-        # still warming up, and those that could not be looked for.
-        answer["kinds"] = kinds
+    _kinds(opened, answer)
     if isinstance(evidence.get("detection"), dict):
         answer["detection"] = evidence["detection"]
     summary = _summary(evidence)
@@ -936,6 +946,7 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
     if len(entries) > DEFAULT_INCIDENTS:
         answer["incidents_omitted"] = len(entries) - DEFAULT_INCIDENTS
     answer["not_checked"] = _not_checked(opened)
+    _kinds(opened, answer)
     if isinstance(evidence.get("watchdog"), dict):
         answer["watchdog"] = evidence["watchdog"]
     if rank is not None:
@@ -947,6 +958,10 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
              "last_step": (entry.get("detection") or {}).get("report_last_step"),
              **({"incidents": [i.get("kind") for i in entry["incidents"] if isinstance(i, dict)]}
                 if isinstance(entry.get("incidents"), list) else {}),
+             # Of the 25 kinds this rank's own report judges: where a rank differs from the others.
+             **({"kinds": {key: entry["kind_counts"].get(key) for key in (
+                 "checked", "not_enough_history", "not_configured", "unavailable")}}
+                if isinstance(entry.get("kind_counts"), dict) else {}),
              **({"stream": entry["stream"]} if isinstance(entry.get("stream"), dict) else {})}
             for number, entry in sorted(rows.items(), key=lambda item: item[0] if isinstance(item[0], int) else -1)
         ]
@@ -983,9 +998,11 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " for, because the capture does not record what it needs; one under `kinds.unavailable` was asked for"
             " and could not be judged, and makes the state degraded. Kinds under `kinds.history_not_stated` come"
             " from a file written before this was recorded: treat them as not enough history. When the answer has"
-            " no `kinds` (a run folder, or a file from an older version), what was checked is not stated: do not"
-            " infer it. A not_checked entry or an unknown rank means that part was not judged."
-            " For a run folder the incidents are grouped across ranks; `rank` keeps one rank's."
+            " no `kinds` (a file from an older version, or a run folder with `kinds_not_stated`, which gives the"
+            " reason), what was checked is not stated: do not infer it. A not_checked entry or an unknown rank"
+            " means that part was not judged."
+            " For a run folder the incidents are grouped across ranks, and `rank` keeps one rank's; `kinds` is"
+            " then the whole run's, read as get_all_ranks_status describes."
         ),
         "inputSchema": {
             "type": "object",
@@ -1058,7 +1075,17 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "For a run folder in a tensorquill-server store, or an all-ranks evidence file: the run state, how many"
             " ranks are judged, unknown, clean and with incidents, each report state with its reason, the incidents"
             " grouped across ranks and those of the run as a whole (a stall, a silent rank), and the server's"
-            " progress status. A rank whose report is not current is unknown and is never counted as clean. `rank`"
+            " progress status. A rank whose report is not current is unknown and is never counted as clean."
+            " `kinds` says what was checked for the run, over the judged ranks only (`kinds.judged_ranks`; those"
+            " under `kinds.ranks_not_counted` are in no value). A kind under `kinds.checked` was checked on every"
+            " judged rank with enough history, and only for those does nothing found mean anything. A kind takes"
+            " its worst judged rank's value, so one under `kinds.not_configured` or `kinds.unavailable` may still"
+            " be checked on other ranks: `kinds.differs_by_rank` names each such kind's ranks by value (with"
+            " `not_enough_history` for those of its checked ranks still warming up, where nothing found is no"
+            " verdict either), and an incident of that kind stands for the ranks that show it. `kinds.not_enough_history` gives the fewest"
+            " `records` any judged rank has and the ranks still warming up. When a judged rank's report does not"
+            " say what was checked, or no rank is judged, there is no `kinds`: `kinds_not_stated` gives the reason,"
+            " and nothing is to be inferred. `per_rank[].kinds` counts each rank's own 25 kinds. `rank`"
             " gives one rank's entry in full. On one rank's capture or evidence file this is an error that says so."
         ),
         "inputSchema": {

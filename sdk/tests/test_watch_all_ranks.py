@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import statistics
@@ -166,6 +167,16 @@ def entry(evidence: dict, rank: int) -> dict:
     return found
 
 
+def without_count(summary: str) -> list[str]:
+    """The summary's lines without the count of what was checked, which must be its last line.
+    The two stall kinds are checked once the server has written a status and unavailable until
+    then, so a test whose server has only just started does not fix the count's words; the
+    tests of the count itself are at the end of this file and in test_kind_checks.py."""
+    *lines, last = summary.splitlines()
+    assert re.match(r"\d+ of 32 kinds checked on (both ranks|all \d+ ranks), ", last), last
+    return lines
+
+
 def assert_unknown(evidence: dict, summary: str, rank: int, state: str) -> None:
     """A rank that is not current is unknown: stated, and in no list that says "no incidents"."""
     detection = entry(evidence, rank)["detection"]
@@ -194,7 +205,7 @@ def test_ranks_that_are_all_current_with_no_incidents_are_said_to_be_clean(tmp_p
         assert (detection["state"], detection["judged"], detection["report_last_step"], detection["stored_last_step"]) == (
             "current", True, 59, 59)
         assert entry(evidence, rank)["incidents"] == []
-    assert summary.splitlines() == [
+    assert without_count(summary) == [
         "No incidents detected on any of the 4 ranks: every rank's report from tensorquill-server is current through step 59."
     ]
     assert run.server.terminate() == 0
@@ -216,7 +227,7 @@ def test_identical_incidents_on_every_rank_are_one_group_that_names_the_ranks(tm
     assert all(entry(evidence, r)["incidents"] == [{"kind": "non_finite", "class": "invariant", "step": 30, "group": 0}]
                for r in range(4))
     assert (group["class"], group["incident"]["class"]) == ("invariant", "invariant")
-    assert summary.splitlines() == [
+    assert without_count(summary) == [
         "1 distinct incident on 4 of 4 ranks; every rank's report from tensorquill-server is current through step 59.",
         "Common to all 4 judged ranks (0-3):",
         "  - NaN or Inf at step 30 in blk2",
@@ -234,7 +245,7 @@ def test_the_same_fault_with_different_numbers_is_still_one_group_and_says_whose
     assert (group["kind"], group["step"], group["ranks"]) == ("grad_spike", 40, [0, 1, 2, 3])
     assert group["numbers_differ"] is True and group["incident_rank"] == 0
     assert round(group["incident"]["ratio"]) == 8
-    lines = summary.splitlines()
+    lines = without_count(summary)
     assert lines[2].startswith("  - Gradient spike at step 40: norm 8") and lines[2].endswith("(rank 0's numbers)")
     assert lines[3:] == ["By class: anomaly grad_spike"]
     assert run.server.terminate() == 0
@@ -250,7 +261,7 @@ def test_an_incident_on_one_rank_only_is_named_and_the_others_are_listed_as_havi
     assert evidence["clean_ranks"] == [0, 1, 3] and evidence["ranks_with_incidents"] == [2]
     assert entry(evidence, 2)["incidents"] == [{"kind": "grad_spike", "class": "anomaly", "step": 40, "group": 0}]
     assert entry(evidence, 1)["incidents"] == []
-    assert summary.splitlines() == [
+    assert without_count(summary) == [
         "1 distinct incident on 1 of 4 ranks; every rank's report from tensorquill-server is current through step 59.",
         "Only on some ranks:",
         "  - rank 2 only: Gradient spike at step 40: norm 8, 8× the median of recent steps",
@@ -284,7 +295,7 @@ def test_the_same_kind_at_the_same_step_naming_different_things_is_two_groups(tm
     evidence, summary = look(run, tmp_path)
     shown = [(g["kind"], g["step"], g["ranks"], g["incident"]["layers"]) for g in evidence["incident_groups"]]
     assert shown == [("non_finite", 30, [0, 1, 2], ["blk2"]), ("non_finite", 30, [3], ["blk3"])]
-    assert summary.splitlines()[1:] == [
+    assert without_count(summary)[1:] == [
         "Only on some ranks:",
         "  - ranks 0-2 (3 of 4): NaN or Inf at step 30 in blk2",
         "  - rank 3 only: NaN or Inf at step 30 in blk3",
@@ -534,7 +545,9 @@ def test_after_a_kill_every_report_stands_and_the_status_is_called_old(tmp_path)
     assert evidence["watchdog"]["not_written_for_seconds"] > 0
     lines = summary.splitlines()
     assert lines[0].startswith("No incidents detected on any of the 3 ranks")
-    assert lines[1].startswith("The server's status was last written") and "Nothing is watching this run for stalls" in lines[1]
+    # A status that is too old was still read, so the stall kinds count as checked; the run state says `unknown`.
+    assert lines[1] == "6 of 32 kinds checked on all 3 ranks, 26 not configured"
+    assert lines[2].startswith("The server's status was last written") and "Nothing is watching this run for stalls" in lines[2]
 
 
 def test_a_stopped_server_qualifies_the_headline(tmp_path):
@@ -549,6 +562,7 @@ def test_a_stopped_server_qualifies_the_headline(tmp_path):
     assert evidence["watchdog"]["summary"] == "server_stopped"
     assert summary.splitlines() == [
         "No incidents detected on any of the 2 ranks: every rank's report from tensorquill-server is current through step 59.",
+        "6 of 32 kinds checked on both ranks, 26 not configured",
         "The server has stopped: nothing is watching this run for stalls, and no new steps are stored.",
     ]
 
@@ -712,8 +726,9 @@ def test_a_stall_is_one_run_level_incident_and_the_ranks_are_still_judged(tmp_pa
     lines = summary.splitlines()
     assert lines[0] == ("No incidents in the ranks' step records on any of the 3 ranks: every rank's report from"
                         " tensorquill-server is current through step 59.")
-    assert lines[1].startswith("Job stalled after step 59: none of 3 ranks has sent a new step") and len(lines) == 3
+    assert lines[1].startswith("Job stalled after step 59: none of 3 ranks has sent a new step") and len(lines) == 4
     assert lines[2] == "By class: observation job_stalled (observations claim no failure and do not make the run unhealthy)"
+    assert lines[3] == "6 of 32 kinds checked on all 3 ranks, 26 not configured"
     assert (stall["class"], evidence["run_state"]["state"]) == ("observation", "unknown")
 
 
@@ -963,11 +978,12 @@ def test_when_every_rank_has_a_different_incident_the_summary_is_still_a_few_lin
     evidence = json.loads(out.read_text())
     assert len(evidence["incident_groups"]) == 64 and [g["ranks"] for g in evidence["incident_groups"]][:2] == [[0], [1]]
     lines = incident_summary(evidence).splitlines()
-    assert len(lines) == 1 + 1 + ev.SUMMARY_PARTIAL_LINES + 1 + 1 == 12
+    assert len(lines) == 1 + 1 + ev.SUMMARY_PARTIAL_LINES + 1 + 1 + 1 == 13
     assert lines[0] == "64 distinct incidents on 64 of 64 ranks; every rank's report from tensorquill-server is current through step 1999."
     assert lines[2] == "  - rank 0 only: NaN or Inf at step 100 in blk0" and lines[9] == "  - rank 7 only: NaN or Inf at step 107 in blk7"
     assert lines[10] == "  - and 56 more distinct incidents on other ranks (non_finite x56); see incident_groups in the evidence file"
     assert lines[11] == "By class: invariant non_finite"
+    assert re.match(r"\d+ of 32 kinds checked on all 64 ranks, ", lines[12]) and len(lines[12]) < 400, lines[12]
     # Common and partial together: ten incidents on every rank and one extra on rank 5 only.
     run = fabricated_run(tmp_path / "g", 64, 2000, template, lambda rank: template["incidents"] + (
         [{"kind": "non_finite", "step": 9, "layers": ["x"], "gradients": []}] if rank == 5 else []))
@@ -1001,3 +1017,58 @@ def test_64_ranks_from_a_real_server_are_judged_grouped_and_cheap_to_look_at(tmp
     assert "  - ranks 1, 3, 5, 7, 9, 11, 13, 15, and 24 more (32 of 64): Gradient spike at step 40" in summary
     assert evidence["world_size"] == 64 and len(evidence["ranks"]) == 64 and entry(evidence, 63)["stream"]["state"] in ("active", "finished")
     assert run.server.terminate() == 0
+
+
+# --- What was checked, for the run ------------------------------------------------------------
+#
+# The rule itself is tested case by case in test_kind_checks.py, on stores written by hand.
+# Here the ranks' `kind_checks` are the real server's own.
+
+
+def test_what_was_checked_is_said_for_the_run_from_the_servers_own_reports(tmp_path):
+    run = Run(tmp_path, *FAST)
+    full = [{**item, "weights_unchanged": [], "grad_norms": {"w": 1.0}} for item in steady(60)]
+    run.send(0, full)       # records weights
+    run.send(1, steady(60))  # does not
+    run.send(2, steady(5))   # short of history
+    run.send(3, full)       # records weights, and will not be judged
+    assert run.server.terminate() == 0
+    run.report_file(3).unlink()
+    evidence, summary = look(run, tmp_path)
+    assert (evidence["judged_ranks"], evidence["unknown_ranks"]) == ([0, 1, 2], [3])
+    checks = evidence["kind_checks"]
+    assert list(checks) == list(ev.INCIDENT_CLASSES)
+    # Checked on rank 0 only: never the best rank's value, and rank 3 is in no list.
+    assert (checks["stalled_weights"]["value"], checks["stalled_weights"]["ranks"]) == (
+        "not_configured", {"checked": [0], "not_configured": [1, 2]})
+    # Short on rank 2, so short for the run, with the fewest records and that rank named.
+    assert checks["grad_spike"] == {
+        "value": "checked", "enough_history": False, "records": 5, "records_needed": 13,
+        "needs": "grad_norm or clip_grad_norm", "not_enough_history_ranks": [2],
+    }
+    assert checks["job_stalled"]["value"] == "checked" and checks["memory_imbalance"]["value"] == "not_configured"
+    assert 3 not in [rank for check in checks.values() for ranks in (check.get("ranks") or {}).values() for rank in ranks]
+    assert [("kind_counts" in entry(evidence, rank)) for rank in range(4)] == [True, True, True, False]
+    assert (entry(evidence, 0)["kind_counts"]["checked"], entry(evidence, 1)["kind_counts"]["checked"]) == (5, 4)
+    assert summary.splitlines()[-1] == (
+        "6 of 32 kinds checked on the 3 judged ranks of 4 (rank 3 not judged, so not counted), 1 of them without enough"
+        " history yet (grad_spike 5 of 13 records on rank 2), 26 not configured, 1 of them checked on some ranks only"
+        " (stalled_weights on rank 0)"
+    )
+    # The public look and the MCP tool give the same object.
+    from tensorquill import mcp_server
+
+    assert json.loads(json.dumps(ev.all_ranks_evidence(run.folder)))["kind_checks"] == checks
+    status = mcp_server.get_all_ranks_status(mcp_server.Source(run.folder), {})
+    assert status["kinds"]["differs_by_rank"] == {"stalled_weights": {"checked": "0", "not_configured": "1-2"}}
+    assert (status["kinds"]["judged_ranks"], status["kinds"]["ranks_not_counted"]) == ("0-2", "3")
+    assert status["kinds"]["not_enough_history"] == {"grad_spike": {"records": 5, "records_needed": 13, "ranks": "2"}}
+
+    # The same store as a server older than `kind_checks` would have left rank 1's report: no count.
+    report = json.loads(run.report_file(1).read_text())
+    del report["kind_checks"]
+    run.report_file(1).write_text(json.dumps(report))
+    evidence, summary = look(run, tmp_path / "older")
+    assert evidence["judged_ranks"] == [0, 1, 2] and "kind_checks" not in evidence
+    assert evidence["kind_checks_not_stated"]["ranks"] == [1] and " kinds checked" not in summary
+    assert summary.splitlines()[-1].startswith("What was checked is not stated: the report of rank 1 ")

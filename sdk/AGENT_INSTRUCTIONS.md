@@ -39,7 +39,7 @@ Work in this order.
    - `kinds`: which of the 32 incident kinds were checked, which are not configured, and which are unavailable and why.
    - `not_checked`: the checks that were not made.
    - `ranks`, when the path is a run folder: how many ranks are judged and how many are unknown.
-2. **If the path is a run folder, call `get_all_ranks_status`.** It says which ranks show each incident, which ranks are clean, and which are unknown and why. On one rank's file this tool returns an error that says so; that is expected, and you carry on.
+2. **If the path is a run folder, call `get_all_ranks_status`.** It says which ranks show each incident, which ranks are clean, and which are unknown and why. Its `kinds` says what was checked for the whole run (see "A run folder" below). On one rank's file this tool returns an error that says so; that is expected, and you carry on.
 3. **Pick the incident to explain.** Take the invariants and anomalies, and among them the one with the earliest step. Later incidents are often its consequences.
 4. **Call `get_incident` with its id.** The id has the form `<kind>@<step>`, such as `grad_spike@310`. The answer holds every number the detector recorded, the ranks that show it, and under `look_next` the series calls that show the data behind it.
 5. **Call `get_series` for what the incident names.** Use the names in the incident's `where`, exactly as written. Look at the whole run first, then narrow `start` and `end` around the step until `stride` is 1.
@@ -90,7 +90,18 @@ The summary's line "N of 32 kinds checked" is the count, and it names the kinds 
 
 `kinds.history_not_stated` appears for a file written before this was recorded. Treat those kinds as not enough history: the file does not say.
 
-`kinds` is there for one rank's capture or evidence file. A run folder's answer, and a file written by an older version, have no `kinds` and no count. Then what was checked is not stated: say so, and do not infer it from the incidents that are listed.
+`kinds` is there for one rank's capture or evidence file, and for a run folder. A file written by an older version has no `kinds` and no count. Then what was checked is not stated: say so, and do not infer it from the incidents that are listed.
+
+**A run folder.** For a run folder, `kinds` (in `get_all_ranks_status` and `list_incidents`) is about the whole run, and is read like this:
+
+- It counts judged ranks only. `kinds.judged_ranks` names them, and `kinds.ranks_not_counted` names the ranks that are not judged. Nothing in `kinds` says anything about those: never write that a kind was checked on a rank listed there.
+- A kind takes the value of its worst judged rank. So `kinds.checked` lists the kinds that every judged rank checked with enough history, and only for those does "nothing found" cover every judged rank.
+- A kind under `kinds.not_configured` or `kinds.unavailable` may still be checked on some ranks. `kinds.differs_by_rank` names each such kind's ranks by value, for example `"stalled_weights": {"checked": "0", "not_configured": "1"}`. Say it that way: "stalled weights were checked on rank 0 only". When the entry also has `not_enough_history` (or `history_not_stated`), the ranks named there checked the kind but its rule is still warming up on them, so nothing found is not a verdict there either: say "checked on ranks 1-2, without enough history yet". An incident of such a kind stands for the ranks that show it.
+- A kind under `kinds.not_enough_history` is short of history on at least one judged rank. `records` is the fewest any judged rank has, and `ranks` names the ranks that are short when not all are.
+- One unavailable rank makes the kind unavailable for the run, and the run `degraded`, as for one rank.
+- The summary's count line names the same things: "6 of 32 kinds checked on the 3 judged ranks of 4 (rank 3 not judged, so not counted), 1 of them without enough history yet (grad_spike 5 of 13 records on rank 2), 26 not configured, 1 of them checked on some ranks only (stalled_weights on rank 0)".
+- When there is no `kinds`, `kinds_not_stated` gives the reason: no rank is judged, or a judged rank's report was written by a server that does not say what it checked. Then nothing is counted for the run, and the summary says "What was checked is not stated". Say so, and do not infer it.
+- The invariant `duplicate_batches` is compared by the server, and its status names the ranks it compared only when it finds a duplicate. Read `checked` for it as "every judged rank recorded its batches and a status was read", not as proof that every rank was compared.
 
 A check listed under `not_checked` was not made, and each entry gives the reason. It is not a finding of "nothing wrong". Every unavailable kind is named by one of these entries, or by the reason `no_status`.
 
