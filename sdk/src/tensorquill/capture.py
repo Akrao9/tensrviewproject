@@ -115,9 +115,13 @@ def _first_tensor(output: Any, *, integer: bool) -> torch.Tensor | None:
     return None
 
 
-def _stats_hook(buf: torch.Tensor, stat_idx: torch.Tensor, row: int) -> Callable[..., None]:
+def _stats_hook(
+    buf: torch.Tensor, stat_idx: torch.Tensor, row: int, phase: _Evaluating | None = None
+) -> Callable[..., None]:
+    phase = phase or _Evaluating()
+
     def hook(module: nn.Module, args: Any, output: Any) -> None:
-        if _recomputing():
+        if _recomputing() or _evaluating(module, phase):
             return
         x = _first_tensor(output, integer=False)
         if x is None or x.numel() == 0:
@@ -254,12 +258,15 @@ def _router_hook(
     expert_ids: torch.Tensor,
     spec: Router,
     problems: list[tuple[str, str | None]] | None = None,
+    phase: _Evaluating | None = None,
 ) -> Callable[..., None]:
     """The forward hook that adds a router's chosen experts to `counts`. Nothing in it raises
     into training: what cannot be counted refuses the router for the session (`problems`,
     said once by the session and written under `moe_refused`), first from types, layouts,
     devices and shapes alone, so the same under `torch.compile`, and in eager mode from any
-    exception left, which is caught."""
+    exception left, which is caught. A forward that is not training (`_evaluating`) is left
+    out before anything is read, so an evaluation batch is neither counted nor refused."""
+    phase = phase or _Evaluating()
 
     def refuse(why: Callable[[], str], fix: str | None = None) -> None:
         # Built only the first time: a refused router's hook still runs on every forward, and
@@ -350,7 +357,7 @@ def _router_hook(
             counts.add_(torch.cat([hits, (idx.numel() - hits.sum()).reshape(1)]))
 
     def hook(module: nn.Module, args: Any, output: Any) -> None:
-        if _recomputing():
+        if _recomputing() or _evaluating(module, phase):
             return
         if torch.compiler.is_compiling():
             # No `try` in a traced hook: the checks above are what keep it from raising there.
@@ -460,6 +467,36 @@ def _recomputing() -> bool:
     compilation the check is skipped: a compiled forward is never a recomputation.
     """
     return not torch.compiler.is_compiling() and torch._C._current_graph_task_id() != -1
+
+
+class _Evaluating:
+    """Whether the session's phase is `"eval"` (`Session.set_phase`), shared with its hooks.
+    An attribute of an object of its own, so a hook that reads it guards on one bool."""
+
+    on = False
+
+
+def _evaluating(module: nn.Module, phase: _Evaluating) -> bool:
+    """True for a forward that is not training: one whose statistics belong to no optimizer
+    step, so they must not reach the next step's record.
+
+    Lightning and the Hugging Face `Trainer` evaluate with the model in eval mode and without
+    gradients (`torch.no_grad` or `torch.inference_mode`), as most hand-written loops do, so
+    the two together mark an evaluation without anything from the user. Neither alone does:
+    reentrant activation checkpointing runs a training forward without gradients, and some
+    training keeps modules in eval mode (frozen blocks, dropout turned off). Under
+    `session.phase("eval")` (which the Lightning and Hugging Face callbacks set), either one
+    is enough. The phase alone never is: a training forward in train mode with gradients
+    counts even under a phase left behind by a callback that missed its end.
+
+    In a training forward both signals are on and the phase is not read, so a compiled
+    training graph carries no guard on it; Dynamo already guards on grad mode and on each
+    module's `training`, so an evaluation compiles no more often than without the hooks.
+    """
+    training, grad = module.training, torch.is_grad_enabled()
+    if training and grad:
+        return False
+    return (not training and not grad) or phase.on
 
 
 def _clip_grad_norm_wrapper(parameters: Any, *args: Any, **kwargs: Any) -> Any:
@@ -655,13 +692,18 @@ class Session:
         for buf in (self._act, self._stat_idx, *self._counts_list, *self._expert_ids.values()):
             _mark_static(buf)
 
+        # Forwards that are not training (evaluation, the probe) are left out by the hooks
+        # (`_evaluating`); this says whether the session's phase is "eval" (`set_phase`).
+        self._evaluating = _Evaluating()
         self._handles = [
-            module.register_forward_hook(_stats_hook(self._act, self._stat_idx, row))
+            module.register_forward_hook(_stats_hook(self._act, self._stat_idx, row, self._evaluating))
             for row, (_, module) in enumerate(selected)
         ]
         self._handles += [
             modules[name].register_forward_hook(
-                _router_hook(self._counts[name], self._expert_ids[name], spec, self._router_problems[name])
+                _router_hook(
+                    self._counts[name], self._expert_ids[name], spec, self._router_problems[name], self._evaluating
+                )
             )
             for name, spec in self._routers.items()
         ]
@@ -1415,8 +1457,11 @@ class Session:
     def set_phase(self, phase: str = "train") -> None:
         """Say what the process is doing: `"train"` (the default), `"eval"`, `"checkpoint"`, or
         any short word. While it is not `"train"` and its heartbeats go on, the server does
-        not call the missing steps a hang. A no-op unless streaming with `endpoint=`."""
+        not call the missing steps a hang. Under `"eval"`, a forward in eval mode or without
+        gradients is also left out of the records (`_evaluating`); without it, only one with
+        both. Otherwise a no-op unless streaming with `endpoint=`."""
         self._phase = phase
+        self._evaluating.on = phase == "eval"
         heartbeat = getattr(self._sink, "heartbeat", None)
         if heartbeat is not None:
             heartbeat.set_phase(phase)
