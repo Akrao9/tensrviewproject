@@ -878,6 +878,34 @@ def test_a_rank_short_of_history_makes_the_kind_short_for_the_run_and_is_named(t
     assert status["kinds"]["not_enough_history"] == {"grad_spike": {"records": 5, "records_needed": 13}}
 
 
+def test_a_kind_checked_on_some_ranks_only_says_when_those_ranks_are_still_warming_up(tmp_path):
+    # Ranks 0 and 1 record weights, rank 0 on two steps only (the rule needs three); rank 2 records none.
+    twice = steps(60, weights_unchanged=lambda step: [] if step < 2 else None, grad_norms={"w": 1.0})
+    folder = hand_store(tmp_path, {0: twice, 1: steps(60, **WEIGHTS), 2: steps(60)})
+    evidence, summary, status = three_ways(folder, tmp_path)
+    check = evidence["kind_checks"]["stalled_weights"]
+    assert (check["value"], check["ranks"]) == ("not_configured", {"checked": [0, 1], "not_configured": [2]})
+    assert check["not_enough_history_ranks"] == [0]
+    assert "(stalled_weights on ranks 0-1 without enough history yet on rank 0)" in count_line(summary)
+    assert status["kinds"]["differs_by_rank"]["stalled_weights"] == {
+        "checked": "0-1", "not_configured": "2", "not_enough_history": "0"}
+    # Short on every rank that checks it: no rank among them differs, so none is named twice.
+    both = hand_store(tmp_path / "both", {0: twice, 1: steps(60)})
+    _, summary, status = three_ways(both, tmp_path)
+    assert "(stalled_weights on rank 0 without enough history yet)" in count_line(summary)
+    assert status["kinds"]["differs_by_rank"]["stalled_weights"]["not_enough_history"] == "0"
+
+    def strip(report):
+        for item in report["kind_checks"].values():
+            del item["enough_history"]
+
+    older = hand_store(tmp_path / "older", {0: steps(60, **WEIGHTS), 1: steps(60)})
+    change_report(older, 0, strip)
+    _, summary, status = three_ways(older, tmp_path)
+    assert "(stalled_weights on rank 0 with no word on its history)" in count_line(summary)
+    assert status["kinds"]["differs_by_rank"]["stalled_weights"]["history_not_stated"] == "0"
+
+
 def test_an_incident_on_a_rank_with_enough_history_is_not_called_a_faster_rules(tmp_path):
     spike = {"kind": "grad_spike", "step": 40, "grad_norm": 9.0, "baseline": 1.0, "ratio": 9.0, "parameters": [],
              "spike_count": 1, "spike_steps": [40]}

@@ -3111,7 +3111,8 @@ def all_ranks_checked_line(evidence: Mapping[str, Any]) -> str | None:
     of 13 records on rank 1), 25 not configured, 1 of them checked on some ranks only
     (stalled_weights on rank 0)`. A kind is counted as checked only when every judged rank
     checked it; ranks are named wherever the judged ranks differ, and the ranks that are not
-    judged are named as not counted."""
+    judged are named as not counted. A kind checked on some ranks only says so when those
+    ranks are still short of history."""
     counts = checked_counts(evidence)
     if counts is None:
         missing = evidence.get("kind_checks_not_stated")
@@ -3151,7 +3152,18 @@ def all_ranks_checked_line(evidence: Mapping[str, Any]) -> str | None:
     partly = [kind for kind in INCIDENT_CLASSES if isinstance(checks.get(kind), Mapping)
               and checks[kind].get("value") == "not_configured" and (checks[kind].get("ranks") or {}).get("checked")]
     if partly:
-        each = [differing(kind, "checked") + (", where it is reported" if reported.get(kind) else "") for kind in partly]
+        each = []
+        for kind in partly:
+            # "Checked" there is not yet a verdict there either, when the rank is still warming up.
+            there = checks[kind]["ranks"]["checked"]
+            short = checks[kind].get("not_enough_history_ranks") or ()
+            silent = checks[kind].get("history_not_stated_ranks") or ()
+            said = differing(kind, "checked")
+            if short:
+                said += " without enough history yet" + ("" if len(short) == len(there) else f" {_on_ranks(short)}")
+            if silent:
+                said += " with no word on its history" + ("" if len(silent) == len(there) else f" {_on_ranks(silent)}")
+            each.append(said + (", where it is reported" if reported.get(kind) else ""))
         line += f", {len(partly)} of them checked on some ranks only ({_some(each)})"
     if counts["unavailable"]:
         line += f", {counts['unavailable']} unavailable ({_some([differing(k, 'unavailable') for k in counts['unavailable_kinds']])})"
@@ -3169,7 +3181,9 @@ def all_ranks_kinds(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
       `ranks` (all of them when there is no `ranks`).
     - `not_configured` and `unavailable` are the worst judged rank's value, so a kind listed
       there may be checked on other ranks: `differs_by_rank` gives each such kind's ranks by
-      value. An incident of such a kind stands for the ranks that show it.
+      value, and under `not_enough_history` (or `history_not_stated`) those of its checked
+      ranks whose rule is still warming up. An incident of such a kind stands for the ranks
+      that show it.
     - `judged_ranks` and `ranks_not_counted`: who the values are about, and who they are not.
     """
     found = kinds_by_value(evidence)
@@ -3183,8 +3197,15 @@ def all_ranks_kinds(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
             entry["ranks"] = _rank_ranges(short)
         if reported.get(kind, set()) & set(short):
             entry["reported"] = True
-    differs = {kind: {value: _rank_ranges(ranks) for value, ranks in check["ranks"].items()}
-               for kind, check in checks.items() if isinstance(check, Mapping) and isinstance(check.get("ranks"), Mapping)}
+    differs = {
+        kind: {**{value: _rank_ranges(ranks) for value, ranks in check["ranks"].items()},
+               # Of the ranks that checked it: those whose rule could not have fired yet.
+               **({"not_enough_history": _rank_ranges(check["not_enough_history_ranks"])}
+                  if check.get("not_enough_history_ranks") else {}),
+               **({"history_not_stated": _rank_ranges(check["history_not_stated_ranks"])}
+                  if check.get("history_not_stated_ranks") else {})}
+        for kind, check in checks.items() if isinstance(check, Mapping) and isinstance(check.get("ranks"), Mapping)
+    }
     return {
         **found,
         **({"differs_by_rank": differs} if differs else {}),
