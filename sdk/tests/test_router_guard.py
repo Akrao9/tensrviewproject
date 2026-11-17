@@ -582,7 +582,11 @@ def test_a_dtensor_is_refused_not_raised(tmp_path):
     dist = pytest.importorskip("torch.distributed")
     if not dist.is_available() or dist.is_initialized():
         pytest.skip("needs torch.distributed and no process group yet")
-    from torch.distributed.tensor import DTensor, Replicate, init_device_mesh
+    try:
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import DTensor, Replicate
+    except ImportError as error:
+        pytest.skip(f"no DTensor in this PyTorch: {error}")
 
     dist.init_process_group("gloo", rank=0, world_size=1, store=dist.HashStore())
     try:
