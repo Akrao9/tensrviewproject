@@ -256,10 +256,10 @@ impl Progress {
         floor.max(self.cadence().map_or(0.0, |gap| gap * config.silent_factor))
     }
 
-    /// An open stream with no stored batch whose counter has shown no training step: the rank
-    /// is under `start_limit`, not under its threshold.
+    /// No stored batch and a counter that has shown no training step: while its stream is open
+    /// the rank is under `start_limit`, not under its threshold.
     fn before_its_first_step(&self) -> bool {
-        self.stream == Stream::Open && self.last_step.is_none() && !self.stepped
+        self.last_step.is_none() && !self.stepped
     }
 
     /// When the rank last showed a sign of work: its counter moved or it changed its phase
@@ -425,6 +425,22 @@ impl Progress {
         let since_change = seconds(&carry["since_change_seconds"])?;
         let stopped = matches!(state, "silent" | "lost" | "unresponsive");
         let dropped = stream == "dropped";
+        // Absent from a status written before it was kept: no step seen.
+        let stepped = carry["stepped"].as_bool().unwrap_or(false);
+        let work_still = seconds(&carry["work_still_seconds"])?;
+        let phase_seconds = seconds(&entry["phase_seconds"])?;
+        // The quiet time a stopped rank had. A rank called silent before its first stored batch
+        // had made no progress to count from: its clock was its counter, or its last sign of work
+        // (see `quiet_seconds`), and it keeps that one, or a warning would come back critical.
+        let quiet = if state == "silent" && !dropped && entry["last_step"].is_null() {
+            if stepped {
+                work_still
+            } else {
+                work_still.min(phase_seconds)
+            }
+        } else {
+            since_progress
+        };
         // When the stream's state last changed, as an age. Finished stays finished. A rank that
         // was already stopped keeps the quiet time it had and is at least past the floor, so it
         // is `lost` at once. A rank whose stream had dropped goes on counting; one that was
@@ -432,7 +448,7 @@ impl Progress {
         let change_age = if stream == "finished" {
             since_change
         } else if stopped {
-            (if dropped { since_change } else { since_progress }).max(config.silent_floor.as_secs_f64() + 0.001)
+            (if dropped { since_change } else { quiet }).max(config.silent_floor.as_secs_f64() + 0.001)
         } else if dropped {
             since_change
         } else {
@@ -459,16 +475,15 @@ impl Progress {
         }
         Some(Self {
             phase: entry["phase"].as_str()?.chars().take(40).collect(),
-            phase_since: ago(now, seconds(&entry["phase_seconds"])?),
+            phase_since: ago(now, phase_seconds),
             last_heartbeat: match &entry["heartbeat_age_seconds"] {
                 Value::Null => None,
                 age => Some(ago(now, seconds(age)?)),
             },
             heartbeat_interval: seconds(&carry["heartbeat_interval_seconds"])?.clamp(0.0, 3600.0),
             work: carry["work"].as_i64(),
-            work_moved: ago(now, seconds(&carry["work_still_seconds"])?),
-            // Absent from a status written before these were kept: no step seen, no times.
-            stepped: carry["stepped"].as_bool().unwrap_or(false),
+            work_moved: ago(now, work_still),
+            stepped,
             step_seconds: carry["step_seconds"]
                 .as_array()
                 .map_or(&[][..], Vec::as_slice)
@@ -1767,6 +1782,55 @@ mod tests {
         let fresh = restarted(&older, 60, now);
         fresh.stream_opened(&key(0), now);
         assert_eq!(states(&fresh, at(now, 20)), ["starting"]);
+        // Silent at warning when the server stopped, 85 s after the counter last moved (critical at
+        // 180 s): still a warning in the first file of the new server, while its sender is away,
+        // and when it is back, and critical when its own clock says so. Not counted from when the
+        // rank was first seen, which was 180 s before the stop.
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        for second in (5..180).step_by(15) {
+            let work = if second < 95 { 0 } else { 40 };
+            dog.heartbeat(&key(0), "train", 15.0, Some(work), None, at(t0, second));
+        }
+        let before = dog.statuses(at(t0, 180), true)["run"].clone();
+        assert_eq!(
+            (&before["ranks"][0]["state"], &before["ranks"][0]["severity"]),
+            (&json!("silent"), &json!("warning"))
+        );
+        let fresh = restarted(&before, 60, now);
+        assert_eq!(states(&fresh, at(now, 1)), ["silent"]);
+        assert_eq!(rank_field(&fresh, at(now, 1), "severity"), "warning");
+        assert_eq!(rank_field(&fresh, at(now, 50), "severity"), "warning"); // 135 s
+        fresh.stream_opened(&key(0), at(now, 55));
+        for second in (56..200).step_by(15) {
+            fresh.heartbeat(&key(0), "train", 15.0, Some(40), None, at(now, second));
+        }
+        assert_eq!(states(&fresh, at(now, 60)), ["silent"]);
+        assert_eq!(rank_field(&fresh, at(now, 90), "severity"), "warning"); // 175 s
+        assert_eq!(rank_field(&fresh, at(now, 100), "severity"), "critical"); // 185 s
+                                                                              // The same for a rank that never stepped: a warning from the start limit (600 s), critical
+                                                                              // at 780 s, across a restart at 650 s.
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        for second in (5..650).step_by(15) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, second));
+        }
+        let before = dog.statuses(at(t0, 650), true)["run"].clone();
+        assert_eq!(
+            (&before["ranks"][0]["state"], &before["ranks"][0]["severity"]),
+            (&json!("silent"), &json!("warning"))
+        );
+        let fresh = restarted(&before, 60, now);
+        assert_eq!(states(&fresh, at(now, 1)), ["silent"]);
+        assert_eq!(rank_field(&fresh, at(now, 1), "severity"), "warning");
+        assert_eq!(rank_field(&fresh, at(now, 50), "severity"), "warning"); // 700 s
+        fresh.stream_opened(&key(0), at(now, 55));
+        for second in (56..200).step_by(15) {
+            fresh.heartbeat(&key(0), "train", 15.0, Some(0), None, at(now, second));
+        }
+        assert_eq!(states(&fresh, at(now, 120)), ["silent"]);
+        assert_eq!(rank_field(&fresh, at(now, 120), "severity"), "warning"); // 770 s
+        assert_eq!(rank_field(&fresh, at(now, 140), "severity"), "critical"); // 790 s
     }
 
     #[test]

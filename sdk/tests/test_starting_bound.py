@@ -177,8 +177,8 @@ def test_a_real_rank_that_is_slow_to_its_first_step_and_its_first_batch_is_never
                before=6.0, steps=60, step_seconds=0.3)
     try:
         job.until(lambda rank: rank.get("severity") == "warning", "the warning before the first step")
-        stepping = time.monotonic()
         job.until(lambda rank: rank.get("state") == "starting" and (rank.get("work") or 0) > 0, "the first steps seen")
+        stepping = time.monotonic()
         stored = job.until(lambda rank: rank.get("last_step") is not None and rank, "the first stored batch")
         assert time.monotonic() - stepping > 10.0  # longer than the floor, the limit and the critical time
         assert (stored["state"], stored["severity"]) == ("active", None)
