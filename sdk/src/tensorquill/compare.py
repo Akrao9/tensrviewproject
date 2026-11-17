@@ -458,8 +458,8 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_
 
     try:
         records = [load_records(run["records"]["path"], rank=run["records"]["rank"]) for run in opened]
-    except (OSError, ValueError) as error:
-        return {"state": "no_records", "detail": f"the step records could not be read again for where the runs part ({error})"}
+    except (OSError, ValueError, ImportError) as error:  # ImportError: a store's parts need pyarrow
+        return {"state": "no_records", "detail": f"the step records could not be read for where the runs part ({error})"}
     found = first_divergence(records[0], records[1], rank=ranks[0])
     lines = divergence_summary(found)
     series = found.get("series") or {}
