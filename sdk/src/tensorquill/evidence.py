@@ -3575,6 +3575,37 @@ def _router_sizes(records: list[dict[str, Any]]) -> dict[str, int]:
     return sizes
 
 
+MOE_KINDS = ("moe_imbalance", "starved_experts")
+
+
+def refused_routers_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The `router` entry of `not_checked`: routers the capture refused to count.
+
+    A router whose output's first integer tensor cannot be expert indices is not counted
+    (capture.py's router guard) and leaves no entry in `moe`, so the MoE rules never see
+    it. The capture says so once, under `moe_refused` on the first record it wrote after
+    the refusal. Without this entry a run whose only router was refused would read "no MoE
+    incident", which is not "MoE checked". The server writes the same entry (detect.rs).
+    """
+    first: dict[str, tuple[int, str]] = {}
+    for record in records:
+        refused = record.get("moe_refused")
+        if not isinstance(refused, Mapping):
+            continue
+        for name, why in refused.items():
+            first.setdefault(str(name), (int(record["step"]), str(why)))
+    if not first:
+        return None
+    names = sorted(first)
+    return {
+        "check": "router",
+        "kinds": list(MOE_KINDS),
+        "routers": names,
+        "reason": "; ".join(f"router {name} is not counted: {first[name][1]}" for name in names),
+        "step": min(step for step, _ in first.values()),
+    }
+
+
 def _diversity_from_counts(counts: list[int], n_experts: int) -> float:
     total = sum(counts)
     if total <= 0 or n_experts <= 0:
@@ -3968,6 +3999,9 @@ def build_evidence(
         if non_finite_hit is not None:
             incidents.append(non_finite_hit)
         incidents.extend(detect_system_incidents(records, not_checked))
+        refused = refused_routers_not_checked(records)
+        if refused is not None:
+            not_checked.append(refused)
         rank_checks = kind_checks(input_counts(records), not_checked, starve_window=starve_window)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
     # A status is expected where a server stores the run (a directory of its parts, or one

@@ -1110,12 +1110,29 @@ struct Moe {
     kept: Option<Kept>,
     /// How many rows had a router with tokens to judge: the `moe` input count.
     judged_rows: u64,
+    /// Routers the capture refused to count (`moe_refused`, said once on a record), each
+    /// with the first step it was said on and why. They leave no entry in `moe_counts`.
+    refused: BTreeMap<String, (i64, String)>,
 }
 
 impl Moe {
     fn row(&mut self, step: i64, columns: &Columns, row: usize, options: &Thresholds) {
         if let Some(kept) = &mut self.kept {
             kept.rows.push((step, kept.samples.len()));
+        }
+        // `moe_refused` travels in `extra_json`, which is parsed only on a row that names it.
+        if let Some(extra) = text(columns.extra, row).filter(|extra| extra.contains("\"moe_refused\"")) {
+            let extra: Option<Value> = serde_json::from_str(extra).ok();
+            if let Some(refused) = extra
+                .as_ref()
+                .and_then(|extra| extra.get("moe_refused"))
+                .and_then(Value::as_object)
+            {
+                for (name, why) in refused {
+                    let why = why.as_str().map_or_else(|| why.to_string(), str::to_owned);
+                    self.refused.entry(name.clone()).or_insert((step, why));
+                }
+            }
         }
         if let Some(top_k) = &columns.moe_top_k {
             for entry in top_k.row(row) {
@@ -1293,6 +1310,24 @@ impl Moe {
             }
         }
         self.judged_rows += u64::from(judged);
+    }
+
+    /// The `router` entry of `not_checked`: Python's `refused_routers_not_checked`. A run
+    /// whose only router was refused has no MoE incident, and that is not "MoE checked".
+    fn refused_not_checked(&self) -> Option<Value> {
+        let step = self.refused.values().map(|(step, _)| *step).min()?;
+        let reason: Vec<String> = self
+            .refused
+            .iter()
+            .map(|(name, (_, why))| format!("router {name} is not counted: {why}"))
+            .collect();
+        Some(json!({
+            "check": "router",
+            "kinds": ["moe_imbalance", "starved_experts"],
+            "routers": self.refused.keys().collect::<Vec<_>>(),
+            "reason": reason.join("; "),
+            "step": step,
+        }))
     }
 
     fn incidents(&self, out: &mut Vec<Value>) {
@@ -3192,6 +3227,7 @@ impl RankDetectors {
         out.extend(self.resumes.not_checked().cloned());
         out.extend(self.attention.probe_not_checked());
         self.system.not_checked(&mut out);
+        out.extend(self.moe.refused_not_checked());
         out
     }
 
@@ -4100,6 +4136,49 @@ mod tests {
         );
         assert_eq!(checks["repeated_steps"]["records"], 4);
         assert!(values(&checks, "unavailable").is_empty());
+    }
+
+    #[test]
+    fn a_refused_router_makes_the_moe_kinds_unavailable_and_says_why() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        // The capture leaves a refused router out of `moe_counts` and says why once, on the
+        // first record it wrote after the refusal, under `moe_refused` in `extra_json`.
+        let rows: Vec<MoeRow> = (0..4)
+            .map(|step| (1, step, vec![("counted", vec![30, 30, 30, 30])]))
+            .collect();
+        let base = moe_rows(&rows, 2);
+        let said = r#"{"moe_refused":{"refused":"its output's first integer tensor has shape (8,)"}}"#;
+        let extra: Vec<Option<&str>> = vec![None, Some(said), None, Some(r#"{"moe_refused_not":1}"#)];
+        let mut fields: Vec<Field> = base.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        fields.push(Field::new("extra_json", DataType::Utf8, true));
+        let mut columns = base.columns().to_vec();
+        columns.push(Arc::new(StringArray::from(extra)));
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+
+        let detectors = judge(0, &[batch], &usual()).unwrap();
+        let reason = "router refused is not counted: its output's first integer tensor has shape (8,)";
+        let entry = json!({
+            "check": "router", "kinds": ["moe_imbalance", "starved_experts"], "routers": ["refused"],
+            "reason": reason, "step": 1,
+        });
+        assert_eq!(detectors.not_checked().last(), Some(&entry));
+        let checks = detectors.kind_checks();
+        assert_eq!(values(&checks, "unavailable"), ["moe_imbalance", "starved_experts"]);
+        // The counted router's rows still count toward the kinds' history.
+        assert_eq!(checks["moe_imbalance"]["records"], 4);
+        assert_eq!(
+            (&checks["moe_imbalance"]["check"], &checks["moe_imbalance"]["reason"]),
+            (&json!("router"), &json!(reason))
+        );
+        assert!(detectors
+            .incidents()
+            .iter()
+            .all(|i| i["kind"] != "moe_imbalance" && i["kind"] != "starved_experts"));
+
+        // Without the note, the same rows are an MoE run that was checked.
+        let clean = judge(0, &[base], &usual()).unwrap();
+        assert!(clean.not_checked().iter().all(|e| e["check"] != "router"));
+        assert_eq!(clean.kind_checks()["moe_imbalance"]["value"], "checked");
     }
 
     #[test]
