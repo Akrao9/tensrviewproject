@@ -3087,6 +3087,88 @@ def _all_ranks_kind_checks(
         stated, others, memory={n: looks[n]["report"].get("memory") for n in judged}, status=status)
 
 
+_STATUS_INCIDENT_KINDS = ("job_stalled", "rank_silent", "duplicate_batches")  # from the server's status
+
+
+def combine_rank_evidence(
+    per_rank: Mapping[int, Mapping[str, Any]],
+    *,
+    status: Mapping[str, Any] | None = None,
+    status_expected: bool = False,
+    unknown_ranks: Mapping[int, str] | None = None,
+    memory: Mapping[int, Any] | None = None,
+) -> dict[str, Any]:
+    """The run-level part of the all-ranks view, built from one evidence per judged rank.
+
+    For the ranks `all_ranks_evidence` cannot read as a whole: a run of local `.jsonl` files
+    (each rank judged by `build_evidence`, or read from its evidence file), and a store whose
+    ranks are not all current (some judged from their reports, some from their parts). It
+    applies the view's rules and no other: incidents grouped across ranks by
+    `_incident_identity` (`incident_groups`), the run's own incidents apart (`run_incidents`:
+    the server's status, read once, and `memory_imbalance` across ranks), what was checked by
+    `run_kind_checks` (`kind_checks`, or `kind_checks_not_stated`), and `run_state` over all of
+    it. `unknown_ranks` are the ranks with no evidence, with why: they are in no value.
+
+    `status` is the server's status for a store (`status_expected=True`); a local run has none,
+    and then `duplicate_batches`, which only the server compares, is `not_configured`.
+    `memory` is each rank's latest memory reading where its evidence does not carry it (a
+    server report's `memory`). An evidence may carry `last_step`, which the caller knows from
+    the records or the report; the run's is `{"min", "max"}` over the judged ranks.
+    """
+    judged = sorted(per_rank)
+    unknown = dict(unknown_ranks or {})
+    stream = ((list(status["incidents"]) if isinstance(status.get("incidents"), list) else detect_watchdog_incidents(status))
+              if status is not None else [])
+    looks = {n: {"report": {"incidents": [dict(i) for i in per_rank[n].get("incidents") or ()
+                                          if isinstance(i, Mapping) and not (status is not None and i.get("kind") in _STATUS_INCIDENT_KINDS)]}}
+             for n in judged}
+    groups = _group_incidents(looks, judged)
+    readings = {n: (memory or {}).get(n, per_rank[n].get("memory")) for n in judged}
+    run_incidents = [dict(i) for i in stream]
+    imbalance = detect_memory_imbalance(readings)
+    if imbalance is not None:
+        run_incidents.append(imbalance)
+    with_classes(run_incidents)
+    not_checked = [dict(item) for n in judged for item in per_rank[n].get("not_checked") or () if isinstance(item, Mapping)]
+    steps = [s for n in judged if isinstance(s := per_rank[n].get("last_step"), int) and not isinstance(s, bool)]
+    combined: dict[str, Any] = {
+        "rank_count": len(set(judged) | set(unknown)),
+        "judged_ranks": judged,
+        "unknown_ranks": sorted(unknown),
+        "ranks_with_incidents": sorted({n for group in groups for n in group["ranks"]}),
+        "last_step": {"min": min(steps), "max": max(steps)} if steps else None,
+        "incident_groups": groups,
+        "run_incidents": run_incidents,
+    }
+    stated = {n: found for n in judged if (found := stated_kind_checks(per_rank[n])) is not None}
+    silent = [n for n in judged if n not in stated]
+    if not judged:
+        combined["kind_checks_not_stated"] = {"code": "no_judged_rank", "ranks": [],
+                                              "detail": "no rank is judged, so nothing is said about what was checked"}
+    elif silent:
+        combined["kind_checks_not_stated"] = {
+            "code": "report_without_kind_checks", "ranks": silent,
+            "detail": f"the evidence of rank{'s' if len(silent) != 1 else ''} {_rank_ranges(silent, 8)} does not say what"
+                      " was checked (`kind_checks`: an older version wrote it), so the kinds are not counted for the run",
+        }
+    else:
+        others = other_kind_checks(status=status, status_expected=status_expected, not_checked=not_checked,
+                                   flight_recorder=False, traincheck=False)
+        checks = run_kind_checks(stated, others, memory=readings, status=status)
+        if status is None and not status_expected:
+            # No server compared the ranks' batches: not looked for, which is not "unavailable".
+            checks["duplicate_batches"] = {"value": "not_configured", "enough_history": False,
+                                           "needs": _CROSS_RANK_NEEDS["duplicate_batches"]}
+        combined["kind_checks"] = checks
+    incidents = [group["incident"] for group in groups] + run_incidents
+    combined["run_state"] = run_state(
+        incidents=incidents, steps_judged=bool(steps),
+        status=status, status_age=_status_age(status), not_checked=not_checked, unknown_ranks=unknown,
+        judged_ranks=judged, status_expected=status_expected,
+    )
+    return combined
+
+
 def _all_ranks_reported(evidence: Mapping[str, Any]) -> dict[Any, set[int]]:
     """The ranks that show an incident of each kind, from the incident groups."""
     found: dict[Any, set[int]] = {}

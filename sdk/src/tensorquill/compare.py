@@ -22,11 +22,21 @@ The result has four parts, in this order, and the printed summary keeps the orde
    not show it, the entry says whether that run looked.
 4. `divergence`: where two runs part (`where_runs_part`, which calls `divergence.first_divergence`).
 
-One rank of each run is read: rank 0 unless `rank=` names another, and the result says which.
-Incidents on a run's other ranks are not compared, and it says that too. Local files are
-judged here by the Python detectors with the default thresholds; a run in a server's store is
-read from the rank's `incidents.json` when that report is current (no part is opened), and
-from its parts otherwise.
+Every rank of each run is read, unless `rank=` names one rank to read of every run. A run of
+several ranks is compared as a whole, by the all-ranks view's rules: its incidents are every
+judged rank's, grouped across ranks (an entry's `ranks` names the ranks that show it), and a
+kind is `checked` for the run only when every judged rank checked it with enough history. A
+run in a server's store is read through the all-ranks view (`all_ranks_evidence`: each rank's
+`incidents.json` and the status; no part is opened); a rank whose report is not current is
+unknown there, and the command line judges it from its parts, as for one rank, when they can
+be read. Local files are judged here by the Python detectors with the default thresholds,
+each rank on its own, and put together by the same rules (`combine_rank_evidence`). Ranks
+that are not judged are named (`other_ranks_not_compared`, `read_from.unknown_ranks`), never
+counted as clean. A run of one rank is read as before.
+
+Part 4 compares rank r of one run with rank r of the other, for each rank, and gives the
+earliest divergence with its rank. Runs whose ranks differ are not compared there
+(`ranks_differ`); nothing is ever made across ranks.
 
 `compare_runs` returns the result and writes nothing. The command line writes `compare.json`.
 """
@@ -60,32 +70,44 @@ def _is_step(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
-    from .evidence import _Tail, build_evidence, load_records
+def _read_local(path: Path) -> tuple[list[dict[str, Any]], bool]:
+    """Every record of a `.jsonl` file, and whether a line that is not whole was left out."""
+    from .evidence import _Tail, load_records
 
-    files: Mapping[int, Path] = run.get("files") or {}
-    if not files:
-        raise _runs.RunLookupError(f"run {run['run_id']} has a manifest and no records yet: nothing to compare")
-    path = files.get(rank) if rank is not None and rank in files else files[min(files)]
-    unfinished = False
     try:
-        records = load_records(path, all_attempts=True)
+        return load_records(path, all_attempts=True), False
     except ValueError:
         # A line the job is still writing, or one torn by a killed process: the whole lines are
         # read, as the watcher reads them, and the result says so.
         tail = _Tail(Path(path), None)
         tail.poll()
-        records, unfinished = tail.records, True
+        return tail.records, True
+
+
+def _rank_of(record: Mapping[str, Any]) -> int:
+    return int(record.get("rank", 0))
+
+
+def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
+    from .evidence import build_evidence
+
+    files: Mapping[int, Path] = run.get("files") or {}
+    if not files:
+        raise _runs.RunLookupError(f"run {run['run_id']} has a manifest and no records yet: nothing to compare")
+    path = files.get(rank) if rank is not None and rank in files else files[min(files)]
+    records, unfinished = _read_local(path)
     if not records:
         raise _runs.RunLookupError(f"run {run['run_id']} has no whole record in {path} yet: nothing to compare")
-    held = sorted({int(r.get("rank", 0)) for r in records})
+    held = sorted({_rank_of(r) for r in records})
     ranks = sorted(set(files) | set(held))
+    if rank is None and len(ranks) > 1:
+        return _open_local_all_ranks(run, files, path, records, unfinished)
     # The rank asked for; a run with one rank is read on the rank it has, and says which.
     picked = rank if rank in held else held[0] if held and (rank is None or len(ranks) == 1) else None
     if picked is None:
         raise _runs.RunLookupError(f"run {run['run_id']} has no rank {rank} here: it has rank{'s' if len(ranks) != 1 else ''} "
                                    f"{', '.join(map(str, ranks))}")
-    records = [r for r in records if int(r.get("rank", 0)) == picked]
+    records = [r for r in records if _rank_of(r) == picked]
     evidence = build_evidence(records, run_manifest=run.get("manifest") or {})
     steps = [r["step"] for r in records if _is_step(r.get("step"))]
     return {
@@ -94,6 +116,55 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
                       "judged_by": "the Python detectors, here, with the default thresholds",
                       **({"unfinished_lines_left_out": True} if unfinished else {})},
         "records": {"path": str(path), "rank": picked},
+    }
+
+
+def _all_ranks_run(combined: Mapping[str, Any]) -> dict[str, Any]:
+    """The run-level evidence parts 2 and 3 read, from the all-ranks view or
+    `combine_rank_evidence`: the view's keys, with `incidents` the grouped incidents (one for
+    each group, whatever its ranks) and the run's own."""
+    groups = [g for g in combined.get("incident_groups") or () if isinstance(g, Mapping) and isinstance(g.get("incident"), Mapping)]
+    run_incidents = [i for i in combined.get("run_incidents") or () if isinstance(i, Mapping)]
+    return {**combined, "incidents": [g["incident"] for g in groups] + run_incidents}
+
+
+def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], first: Path,
+                          records: list[dict[str, Any]], unfinished: bool) -> dict[str, Any]:
+    """Every rank of a run kept as local files: each rank judged here by `build_evidence`, as
+    one rank's is, and the ranks put together by the all-ranks view's rules
+    (`combine_rank_evidence`)."""
+    from .evidence import build_evidence, combine_rank_evidence
+
+    by_rank: dict[int, list[dict[str, Any]]] = {}
+    paths: dict[int, str] = {}
+    unfinished_in: list[str] = [str(first)] if unfinished else []
+    for path in [first, *(files[n] for n in sorted(files) if files[n] != first)]:
+        found, torn = (records, unfinished) if path == first else _read_local(path)
+        if torn and str(path) not in unfinished_in:
+            unfinished_in.append(str(path))
+        for record in found:
+            number = _rank_of(record)
+            if paths.setdefault(number, str(path)) == str(path):  # a rank is read from the first file that holds it
+                by_rank.setdefault(number, []).append(record)
+    unknown = {n: f"its file {files[n].name} holds no whole record yet" for n in files if n not in by_rank}
+    per_rank = {}
+    for number, own in sorted(by_rank.items()):
+        steps = [r["step"] for r in own if _is_step(r.get("step"))]
+        per_rank[number] = {**build_evidence(own, run_manifest=run.get("manifest") or {}),
+                            "last_step": max(steps) if steps else None}
+    combined = combine_rank_evidence(per_rank, unknown_ranks=unknown)
+    last = combined.get("last_step")
+    ranks = sorted(set(per_rank) | set(unknown))
+    return {
+        "evidence": _all_ranks_run(combined), "last_step": last.get("max") if isinstance(last, Mapping) else None,
+        "read_from": {"path": str(first.parent if len(set(paths.values())) > 1 else first), "kind": "local records",
+                      "rank": None, "ranks": ranks, "all_ranks": True,
+                      "judged_ranks": combined["judged_ranks"], "unknown_ranks": combined["unknown_ranks"],
+                      **({"unknown_why": unknown} if unknown else {}),
+                      "judged_by": "the Python detectors, here, with the default thresholds, on each rank; the ranks put "
+                                   "together by the all-ranks view's rules",
+                      **({"unfinished_lines_left_out": True, "unfinished_in": unfinished_in} if unfinished_in else {})},
+        "records": {"path": str(first), "rank": None, "ranks": {n: paths[n] for n in sorted(per_rank)}},
     }
 
 
@@ -107,6 +178,8 @@ def _open_store(run: Mapping[str, Any], rank: int | None, read_parts: bool) -> d
     folders = _discover_rank_folders(folder)
     if not folders:
         raise _runs.RunLookupError(f"run {run['run_id']} at {folder} has no rank=<n> folder yet: nothing to compare")
+    if rank is None and len(folders) > 1:
+        return _open_store_all_ranks(run, folder, folders, read_parts)
     picked = rank if rank in folders else min(folders) if rank is None or len(folders) == 1 else None
     if picked is None:
         raise _runs.RunLookupError(f"run {run['run_id']} has no rank {rank}: its store holds ranks "
@@ -142,14 +215,88 @@ def _open_store(run: Mapping[str, Any], rank: int | None, read_parts: bool) -> d
     }
 
 
+def _open_store_all_ranks(run: Mapping[str, Any], folder: Path, folders: Mapping[int, Path],
+                          read_parts: bool) -> dict[str, Any]:
+    """Every rank of a run in a server's store: the all-ranks view (`all_ranks_evidence`),
+    which reads each rank's report and the status and opens no part. A rank whose report is
+    not current is in no value there. With `read_parts`, such a rank's parts are read and
+    judged here, as for one rank, and the ranks are put together by the same rules
+    (`combine_rank_evidence`); a rank whose parts cannot be read (no `pyarrow`, a torn part)
+    stays unknown, with why."""
+    from .evidence import (
+        _report_evidence, all_ranks_evidence, applied_thresholds, build_evidence, combine_rank_evidence,
+        load_records, read_server_report, read_watchdog,
+    )
+
+    view = all_ranks_evidence(folder)
+    reasons = {entry["rank"]: f"{entry['detection'].get('state')}: {entry['detection'].get('reason')}"
+               for entry in view.get("ranks") or () if entry.get("rank") in view.get("unknown_ranks", ())}
+    stale = [n for n in view.get("unknown_ranks") or () if n in folders]
+    if not view.get("judged_ranks") and not (read_parts and stale):
+        raise _runs.RunLookupError(
+            f"run {run['run_id']} has no rank with a current report from its server ("
+            + "; ".join(f"rank {n} {why}" for n, why in sorted(reasons.items())[:4])
+            + "). Nothing current to compare without reading its parts and judging them here, which "
+              "`python -m tensorquill compare` does")
+    judged_here: list[int] = []
+    if read_parts and stale:
+        status = read_watchdog(folder / "watchdog.json")
+        per_rank: dict[int, dict[str, Any]] = {}
+        memory: dict[int, Any] = {}
+        unknown = {n: why for n, why in reasons.items() if n not in folders}
+        for number in sorted(folders):
+            look = read_server_report(folders[number])
+            if look["state"] == "current":
+                report = look["report"]
+                per_rank[number] = {**_report_evidence(folders[number], look, status), "last_step": report.get("last_step")}
+                memory[number] = report.get("memory")
+                continue
+            applied = applied_thresholds(look["report"]) if isinstance(look.get("report"), Mapping) else {}
+            try:
+                records = load_records(folder, rank=number, all_attempts=True)
+            except (OSError, ValueError, ImportError) as error:  # ImportError: the parts need pyarrow
+                unknown[number] = f"{look['state']}: {look['reason']}; its parts could not be read here ({error})"
+                continue
+            steps = [r["step"] for r in records if _is_step(r.get("step"))]
+            per_rank[number] = {**build_evidence(records, watchdog=folder / "watchdog.json",
+                                                 run_manifest=run.get("manifest") or {}, **applied),
+                                "last_step": max(steps) if steps else None}
+            judged_here.append(number)
+        combined = combine_rank_evidence(per_rank, status=status, status_expected=True, unknown_ranks=unknown,
+                                         memory=memory)
+    else:
+        combined, unknown = view, reasons
+    last = combined.get("last_step")
+    judged = ("the all-ranks view: each rank's report from its server (incidents.json), with the thresholds the "
+              "server applied, and the server's status; no part was read")
+    if judged_here:
+        judged += (f", but for rank{'s' if len(judged_here) != 1 else ''} {', '.join(map(str, judged_here))}, whose "
+                   "reports are not current: the Python detectors judged their stored parts here, with the thresholds "
+                   "the server's last report applied")
+    unknown_now = list(combined.get("unknown_ranks") or ())
+    return {
+        "evidence": _all_ranks_run(combined), "last_step": last.get("max") if isinstance(last, Mapping) else None,
+        "read_from": {"path": str(folder), "kind": "server store", "rank": None,
+                      "ranks": sorted(set(folders) | set(unknown_now)), "all_ranks": True,
+                      "judged_ranks": list(combined.get("judged_ranks") or ()), "unknown_ranks": unknown_now,
+                      **({"judged_here": judged_here} if judged_here else {}),
+                      **({"unknown_why": {n: unknown.get(n) for n in unknown_now}} if unknown_now else {}),
+                      "judged_by": judged},
+        "records": {"path": str(folder), "rank": None, "ranks": {n: str(folder) for n in sorted(folders)}},
+    }
+
+
 def _open_evidence_file(path: Path, rank: int | None) -> dict[str, Any]:
     try:
         evidence = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise _runs.RunLookupError(f"{path} cannot be read as an evidence file ({error})") from None
+    if isinstance(evidence, dict) and evidence.get("view") == "all_ranks" and isinstance(evidence.get("incident_groups"), list):
+        if rank is not None:
+            raise _runs.RunLookupError(f"{path} is an all-ranks view; to read rank {rank} alone, give the run folder")
+        return _open_all_ranks_file(path, evidence)
     if not isinstance(evidence, dict) or "incidents" not in evidence:
-        what = "an all-ranks view, which lists no kind_checks: give the run folder" if isinstance(evidence, dict) and evidence.get("view") else "not one rank's evidence"
-        raise _runs.RunLookupError(f"{path} is {what}")
+        raise _runs.RunLookupError(f"{path} is not one rank's evidence or an all-ranks view")
     own = (evidence.get("detection") or {}).get("rank") if isinstance(evidence.get("detection"), Mapping) else None
     if rank is not None and _is_step(own) and own != rank:
         raise _runs.RunLookupError(f"{path} is rank {own}'s evidence, not rank {rank}'s")
@@ -161,6 +308,25 @@ def _open_evidence_file(path: Path, rank: int | None) -> dict[str, Any]:
         "evidence": evidence, "last_step": None,
         "read_from": {"path": str(path), "kind": "evidence file", "rank": own if _is_step(own) else None, "ranks": None,
                       "judged_by": "whatever wrote the file" + (" (compact)" if isinstance(evidence.get("compact"), Mapping) else "")},
+        "records": None,
+    }
+
+
+def _open_all_ranks_file(path: Path, view: Mapping[str, Any]) -> dict[str, Any]:
+    """An all-ranks view as the watcher wrote it (`--rank all`): read as it stands."""
+    run_id = view.get("run_id")
+    block = view.get("run") if isinstance(view.get("run"), Mapping) else None
+    last = view.get("last_step")
+    ranks = sorted(e["rank"] for e in view.get("ranks") or () if isinstance(e, Mapping) and _is_step(e.get("rank")))
+    return {
+        "run_id": run_id, "manifest": None,
+        "block": {**_manifest.run_block(run_id, block), "run_id": run_id},
+        "evidence": _all_ranks_run(view),
+        "last_step": last.get("max") if isinstance(last, Mapping) and _is_step(last.get("max")) else None,
+        "read_from": {"path": str(path), "kind": "evidence file", "rank": None, "ranks": ranks, "all_ranks": True,
+                      "judged_ranks": list(view.get("judged_ranks") or ()),
+                      "unknown_ranks": list(view.get("unknown_ranks") or ()),
+                      "judged_by": "whatever wrote the file (the all-ranks view)"},
         "records": None,
     }
 
@@ -263,11 +429,20 @@ def _check_of(evidence: Mapping[str, Any], kind: str) -> Mapping[str, Any] | Non
 def _looked(evidence: Mapping[str, Any], kind: Any) -> str:
     """Whether one run's evidence looked for `kind`: `checked`, `not_enough_history` (checked,
     but its slowest rule has not had the records it needs), `not_configured`, `unavailable`,
-    or `not_said` for evidence without `kind_checks` or a kind it does not list."""
+    or `not_said` for evidence without `kind_checks` or a kind it does not list. For a run of
+    several ranks read whole, also `history_not_stated`: checked on every judged rank, and
+    some rank does not say whether it had the records it needs."""
     check = _check_of(evidence, kind) if isinstance(kind, str) else None
     if check is None:
         return "not_said"
     value = check.get("value")
+    if value == "checked" and "judged_ranks" in evidence:
+        # The whole run's (the all-ranks rule): `checked` on every judged rank, and its history
+        # is enough only when every one of them says so. A rank that does not say is not read
+        # as enough.
+        from .evidence import kind_history
+
+        return {"enough": "checked", "not_enough": "not_enough_history"}.get(kind_history(check), "history_not_stated")
     if value == "checked":
         return "checked" if check.get("enough_history", True) else "not_enough_history"
     return value if isinstance(value, str) else "not_said"
@@ -297,12 +472,26 @@ def compare_checked(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[
         needs = next((c["needs"] for _, run in said if (c := _check_of(run["evidence"], kind)) and c.get("needs")), None)
         if needs:
             entry["needs"] = needs
+        # In a run read on every rank, the ranks by value when they differ within that run.
+        by_rank = {label: c["ranks"] for label, run in said
+                   if (c := _check_of(run["evidence"], kind)) and isinstance(c.get("ranks"), Mapping)}
+        if by_rank:
+            entry["ranks"] = by_rank
         differs.append(entry)
+    whole = {label: run["read_from"].get("judged_ranks") or [] for label, run in zip(labels, opened)
+             if run["read_from"].get("all_ranks")}
     return {
         "ranks_read": {label: run["read_from"].get("rank") for label, run in zip(labels, opened)},
+        # Runs read on every rank (`ranks_read` is None for them): the judged ranks, which are
+        # the ones the run's `kind_checks` count.
+        **({"all_ranks_read": whole} if whole else {}),
         "differs": differs,
         "same": same if len(said) > 1 else 0,
         "not_said_by": not_said,
+        **({"not_said_why": {label: (run["evidence"].get("kind_checks_not_stated") or {}).get("detail")
+                             for label, run in zip(labels, opened)
+                             if label in not_said and isinstance(run["evidence"].get("kind_checks_not_stated"), Mapping)}}
+           if any(isinstance(run["evidence"].get("kind_checks_not_stated"), Mapping) for run in opened) else {}),
     }
 
 
@@ -366,18 +555,18 @@ def compare_incidents(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
 
     groups: dict[str, dict[str, Any]] = {}
     for label, run in zip(labels, opened):
-        for incident in run["evidence"].get("incidents") or ():
-            if not isinstance(incident, Mapping) or "kind" not in incident:
-                continue
+        for incident, ranks in _shown_incidents(run["evidence"]):
             group = groups.setdefault(incident_identity(incident), {"kind": incident["kind"], "runs": {}})
             step = incident.get("step") if _is_step(incident.get("step")) else None
             shown = group["runs"].get(label)
             if shown is None:
-                group["runs"][label] = {"first_step": step, "count": 1, "where": incident_where(incident)}
+                shown = group["runs"][label] = {"first_step": step, "count": 1, "where": incident_where(incident), "ranks": set()}
             else:
                 shown["count"] += 1
                 if step is not None and (shown["first_step"] is None or step < shown["first_step"]):
                     shown.update(first_step=step, where=incident_where(incident))
+            if ranks is not None:
+                shown["ranks"].update(ranks)
     order = {kind: index for index, kind in enumerate(INCIDENT_CLASSES)}
     entries: list[dict[str, Any]] = []
     for group in groups.values():
@@ -401,6 +590,9 @@ def compare_incidents(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
             "first_step": {label: shown[label]["first_step"] for label in labels if label in shown},
             "where": {label: shown[label]["where"] for label in labels if label in shown},
             **({"count": {label: s["count"] for label, s in shown.items()}} if any(s["count"] > 1 for s in shown.values()) else {}),
+            # For a run read on every rank: the ranks that show it there.
+            **({"ranks": {label: sorted(shown[label]["ranks"]) for label in labels if label in shown and shown[label]["ranks"]}}
+               if any(s["ranks"] for s in shown.values()) else {}),
             # For each run that does not show it: `checked` (it looked, with enough history, and
             # found none), or why its silence is not a "none": `not_enough_history`,
             # `not_configured`, `unavailable`, `not_said`, `ended_before_step`.
@@ -409,18 +601,37 @@ def compare_incidents(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
     entries.sort(key=lambda e: (min((s for s in e["first_step"].values() if s is not None), default=float("inf")),
                                 order.get(e["kind"], len(order)), json.dumps(e["where"], sort_keys=True, default=str)))
     only = {label: [i for i, e in enumerate(entries) if e["in"] == [label]] for label in labels}
-    multi = {label: run["read_from"]["ranks"] for label, run in zip(labels, opened)
-             if run["read_from"].get("ranks") and len(run["read_from"]["ranks"]) > 1}
+    # The ranks of each run whose incidents are not here: the others, when one rank was read
+    # (`rank=`), or those with no current report or evidence, when every rank was.
+    other: dict[str, list[int]] = {}
+    for label, run in zip(labels, opened):
+        read = run["read_from"]
+        if read.get("all_ranks"):
+            if read.get("unknown_ranks"):
+                other[label] = list(read["unknown_ranks"])
+        elif read.get("ranks") and len(read["ranks"]) > 1:
+            other[label] = [r for r in read["ranks"] if r != read["rank"]]
     return {
         "entries": entries,
         "only_in": only,
         "in_all": [i for i, e in enumerate(entries) if len(e["in"]) == len(labels)],
         "counts": {label: sum(1 for e in entries if label in e["in"]) for label in labels},
-        # One rank of each run was read. A run of several ranks may show more on the others.
-        **({"other_ranks_not_compared": {
-            label: [r for r in ranks if r != opened[labels.index(label)]["read_from"]["rank"]] for label, ranks in multi.items()
-        }} if multi else {}),
+        **({"other_ranks_not_compared": other} if other else {}),
     }
+
+
+def _shown_incidents(evidence: Mapping[str, Any]) -> list[tuple[Mapping[str, Any], list[int] | None]]:
+    """A run's incidents, each with the ranks that show it: from the incident groups for a run
+    read on every rank (the run's own incidents, such as a stall, have no ranks of their own
+    here), and with None for one rank's evidence."""
+    found: list[tuple[Mapping[str, Any], list[int] | None]] = []
+    if "incident_groups" in evidence:
+        for group in evidence.get("incident_groups") or ():
+            if isinstance(group, Mapping) and isinstance(group.get("incident"), Mapping) and "kind" in group["incident"]:
+                found.append((group["incident"], [r for r in group.get("ranks") or () if _is_step(r)]))
+        found += [(i, None) for i in evidence.get("run_incidents") or () if isinstance(i, Mapping) and "kind" in i]
+        return found
+    return [(i, None) for i in evidence.get("incidents") or () if isinstance(i, Mapping) and "kind" in i]
 
 
 # --- Part 4: where two runs part -------------------------------------------------------------
@@ -449,6 +660,8 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_
     if stored and not read_parts:
         return {"state": "not_read", "detail": f"where the two runs part reads every step record, and the stored parts of "
                 f"{' and '.join(stored)} are not opened here: use the command line"}
+    if any(run["records"].get("rank") is None for run in opened):
+        return _where_ranks_part(opened, labels)
     ranks = [run["records"]["rank"] for run in opened]
     if ranks[0] != ranks[1]:
         return {"state": "ranks_differ", "detail": f"where the two runs part compares one rank of each run, and rank {ranks[0]} of "
@@ -472,6 +685,83 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_
     }
 
 
+def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[str, Any]:
+    """Part 4 for runs read on every rank: rank r of one run against rank r of the other, for
+    each rank, by the same rule as for one rank. Nothing is made across ranks. Runs whose
+    ranks differ are not compared: a rank's share of the data depends on how many there are.
+
+    The answer is the earliest divergence over the ranks (the lowest rank on a tie), with the
+    keys one rank's answer has, read from that rank; `no_divergence` only when every rank
+    says so; else `no_answer`, naming the ranks without one. `by_rank` has each rank's answer
+    in brief.
+    """
+    from .divergence import divergence_summary, first_divergence
+    from .evidence import load_records
+
+    sets = []
+    for run in opened:
+        records = run["records"]
+        sets.append(sorted(records["ranks"]) if records.get("rank") is None else [records["rank"]])
+    if sets[0] != sets[1]:
+        return {"state": "ranks_differ", "ranks": {labels[0]: sets[0], labels[1]: sets[1]},
+                "detail": f"where the two runs part compares each rank with the same rank of the other run, and {labels[0]} "
+                          f"has {_rank_text(sets[0])} where {labels[1]} has {_rank_text(sets[1])}: with other ranks a rank reads another share of the data, so no rank is "
+                          "compared"}
+    answers: dict[int, dict[str, Any]] = {}
+    summaries: dict[int, str] = {}
+    for rank in sets[0]:
+        try:
+            pair = [load_records(run["records"]["ranks"][rank], rank=rank) for run in opened]
+        except (OSError, ValueError, ImportError) as error:  # ImportError: a store's parts need pyarrow
+            return {"state": "no_records", "detail": f"the step records of rank {rank} could not be read for where the runs "
+                                                     f"part ({error})"}
+        found = first_divergence(pair[0], pair[1], rank=rank)
+        summaries[rank] = divergence_summary(found)
+        series = found.get("series") or {}
+        answers[rank] = {**found, "series": {name: e for name, e in series.items() if e.get("status") != "agrees"},
+                         "series_agreeing": sum(1 for e in series.values() if e.get("status") == "agrees")}
+        del pair
+    diverged = [r for r, found in answers.items() if found["answer"] == "diverged"]
+    unanswered = [r for r, found in answers.items() if found["answer"] == "no_answer"]
+
+    def step(rank: int) -> float:
+        value = (answers[rank].get("divergence") or {}).get("step")
+        return value if _is_step(value) else float("inf")
+
+    if diverged:
+        picked = min(diverged, key=lambda r: (step(r), r))
+        state = "diverged"
+        detail = (f"on rank {picked}, earliest of the {len(diverged)} of {len(answers)} ranks that part: "
+                  f"{answers[picked]['reason']}")
+    elif unanswered:
+        picked = unanswered[0]
+        state = "no_answer"
+        detail = (f"no answer on {_rank_text(unanswered)} of the {len(answers)} compared"
+                  + (f", and no divergence on the others" if len(unanswered) < len(answers) else "")
+                  + f"; rank {picked}: {answers[picked]['reason']}")
+    else:
+        picked = min(answers)
+        state = "no_divergence"
+        detail = f"no divergence on any of the {len(answers)} ranks compared; rank {picked}: {answers[picked]['reason']}"
+    chosen = answers[picked]
+    brief = []
+    for rank, found in answers.items():
+        item: dict[str, Any] = {"rank": rank, "answer": found["answer"]}
+        if found["answer"] == "diverged":
+            item.update(step=(found.get("divergence") or {}).get("step"), series=(found.get("divergence") or {}).get("series"))
+        elif found["answer"] == "no_answer":
+            item["reason"] = found["reason"]
+        brief.append(item)
+    return {
+        "state": state, "detail": detail,
+        "lines": f"On rank {picked}: {summaries[picked]}",
+        "labels": {"a": labels[0], "b": labels[1]},
+        **{key: value for key, value in chosen.items() if key not in ("answer", "reason")},
+        "ranks_compared": sorted(answers),
+        "by_rank": brief,
+    }
+
+
 # --- The whole comparison ---------------------------------------------------------------------
 
 
@@ -480,8 +770,8 @@ def compare_runs(*runs: str | Path, source: str | Path | None = None, project: s
     """Compare two or more runs and return the result (see the module's text). Nothing is written.
 
     Each of `runs` is a run ID or a name at `source` (default `tensorquill-out`), or a path.
-    `project` narrows a name to one project. `rank` is the rank read of every run (default:
-    each run's lowest, rank 0). `paths=False` takes IDs and names only. `read_parts=False`
+    `project` narrows a name to one project. `rank` is the one rank read of every run
+    (default: every rank of each run; a run of one rank is read on the rank it has). `paths=False` takes IDs and names only. `read_parts=False`
     refuses a run in a server's store whose report is not current; otherwise its parts are read
     and judged here.
     Raises `runs.RunLookupError` (a `ValueError`) for a run that is not found, a name that fits
@@ -508,6 +798,7 @@ def compare_runs(*runs: str | Path, source: str | Path | None = None, project: s
             "run_state": (run["evidence"].get("run_state") or {}).get("state"),
             "last_step": run["last_step"],
             "incidents": len([i for i in run["evidence"].get("incidents") or () if isinstance(i, Mapping)]),
+            "rank_count": len(run["read_from"]["ranks"]) if run["read_from"].get("ranks") else None,
             "read_from": run["read_from"],
         } for label, wanted, run in zip(labels, runs, opened)],
         # The order of the four parts is part of the format: what was checked is read before
@@ -529,7 +820,14 @@ _LOOKED_TEXT = {
     "not_configured": "not configured",
     "unavailable": "unavailable",
     "not_said": "not said",
+    "history_not_stated": "checked, without saying whether it had enough history on every rank",
 }
+def _rank_text(ranks: list[int]) -> str:
+    from .evidence import _rank_ranges
+
+    return f"rank{'s' if len(ranks) != 1 else ''} {_rank_ranges(ranks, 8)}"
+
+
 _ABSENT_TEXT = {
     "checked": "{run} checked this kind and found none",
     "not_enough_history": "{run} checked this kind without enough history yet, so its silence is not a \"none\"",
@@ -537,6 +835,8 @@ _ABSENT_TEXT = {
     "unavailable": "{run} did not look: the kind was unavailable there",
     "not_said": "{run}'s evidence does not say whether it looked",
     "ended_before_step": "{run} ended before this step",
+    "history_not_stated": "{run} checked this kind on every rank, and some rank does not say whether it had enough "
+                          "history, so its silence is not a \"none\"",
 }
 
 
@@ -563,8 +863,14 @@ def summary_text(result: Mapping[str, Any]) -> str:
     lines = [f"Comparing {len(runs)} runs"]
     for run in runs:
         read = run["read_from"]
-        rank = f"rank {read['rank']}" if read.get("rank") is not None else "one rank"
-        of = f" of {len(read['ranks'])}" if read.get("ranks") and len(read["ranks"]) > 1 else ""
+        if read.get("all_ranks"):
+            judged, unknown = read.get("judged_ranks") or [], read.get("unknown_ranks") or []
+            rank = (f"all {len(read['ranks'])} ranks" if not unknown
+                    else f"{len(judged)} of {len(read['ranks'])} ranks ({_rank_text(unknown)} not judged)")
+            of = ""
+        else:
+            rank = f"rank {read['rank']}" if read.get("rank") is not None else "one rank"
+            of = f" of {len(read['ranks'])}" if read.get("ranks") and len(read["ranks"]) > 1 else ""
         lines.append(
             f"  {run['label']}  {run['name']} (run ID {run['run_id']}, project {run['project']}): "
             f"{run['run_state'] or 'state unknown'}, "
@@ -585,7 +891,10 @@ def summary_text(result: Mapping[str, Any]) -> str:
                      "its setup is not known and is left out of the differences")
 
     checked = result["checked"]
-    ranks = ", ".join(f"{label} rank {rank}" if rank is not None else f"{label} one rank" for label, rank in checked["ranks_read"].items())
+    whole = checked.get("all_ranks_read") or {}
+    ranks = ", ".join(f"{label} rank {rank}" if rank is not None else
+                      f"{label} {_rank_text(whole[label])}" if label in whole else f"{label} one rank"
+                      for label, rank in checked["ranks_read"].items())
     lines.append(f"2. What was checked: {len(checked['differs'])} kind{'s' if len(checked['differs']) != 1 else ''} differ"
                  f"{'s' if len(checked['differs']) == 1 else ''} ({ranks})")
     for item in checked["differs"]:
@@ -595,10 +904,16 @@ def summary_text(result: Mapping[str, Any]) -> str:
             records, needed = (item.get("records") or {}).get(label), (item.get("records_needed") or {}).get(label)
             if state in ("checked", "not_enough_history") and records is not None and needed is not None:
                 text += f" ({records} of the {needed} records its slowest rule needs)" if state == "not_enough_history" else f" ({records} records)"
+            within = (item.get("ranks") or {}).get(label)
+            if within:
+                text += " (" + ", ".join(f"{_LOOKED_TEXT.get(value, value)} on {_rank_text(ranks)}" for value, ranks in within.items()) + ")"
             states.append(f"{text} in {label}")
         lines.append(f"   {item['kind']}: " + "; ".join(states))
     if checked["not_said_by"]:
         lines.append(f"   the evidence of {', '.join(checked['not_said_by'])} does not say what was checked")
+        for label, why in (checked.get("not_said_why") or {}).items():
+            if why:
+                lines.append(f"      {label}: {why}")
 
     incidents = result["incidents"]
     entries = incidents["entries"]
@@ -614,7 +929,10 @@ def summary_text(result: Mapping[str, Any]) -> str:
             head = "both" if len(labels) == 2 else "all"
         else:
             head = (", ".join(shown) + " only") if len(shown) == 1 else ", ".join(shown)
-        steps = ", ".join(f"{label} step {step}" if step is not None else f"{label} (no step)" for label, step in entry["first_step"].items())
+        on = entry.get("ranks") or {}
+        steps = ", ".join((f"{label} step {step}" if step is not None else f"{label} (no step)")
+                          + (f" (on {_rank_text(on[label])})" if label in on else "")
+                          for label, step in entry["first_step"].items())
         first = entry["where"][shown[0]]
         where = _where_text(first)
         lines.append(f"   {head}: {entry['kind']} ({entry['class']}), first at {steps}" + (f": {where}" if where else ""))
@@ -626,7 +944,9 @@ def summary_text(result: Mapping[str, Any]) -> str:
     other = incidents.get("other_ranks_not_compared")
     if other:
         lines.append("   incidents on other ranks were not compared: " + "; ".join(
-            f"{label} ranks {', '.join(map(str, ranks))}" for label, ranks in other.items()))
+            f"{label} ranks {', '.join(map(str, ranks))}" for label, ranks in other.items())
+            + (" (not judged: no current report or evidence)" if any(
+                run["read_from"].get("all_ranks") for run in runs if run["label"] in other) else ""))
     lines.append(f"4. Where the runs part: {result['divergence']['detail']}")
     return "\n".join(lines)
 
@@ -643,7 +963,7 @@ def main(argv: list[str]) -> None:
                         help=f"where IDs and names are looked up: a folder of local files or a server's store "
                         f"(default: {_runs.DEFAULT_SOURCE})")
     parser.add_argument("--project", help="look a name up in this project only")
-    parser.add_argument("--rank", type=int, help="the rank read of every run (default: each run's lowest)")
+    parser.add_argument("--rank", type=int, help="read this one rank of every run (default: every rank)")
     parser.add_argument("-o", "--output", type=Path, default=Path(DEFAULT_OUTPUT),
                         help=f"where the comparison is written (default: {DEFAULT_OUTPUT})")
     args = parser.parse_args(argv)

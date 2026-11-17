@@ -307,6 +307,14 @@ def test_a_two_process_run_writes_one_manifest_and_both_ranks_read_it(tmp_path):
     assert (written["world_size"], written["name"], written["config"]) == (2, "pair", {"lr": 0.01})
     block = {"project": "granite", "name": "pair", "run_id": "two"}
     assert [ev.build_evidence(out / f"two.rank{rank}.jsonl")["run"] for rank in (0, 1)] == [block, block]
+    # `runs` and `compare` read the run as one run of two ranks, under its one manifest.
+    (row,) = tensorquill.list_runs(out)
+    assert (row["name"], row["rank_count"], row["ranks"], row["evidence"]["state"]) == ("pair", 2, [0, 1], "missing")
+    from tensorquill.compare import open_run
+
+    opened = open_run("pair", out)
+    assert (opened["read_from"]["all_ranks"], opened["read_from"]["judged_ranks"], opened["block"]) == (True, [0, 1], block)
+    assert opened["records"]["ranks"] == {0: str(out / "two.rank0.jsonl"), 1: str(out / "two.rank1.jsonl")}
 
 
 def test_another_rank_checks_its_arguments_and_writes_nothing(toy_moe, tmp_path, monkeypatch):

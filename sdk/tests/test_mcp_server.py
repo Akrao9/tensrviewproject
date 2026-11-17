@@ -854,6 +854,24 @@ def test_compare_runs_takes_ids_and_names_and_says_what_was_checked_before_the_i
     assert "same run" in client.error("compare_runs", runs=["run-1", "baseline"], project="granite")
 
 
+def test_list_runs_and_compare_runs_read_every_rank_of_a_run_of_several(start, kept):
+    # run-4 has two ranks; the spike is on rank 1 only, and both ranks have their evidence file.
+    labelled(kept, "run-4", dense(60, run="run-4"), project="granite", name="two-ranks")
+    rank1 = write_capture(kept / "run-4.rank1.jsonl", dense(60, run="run-4", rank=1, spike=(40, "blocks.1.weight", 60.0)))
+    ev.write_evidence(ev.build_evidence(rank1), rank1.with_suffix(".evidence.json"))
+    client = start(kept / "run-1.rank0.jsonl")
+    rows = {row["run_id"]: row for row in client.call("list_runs")["runs"]}
+    assert (rows["run-4"]["rank_count"], rows["run-4"]["ranks_with_incidents"], rows["run-4"]["first_incident"]) == (
+        2, [1], {"kind": "grad_spike", "step": 40})
+    assert rows["run-1"]["rank_count"] == 1 and rows["run-4"]["run_state"] == "unhealthy"
+    result = client.call("compare_runs", runs=["run-1", "two-ranks"])
+    (entry,) = result["incidents"]["entries"]
+    assert (entry["kind"], entry["in"], entry["ranks"], entry["absent_from"]) == ("grad_spike", ["B"], {"B": [1]}, {"A": "checked"})
+    assert result["runs"][1]["read_from"]["judged_ranks"] == [0, 1] and result["divergence"]["state"] == "ranks_differ"
+    on_zero = client.call("compare_runs", runs=["run-1", "two-ranks"], rank=0)
+    assert on_zero["incidents"]["entries"] == [] and on_zero["incidents"]["other_ranks_not_compared"] == {"B": [1]}
+
+
 def test_a_tool_argument_is_never_taken_as_a_path(start, kept, tmp_path):
     outside = labelled(tmp_path / "elsewhere", "secret", dense(60, run="secret"), project="other", name="secret")
     client = start(kept / "run-1.rank0.jsonl")
@@ -886,10 +904,15 @@ def test_a_run_folder_lists_and_compares_the_runs_of_its_store(start, store):
         assert {row["run_id"]: (row["project"], row["source"], row["ranks"]) for row in listed["runs"]} == {
             "one-rank": ("granite", "store", [0]), RUN: ("uncategorized", "store", [0, 1])}
         result = client.call("compare_runs", runs=["clean", RUN])
-        # Rank 0 of each: rank 1's non-finite layer is not compared, and the answer says so.
-        assert [e["kind"] for e in result["incidents"]["entries"]] == ["resume_lr_change", "grad_spike"]
-        assert result["incidents"]["other_ranks_not_compared"] == {"B": [1]}
+        # Every rank of each (Nov 17, 2026): rank 1's non-finite layer is compared, and named as rank 1's.
+        assert [(e["kind"], e.get("ranks")) for e in result["incidents"]["entries"]] == [
+            ("resume_lr_change", {"B": [0, 1]}), ("grad_spike", {"B": [0, 1]}), ("non_finite", {"B": [1]})]
+        assert "other_ranks_not_compared" not in result["incidents"]
         assert all("no part was read" in run["read_from"]["judged_by"] for run in result["runs"])
+        # Rank 0 of each, asked for: rank 1's non-finite layer is not compared, and the answer says so.
+        on_rank_0 = client.call("compare_runs", runs=["clean", RUN], rank=0)
+        assert [e["kind"] for e in on_rank_0["incidents"]["entries"]] == ["resume_lr_change", "grad_spike"]
+        assert on_rank_0["incidents"]["other_ranks_not_compared"] == {"B": [1]}
         on_rank_1 = client.call("compare_runs", runs=["clean", RUN], rank=1)
         assert "non_finite" in [e["kind"] for e in on_rank_1["incidents"]["entries"]]
         assert on_rank_1["incidents"]["other_ranks_not_compared"] == {"B": [0]}

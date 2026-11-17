@@ -71,19 +71,22 @@ For a run folder, also name the ranks from `on_ranks`. When `numbers_differ` is 
 
 Compare when a person asks for it, or when the run you are explaining has a partner: the same job before a change, or a run of the same project that did not fail.
 
-1. **Call `list_runs`.** It lists the runs kept beside this one by project, each with its name, run ID, run state, last step and first incident. The run ID is the identity. A name is a label and may repeat, so use the ID when two runs share a name. A row whose `run_state` is null with `evidence.state` `missing` is a run nobody has judged yet, not a clean one.
+1. **Call `list_runs`.** It lists the runs kept beside this one by project, each with its name, run ID, run state, rank count, last step and first incident. A run of several ranks is listed as a whole: `ranks_with_incidents` names the ranks that show an incident, and a rank without a current report is unknown, never clean. The run ID is the identity. A name is a label and may repeat, so use the ID when two runs share a name. A row whose `run_state` is null with `evidence.state` `missing` is a run nobody has judged yet, not a clean one.
 2. **Call `compare_runs` with two or more IDs or names.** The first is called A, the second B. Read its four parts in order:
    - `setup`: what differs between the runs' manifests, such as a `config` key. A run listed under `no_manifest` was recorded before runs had a project, and its setup is not known.
    - `checked`: the kinds one run checked and another did not. Read this before the incidents.
-   - `incidents`: each entry says which runs show it (`in`), each run's `first_step`, and what it names in each run (`where`).
-   - `divergence`: where two runs part, for two paired runs (the same job twice, or before and after one change). `state` is `diverged` with the first step and the layer or parameter, `no_divergence`, or `no_answer` with the reason in `detail`; other states say why it was not asked. Runs that never agreed early get `no_answer`, which is a correct result. Do not supply a step yourself when it gives none.
+   - `incidents`: each entry says which runs show it (`in`), each run's `first_step`, and what it names in each run (`where`). For a run of several ranks, `ranks` names the ranks that show it.
+   - `divergence`: where two runs part, for two paired runs (the same job twice, or before and after one change). `state` is `diverged` with the first step and the layer or parameter, `no_divergence`, or `no_answer` with the reason in `detail`; other states say why it was not asked, such as `ranks_differ` for runs with different ranks. Runs that never agreed early get `no_answer`, which is a correct result. Do not supply a step yourself when it gives none. For runs of several ranks each rank is compared with the same rank of the other run: `rank` says on which rank the earliest divergence is, and `by_rank` gives every rank's answer. Name the rank when you report the step.
 3. **For an incident in one run only, read `absent_from` before you call it a difference.** It gives one word for each run that does not show the incident:
    - `checked`: that run looked, with enough history, and found none. Only this is a real difference between the runs.
    - `not_configured` or `unavailable`: that run never looked. Write "B was not checked for it", never "B does not have it".
    - `not_enough_history`: that run's rule had too few records to fire.
    - `ended_before_step`: that run stopped before the step where the other first shows it.
    - `not_said`: that run's evidence does not say what was checked.
-4. **Say which rank was read.** One rank of each run is compared, and each run's `read_from` names it. When `incidents.other_ranks_not_compared` lists ranks, say that incidents on those ranks were not compared.
+   - `history_not_stated`: a run of several ranks checked the kind on every rank, but some rank does not say whether its rule had enough history. Treat it as not enough history.
+
+   For a run of several ranks, `checked` means every judged rank checked the kind. When the ranks differ, the entry in `checked.differs` lists them under `ranks`.
+4. **Say which ranks were read.** Every rank of each run is compared, unless `rank` was given; each run's `read_from` says which (`rank` for one, `judged_ranks` for all). When `incidents.other_ranks_not_compared` lists ranks, say that incidents on those ranks were not compared: they had no current report, and are unknown, not clean.
 
 A difference in `setup` beside a difference in `incidents` is a lead, not a cause. Say that the runs differ in both, and leave the conclusion to the series and to a person.
 
