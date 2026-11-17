@@ -235,7 +235,7 @@ RESUMED = {
     "changes": [{"step": 30, "previous_attempt": 1, "basis": "same_step", "expected_lr": [1e-3], "resumed_lr": [5e-4],
                  "first_lr": [1e-3], "equals_first_lr": False}],
 }
-ATTENTION = {"check": "attention", "kinds": list(ev.ATTN_KINDS), "reason": "no probe recorded attention"}
+ATTENTION = {"check": "probe", "kinds": list(ev.ATTN_KINDS), "reason": "1 of 3 probes failed, the first at step 2000: boom"}
 
 
 def report(rank: int, incidents: list[dict], last_step: int = 59) -> dict:
@@ -656,8 +656,14 @@ def test_a_path_that_does_not_exist_is_an_error_until_it_does(start, tmp_path):
     # What "no incidents" covers: the kinds looked for, the ones never captured, and none that failed.
     kinds = listed["kinds"]
     assert "grad_spike" in kinds["checked"] and "job_stalled" in kinds["not_configured"] and kinds["unavailable"] == {}
-    assert len(kinds["checked"]) + len(kinds["not_configured"]) == 32
-    assert f"{len(kinds['checked'])} of 32 kinds checked" in listed["summary"]
+    # Thirty steps are enough for a gradient spike and too few for activation drift, which is
+    # checked and listed apart: "nothing found" is no verdict for it yet.
+    assert kinds["not_enough_history"] == dict.fromkeys(
+        ("activation_drift", "dead_activations"), {"records": 30, "records_needed": 60})
+    assert not set(kinds["checked"]) & set(kinds["not_enough_history"]) and "history_not_stated" not in kinds
+    assert len(kinds["checked"]) + len(kinds["not_enough_history"]) + len(kinds["not_configured"]) == 32
+    assert (f"{len(kinds['checked']) + 2} of 32 kinds checked, 2 of them without enough history yet"
+            " (activation_drift 30 of 60 records, dead_activations 30 of 60)") in listed["summary"]
     assert client.call("get_series", name="loss")["range"]["end"] == 29
 
     client = start(tmp_path)  # a folder that is no run folder
@@ -702,6 +708,11 @@ def test_the_agent_instructions_name_the_four_tools_and_offer_no_action_on_the_r
     assert [tool["name"] for tool in mcp_server.TOOLS] == TOOLS
     for word in ("invariant", "anomaly", "observation", "not_checked", "unknown", "run_state", "python -m tensorquill.mcp_server"):
         assert word in text, word
+    # "Checked" is told from "checked, not enough history yet", in the instructions and in the tool's own words.
+    described = next(tool["description"] for tool in mcp_server.TOOLS if tool["name"] == "list_incidents")
+    for word in ("kinds.checked", "kinds.not_enough_history", "records_needed", "kinds.history_not_stated"):
+        assert word in text and word in described, word
+    assert "not enough history yet" in text and "still warming up" in text and "still warming up" in described
     # The document sends the agent to each incident's `class` and copies no table of kinds. The
     # few kinds it gives as examples sit on a line that names their class, as the SDK has it.
     examples = [(kind, line) for line in text.splitlines() for kind in ev.INCIDENT_CLASSES if f"`{kind}`" in line]

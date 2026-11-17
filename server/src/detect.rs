@@ -250,6 +250,59 @@ pub const KIND_INPUTS: [(&str, &str); 25] = [
     ("input_starvation", "data_wait"),
 ];
 
+/// How many rows carrying a kind's input its rule needs: `records_needed` in a report's
+/// `kind_checks`, in the order of [`PORTED`]. `RECORDS_NEEDED` in `evidence.py` is the
+/// reference and gives the definition and each kind's rules: for each rule of the kind, the
+/// fewest rows it can report an incident on, and the kind needs the largest of those. A kind
+/// with one rule and no warm-up needs 1. `starved_experts` needs the window a run is judged
+/// with ([`records_needed`]).
+pub const RECORDS_NEEDED: [(&str, u64); 25] = [
+    // The diversity drop of a top-k router (k >= 3): its earlier samples and the one judged.
+    ("moe_imbalance", OVERLOAD_MIN_HISTORY as u64 + 1),
+    ("starved_experts", STARVE_WINDOW as u64),
+    // One parameter: its earlier norms, then `SPIKE_SUSTAIN` in a row (the total needs 11).
+    ("grad_spike", SPIKE_MIN_HISTORY as u64 + SPIKE_SUSTAIN as u64),
+    ("stalled_weights", STALL_STEPS as u64),
+    ("repeated_steps", 1),
+    // Skips in a row (a scale below the floor needs 1).
+    ("loss_scale_trouble", SCALE_SKIP_RUN),
+    ("resume_lr_change", 1),
+    ("resume_data_mismatch", 1),
+    ("resume_incomplete", 1),
+    // The same batch: the batch and the steps that repeat it (no batch needs 3).
+    ("data_stalled", data::DATA_STALL_STEPS as u64 + 1),
+    // A pass of two different batches, and the next pass matching both.
+    ("epoch_order_repeated", 4),
+    ("activation_spike", ACT_MIN_HISTORY as u64 + 1),
+    ("activation_drift", (ACT_WINDOW + ACT_RECENT) as u64),
+    ("dead_activations", (ACT_WINDOW + ACT_RECENT) as u64),
+    ("attention_collapse", (ATTN_MIN_HISTORY + ATTN_SUSTAIN) as u64),
+    ("attention_uniform", (ATTN_MIN_HISTORY + ATTN_SUSTAIN) as u64),
+    ("attention_logit_growth", (ATTN_MIN_HISTORY + ATTN_SUSTAIN) as u64),
+    ("non_finite", 1),
+    ("replica_drift", 1),
+    ("memory_growth", system::MEMORY_GROWTH_READINGS as u64),
+    ("memory_pressure", 1),
+    ("allocator_retries", 1),
+    // An ECC count above the attempt's first reading (an Xid needs 1).
+    ("hardware_errors", 2),
+    ("gpu_throttled", 1),
+    // The rise: the first full window as the baseline and one more step (the share needs 20).
+    ("input_starvation", system::INPUT_WINDOW as u64 + 1),
+];
+
+/// [`RECORDS_NEEDED`] for one kind as a run applies it: `starved_experts` needs the
+/// `starve_window` the run is judged with, every other kind its constant.
+pub fn records_needed(kind: &str, thresholds: &Thresholds) -> u64 {
+    if kind == "starved_experts" {
+        return thresholds.starve_window as u64;
+    }
+    RECORDS_NEEDED
+        .iter()
+        .find(|(known, _)| *known == kind)
+        .map_or(1, |(_, needed)| *needed)
+}
+
 /// The kinds a `not_checked` entry stands for when it lists none itself.
 const CHECK_KINDS: [(&str, &str); 3] = [
     ("resume_lr", "resume_lr_change"),
@@ -1983,7 +2036,6 @@ struct AttentionSeries {
 struct AttentionModule {
     share: AttentionSeries,
     logit: AttentionSeries,
-    seen: usize,
 }
 
 fn attention_hit(kind: &str, value: f64, base: f64) -> bool {
@@ -1999,8 +2051,6 @@ fn attention_hit(kind: &str, value: f64, base: f64) -> bool {
 struct Attention {
     modules: Named<AttentionModule>,
     probe_steps: Vec<i64>,
-    /// The most probes any module has been seen on.
-    most: usize,
     /// The incident of each kind, by its place in `ATTN_KINDS`.
     found: [Option<Value>; 3],
     /// The probe steps that are part of a confirmed run, per kind.
@@ -2041,8 +2091,6 @@ impl Attention {
         let mut context: Option<Option<Value>> = None;
         for (position, (name, stats)) in attention.iter().enumerate() {
             let module = self.modules.slot(position, name);
-            module.seen += 1;
-            self.most = self.most.max(module.seen);
             for (series, value, kinds) in [
                 (&mut module.share, stats.share, &ATTN_KINDS[..2]),
                 (&mut module.logit, stats.logit, &ATTN_KINDS[2..]),
@@ -2153,26 +2201,10 @@ impl Attention {
         }
     }
 
-    fn not_checked(&self) -> Option<Value> {
-        let needed = ATTN_MIN_HISTORY + ATTN_SUSTAIN;
-        (!self.probe_steps.is_empty() && self.most < needed).then(|| {
-            json!({
-                "check": "attention",
-                "kinds": ATTN_KINDS,
-                "reason": format!(
-                    "{} probe{} recorded attention; a layer is judged against its own first {} and a change must hold on {} probes in a row, so {} are needed",
-                    self.most,
-                    if self.most == 1 { "" } else { "s" },
-                    ATTN_MIN_HISTORY,
-                    ATTN_SUSTAIN,
-                    needed,
-                ),
-            })
-        })
-    }
-
     /// The `probe` entry of `not_checked`: probes that failed. A failed probe leaves its
     /// step unjudged, and a rule that must hold on probes in a row may have missed a change.
+    /// Too few probes to judge is not an entry: the attention kinds are then `checked`
+    /// without enough history ([`RankDetectors::kind_checks`]), which degrades nothing.
     fn probe_not_checked(&self) -> Option<Value> {
         let (step, said) = self.first_failure.as_ref()?;
         Some(json!({
@@ -3158,7 +3190,6 @@ impl RankDetectors {
         ];
         out.extend(self.attempts.not_checked.iter().cloned());
         out.extend(self.resumes.not_checked().cloned());
-        out.extend(self.attention.not_checked());
         out.extend(self.attention.probe_not_checked());
         self.system.not_checked(&mut out);
         out
@@ -3196,8 +3227,10 @@ impl RankDetectors {
     /// - `checked`: otherwise, when any row carried the kind's input ([`KIND_INPUTS`]).
     /// - `not_configured`: no row did. The capture was never set up to provide it.
     ///
-    /// Each entry also has `records`, the rows that carried the input, and `needs`, the
-    /// input by name.
+    /// Each entry also has `records`, the rows that carried the input, `needs`, the input by
+    /// name, `records_needed` ([`records_needed`]) and `enough_history`, which is `records >=
+    /// records_needed` whatever the value. A kind is `checked` from its first row, so it is
+    /// `enough_history` that says whether "nothing found" is a verdict yet.
     pub fn kind_checks(&self) -> Value {
         let not_checked = self.not_checked();
         let counts = self.input_counts();
@@ -3208,6 +3241,8 @@ impl RankDetectors {
                 .position(|(name, _)| *name == input)
                 .expect("every kind's input is listed");
             let (records, needs) = (counts[at], INPUT_NEEDS[at].1);
+            let needed = records_needed(kind, &self.thresholds);
+            let enough = records >= needed;
             let names = |item: &&Value| match item["kinds"].as_array() {
                 Some(kinds) => kinds.iter().any(|named| named == kind),
                 None => CHECK_KINDS
@@ -3216,12 +3251,13 @@ impl RankDetectors {
             };
             let entry = match not_checked.iter().find(names) {
                 Some(item) => json!({
-                    "value": "unavailable", "records": records, "needs": needs,
+                    "value": "unavailable", "records": records, "records_needed": needed,
+                    "enough_history": enough, "needs": needs,
                     "check": item["check"], "reason": item["reason"],
                 }),
                 None => json!({
                     "value": if records > 0 { "checked" } else { "not_configured" },
-                    "records": records, "needs": needs,
+                    "records": records, "records_needed": needed, "enough_history": enough, "needs": needs,
                 }),
             };
             checks.insert(kind.to_string(), entry);
@@ -3946,6 +3982,71 @@ mod tests {
     }
 
     #[test]
+    fn what_each_kind_needs_is_these_numbers_and_the_window_a_run_is_judged_with() {
+        let kinds: Vec<&str> = RECORDS_NEEDED.iter().map(|(kind, _)| *kind).collect();
+        assert_eq!(kinds, PORTED);
+        // By hand from the rules, not from the constants: evidence.py lists each kind's rules.
+        let by_hand: [u64; 25] = [
+            11, 50, 13, 3, 1, 10, 1, 1, 1, 4, 4, 11, 60, 60, 4, 4, 4, 1, 1, 6, 1, 1, 2, 1, 21,
+        ];
+        for ((kind, needed), expected) in RECORDS_NEEDED.iter().zip(by_hand) {
+            assert_eq!(*needed, expected, "{kind}");
+            assert_eq!(records_needed(kind, &usual()), expected, "{kind}");
+        }
+        let narrow = Arc::new(Thresholds::parse(r#"{"starve_window": 7}"#).unwrap());
+        assert_eq!(records_needed("starved_experts", &narrow), 7);
+        assert_eq!(records_needed("moe_imbalance", &narrow), 11);
+        let rows: Vec<MoeRow> = (0..7).map(|step| (1, step, vec![("a", vec![40, 40])])).collect();
+        let checks = judge(0, &[moe_rows(&rows, 1)], &narrow).unwrap().kind_checks();
+        assert_eq!(checks["starved_experts"]["records_needed"], 7);
+        assert_eq!(checks["starved_experts"]["enough_history"], true);
+        assert_eq!(checks["moe_imbalance"]["enough_history"], false);
+        let checks = judge(0, &[moe_rows(&rows, 1)], &usual()).unwrap().kind_checks();
+        assert_eq!(checks["starved_experts"]["records_needed"], 50);
+        assert_eq!(checks["starved_experts"]["enough_history"], false);
+    }
+
+    #[test]
+    fn a_kind_is_checked_from_its_first_row_and_says_when_its_rule_has_enough_history() {
+        let good = r#"{"attention":{"blocks.0.attn":{"entropy_share":[0.6,0.62],"max_logit":[2.0,2.1]}}}"#;
+        for (probes, enough) in [(1, false), (3, false), (4, true), (5, true)] {
+            let rows: Vec<Option<&str>> = (0..probes).map(|_| Some(good)).collect();
+            let detectors = judge(0, &[probe_rows(&rows)], &usual()).unwrap();
+            // Too few probes is no entry of `not_checked`: only the two files the server never has.
+            assert_eq!(detectors.not_checked().len(), 2, "{probes} probes");
+            let checks = detectors.kind_checks();
+            for kind in ATTN_KINDS {
+                assert_eq!(
+                    checks[kind],
+                    json!({
+                        "value": "checked", "records": probes, "records_needed": 4, "enough_history": enough,
+                        "needs": "probe with attention (probe=)",
+                    }),
+                    "{kind} after {probes} probes"
+                );
+            }
+            // Every row is the input of `repeated_steps`, which needs one.
+            assert_eq!(checks["repeated_steps"]["enough_history"], true);
+        }
+        // A kind no row carried the input of has no history either, and is still not configured.
+        let none = judge(0, &[key_rows(&steps("run", 0, 1, 0..3))], &usual())
+            .unwrap()
+            .kind_checks();
+        assert_eq!(
+            none["grad_spike"],
+            json!({
+                "value": "not_configured", "records": 0, "records_needed": 13, "enough_history": false,
+                "needs": "grad_norm or clip_grad_norm",
+            })
+        );
+        for kind in PORTED {
+            let check = &none[kind];
+            let enough = check["records"].as_u64().unwrap() >= check["records_needed"].as_u64().unwrap();
+            assert_eq!(check["enough_history"], enough, "{kind}");
+        }
+    }
+
+    #[test]
     fn rows_that_carry_nothing_but_their_step_check_one_kind() {
         let detectors = judge(0, &[key_rows(&steps("run", 0, 1, 0..12))], &usual()).unwrap();
         let checks = detectors.kind_checks();
@@ -3954,11 +4055,17 @@ mod tests {
         assert_eq!(values(&checks, "not_configured").len(), 24);
         assert_eq!(
             checks["repeated_steps"],
-            json!({"value": "checked", "records": 12, "needs": "step records"})
+            json!({
+                "value": "checked", "records": 12, "records_needed": 1, "enough_history": true,
+                "needs": "step records",
+            })
         );
         assert_eq!(
             checks["stalled_weights"],
-            json!({"value": "not_configured", "records": 0, "needs": "weights_unchanged with grad_norms (full capture)"})
+            json!({
+                "value": "not_configured", "records": 0, "records_needed": 3, "enough_history": false,
+                "needs": "weights_unchanged with grad_norms (full capture)",
+            })
         );
         // The report carries it, beside the two lists it always had.
         let document = report("run", 0, &detectors, 0);
@@ -3980,8 +4087,17 @@ mod tests {
             values(&checks, "checked"),
             ["moe_imbalance", "starved_experts", "repeated_steps"]
         );
-        let moe = json!({"value": "checked", "records": 2, "needs": "moe: a router's expert counts"});
-        assert_eq!((&checks["moe_imbalance"], &checks["starved_experts"]), (&moe, &moe));
+        // Two rows routed tokens: both kinds are checked, and neither rule has its history yet.
+        let moe = |needed: u64| {
+            json!({
+                "value": "checked", "records": 2, "records_needed": needed, "enough_history": false,
+                "needs": "moe: a router's expert counts",
+            })
+        };
+        assert_eq!(
+            (&checks["moe_imbalance"], &checks["starved_experts"]),
+            (&moe(11), &moe(50))
+        );
         assert_eq!(checks["repeated_steps"]["records"], 4);
         assert!(values(&checks, "unavailable").is_empty());
     }
@@ -4021,22 +4137,23 @@ mod tests {
             assert_eq!(
                 checks[*kind],
                 json!({
-                    "value": "unavailable", "records": 4, "needs": "probe with attention (probe=)",
-                    "check": "probe", "reason": reason,
+                    "value": "unavailable", "records": 4, "records_needed": 4, "enough_history": true,
+                    "needs": "probe with attention (probe=)", "check": "probe", "reason": reason,
                 })
             );
         }
         assert_eq!(values(&checks, "checked"), ["repeated_steps"]);
 
-        // Too few probes to judge is the entry there always was, and it names the kinds first.
+        // Too few probes to judge and one that failed: only the failure is an entry.
         let few = judge(0, &[probe_rows(&[Some(good), Some(failed), Some(good)])], &usual()).unwrap();
         let checks: Vec<Value> = few.not_checked()[2..]
             .iter()
             .map(|item| item["check"].clone())
             .collect();
-        assert_eq!(checks, [json!("attention"), json!("probe")]);
-        assert_eq!(few.kind_checks()["attention_collapse"]["check"], "attention");
+        assert_eq!(checks, [json!("probe")]);
+        assert_eq!(few.kind_checks()["attention_collapse"]["check"], "probe");
         assert_eq!(few.kind_checks()["attention_collapse"]["records"], 2);
+        assert_eq!(few.kind_checks()["attention_collapse"]["enough_history"], false);
 
         // An error that is not text is kept as the JSON it was.
         let odd = judge(0, &[probe_rows(&[Some(r#"{"error":{"code":3}}"#)])], &usual()).unwrap();

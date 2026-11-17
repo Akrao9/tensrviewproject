@@ -20,8 +20,10 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .data_checks import detect_data_stalled, detect_epoch_order_repeated, detect_resume_state
+from .data_checks import DATA_STALL_STEPS, detect_data_stalled, detect_epoch_order_repeated, detect_resume_state
 from .evidence_system import (
+    INPUT_WINDOW,
+    MEMORY_GROWTH_READINGS,
     SYSTEM_KINDS,
     describe_system,
     detect_memory_imbalance,
@@ -77,7 +79,12 @@ ACT_DEAD_RISE = 0.25  # zero fraction above its baseline, as a recent median
 # judged against the median of its own last ATTN_WINDOW earlier probes that showed nothing,
 # from its ATTN_MIN_HISTORY-th probe on, and a change counts only when it holds on ATTN_SUSTAIN
 # probes in a row (dated at the first). With the defaults nothing can be reported before a
-# module's fourth probe. Calibrated on SmolLM2-360M fine-tunes (seeded and healthy probes)
+# module's fourth probe: its first two fill the baseline, the third is the first one judged,
+# and the fourth confirms it. The capture probes on every `probe_every`-th step it commits,
+# counting from 1, so with 1,000 that is the 4,000th step of a run's first attempt (the
+# incident is then dated at the third probe, the 3,000th). Until then the attention kinds are
+# `checked` without enough history (`kind_checks`), which does not degrade the run.
+# Calibrated on SmolLM2-360M fine-tunes (seeded and healthy probes)
 # and on tiny Llamas trained from scratch on CPU; see the plan's decision of Nov 16, 2026.
 ATTN_MIN_HISTORY = 2
 ATTN_WINDOW = 5
@@ -857,17 +864,16 @@ def detect_attention_anomalies(
 
     One incident per kind: the step of the first probe, the probe that confirmed it, the
     modules whose run started there (in the probe's order, at most ATTN_MODULES), how many,
-    and how many probes were part of a confirmed run in all. With probes but too few for any
-    module to be judged and confirmed, `not_checked` gets an `attention` entry saying so, and
-    a `probe` entry when any probe failed (`{"error": ...}` in place of its results).
+    and how many probes were part of a confirmed run in all. `not_checked` gets a `probe`
+    entry when any probe failed (`{"error": ...}` in place of its results). Too few probes for
+    a module to be judged and confirmed is not an entry: the kinds are then `checked` without
+    enough history yet (`kind_checks`, `RECORDS_NEEDED`), and the run is not degraded for it.
     """
     shares: dict[str, _AttentionSeries] = {}
     logits: dict[str, _AttentionSeries] = {}
     found: dict[str, dict[str, Any]] = {}
     affected: dict[str, set[int]] = {}
     probe_steps: list[int] = []
-    most = 0  # the most probes any module has been seen on
-    seen: dict[str, int] = {}
     asked, failed, first_failure = 0, 0, None
     for record in sorted(records, key=lambda r: r["step"]):
         probe = record.get("probe")
@@ -886,8 +892,6 @@ def detect_attention_anomalies(
         confirmed: dict[str, list[dict[str, Any]]] = {}
         for module, stats in attention.items():
             share, logit, heads = _attention_values(stats)
-            seen[module] = seen.get(module, 0) + 1
-            most = max(most, seen[module])
             for series_of, value, kinds in (
                 (shares, share, ("attention_collapse", "attention_uniform")),
                 (logits, logit, ("attention_logit_growth",)),
@@ -941,15 +945,6 @@ def detect_attention_anomalies(
     for kind, incident in found.items():
         incident["affected_probes"] = len(affected[kind])
         incident["probes"] = len(probe_steps)
-    needed = ATTN_MIN_HISTORY + ATTN_SUSTAIN
-    if not_checked is not None and probe_steps and most < needed:
-        not_checked.append({
-            "check": "attention",
-            "kinds": list(ATTN_KINDS),
-            "reason": f"{most} probe{'s' if most != 1 else ''} recorded attention; a layer is judged against its own"
-                      f" first {ATTN_MIN_HISTORY} and a change must hold on {ATTN_SUSTAIN} probes in a row, so"
-                      f" {needed} are needed",
-        })
     if not_checked is not None and first_failure is not None:
         # A probe that failed leaves its step unjudged, and a rule that must hold on probes
         # in a row may have missed a change there.
@@ -1415,10 +1410,16 @@ def with_classes(incidents: Iterable[dict[str, Any]]) -> None:
 #                   nothing is wrong with the monitoring
 #   unavailable     the inputs were asked for and could not be judged: a `not_checked` entry
 #                   names the kind (a probe that failed, a reading that could not be taken,
-#                   too few probes to judge, a resume that could not be compared, a file
-#                   that could not be read), or a server stores the run and its progress
-#                   status is missing
+#                   a resume that could not be compared, a file that could not be read), or
+#                   a server stores the run and its progress status is missing
 # Only `unavailable` makes a run `degraded` (see `run_state`).
+#
+# A kind is `checked` from its first record, and a rule that is still warming up does not
+# degrade a run. So each kind also says whether its rule has had enough history
+# (`enough_history`), and the server's kinds give the two numbers it is worked out from:
+# `records`, the records that carried the kind's input, against `records_needed`
+# (`RECORDS_NEEDED`). "Nothing found" for a kind that is `checked` without enough history
+# is not a verdict: its rule could not have fired yet.
 KIND_CHECK_VALUES = ("checked", "not_configured", "unavailable")
 # What each count of `input_counts` counts, as an evidence file names it under `needs`.
 INPUT_NEEDS: dict[str, str] = {
@@ -1450,7 +1451,81 @@ KIND_INPUTS: dict[str, str] = {
     "memory_growth": "cuda", "memory_pressure": "cuda", "allocator_retries": "cuda", "hardware_errors": "nvml",
     "gpu_throttled": "nvml", "input_starvation": "data_wait",
 }
-# The kinds a `not_checked` entry stands for when it lists none itself (`kinds`).
+# How many records carrying a kind's input (`records`, as `input_counts` counts them) its
+# rule needs: `records_needed` in `kind_checks`, and `enough_history` is `records >=
+# records_needed`. One definition for every kind:
+#
+#   For each rule of the kind, take the fewest records it can report an incident on. The
+#   kind needs the largest of those: from then on every one of its rules could have fired.
+#
+# A kind with one rule and no warm-up needs 1. The rules, and the fewest records each can
+# report on (the largest is the entry below):
+#   moe_imbalance         share (top-1, top-2) 1; collapse (top-k >= 3, during warm-up) 1;
+#                         diversity drop (top-k >= 3) OVERLOAD_MIN_HISTORY earlier samples and
+#                         the one judged
+#   starved_experts       a full window: the `starve_window` option (STARVE_WINDOW)
+#   grad_spike            the total: SPIKE_MIN_HISTORY earlier norms and the one judged, 11;
+#                         one parameter: SPIKE_MIN_HISTORY earlier norms, then SPIKE_SUSTAIN in
+#                         a row
+#   stalled_weights       STALL_STEPS weight checks in a row
+#   loss_scale_trouble    a scale below the floor 1; SCALE_SKIP_RUN skips in a row
+#   data_stalled          no batch: DATA_STALL_STEPS steps in a row, 3; the same batch: the
+#                         batch and DATA_STALL_STEPS steps that repeat it
+#   epoch_order_repeated  the shortest pass that can be repeated has two different batches,
+#                         and the next pass must match both
+#   activation_spike      ACT_MIN_HISTORY earlier records and the one judged
+#   activation_drift, dead_activations
+#                         the first ACT_WINDOW records as the baseline and ACT_RECENT more
+#   the attention kinds   ATTN_MIN_HISTORY probes as the baseline, then ATTN_SUSTAIN in a row
+#   memory_growth         MEMORY_GROWTH_READINGS readings, each above the one before
+#   hardware_errors       an Xid 1; an ECC count above the attempt's first reading 2
+#   input_starvation      the share: one window of INPUT_WINDOW steps, 20; the rise: the first
+#                         full window as the baseline and one more step
+#   every other kind      1: the rule reads one record (`non_finite`, `replica_drift`,
+#                         `memory_pressure`, `allocator_retries`, `gpu_throttled`), or compares a
+#                         resume or a repeated step with what earlier attempts wrote, which the
+#                         count of records leaves out once a later attempt has replaced them
+#                         (`repeated_steps` and the three resume kinds)
+#
+# This is a floor, not a promise. `records` counts every record that carried the input, and
+# a rule may count fewer: a parameter, module or router seen on fewer records has less
+# history of its own; a total that is not finite or belongs to a skipped step is left out;
+# the memory, hardware and data-wait rules start over at each attempt; an epoch must end
+# before the next can be compared with it; and a starved expert also needs enough tokens in
+# the window. So `enough_history` false means the kind's slowest rule cannot have fired, and
+# true means the count has reached what that rule needs. A kind can report before it has
+# enough history, through one of its rules that needs less. `server/src/detect.rs` has the
+# same table (`RECORDS_NEEDED`) and the parity tests hold the two equal.
+RECORDS_NEEDED: dict[str, int] = {
+    "moe_imbalance": OVERLOAD_MIN_HISTORY + 1,
+    "starved_experts": STARVE_WINDOW,
+    "grad_spike": SPIKE_MIN_HISTORY + SPIKE_SUSTAIN,
+    "stalled_weights": STALL_STEPS,
+    "repeated_steps": 1,
+    "loss_scale_trouble": SCALE_SKIP_RUN,
+    "resume_lr_change": 1,
+    "resume_data_mismatch": 1,
+    "resume_incomplete": 1,
+    "data_stalled": DATA_STALL_STEPS + 1,
+    "epoch_order_repeated": 4,
+    "activation_spike": ACT_MIN_HISTORY + 1,
+    "activation_drift": ACT_WINDOW + ACT_RECENT,
+    "dead_activations": ACT_WINDOW + ACT_RECENT,
+    "attention_collapse": ATTN_MIN_HISTORY + ATTN_SUSTAIN,
+    "attention_uniform": ATTN_MIN_HISTORY + ATTN_SUSTAIN,
+    "attention_logit_growth": ATTN_MIN_HISTORY + ATTN_SUSTAIN,
+    "non_finite": 1,
+    "replica_drift": 1,
+    "memory_growth": MEMORY_GROWTH_READINGS,
+    "memory_pressure": 1,
+    "allocator_retries": 1,
+    "hardware_errors": 2,
+    "gpu_throttled": 1,
+    "input_starvation": INPUT_WINDOW + 1,
+}
+# The kinds a `not_checked` entry stands for when it lists none itself (`kinds`). The
+# `attention` entry ("too few probes") is no longer written: it is read from evidence and
+# server reports made before `enough_history`.
 _CHECK_KINDS: dict[str, tuple[str, ...]] = {
     "resume_lr": ("resume_lr_change",),
     "resume_data": ("resume_data_mismatch",),
@@ -1524,24 +1599,40 @@ def _unavailable(entry: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
     return {"value": "unavailable", **extra, "check": entry.get("check"), "reason": entry.get("reason")}
 
 
-def kind_checks(counts: Mapping[str, int], not_checked: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+def records_needed(starve_window: int = STARVE_WINDOW) -> dict[str, int]:
+    """`RECORDS_NEEDED` as a run applies it: `starved_experts` needs the window the run was
+    judged with (the `starve_window` option), every other kind its constant."""
+    return {**RECORDS_NEEDED, "starved_experts": int(starve_window)}
+
+
+def kind_checks(
+    counts: Mapping[str, int], not_checked: Iterable[Mapping[str, Any]], *, starve_window: int = STARVE_WINDOW
+) -> dict[str, dict[str, Any]]:
     """The value of each of the server's kinds (`KIND_INPUTS`), from how many records carried
     its input (`input_counts`) and the checks that could not be made.
 
     A kind a `not_checked` entry names is `unavailable`, with that entry's `check` and
     `reason`, however many records carried its input: a probe that failed once leaves a
     step unjudged, as one failed memory reading does. Otherwise it is `checked` when any
-    record carried the input and `not_configured` when none did. `tensorquill-server`
-    gives the same object in its report (`kind_checks`).
+    record carried the input and `not_configured` when none did.
+
+    Every entry also has `records`, `records_needed` (`RECORDS_NEEDED`, with the
+    `starve_window` the run was judged with) and `enough_history`, which is `records >=
+    records_needed` whatever the value. A kind is `checked` from its first record, so it is
+    `enough_history` that says whether "nothing found" is a verdict yet.
+    `tensorquill-server` gives the same object in its report (`kind_checks`).
     """
     named = _kinds_not_checked(not_checked)
+    needed = records_needed(starve_window)
     checks: dict[str, dict[str, Any]] = {}
     for kind, counter in KIND_INPUTS.items():
-        records, needs = int(counts.get(counter, 0)), INPUT_NEEDS[counter]
+        records = int(counts.get(counter, 0))
+        history = {"records": records, "records_needed": needed[kind], "enough_history": records >= needed[kind],
+                   "needs": INPUT_NEEDS[counter]}
         if kind in named:
-            checks[kind] = _unavailable(named[kind], records=records, needs=needs)
+            checks[kind] = _unavailable(named[kind], **history)
         else:
-            checks[kind] = {"value": "checked" if records > 0 else "not_configured", "records": records, "needs": needs}
+            checks[kind] = {"value": "checked" if records > 0 else "not_configured", **history}
     return checks
 
 
@@ -1564,6 +1655,11 @@ def other_kind_checks(
       `unavailable` when it could not be read, `not_configured` when it was not given.
     - `duplicate_batches` and `memory_imbalance` compare ranks, which one rank's evidence
       cannot: `not_configured` here. The all-ranks view (`--rank all`) judges them.
+
+    None of these is counted in records, so they have no `records` or `records_needed`.
+    Their source is whole once it is read (the status is the server's own verdict, which
+    waits out its silence thresholds there; a file holds a finished analysis), so
+    `enough_history` is true exactly when the kind is `checked`.
     """
     named = _kinds_not_checked(not_checked)
     checks: dict[str, dict[str, Any]] = {}
@@ -1585,44 +1681,107 @@ def other_kind_checks(
                 checks[kind] = {"value": "checked" if given else "not_configured", "needs": needs}
     for kind in ("duplicate_batches", "memory_imbalance"):
         checks[kind] = {"value": "not_configured", "needs": "every rank's report (--rank all)"}
+    for kind, check in checks.items():
+        # After `value`, before `needs`, where the server's kinds have it.
+        checks[kind] = {"value": check["value"], "enough_history": check["value"] == "checked",
+                        **{key: value for key, value in check.items() if key != "value"}}
     return checks
+
+
+def kind_history(check: Any) -> str | None:
+    """What a `kind_checks` entry says about a checked kind's history: `enough`,
+    `not_enough` (its rule is still warming up: "nothing found" is not a verdict yet), or
+    `not_stated` for an entry without `enough_history`, which a version before the field
+    wrote and which is never read as enough. None for a kind that is not `checked`."""
+    if not isinstance(check, Mapping) or check.get("value") != "checked":
+        return None
+    enough = check.get("enough_history")
+    return "not_stated" if not isinstance(enough, bool) else "enough" if enough else "not_enough"
 
 
 def checked_counts(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     """How many kinds have each value in an evidence file's `kind_checks`, with the names of
     the unavailable ones: `{"kinds", "checked", "not_configured", "unavailable", "unavailable_kinds"}`.
-    None for evidence without the key. `kinds` is every kind this version knows (32)."""
+    Of the checked kinds, `not_enough_history` counts those whose rule is still warming up,
+    named under `not_enough_history_kinds`, and `history_not_stated` those whose entry does
+    not say (a file from before `enough_history`). None for evidence without the key.
+    `kinds` is every kind this version knows (32)."""
     checks = evidence.get("kind_checks")
     if not isinstance(checks, Mapping):
         return None
     of = {value: [kind for kind in INCIDENT_CLASSES if isinstance(checks.get(kind), Mapping)
                   and checks[kind].get("value") == value] for value in KIND_CHECK_VALUES}
+    history = {kind: kind_history(checks[kind]) for kind in of["checked"]}
+    warming = [kind for kind, found in history.items() if found == "not_enough"]
     return {"kinds": len(INCIDENT_CLASSES), **{value: len(kinds) for value, kinds in of.items()},
-            "unavailable_kinds": of["unavailable"]}
+            "unavailable_kinds": of["unavailable"], "not_enough_history": len(warming),
+            "not_enough_history_kinds": warming,
+            "history_not_stated": sum(found == "not_stated" for found in history.values())}
 
 
 def kinds_by_value(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     """An evidence file's `kind_checks` by value, for a reader who wants names and not every
-    entry: the kinds `checked`, the kinds `not_configured`, and for each `unavailable` kind
-    the reason. None for evidence without the key."""
+    entry. None for evidence without the key.
+
+    - `checked`: the kinds whose rule ran with enough history. "Nothing found" is a verdict
+      for these only.
+    - `not_enough_history`: the kinds that are checked and still warming up, each with its
+      `records` and `records_needed`. Their slowest rule could not have fired yet. One that
+      is among the incidents all the same, found by a rule of the kind that needs fewer
+      records, has `"reported": true`: the incident stands.
+    - `not_configured`, and `unavailable` with each kind's reason.
+    - `history_not_stated`, only when there are any: checked kinds of a file written before
+      `enough_history`. They are not listed as checked, because the file does not say.
+    """
     checks = evidence.get("kind_checks")
     if not isinstance(checks, Mapping):
         return None
     listed = [(kind, check) for kind, check in checks.items() if isinstance(check, Mapping)]
+    history = {kind: kind_history(check) for kind, check in listed}
+    not_stated = [kind for kind, _ in listed if history[kind] == "not_stated"]
+    reported = _reported_kinds(evidence)
     return {
-        "checked": [kind for kind, check in listed if check.get("value") == "checked"],
+        "checked": [kind for kind, _ in listed if history[kind] == "enough"],
+        "not_enough_history": {
+            kind: {**{key: check[key] for key in ("records", "records_needed") if key in check},
+                   **({"reported": True} if kind in reported else {})}
+            for kind, check in listed if history[kind] == "not_enough"
+        },
         "not_configured": [kind for kind, check in listed if check.get("value") == "not_configured"],
         "unavailable": {kind: check.get("reason") for kind, check in listed if check.get("value") == "unavailable"},
+        **({"history_not_stated": not_stated} if not_stated else {}),
     }
 
 
+def _reported_kinds(evidence: Mapping[str, Any]) -> set[Any]:
+    incidents = evidence.get("incidents")
+    return {i.get("kind") for i in incidents if isinstance(i, Mapping)} if isinstance(incidents, (list, tuple)) else set()
+
+
 def checked_line(evidence: Mapping[str, Any]) -> str | None:
-    """`9 of 32 kinds checked, 21 not configured, 2 unavailable (...)`, for the summary; None
-    for evidence that does not say what was checked."""
+    """`9 of 32 kinds checked, 2 of them without enough history yet (grad_spike 5 of 13
+    records, ...), 21 not configured, 2 unavailable (...)`, for the summary; None for
+    evidence that does not say what was checked. The part about history is there only when a
+    checked kind is still warming up, or when the file does not say. A warming-up kind that
+    is among the incidents is marked "but reported by a faster rule", so the line is not read
+    against the incident."""
     counts = checked_counts(evidence)
     if counts is None:
         return None
-    line = f"{counts['checked']} of {counts['kinds']} kinds checked, {counts['not_configured']} not configured"
+    line = f"{counts['checked']} of {counts['kinds']} kinds checked"
+    if counts["not_enough_history"]:
+        checks, reported = evidence["kind_checks"], _reported_kinds(evidence)
+        each = []
+        for at, kind in enumerate(counts["not_enough_history_kinds"]):
+            seen, needed = checks[kind].get("records"), checks[kind].get("records_needed")
+            said = f"{kind} {seen} of {needed}" if seen is not None and needed is not None else kind
+            if at == 0 and " of " in said:
+                said += " records"
+            each.append(said + (" but reported by a faster rule" if kind in reported else ""))
+        line += f", {counts['not_enough_history']} of them without enough history yet ({', '.join(each)})"
+    if counts["history_not_stated"]:
+        line += f", {counts['history_not_stated']} of them with no word on their history (an older version wrote this)"
+    line += f", {counts['not_configured']} not configured"
     if counts["unavailable"]:
         line += f", {counts['unavailable']} unavailable ({', '.join(counts['unavailable_kinds'])})"
     return line
@@ -3354,6 +3513,11 @@ def build_evidence(
                 "this tensorquill-server does not say what was checked (`kind_checks`, an older one): build it"
                 " from the same version"
             )
+        if any(not isinstance(rank_checks[kind].get("enough_history"), bool) for kind in SERVER_KINDS):
+            raise RuntimeError(
+                "this tensorquill-server does not say whether each kind had enough history (`enough_history` in"
+                " `kind_checks`, an older one): build it from the same version"
+            )
         rank_checks = {kind: dict(rank_checks[kind]) for kind in SERVER_KINDS}
         from_rust = [dict(incident) for incident in report["incidents"]]
         incidents = [i for i in from_rust if i.get("kind") != "replica_drift"]
@@ -3404,7 +3568,7 @@ def build_evidence(
         if non_finite_hit is not None:
             incidents.append(non_finite_hit)
         incidents.extend(detect_system_incidents(records, not_checked))
-        rank_checks = kind_checks(input_counts(records), not_checked)
+        rank_checks = kind_checks(input_counts(records), not_checked, starve_window=starve_window)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
     # A status is expected where a server stores the run (a directory of its parts, or one
     # part) or when one was named. A local file or a list of records has no server to miss.

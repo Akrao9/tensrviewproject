@@ -544,7 +544,8 @@ def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, An
     answer["not_checked"] = _not_checked(opened)
     kinds = kinds_by_value(evidence)
     if kinds is not None:
-        # What "no incidents" covers: the kinds that were looked for, and those that could not be.
+        # What "no incidents" covers: the kinds that were looked for with enough history, those
+        # still warming up, and those that could not be looked for.
         answer["kinds"] = kinds
     if isinstance(evidence.get("detection"), dict):
         answer["detection"] = evidence["detection"]
@@ -975,11 +976,15 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " run state with its reasons, what was not checked, and a text summary. An empty list is not by itself"
             " \"no failure\": read the run state's reasons and `kinds`. With no incidents, a state of healthy means"
             " the recorded steps were judged and nothing was found, for the kinds listed under `kinds.checked`"
-            " only. A kind under `kinds.not_configured` was never looked for, because the capture does not record"
-            " what it needs; one under `kinds.unavailable` was asked for and could not be judged, and makes the"
-            " state degraded. When the answer has no `kinds` (a run folder, or a file from an older version), what"
-            " was checked is not stated: do not infer it. A not_checked entry or an unknown rank means that part"
-            " was not judged."
+            " only. A kind under `kinds.not_enough_history` is checked but its rule is still warming up: it has"
+            " seen `records` of the `records_needed` it needs, could not have fired yet, and nothing found is not a"
+            " verdict for it, though the state stays healthy (with `reported`, one of its faster rules did find the"
+            " listed incident, which stands). A kind under `kinds.not_configured` was never looked"
+            " for, because the capture does not record what it needs; one under `kinds.unavailable` was asked for"
+            " and could not be judged, and makes the state degraded. Kinds under `kinds.history_not_stated` come"
+            " from a file written before this was recorded: treat them as not enough history. When the answer has"
+            " no `kinds` (a run folder, or a file from an older version), what was checked is not stated: do not"
+            " infer it. A not_checked entry or an unknown rank means that part was not judged."
             " For a run folder the incidents are grouped across ranks; `rank` keeps one rank's."
         ),
         "inputSchema": {

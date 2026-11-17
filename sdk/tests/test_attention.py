@@ -124,14 +124,19 @@ def test_a_lasting_change_stays_out_of_the_baseline_and_keeps_counting():
     assert found[0]["affected_probes"] == 9 and found[0]["modules"][0]["baseline_probes"] == 3
 
 
-def test_too_few_probes_are_listed_as_not_checked():
-    not_checked: list = []
-    assert ev.detect_attention_anomalies(probe_run({"a": steady()}, 3), not_checked=not_checked) == []
-    assert not_checked == [{"check": "attention", "kinds": list(ev.ATTN_KINDS), "reason": not_checked[0]["reason"]}]
-    assert "3 probes recorded attention" in not_checked[0]["reason"] and "4 are needed" in not_checked[0]["reason"]
-    enough: list = []
-    ev.detect_attention_anomalies(probe_run({"a": steady()}, 4), not_checked=enough)
-    assert enough == []
+def test_too_few_probes_are_checked_without_enough_history_and_not_listed_as_not_checked():
+    # A rule that is still warming up is no fault of the monitoring: nothing is listed, and the
+    # kinds say how many probes they have against the four they need.
+    for probes in (1, 3, 4):
+        not_checked: list = []
+        assert ev.detect_attention_anomalies(probe_run({"a": steady()}, probes), not_checked=not_checked) == []
+        assert not_checked == []
+        evidence = tensorquill.build_evidence(probe_run({"a": steady()}, probes))
+        assert "not_checked" not in evidence and evidence["run_state"]["state"] == "healthy"
+        for kind in ev.ATTN_KINDS:
+            check = evidence["kind_checks"][kind]
+            assert (check["value"], check["records"], check["records_needed"]) == ("checked", probes, 4)
+            assert check["enough_history"] is (probes >= 4)
     nothing: list = []
     ev.detect_attention_anomalies(probe_run({}, 0) + [record(1, grad_norm=1.0)], not_checked=nothing)
     assert nothing == []  # no probe at all (the probe is opt-in): nothing to say
@@ -250,8 +255,13 @@ def test_the_server_reports_the_same_attention_incidents_after_every_stretch(tmp
         sent = upto
         expected = [i for i in tensorquill.build_evidence(records[:upto])["incidents"] if i["kind"] in ev.ATTN_KINDS]
         assert tsd.differences(expected, document["incidents"]) == [], f"after {upto} steps"
-        expected_nc = [n for n in tensorquill.build_evidence(records[:upto]).get("not_checked", []) if n["check"] == "attention"]
-        assert [n for n in document["not_checked"] if n["check"] == "attention"] == expected_nc, f"after {upto} steps"
+        # Too few probes is never an entry; the server's count of probes against the four the rules need is Python's.
+        assert not [n for n in document["not_checked"] if n["check"] == "attention"], f"after {upto} steps"
+        expected_checks = tensorquill.build_evidence(records[:upto])["kind_checks"]
+        assert {kind: document["kind_checks"][kind] for kind in ev.ATTN_KINDS} == {
+            kind: expected_checks[kind] for kind in ev.ATTN_KINDS
+        }, f"after {upto} steps"
+        assert document["kind_checks"]["attention_collapse"]["enough_history"] is (upto >= 40), f"after {upto} steps"
     assert {i["kind"] for i in document["incidents"]} == set(ev.ATTN_KINDS)
     assert all("scalars" in i for i in document["incidents"])
     assert set(ev.ATTN_KINDS) <= set(document["checked"])

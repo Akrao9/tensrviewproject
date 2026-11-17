@@ -144,7 +144,7 @@ def cases() -> dict[str, list[dict]]:
     # Ends inside and at a reading, and at or just past each incident, as the server's stretches do.
     out.update({f"system, {upto} steps": system[:upto] for upto in (10, 11, 112, 115, 190, 230, 260, 300)})
     out.update({f"system edge {name}": records for name, records in test_evidence_system.edges().items()})
-    # Checks that could not be made: too few probes, and resumes with nothing to compare.
+    # Too few probes (checked, without enough history), and resumes with nothing to compare.
     out["attention, the first probes"] = test_attention.parity_run()[:30]
     row, tag = test_data_server.row, test_data_server.tag
     out["a resume after a rollback"] = (
@@ -166,7 +166,8 @@ def test_the_cases_reach_every_kind_the_server_has():
     assert set(SERVER_KINDS) <= seen, set(SERVER_KINDS) - seen
     # And the checks that could not be made, which the Rust path lists in Python's place.
     listed = {n["check"] for records in CASES.values() for n in tensorquill.build_evidence(records).get("not_checked", [])}
-    assert {"resume_lr", "resume_data", "resume_state", "attention", "cuda_memory", "nvml"} <= listed, listed
+    assert {"resume_lr", "resume_data", "resume_state", "probe", "cuda_memory", "nvml"} <= listed, listed
+    assert "attention" not in listed, "too few probes is not a check that failed"
 
 
 @pytest.mark.parametrize("name", CASES)
@@ -310,7 +311,7 @@ def test_a_binary_that_gives_no_samples_or_other_routers_is_refused(monkeypatch,
 
 # --- what was checked: one of three values for every kind -------------------------------------
 
-from test_kind_checks import probed, router_only  # noqa: E402
+from test_kind_checks import BOUNDARY, BY_HAND, boundary_findings, probed, router_only  # noqa: E402
 
 # The parity record sets have no probe run without a failed probe, and no router-only capture.
 CHECK_SETS: dict[str, list[dict]] = {
@@ -328,8 +329,17 @@ CHECK_SETS: dict[str, list[dict]] = {
 def test_both_paths_say_the_same_about_what_was_checked(name):
     assert both(CHECK_SETS[name]) == []
     evidence = tensorquill.build_evidence(CHECK_SETS[name], detectors="rust")
-    degraded = "failed" in name or "too few" in name or "error" in name
+    # Too few probes alone is a rule warming up, which degrades nothing; a probe that failed does.
+    degraded = "failed" in name or "error" in name
     assert evidence["run_state"]["state"] == ("degraded" if degraded else "healthy")
+    attention = evidence["kind_checks"]["attention_collapse"]
+    if name == "probes, too few":
+        assert "not_checked" not in evidence
+        assert attention == {"value": "checked", "records": 3, "records_needed": 4, "enough_history": False,
+                             "needs": "probe with attention (probe=)"}
+    if name == "probes, too few and one failed":
+        assert [n["check"] for n in evidence["not_checked"]] == ["probe"]
+        assert (attention["value"], attention["check"], attention["enough_history"]) == ("unavailable", "probe", False)
 
 
 def test_a_router_only_capture_and_a_failed_probe_read_the_same_through_rust():
@@ -343,7 +353,8 @@ def test_a_router_only_capture_and_a_failed_probe_read_the_same_through_rust():
     failed = tensorquill.build_evidence(CHECK_SETS["probes, one failed"], detectors="rust")
     assert failed["run_state"]["state"] == "degraded" and [n["check"] for n in failed["not_checked"]] == ["probe"]
     assert failed["kind_checks"]["attention_collapse"] == {
-        "value": "unavailable", "records": 5, "needs": "probe with attention (probe=)", "check": "probe",
+        "value": "unavailable", "records": 5, "records_needed": 4, "enough_history": True,
+        "needs": "probe with attention (probe=)", "check": "probe",
         "reason": "1 of 6 probes failed, the first at step 30: RuntimeError: CUDA out of memory",
     }
 
@@ -353,13 +364,20 @@ def test_the_report_gives_pythons_value_for_every_kind_and_every_value_is_reache
 
     sets = {**CASES, **{f"fixture {name}": records for name, records in GATE_FIXTURES.items()}, **CHECK_SETS}
     reached: dict[str, set[str]] = {kind: set() for kind in SERVER_KINDS}
+    history: dict[str, set[bool]] = {kind: set() for kind in SERVER_KINDS}
     for name, records in sets.items():
         python = tensorquill.build_evidence(records)["kind_checks"]
         report = server_report(load_records(records, all_attempts=True))["kind_checks"]
-        # No tolerance: a value, a count and two strings.
+        # No tolerance: a value, two counts, a flag and two strings.
         assert report == {kind: python[kind] for kind in SERVER_KINDS}, name
         for kind, check in report.items():
             reached[kind].add(check["value"])
+            assert check["records_needed"] == BY_HAND[kind], (name, kind)
+            assert check["enough_history"] is (check["records"] >= check["records_needed"]), (name, kind)
+            history[kind].add(check["enough_history"])
+    # Every kind is seen with enough history, and every kind that needs more than a record without.
+    assert all(True in found for found in history.values()), history
+    assert {kind for kind, found in history.items() if False not in found} <= {"repeated_steps"}, history
     assert reached.pop("repeated_steps") == {"checked"}  # every record is its input
     assert all({"checked", "not_configured"} <= found for found in reached.values()), reached
     # The kinds a `not_checked` entry can name.
@@ -384,7 +402,8 @@ def test_the_rust_path_takes_each_kinds_value_from_the_report(monkeypatch):
             report["kind_checks"]["grad_spike"] = change["grad_spike"]
         return report
 
-    made_up = {"value": "unavailable", "records": 7, "needs": "x", "check": "made up", "reason": "because"}
+    made_up = {"value": "unavailable", "records": 7, "records_needed": 9, "enough_history": False, "needs": "x",
+               "check": "made up", "reason": "because"}
     change["grad_spike"] = made_up
     monkeypatch.setattr(module, "server_report", other)
     evidence = tensorquill.build_evidence(moe_edges(), detectors="rust")
@@ -396,9 +415,40 @@ def test_the_rust_path_takes_each_kinds_value_from_the_report(monkeypatch):
     change["grad_spike"] = {"value": "fine", "records": 7, "needs": "x"}
     with pytest.raises(RuntimeError, match="does not say what was checked"):
         tensorquill.build_evidence(moe_edges(), detectors="rust")
+    # A binary from before `enough_history`: its kinds have a value and a count and no word on history.
+    change["grad_spike"] = {"value": "checked", "records": 7, "needs": "x"}
+    with pytest.raises(RuntimeError, match="does not say whether each kind had enough history"):
+        tensorquill.build_evidence(moe_edges(), detectors="rust")
     change["drop"] = True
     with pytest.raises(RuntimeError, match="does not say what was checked"):
         tensorquill.build_evidence(moe_edges(), detectors="rust")
+
+
+# --- enough history: the same boundary through the Rust rules ---------------------------------
+
+
+@pytest.mark.parametrize("name", BOUNDARY)
+def test_the_rust_rules_report_on_exactly_the_records_a_kind_needs_as_pythons_do(name):
+    kind, records, _ = BOUNDARY[name]
+    # Rust fires on the last of the needed records and on neither set of one fewer, and says so.
+    boundary_findings(name, build=lambda given: tensorquill.build_evidence(given, detectors="rust"))
+    for given in (records, records[1:], records[:-1]):
+        assert both(given) == [], f"{name}, {len(given)} records"
+
+
+def test_the_report_takes_the_starved_window_it_was_given():
+    from tensorquill.evidence import load_records
+
+    kind, records, _ = BOUNDARY["starved_experts, a full window"]
+    for window, enough in ((50, True), (51, False), (20, True)):
+        report = server_report(load_records(records, all_attempts=True), thresholds={"starve_window": window})
+        check = report["kind_checks"][kind]
+        assert (check["records"], check["records_needed"], check["enough_history"]) == (50, window, enough)
+        assert both(records, starve_window=window) == []
+        # No other kind's need moves with it.
+        assert {k: c["records_needed"] for k, c in report["kind_checks"].items() if k != kind} == {
+            k: n for k, n in BY_HAND.items() if k != kind
+        }
 
 
 # --- where the two paths differ, on purpose -------------------------------------------------
