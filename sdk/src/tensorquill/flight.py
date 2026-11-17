@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from .manifest import METADATA_KEY as MANIFEST_KEY
+
 SCHEMA_VERSION = 1
 BATCH_STEPS = 50
 BATCH_SECONDS = 2.0
@@ -368,6 +370,7 @@ class FlightSender:
         token: str | None = None,
         tls_root_certs: bytes | str | os.PathLike[str] | None = None,
         world_size: int | None = None,
+        manifest: Mapping[str, Any] | None = None,
         batch_steps: int = BATCH_STEPS,
         batch_seconds: float = BATCH_SECONDS,
         batch_bytes: int = BATCH_BYTES,
@@ -383,6 +386,9 @@ class FlightSender:
         self.run_id = run_id
         self.rank = rank
         self.world_size = world_size  # lets the server name ranks that never connect
+        # The run manifest (`manifest.py`), given on rank 0 only. It rides on the first batch
+        # of each stream, and the server writes `runs/<run_id>/run.json` from it.
+        self.manifest = dict(manifest) if manifest else None
         self.last_error: BaseException | None = None
         self.skipped_lines = 0
         self._location = _location(endpoint)
@@ -540,6 +546,7 @@ class FlightSender:
             acks = threading.Thread(target=read_acks, name="tensorquill-flight-acks", daemon=True)
             acks.start()
             waiting_since: float | None = None
+            first_batch = True
             try:
                 # The ack reader returning is how a stream the server ended shows up here;
                 # the server's status (such as "ingest buffer full") is raised by close().
@@ -562,7 +569,10 @@ class FlightSender:
                             "max_step": max(steps) if steps else None,
                             "end_byte_offset": end,
                             **({"world_size": self.world_size} if self.world_size else {}),
+                            # Optional, and unknown to a server older than it, which ignores it.
+                            **({MANIFEST_KEY: self.manifest} if first_batch and self.manifest else {}),
                         }
+                        first_batch = False
                         batch = pa.RecordBatch.from_pylist(
                             [record_to_row(r) for r in records], schema=schema
                         )
@@ -809,6 +819,7 @@ def attach(
     world_size: int | None = None,
     heartbeat_seconds: float | None = HEARTBEAT_SECONDS,
     stack_seconds: float | None = STACK_SECONDS,
+    manifest: Mapping[str, Any] | None = None,
 ) -> Any:
     """Start streaming `sink`'s file when `endpoint` or `TENSORQUILL_ENDPOINT` is set;
     otherwise return `sink` unchanged, with no socket opened and `pyarrow` not imported."""
@@ -825,7 +836,7 @@ def attach(
     try:
         sender = FlightSender(
             path, endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs,
-            world_size=world_size,
+            world_size=world_size, manifest=manifest,
         )
     except ImportError as error:
         raise ImportError(

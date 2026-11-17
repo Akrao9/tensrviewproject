@@ -46,7 +46,8 @@ from .distributed import FINGERPRINT_WIDTH, replica_spread, unwrap_local
 from .probe import ProbeState, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink
 from .system import SystemPart, SystemReadings
-from .tracker import RunInfo, _world_size, resolve_run
+from . import manifest as _manifest
+from .tracker import RunInfo, _world_size, resolve_run, tracker_labels
 
 STATS = ("mean", "std", "abs_max", "zero_frac")
 _SEEN = len(STATS)  # last column: 1.0 when the hook ran this step
@@ -1530,6 +1531,11 @@ def init(
     model: nn.Module,
     *,
     run_id: str | None = None,
+    project: str | None = None,
+    name: str | None = None,
+    group: str | None = None,
+    tags: Sequence[str] | None = None,
+    config: Mapping[str, Any] | None = None,
     every: int = 50,
     sink: Sink | None = None,
     capture: str | None = None,
@@ -1557,7 +1563,20 @@ def init(
 
     Args:
         run_id: the tracker's run ID. Defaults to MLFLOW_RUN_ID, the active MLflow run or
-            the active W&B run, in that order.
+            the active W&B run, in that order. It is the run's identity: every file and
+            every folder in a server's store is named by it, whatever the project.
+        project: the project the run is listed and compared under. Defaults to
+            `TENSORQUILL_PROJECT`, then the tracker's (W&B's project, or
+            `MLFLOW_EXPERIMENT_NAME`), then `uncategorized`. W&B's rule applies: at most 128
+            characters and none of `/ \\ # ? % :`.
+        name: a label for the run, which may repeat within a project. Defaults to
+            `TENSORQUILL_RUN_NAME`, then the tracker's run name, then the run ID.
+        group: an optional label shared by related runs. Defaults to W&B's group.
+        tags: optional labels.
+        config: an optional flat dictionary of hyperparameters, compared between runs by
+            `python -m tensorquill compare`. Nothing is read from the tracker's config.
+            These five go into the run manifest, `<run_id>.run.json` beside the `.jsonl`
+            file, which rank 0 writes here (see `manifest.py`); other ranks write nothing.
         every: steps kept on the device between transfers to the CPU.
         capture: `"routers"` records MoE router load only: cheap enough to leave on
             (+0.02% to +0.78% on Granite on an RTX PRO 6000). `"full"` adds block
@@ -1646,17 +1665,40 @@ def init(
     layers = defaults["layers"] if layers is None else layers
     grads = defaults["grads"] if grads is None else grads
     weights = defaults["weights"] if weights is None else weights
+    # The explicit labels are checked before anything is opened; a bad one raises here.
+    if project is not None:
+        _manifest.resolve_project(project)
+    if group is not None and not isinstance(group, str):
+        raise ValueError(f"group must be a string, not {type(group).__name__}")
+    _manifest.resolve_name(name, None)
+    tags, config = _manifest.clean_tags(tags), _manifest.clean_config(config)
     run = resolve_run(run_id)
     if sink is None:
-        name = run.run_id
-        sink = JsonlSink(Path("tensorquill-out") / f"{name}.rank{run.rank}.jsonl")
+        sink = JsonlSink(Path("tensorquill-out") / f"{run.run_id}.rank{run.rank}.jsonl")
+    # The project and the name are facts of the run, and a tracker's run exists on rank 0
+    # only, so rank 0 alone resolves and writes them: no collective call is needed.
+    run_manifest = None
+    if run.rank == 0:
+        labels = tracker_labels()
+        run_manifest = _manifest.build_manifest(
+            run_id=run.run_id, run_id_source=run.source,
+            project=_manifest.resolve_project(project, labels.get("project")),
+            name=_manifest.resolve_name(name, run.run_id, labels.get("name")),
+            group=group or labels.get("group"), tags=tags, config=config, world_size=_world_size(),
+        )
+        records_file = getattr(sink, "path", None)
+        if records_file is not None and run.run_id:
+            manifest_file = _manifest.local_manifest_path(records_file, run.run_id)
+            _manifest.write_manifest(manifest_file, run_manifest)
+            # A run started again under its run ID keeps the first start's time.
+            run_manifest = _manifest.read_manifest(manifest_file) or run_manifest
     from .flight import attach  # a no-op unless endpoint= or TENSORQUILL_ENDPOINT is set
 
     sink = attach(
         sink, run.run_id, run.rank, endpoint, world_size=_world_size(), heartbeat_seconds=heartbeat_seconds,
-        stack_seconds=stack_seconds,
+        stack_seconds=stack_seconds, manifest=run_manifest,
     )
-    return Session(
+    session = Session(
         model,
         run=run,
         every=every,
@@ -1678,3 +1720,5 @@ def init(
         system=system,
         data_wait=data_wait,
     )
+    session.manifest = run_manifest  # the run manifest rank 0 wrote; None on every other rank
+    return session

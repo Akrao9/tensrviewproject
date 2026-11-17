@@ -225,6 +225,15 @@ impl Storage {
         }
     }
 
+    /// Replaces `runs/<run_id>/run.json`, the run's manifest: its project, name and setup, as
+    /// rank 0's sender gave it.
+    pub async fn write_manifest(&self, run_id: &str, document: &serde_json::Value) -> Result<(), Error> {
+        let path = self.root.clone().join("runs").join(run_id).join("run.json");
+        let bytes = serde_json::to_vec_pretty(document)?;
+        self.store.put(&path, PutPayload::from(Bytes::from(bytes))).await?;
+        Ok(())
+    }
+
     /// Replaces `runs/<run_id>/rank=<rank>/incidents.json`, what the server's detectors found.
     pub async fn write_incidents(&self, run_id: &str, rank: i32, document: &serde_json::Value) -> Result<(), Error> {
         let path = self.rank_dir(run_id, rank).join("incidents.json");

@@ -20,6 +20,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from . import manifest as _manifest
 from .data_checks import DATA_STALL_STEPS, detect_data_stalled, detect_epoch_order_repeated, detect_resume_state
 from .evidence_system import (
     INPUT_WINDOW,
@@ -2128,6 +2129,7 @@ def _report_evidence(
     evidence = {
         "schema_version": 1,
         "run_id": report.get("run_id"),
+        "run": _manifest.run_block(report.get("run_id"), _manifest.find_manifest(folder, report.get("run_id"))),
         "overload_threshold": applied.get("overload_threshold", OVERLOAD_THRESHOLD),
         "starve_window": applied.get("starve_window", STARVE_WINDOW),
         "starve_ratio": applied.get("starve_ratio", STARVE_RATIO),
@@ -2627,7 +2629,8 @@ def watch(
                     continue
                 here = {**adopted, **thresholds}
                 evidence = build_evidence(
-                    tail.records, **{**build_options, **here, **({"watchdog": status_file} if status_file else {})}
+                    tail.records, **{"run_manifest": source, **build_options, **here,
+                                     **({"watchdog": status_file} if status_file else {})}
                 )
                 if look is not None:
                     evidence["detection"] = {**_detection(look, "python", picked_rank),
@@ -2976,6 +2979,7 @@ def _all_ranks_evidence(
         "view": ALL_RANKS_VIEW,
         "view_version": ALL_RANKS_VIEW_VERSION,
         "run_id": run_ids[0] if run_ids else source.name,
+        "run": _manifest.run_block(run_ids[0] if run_ids else source.name, _manifest.find_manifest(source)),
         "run_folder": str(source.resolve()),
         "written_at_ms": int(time.time() * 1000),
         "rank_count": len(looks),
@@ -3477,8 +3481,15 @@ def build_evidence(
     traincheck: str | Path | None = None,
     detectors: str = "python",
     server_binary: str | os.PathLike[str] | None = None,
+    run_manifest: str | Path | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build viewer-neutral detector evidence from captured step records.
+
+    The evidence's `run` block (project, name, run ID) is read from the run manifest
+    (`manifest.py`): the one beside `source` when that is a path, or `run_manifest`, which is
+    the manifest itself, its file, or the `.jsonl` file or run folder it sits beside (for a
+    caller that hands over records it has already read). A run without a manifest reads as
+    project `uncategorized` with its run ID as its name.
 
     The detectors read one rank's steps. `rank` picks that rank out of a run directory or a
     list of records; records of several ranks with no `rank` given raise `ValueError`,
@@ -3661,6 +3672,8 @@ def build_evidence(
     evidence = {
         "schema_version": 1,
         "run_id": run_id,
+        "run": _manifest.run_block(run_id, _manifest.find_manifest(
+            run_manifest if run_manifest is not None else source, run_id)),
         "layer_count": len(routers),
         "expert_count": expert_count,
         "router_names": routers,
@@ -4917,7 +4930,7 @@ def main() -> None:
         evidence = build_evidence(
             records, **args.thresholds, watchdog=_watchdog_beside(args.input),
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
-            traincheck=args.traincheck, detectors=args.detectors,
+            traincheck=args.traincheck, detectors=args.detectors, run_manifest=args.input,
         )
     except (RuntimeError, ValueError) as error:
         if args.detectors != "rust":

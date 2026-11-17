@@ -143,7 +143,19 @@ struct BatchMetadata {
     /// The number of ranks in the job, when the sender knows it; names ranks that never connect.
     #[serde(default)]
     world_size: Option<i32>,
+    /// The run manifest (project, name, setup), on the first batch of each of rank 0's streams
+    /// from a sender that has one. Written as `runs/<run_id>/run.json`. A sender older than the
+    /// key sends none, and that run has no manifest.
+    ///
+    /// This struct must never refuse unknown keys: a key added here later is how a newer
+    /// sender keeps working with this server.
+    #[serde(default)]
+    run_manifest: Option<serde_json::Value>,
 }
+
+/// The largest manifest stored, as JSON text. A sender's `config` is a flat dictionary of
+/// hyperparameters; anything larger is not a manifest.
+pub const MANIFEST_MAX_BYTES: usize = 64 * 1024;
 
 type Key = (String, i32);
 type AckSender = mpsc::UnboundedSender<Result<PutResult, Status>>;
@@ -197,6 +209,8 @@ pub struct Ingest {
     /// What each rank's detectors last reported, for the run state in `watchdog.json`. Kept
     /// apart from the rank buffers so the watchdog never waits for a flush or a rebuild.
     reports: Mutex<HashMap<Key, RankReport>>,
+    /// The manifest last written per run, as JSON text, so the same one is written once.
+    manifests: Mutex<HashMap<String, String>>,
 }
 
 impl Ingest {
@@ -216,6 +230,7 @@ impl Ingest {
             written: Mutex::new(HashMap::new()),
             data_windows: Mutex::new(HashMap::new()),
             reports: Mutex::new(HashMap::new()),
+            manifests: Mutex::new(HashMap::new()),
             used: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             buffers: Mutex::new(HashMap::new()),
@@ -578,11 +593,52 @@ impl Ingest {
             }
             self.accept(key, batch, metadata.end_byte_offset, metadata.world_size, ack)
                 .await?;
+            // After the rows, which matter more: a manifest that cannot be stored never
+            // refuses a batch.
+            if let Some(manifest) = metadata.run_manifest {
+                self.store_manifest(&key.0, manifest).await;
+            }
         }
         if let Some(key) = key {
             self.flush_key(key).await?; // end of stream
         }
         Ok(())
+    }
+
+    /// Writes `runs/<run_id>/run.json` when the manifest is new for this run or differs from
+    /// the one last written (a run started again under its run ID). The folder comes from the
+    /// stream's descriptor, never from the manifest. One that is not an object, names another
+    /// run or is too large is left out with a line on stderr, and so is a failed write, which
+    /// the next stream's first batch tries again.
+    async fn store_manifest(&self, run_id: &str, manifest: serde_json::Value) {
+        let Some(object) = manifest.as_object() else {
+            eprintln!("tensorquill-server: the run manifest of {run_id} is not a JSON object; not stored");
+            return;
+        };
+        if object
+            .get("run_id")
+            .is_some_and(|named| !named.is_null() && named.as_str() != Some(run_id))
+        {
+            eprintln!("tensorquill-server: the run manifest sent for {run_id} names another run; not stored");
+            return;
+        }
+        let text = manifest.to_string();
+        if text.len() > MANIFEST_MAX_BYTES {
+            eprintln!(
+                "tensorquill-server: the run manifest of {run_id} is {} bytes (limit {MANIFEST_MAX_BYTES}); not stored",
+                text.len()
+            );
+            return;
+        }
+        if self.manifests.lock().unwrap().get(run_id) == Some(&text) {
+            return;
+        }
+        match self.storage.write_manifest(run_id, &manifest).await {
+            Ok(()) => {
+                self.manifests.lock().unwrap().insert(run_id.to_string(), text);
+            }
+            Err(error) => eprintln!("tensorquill-server: cannot write the run manifest of {run_id}: {error}"),
+        }
     }
 
     /// A heartbeat from a rank's own process.

@@ -1727,3 +1727,143 @@ async fn simulated_latency_report() {
         }
     }
 }
+
+// --- The run manifest -------------------------------------------------------------------
+
+fn manifest_metadata(end: i64, manifest: &serde_json::Value) -> String {
+    serde_json::json!({
+        "schema_version": 1, "run_id": RUN, "rank": 0, "min_step": null, "max_step": null,
+        "end_byte_offset": end, "run_manifest": manifest,
+    })
+    .to_string()
+}
+
+fn stored_manifest(root: &Path) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(root.join("runs").join(RUN).join("run.json")).ok()?;
+    Some(serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn a_manifest_on_a_batch_is_written_as_run_json_and_replaced_when_it_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), manual(), None).await;
+    let first = serde_json::json!({
+        "schema_version": 1, "project": "granite", "name": "baseline", "run_id": RUN,
+        "config": {"lr": 0.001}, "a_field_this_server_does_not_know": [1, 2],
+    });
+
+    let mut put = open(&server, 0).await;
+    put.send_with_metadata(batch(0, 0..5), manifest_metadata(5, &first))
+        .await;
+    // Written while the stream is still open, before any part is: a listing can name a run
+    // from its first batch.
+    until("run.json", || stored_manifest(dir.path()).is_some()).await;
+    assert_eq!(
+        stored_manifest(dir.path()).unwrap(),
+        first,
+        "stored as the sender gave it"
+    );
+    assert_eq!(put.finish().await, vec![5]);
+    let path = dir.path().join("runs").join(RUN).join("run.json");
+    let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    // The same manifest on a later stream is not written again.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut put = open(&server, 0).await;
+    put.send_with_metadata(batch(0, 5..10), manifest_metadata(10, &first))
+        .await;
+    assert_eq!(put.finish().await, vec![10]);
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), written);
+
+    // The run starts again under its run ID with another name: the file follows.
+    let mut second = first.clone();
+    second["name"] = "after-the-fix".into();
+    let mut put = open(&server, 0).await;
+    put.send_with_metadata(batch(0, 10..15), manifest_metadata(15, &second))
+        .await;
+    assert_eq!(put.finish().await, vec![15]);
+    assert_eq!(stored_manifest(dir.path()).unwrap()["name"], "after-the-fix");
+    assert_eq!(stored_steps(dir.path())[&0], (0..15).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn a_sender_older_than_the_manifest_and_one_newer_than_this_server_both_store_their_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), manual(), None).await;
+
+    // Older: the five keys and no manifest.
+    let mut put = open(&server, 0).await;
+    put.send(batch(0, 0..5), 5).await;
+    assert_eq!(put.finish().await, vec![5]);
+    assert_eq!(
+        stored_manifest(dir.path()),
+        None,
+        "no manifest was sent, so none is written"
+    );
+
+    // Newer: a key this server has never heard of. An older server meets `run_manifest` this way.
+    let mut put = open(&server, 0).await;
+    let newer = format!(
+        "{{\"schema_version\":1,\"run_id\":\"{RUN}\",\"rank\":0,\"end_byte_offset\":10,\"a_key_from_a_later_sender\":{{\"x\":1}}}}"
+    );
+    put.send_with_metadata(batch(0, 5..10), newer).await;
+    assert_eq!(put.finish().await, vec![10]);
+    assert_eq!(stored_steps(dir.path())[&0], (0..10).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn a_manifest_that_cannot_be_stored_never_refuses_the_batch() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), manual(), None).await;
+    let mut end = 0;
+    let too_large = serde_json::json!({"run_id": RUN, "config": {"blob": "x".repeat(70_000)}});
+    for bad in [
+        serde_json::json!("not an object"),
+        serde_json::json!({"run_id": "another-run", "project": "p"}),
+        serde_json::json!({"run_id": "../../escape", "project": "p"}),
+        too_large,
+    ] {
+        let mut put = open(&server, 0).await;
+        put.send_with_metadata(batch(0, end..end + 5), manifest_metadata(end + 5, &bad))
+            .await;
+        end += 5;
+        assert_eq!(put.finish().await, vec![end], "{bad:.80}");
+    }
+    assert_eq!(stored_manifest(dir.path()), None);
+    assert_eq!(stored_steps(dir.path())[&0], (0..end).collect::<Vec<_>>());
+    let listed: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(listed, ["runs"], "nothing is written outside the run's folder");
+
+    // The store refuses the manifest's write: the rows are stored and acknowledged all the same,
+    // and the next stream's manifest is written.
+    let store = TestStore::new();
+    let server = start_on(store.clone(), manual(), None).await;
+    let good = serde_json::json!({"run_id": RUN, "project": "p", "name": "n"});
+    let manifest_path = object_store::path::Path::from(format!("runs/{RUN}/run.json"));
+    let mut put = open(&server, 0).await;
+    put.send(batch(0, 0..5), 5).await;
+    assert_eq!(put.finish().await, vec![5]);
+    store.knobs.fail_puts.store(1, Ordering::SeqCst);
+    // Steps already stored: nothing to write but the manifest, whose write fails.
+    let mut put = open(&server, 0).await;
+    put.send_with_metadata(batch(0, 0..5), manifest_metadata(5, &good))
+        .await;
+    assert_eq!(put.finish().await.last(), Some(&5));
+    assert_eq!(
+        store.knobs.fail_puts.load(Ordering::SeqCst),
+        0,
+        "the manifest's write was tried and failed"
+    );
+    assert!(store.inner.get(&manifest_path).await.is_err());
+    let mut put = open(&server, 0).await;
+    put.send_with_metadata(batch(0, 5..10), manifest_metadata(10, &good))
+        .await;
+    assert_eq!(put.finish().await, vec![10]);
+    let stored = store.inner.get(&manifest_path).await.unwrap().bytes().await.unwrap();
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&stored).unwrap(), good);
+    assert_eq!(steps_in(&store).await, (0..10).collect::<Vec<_>>());
+}
