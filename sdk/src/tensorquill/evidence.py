@@ -1946,9 +1946,9 @@ def thresholds_line(evidence: Mapping[str, Any]) -> str | None:
     It reads what the evidence lists as applied: `detection.thresholds` for one rank of a
     server's store, whether the server judged or this process did, and `thresholds` in the
     all-ranks view, or every set of `thresholds_by_rank` with its ranks when the judged ranks
-    differ. Evidence with neither gives None. That is a local file's (`build_evidence`): there
-    the caller gave the options itself, and the evidence holds three of the five as keys of
-    their own (`overload_threshold`, `starve_window`, `starve_ratio`) and not the other two.
+    differ. Evidence with no `detection` (a local `.jsonl` file, or a store's parts read without
+    `--watch`) is `build_evidence`'s: it lists the five as `thresholds` only when one is not the
+    default, so at the defaults it lists none and gives None, as evidence from before the key does.
     """
     if evidence.get("view") == ALL_RANKS_VIEW:
         who = "the server applied"
@@ -1965,9 +1965,12 @@ def thresholds_line(evidence: Mapping[str, Any]) -> str | None:
             off = _off_default(evidence.get("thresholds"))
     else:
         detection = evidence.get("detection")
-        detection = detection if isinstance(detection, Mapping) else {}
-        who = "the server applied" if detection.get("source") == "server" else "the detectors ran here with"
-        off = _off_default(detection.get("thresholds"))
+        if isinstance(detection, Mapping):
+            who = "the server applied" if detection.get("source") == "server" else "the detectors ran here with"
+            off = _off_default(detection.get("thresholds"))
+        else:  # a local file, or a store's parts read without --watch: judged here
+            who = "the detectors ran here with"
+            off = _off_default(evidence.get("thresholds"))
     if not off:
         return None
     return f"Thresholds that are not the defaults: {who} {', '.join(off)}."
@@ -4134,6 +4137,12 @@ def build_evidence(
         "top_k": router_top_k,
         "starve_window": starve_window,
         "starve_ratio": starve_ratio,
+        # The five the detectors ran with, under the name a server's report lists them by, and
+        # only when one is not the default: evidence at the defaults is what it was before.
+        **({"thresholds": ran_with} if _off_default(ran_with := {
+            "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
+            "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": _top_k_option(top_k),
+        }) else {}),
         "incidents": incidents,
         "samples": samples,
         **({"detectors": "rust"} if from_rust is not None else {}),
