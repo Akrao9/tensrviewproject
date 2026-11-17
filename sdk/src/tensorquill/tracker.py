@@ -12,6 +12,7 @@ import sys
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,45 @@ def tracker_run_id() -> tuple[str, str] | None:
         # background process and raises in shared-mode runs.
         return run.id, "wandb"
     return None
+
+
+def tracker_labels() -> dict[str, str]:
+    """The project, run name and group of the tracker run this process can see, with no
+    collective call and no round trip: any of `project`, `name` and `group` that is known.
+
+    W&B's `run.project`, `run.name` and `run.group` each return a field of the run's local
+    settings (`wandb_run.py`). MLflow's run name is on the active run object; its experiment
+    name is read from `MLFLOW_EXPERIMENT_NAME` only, because looking it up by the run's
+    experiment ID is a call to the tracking server, and nothing here may wait on one.
+    Any failure to read a label leaves it out.
+    """
+    found: dict[str, str] = {}
+
+    def take(key: str, read: Any) -> None:
+        if key in found:
+            return
+        try:
+            value = read()
+        except Exception:  # noqa: BLE001  a tracker's attribute must never stop a run
+            return
+        if isinstance(value, str) and value:
+            found[key] = value
+
+    mlflow = sys.modules.get("mlflow")
+    if mlflow is not None:
+        try:
+            active = mlflow.active_run()
+        except Exception:  # noqa: BLE001
+            active = None
+        if active is not None:
+            take("name", lambda: active.info.run_name)
+            take("project", lambda: os.environ.get("MLFLOW_EXPERIMENT_NAME"))
+    run = getattr(sys.modules.get("wandb"), "run", None)
+    if run is not None:
+        take("project", lambda: run.project)
+        take("name", lambda: run.name)
+        take("group", lambda: run.group)
+    return found
 
 
 def _launcher_run_id() -> str | None:

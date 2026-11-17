@@ -60,7 +60,7 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 | The Rust detectors on a local file (`tensorquill-server detect`, `--detectors rust`, `build_evidence(detectors="rust")`): the incidents of the 25 per-rank kinds, the five threshold options, and the per-step MoE samples (`detect --samples`) | Built Nov 16, 2026, tested on macOS against the Python detectors on 64 record sets and against the golden files. Not the default, and no Python detector is deleted. Not run on Linux |
 | What was checked (`kind_checks` in `evidence.json`, in the server's `incidents.json` and in `detect`'s output): `checked`, `not_configured` or `unavailable` for each of the 32 kinds, the count in the summary, and `degraded` only for `unavailable` | Built Nov 16, 2026, tested on macOS in Python and in Rust, the two held equal on 71 record sets. Also in the watcher's evidence from a server's report, and for the whole run in the all-ranks view (built Nov 17, 2026: a kind takes its worst judged rank's value and the ranks that differ are named). Not run on a real job |
 | Compact evidence (`--compact`) and the trigger (`--watch --on-incident COMMAND`, `--webhook URL`): once for each new incident, invariants by default and a stalled job or silent rank once the server calls it `critical` | Built Nov 16, 2026, tested on CPU (macOS), the store paths through the real server binary. No real agent or outside webhook has been driven by it |
-| Read-only MCP server (`python -m tensorquill.mcp_server PATH`, four tools) and the explain-only [agent instructions](AGENT_INSTRUCTIONS.md) | Built Nov 16, 2026, tested with a scripted client on the seven Gate 1 fixtures. No live agent has used it |
+| Read-only MCP server (`python -m tensorquill.mcp_server PATH`, six tools: four on one run, and `list_runs` and `compare_runs` since Nov 17, 2026) and the explain-only [agent instructions](AGENT_INSTRUCTIONS.md) | Built Nov 16, 2026, tested with a scripted client on the seven Gate 1 fixtures. No live agent has used it |
 | The Rust detectors from Python (`--detectors rust`, through `tensorquill-server detect`): one read of a file or store, `--watch` on a growing file or a store, and `--rank all`; `detect --run` for every rank of a run, with `duplicate_batches` across ranks; a reader that takes the thresholds a server applied; and the all-ranks view as one call, `evidence.all_ranks_evidence` | Built Nov 16, 2026, tested on CPU (macOS) with the debug binary: the same evidence as the Python detectors on 57 record sets and the seven Gate 1 fixtures, read once and written a stretch at a time. The Python detectors are still the default and none is deleted |
 | No graph breaks and no recompiles under `torch.compile` | Tested with `eager`, `aot_eager`, and AOTAutograd static-input checks on CPU; on CUDA with Inductor and CUDA graphs on a toy MoE, and with Inductor and CUDA graphs off on Granite |
 
@@ -742,11 +742,40 @@ Built Nov 16, 2026, tested with mocked CUDA and NVML; the GPU side waits for a C
   - A hung NVML call blocks the writer thread and, once its queue fills, training.
   - Only PyTorch's `DataLoader` iterator and `time_data` are timed.
 
+## Projects, run names and comparing runs
+
+Built Nov 17, 2026, on CPU (macOS). A run has a project and a name, as in W&B, and two or more runs can be compared on what only TensorQuill records: what was checked and the incidents. Charts of scalars across runs stay with W&B and MLflow.
+
+```python
+session = tensorquill.init(model, project="granite", name="baseline", config={"lr": 1e-5})
+```
+
+- **The run ID is still the identity.** Every file and every folder in a server's store is named by it, and nothing moves under a project folder. The name is a label and may repeat.
+- **Where the labels come from.** `project`: the argument, then `TENSORQUILL_PROJECT`, then W&B's project or `MLFLOW_EXPERIMENT_NAME`, then `uncategorized`. `name`: the argument, then `TENSORQUILL_RUN_NAME`, then the tracker's run name, then the run ID. W&B's rule for a project name applies (at most 128 characters, none of `/ \ # ? % :`): a bad argument raises at `init`, and a bad name from the environment or the tracker is made to fit with a warning. MLflow's experiment is not looked up by its ID, because that is a call to the tracking server.
+- **The run manifest.** Rank 0 writes `<run_id>.run.json` beside its `.jsonl` file at `init`: project, name, group, tags, start time, world size, the SDK and PyTorch versions, where the run ID came from, and `config`. With `endpoint=` it rides on the first batch of each of rank 0's streams, and the server writes `runs/<run_id>/run.json`. A manifest that cannot be written is warned about and the run goes on. A manifest over 60,000 bytes goes to the server without its `config` (marked `config_left_out`, with a warning at `init`), and the server stores none over 64 KiB. An older server ignores the key, and an older sender still works with a new server.
+- **Every evidence file has a `run` block** with the project, the name and the run ID. A run recorded before the manifest existed reads as `uncategorized` with its run ID as its name.
+
+```sh
+python -m tensorquill runs tensorquill-out --project granite
+python -m tensorquill compare baseline after-the-fix --source tensorquill-out
+```
+
+- **`runs <folder or store>`** lists one row a run, by project: name, run ID, run state, last step, incidents by class, the first incident, how many kinds were checked, and the start time. It reads the manifests and the small evidence or report files only. It opens no Parquet part and runs no detector, so a local run whose evidence file was never written is listed with `?` and a note. `tensorquill.list_runs(source, project=None)` gives the rows.
+- **`compare A B [C ...]`** takes each run by ID or name at `--source` (default `tensorquill-out`), or as a path. An exact ID wins, and a name that fits several runs is refused with their IDs. It prints a summary and writes `compare.json`, in four parts:
+  1. What differs in the setup: project, group, world size, versions and each `config` key.
+  2. What was checked: a kind checked in one run and not configured, unavailable or not yet with enough history in another. This comes before the incidents.
+  3. The incidents, by kind and what they name, with each run's first step. For a run that does not show one, the entry says whether that run looked (`absent_from`).
+  4. Where two runs part: **not built**. The output says so and never gives a step.
+- **One rank of each run is read**, rank 0 unless `--rank` says otherwise, and the output names it and says that incidents on the other ranks were not compared. Local files are judged here by the Python detectors with the default thresholds. A run in a store is read from the server's report when it is current, and no part is opened; when it is not, the command reads the parts and judges them here with the thresholds that report applied, and says so, while the MCP tool refuses with the report's state.
+- **`runs` and `compare` are verbs wherever they come first.** A file or folder with one of those names is read as `./runs` or `./compare`. This changes what `python -m tensorquill runs` meant for a folder named `runs`.
+- **Checked** in `tests/test_run_manifest.py` (30 tests) and `tests/test_runs_compare.py` (20 tests): two runs of one project told apart from local files and from a real server's store; a two-process run writes one manifest; a healthy run and each seeded run of `examples/seeded_failures.py --toy` compare as one incident in the second only, on the seeded parameter; a router-only run against a full-capture run reports what was checked before any incident.
+- **Not checked:** a GPU, Linux, a real W&B or MLflow run (the trackers are stand-ins in the tests), S3 or GCS, a run of more than two ranks, and a store of more than a few hundred runs.
+
 ## For a coding agent: a read-only MCP server
 
 Built Nov 16, 2026. `python -m tensorquill.mcp_server PATH` serves one run's evidence to a coding agent over MCP (stdio). `PATH` is an `evidence.json`, a `.jsonl` capture, or a run folder in a server's store (`runs/<run_id>`). It needs no package beyond the SDK: the part of the protocol it uses (revision 2025-06-18) is written out in `mcp_server.py`.
 
-It has four tools, and all four only read:
+It has six tools, and all six only read. Four answer about the run at `PATH`; `list_runs` and `compare_runs` (Nov 17, 2026) read the folder that run is kept in, or the one named with `--runs FOLDER`, and take run IDs and names found there, never a path:
 
 | Tool | Gives |
 | --- | --- |
@@ -754,12 +783,14 @@ It has four tools, and all four only read:
 | `get_incident` | One incident in full |
 | `get_series` | One layer's, parameter's, router's or logged scalar's values over a step range |
 | `get_all_ranks_status` | For a run folder: which ranks are judged, unknown, clean or showing incidents |
+| `list_runs` | The runs kept beside this one, by project: name, run ID, run state, last step, incidents by class, first incident |
+| `compare_runs` | Two or more of those runs by ID or name: what differs in the setup, in what was checked, and in the incidents |
 
 - **It follows a live run.** The path is read again at every call.
 - **Answers are bounded.** No reply is longer than 50 KB. A long series is thinned to 200 points with the stride reported, and the minimum, maximum and median are still taken over every recorded step.
-- **For a run folder it runs no detector.** The incidents come from the server's own reports, and only `get_series` opens the Parquet parts, which needs `pyarrow`.
+- **For a run folder it runs no detector.** The incidents come from the server's own reports, and only `get_series` opens the Parquet parts, which needs `pyarrow`. `compare_runs` keeps to this: a run whose report is not current is refused with the reason. On local files it runs the Python detectors, as `list_incidents` does on a capture.
 - **The page to give the agent** is [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md): which tool to call first, how to name the step, the layer or parameter and the kind, what the three classes and "not checked" mean, and that it explains and takes no action on the run.
-- **Checked** in `tests/test_mcp_server.py` (29 tests): a scripted client using only the four tools recovers the kind, the first step and the layer, parameter or module of all seven Gate 1 fixtures; the size cap on a 10,000-step run; a two-rank run folder, by hand and through the real server; every error case.
+- **Checked** in `tests/test_mcp_server.py` (34 tests): a scripted client using only the first four tools recovers the kind, the first step and the layer, parameter or module of all seven Gate 1 fixtures; the size cap on a 10,000-step run; a two-rank run folder, by hand and through the real server; every error case.
 - **Not checked:** no live agent has used it.
 
 ## Things to know

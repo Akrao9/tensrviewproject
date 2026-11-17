@@ -6,7 +6,10 @@ What these tests hold it to:
 - a scripted client that uses only the four tools recovers, for each of the seven Gate 1
   fixtures, the kind, the first step and the layer, parameter or module of the answer key, and
   finds that step again in the series itself;
-- the tool list is exactly the four, all marked read-only, and a session changes no file;
+- the tool list is exactly the six, all marked read-only, and a session changes no file (four
+  until Nov 17, 2026, when `list_runs` and `compare_runs` joined them on purpose);
+- `list_runs` and `compare_runs` read the folder the run is kept in, take run IDs and names and
+  never a path, and refuse a name that fits several runs with their IDs;
 - every reply is strict JSON of at most `MAX_ANSWER_BYTES`, whatever the run's length: a series
   is thinned with the stride reported, and a one-step spike between the points is still named;
 - a run folder with two ranks gives the all-ranks status, and a rank whose report is not
@@ -40,7 +43,8 @@ from tensorquill import mcp_server
 SRC = Path(tensorquill.__file__).resolve().parents[1]
 SDK = Path(__file__).resolve().parents[1]
 BAKEOFF = SDK.parent / "experiments" / "moe-bakeoff"
-TOOLS = ["list_incidents", "get_incident", "get_series", "get_all_ranks_status"]
+# The first four answer about the run at PATH; the last two (C4) about the runs kept beside it.
+TOOLS = ["list_incidents", "get_incident", "get_series", "get_all_ranks_status", "list_runs", "compare_runs"]
 GATE_1 = ["seeded", "unseen-1", "unseen-2", "unseen-3", "unseen-4", "unseen-5", "unseen-6"]
 RUN = "two-ranks"
 
@@ -281,7 +285,7 @@ def tree(root: Path) -> dict[str, tuple[int, int]]:
 # --- The protocol ---------------------------------------------------------------------------
 
 
-def test_the_tool_list_is_exactly_the_four_read_only_tools(start, tmp_path):
+def test_the_tool_list_is_exactly_the_six_read_only_tools(start, tmp_path):
     client = start(tmp_path / "absent.jsonl", hello=False)
     hello = client.initialize()
     assert hello["protocolVersion"] == "2025-06-18"
@@ -334,6 +338,9 @@ def test_a_session_changes_no_file(start, store, tmp_path):
             client.call("get_incident", id=incident["id"])
         client.result("get_series", name="blocks.1.weight")
         client.result("get_all_ranks_status")
+        listed = client.call("list_runs")
+        assert listed["count"] >= 1
+        client.result("compare_runs", runs=[listed["runs"][0]["run_id"], "another"])
         assert client.close() == 0
         assert list(client.cwd.iterdir()) == []
     assert (tree(tmp_path / "data"), tree(store)) == before
@@ -745,10 +752,17 @@ def test_values_that_are_not_finite_are_strings_in_a_series(start, tmp_path):
 # --- The instructions ---------------------------------------------------------------------
 
 
-def test_the_agent_instructions_name_the_four_tools_and_offer_no_action_on_the_run():
+def test_the_agent_instructions_name_the_six_tools_and_offer_no_action_on_the_run():
     text = (SDK / "AGENT_INSTRUCTIONS.md").read_text(encoding="utf-8")
-    named = set(re.findall(r"`((?:list|get|set|put|write|pause|stop|kill|cancel|delete|update|create|restart)_[a-z_]+)", text))
+    # `compare` joined the verbs looked for on Nov 17, 2026, with the tool `compare_runs`.
+    named = set(re.findall(r"`((?:list|get|compare|set|put|write|pause|stop|kill|cancel|delete|update|create|restart)_[a-z_]+)", text))
     assert named == set(TOOLS)
+    # What a comparison must not be read as, in the instructions and in the tool's own words.
+    compared = next(tool["description"] for tool in mcp_server.TOOLS if tool["name"] == "compare_runs")
+    for word in ("absent_from", "other_ranks_not_compared", "divergence"):
+        assert word in text and word in compared, word
+    for word in ("not_configured", "not_enough_history", "ended_before_step", "not_said", "--runs FOLDER"):
+        assert word in text, word
     assert [tool["name"] for tool in mcp_server.TOOLS] == TOOLS
     for word in ("invariant", "anomaly", "observation", "not_checked", "unknown", "run_state", "python -m tensorquill.mcp_server"):
         assert word in text, word
@@ -763,6 +777,160 @@ def test_the_agent_instructions_name_the_four_tools_and_offer_no_action_on_the_r
     assert 1 <= len({kind for kind, _ in examples}) <= 6
     for kind, line in examples:
         assert ev.INCIDENT_CLASSES[kind] in line, f"{kind} is an {ev.INCIDENT_CLASSES[kind]}: {line}"
+
+
+# --- The runs kept beside this one: list_runs and compare_runs ---------------------------------
+
+
+def labelled(folder: Path, run_id: str, records: list[dict], evidence: bool = True, **manifest) -> Path:
+    """A run as `tensorquill.init` leaves it: records, the manifest, and the evidence file."""
+    folder.mkdir(parents=True, exist_ok=True)
+    capture = write_capture(folder / f"{run_id}.rank0.jsonl", records)
+    if manifest:
+        (folder / f"{run_id}.run.json").write_text(json.dumps({"schema_version": 1, "run_id": run_id, "config": {}, **manifest}))
+    if evidence:
+        ev.write_evidence(ev.build_evidence(capture), capture.with_suffix(".evidence.json"))
+    return capture
+
+
+@pytest.fixture
+def kept(tmp_path) -> Path:
+    """A folder of four runs: two of one project, two that share a name, one with no manifest."""
+    folder = tmp_path / "tensorquill-out"
+    labelled(folder, "run-1", dense(60, run="run-1"), project="granite", name="baseline", config={"lr": 0.001})
+    labelled(folder, "run-2", dense(60, run="run-2", spike=(40, "blocks.1.weight", 60.0)), project="granite",
+             name="after-the-fix", config={"lr": 0.01})
+    labelled(folder, "run-3", dense(60, run="run-3"), evidence=False, project="llama", name="baseline")
+    labelled(folder, "old-run", dense(5, run="old-run"))
+    return folder
+
+
+def test_list_runs_gives_the_runs_beside_this_one_by_project(start, kept):
+    client = start(kept / "run-2.rank0.jsonl")
+    listed = client.call("list_runs")
+    assert listed["folder"] == str(kept) and listed["count"] == 4
+    assert listed["projects"] == {"granite": 2, "llama": 1, "uncategorized": 1}
+    rows = {row["run_id"]: row for row in listed["runs"]}
+    assert (rows["run-2"]["name"], rows["run-2"]["run_state"], rows["run-2"]["first_incident"]) == (
+        "after-the-fix", "unhealthy", {"kind": "grad_spike", "step": 40})
+    assert rows["run-1"]["incidents"] == {} and rows["run-1"]["kinds_checked"]["of"] == 32
+    # No evidence file was written for run-3: nothing is said of it, and that is not "clean".
+    assert (rows["run-3"]["run_state"], rows["run-3"]["incidents"], rows["run-3"]["evidence"]["state"]) == (None, None, "missing")
+    assert (rows["old-run"]["project"], rows["old-run"]["name"], rows["old-run"]["has_manifest"]) == ("uncategorized", "old-run", False)
+    only = client.call("list_runs", project="granite", limit=1)
+    assert (only["count"], only["shown"], [row["run_id"] for row in only["runs"]]) == (2, 1, ["run-1"])
+    assert "no run of project 'nobody'" in client.error("list_runs", project="nobody")
+    assert "granite (2)" in client.error("list_runs", project="nobody")
+    assert "takes no argument named 'path'" in client.error("list_runs", path=str(kept))
+
+
+def test_compare_runs_takes_ids_and_names_and_says_what_was_checked_before_the_incidents(start, kept):
+    client = start(kept / "run-2.rank0.evidence.json")
+    result = client.call("compare_runs", runs=["run-1", "after-the-fix"])
+    assert [(run["label"], run["run_id"], run["name"]) for run in result["runs"]] == [
+        ("A", "run-1", "baseline"), ("B", "run-2", "after-the-fix")]
+    keys = list(result)
+    assert keys.index("setup") < keys.index("checked") < keys.index("incidents") < keys.index("divergence")
+    assert result["setup"]["differs"] == [{"field": "config.lr", "values": {"A": 0.001, "B": 0.01}}]
+    (entry,) = result["incidents"]["entries"]
+    assert (entry["kind"], entry["in"], entry["first_step"], entry["absent_from"]) == (
+        "grad_spike", ["B"], {"B": 40}, {"A": "checked"})
+    assert entry["where"]["B"] == {"parameters": ["blocks.1.weight"]}
+    assert result["divergence"]["state"] == "not_built" and "step" not in result["divergence"]
+
+    # A short run's silence is not a "none", and the tool says so.
+    short = client.call("compare_runs", runs=["old-run", "run-2"])
+    assert short["incidents"]["entries"][0]["absent_from"] == {"A": "not_enough_history"}
+    assert short["setup"]["no_manifest"] == ["A"]
+
+    # A name that fits two runs is refused with their IDs; a project narrows it.
+    refused = client.error("compare_runs", runs=["baseline", "run-2"])
+    assert "fits 2 runs" in refused and "run-1" in refused and "run-3" in refused and "give the run ID" in refused
+    narrowed = client.call("compare_runs", runs=["baseline", "run-2"], project="granite")
+    assert [run["run_id"] for run in narrowed["runs"]] == ["run-1", "run-2"]
+    assert "no run with the ID or name 'nobody'" in client.error("compare_runs", runs=["run-1", "nobody"])
+    for bad in (["run-1"], "run-1", ["run-1", 2], [], ["run-1", ""], ["run-1"] * 9):
+        assert "`runs` must be a list of 2 to 8" in client.error("compare_runs", runs=bad)
+    assert "same run" in client.error("compare_runs", runs=["run-1", "baseline"], project="granite")
+
+
+def test_a_tool_argument_is_never_taken_as_a_path(start, kept, tmp_path):
+    outside = labelled(tmp_path / "elsewhere", "secret", dense(60, run="secret"), project="other", name="secret")
+    client = start(kept / "run-1.rank0.jsonl")
+    for wanted in (str(outside), str(outside.parent), "../elsewhere/secret.rank0.jsonl", str(kept / "run-2.rank0.jsonl")):
+        refused = client.error("compare_runs", runs=["run-1", wanted])
+        assert "no run with the ID or name" in refused and "secret" not in refused.replace(wanted, "")
+    assert "secret" not in json.dumps(client.call("list_runs"))
+    # Started with --runs, the same server reads that folder and nothing else.
+    elsewhere = start(kept / "run-1.rank0.jsonl", "--runs", str(outside.parent))
+    assert [row["run_id"] for row in elsewhere.call("list_runs")["runs"]] == ["secret"]
+    nowhere = start(kept / "run-1.rank0.jsonl", "--runs", str(tmp_path / "absent"))
+    assert "is not a folder" in nowhere.error("list_runs") and "--runs FOLDER" in nowhere.error("compare_runs", runs=["a", "b"])
+    assert nowhere.call("list_incidents")["run_state"]["state"] == "healthy"  # the run itself still answers
+
+
+def test_a_run_folder_lists_and_compares_the_runs_of_its_store(start, store):
+    """`store` is `runs/two-ranks` with two ranks; a second run is put beside it."""
+    other = store.parent / "one-rank"
+    (other / "rank=0" / "attempt=1").mkdir(parents=True)
+    (other / "rank=0" / "attempt=1" / "part-0-59.parquet").write_bytes(b"")
+    (other / "rank=0" / "incidents.json").write_text(json.dumps({**report(0, []), "run_id": "one-rank"}), encoding="utf-8")
+    (other / "run.json").write_text(json.dumps({"run_id": "one-rank", "project": "granite", "name": "clean"}), encoding="utf-8")
+    (other / "watchdog.json").write_text(json.dumps({
+        "schema_version": 1, "summary": "finished", "world_size": 1, "ranks": [{"rank": 0, "state": "finished", "last_step": 59}],
+    }), encoding="utf-8")
+    for path in (store, store / "rank=1"):
+        client = start(path)
+        listed = client.call("list_runs")
+        assert listed["folder"] == str(store.parent.resolve())
+        assert {row["run_id"]: (row["project"], row["source"], row["ranks"]) for row in listed["runs"]} == {
+            "one-rank": ("granite", "store", [0]), RUN: ("uncategorized", "store", [0, 1])}
+        result = client.call("compare_runs", runs=["clean", RUN])
+        # Rank 0 of each: rank 1's non-finite layer is not compared, and the answer says so.
+        assert [e["kind"] for e in result["incidents"]["entries"]] == ["resume_lr_change", "grad_spike"]
+        assert result["incidents"]["other_ranks_not_compared"] == {"B": [1]}
+        assert all("no part was read" in run["read_from"]["judged_by"] for run in result["runs"])
+        on_rank_1 = client.call("compare_runs", runs=["clean", RUN], rank=1)
+        assert "non_finite" in [e["kind"] for e in on_rank_1["incidents"]["entries"]]
+        assert on_rank_1["incidents"]["other_ranks_not_compared"] == {"B": [0]}
+    # A report that is behind its store is not current. The tool opens no part and runs no
+    # detector on a run folder, so it says so and compares nothing.
+    (other / "rank=0" / "attempt=1" / "part-60-99.parquet").write_bytes(b"")
+    refused = client.error("compare_runs", runs=["clean", RUN])
+    assert "one-rank rank 0 has no current report from its server: it is behind" in refused
+    assert client.call("list_runs")["count"] == 2
+
+
+def test_a_listing_of_many_runs_and_a_comparison_of_fat_runs_stay_within_the_size_cap(start, tmp_path):
+    folder = tmp_path / "many"
+    for index in range(230):
+        labelled(folder, f"run-{index:03d}", dense(2, run=f"run-{index:03d}"), evidence=False, project="sweep",
+                 name=f"trial-{index}", tags=["t" * 40] * 5)
+    wide = [f"blocks.{block}.sub.{part}.weight" for block in range(40) for part in range(10)]
+    for run_id in ("fat-a", "fat-b"):
+        records = dense(60, run=run_id)
+        for record in records:
+            record["grad_norms"] = {name: 0.1 for name in wide}
+            record["layers"] = {name: {"mean": 0.0, "std": 1.0, "abs_max": 2.0, "zero_frac": 0.0} for name in wide}
+        if run_id == "fat-b":
+            for name in wide:
+                records[40]["layers"][name]["abs_max"] = float("nan")
+        labelled(folder, run_id, records, evidence=False, project="fat", name=run_id, config={f"key{i}": "v" * 100 for i in range(300)})
+    client = start(folder / "fat-a.rank0.jsonl")
+    listed = client.call("list_runs", limit=200)
+    assert listed["count"] == 232 and len(listed["runs"]) <= 200
+    result = client.call("compare_runs", runs=["fat-a", "fat-b"])
+    # 300 config keys of 100 characters differ in nothing, and an incident naming 400 layers lists eight.
+    (entry,) = result["incidents"]["entries"]
+    assert (entry["kind"], entry["in"], len(entry["where"]["B"]["layers"]), entry["where"]["B"]["layers_count"]) == (
+        "non_finite", ["B"], 8, 400)
+    assert len(result["setup"]["config_keys_same"]) == 300 and "truncated" not in result
+    # Every key differing is more than a reply holds: it is cut, with a note of where.
+    labelled(folder, "fat-c", dense(60, run="fat-c"), evidence=False, project="fat", name="fat-c",
+             config={f"key{i}": "w" * 100 for i in range(300)})
+    cut = client.call("compare_runs", runs=["fat-a", "fat-c"])
+    assert "truncated" in cut and cut["incidents"]["entries"] == []
+    assert client.largest <= mcp_server.MAX_ANSWER_BYTES
 
 
 # --- The same through the real server ---------------------------------------------------------
