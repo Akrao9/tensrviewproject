@@ -471,9 +471,12 @@ def _recomputing() -> bool:
 
 class _Evaluating:
     """Whether the session's phase is `"eval"` (`Session.set_phase`), shared with its hooks.
-    An attribute of an object of its own, so a hook that reads it guards on one bool."""
+    An attribute of an object of its own, so a hook that reads it guards on one bool. Set
+    on the instance from the start: one that moved from the class to the instance at the
+    first `set_phase` would fail the guard and compile the training graph again."""
 
-    on = False
+    def __init__(self) -> None:
+        self.on = False
 
 
 def _evaluating(module: nn.Module, phase: _Evaluating) -> bool:
@@ -489,14 +492,16 @@ def _evaluating(module: nn.Module, phase: _Evaluating) -> bool:
     is enough. The phase alone never is: a training forward in train mode with gradients
     counts even under a phase left behind by a callback that missed its end.
 
-    In a training forward both signals are on and the phase is not read, so a compiled
-    training graph carries no guard on it; Dynamo already guards on grad mode and on each
-    module's `training`, so an evaluation compiles no more often than without the hooks.
+    What is read is ordered for `torch.compile`, where each value read becomes a guard.
+    Dynamo always guards on grad mode, but on a module's `training` only when something
+    reads it. With gradients on, the phase flag is read first and `training` only under the
+    eval phase, so `model.eval()` alone compiles nothing that the model without the hooks
+    would not; the training graph gains one guard, on the flag. With gradients off (a new
+    graph anyway), `training` is read first and the flag only in train mode.
     """
-    training, grad = module.training, torch.is_grad_enabled()
-    if training and grad:
-        return False
-    return (not training and not grad) or phase.on
+    if torch.is_grad_enabled():
+        return phase.on and not module.training
+    return not module.training or phase.on
 
 
 def _clip_grad_norm_wrapper(parameters: Any, *args: Any, **kwargs: Any) -> Any:
