@@ -279,8 +279,8 @@ Listed Nov 16, 2026, from the focused plan's build pieces and the four things th
 | B1 | Benchmark without the Rune arm: the harness's two gate lines | Decision 3 | `experiments/gate1/harness.py`, `PREREGISTRATION.md` | The author's amendments |
 | G1 | Attention maps out of `probe_json` | Open gap | `probe.py`, `flight.py`, the attention part of `detect.rs` | Results 1 and 2, by the focused plan |
 | A6 | What was checked in the all-ranks view | Open item of "R2, A1 and R4 merged" | The all-ranks functions and summary in `evidence.py`; `get_all_ranks_status` in `mcp_server.py` | Nothing |
-| C1 | Project, run name and the run manifest, with the `run` block | "Projects, run names and comparing runs", piece 1 | `init` in `capture.py`, `tracker.py`, the batch metadata in `flight.py`, `BatchMetadata` in `ingest.rs`, one key in `build_evidence` and in the all-ranks view | Nothing |
-| C2 | The `runs` listing and `compare` parts 1 to 3 | The same, piece 2 | New files for listing and comparing; a dispatch in `__main__.py` | C1; A6 for a run of many ranks |
+| C1 | Project, run name and the run manifest, with the `run` block | "Projects, run names and comparing runs", piece 1 | `init` in `capture.py`, `tracker.py`, the batch metadata in `flight.py`, `BatchMetadata` in `ingest.rs`, one key in `build_evidence`, in `_report_evidence` and in the all-ranks view | Nothing |
+| C2 | The `runs` listing and `compare` parts 1 to 3 | The same, piece 2 | New files for listing and comparing; a dispatch at `main` in `evidence.py`, which `__main__.py` and the console script both call | C1; A6 for a run of many ranks |
 | C3 | Where two runs part | The same, piece 3 | One new file and its tests | Nothing; joined to `compare` after C2 |
 | C4 | MCP tools `list_runs` and `compare_runs` | The same, piece 4 | `mcp_server.py`, `test_mcp_server.py`, `AGENT_INSTRUCTIONS.md` | C2 |
 | P1 | CI's server and extras jobs on PyTorch 2.15; Python 3.13 and 3.14 in the package classifiers | Loose ends of Nov 16, 2026 | `.github/workflows/ci.yml`, `sdk/pyproject.toml` | Nothing. First, since every lane adds test files to `ci.yml` |
@@ -291,7 +291,7 @@ Listed Nov 16, 2026, from the focused plan's build pieces and the four things th
 2. **Where two runs part:** C3. A new file that reads two runs' records, so it meets nothing until it is joined to `compare`.
 3. **All ranks:** A6.
 
-Where they meet: lanes 1 and 3 both add a key to the all-ranks view and both change `mcp_server.py` (lane 3 owns the all-ranks functions and `get_all_ranks_status`; lane 1 adds new tools only). C2's part 2 on a run of many ranks reads what A6 writes, so A6 is merged before C2 is called done. R5 can be a fourth lane, but it rewrites the detection block of `build_evidence`, deletes tests the other lanes lean on, and makes offline detection need the server binary and `pyarrow` after a plain `pip install`; it is not needed for the first release.
+Where they meet: lanes 1 and 3 both add a key to the all-ranks view and both change `mcp_server.py` (lane 3 owns the all-ranks functions and `get_all_ranks_status`; lane 1 adds new tools only). C2's part 2 on a run of many ranks reads what A6 writes, so A6 is merged before C2 is called done. R5 can be a fourth lane, but it rewrites the detection block of `build_evidence`, changes the default detectors under every other lane's tests, and makes offline detection need the server binary and `pyarrow` after a plain `pip install`; it is not needed for the first release.
 
 **The four lanes, as they stood on Nov 16, 2026.** All are merged:
 
@@ -772,8 +772,8 @@ State as of Nov 16, 2026.
   - *Accepted, so the focused plan changes in three places* (the author's doc; not edited here): the "Not planned" line under "After the four weeks", step 4 "Learn across runs", and one more build item with its done test.
   - *Where the pieces meet other work, read from the code Nov 16, 2026, nothing run.*
     - `init` is in `capture.py` and the run ID is resolved in `tracker.py`. The batch metadata is built in one place in `flight.py`, and `BatchMetadata` in `server/src/ingest.rs` has five fields and does not refuse unknown ones.
-    - The command line is one parser in `evidence.py` whose first argument is a path, and `__main__.py` only calls it. `runs` and `compare` are new verbs, so they need a dispatch in front of that parser, and a rule for a file that is itself named `runs` or `compare`.
-    - The `run` block is one key in `build_evidence` and one in the all-ranks view. The golden files freeze five keys (`incidents`, `kind_checks`, `not_checked`, `run_state`, `samples`), so the block does not change them.
+    - The command line is one parser in `evidence.py` whose first argument is a path. Both `__main__.py` and the `tensorquill` console script (`tensorquill.evidence:main`) call it. `runs` and `compare` are new verbs, so they need a dispatch inside or in front of `main`, and a rule for a file that is itself named `runs` or `compare`.
+    - The `run` block has three homes, because evidence is built in three places that each set `run_id` themselves: `build_evidence`, `_report_evidence` (a store's evidence from the server's report) and the all-ranks view. `kind_checks` missed the second one until the merge of Nov 16, 2026. The golden files freeze five keys (`incidents`, `kind_checks`, `not_checked`, `run_state`, `samples`), so the block does not change them.
     - `test_mcp_server.py` holds the tool list to exactly four; C4 makes it six.
 - [x] **Rune viewer postponed (decided Nov 16, 2026).** The author confirmed it ("postpone rune"). This reverses the viewer decision of Nov 14, 2026 ("the Rune app is built either way"), and Step 22 is not part of the first release.
   - *What stays.* Stock Rerun 0.43.2 is the viewer, `export_rerun` and its blueprint stay, and the evidence schema stays independent of any viewer.
