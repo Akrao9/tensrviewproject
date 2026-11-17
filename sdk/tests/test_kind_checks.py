@@ -5,11 +5,17 @@
   weight or activation checks, no `scaler=` means no loss-scale check, and a local file that
   no server was watching has no stall check.
 - `unavailable`: the input was asked for and could not be judged (a probe that failed, a file
-  that could not be read, too few probes, a server's store with no progress status).
+  that could not be read, a server's store with no progress status).
 
 Only `unavailable` makes the run `degraded`, and the summary carries the count
-("3 of 32 kinds checked"). These tests are the Python side and need nothing but the SDK.
-test_server_detect.py holds the Rust report to the same values on every parity case.
+("3 of 32 kinds checked"). A kind is `checked` from its first record, so each kind also says
+whether its rule has had enough history: `records` against `records_needed`, and
+`enough_history`. A rule that is still warming up (too few probes among them) does not
+degrade the run, and the summary and the listing by value name it apart from the kinds
+whose "nothing found" is a verdict.
+
+These tests are the Python side and need nothing but the SDK. test_server_detect.py holds
+the Rust report to the same values on every parity case, and runs `BOUNDARY` through Rust.
 """
 
 from __future__ import annotations
@@ -30,6 +36,23 @@ ATTENTION = ("attention_collapse", "attention_uniform", "attention_logit_growth"
 WEIGHTS_AND_ACTIVATIONS = ("stalled_weights", "activation_spike", "activation_drift", "dead_activations")
 STALLS = ("job_stalled", "rank_silent")
 ACTIVE = {"schema_version": 1, "summary": "active", "ranks": [{"rank": 0, "state": "active"}]}
+MOE_NEEDS, STATUS_NEEDS = "moe: a router's expert counts", "the server's progress status (watchdog.json)"
+# What each of the server's kinds needs, by hand from its rules (`RECORDS_NEEDED` in evidence.py
+# lists them). The Rust unit test `what_each_kind_needs_is_these_numbers_...` has the same list.
+BY_HAND = {
+    "moe_imbalance": 11, "starved_experts": 50, "grad_spike": 13, "stalled_weights": 3, "repeated_steps": 1,
+    "loss_scale_trouble": 10, "resume_lr_change": 1, "resume_data_mismatch": 1, "resume_incomplete": 1,
+    "data_stalled": 4, "epoch_order_repeated": 4, "activation_spike": 11, "activation_drift": 60,
+    "dead_activations": 60, "attention_collapse": 4, "attention_uniform": 4, "attention_logit_growth": 4,
+    "non_finite": 1, "replica_drift": 1, "memory_growth": 6, "memory_pressure": 1, "allocator_retries": 1,
+    "hardware_errors": 2, "gpu_throttled": 1, "input_starvation": 21,
+}
+
+
+def checked(records: int, kind: str, needs: str, value: str = "checked") -> dict:
+    """A server kind's entry with no reason: its value, the count and what the count is held against."""
+    return {"value": value, "records": records, "records_needed": BY_HAND[kind],
+            "enough_history": records >= BY_HAND[kind], "needs": needs}
 
 
 def values(evidence: dict) -> dict[str, str]:
@@ -73,8 +96,16 @@ def test_every_kind_gets_a_value_and_the_servers_kinds_each_have_an_input():
     assert list(checks) == list(ev.INCIDENT_CLASSES) and len(checks) == 32
     for kind, check in checks.items():
         assert check["value"] in ev.KIND_CHECK_VALUES and isinstance(check["needs"], str) and check["needs"]
-        assert ("records" in check) == (kind in ev.SERVER_KINDS), kind
+        assert ("records" in check) == ("records_needed" in check) == (kind in ev.SERVER_KINDS), kind
         assert ("reason" in check) == (check["value"] == "unavailable"), kind
+        # Every kind says whether its rule has had enough history: the count against what the
+        # rule needs for a kind counted in records, and "its source was read" for the rest.
+        assert isinstance(check["enough_history"], bool), kind
+        if kind in ev.SERVER_KINDS:
+            assert check["records_needed"] == BY_HAND[kind] >= 1, kind
+            assert check["enough_history"] == (check["records"] >= check["records_needed"]), kind
+        else:
+            assert check["enough_history"] == (check["value"] == "checked"), kind
 
 
 def rust_pairs(name: str) -> list[tuple[str, str]]:
@@ -91,6 +122,22 @@ def test_the_rust_tables_are_these_tables():
     assert rust_pairs("INPUT_NEEDS") == list(ev.INPUT_NEEDS.items())
 
 
+def test_what_each_kind_needs_is_the_same_numbers_here_by_hand_and_in_rust():
+    assert ev.RECORDS_NEEDED == BY_HAND and tuple(ev.RECORDS_NEEDED) == ev.SERVER_KINDS
+    assert ev.records_needed() == BY_HAND
+    # The window a run is judged with, not the default one.
+    assert ev.records_needed(7) == {**BY_HAND, "starved_experts": 7}
+    source = DETECT_RS.read_text(encoding="utf-8")
+    # The table names the kinds in order; its numbers are expressions over the rules' constants,
+    # which a Rust unit test holds to the list it has by hand. That list is read here.
+    table = re.search(r"pub const RECORDS_NEEDED: \[\(&str, u64\); 25\] = \[(.*?)\n\];", source, re.S)
+    assert table, "RECORDS_NEEDED is not in server/src/detect.rs in the shape this test reads"
+    assert re.findall(r'^    \("([a-z_]+)",', table.group(1), re.M) == list(BY_HAND)
+    by_hand = re.search(r"let by_hand: \[u64; 25\] = \[(.*?)\];", source, re.S)
+    assert by_hand, "the Rust unit test's list is not in the shape this test reads"
+    assert [int(n) for n in re.findall(r"\d+", by_hand.group(1))] == list(BY_HAND.values())
+
+
 # --- not configured: the capture was never set up to provide it -------------------------------
 
 
@@ -102,9 +149,12 @@ def test_a_router_only_capture_reads_healthy_and_lists_what_it_cannot_show():
     assert [kind for kind, value in found.items() if value == "checked"] == ["moe_imbalance", "starved_experts", "repeated_steps"]
     assert "unavailable" not in found.values()
     assert evidence["incidents"] == [] and evidence["run_state"] == {"state": "healthy", "reasons": []}
-    assert evidence["kind_checks"]["moe_imbalance"] == {"value": "checked", "records": 60, "needs": "moe: a router's expert counts"}
+    assert evidence["kind_checks"]["moe_imbalance"] == {
+        "value": "checked", "records": 60, "records_needed": 11, "enough_history": True, "needs": MOE_NEEDS,
+    }
     assert evidence["kind_checks"]["stalled_weights"] == {
-        "value": "not_configured", "records": 0, "needs": "weights_unchanged with grad_norms (full capture)",
+        "value": "not_configured", "records": 0, "records_needed": 3, "enough_history": False,
+        "needs": "weights_unchanged with grad_norms (full capture)",
     }
     # The summary says how much of the list "no incidents" covers.
     assert ev.incident_summary(evidence).splitlines()[:2] == ["No incidents detected.", "3 of 32 kinds checked, 29 not configured"]
@@ -187,8 +237,7 @@ def test_a_failed_probe_reads_degraded_and_says_which_kinds_it_leaves_unjudged()
     for kind in ATTENTION:
         # Five probes did record attention: one that failed is enough, as one failed memory reading is.
         assert evidence["kind_checks"][kind] == {
-            "value": "unavailable", "records": 5, "needs": "probe with attention (probe=)",
-            "check": "probe", "reason": entry["reason"],
+            **checked(5, kind, "probe with attention (probe=)", "unavailable"), "check": "probe", "reason": entry["reason"],
         }
     summary = ev.incident_summary(evidence).splitlines()
     assert summary[1] == "1 of 32 kinds checked, 28 not configured, 3 unavailable (attention_collapse, attention_uniform, attention_logit_growth)"
@@ -205,17 +254,80 @@ def test_a_failed_probe_reads_degraded_and_says_which_kinds_it_leaves_unjudged()
     assert tensorquill.build_evidence(odd)["not_checked"][0]["reason"] == '1 of 1 probe failed, the first at step 0: {"code":3}'
 
 
-def test_too_few_probes_to_judge_are_unavailable_under_their_own_entry():
+def test_too_few_probes_are_checked_without_enough_history_and_do_not_degrade_the_run():
     evidence = tensorquill.build_evidence(probed(steps=30))  # three probes, four needed
-    assert [n["check"] for n in evidence["not_checked"]] == ["attention"]
-    check = evidence["kind_checks"]["attention_logit_growth"]
-    assert (check["value"], check["check"], check["records"]) == ("unavailable", "attention", 3)
-    assert check["reason"] == evidence["not_checked"][0]["reason"]
-    assert evidence["run_state"]["state"] == "degraded"
-    # Too few and one failed: both entries are listed, and the kinds name the first.
+    assert "not_checked" not in evidence and evidence["incidents"] == []
+    for kind in ATTENTION:
+        assert evidence["kind_checks"][kind] == {
+            "value": "checked", "records": 3, "records_needed": 4, "enough_history": False,
+            "needs": "probe with attention (probe=)",
+        }
+    assert evidence["run_state"] == {"state": "healthy", "reasons": []}
+    # "Nothing found" is not said for them: the summary and the listing by value set them apart.
+    assert ev.incident_summary(evidence).splitlines() == [
+        "No incidents detected.",
+        "4 of 32 kinds checked, 3 of them without enough history yet (attention_collapse 3 of 4 records,"
+        " attention_uniform 3 of 4, attention_logit_growth 3 of 4), 28 not configured",
+    ]
+    listed = ev.kinds_by_value(evidence)
+    assert listed["checked"] == ["repeated_steps"]
+    assert listed["not_enough_history"] == dict.fromkeys(ATTENTION, {"records": 3, "records_needed": 4})
+    # The fourth probe is enough.
+    enough = tensorquill.build_evidence(probed(steps=31))
+    assert all(enough["kind_checks"][kind]["enough_history"] for kind in ATTENTION)
+    assert ev.kinds_by_value(enough)["not_enough_history"] == {} and enough["run_state"]["state"] == "healthy"
+    # Too few and one failed: the failure is the only entry, and it is what makes the kinds unavailable.
     both = tensorquill.build_evidence(probed(steps=30, fail_at=(20,)))
-    assert [n["check"] for n in both["not_checked"]] == ["attention", "probe"]
-    assert both["kind_checks"]["attention_collapse"]["check"] == "attention"
+    assert [n["check"] for n in both["not_checked"]] == ["probe"]
+    check = both["kind_checks"]["attention_collapse"]
+    assert (check["value"], check["check"], check["records"], check["enough_history"]) == ("unavailable", "probe", 2, False)
+    assert both["run_state"]["state"] == "degraded"
+    # An unavailable kind is not listed as warming up as well: one reason is enough.
+    assert ev.kinds_by_value(both)["not_enough_history"] == {} and ev.checked_counts(both)["not_enough_history"] == 0
+
+
+def test_a_real_capture_probes_on_every_nth_committed_step_so_the_fourth_probe_is_the_first_that_can_report():
+    import torch
+
+    from test_probe import Toy, _train
+
+    torch.manual_seed(0)
+    model, sink = Toy(), tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=1, probe=torch.zeros(2, 8, dtype=torch.long), probe_every=3)
+    _train(model, session, 12, torch.randint(0, 32, (2, 8)))
+    session.close()
+    recorded = sorted(sink.records, key=lambda r: r["step"])
+    probes = [n for n, r in enumerate(recorded, 1) if "probe" in r]
+    assert probes == [3, 6, 9, 12]  # the 3rd, 6th, ... step the session committed, counting from 1
+    assert all(r["probe"]["attention"] for r in recorded if "probe" in r), "the toy model's real attention"
+
+    # As the capture recorded it: three probes are too few, and the run is not degraded for it.
+    for steps, seen in ((2, 0), (3, 1), (8, 2), (11, 3), (12, 4)):
+        evidence = tensorquill.build_evidence(recorded[:steps])
+        for kind in ATTENTION:
+            check = evidence["kind_checks"][kind]
+            assert (check["records"], check["records_needed"], check["enough_history"]) == (seen, 4, seen >= 4), steps
+            assert check["value"] == ("checked" if seen else "not_configured"), steps
+        assert "not_checked" not in evidence and evidence["run_state"]["state"] == "healthy", steps
+
+    # On the same schedule, attention that collapses on the third probe: it cannot be reported
+    # before the fourth. With `probe_every` 1,000 that is the 4,000th step of a run's first
+    # attempt, and the incident is dated at the third probe, the 3,000th.
+    def collapsing(steps):
+        out = []
+        for count, record in enumerate(recorded[:steps], 1):
+            if "probe" in record:
+                share = 0.6 if count <= 6 else 0.1
+                record = {**record, "probe": {"attention": {"blocks.0": {"entropy_share": [share], "max_logit": [2.0]}}}}
+            out.append(record)
+        return tensorquill.build_evidence(out)
+
+    assert not [i for i in collapsing(11)["incidents"] if i["kind"] in ATTENTION]
+    assert collapsing(11)["kind_checks"]["attention_collapse"]["enough_history"] is False
+    evidence = collapsing(12)
+    found = [i for i in evidence["incidents"] if i["kind"] == "attention_collapse"]
+    assert len(found) == 1 and evidence["kind_checks"]["attention_collapse"]["enough_history"] is True
+    assert (found[0]["step"], found[0]["confirmed_step"]) == (recorded[8]["step"], recorded[11]["step"])
 
 
 def test_a_kind_named_by_a_not_checked_entry_is_unavailable_however_many_records_it_has():
@@ -228,9 +340,13 @@ def test_a_kind_named_by_a_not_checked_entry_is_unavailable_however_many_records
         "not an entry",
     ]
     checks = ev.kind_checks(counts, not_checked)
-    assert checks["resume_lr_change"] == {"value": "unavailable", "records": 9, "needs": "lr", "check": "resume_lr", "reason": "no learning rate"}
+    assert checks["resume_lr_change"] == {
+        **checked(9, "resume_lr_change", "lr", "unavailable"), "check": "resume_lr", "reason": "no learning rate",
+    }
     assert checks["hardware_errors"]["reason"] == "not supported"  # the first entry that names it
-    assert checks["gpu_throttled"] == {"value": "checked", "records": 4, "needs": "system.nvml (system=True)"}
+    assert checks["gpu_throttled"] == checked(4, "gpu_throttled", "system.nvml (system=True)")
+    # Whether there is enough history is the count against the need, whatever the value.
+    assert checks["hardware_errors"]["enough_history"] is True and checks["memory_growth"]["enough_history"] is False
     assert checks["memory_growth"]["value"] == "checked" and checks["repeated_steps"]["value"] == "checked"
     assert [kind for kind, check in checks.items() if check["value"] == "unavailable"] == ["resume_lr_change", "hardware_errors"]
     assert sum(check["value"] == "not_configured" for check in checks.values()) == 25 - 2 - 5
@@ -245,7 +361,7 @@ def test_a_local_file_no_server_watched_has_no_stall_check_to_miss(tmp_path):
     path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
     for source in (records, path):
         evidence = tensorquill.build_evidence(source)
-        assert all(evidence["kind_checks"][kind] == {"value": "not_configured", "needs": "the server's progress status (watchdog.json)"}
+        assert all(evidence["kind_checks"][kind] == {"value": "not_configured", "enough_history": False, "needs": STATUS_NEEDS}
                    for kind in STALLS)
         assert "no_status" not in codes(evidence) and evidence["run_state"]["state"] == "healthy"
 
@@ -254,14 +370,15 @@ def test_a_status_that_was_named_and_cannot_be_read_is_unavailable_and_degrades(
     evidence = tensorquill.build_evidence(router_only(), watchdog=tmp_path / "watchdog.json")
     for kind in STALLS:
         assert evidence["kind_checks"][kind] == {
-            "value": "unavailable", "needs": "the server's progress status (watchdog.json)", "check": "status",
+            "value": "unavailable", "enough_history": False, "needs": STATUS_NEEDS, "check": "status",
             "reason": "no progress status (the server's watchdog.json): whether the job is still making progress is not checked",
         }
     assert evidence["run_state"]["state"] == "degraded" and codes(evidence) == ["no_status"]
     assert ev.incident_summary(evidence).splitlines()[1] == "3 of 32 kinds checked, 27 not configured, 2 unavailable (job_stalled, rank_silent)"
 
     read = tensorquill.build_evidence(router_only(), watchdog=ACTIVE)
-    assert all(read["kind_checks"][kind] == {"value": "checked", "needs": "the server's progress status (watchdog.json)"} for kind in STALLS)
+    # A status that was read is whole: the server waited out its own thresholds before writing it.
+    assert all(read["kind_checks"][kind] == {"value": "checked", "enough_history": True, "needs": STATUS_NEEDS} for kind in STALLS)
     assert read["run_state"] == {"state": "healthy", "reasons": []}
     assert ev.incident_summary(read).splitlines()[1] == "5 of 32 kinds checked, 27 not configured"
 
@@ -315,7 +432,9 @@ def test_a_file_that_was_given_is_checked_or_unavailable_and_one_that_was_not_is
     good = tmp_path / "violations_summary.json"
     good.write_text(json.dumps(_summary([])), encoding="utf-8")
     evidence = tensorquill.build_evidence(router_only(), traincheck=good)
-    assert evidence["kind_checks"]["traincheck_violation"] == {"value": "checked", "needs": "TrainCheck results (traincheck=)"}
+    assert evidence["kind_checks"]["traincheck_violation"] == {
+        "value": "checked", "enough_history": True, "needs": "TrainCheck results (traincheck=)",
+    }
     assert evidence["run_state"]["state"] == "healthy"
 
     evidence = tensorquill.build_evidence(router_only(), traincheck=tmp_path / "missing.json", flight_recorder=tmp_path / "no-dumps")
@@ -327,6 +446,7 @@ def test_a_file_that_was_given_is_checked_or_unavailable_and_one_that_was_not_is
     assert ev.checked_counts(evidence) == {
         "kinds": 32, "checked": 3, "not_configured": 26, "unavailable": 3,
         "unavailable_kinds": ["collective_hang", "collective_desync", "traincheck_violation"],
+        "not_enough_history": 0, "not_enough_history_kinds": [], "history_not_stated": 0,
     }
 
 
@@ -336,9 +456,11 @@ def test_a_file_that_was_given_is_checked_or_unavailable_and_one_that_was_not_is
 def test_the_count_is_out_of_every_kind_and_evidence_without_the_key_has_no_line():
     assert ev.checked_counts({}) is None and ev.checked_line({"incidents": []}) is None
     assert "kinds checked" not in ev.incident_summary({"incidents": [], "samples": []})
-    checks = {"grad_spike": {"value": "checked"}, "non_finite": {"value": "unavailable"}, "not_a_kind": {"value": "checked"}}
+    checks = {"grad_spike": {"value": "checked", "enough_history": True}, "non_finite": {"value": "unavailable"},
+              "not_a_kind": {"value": "checked"}}
     assert ev.checked_counts({"kind_checks": checks}) == {
         "kinds": 32, "checked": 1, "not_configured": 0, "unavailable": 1, "unavailable_kinds": ["non_finite"],
+        "not_enough_history": 0, "not_enough_history_kinds": [], "history_not_stated": 0,
     }
     assert ev.checked_line({"kind_checks": checks}) == "1 of 32 kinds checked, 0 not configured, 1 unavailable (non_finite)"
     # With incidents the line follows them.
@@ -355,6 +477,7 @@ def test_the_kinds_by_value_are_names_with_a_reason_for_each_unavailable_one(tmp
     evidence = tensorquill.build_evidence(probed(fail_at=(30,)), watchdog=tmp_path / "watchdog.json")
     found = ev.kinds_by_value(evidence)
     assert found["checked"] == ["repeated_steps"] and len(found["not_configured"]) == 26
+    assert found["not_enough_history"] == {} and "history_not_stated" not in found
     assert list(found["unavailable"]) == [*ATTENTION, *STALLS]
     assert found["unavailable"]["attention_uniform"].startswith("1 of 6 probes failed")
     assert found["unavailable"]["rank_silent"].startswith("no progress status")
@@ -370,3 +493,177 @@ def test_the_command_line_prints_the_count(tmp_path, capsys, monkeypatch):
     assert "Run state: healthy" in printed
     written = json.loads(path.with_suffix(".evidence.json").read_text(encoding="utf-8"))
     assert written["kind_checks"]["job_stalled"]["value"] == "not_configured" and written["run_state"]["state"] == "healthy"
+
+
+# --- enough history: each kind's slowest rule fires on exactly the records the table gives ------
+#
+# One record set for every kind that needs more than one record. Each holds exactly
+# `records_needed` records carrying the kind's input, and its slowest rule reports on the last
+# of them. Without its first record (one record of history less) the same fault is not
+# reported. test_server_detect.py runs the same sets through the Rust detectors.
+
+GIB = 1024 ** 3
+
+
+def _step(step: int, **values) -> dict:
+    return {"schema_version": 1, "run_id": "boundary", "rank": 0, "attempt": 1, "step": step, "ts": float(step), **values}
+
+
+def _moe(counts: list[int], top_k: int) -> dict:
+    return {"moe": {"router": counts}, "moe_top_k": {"router": top_k}}
+
+
+def _layer(std: float = 1.0, abs_max: float = 2.0, zero_frac: float = 0.0) -> dict:
+    return {"layers": {"blocks.0": {"mean": 0.0, "std": std, "abs_max": abs_max, "zero_frac": zero_frac}}}
+
+
+def _probe(share: float = 0.6, logit: float = 2.0) -> dict:
+    return {"probe": {"attention": {"blocks.0.attn": {"entropy_share": [share, share], "max_logit": [logit, logit]}}}}
+
+
+def _batch(name: str, epoch: int = 0) -> dict:
+    return {"data": {"batches": 1, "batch_hash": name * 16, "epoch": epoch, "sampler_epoch": 0, "shuffle": True}}
+
+
+def _each(values: list[dict]) -> list[dict]:
+    return [_step(step, **value) for step, value in enumerate(values)]
+
+
+def boundary() -> dict[str, tuple[str, list[dict], dict]]:
+    """name -> (kind, the records, what the incident must hold: the rule that reported)."""
+    wait = [0.0] * 11 + [0.5] * 10  # the median share is 0 over the first 20 steps and 0.25 over the last 20
+    return {
+        # Top-4 routing: ten even samples, then four experts take nearly everything and none is empty,
+        # so only the diversity drop against the router's own history can flag it.
+        "moe_imbalance, the diversity drop": (
+            "moe_imbalance", _each([_moe([100] * 8, 4)] * 10 + [_moe([195] * 4 + [5] * 4, 4)]), {"overloaded": [1, 2, 3, 4]},
+        ),
+        # One expert gets a token a step: far under a tenth of an even share over the window, and never empty.
+        "starved_experts, a full window": ("starved_experts", _each([_moe([1000] * 7 + [1], 1)] * 50), {}),
+        # A small parameter beside a large one: the total does not move, the parameter stays at 50 times its own norm.
+        "grad_spike, one parameter": (
+            "grad_spike",
+            _each([{"grad_norm": 1000.0, "grad_norms": {"big": 1000.0, "small": 1.0}}] * 10
+                  + [{"grad_norm": 1001.25, "grad_norms": {"big": 1000.0, "small": 50.0}}] * 3),
+            {"trigger": "parameter", "sustained": 3},
+        ),
+        "stalled_weights": (
+            "stalled_weights", _each([{"grad_norm": 1.0, "grad_norms": {"w": 1.0}, "weights_unchanged": ["w"]}] * 3), {"consecutive": 3},
+        ),
+        "loss_scale_trouble, skips in a row": (
+            "loss_scale_trouble", _each([{"step_skipped": True, "grad_scale": 65536.0}] * 10), {"reason": "skips"},
+        ),
+        "data_stalled, the same batch": ("data_stalled", _each([_batch("a")] * 4), {"reason": "same_batch"}),
+        "epoch_order_repeated": (
+            "epoch_order_repeated", _each([_batch("a"), _batch("b"), _batch("a", 1), _batch("b", 1)]), {"batches_compared": 2},
+        ),
+        "activation_spike": ("activation_spike", _each([_layer()] * 10 + [_layer(abs_max=20.0)]), {}),
+        # 3.5 times the baseline: under the spike rule's 5, over the drift rule's 3.
+        "activation_drift": ("activation_drift", _each([_layer()] * 50 + [_layer(std=3.5, abs_max=7.0)] * 10), {}),
+        "dead_activations": ("dead_activations", _each([_layer()] * 50 + [_layer(zero_frac=0.5)] * 10), {}),
+        "attention_collapse": ("attention_collapse", _each([_probe()] * 2 + [_probe(share=0.2)] * 2), {}),
+        "attention_uniform": ("attention_uniform", _each([_probe()] * 2 + [_probe(share=0.99)] * 2), {}),
+        "attention_logit_growth": ("attention_logit_growth", _each([_probe()] * 2 + [_probe(logit=5.0)] * 2), {}),
+        "memory_growth": (
+            "memory_growth",
+            _each([{"system": {"cuda": {"device": 0, "allocated": GIB + n * 100 * 1024 ** 2, "reserved": 4 * GIB,
+                                         "total": 16 * GIB, "alloc_retries": 0, "ooms": 0}}} for n in range(6)]),
+            {"readings": 6},
+        ),
+        "hardware_errors, an ECC count that rose": (
+            "hardware_errors",
+            _each([{"system": {"nvml": {"ecc_uncorrected": count, "xid": [], "throttle": []}}} for count in (3, 4)]),
+            {"xid": [], "ecc_uncorrected_at_start": 3},
+        ),
+        "input_starvation, the rise": (
+            "input_starvation", _each([{"data_wait": share, "step_time": 1.0} for share in wait]), {"rule": "rise"},
+        ),
+    }
+
+
+BOUNDARY = boundary()
+
+
+def test_the_boundary_sets_cover_every_kind_that_needs_more_than_one_record():
+    assert {kind for kind, _, _ in BOUNDARY.values()} == {kind for kind, needed in BY_HAND.items() if needed > 1}
+    assert sorted({kind for kind, needed in BY_HAND.items() if needed == 1}) == sorted([
+        "repeated_steps", "resume_lr_change", "resume_data_mismatch", "resume_incomplete", "non_finite", "replica_drift",
+        "memory_pressure", "allocator_retries", "gpu_throttled",
+    ])
+
+
+def boundary_findings(name: str, build=tensorquill.build_evidence) -> None:
+    """The slowest rule of the kind reports on exactly `records_needed` records and not on one
+    fewer, and `enough_history` turns true with that record. `build` makes the evidence."""
+    kind, records, holds = BOUNDARY[name]
+    evidence = build(records)
+    check = evidence["kind_checks"][kind]
+    assert (check["value"], check["records"], check["records_needed"]) == ("checked", len(records), BY_HAND[kind]), name
+    assert check["records"] == check["records_needed"] and check["enough_history"] is True, name
+    found = [i for i in evidence["incidents"] if i["kind"] == kind]
+    assert len(found) == 1, (name, [i["kind"] for i in evidence["incidents"]])
+    assert {key: found[0][key] for key in holds} == holds, name
+    # It is established on the last record, not before.
+    last = found[0].get("confirmed_step", found[0].get("through_step", found[0]["step"]))
+    if kind not in ("grad_spike", "epoch_order_repeated"):  # these are dated at the start of what lasted
+        assert last == records[-1]["step"], name
+    for fewer in (records[1:], records[:-1]):  # one record of history less, and the last record not yet written
+        evidence = build(fewer)
+        check = evidence["kind_checks"][kind]
+        assert (check["value"], check["records"], check["enough_history"]) == ("checked", BY_HAND[kind] - 1, False), name
+        assert not [i for i in evidence["incidents"] if i["kind"] == kind], name
+        # Warming up is not a fault of the monitoring.
+        assert "not_checked" not in evidence, name
+        assert kind in ev.kinds_by_value(evidence)["not_enough_history"] and kind not in ev.kinds_by_value(evidence)["checked"]
+        assert f"{kind} {BY_HAND[kind] - 1} of {BY_HAND[kind]}" in ev.checked_line(evidence), name
+
+
+@pytest.mark.parametrize("name", BOUNDARY)
+def test_a_kinds_slowest_rule_reports_on_exactly_the_records_it_needs(name):
+    boundary_findings(name)
+
+
+def test_a_kind_can_report_through_a_faster_rule_before_it_has_enough_history():
+    # A loss scale below 1 is reported on the first record; the run of skips needs ten.
+    evidence = tensorquill.build_evidence(_each([{"step_skipped": False, "grad_scale": 0.5}]))
+    assert [(i["kind"], i["reason"]) for i in evidence["incidents"]] == [("loss_scale_trouble", "scale")]
+    check = evidence["kind_checks"]["loss_scale_trouble"]
+    assert (check["records"], check["records_needed"], check["enough_history"]) == (1, 10, False)
+    assert evidence["run_state"]["state"] == "unhealthy"
+    # The total's gradient spike needs eleven records, the kind thirteen.
+    spiked = tensorquill.build_evidence(_each([{"grad_norm": 1.0}] * 10 + [{"grad_norm": 80.0}]))
+    assert [i["kind"] for i in spiked["incidents"]] == ["grad_spike"] and "trigger" not in spiked["incidents"][0]
+    assert spiked["kind_checks"]["grad_spike"]["enough_history"] is False
+
+
+def test_starved_experts_needs_the_window_the_run_was_judged_with():
+    records = _each([_moe([1000] * 7 + [1], 1)] * 12)
+    usual = tensorquill.build_evidence(records)["kind_checks"]
+    assert (usual["starved_experts"]["records_needed"], usual["starved_experts"]["enough_history"]) == (50, False)
+    assert usual["moe_imbalance"]["enough_history"] is True  # 12 of 11
+    for window, enough in ((12, True), (13, False)):
+        evidence = tensorquill.build_evidence(records, starve_window=window)
+        check = evidence["kind_checks"]["starved_experts"]
+        assert (check["records"], check["records_needed"], check["enough_history"]) == (12, window, enough)
+        assert bool([i for i in evidence["incidents"] if i["kind"] == "starved_experts"]) == enough
+    assert ev.kind_checks({"moe": 12}, [], starve_window=12)["starved_experts"]["enough_history"] is True
+
+
+def test_a_file_from_before_the_field_is_never_read_as_enough_history(tmp_path):
+    evidence = tensorquill.build_evidence(router_only())
+    old = {**evidence, "kind_checks": {
+        kind: {key: value for key, value in check.items() if key not in ("records_needed", "enough_history")}
+        for kind, check in evidence["kind_checks"].items()
+    }}
+    assert ev.kind_history(evidence["kind_checks"]["moe_imbalance"]) == "enough"
+    assert ev.kind_history(old["kind_checks"]["moe_imbalance"]) == "not_stated"
+    assert ev.kind_history(old["kind_checks"]["grad_spike"]) is None and ev.kind_history("no entry") is None
+    listed = ev.kinds_by_value(old)
+    assert listed["checked"] == [] and listed["not_enough_history"] == {}
+    assert listed["history_not_stated"] == ["moe_imbalance", "starved_experts", "repeated_steps"]
+    assert ev.checked_counts(old)["history_not_stated"] == 3 and ev.checked_counts(old)["not_enough_history"] == 0
+    assert ev.checked_line(old) == (
+        "3 of 32 kinds checked, 3 of them with no word on their history (an older version wrote this), 29 not configured"
+    )
+    # A current file with every checked kind past its warm-up says nothing more than the count.
+    assert ev.checked_line(evidence) == "3 of 32 kinds checked, 29 not configured"

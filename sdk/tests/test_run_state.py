@@ -245,14 +245,47 @@ def test_what_a_rank_could_not_check_makes_the_run_degraded_in_both(tmp_path):
     from test_server_reports import QUICK_STATUS
 
     run = twa.Run(tmp_path, *twa.FAST, *QUICK_STATUS)
-    # Rank 1 ran the probe twice: too few probes for the attention rules, which its report lists.
+    # Rank 1 ran the probe twice and the second one failed, which its report lists.
+    probes = {19: {"attention": {"blk": attention(0.4, 9.0)}}, 39: {"error": "RuntimeError: CUDA out of memory"}}
+    probed = [{**r, "probe": probes[r["step"]]} if r["step"] in probes else r for r in twa.steady(60)]
+    senders = [run.keep_open(0, twa.steady(60)), run.keep_open(1, probed)]
+    found = wait_for_state(run, "degraded")
+    assert found["reasons"] == [{**found["reasons"][0], "code": "not_checked", "checks": ["probe"]}]
+    evidence, _ = twa.look(run, tmp_path / "a")
+    assert comparable(evidence["run_state"]) == comparable(found)
+    for sender in senders:
+        sender.close()
+    assert run.server.terminate() == 0
+
+
+def test_a_rule_that_is_still_warming_up_leaves_the_run_healthy_in_both(tmp_path):
+    twa = _server()
+    from test_attention import attention
+    from test_server_reports import QUICK_STATUS
+
+    run = twa.Run(tmp_path, *twa.FAST, *QUICK_STATUS)
+    # Rank 1 ran the probe twice: too few probes for the attention rules, which need four. That
+    # was a `not_checked` entry and a degraded run; it is a kind checked without enough history.
     probed = [{**r, "probe": {"attention": {"blk": attention(0.4, 9.0)}}} if r["step"] in (19, 39) else r
               for r in twa.steady(60)]
     senders = [run.keep_open(0, twa.steady(60)), run.keep_open(1, probed)]
-    found = wait_for_state(run, "degraded")
-    assert found["reasons"] == [{**found["reasons"][0], "code": "not_checked", "checks": ["attention"]}]
-    evidence, _ = twa.look(run, tmp_path / "a")
+    found = wait_for_state(run, "healthy")
+    assert found == {"state": "healthy", "reasons": []}
+    report = json.loads(run.report_file(1).read_text())
+    assert [n["check"] for n in report["not_checked"]] == ["flight_recorder", "traincheck"]
+    for kind in ev.ATTN_KINDS:
+        assert report["kind_checks"][kind] == {
+            "value": "checked", "records": 2, "records_needed": 4, "enough_history": False,
+            "needs": "probe with attention (probe=)",
+        }
+    assert report["kind_checks"]["grad_spike"]["enough_history"] is True  # 60 of 13
+    evidence, summary = twa.look(run, tmp_path / "a")
     assert comparable(evidence["run_state"]) == comparable(found)
+    # One rank's evidence from the same store says which kinds "nothing found" does not cover.
+    one = tensorquill.build_evidence(run.folder, rank=1)
+    assert one["run_state"]["state"] == "healthy" and "not_checked" not in one
+    assert list(ev.kinds_by_value(one)["not_enough_history"]) == list(ev.ATTN_KINDS)
+    assert "3 of them without enough history yet (attention_collapse 2 of 4 records" in ev.incident_summary(one)
     for sender in senders:
         sender.close()
     assert run.server.terminate() == 0

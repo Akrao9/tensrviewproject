@@ -73,13 +73,18 @@ A kind the tools mark `unclassified` is one this version does not know. The run 
 
 ## What was checked, and what "not checked" means
 
-"No incidents" covers only the kinds that were checked. Every evidence file gives each of the 32 kinds one of three values, and `list_incidents` lists them under `kinds` (the file itself has them under `kind_checks`, with how many records carried each kind's input and what the kind needs):
+"No incidents" covers only the kinds that were checked with enough history. Every evidence file gives each of the 32 kinds one of three values, and says whether the kind's rule has had enough history. `list_incidents` lists them under `kinds` (the file itself has them under `kind_checks`, with how many records carried each kind's input, how many its rule needs, and what the kind is judged from):
 
-- **checked**: records carried what the kind is judged from, and its rule ran over them. Only for these does "nothing found" mean anything.
+- **checked**: records carried what the kind is judged from, and its rule ran over them with enough history. `kinds.checked` lists these, and only for these does "nothing found" mean anything.
+- **checked, not enough history yet**: records carried the input, but fewer than the rule needs, so it could not have fired. `kinds.not_enough_history` lists these, each with `records` (seen) and `records_needed`: the anomaly `grad_spike` needs 13 recorded steps, activation drift 60, a starved expert a full window of 50, and the attention rules four probes, which with `probe_every` at 1,000 is the 4,000th step. This is not a fault and the run stays `healthy`, because every run starts this way. Never write "no gradient spike" or "attention looks fine" for a kind listed here: write that it is still warming up, with the two numbers. In the file, the kind's value is still `checked` and `enough_history` is `false`.
 - **not configured**: the capture was never set up to record it. A router-only capture has no weight or activation checks, a run without `scaler=` has no loss-scale check, a run without `replica_group=` has no drift check, and a local file that no server was watching has no stall check. This is not a fault and does not change the run state. Never write "no stalled weights" or "activations look fine" for a kind listed here: write that it was not captured, and what would capture it.
-- **unavailable**: it was asked for and could not be judged: a probe that failed, a reading that could not be taken, too few probes, a resume that could not be compared, a file that could not be read, a server's store without its progress status. Each has a reason. This makes the run `degraded`.
+- **unavailable**: it was asked for and could not be judged: a probe that failed, a reading that could not be taken, a resume that could not be compared, a file that could not be read, a server's store without its progress status. Each has a reason. This makes the run `degraded`.
 
-The summary's line "N of 32 kinds checked" is the count. Say it when you report that nothing was found.
+`records_needed` is a floor. Reaching it means the count is what the kind's slowest rule needs, not that every parameter, module or router has that much history of its own. Below it, that rule cannot have fired. A kind can still report an incident before it has enough history, through one of its rules that needs less: the incident stands, and the kind's other rules are still warming up.
+
+The summary's line "N of 32 kinds checked" is the count, and it names the kinds without enough history: "6 of 32 kinds checked, 1 of them without enough history yet (grad_spike 3 of 13 records)". Say both when you report that nothing was found.
+
+`kinds.history_not_stated` appears for a file written before this was recorded. Treat those kinds as not enough history: the file does not say.
 
 `kinds` is there for one rank's capture or evidence file. A run folder's answer, and a file written by an older version, have no `kinds` and no count. Then what was checked is not stated: say so, and do not infer it from the incidents that are listed.
 
@@ -87,7 +92,7 @@ A check listed under `not_checked` was not made, and each entry gives the reason
 
 - Never write "no problem with X" when the check for X is listed there. Write "X was not checked" and give the reason.
 - An empty incident list is not by itself "no failure found". Read the reasons under `run_state`:
-  - `healthy` means every expected source was current, nothing was unavailable, and nothing was found among the kinds checked. A local capture can read `healthy`: it has no progress status from a server, so whether the job is still making progress was never watched, and the stall kinds are listed as not configured.
+  - `healthy` means every expected source was current, nothing was unavailable, and nothing was found among the kinds checked. It does not mean every checked kind had enough history: a run a few steps old is `healthy` with most rules still warming up, so read `kinds.not_enough_history` before calling it clean. A local capture can read `healthy`: it has no progress status from a server, so whether the job is still making progress was never watched, and the stall kinds are listed as not configured.
   - `degraded` means a kind is unavailable: a `not_checked` entry, or `no_status` where a server stores the run and its status is missing.
   - Any other reason means part of the picture is missing. Say which part.
 - A rank listed as unknown has a report that is not current. Nothing is known about incidents on it, and it is never counted as clean. Say which ranks are unknown.

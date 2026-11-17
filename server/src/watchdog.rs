@@ -1852,7 +1852,7 @@ mod tests {
             "unknown"
         );
         // Unhealthy wins over unknown, which wins over degraded; every reason is kept.
-        let checks: &[&str] = &["attention"];
+        let checks: &[&str] = &["probe"];
         let (state, codes) = state_of(&two_ranks("server_stopped"), &[(0, spike, checks)], true);
         assert_eq!(state, "unhealthy");
         assert_eq!(codes, ["incidents", "ranks_unknown", "server_stopped", "not_checked"]);
