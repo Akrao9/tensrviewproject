@@ -683,11 +683,16 @@ def test_runs_given_as_paths_a_store_read_from_its_report_and_a_report_that_cann
     with pytest.raises(ValueError, match="holds 2 runs"):
         tensorquill.compare_runs(store, capture)
 
-    # A report that is behind its store cannot be used, so the parts are read, and here they cannot be.
+    # A report that is behind its store cannot be used, so the parts are read, and here they
+    # cannot be (they are not Parquet): the rank is unknown, with why, and the comparison is made.
     (store / "runs" / "run-2" / "rank=0" / "attempt=1" / "part-60-99.parquet").write_bytes(b"not Parquet either")
-    with pytest.raises(Exception) as failed:
-        tensorquill.compare_runs("baseline", "after-the-fix", source=store)
-    assert not isinstance(failed.value, AssertionError)
+    stale = tensorquill.compare_runs("baseline", "after-the-fix", source=store)
+    read = stale["runs"][1]["read_from"]
+    assert (read["rank"], read["judged_ranks"], read["unknown_ranks"]) == (0, [], [0])
+    assert read["unknown_why"][0].startswith("behind") and "its parts could not be read here" in read["unknown_why"][0]
+    assert stale["runs"][1]["run_state"] == "unknown" and stale["incidents"]["entries"] == []
+    assert stale["incidents"]["other_ranks_not_compared"] == {"B": [0]}
+    assert stale["divergence"]["state"] == "no_records"
 
 
 def checks(**without_history: bool) -> dict:
@@ -931,3 +936,173 @@ def test_runs_of_two_ranks_streamed_to_a_real_server_are_compared_on_every_rank_
     assert not_read["runs"][1]["read_from"]["unknown_ranks"] == [1] and not_read["incidents"]["entries"] == []
     assert not_read["incidents"]["other_ranks_not_compared"] == {"B": [1]}
     assert not_read["runs"][1]["read_from"]["unknown_why"][1].startswith("missing")
+
+
+# --- Gaps closed after every rank was read (Nov 17, 2026) ------------------------------------
+
+
+def test_the_one_rank_store_path_answers_with_why_when_pyarrow_is_not_installed(tmp_path, monkeypatch):
+    """A run of one rank in a store whose report is behind: the parts would be read here, and
+    without pyarrow they cannot be. The comparison is made, with that rank unknown and why, as
+    the all-ranks path does; `rank=0` on a run of several ranks too. Nothing raises ImportError."""
+    store = hand_store(tmp_path / "store", {
+        "run-1": ({"project": "granite", "name": "baseline"}, []),
+        "run-2": ({"project": "granite", "name": "after-the-fix"}, [SPIKE]),
+    })
+    ranked_store(tmp_path / "store", {"run-3": {0: ([], None), 1: ([SPIKE], None)}})
+    for run_id in ("run-2", "run-3"):
+        (store / "runs" / run_id / "rank=0" / "attempt=1" / "part-60-99.parquet").write_bytes(b"not Parquet either")
+    monkeypatch.setitem(sys.modules, "pyarrow", None)
+    monkeypatch.setitem(sys.modules, "pyarrow.parquet", None)
+    with pytest.raises(ImportError):
+        ev.load_records(store / "runs" / "run-2", rank=0)  # the guard is real: the parts need pyarrow here
+
+    for rank in (None, 0):
+        result = tensorquill.compare_runs("baseline", "after-the-fix", source=store, rank=rank)
+        run = result["runs"][1]
+        read = run["read_from"]
+        assert (read["rank"], read["ranks"], read["judged_ranks"], read["unknown_ranks"]) == (0, [0], [], [0])
+        assert read["unknown_why"][0].startswith("behind") and "reading Parquet parts needs pyarrow" in read["unknown_why"][0]
+        assert read["judged_by"].startswith("nothing: rank 0 is not judged")
+        # Never clean: the run state is unknown, what was checked is not said, and the spike
+        # the stale report holds is not counted as found or as absent.
+        assert (run["run_state"], run["incidents"], run["last_step"]) == ("unknown", 0, None)
+        assert result["incidents"]["entries"] == [] and result["incidents"]["other_ranks_not_compared"] == {"B": [0]}
+        assert result["checked"]["not_said_by"] == ["A", "B"]
+        assert "no rank is judged" in result["checked"]["not_said_why"]["B"]
+        assert result["divergence"]["state"] == "no_records" and "pyarrow" in result["divergence"]["detail"]
+        assert "rank 0 (not judged: behind" in result["summary"]
+        assert "(not judged: no current report or evidence)" in result["summary"]
+    # The MCP tool's path never opens a part: still refused, with the reason.
+    with pytest.raises(runs_module.RunLookupError, match="no current report from its server"):
+        tensorquill.compare_runs("baseline", "after-the-fix", source=store, read_parts=False)
+
+    # One rank of a run of several, asked for with `rank=`: the same answer, the other rank named.
+    on_zero = tensorquill.compare_runs("run-1", "run-3", source=store, rank=0)
+    read = on_zero["runs"][1]["read_from"]
+    assert (read["rank"], read["ranks"], read["unknown_ranks"]) == (0, [0, 1], [0])
+    assert on_zero["incidents"]["other_ranks_not_compared"] == {"B": [0, 1]}
+    # Read whole, rank 1's current report is judged and rank 0 is unknown, as before.
+    whole = tensorquill.compare_runs("run-1", "run-3", source=store)
+    assert (whole["runs"][1]["read_from"]["judged_ranks"], whole["runs"][1]["read_from"]["unknown_ranks"]) == ([1], [0])
+
+    # The listing reads no part: unchanged, and it says the rank is not current.
+    rows = {row["run_id"]: row for row in tensorquill.list_runs(store)}
+    assert rows["run-2"]["evidence"]["state"] == "ranks_unknown" and rows["run-2"]["rank_count"] == 1
+
+
+def test_without_pyarrow_installed_the_command_line_compares_a_stale_one_rank_store_run(tmp_path):
+    """As in a base install: a `pyarrow` that cannot be imported first on the path, and no
+    server binary. `compare` writes its result and says why the rank is not judged."""
+    store = hand_store(tmp_path / "store", {
+        "run-1": ({"project": "granite", "name": "baseline"}, []),
+        "run-2": ({"project": "granite", "name": "after-the-fix"}, [SPIKE]),
+    })
+    (store / "runs" / "run-2" / "rank=0" / "attempt=1" / "part-60-99.parquet").write_bytes(b"not Parquet either")
+    blocked = tmp_path / "no-pyarrow"
+    blocked.mkdir()
+    (blocked / "pyarrow.py").write_text('raise ModuleNotFoundError("No module named pyarrow", name="pyarrow")\n')
+    env = child_env()
+    env["PYTHONPATH"] = os.pathsep.join([str(blocked), env["PYTHONPATH"]])
+    env.pop("TENSORQUILL_SERVER_BIN", None)
+    done = subprocess.run([sys.executable, "-m", "tensorquill", "compare", "baseline", "after-the-fix", "--source",
+                           str(store), "-o", str(tmp_path / "compare.json")],
+                          cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    assert "ImportError" not in done.stderr and "Traceback" not in done.stderr
+    result = json.loads((tmp_path / "compare.json").read_text())
+    why = result["runs"][1]["read_from"]["unknown_why"]["0"]
+    assert "reading Parquet parts needs pyarrow" in why
+    assert "rank 0 (not judged: behind" in done.stdout
+
+
+def shared_file(folder: Path, name: str, ranks: tuple[int, ...], run: str = "shared", steps: int = 60,
+                spike_on: int | None = None) -> Path:
+    """One `.jsonl` file holding several ranks, their records interleaved step by step."""
+    per_rank = [dense(steps, run=run, rank=r, spike=(40, "blocks.1.weight", 60.0) if r == spike_on else None) for r in ranks]
+    folder.mkdir(parents=True, exist_ok=True)
+    return write_capture(folder / name, [record for step in zip(*per_rank) for record in step])
+
+
+def manifest_file(folder: Path, run_id: str, **fields) -> None:
+    (folder / f"{run_id}.run.json").write_text(json.dumps({
+        "schema_version": 1, "run_id": run_id, "project": "p", "name": run_id, "created_at": "2026-11-17T10:00:00Z",
+        **fields}))
+
+
+def test_a_file_of_several_ranks_is_listed_with_its_ranks_and_never_as_one(tmp_path, monkeypatch):
+    folder = tmp_path / "out"
+    both = shared_file(folder, "both.jsonl", (0, 1), run="both", spike_on=1)
+    # The listing stays cheap: no detector, and no file read whole.
+    monkeypatch.setattr(ev, "build_evidence", lambda *a, **k: pytest.fail("the listing ran a detector"))
+    monkeypatch.setattr(ev, "load_records", lambda *a, **k: pytest.fail("the listing read every record"))
+    monkeypatch.setattr(cmp, "_read_local", lambda *a, **k: pytest.fail("the listing read every record"))
+
+    # No manifest: the first and last records name ranks 0 and 1, and nothing says there are no more.
+    (row,) = tensorquill.list_runs(folder)
+    assert (row["ranks"], row["rank_count"]) == ([0, 1], None)
+    assert "both.jsonl has a name of its own" in row["rank_count_not_known"]
+    assert "ranks 0, 1" in row["rank_count_not_known"] and "no run manifest says the world size" in row["rank_count_not_known"]
+    assert (row["evidence"]["state"], row["evidence"]["rank"]) == ("missing", None)
+    assert f"python -m tensorquill {both} --rank N" in row["evidence"]["detail"]
+    text = runs_module.listing_text([row], folder)
+    assert "2+" in text.splitlines()[2] and "ranks not counted: both.jsonl has a name of its own" in text
+
+    # The manifest's world size settles it, when it equals the ranks seen.
+    manifest_file(folder, "both", world_size=2)
+    (row,) = tensorquill.list_runs(folder)
+    assert (row["ranks"], row["rank_count"]) == ([0, 1], 2) and "rank_count_not_known" not in row
+    assert " 2 " in runs_module.listing_text([row], folder).splitlines()[2]
+    manifest_file(folder, "both", world_size=4)
+    (row,) = tensorquill.list_runs(folder)
+    assert row["rank_count"] is None and "the run manifest says world size 4" in row["rank_count_not_known"]
+    manifest_file(folder, "both", world_size=2)
+    monkeypatch.undo()
+
+    # Its evidence file is one rank's and does not say which: its incidents are listed, the
+    # run is never called healthy for it, and what was checked is not counted for the run.
+    assert cli(str(both), "--rank", "0", cwd=folder).returncode == 0
+    (row,) = tensorquill.list_runs(folder)
+    assert (row["run_state"], row["incidents"], row["kinds_checked"]) == ("unknown", {}, None)
+    assert (row["evidence"]["state"], row["evidence"]["rank"], row["evidence"]["judged_ranks"], row["evidence"]["unknown_ranks"]) == (
+        "ranks_unknown", None, 1, 1)
+    assert "its evidence file is one rank's, without saying which" in row["evidence"]["detail"]
+    assert cli(str(both), "--rank", "1", cwd=folder).returncode == 0
+    (row,) = tensorquill.list_runs(folder)
+    assert (row["run_state"], row["incidents"], row["first_incident"]) == (
+        "unhealthy", {"anomaly": 1}, {"kind": "grad_spike", "step": 40})
+
+    # `compare` reads every rank of the file, and its count agrees with the listing's.
+    result = tensorquill.compare_runs(both, local_run(tmp_path / "other", "one"))
+    assert result["runs"][0]["rank_count"] == row["rank_count"] == 2
+    assert [(e["kind"], e["ranks"]) for e in result["incidents"]["entries"]] == [("grad_spike", {"A": [1]})]
+
+
+def test_a_file_named_for_its_rank_or_of_one_rank_is_counted_as_before(tmp_path):
+    folder = tmp_path / "out"
+    local_run(folder, "named", project="p", name="named", world_size=2)  # `.rank0.jsonl`: rank 0 alone
+    write_capture(folder / "trainer.jsonl", dense(5, run="hf-run"))
+    manifest_file(folder, "hf-run", world_size=1)
+    write_capture(folder / "unsaid.jsonl", dense(5, run="unsaid"))  # no manifest
+    # Rank 1 in the middle only: the first and last records are rank 0's.
+    zero, one = dense(6, run="ends-alike"), dense(5, run="ends-alike", rank=1)
+    write_capture(folder / "ends-alike.jsonl", zero[:5] + one + zero[5:])
+    rows = {row["run_id"]: row for row in tensorquill.list_runs(folder)}
+    assert (rows["named"]["rank_count"], rows["hf-run"]["rank_count"]) == (1, 1)
+    assert "rank_count_not_known" not in rows["named"] and "rank_count_not_known" not in rows["hf-run"]
+    # A file of its own name whose first and last records are one rank, with nothing to say
+    # whether others are in between: not printed as 1.
+    assert (rows["unsaid"]["ranks"], rows["unsaid"]["rank_count"]) == ([0], None)
+    assert "1+" in runs_module.listing_text([rows["unsaid"]], folder)
+    # Its evidence file is read as before: most such files are one rank's.
+    assert rows["unsaid"]["evidence"]["state"] == "missing" and rows["unsaid"]["evidence"]["rank"] == 0
+    assert (rows["ends-alike"]["ranks"], rows["ends-alike"]["rank_count"]) == ([0], None)
+    assert tensorquill.compare_runs("ends-alike", "unsaid", source=folder)["runs"][0]["rank_count"] == 2
+    # With a manifest of world size 2, the same file is read as possibly several ranks whichever
+    # rank wrote its last line: its evidence file is not taken for the run's.
+    manifest_file(folder, "ends-alike", world_size=2)
+    assert cli(str(folder / "ends-alike.jsonl"), "--rank", "0", cwd=folder).returncode == 0
+    row = {r["run_id"]: r for r in tensorquill.list_runs(folder)}["ends-alike"]
+    assert (row["rank_count"], row["run_state"], row["kinds_checked"]) == (None, "unknown", None)
+    assert (row["evidence"]["state"], row["evidence"]["rank"]) == ("ranks_unknown", None)
+    assert "may hold several ranks (its first and last records name rank 0)" in row["evidence"]["detail"]

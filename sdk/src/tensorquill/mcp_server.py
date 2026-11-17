@@ -1011,7 +1011,7 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
 
 _ROW_KEYS = ("project", "name", "run_id", "group", "tags", "has_manifest", "source", "started", "run_state", "last_step",
              "incidents", "first_incident", "kinds_checked", "ranks", "evidence", "rank_count", "ranks_with_incidents",
-             "kinds_not_stated")
+             "kinds_not_stated", "rank_count_not_known")
 
 
 def _text_argument(arguments: Mapping[str, Any], name: str) -> str | None:
@@ -1198,7 +1198,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " and its small evidence or report files only, and runs no detector: a local run whose evidence file was"
             " never written has `run_state` null and `evidence.state` \"missing\", which is not \"clean\". A run"
             " with `has_manifest` false was recorded before runs had a project, and is listed under"
-            " `uncategorized` with its run ID as its name. `rank_count` is how many ranks the run has. For a run of"
+            " `uncategorized` with its run ID as its name. `rank_count` is how many ranks the run has, or null when the"
+            " listing cannot count them without reading every record (`rank_count_not_known` says why). For a run of"
             " several ranks the row is the whole run's, by the all-ranks rules: the incidents of every judged rank"
             " (`ranks_with_incidents` names them), and a kind counts as checked only when every judged rank checked"
             " it. A rank without a current report or evidence file is unknown (`evidence.unknown_ranks`), never"

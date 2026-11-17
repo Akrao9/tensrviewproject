@@ -29,7 +29,9 @@ kind is `checked` for the run only when every judged rank checked it with enough
 run in a server's store is read through the all-ranks view (`all_ranks_evidence`: each rank's
 `incidents.json` and the status; no part is opened); a rank whose report is not current is
 unknown there, and the command line judges it from its parts, as for one rank, when they can
-be read. Local files are judged here by the Python detectors with the default thresholds,
+be read. When they cannot (no `pyarrow`, a torn part), the rank stays unknown with why
+(`read_from.unknown_why`), for one rank read alone too: the comparison is still made, and
+never counts that rank as clean. Local files are judged here by the Python detectors with the default thresholds,
 each rank on its own, and put together by the same rules (`combine_rank_evidence`). Ranks
 that are not judged are named (`other_ranks_not_compared`, `read_from.unknown_ranks`), never
 counted as clean. A run of one rank is read as before.
@@ -202,7 +204,11 @@ def _open_store(run: Mapping[str, Any], rank: int | None, read_parts: bool) -> d
         # here, as the watcher does: with the thresholds the server applied, when a report says
         # them, so the incidents do not change with who judged them.
         applied = applied_thresholds(look["report"]) if isinstance(look.get("report"), Mapping) else {}
-        records = load_records(folder, rank=picked, all_attempts=True)
+        try:
+            records = load_records(folder, rank=picked, all_attempts=True)
+        except (OSError, ValueError, ImportError) as error:  # ImportError: the parts need pyarrow
+            return _unread_store_rank(run, folder, folders, picked,
+                                      f"{look['state']}: {look['reason']}; its parts could not be read here ({error})")
         evidence = build_evidence(records, watchdog=folder / "watchdog.json", run_manifest=run.get("manifest") or {},
                                   **applied)
         steps = [r["step"] for r in records if _is_step(r.get("step"))]
@@ -214,6 +220,25 @@ def _open_store(run: Mapping[str, Any], rank: int | None, read_parts: bool) -> d
         "evidence": evidence, "last_step": last if _is_step(last) else None,
         "read_from": {"path": str(folder), "kind": "server store", "rank": picked, "ranks": sorted(folders),
                       "judged_by": judged},
+        "records": {"path": str(folder), "rank": picked},
+    }
+
+
+def _unread_store_rank(run: Mapping[str, Any], folder: Path, folders: Mapping[int, Path], picked: int,
+                       why: str) -> dict[str, Any]:
+    """One rank of a store whose report is not current and whose parts cannot be read here (no
+    `pyarrow`, a torn part): unknown, with why, as the all-ranks path leaves such a rank. Its
+    evidence is the all-ranks rules' over no judged rank: no incident of its own, what was
+    checked not stated, the run state unknown; the server's status still counts."""
+    from .evidence import combine_rank_evidence, read_watchdog
+
+    combined = combine_rank_evidence({}, status=read_watchdog(folder / "watchdog.json"), status_expected=True,
+                                     unknown_ranks={picked: why})
+    return {
+        "evidence": _all_ranks_run(combined), "last_step": None,
+        "read_from": {"path": str(folder), "kind": "server store", "rank": picked, "ranks": sorted(folders),
+                      "judged_ranks": [], "unknown_ranks": [picked], "unknown_why": {picked: why},
+                      "judged_by": f"nothing: rank {picked} is not judged ({why})"},
         "records": {"path": str(folder), "rank": picked},
     }
 
@@ -612,8 +637,9 @@ def compare_incidents(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
         if read.get("all_ranks"):
             if read.get("unknown_ranks"):
                 other[label] = list(read["unknown_ranks"])
-        elif read.get("ranks") and len(read["ranks"]) > 1:
-            other[label] = [r for r in read["ranks"] if r != read["rank"]]
+        elif (read.get("ranks") and len(read["ranks"]) > 1) or read.get("unknown_ranks"):
+            # One rank read (`rank=`): the others, and that rank itself when it could not be judged.
+            other[label] = sorted({r for r in read.get("ranks") or () if r != read["rank"]} | set(read.get("unknown_ranks") or ()))
     return {
         "entries": entries,
         "only_in": only,
@@ -890,6 +916,8 @@ def summary_text(result: Mapping[str, Any]) -> str:
         else:
             rank = f"rank {read['rank']}" if read.get("rank") is not None else "one rank"
             of = f" of {len(read['ranks'])}" if read.get("ranks") and len(read["ranks"]) > 1 else ""
+            if read.get("unknown_ranks"):  # the one rank read could not be judged
+                of += f" (not judged: {(read.get('unknown_why') or {}).get(read['rank'], 'no current report')})"
         lines.append(
             f"  {run['label']}  {run['name']} (run ID {run['run_id']}, project {run['project']}): "
             f"{run['run_state'] or 'state unknown'}, "
@@ -965,7 +993,8 @@ def summary_text(result: Mapping[str, Any]) -> str:
         lines.append("   incidents on other ranks were not compared: " + "; ".join(
             f"{label} ranks {', '.join(map(str, ranks))}" for label, ranks in other.items())
             + (" (not judged: no current report or evidence)" if any(
-                run["read_from"].get("all_ranks") for run in runs if run["label"] in other) else ""))
+                run["read_from"].get("all_ranks") or run["read_from"].get("unknown_ranks")
+                for run in runs if run["label"] in other) else ""))
     lines.append(f"4. Where the runs part: {result['divergence']['detail']}")
     return "\n".join(lines)
 
