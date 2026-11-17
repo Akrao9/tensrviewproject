@@ -34,7 +34,13 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.11", "3.12"]
-        torch: ["2.6", "2.10", "2.14"]
+        torch: ["2.6", "2.10", "2.14", "2.15"]
+        # The newest PyTorch on the newer Pythons it ships wheels for (2.15 has them for 3.11 to 3.15).
+        include:
+          - python: "3.13"
+            torch: "2.15"
+          - python: "3.14"
+            torch: "2.15"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
