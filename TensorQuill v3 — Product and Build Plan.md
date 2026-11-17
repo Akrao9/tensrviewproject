@@ -770,7 +770,7 @@ State as of Nov 16, 2026.
     3. Part 4. Done when the same pair names the seeded step within one check interval and the seeded parameter, and two healthy runs with different seeds get "no answer" and not a step.
     4. The MCP tools, then (if asked for) two runs side by side in Rerun and the outlier among several runs.
   - *Not in this design:* charts of scalars across runs, sweeps, reports, a hosted project page, artifact and model versions.
-  - *Accepted, so the focused plan changes in three places* (the author's doc; not edited here): the "Not planned" line under "After the four weeks", step 4 "Learn across runs", and one more build item with its done test.
+  - *Accepted, so the focused plan changes in three places* (made in the author's doc and its copy here later the same day, at the author's word): the "Not planned" line under "After the four weeks", step 4 "Learn across runs", and one more build item with its done test.
   - *Where the pieces meet other work, read from the code Nov 16, 2026, nothing run.*
     - `init` is in `capture.py` and the run ID is resolved in `tracker.py`. The batch metadata is built in one place in `flight.py`, and `BatchMetadata` in `server/src/ingest.rs` has five fields and does not refuse unknown ones.
     - The command line is one parser in `evidence.py` whose first argument is a path. Both `__main__.py` and the `tensorquill` console script (`tensorquill.evidence:main`) call it. `runs` and `compare` are new verbs, so they need a dispatch inside or in front of `main`, and a rule for a file that is itself named `runs` or `compare`.
@@ -790,7 +790,7 @@ State as of Nov 16, 2026.
     - Read plainly: any stall at `critical` fires, whatever its assessment (a suspected hang, a lost connection). Open to narrowing.
     - The README is to say plainly that a local run with no server cannot detect a hang at all.
   - *How it is built.* Two side sessions at the same time: one for item 2 (it owns `kind_checks`, `not_checked`, `detect.rs` and the golden files), one for items 1 and 4 (Python only: `trigger.py`, the printed line, the README). The re-timing of item 3 runs after both are merged, so that two builds do not spoil the numbers and the timed code is the code to release.
-  - *What it moves.* A6 (what was checked in the all-ranks view) now waits on item 2, which changes the shape of `kind_checks`. The focused plan's line "A hang fires only when its kind is named" (build piece 3) is out of date; the author's doc, not edited here.
+  - *What it moves.* A6 (what was checked in the all-ranks view) now waits on item 2, which changes the shape of `kind_checks`. The focused plan's line "A hang fires only when its kind is named" (build piece 3) was out of date; the author's doc and its copy here were brought up to date later the same day, at the author's word, with build piece 6 (comparing runs), the Rune decision as settled, the two trial jobs and the re-timing.
 - [x] **Rune viewer postponed (decided Nov 16, 2026).** The author confirmed it ("postpone rune"). This reverses the viewer decision of Nov 14, 2026 ("the Rune app is built either way"), and Step 22 is not part of the first release.
   - *What stays.* Stock Rerun 0.43.2 is the viewer, `export_rerun` and its blueprint stay, and the evidence schema stays independent of any viewer.
   - *Taken up again when* outside users ask for views Rerun cannot give, which is the condition in the focused plan's freeze row.
