@@ -410,6 +410,8 @@ def test_two_runs_of_one_project_are_told_apart_in_a_servers_store_by_every_read
         for evidence in (from_local, from_parts, from_rank_folder, from_report, recomputed, all_ranks):
             assert evidence["run"] == block
         assert ev.all_ranks_evidence(folder)["run"] == block
+        # The view carries both things added to it on separate branches: the run block and what was checked.
+        assert isinstance(ev.all_ranks_evidence(folder)["kind_checks"], dict)
 
 
 def test_a_manifest_too_large_for_a_stream_goes_without_its_config_or_not_at_all():

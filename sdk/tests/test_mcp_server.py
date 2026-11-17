@@ -836,7 +836,7 @@ def test_compare_runs_takes_ids_and_names_and_says_what_was_checked_before_the_i
     assert (entry["kind"], entry["in"], entry["first_step"], entry["absent_from"]) == (
         "grad_spike", ["B"], {"B": 40}, {"A": "checked"})
     assert entry["where"]["B"] == {"parameters": ["blocks.1.weight"]}
-    assert result["divergence"]["state"] == "not_built" and "step" not in result["divergence"]
+    assert result["divergence"]["state"] in ("no_answer", "no_divergence", "diverged", "no_records") and result["divergence"]["detail"]
 
     # A short run's silence is not a "none", and the tool says so.
     short = client.call("compare_runs", runs=["old-run", "run-2"])

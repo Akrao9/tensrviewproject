@@ -349,7 +349,10 @@ def test_a_router_only_run_against_a_full_capture_run_says_what_was_checked_befo
     assert text.index("1. Setup") < text.index("2. What was checked") < text.index(
         "non_finite: not configured in A; checked") < text.index("3. Incidents") < text.index(
         "B only: non_finite") < text.index("A did not look: the kind is not configured there") < text.index("4. Where the runs part")
-    assert result["divergence"] == {"state": "not_built", "detail": "where the two runs part is not built in this version"}
+    # Part 4 is asked of these two (their records were read): a router-only run and a full capture share
+    # too little to be a pair, so it gives its reason and never a step.
+    assert result["divergence"]["state"] in ("no_answer", "no_divergence") and result["divergence"]["divergence"] is None
+    assert result["divergence"]["detail"] and result["divergence"]["labels"] == {"a": "A", "b": "B"}
 
 
 def test_a_short_run_against_a_long_one_says_which_kinds_have_not_had_enough_history(tmp_path):

@@ -20,7 +20,7 @@ The result has four parts, in this order, and the printed summary keeps the orde
 3. `incidents`: by kind and what the incident names (the layer and router, the parameters,
    the modules), with the runs that show it and each run's first step. For a run that does
    not show it, the entry says whether that run looked.
-4. `divergence`: where two runs part. Not built in this version (`where_runs_part`).
+4. `divergence`: where two runs part (`where_runs_part`, which calls `divergence.first_divergence`).
 
 One rank of each run is read: rank 0 unless `rank=` names another, and the result says which.
 Incidents on a run's other ranks are not compared, and it says that too. Local files are
@@ -426,20 +426,50 @@ def compare_incidents(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
 # --- Part 4: where two runs part -------------------------------------------------------------
 
 
-def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[str, Any]:
-    """PART 4, NOT BUILT HERE. The first step, and the layer or parameter, where a series
-    leaves two runs' own early agreement and stays out.
+def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_parts: bool = True) -> dict[str, Any]:
+    """Part 4: the first step, and the layer or parameter, where a series leaves two runs' own
+    early agreement and stays out (`divergence.first_divergence`, which reads both runs' step
+    records). The block always carries a `state` and a `detail`, which `summary_text` prints.
 
-    This is the one place the rule is joined to `compare`: it is written in its own module
-    (`divergence.py`, plan row C3), which reads two runs' records. Each opened run carries
-    `records` (`{"path", "rank"}`: what `evidence.load_records(path, rank=rank)` reads), or
-    None for a run given as an evidence file. Whatever is returned here becomes the result's
-    `divergence` block and must carry a `state` and a `detail`; `summary_text` prints the
-    `detail`. Until the join the answer is `not_built`, never a step.
+    `state` is the rule's own answer (`diverged`, `no_divergence`, `no_answer`), or says why it
+    was not asked: `not_asked` (it is for two runs only), `no_records` (a run was given as an
+    evidence file, or its records could not be read), `not_read` (`read_parts=False` and a run
+    is in a server's store, whose parts are not opened then) or `ranks_differ`. It is for paired
+    runs, so `no_answer` is common and correct, and no step is ever given without `diverged`.
+    Of the rule's per-series table only the series that do not agree are kept: on a 700-series
+    model the whole table is half a megabyte.
     """
     if len(opened) != 2:
         return {"state": "not_asked", "detail": f"where runs part is answered for two runs only, and {len(opened)} were given"}
-    return {"state": "not_built", "detail": "where the two runs part is not built in this version"}
+    without = [label for run, label in zip(opened, labels) if not run.get("records")]
+    if without:
+        return {"state": "no_records", "detail": f"where the two runs part needs both runs' step records, and {' and '.join(without)} "
+                f"{'was' if len(without) == 1 else 'were'} given as an evidence file"}
+    stored = [label for run, label in zip(opened, labels) if (run.get("read_from") or {}).get("kind") == "server store"]
+    if stored and not read_parts:
+        return {"state": "not_read", "detail": f"where the two runs part reads every step record, and the stored parts of "
+                f"{' and '.join(stored)} are not opened here: use the command line"}
+    ranks = [run["records"]["rank"] for run in opened]
+    if ranks[0] != ranks[1]:
+        return {"state": "ranks_differ", "detail": f"where the two runs part compares one rank of each run, and rank {ranks[0]} of "
+                f"{labels[0]} and rank {ranks[1]} of {labels[1]} were read"}
+    from .divergence import divergence_summary, first_divergence
+    from .evidence import load_records
+
+    try:
+        records = [load_records(run["records"]["path"], rank=run["records"]["rank"]) for run in opened]
+    except (OSError, ValueError) as error:
+        return {"state": "no_records", "detail": f"the step records could not be read again for where the runs part ({error})"}
+    found = first_divergence(records[0], records[1], rank=ranks[0])
+    lines = divergence_summary(found)
+    series = found.get("series") or {}
+    kept = {name: entry for name, entry in series.items() if entry.get("status") != "agrees"}
+    return {
+        "state": found["answer"], "detail": found["reason"], "lines": lines,
+        "labels": {"a": labels[0], "b": labels[1]},
+        **{key: value for key, value in found.items() if key not in ("answer", "reason", "series")},
+        "series": kept, "series_agreeing": len(series) - len(kept),
+    }
 
 
 # --- The whole comparison ---------------------------------------------------------------------
@@ -485,7 +515,7 @@ def compare_runs(*runs: str | Path, source: str | Path | None = None, project: s
         "setup": compare_setup(opened, labels),
         "checked": compare_checked(opened, labels),
         "incidents": compare_incidents(opened, labels),
-        "divergence": where_runs_part(opened, labels),
+        "divergence": where_runs_part(opened, labels, read_parts=read_parts),
     }
     result["summary"] = summary_text(result)
     return result

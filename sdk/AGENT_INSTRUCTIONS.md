@@ -76,7 +76,7 @@ Compare when a person asks for it, or when the run you are explaining has a part
    - `setup`: what differs between the runs' manifests, such as a `config` key. A run listed under `no_manifest` was recorded before runs had a project, and its setup is not known.
    - `checked`: the kinds one run checked and another did not. Read this before the incidents.
    - `incidents`: each entry says which runs show it (`in`), each run's `first_step`, and what it names in each run (`where`).
-   - `divergence`: where two runs part. This version does not build it, and says so. Do not supply a step yourself.
+   - `divergence`: where two runs part, for two paired runs (the same job twice, or before and after one change). `state` is `diverged` with the first step and the layer or parameter, `no_divergence`, or `no_answer` with the reason in `detail`; other states say why it was not asked. Runs that never agreed early get `no_answer`, which is a correct result. Do not supply a step yourself when it gives none.
 3. **For an incident in one run only, read `absent_from` before you call it a difference.** It gives one word for each run that does not show the incident:
    - `checked`: that run looked, with enough history, and found none. Only this is a real difference between the runs.
    - `not_configured` or `unavailable`: that run never looked. Write "B was not checked for it", never "B does not have it".
