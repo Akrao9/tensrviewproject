@@ -41,7 +41,9 @@ from .evidence import (
     load_records,
     routing_colors,
 )
+from .compare import compare_runs
 from .evidence_system import detect_memory_imbalance, detect_system_incidents, latest_memory
+from .runs import list_runs
 from .sink import JsonlSink, MemorySink, Sink
 from .tracker import RunInfo, resolve_run
 
@@ -59,6 +61,7 @@ __all__ = [
     "batch_hash",
     "build_evidence",
     "checkpoint_manifest",
+    "compare_runs",
     "detect_data_stalled",
     "detect_duplicate_batches",
     "detect_epoch_order_repeated",
@@ -83,6 +86,7 @@ __all__ = [
     "incident_summary",
     "init",
     "latest_memory",
+    "list_runs",
     "load_records",
     "parameter_fingerprints",
     "replica_spread",

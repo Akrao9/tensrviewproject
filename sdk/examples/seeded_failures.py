@@ -25,6 +25,15 @@ fails.
 
     python examples/seeded_failures.py --case both --out runs/seeded
 
+`--case healthy` trains the same model on the same batches with nothing planted, and passes when
+`build_evidence` lists no incident; `--case all` runs it and then the two seeded cases. It is the
+other half of a pair for `python -m tensorquill compare`: each case is a run of the project
+`seeded-failures`, named after its case, with what was planted in its `config`:
+
+    python -m tensorquill compare runs/seeded/healthy/healthy.jsonl runs/seeded/grad_spike/grad_spike.jsonl
+
+With bfloat16 weights the healthy run is not clean (see below), so use `--dtype float32` for the pair.
+
 `--toy` uses a tiny random Llama on random tokens, for checking the script on CPU. Weights are
 bfloat16 on a GPU, as in `dense_outlier_check.py`. With a learning rate of 1e-5 some bfloat16
 weights (RMSNorm's, near 1.0) never change, so `stalled_weights` starts with those, from the third
@@ -54,6 +63,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dense_outlier_check import FLUSH_EVERY, MODEL, build_models, load_batches, train_step  # noqa: E402
 
 CASES = ("grad_spike", "stalled_weights")
+HEALTHY = "healthy"  # nothing planted: the run the seeded ones are compared with
+PROJECT = "seeded-failures"
 DEFAULT_PARAMETER = "self_attn.k_proj.weight"  # suffix; the block is the middle one unless --layer says
 DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
 
@@ -313,7 +324,10 @@ def judge_stalled_weights(
 
 
 def steps_for(case: str, args) -> int:
-    """Enough steps for the failure to be seen and one more interval to spare, in whole intervals."""
+    """Enough steps for the failure to be seen and one more interval to spare, in whole intervals.
+    The healthy run takes as many as the longer seeded case, so it reaches every step they do."""
+    if case == HEALTHY:
+        return max(steps_for(seeded, args) for seeded in CASES)
     needed = args.seed_step if case == "grad_spike" else first_visible_stall(args.freeze_step)
     return (needed // FLUSH_EVERY + 2) * FLUSH_EVERY
 
@@ -346,14 +360,19 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
     scale = GradientScale(seeded, factor) if case == "grad_spike" else None
     jsonl = out / f"{case}.jsonl"
     out.mkdir(parents=True)
+    planted: dict[str, Any] = {"case": case, "parameter": name, "dtype": str(dtype), "lr": args.lr, "steps": steps}
     if case == "grad_spike":
+        planted.update(seed_step=args.seed_step, factor=factor)
         print(f"Seeding {name} ({dtype}): gradient x{factor:g} from step {args.seed_step}, {steps} steps", flush=True)
+    elif case == HEALTHY:
+        print(f"Seeding nothing ({dtype}): {steps} steps", flush=True)
     else:
+        planted.update(freeze_step=args.freeze_step)
         print(f"Seeding {name} ({dtype}): learning rate 0 from step {args.freeze_step}, {steps} steps", flush=True)
     try:
         with tensorquill.init(
             model, run_id=f"seeded-{case}", capture="full", every=FLUSH_EVERY, weights=WEIGHT_EVERY,
-            sink=tensorquill.JsonlSink(jsonl),
+            sink=tensorquill.JsonlSink(jsonl), project=PROJECT, name=case, config=planted,
         ) as session:
             assert name in session.param_names, f"{name} is not captured"
             for step in range(steps):
@@ -372,6 +391,10 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
     print(tensorquill.incident_summary(evidence))
     if case == "grad_spike":
         verdict = judge_grad_spike(evidence, records, name, args.seed_step, factor)
+    elif case == HEALTHY:
+        kinds = sorted({incident["kind"] for incident in evidence["incidents"]})
+        verdict = Verdict(case, not kinds, "no incident, with nothing planted" if not kinds else
+                          f"nothing was planted and the evidence lists {', '.join(kinds)}")
     else:
         verdict = judge_stalled_weights(evidence, records, name, args.freeze_step)
     print()
@@ -384,7 +407,8 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--case", choices=[*CASES, "both"], default="both")
+    parser.add_argument("--case", choices=[*CASES, "both", HEALTHY, "all"], default="both",
+                        help="both: the two seeded cases; healthy: nothing planted; all: healthy, then both")
     parser.add_argument("--out", type=Path, required=True, help="new directory; each case writes a folder in it")
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -411,8 +435,10 @@ def main(argv: list[str] | None = None) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if not args.toy and device.type != "cuda":
         parser.error("a CUDA GPU is required; use --toy to check the script on CPU")
-    cases = CASES if args.case == "both" else (args.case,)
+    cases = {"both": CASES, "all": (HEALTHY, *CASES)}.get(args.case, (args.case,))
     for case in cases:
+        if case == HEALTHY:
+            continue
         # A spike in one parameter is known once it has lasted SPIKE_SUSTAIN recorded steps.
         need = args.seed_step + SPIKE_SUSTAIN if case == "grad_spike" else first_visible_stall(args.freeze_step) + 1
         if args.steps and args.steps < need:

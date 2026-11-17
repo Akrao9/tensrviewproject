@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -4767,7 +4768,21 @@ def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    # Two verbs come before the path: `runs` (list the runs of a folder or store) and `compare`.
+    # The first argument alone decides, whatever is on disk, so the same command means the same
+    # thing everywhere; a file or folder with one of those names is read as `./runs` or
+    # `./compare`. Both `python -m tensorquill` and the `tensorquill` console script come here.
+    if len(sys.argv) > 1 and sys.argv[1] in ("runs", "compare"):
+        from . import runs as _runs
+
+        _runs.main(sys.argv[1], sys.argv[2:])
+        return
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="Two verbs take the place of the path: `python -m tensorquill runs <folder or store>` lists the "
+        "runs there by project, and `python -m tensorquill compare A B` compares runs given by ID or name "
+        "(each has its own --help). A file or folder named `runs` or `compare` is read as ./runs or ./compare.",
+    )
     parser.add_argument(
         "input",
         type=Path,
