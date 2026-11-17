@@ -23,7 +23,7 @@ from torch import nn
 
 import tensorquill
 from tensorquill.capture import Router
-from tensorquill.evidence import MOE_KINDS, input_counts
+from tensorquill.evidence import MOE_KINDS, incident_summary, input_counts
 
 EXPERTS, TOP_K = 8, 2
 
@@ -208,6 +208,129 @@ def test_under_torch_compile_the_guard_says_the_same_and_counts_nothing(tmp_path
     assert [r["step"] for r in records if "moe_refused" in r] == [0]
 
 
+# --- A router given an `indices=` function ----------------------------------------------------
+
+DEFAULT_FIX = (
+    "To count it, pass routers={'router': tensorquill.Router(8, 2, indices=...)} with a function that returns "
+    "the chosen expert indices from its output, or name the module inside it whose output is the router's logits"
+)
+INDICES_FIX = (
+    "To count it, change its indices= function to return the chosen expert indices, integers from 0 to 7, one "
+    "or 2 for each token, or drop indices= and name the module inside it whose output is the router's logits"
+)
+
+
+def _refused_by_indices(tmp_path, indices, steps=4, every=None, compile_backend=None, endpoint=None):
+    """Run `IndexRouter` with the given `indices=` function; the router must be refused, said once
+    as a warning, never raised into training. Returns the records and the warning."""
+    torch.manual_seed(0)
+    model = Model(IndexRouter(16))
+    if endpoint is None:
+        path = tmp_path / "given.jsonl"
+        out = {"sink": tensorquill.JsonlSink(path)}
+    else:  # streamed: the local file is written where the run is, in tensorquill-out/
+        path = tmp_path / "tensorquill-out" / "given.rank0.jsonl"
+        out = {"endpoint": endpoint}
+    with pytest.warns(RuntimeWarning, match="not counting the router 'router'") as caught:
+        session = tensorquill.init(model, run_id="given", routers={"router": Router(EXPERTS, TOP_K, indices=indices)},
+                                   every=every or steps, **out)
+        stepped = torch.compile(model, backend=compile_backend) if compile_backend else model
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        for _ in range(steps):
+            optimizer.zero_grad()
+            stepped(torch.randn(6, 20, 4)).backward()
+            optimizer.step()
+        session.close()
+    said = [str(w.message) for w in caught if "not counting the router" in str(w.message)]
+    assert len(said) == 1
+    assert INDICES_FIX in said[0] and "pass routers=" not in said[0]
+    return [json.loads(line) for line in path.read_text().splitlines()], said[0]
+
+
+def _one_refusal(records, step=0):
+    assert [r["step"] for r in records if "moe_refused" in r] == [step]
+    [why] = [r["moe_refused"]["router"] for r in records if "moe_refused" in r]
+    [entry] = [e for e in tensorquill.build_evidence(records)["not_checked"] if e["check"] == "router"]
+    assert entry["reason"] == f"router router is not counted: {why}" and entry["step"] == step
+    return why
+
+
+def test_an_indices_function_that_returns_the_wrong_shape_is_refused(tmp_path):
+    records, said = _refused_by_indices(tmp_path, lambda out: out[..., 0].sum(0))  # [20] for 120 tokens
+    assert len(records) == 4 and _no_entry(records)
+    why = _one_refusal(records)
+    assert why.startswith("its indices= function returned shape (20,), which is not expert indices for the 120 tokens")
+    assert why.endswith(INDICES_FIX) and why in said
+
+
+@pytest.mark.parametrize(
+    ("indices", "start"),
+    [
+        (lambda out: out.float(), "its indices= function returned a float32 tensor, not integer expert indices"),
+        (lambda out: out > 3, "its indices= function returned a bool tensor"),
+        (lambda out: out.tolist(), "its indices= function returned list, not a tensor"),
+    ],
+    ids=["float", "bool", "list"],
+)
+def test_an_indices_function_that_returns_no_integer_tensor_is_refused(tmp_path, indices, start):
+    records, _ = _refused_by_indices(tmp_path, indices)
+    assert _no_entry(records) and _one_refusal(records).startswith(start)
+
+
+@pytest.mark.parametrize("compile_backend", [None, "eager"], ids=["eager", "compiled"])
+def test_an_indices_function_that_raises_is_refused_and_training_goes_on(tmp_path, compile_backend):
+    def broken(out):
+        raise KeyError("indices")  # as one written for a router that returns a dict
+
+    records, said = _refused_by_indices(tmp_path, broken, compile_backend=compile_backend)
+    assert len(records) == 4 and _no_entry(records)  # every step trained and was written
+    why = _one_refusal(records)
+    assert why.startswith("its indices= function raised ") and why.endswith(INDICES_FIX)
+
+
+def test_an_indices_function_whose_values_leave_the_experts_is_refused_from_that_block(tmp_path):
+    """Values are judged after the counts' copy to the CPU that `flush` makes anyway, so the
+    first block (steps 0-3, in range) is counted and the router is refused from the block in
+    which a value fell outside 0..7: a router counted and then refused."""
+    calls = []
+
+    def drifting(out):
+        calls.append(1)
+        return out + EXPERTS if len(calls) == 6 else out  # step 5 only, all its indices out
+
+    records, said = _refused_by_indices(tmp_path, drifting, steps=8, every=4)
+    assert _routed(records[:4]) == [120 * TOP_K] * 4
+    assert _no_entry(records[4:]) and len(records) == 8
+    why = _one_refusal(records, step=4)
+    assert why.startswith("its indices= function returned 240 values outside 0 to 7 at step 5, which match no expert")
+    evidence = tensorquill.build_evidence(records)
+    # Counted steps are judged; the refused ones are a router missing from the record, as for
+    # any router a record lacks, never zeros.
+    assert [s["step"] for s in evidence["samples"] if not s.get("missing")] == [0, 1, 2, 3]
+    assert [s["step"] for s in evidence["samples"] if s.get("missing")] == [4, 5, 6, 7]
+    for kind in MOE_KINDS:
+        check = evidence["kind_checks"][kind]
+        assert check["value"] == "unavailable" and check["records"] == 4 and check["reason"].endswith(INDICES_FIX)
+
+
+def test_the_reason_names_the_router_and_both_fixes_in_every_place_it_is_printed(tmp_path):
+    with pytest.warns(RuntimeWarning, match="not counting the router 'router'") as caught:
+        records = _run(tmp_path, CountsFirstRouter(16), {"router": Router(EXPERTS, TOP_K)})
+    why = (
+        "its output's first integer tensor has shape (8,), which is not expert indices for the 120 tokens it "
+        f"was called on. {DEFAULT_FIX}"
+    )
+    [said] = [str(w.message) for w in caught if "not counting the router" in str(w.message)]
+    assert said == f"TensorQuill is not counting the router 'router': {why}. Its expert loads are not recorded."
+    assert records[0]["moe_refused"] == {"router": why}
+    reason = f"router router is not counted: {why}"
+    evidence = tensorquill.build_evidence(records)
+    [entry] = [e for e in evidence["not_checked"] if e["check"] == "router"]
+    assert entry["reason"] == reason
+    assert all(evidence["kind_checks"][kind]["reason"] == reason for kind in MOE_KINDS)
+    assert f"Not checked (router): {reason}" in incident_summary(evidence).splitlines()
+
+
 def test_a_model_with_no_refused_router_writes_no_refusal(tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
@@ -263,3 +386,41 @@ def test_the_server_stores_a_refused_router_as_no_entry_and_says_why(tmp_path, m
         e for e in python["not_checked"] if e["check"] == "router"
     ]
     assert rust["kind_checks"] == python["kind_checks"] and rust["samples"] == python["samples"]
+    # The server prints the capture's reason as written: the router, why, and both fixes.
+    [entry] = [e for e in rust["not_checked"] if e["check"] == "router"]
+    assert entry["reason"] == (
+        "router refused is not counted: its output's first integer tensor has shape (8,), which is not expert "
+        f"indices for the 120 tokens it was called on. {DEFAULT_FIX.replace(repr('router'), repr('refused'))}"
+    )
+
+
+def test_the_server_reads_an_indices_router_counted_and_then_refused_as_python_does(tmp_path, monkeypatch):
+    """A state the shape guard never made: a router counted in the first block and refused from
+    the second, when its `indices=` function returned values outside the experts."""
+    _binary()
+    from test_flight_e2e import Server, stored_records
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)
+    calls = []
+
+    def drifting(out):
+        calls.append(1)
+        return out + EXPERTS if len(calls) == 6 else out
+
+    server = Server(tmp_path / "store")
+    try:
+        records, _ = _refused_by_indices(tmp_path, drifting, steps=8, every=4, endpoint=server.endpoint)
+    finally:
+        assert server.terminate() == 0
+    stored = stored_records(tmp_path / "store", "given")
+    assert stored == records and len(stored) == 8
+    assert _routed(stored[:4]) == [120 * TOP_K] * 4 and _no_entry(stored[4:])
+    python = tensorquill.build_evidence(stored)
+    rust = tensorquill.build_evidence(stored, detectors="rust")
+    assert rust["detectors"] == "rust"
+    [entry] = [e for e in rust["not_checked"] if e["check"] == "router"]
+    assert entry == next(e for e in python["not_checked"] if e["check"] == "router")
+    assert entry["step"] == 4 and entry["reason"].endswith(INDICES_FIX)
+    assert rust["kind_checks"] == python["kind_checks"] and rust["samples"] == python["samples"]
+    assert all(rust["kind_checks"][kind]["value"] == "unavailable" for kind in MOE_KINDS)

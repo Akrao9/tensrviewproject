@@ -3663,11 +3663,17 @@ MOE_KINDS = ("moe_imbalance", "starved_experts")
 def refused_routers_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
     """The `router` entry of `not_checked`: routers the capture refused to count.
 
-    A router whose output's first integer tensor cannot be expert indices is not counted
-    (capture.py's router guard) and leaves no entry in `moe`, so the MoE rules never see
-    it. The capture says so once, under `moe_refused` on the first record it wrote after
-    the refusal. Without this entry a run whose only router was refused would read "no MoE
-    incident", which is not "MoE checked". The server writes the same entry (detect.rs).
+    A router whose output cannot be read as expert indices is not counted (capture.py's
+    router guard: the first integer tensor's shape, or what an `indices=` function returned
+    or raised) and leaves no entry in `moe`, so the MoE rules never see it. The capture says
+    so once, under `moe_refused` on the first record it wrote after the refusal. Without this
+    entry a run whose only router was refused would read "no MoE incident", which is not "MoE
+    checked". The server writes the same entry (detect.rs).
+
+    The capture writes the whole reason after "router NAME is not counted: ": why, and the
+    two ways to have it counted for how that router was named, which only the capture knows.
+    It is printed as written, so this entry, the server's and the session's warning say the
+    same. Records from before that carry the why alone and read as before.
     """
     first: dict[str, tuple[int, str]] = {}
     for record in records:
