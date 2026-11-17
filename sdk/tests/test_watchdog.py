@@ -622,3 +622,32 @@ def test_watch_status_clock_skew_uses_monotonic_time(tmp_path, monkeypatch):
         watchdog=status_file,
     )
     assert ages == [None, 5.0]
+
+
+def test_a_stall_before_the_first_stored_batch_is_said_as_that():
+    """The server calls a rank silent that has an open stream and no batch stored (its `last_step`
+    is null): the summary must not say "after step 0" or "since step None"."""
+    def said(hit):
+        return tensorquill.incident_summary({"incidents": [hit], "samples": [], "layer_count": 0,
+                                             "expert_count": 0, "router_names": []})
+
+    hung = {**_rank(0, "silent", None, 410.0, beat=3.0, severity="warning"), "work": 40}
+    waiting = {**_rank(1, "silent", None, 410.0, beat=3.0, severity="warning"), "work": 0}
+    [hit] = detect_watchdog_incidents(_status("stalled", [hung, waiting]))
+    assert (hit["kind"], hit["step"], hit["severity"]) == ("job_stalled", 0, "warning")
+    text = said(hit)
+    assert ("Job stalled before its first batch was stored: none of 2 ranks has sent a step in 410 s, and the"
+            " heartbeats' work counter stands at 40 (its heartbeats continue and it says it is in phase `train`).") in text
+    assert "a long startup (compilation, a data load)" in text and "after step" not in text
+    # No counter moved, or an older server that writes none: nothing is said of it.
+    for ranks in ([waiting], [_rank(0, "silent", None, 1900.0)]):
+        text = said(detect_watchdog_incidents(_status("stalled", ranks))[0])
+        assert "before its first batch was stored: none of 1 rank has sent a step in" in text and "work counter" not in text
+    # One rank stuck before its first step while another goes on.
+    [hit] = detect_watchdog_incidents(_status("degraded", [_rank(0, "active", 400), hung | {"rank": 1}]))
+    assert (hit["kind"], hit["step"], hit["newest_step"]) == ("rank_silent", 400, 400)
+    text = said(hit)
+    assert "rank 1 has had no step stored yet (its heartbeats continue" in text and "None" not in text
+    # A job with one rank past its first batch is a stall after that step, as before.
+    [hit] = detect_watchdog_incidents(_status("stalled", [_rank(0, "silent", 49, 700.0), hung | {"rank": 1}]))
+    assert "Job stalled after step 49" in said(hit)

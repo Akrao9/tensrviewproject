@@ -55,6 +55,12 @@ struct Args {
     /// A phase other than training (evaluation, a checkpoint) that shows no sign of work is called a suspected hang after this long.
     #[arg(long, default_value_t = 1800.0)]
     pause_seconds: f64,
+    /// A rank that has stored no batch and shown no training step (it is compiling, loading data, in its
+    /// first collective, or sends no heartbeat) is `starting` for this long since its last sign of work,
+    /// then reported silent, and `critical` --critical-seconds later. Set it above your longest startup;
+    /// the default is not calibrated. A rank whose heartbeats show it stepping is not limited by this.
+    #[arg(long, default_value_t = 1800.0)]
+    start_seconds: f64,
     /// How many times a rank's usual time between batches it may stay quiet before it is silent.
     #[arg(long, default_value_t = 5.0)]
     silent_factor: f64,
@@ -194,6 +200,7 @@ async fn run(args: Args) -> Result<(), Error> {
         silent_factor: args.silent_factor,
         critical: Duration::from_secs_f64(args.critical_seconds),
         pause_limit: Duration::from_secs_f64(args.pause_seconds),
+        start_limit: Duration::from_secs_f64(args.start_seconds),
         watchdog_interval: Duration::from_secs_f64(args.watchdog_seconds),
         status_refresh: Duration::from_secs_f64(args.watchdog_seconds * 3.0),
         detect: !args.no_detect,
