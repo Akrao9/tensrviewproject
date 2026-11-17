@@ -1314,6 +1314,8 @@ impl Moe {
 
     /// The `router` entry of `not_checked`: Python's `refused_routers_not_checked`. A run
     /// whose only router was refused has no MoE incident, and that is not "MoE checked".
+    /// The capture's text is printed as written: why, and the fixes for how that router was
+    /// named, so the server, the Python evidence and the session's warning say the same.
     fn refused_not_checked(&self) -> Option<Value> {
         let step = self.refused.values().map(|(step, _)| *step).min()?;
         let reason: Vec<String> = self

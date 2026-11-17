@@ -82,6 +82,12 @@ class Router:
     `indices` picks the tensor of chosen expert indices out of the module's output. By
     default it is the first integer tensor in the output, or the top-`top_k` indices of
     the first floating-point tensor whose last dimension equals `n_experts`.
+
+    A function given as `indices` is checked as the default is, and more: it must return an
+    integer tensor on the counts' device, of a size that is a whole multiple of the tokens
+    the router was called on, with values in `0..n_experts-1`. One that raises, or returns
+    anything else, has its router refused for the session (`_router_hook`), never an error
+    in training.
     """
 
     n_experts: int
@@ -157,14 +163,83 @@ def _tokens(args: Any) -> int | None:
     return total // width if type(total) is int else None
 
 
+def _refusal(name: str, spec: Router, why: str) -> str:
+    """Why a router is not counted and the two ways to have it counted, as one text: the
+    session's warning and the value of `moe_refused` (so the evidence and the server print
+    the same words). The fixes depend on how the router was named, which only the capture
+    knows. No "; ": the evidence joins several routers' reasons with it."""
+    inner = "name the module inside it whose output is the router's logits"
+    if spec.indices is None:
+        fix = (
+            f"pass routers={{{name!r}: tensorquill.Router({spec.n_experts}, {spec.top_k}, indices=...)}} with a "
+            f"function that returns the chosen expert indices from its output, or {inner}"
+        )
+    else:
+        fix = (
+            f"change its indices= function to return the chosen expert indices, integers from 0 to "
+            f"{spec.n_experts - 1}, one or {spec.top_k} for each token, or drop indices= and {inner}"
+        )
+    return f"{why}. To count it, {fix}"
+
+
+def _short(error: BaseException) -> str:
+    # One bounded line: it is written into a record and printed in the evidence, which joins
+    # several routers' reasons with "; ".
+    text = " ".join(f"{type(error).__name__}: {error}".split()).replace("; ", ", ")
+    return text if len(text) <= 200 else text[:199] + "…"
+
+
+def _not_indices(idx: Any, device: torch.device) -> str | None:
+    """What makes the `indices=` function's result unusable as expert indices, from its type
+    alone; None when it is an integer tensor on the counts' device."""
+    if not isinstance(idx, torch.Tensor):
+        return f"its indices= function returned {type(idx).__name__}, not a tensor"
+    if idx.is_floating_point() or idx.is_complex() or idx.dtype == torch.bool:
+        return f"its indices= function returned a {str(idx.dtype).removeprefix('torch.')} tensor, not integer expert indices"
+    if idx.device != device:
+        return f"its indices= function returned a tensor on {idx.device}, not on {device} where the counts are"
+    return None
+
+
+def _count_width(spec: Router) -> int:
+    """Slots in a router's counts buffer: one per expert, and for an `indices=` router one more
+    for the indices that match no expert (`_router_hook`, judged in `flush`)."""
+    return spec.n_experts + (spec.indices is not None)
+
+
 def _router_hook(
     counts: torch.Tensor, expert_ids: torch.Tensor, spec: Router, problems: list[str] | None = None
 ) -> Callable[..., None]:
+    def refuse(why: Callable[[], str]) -> None:
+        # Built only the first time: a refused router's hook still runs on every forward, and
+        # the text may format a user's exception or a shape.
+        if problems is not None and not problems:
+            problems.append(why())
+
     def hook(module: nn.Module, args: Any, output: Any) -> None:
         if _recomputing():
             return
         if spec.indices is not None:
-            idx = spec.indices(output)
+            # The user's function: one that raises, or returns what cannot be expert indices,
+            # refuses this router and never raises into training. Checked from types and
+            # shapes only; its values are judged in `flush`, from the last slot of `counts`, after the
+            # copy to the CPU that is made anyway.
+            try:
+                idx = spec.indices(output)
+            except Exception as error:  # noqa: BLE001
+                refuse(lambda: f"its indices= function raised {_short(error)}")
+                return
+            wrong = _not_indices(idx, counts.device)
+            if wrong is not None:
+                refuse(lambda: wrong)
+                return
+            tokens, chosen = _tokens(args), idx.numel()
+            if tokens and type(chosen) is int and (chosen < tokens or chosen % tokens):
+                refuse(lambda: (
+                    f"its indices= function returned shape {tuple(idx.shape)}, which is not expert indices for "
+                    f"the {tokens} tokens it was called on"
+                ))
+                return
         else:
             idx = _first_tensor(output, integer=True)
             if idx is not None:
@@ -175,11 +250,10 @@ def _router_hook(
                 # depends on the data; the session warns once and this router is not counted.
                 tokens, chosen = _tokens(args), idx.numel()
                 if tokens and type(chosen) is int and (chosen < tokens or chosen % tokens):
-                    if problems is not None and not problems:
-                        problems.append(
-                            f"its output's first integer tensor has shape {tuple(idx.shape)}, which is not expert "
-                            f"indices for the {tokens} tokens it was called on"
-                        )
+                    refuse(lambda: (
+                        f"its output's first integer tensor has shape {tuple(idx.shape)}, which is not expert "
+                        f"indices for the {tokens} tokens it was called on"
+                    ))
                     return
             if idx is None:
                 logits = _first_tensor(output, integer=False)
@@ -196,7 +270,14 @@ def _router_hook(
             return
         # Fixed output shape: `bincount` would make the shape depend on the data.
         # Accumulate across gradient-accumulation microbatches; `_commit` zeroes `counts`.
-        counts.add_((idx.detach().reshape(-1, 1) == expert_ids).sum(0))
+        hits = (idx.detach().reshape(-1, 1) == expert_ids).sum(0)
+        if spec.indices is None:
+            counts.add_(hits)
+        else:
+            # An `indices=` router's buffer has a last slot for the indices outside
+            # 0..n_experts-1, which match no expert (`_count_width`): device work only, read in
+            # `flush` with the counts (no sync here). Default routers keep the work they had.
+            counts.add_(torch.cat([hits, (idx.numel() - hits.sum()).reshape(1)]))
 
     return hook
 
@@ -456,7 +537,7 @@ class Session:
         self._weight_dtypes: dict[str, int] = {}
         self._spread: torch.Tensor | None = None
         self._counts = {
-            name: torch.zeros(spec.n_experts, dtype=torch.int64, device=self.device)
+            name: torch.zeros(_count_width(spec), dtype=torch.int64, device=self.device)
             for name, spec in self._routers.items()
         }
         self._expert_ids = {
@@ -1009,19 +1090,47 @@ class Session:
             self._pending_lr = [float(lr)] if isinstance(lr, (int, float)) else [float(v) for v in lr]
         self._commit(step)
 
+    def _router_refusals(self) -> dict[str, str]:
+        """Each refused router's reason: why, and the fixes for how it was named (`_refusal`)."""
+        return {
+            name: _refusal(name, self._routers[name], found[0])
+            for name, found in self._router_problems.items()
+            if found
+        }
+
+    def _say_router_problems(self, stacklevel: int) -> None:
+        for name, reason in self._router_refusals().items():
+            if name not in self._router_problems_said:
+                self._router_problems_said.add(name)
+                warnings.warn(
+                    f"TensorQuill is not counting the router {name!r}: {reason}. Its expert loads are not recorded.",
+                    RuntimeWarning, stacklevel=stacklevel,
+                )
+
+    def _judge_index_ranges(self, counts: torch.Tensor, n: int) -> None:
+        """Refuse an `indices=` router whose function returned indices outside 0..n_experts-1
+        on any step of this block. Read from the counts' last slot, already on the CPU: the
+        check adds no transfer and no sync. Default routers are not judged on their values:
+        their indices come from `topk`/`argmax` of logits, or from an integer tensor that the
+        shape guard alone judges, as before."""
+        offset = 0
+        for name, spec in self._routers.items():
+            width = _count_width(spec)
+            size = n * width
+            if spec.indices is not None and not self._router_problems[name]:
+                outside = counts[offset : offset + size].reshape(n, width)[:, -1].tolist()
+                bad = next((i for i, v in enumerate(outside) if v), None)
+                if bad is not None:
+                    self._router_problems[name].append(
+                        f"its indices= function returned {outside[bad]} value{'s' if outside[bad] != 1 else ''} "
+                        f"outside 0 to {spec.n_experts - 1} at step {self._steps[bad]}, which match no expert"
+                    )
+            offset += size
+
     @torch.no_grad()
     def _commit(self, step: int | None) -> None:
         current = self._next_step if step is None else step
-        for name, found in self._router_problems.items():
-            if found and name not in self._router_problems_said:
-                self._router_problems_said.add(name)
-                warnings.warn(
-                    f"TensorQuill is not counting the router {name!r}: {found[0]}. Its expert loads are not "
-                    f"recorded. Pass routers={{{name!r}: tensorquill.Router(n_experts, top_k, indices=...)}} with a "
-                    "function that returns the chosen expert indices from its output, or name the module inside "
-                    "it whose output is the router's logits.",
-                    RuntimeWarning, stacklevel=3,
-                )
+        self._say_router_problems(stacklevel=4)
         if (
             not self._spread_recorded
             and self._replica_group is not None
@@ -1161,6 +1270,9 @@ class Session:
             if self._ring_counts
             else None
         )
+        if counts is not None:
+            self._judge_index_ranges(counts, n)
+            self._say_router_problems(stacklevel=4)
         spreads = (
             _cpu_copy(self._ring_spread[:n])
             if self._ring_spread is not None and any(self._ring_spread_seen)
@@ -1183,7 +1295,7 @@ class Session:
         # Host-side allocator counters: no GPU work, no sync (system.py).
         system = self._system.flush() if self._system is not None else None
         # Read here, on the training thread, so the block is decided as it is queued.
-        refused = {name: found[0] for name, found in self._router_problems.items() if found}
+        refused = self._router_refusals()
         announce = {name: why for name, why in refused.items() if name not in self._router_refusals_written}
         self._router_refusals_written.update(announce)
         self._ring_ts = []
@@ -1361,9 +1473,10 @@ class Session:
         moe: dict[str, list[list[int]]] = {}
         offset = 0
         for name, spec in self._routers.items():
-            size = n * spec.n_experts
+            width = _count_width(spec)
+            size = n * width
             if not refused or name not in refused:
-                moe[name] = counts[offset : offset + size].reshape(n, spec.n_experts).tolist()
+                moe[name] = counts[offset : offset + size].reshape(n, width)[:, : spec.n_experts].tolist()
             offset += size
 
         records = []
