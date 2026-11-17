@@ -245,6 +245,8 @@ def test_the_command_line_writes_the_results_table(built, tmp_path):
     assert "| B | the Rune viewer app with the run's evidence.json | not run |" in text
     assert "| R | stock Rerun 0.43.2" in text and "| not run |" in text
     assert "Arm B: not run." in text
+    # The validation sets are human trials in arms C and A, so the amended gate is not checked.
+    assert "- C against R: not checked; arms C and R have no agent trials on held-out fixtures." in text
 
 
 def test_finding_nothing_scores_nothing(built):
@@ -390,3 +392,168 @@ def test_the_gate_lines_compare_arms_on_shared_fixtures_only(built):
     files.append(("b2", {**answer(arm="B", trial=3, **{**right, "step": 1}), "tool_calls": 10}))
     lines = harness.gate_checks(harness.score(key, files))
     assert any(line.startswith("Accuracy, B against A on unseen-1:") and line.endswith("FAILS.") for line in lines)
+
+
+# --- The gate as amended Nov 17, 2026: arm C against arm R, agent trials only ------------------
+
+
+def trials(arm, *, calls=10, participant="agent:model-x", fixtures=harness.HELD_OUT, broken=0, break_field="step",
+           name=""):
+    """Three trials per fixture in `arm`, each the perfect set's answer, with `broken` items made wrong.
+
+    Each broken item is one file's `step` (or `location`), never `kind`, which would also cost the
+    questions that count only with the right kind. Every trial has the same tool-call count, so a
+    trial that drops out of the correct set does not move the median.
+    """
+    files = []
+    for trial in (1, 2, 3):
+        for fixture in fixtures:
+            base = json.loads((VALIDATION / "perfect" / f"{fixture}.json").read_text(encoding="utf-8"))
+            base.update(arm=arm, trial=trial, participant=participant, tool_calls=calls)
+            if broken:
+                base["answers"][break_field] = 1  # no fixture's step or layer is 1
+                broken -= 1
+            files.append((f"{name or arm}-{fixture}-{trial}", base))
+    assert broken == 0, "more broken items than files"
+    return files
+
+
+def c_against_r(key, files):
+    lines = harness.evidence_gate_checks(harness.score(key, files))
+    return lines, next(line for line in lines if line.startswith("Gate (C against R"))
+
+
+def part(lines, prefix):
+    return next(line for line in lines if line.startswith(prefix))
+
+
+def test_c_against_r_passes_when_c_is_as_accurate_with_fewer_tool_calls(built):
+    _, key = built
+    files = trials("C", calls=8) + trials("R", calls=12)
+    rows = harness.score(key, files)
+    for arm in ("C", "R"):
+        assert sum(r["scored"] for r in rows if r["arm"] == arm) == 96
+    lines, verdict = c_against_r(key, files)
+    names = ", ".join(harness.HELD_OUT)
+    assert f"Accuracy, C against R on {names}: 96 of 96 (100.0%) against 96 of 96 (100.0%), +0.0 pp: met " \
+           "(C may be at most 5.0 pp behind R)." in lines
+    assert "Median agent tool calls to a correct answer, C against R: 8.0 against 12.0 (18 and 18 correct trials): met " \
+           "(C must be no more than R)." in lines
+    assert verdict == "Gate (C against R, amendment of Nov 17, 2026): PASSES. Both parts must hold."
+    assert "Model: model-x in both arms." in lines
+    assert any(line.startswith("Time limit per trial: not recorded") for line in lines)
+    assert not any("held-out fixtures only" in line for line in lines)  # all six are shared
+
+
+@pytest.mark.parametrize("behind,passes", [(4, True), (5, False)])
+def test_c_may_be_four_items_of_96_behind_r_but_not_five(built, behind, passes):
+    _, key = built
+    for field in ("step", "location"):
+        files = trials("C", broken=behind, break_field=field) + trials("R")
+        lines, verdict = c_against_r(key, files)
+        accuracy = part(lines, "Accuracy, C against R")
+        assert f"{96 - behind} of 96" in accuracy and "96 of 96" in accuracy
+        assert accuracy.endswith("met (C may be at most 5.0 pp behind R).") == passes, accuracy
+        assert "FAILS" not in part(lines, "Median agent tool calls")  # equal medians: only accuracy decides
+        assert verdict.endswith("PASSES. Both parts must hold." if passes else "FAILS. Both parts must hold.")
+    # 4 of 96 is 4.2 points and 5 of 96 is 5.2, as the amendment says.
+    assert f"-{100 * behind / 96:.1f} pp" in accuracy
+
+
+def test_c_against_r_fails_on_tool_calls_alone(built):
+    _, key = built
+    lines, verdict = c_against_r(key, trials("C", calls=13) + trials("R", calls=12))
+    assert part(lines, "Accuracy, C against R").endswith("met (C may be at most 5.0 pp behind R).")
+    assert part(lines, "Median agent tool calls") == ("Median agent tool calls to a correct answer, C against R: "
+                                                      "13.0 against 12.0 (18 and 18 correct trials): FAILS "
+                                                      "(C must be no more than R).")
+    assert "FAILS" in verdict
+
+
+def test_equal_tool_call_medians_pass(built):
+    _, key = built
+    files = trials("C", calls=10) + trials("R", calls=10)
+    # Medians, not means: C's 9, 10, 30 and R's 10, 10, 10 per fixture both have median 10.
+    for i, (_, answer_file) in enumerate(files[:18]):
+        answer_file["tool_calls"] = (9, 10, 30)[i // 6]
+    lines, verdict = c_against_r(key, files)
+    assert "10.0 against 10.0" in part(lines, "Median agent tool calls") and verdict.endswith("PASSES. Both parts must hold.")
+
+
+def test_no_correct_trial_in_c_fails_the_tool_call_part(built):
+    _, key = built
+    # Every C trial has a wrong step; to keep the accuracy part out of it, R loses as many items.
+    files = trials("C", broken=18) + trials("R", broken=18, break_field="location", calls=1)
+    lines, verdict = c_against_r(key, files)
+    assert part(lines, "Accuracy, C against R").endswith("met (C may be at most 5.0 pp behind R).")
+    assert part(lines, "Median agent tool calls") == \
+        "Median agent tool calls to a correct answer: FAILS; arm C has no correct trial."
+    assert "FAILS" in verdict
+    # Neither arm with a correct trial fails too.
+    lines, verdict = c_against_r(key, trials("C", broken=18) + trials("R", broken=18))
+    assert part(lines, "Median agent tool calls").endswith("arm C has no correct trial.") and "FAILS" in verdict
+
+
+def test_no_correct_trial_in_r_and_one_in_c_meets_the_tool_call_part(built):
+    _, key = built
+    files = trials("C", calls=50) + trials("R", broken=18, calls=1)
+    lines, verdict = c_against_r(key, files)
+    assert part(lines, "Median agent tool calls") == \
+        "Median agent tool calls to a correct answer: met; C 50.0, and arm R has no correct trial."
+    assert verdict.endswith("PASSES. Both parts must hold.")
+
+
+def test_c_against_r_counts_only_the_fixtures_both_arms_answered(built):
+    _, key = built
+    # C alone answered unseen-1 and unseen-2, every trial wrong and slow; R alone answered unseen-5 and
+    # unseen-6. Counted, C's unseen-1 and unseen-2 trials would fail both parts.
+    files = (trials("C", fixtures=["unseen-1", "unseen-2"], broken=6, calls=99, name="C-only")
+             + trials("C", fixtures=["unseen-3", "unseen-4"], calls=5)
+             + trials("R", fixtures=["unseen-3", "unseen-4", "unseen-5", "unseen-6"], calls=5))
+    lines, verdict = c_against_r(key, files)
+    assert lines[0] == ("C against R on 2 of the 6 held-out fixtures only (unseen-3, unseen-4); "
+                        "the others lack agent trials in one arm or both.")
+    assert part(lines, "Accuracy, C against R") == ("Accuracy, C against R on unseen-3, unseen-4: 36 of 36 (100.0%) "
+                                                    "against 36 of 36 (100.0%), +0.0 pp: met "
+                                                    "(C may be at most 5.0 pp behind R).")
+    assert "5.0 against 5.0 (6 and 6 correct trials)" in part(lines, "Median agent tool calls")
+    assert verdict.endswith("PASSES. Both parts must hold.")
+
+
+def test_c_against_r_ignores_human_trials_and_the_practice_fixture(built):
+    _, key = built
+    files = trials("C", calls=8) + trials("R", calls=12)
+    # Counted, these would put C 18 items behind R and its median above R's.
+    files += [(f"human-{name}", {**body, "participant": "human:author", "tool_calls": None})
+              for name, body in trials("C", broken=18, name="h")]
+    files += [("practice", {**answer(fixture="seeded", arm="C", kind="none"), "tool_calls": 500})]
+    lines, verdict = c_against_r(key, files)
+    assert "96 of 96 (100.0%) against 96 of 96" in part(lines, "Accuracy, C against R")
+    assert "8.0 against 12.0" in part(lines, "Median agent tool calls")
+    assert verdict.endswith("PASSES. Both parts must hold.")
+    assert "Model: model-x in both arms." in lines  # the human's name is not a model
+    # With only human trials in one arm, the gate is not checked at all.
+    only_humans = [(n, {**b, "participant": "human:author"}) for n, b in trials("R")]
+    assert harness.evidence_gate_checks(harness.score(key, trials("C") + only_humans)) == \
+        ["C against R: not checked; arm R has no agent trials on held-out fixtures."]
+
+
+def test_a_correct_trial_without_a_tool_call_count_leaves_the_part_undecided(built):
+    _, key = built
+    files = trials("C", calls=8) + trials("R", calls=None)
+    lines, verdict = c_against_r(key, files)
+    assert part(lines, "Median agent tool calls") == ("Median agent tool calls to a correct answer: cannot be judged; "
+                                                      "correct agent trials without a tool-call count: 18 in arm R.")
+    assert verdict == ("Gate (C against R, amendment of Nov 17, 2026): not decided, since the tool-call part "
+                       "cannot be judged. Both parts must hold.")
+
+
+def test_the_results_table_says_when_the_models_differ(built):
+    _, key = built
+    files = trials("C", participant="agent:model-x") + trials("R", participant="agent:model-y")
+    lines = harness.evidence_gate_checks(harness.score(key, files))
+    assert ("Model: the arms' answer files differ or mix models (C: model-x; R: model-y). The amendment requires "
+            "the same model in every arm; the verdict above does not account for it.") in lines
+    table = harness.results_table(harness.score(key, files))
+    assert "## Gate 1: arm C against arm R (amendment of Nov 17, 2026; agent trials only)" in table
+    assert "- Model: the arms' answer files differ" in table

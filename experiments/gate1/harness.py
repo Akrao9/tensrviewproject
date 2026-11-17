@@ -512,6 +512,93 @@ def gate_checks(rows: list[dict]) -> list[str]:
     return lines
 
 
+def _model(participant: str) -> str:
+    """The model an agent trial names: the text after `agent:`."""
+    return participant.split(":", 1)[1].strip()
+
+
+def evidence_gate_checks(rows: list[dict]) -> list[str]:
+    """The gate as the amendment of Nov 17, 2026 sets it: arm C (evidence and its summary) against
+    arm R (stock Rerun with the same evidence, summary and `run.rrd`), agent trials only, on the
+    held-out fixtures both arms answered. Both parts must hold:
+
+    1. Accuracy: C's minus R's is -5.0 points or more (at 96 items each, at most 4 items behind).
+    2. Tool calls: C's median agent tool calls to a correct answer is no more than R's. With no
+       correct trial in C the part fails; with none in R and one in C it is met.
+
+    The model is compared and reported beside the verdict; the amendment requires the same model in
+    every arm but gives no rule that changes the verdict, so it does not. The time limit is not in
+    the answer format and is reported as not recorded.
+    """
+    agent = {arm: [r for r in rows if r["arm"] == arm and r["held_out"] and r["agent"]] for arm in ("C", "R")}
+    missing = [arm for arm in ("C", "R") if not agent[arm]]
+    if missing:
+        who = "arms C and R have" if len(missing) == 2 else f"arm {missing[0]} has"
+        return [f"C against R: not checked; {who} no agent trials on held-out fixtures."]
+    shared = {r["fixture"] for r in agent["C"]} & {r["fixture"] for r in agent["R"]}
+    if not shared:
+        return ["C against R: not checked; no held-out fixture has agent trials in both arms."]
+    c = [r for r in agent["C"] if r["fixture"] in shared]
+    r_ = [r for r in agent["R"] if r["fixture"] in shared]
+    names = ", ".join(sorted(shared))
+    lines = []
+    if len(shared) < len(HELD_OUT):
+        lines.append(f"C against R on {len(shared)} of the {len(HELD_OUT)} held-out fixtures only ({names}); "
+                     f"the others lack agent trials in one arm or both.")
+
+    # 1. Accuracy, compared in integers, not rounded percentages:
+    # 100 (cr/cs - rr/rs) >= -5  <=>  100 (cr rs - rr cs) >= -5 cs rs.
+    cr, cs = sum(x["right"] for x in c), sum(x["scored"] for x in c)
+    rr, rs = sum(x["right"] for x in r_), sum(x["scored"] for x in r_)
+    accuracy_ok = (100 * (cr * rs - rr * cs) >= -GATE_ACCURACY_PP * cs * rs)
+    c_acc, r_acc = 100.0 * cr / cs, 100.0 * rr / rs
+    lines.append(f"Accuracy, C against R on {names}: {cr} of {cs} ({c_acc:.1f}%) against {rr} of {rs} ({r_acc:.1f}%), "
+                 f"{c_acc - r_acc:+.1f} pp: {'met' if accuracy_ok else 'FAILS'} (C may be at most 5.0 pp behind R).")
+
+    # 2. Tool calls to a correct answer. "Has a correct trial" is read from `correct`, so a correct
+    # trial without a count can never turn into "R has none".
+    c_correct = [x for x in c if x["correct"]]
+    r_correct = [x for x in r_ if x["correct"]]
+    uncounted = {arm: sum(x["tool_calls"] is None for x in mine) for arm, mine in (("C", c_correct), ("R", r_correct))}
+    c_median = _median([x["tool_calls"] for x in c_correct if x["tool_calls"] is not None])
+    r_median = _median([x["tool_calls"] for x in r_correct if x["tool_calls"] is not None])
+    if not c_correct:
+        calls_ok = False
+        lines.append("Median agent tool calls to a correct answer: FAILS; arm C has no correct trial.")
+    elif any(uncounted.values()):
+        calls_ok = None
+        gaps = ", ".join(f"{n} in arm {arm}" for arm, n in uncounted.items() if n)
+        lines.append(f"Median agent tool calls to a correct answer: cannot be judged; correct agent trials "
+                     f"without a tool-call count: {gaps}.")
+    elif not r_correct:
+        calls_ok = True
+        lines.append(f"Median agent tool calls to a correct answer: met; C {_fmt(c_median)}, and arm R has no "
+                     f"correct trial.")
+    else:
+        calls_ok = c_median <= r_median
+        lines.append(f"Median agent tool calls to a correct answer, C against R: {_fmt(c_median)} against "
+                     f"{_fmt(r_median)} ({len(c_correct)} and {len(r_correct)} correct trials): "
+                     f"{'met' if calls_ok else 'FAILS'} (C must be no more than R).")
+
+    if calls_ok is None:
+        verdict = "not decided, since the tool-call part cannot be judged" + ("" if accuracy_ok else
+                                                                              "; the accuracy part already FAILS")
+    else:
+        verdict = "PASSES" if accuracy_ok and calls_ok else "FAILS"
+    lines.append(f"Gate (C against R, amendment of Nov 17, 2026): {verdict}. Both parts must hold.")
+
+    models = {arm: sorted({_model(x["participant"]) for x in mine}) for arm, mine in (("C", c), ("R", r_))}
+    if models["C"] == models["R"] and len(models["C"]) == 1:
+        lines.append(f"Model: {models['C'][0]} in both arms.")
+    else:
+        lines.append(f"Model: the arms' answer files differ or mix models (C: {', '.join(models['C'])}; "
+                     f"R: {', '.join(models['R'])}). The amendment requires the same model in every arm; "
+                     f"the verdict above does not account for it.")
+    lines.append("Time limit per trial: not recorded in the answer files, so whether it was the same in both arms "
+                 "is not checked here; compare it with the amendment by hand.")
+    return lines
+
+
 def results_table(rows: list[dict]) -> str:
     held = [r for r in rows if r["held_out"]]
     practice = [r for r in rows if not r["held_out"]]
@@ -542,6 +629,8 @@ def results_table(rows: list[dict]) -> str:
             marks = [r["marks"][qid] for r in mine if r["marks"][qid] is not None]
             cells.append(f"{sum(marks)} / {len(marks)}" if marks else "–")
         out.append(f"| {arm} | " + " | ".join(cells) + " |")
+    out += ["", "## Gate 1: arm C against arm R (amendment of Nov 17, 2026; agent trials only)", ""]
+    out += [f"- {line}" for line in evidence_gate_checks(held)]
     out += ["", "## Gate 1 checks (plan Step 9)", ""]
     out += [f"- {line}" for line in gate_checks(held)]
     out += ["", "## Every answer file", "",
