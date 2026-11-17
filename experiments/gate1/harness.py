@@ -565,15 +565,17 @@ def evidence_gate_checks(rows: list[dict]) -> list[str]:
     if not c_correct:
         calls_ok = False
         lines.append("Median agent tool calls to a correct answer: FAILS; arm C has no correct trial.")
+    elif not r_correct:
+        calls_ok = True
+        lines.append(f"Median agent tool calls to a correct answer: met; arm C has {len(c_correct)} correct "
+                     f"trials (median {_fmt(c_median)}), and arm R has no correct trial.")
     elif any(uncounted.values()):
+        # Both arms have correct trials, but not every one has a count: the amendment does not say
+        # how such a trial counts, so the part is left undecided rather than guessed.
         calls_ok = None
         gaps = ", ".join(f"{n} in arm {arm}" for arm, n in uncounted.items() if n)
         lines.append(f"Median agent tool calls to a correct answer: cannot be judged; correct agent trials "
                      f"without a tool-call count: {gaps}.")
-    elif not r_correct:
-        calls_ok = True
-        lines.append(f"Median agent tool calls to a correct answer: met; C {_fmt(c_median)}, and arm R has no "
-                     f"correct trial.")
     else:
         calls_ok = c_median <= r_median
         lines.append(f"Median agent tool calls to a correct answer, C against R: {_fmt(c_median)} against "

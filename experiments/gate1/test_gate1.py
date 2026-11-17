@@ -499,7 +499,13 @@ def test_no_correct_trial_in_r_and_one_in_c_meets_the_tool_call_part(built):
     files = trials("C", calls=50) + trials("R", broken=18, calls=1)
     lines, verdict = c_against_r(key, files)
     assert part(lines, "Median agent tool calls") == \
-        "Median agent tool calls to a correct answer: met; C 50.0, and arm R has no correct trial."
+        "Median agent tool calls to a correct answer: met; arm C has 18 correct trials (median 50.0), and arm R " \
+        "has no correct trial."
+    assert verdict.endswith("PASSES. Both parts must hold.")
+    # Met with no condition on counts: C's correct trials need none when R has no correct trial.
+    lines, verdict = c_against_r(key, trials("C", calls=None) + trials("R", broken=18, calls=1))
+    assert part(lines, "Median agent tool calls") == "Median agent tool calls to a correct answer: met; arm C has " \
+        "18 correct trials (median –), and arm R has no correct trial."
     assert verdict.endswith("PASSES. Both parts must hold.")
 
 
@@ -523,9 +529,14 @@ def test_c_against_r_counts_only_the_fixtures_both_arms_answered(built):
 def test_c_against_r_ignores_human_trials_and_the_practice_fixture(built):
     _, key = built
     files = trials("C", calls=8) + trials("R", calls=12)
-    # Counted, these would put C 18 items behind R and its median above R's.
+    # Counted, the wrong ones would put C 18 items behind R, and the right ones, with 99 calls each,
+    # would lift C's median above R's 12.
     files += [(f"human-{name}", {**body, "participant": "human:author", "tool_calls": None})
               for name, body in trials("C", broken=18, name="h")]
+    files += [(f"human-right-{name}", {**body, "participant": "human:someone", "trial": body["trial"] + 3})
+              for name, body in trials("C", calls=99, name="hr")]
+    files += [(f"human-right2-{name}", {**body, "participant": "human:someone", "trial": body["trial"] + 6})
+              for name, body in trials("C", calls=99, name="hr2")]
     files += [("practice", {**answer(fixture="seeded", arm="C", kind="none"), "tool_calls": 500})]
     lines, verdict = c_against_r(key, files)
     assert "96 of 96 (100.0%) against 96 of 96" in part(lines, "Accuracy, C against R")
