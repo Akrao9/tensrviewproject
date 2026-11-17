@@ -26,7 +26,11 @@ The server has four tools and all four only read: `list_incidents`, `get_inciden
 
 ## When you are woken
 
-You are woken because an evidence file lists a new incident, or because a person asks about a run. Today a person or the team's own script starts you; TensorQuill's own trigger is planned and not built yet.
+You are woken because an evidence file lists a new incident, or because a person asks about a run. A person or the team's own script may start you, or TensorQuill's trigger (`--watch --on-incident` or `--webhook`), which starts you once for each new incident.
+
+The trigger wakes you for an invariant, and for a stall once the server calls it critical: a `job_stalled` or `rank_silent` incident, each an observation, whose `severity` is `critical`. Anomalies and the other observations wake you only if the team asked for them.
+
+When a critical stall woke you, it is still an observation and not a verdict. The server saw no new step for a long time; it cannot tell a hang from a long pause, a killed job or a dead sender. Read the incident's `assessment`, its `stuck_at` (where each stopped rank's main thread was, and for how long it had not moved) and how long each rank has been quiet, say which of those explanations the evidence supports and which it cannot rule out, and take no action on the job.
 
 Work in this order.
 
