@@ -4,14 +4,28 @@
         --on-incident 'my-agent "Explain the $TENSORQUILL_INCIDENT_KIND incident in $TENSORQUILL_EVIDENCE"'
     python -m tensorquill store/runs/r --rank all --watch --webhook https://example.com/hooks/tensorquill
 
-**What fires.** An incident is new when its rank, kind and step have not fired before. Only
-invariants (`evidence.INCIDENT_CLASSES`) fire by default; `--fire-anomalies` adds the anomalies,
-whose thresholds are not tuned on other people's jobs yet, and `--fire-kind KIND` adds one kind
-by name, which is the only way an observation (a stalled job and a silent rank among them) or a
-kind this version does not know fires. A change of run state never fires anything: incidents
-never close, so the state says nothing an incident did not say first. In the all-ranks view an
-incident that several ranks share (one incident group) fires once for the ranks that show it,
-not once a rank; ranks that join the group on a later look fire once more, for those ranks.
+**What fires.** An incident is new when its rank, kind and step have not fired before. By
+default the invariants (`evidence.INCIDENT_CLASSES`) fire, and so does a stall that has reached
+`critical`: a `job_stalled` or `rank_silent` incident (`STALL_KINDS`) whose `severity` is
+`critical`, whatever its `assessment`. `--fire-anomalies` adds the anomalies, whose thresholds
+are not tuned on other people's jobs yet, and `--fire-kind KIND` adds one kind by name, which is
+the only way any other observation, a stall still at `warning`, or a kind this version does not
+know fires. A change of run state never fires anything: incidents never close, so the state says
+nothing an incident did not say first. In the all-ranks view an incident that several ranks share
+(one incident group) fires once for the ranks that show it, not once a rank; ranks that join the
+group on a later look fire once more, for those ranks.
+
+**A stall** is the server's reading of what a run's ranks send (`watchdog.json`), so only a
+watcher of a server's store, or of a file given a status with `watchdog=`, ever lists one. The
+two kinds stay observations: the run state does not move for them, and the class the command
+gets is `observation`. The server calls a stopped rank `critical` after its `--critical-seconds`
+(900) or three of the rank's own silence thresholds, if that is longer, and gives a severity only
+to a rank that is silent, unresponsive or lost: a rank in a declared evaluation or checkpoint
+phase is `paused`, has none, and so cannot make a stall `critical`. A stall named with
+`--fire-kind` fires at `warning` and not again when it becomes `critical`, since the key is the
+same; one not named fires once, when it becomes `critical`. A stall whose kind or step changes
+is another incident and fires again: a silent rank at `critical` whose job then stops altogether
+(`rank_silent`, then `job_stalled`), or a second rank that falls silent at an earlier step.
 
 **What has fired** is kept in a small state file beside the evidence (`run.evidence.json` and
 `run.evidence.compact.json` both give `run.evidence.fired.json`), so a watcher that is
@@ -83,6 +97,10 @@ from .evidence import ALL_RANKS_VIEW, INCIDENT_CLASSES, _group_line, _rank_range
 STATE_VERSION = 1
 PAYLOAD_VERSION = 1
 FIRE_CLASSES = ("invariant",)  # the classes that fire with no option
+# The two stall kinds, read from the server's status. Observations, and still fired with no
+# option once their severity is this: a hung job is what the watcher is left running for.
+STALL_KINDS = ("job_stalled", "rank_silent")
+STALL_FIRES_AT = "critical"
 ATTEMPTS = 4  # tries in all for one incident and one target
 RETRY_SECONDS = 5.0  # before the second try; doubled before each one after
 WEBHOOK_TIMEOUT = 10.0
@@ -131,9 +149,10 @@ class Trigger:
     """Fires once for each new incident of the evidence a watcher writes (see the module's text).
 
     `watch(..., trigger=Trigger("my-command"))` calls `tick()` on every look and
-    `look(evidence, path)` after every write; neither ever raises. `anomalies` adds the
-    anomalies to the invariants, `kinds` any kinds by name. `state_path` replaces the state
-    file beside the evidence. `log` gets each line this prints.
+    `look(evidence, path)` after every write; neither ever raises. Invariants fire, and a
+    stall at `critical` (`STALL_KINDS`); `anomalies` adds the anomalies, `kinds` any kinds by
+    name, a stall at `warning` among them. `state_path` replaces the state file beside the
+    evidence. `log` gets each line this prints.
     """
 
     def __init__(
@@ -250,12 +269,19 @@ class Trigger:
 
     # --- From evidence to firings ----------------------------------------------------------
 
-    def _fires(self, kind: Any) -> bool:
-        return kind in self.kinds or incident_class(kind) in self.classes
+    def _fires(self, incident: Mapping[str, Any]) -> bool:
+        """Whether the options let this incident fire: its kind was named, its class fires, or
+        it is a stall the server calls critical. The severity is the incident's own, which
+        only a stopped rank sets (`evidence._progress_incidents`, and `progress_incidents` in
+        the server's `watchdog.rs`): a paused rank has none. One with no severity does not fire."""
+        kind = incident.get("kind")
+        if kind in self.kinds or incident_class(kind) in self.classes:
+            return True
+        return kind in STALL_KINDS and incident.get("severity") == STALL_FIRES_AT
 
     def _unit(self, incident: Mapping[str, Any], ranks: list[Any], group: Mapping[str, Any]) -> dict[str, Any] | None:
         kind = incident.get("kind")
-        if not self._fires(kind):
+        if not self._fires(incident):
             if incident_class(kind) is None and isinstance(kind, str) and kind not in self._unknown:
                 self._unknown.add(kind)
                 self._log(f"trigger: incident kind {kind!r} is not known to this version, so it has no class and"
@@ -524,8 +550,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "again). It gets the incident as JSON on standard input and TENSORQUILL_EVIDENCE (the evidence file), "
         "TENSORQUILL_INCIDENT_KIND, _CLASS, _STEP, _RANKS, _SUMMARY, _ID and TENSORQUILL_RUN_ID in its environment; "
         "nothing is added to the command line. It is not waited for or stopped, one runs at a time, and a start "
-        "that fails or an exit status other than 0 is tried again on later looks, 4 tries in all. Only invariants "
-        "fire unless --fire-anomalies or --fire-kind says more; a change of run state never fires",
+        "that fails or an exit status other than 0 is tried again on later looks, 4 tries in all. Invariants fire, "
+        "and a stalled job or silent rank once the server calls it critical; --fire-anomalies and --fire-kind add "
+        "more; a change of run state never fires",
     )
     parser.add_argument(
         "--webhook",
@@ -550,7 +577,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=[],
         metavar="KIND",
         help="with --on-incident or --webhook: this kind fires too, whatever its class (repeat the option for more); "
-        "the only way an observation fires, such as job_stalled or rank_silent",
+        "the only way an observation fires, but for a stall: job_stalled and rank_silent fire with no option once "
+        "their severity is critical, and from their warning when named here (once, not again at critical)",
     )
 
 
@@ -574,7 +602,8 @@ def from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Trig
         if kind not in INCIDENT_CLASSES:
             print(f"--fire-kind {kind}: not a kind this version knows ({', '.join(sorted(INCIDENT_CLASSES))});"
                   " it fires only if an incident of exactly that kind is listed")
-    fires = ["invariants", *(["anomalies"] if args.fire_anomalies else []), *sorted(set(args.fire_kind))]
+    fires = ["invariants", "a stall at critical", *(["anomalies"] if args.fire_anomalies else []),
+             *sorted(set(args.fire_kind))]
     targets = [name for name, given in (("the command", args.on_incident), ("the webhook", args.webhook)) if given]
     print(f"trigger: each new incident fires {' and '.join(targets)} once; firing: {', '.join(fires)}", flush=True)
     return trigger
