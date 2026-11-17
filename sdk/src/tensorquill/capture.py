@@ -115,9 +115,13 @@ def _first_tensor(output: Any, *, integer: bool) -> torch.Tensor | None:
     return None
 
 
-def _stats_hook(buf: torch.Tensor, stat_idx: torch.Tensor, row: int) -> Callable[..., None]:
+def _stats_hook(
+    buf: torch.Tensor, stat_idx: torch.Tensor, row: int, phase: _Evaluating | None = None
+) -> Callable[..., None]:
+    phase = phase or _Evaluating()
+
     def hook(module: nn.Module, args: Any, output: Any) -> None:
-        if _recomputing():
+        if _recomputing() or _evaluating(module, phase):
             return
         x = _first_tensor(output, integer=False)
         if x is None or x.numel() == 0:
@@ -163,13 +167,26 @@ def _tokens(args: Any) -> int | None:
     return total // width if type(total) is int else None
 
 
-def _refusal(name: str, spec: Router, why: str) -> str:
+def _refusal(name: str, spec: Router, why: str, fix: str | None = None, device: Any = None) -> str:
     """Why a router is not counted and the two ways to have it counted, as one text: the
     session's warning and the value of `moe_refused` (so the evidence and the server print
     the same words). The fixes depend on how the router was named, which only the capture
-    knows. No "; ": the evidence joins several routers' reasons with it."""
+    knows, and for two reasons on the reason itself (`fix`, set by `_router_hook`): output on
+    another device than the counts (`device`), where the inner module's output would be too,
+    and a `top_k` above the number of experts. No "; ": the evidence joins several routers'
+    reasons with it."""
     inner = "name the module inside it whose output is the router's logits"
-    if spec.indices is None:
+    if fix == "device":
+        fix = (
+            f"pass routers={{{name!r}: tensorquill.Router({spec.n_experts}, {spec.top_k}, indices=...)}} with a "
+            f"function that returns the chosen expert indices from its output on {device}, where the counts are"
+        )
+    elif fix == "top_k":
+        fix = (
+            f"pass routers={{{name!r}: tensorquill.Router(n_experts, top_k)}} with its number of experts and a "
+            f"top_k of at most that number"
+        )
+    elif spec.indices is None:
         fix = (
             f"pass routers={{{name!r}: tensorquill.Router({spec.n_experts}, {spec.top_k}, indices=...)}} with a "
             f"function that returns the chosen expert indices from its output, or {inner}"
@@ -198,6 +215,35 @@ def _not_indices(idx: Any, device: torch.device) -> str | None:
         return f"its indices= function returned a {str(idx.dtype).removeprefix('torch.')} tensor, not integer expert indices"
     if idx.device != device:
         return f"its indices= function returned a tensor on {idx.device}, not on {device} where the counts are"
+    wrong = _unusable(idx, device, "the tensor its indices= function returned")
+    return None if wrong is None else wrong[0]
+
+
+try:  # DTensor (tensor parallelism); absent from builds of PyTorch without torch.distributed
+    from torch.distributed.tensor import DTensor as _DTensor
+except Exception:  # noqa: BLE001
+    _DTensor = None
+# Integer types `==` cannot compare with the int64 expert numbers: it raises, eager and compiled.
+_UNCOMPARABLE = tuple(getattr(torch, name) for name in ("uint16", "uint32", "uint64") if hasattr(torch, name))
+
+
+def _unusable(t: torch.Tensor, device: torch.device, what: str) -> tuple[str, str | None] | None:
+    """What makes a tensor of indices or logits raise in the counting (`_router_hook`), from
+    its type, layout, device and dtype alone: no data, so no sync, and the same under
+    `torch.compile`, where an op that raises fails the trace before any `except` could see
+    it. The reason, and the fix `_refusal` names for it; None when the counting can read the
+    tensor. Only what raises today is refused: nothing counted before is."""
+    if _DTensor is not None and isinstance(t, _DTensor):
+        return f"{what} is a DTensor, not a plain tensor", None
+    if t.is_nested:
+        return f"{what} is a nested tensor", None
+    if t.layout != torch.strided:
+        return f"{what} is a {str(t.layout).removeprefix('torch.')} tensor, not a dense one", None
+    if t.device != device:
+        return f"{what} is on {t.device}, not on {device} where the counts are", "device"
+    if t.dtype in _UNCOMPARABLE or (t.is_floating_point() and t.dtype.itemsize == 1):
+        # uint16/32/64 cannot be compared with int64; PyTorch has no argmax or topk for float8.
+        return f"{what} is {str(t.dtype).removeprefix('torch.')}, which TensorQuill cannot count", None
     return None
 
 
@@ -208,17 +254,27 @@ def _count_width(spec: Router) -> int:
 
 
 def _router_hook(
-    counts: torch.Tensor, expert_ids: torch.Tensor, spec: Router, problems: list[str] | None = None
+    counts: torch.Tensor,
+    expert_ids: torch.Tensor,
+    spec: Router,
+    problems: list[tuple[str, str | None]] | None = None,
+    phase: _Evaluating | None = None,
 ) -> Callable[..., None]:
-    def refuse(why: Callable[[], str]) -> None:
-        # Built only the first time: a refused router's hook still runs on every forward, and
-        # the text may format a user's exception or a shape.
-        if problems is not None and not problems:
-            problems.append(why())
+    """The forward hook that adds a router's chosen experts to `counts`. Nothing in it raises
+    into training: what cannot be counted refuses the router for the session (`problems`,
+    said once by the session and written under `moe_refused`), first from types, layouts,
+    devices and shapes alone, so the same under `torch.compile`, and in eager mode from any
+    exception left, which is caught. A forward that is not training (`_evaluating`) is left
+    out before anything is read, so an evaluation batch is neither counted nor refused."""
+    phase = phase or _Evaluating()
 
-    def hook(module: nn.Module, args: Any, output: Any) -> None:
-        if _recomputing():
-            return
+    def refuse(why: Callable[[], str], fix: str | None = None) -> None:
+        # Built only the first time: a refused router's hook still runs on every forward, and
+        # the text may format a user's exception or a shape. `fix` picks the fix `_refusal` names.
+        if problems is not None and not problems:
+            problems.append((why(), fix))
+
+    def count(args: Any, output: Any) -> None:
         if spec.indices is not None:
             # The user's function: one that raises, or returns what cannot be expert indices,
             # refuses this router and never raises into training. Checked from types and
@@ -255,19 +311,40 @@ def _router_hook(
                         f"indices for the {tokens} tokens it was called on"
                     ))
                     return
-            if idx is None:
+                # One the counting below would raise on (another device than the counts, say).
+                wrong = _unusable(idx, counts.device, "its output's first integer tensor")
+                if wrong is not None:
+                    refuse(lambda: wrong[0], wrong[1])
+                    return
+            else:
                 logits = _first_tensor(output, integer=False)
-                if logits is not None and logits.ndim >= 1 and logits.shape[-1] == spec.n_experts:
-                    # Detached, so the hook saves nothing for backward: non-reentrant
-                    # checkpointing checks that recomputation saves the same tensors.
-                    logits = logits.detach()
-                    idx = (
-                        logits.argmax(dim=-1)
-                        if spec.top_k <= 1
-                        else logits.topk(spec.top_k, dim=-1).indices
-                    )
-        if idx is None:
-            return
+                if logits is None:
+                    # No tensor to read: nothing is counted and nothing refused, as before.
+                    return
+                # Logits of another width are not this router's: counting nothing would write
+                # zeros that read as a router that routed no token.
+                if logits.ndim < 1 or logits.shape[-1] != spec.n_experts:
+                    refuse(lambda: (
+                        f"its output has no integer tensor and its first floating-point tensor has shape "
+                        f"{tuple(logits.shape)}, which is not logits for its {spec.n_experts} experts"
+                    ))
+                    return
+                if spec.n_experts < max(spec.top_k, 1):
+                    # `topk` would raise (and `argmax` over no experts).
+                    refuse(lambda: f"its top_k is {spec.top_k} but it has {spec.n_experts} experts", "top_k")
+                    return
+                wrong = _unusable(logits, counts.device, "its output's first floating-point tensor")
+                if wrong is not None:
+                    refuse(lambda: wrong[0], wrong[1])
+                    return
+                # Detached, so the hook saves nothing for backward: non-reentrant
+                # checkpointing checks that recomputation saves the same tensors.
+                logits = logits.detach()
+                idx = (
+                    logits.argmax(dim=-1)
+                    if spec.top_k <= 1
+                    else logits.topk(spec.top_k, dim=-1).indices
+                )
         # Fixed output shape: `bincount` would make the shape depend on the data.
         # Accumulate across gradient-accumulation microbatches; `_commit` zeroes `counts`.
         hits = (idx.detach().reshape(-1, 1) == expert_ids).sum(0)
@@ -278,6 +355,20 @@ def _router_hook(
             # 0..n_experts-1, which match no expert (`_count_width`): device work only, read in
             # `flush` with the counts (no sync here). Default routers keep the work they had.
             counts.add_(torch.cat([hits, (idx.numel() - hits.sum()).reshape(1)]))
+
+    def hook(module: nn.Module, args: Any, output: Any) -> None:
+        if _recomputing() or _evaluating(module, phase):
+            return
+        if torch.compiler.is_compiling():
+            # No `try` in a traced hook: the checks above are what keep it from raising there.
+            count(args, output)
+            return
+        try:
+            count(args, output)
+        except Exception as error:  # noqa: BLE001
+            # What the checks above do not foresee (an unusual tensor type, say) refuses the
+            # router as they do, and training goes on.
+            refuse(lambda: f"counting its output raised {_short(error)}")
 
     return hook
 
@@ -376,6 +467,41 @@ def _recomputing() -> bool:
     compilation the check is skipped: a compiled forward is never a recomputation.
     """
     return not torch.compiler.is_compiling() and torch._C._current_graph_task_id() != -1
+
+
+class _Evaluating:
+    """Whether the session's phase is `"eval"` (`Session.set_phase`), shared with its hooks.
+    An attribute of an object of its own, so a hook that reads it guards on one bool. Set
+    on the instance from the start: one that moved from the class to the instance at the
+    first `set_phase` would fail the guard and compile the training graph again."""
+
+    def __init__(self) -> None:
+        self.on = False
+
+
+def _evaluating(module: nn.Module, phase: _Evaluating) -> bool:
+    """True for a forward that is not training: one whose statistics belong to no optimizer
+    step, so they must not reach the next step's record.
+
+    Lightning and the Hugging Face `Trainer` evaluate with the model in eval mode and without
+    gradients (`torch.no_grad` or `torch.inference_mode`), as most hand-written loops do, so
+    the two together mark an evaluation without anything from the user. Neither alone does:
+    reentrant activation checkpointing runs a training forward without gradients, and some
+    training keeps modules in eval mode (frozen blocks, dropout turned off). Under
+    `session.phase("eval")` (which the Lightning and Hugging Face callbacks set), either one
+    is enough. The phase alone never is: a training forward in train mode with gradients
+    counts even under a phase left behind by a callback that missed its end.
+
+    What is read is ordered for `torch.compile`, where each value read becomes a guard.
+    Dynamo always guards on grad mode, but on a module's `training` only when something
+    reads it. With gradients on, the phase flag is read first and `training` only under the
+    eval phase, so `model.eval()` alone compiles nothing that the model without the hooks
+    would not; the training graph gains one guard, on the flag. With gradients off (a new
+    graph anyway), `training` is read first and the flag only in train mode.
+    """
+    if torch.is_grad_enabled():
+        return phase.on and not module.training
+    return not module.training or phase.on
 
 
 def _clip_grad_norm_wrapper(parameters: Any, *args: Any, **kwargs: Any) -> Any:
@@ -515,7 +641,8 @@ class Session:
         # why under `moe_refused`. Not per step: the guard reads shapes, so a short batch
         # can let through a step it would refuse at full size, and that step's counts would
         # be the same misread.
-        self._router_problems: dict[str, list[str]] = {name: [] for name in self._routers}
+        # Each problem is (why, which fix `_refusal` names, None for the usual two).
+        self._router_problems: dict[str, list[tuple[str, str | None]]] = {name: [] for name in self._routers}
         self._router_problems_said: set[str] = set()
         self._router_refusals_written: set[str] = set()
         unknown = [name for name in self._routers if name not in modules]
@@ -570,13 +697,18 @@ class Session:
         for buf in (self._act, self._stat_idx, *self._counts_list, *self._expert_ids.values()):
             _mark_static(buf)
 
+        # Forwards that are not training (evaluation, the probe) are left out by the hooks
+        # (`_evaluating`); this says whether the session's phase is "eval" (`set_phase`).
+        self._evaluating = _Evaluating()
         self._handles = [
-            module.register_forward_hook(_stats_hook(self._act, self._stat_idx, row))
+            module.register_forward_hook(_stats_hook(self._act, self._stat_idx, row, self._evaluating))
             for row, (_, module) in enumerate(selected)
         ]
         self._handles += [
             modules[name].register_forward_hook(
-                _router_hook(self._counts[name], self._expert_ids[name], spec, self._router_problems[name])
+                _router_hook(
+                    self._counts[name], self._expert_ids[name], spec, self._router_problems[name], self._evaluating
+                )
             )
             for name, spec in self._routers.items()
         ]
@@ -1093,7 +1225,7 @@ class Session:
     def _router_refusals(self) -> dict[str, str]:
         """Each refused router's reason: why, and the fixes for how it was named (`_refusal`)."""
         return {
-            name: _refusal(name, self._routers[name], found[0])
+            name: _refusal(name, self._routers[name], *found[0], device=self._counts[name].device)
             for name, found in self._router_problems.items()
             if found
         }
@@ -1121,10 +1253,11 @@ class Session:
                 outside = counts[offset : offset + size].reshape(n, width)[:, -1].tolist()
                 bad = next((i for i, v in enumerate(outside) if v), None)
                 if bad is not None:
-                    self._router_problems[name].append(
+                    self._router_problems[name].append((
                         f"its indices= function returned {outside[bad]} value{'s' if outside[bad] != 1 else ''} "
-                        f"outside 0 to {spec.n_experts - 1} at step {self._steps[bad]}, which match no expert"
-                    )
+                        f"outside 0 to {spec.n_experts - 1} at step {self._steps[bad]}, which match no expert",
+                        None,
+                    ))
             offset += size
 
     @torch.no_grad()
@@ -1329,8 +1462,11 @@ class Session:
     def set_phase(self, phase: str = "train") -> None:
         """Say what the process is doing: `"train"` (the default), `"eval"`, `"checkpoint"`, or
         any short word. While it is not `"train"` and its heartbeats go on, the server does
-        not call the missing steps a hang. A no-op unless streaming with `endpoint=`."""
+        not call the missing steps a hang. Under `"eval"`, a forward in eval mode or without
+        gradients is also left out of the records (`_evaluating`); without it, only one with
+        both. Otherwise a no-op unless streaming with `endpoint=`."""
         self._phase = phase
+        self._evaluating.on = phase == "eval"
         heartbeat = getattr(self._sink, "heartbeat", None)
         if heartbeat is not None:
             heartbeat.set_phase(phase)
