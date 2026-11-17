@@ -191,4 +191,23 @@ The arm labels on these two sets (C and A) only exercise the table; they say not
 
 ## Amendments
 
-None yet.
+### Nov 16, 2026: the summary's count line says which kinds are short of history
+
+Entered before any trial was run. It changes what arms C and R are shown (`summary.txt`, and `kind_checks` in `evidence.json`). It changes no question, no answer key and no scoring.
+
+- **What changed.** Each kind in `kind_checks` now carries `enough_history`, and the 25 kinds read from step records carry `records_needed` beside `records`. The summary's count line names the checked kinds whose rule has not had enough history. This is the plan's decision "Enough history".
+- **Why it shows here.** The five MoE fixtures are 4 to 31 records long, and `moe_imbalance` needs 11 records and `starved_experts` 50. The two dense fixtures have 400 records and their line is unchanged.
+
+| Fixture | Records | The count line in `summary.txt` |
+| --- | --- | --- |
+| `seeded` | 4 | `3 of 32 kinds checked, 2 of them without enough history yet (moe_imbalance 4 of 11 records but reported by a faster rule, starved_experts 4 of 50), 29 not configured` |
+| `unseen-1` | 8 | the same, with `8 of 11` and `8 of 50` |
+| `unseen-3` | 31 | `3 of 32 kinds checked, 1 of them without enough history yet (starved_experts 31 of 50 records), 29 not configured` |
+| `unseen-4` | 9 | as `seeded`, with `9 of 11` and `9 of 50` |
+| `unseen-6` | 7 | as `seeded`, with `7 of 11` and `7 of 50` |
+| `unseen-2`, `unseen-5` | 400 | `7 of 32 kinds checked, 25 not configured`, as before |
+
+- **What did not change.** The incidents, the per-step samples and the run state of all seven fixtures are identical (the golden files hold them, and a script compared each file with the commit before). The line before this amendment read `3 of 32 kinds checked, 29 not configured` on the five MoE fixtures.
+- **"Records needed" is what a kind's slowest rule needs (decided by the author Nov 16, 2026).** The field exists to stop an agent reading "nothing found" as healthy, which only works if "enough history" means every rule of the kind could have fired. With the fastest rule, `moe_imbalance` would say "enough" after one record while the rule that judges a Granite-style router still needs 11.
+- **What a participant may make of it.** In four fixtures `moe_imbalance` is both reported and marked short of history. The incident was found by a rule of the kind that needs fewer records, the line says "but reported by a faster rule", and the incident stands. A participant who doubts the incident because of the clause is reading it wrongly. No question asks about the clause, and it is not scored.
+- **Checked.** `test_gate1.py` (44 tests) and `experiments/moe-bakeoff/test_fixtures.py` (37 tests) pass unchanged. Not run: a trial with an agent or a person.
