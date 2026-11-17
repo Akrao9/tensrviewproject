@@ -291,9 +291,9 @@ def test_in_the_all_ranks_view_a_shared_incident_fires_once_for_its_ranks(tmp_pa
     second = calls()[1]["payload"]
     assert (second["ranks"], second["new_ranks"], second["id"]) == ([0, 1, 2, 3], [2, 3], "r/ranks2-3/non_finite/5")
 
-    # Incidents of the whole run: an invariant fires with no rank; an observation does not, and
-    # a stall is one until the server calls it critical (it was the only way before Nov 16, 2026
-    # that a stall never fired unless named: see the tests under "A stall" below).
+    # Incidents of the whole run: an invariant fires with no rank. An observation does not, and
+    # a stall at `warning` is one of those. (Before Nov 16, 2026 this block held that a stall
+    # never fires unless named; the rule now is in the tests under "A stall" below.)
     hang = {"kind": "collective_hang", "class": "invariant", "step": 9}
     stall = {"kind": "job_stalled", "class": "observation", "step": 9, "ranks": [], "severity": "warning"}
     throttled = {"kind": "gpu_throttled", "class": "observation", "step": 9}
@@ -883,6 +883,59 @@ def test_watchers_of_a_servers_store_fire_once_for_one_rank_and_once_for_all_ran
         store.STARTED.clear()
 
 
+# --- A stream that goes quiet altogether, and a real server -------------------------------------
+
+
+def test_ranks_that_send_nothing_at_all_still_reach_critical_and_fire_once(tmp_path, hook):
+    """Two streams stay open and nothing arrives on them, not a step and not a heartbeat: the
+    server's own timer takes the stall from `warning` to `critical`, and the all-ranks watcher
+    fires once, then. Needs `pyarrow` and the server binary, as `test_watch_all_ranks.py` does."""
+    pytest.importorskip("pyarrow.flight")
+    import test_watch_all_ranks as store
+    from test_server_reports import QUICK_STATUS
+
+    if store.BINARY is None:
+        pytest.skip("tensorquill-server is not built")
+    command, calls = hook
+    # Silent after 1 s, critical after 4 s; nothing but the server's timer moves the status.
+    run = store.Run(tmp_path, *store.FAST, *QUICK_STATUS, "--silent-seconds", "1", "--silent-factor", "0",
+                    "--critical-seconds", "4")
+    senders = []
+    try:
+        senders = [run.keep_open(rank, store.steady(60)) for rank in range(2)]
+        trigger = Trigger(command())
+        seen = []
+
+        def on_update(evidence, path):
+            stalls = [i["severity"] for i in evidence["run_incidents"] if i["kind"] == "job_stalled"]
+            seen.append((stalls, len(trigger.deliveries), [r["stream"].get("heartbeat_age_seconds") for r in evidence["ranks"]]))
+
+        watch(run.folder, tmp_path / "all.json", interval=0.2, polls=45, rank="all", trigger=trigger, on_update=on_update)
+        assert _settle(trigger, lambda: len(calls()) == 1)
+    finally:
+        for sender in senders:
+            sender.close(0.0)
+        for server in store.STARTED:
+            if server.process.poll() is None:
+                server.process.kill()
+                server.process.wait(20)
+            if not server.process.stdout.closed:
+                server.process.stdout.close()
+        store.STARTED.clear()
+    # What was written, in order: healthy, the stall at warning, the stall at critical (each as
+    # often as something else in the status changed, such as the second rank's own severity).
+    # Nothing had fired when a look without the stall or with it at warning was written, nor when
+    # it was first written at critical; and no heartbeat was ever sent.
+    order = [stalls for n, (stalls, _, _) in enumerate(seen) if n == 0 or stalls != seen[n - 1][0]]
+    assert order == [[], ["warning"], ["critical"]], seen
+    assert all(fired == 0 for stalls, fired, _ in seen if stalls != ["critical"]), seen
+    assert next(fired for stalls, fired, _ in seen if stalls == ["critical"]) == 0
+    assert all(age == [None, None] for _, _, age in seen)
+    assert _stall_calls(calls) == [("job_stalled", 59, "critical")]
+    (delivery,) = trigger.deliveries
+    assert (delivery["ranks"], delivery["command"]["attempts"]) == ([None], 1)
+
+
 # --- A real hang: a rank that stops stepping while its process lives, and a real server ---------
 
 # One rank as a launcher starts it. It steps, then stops stepping without closing: its process,
@@ -893,7 +946,7 @@ import torch, tensorquill
 from torch import nn
 
 model = nn.Linear(8, 1)
-# `every=10`: steps leave the device ten at a time, so all 40 are in the file before the stop.
+# `every=10`: steps leave the device ten at a time, so every step is in the file before the stop.
 session = tensorquill.init(model, run_id=os.environ["TQ_RUN_ID"], every=10, heartbeat_seconds=0.5, stack_seconds=1.0)
 session._sink.sender._batch_seconds, session._sink.sender._backoff_cap = 0.25, 0.5
 optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -912,9 +965,9 @@ def stuck_here():
 
 stuck_here()
 """
-# Silent after 2 s without a step, critical after 9 s; the status is looked at every 0.2 s and
+# Silent after 2 s without a step, critical after 10 s; the status is looked at every 0.2 s and
 # an unchanged one is written again every 0.6 s.
-_STALL_SERVER = ("--silent-seconds", "2", "--silent-factor", "0", "--critical-seconds", "9",
+_STALL_SERVER = ("--silent-seconds", "2", "--silent-factor", "0", "--critical-seconds", "10",
                  "--watchdog-seconds", "0.2", "--flush-seconds", "0.3")
 
 
@@ -996,11 +1049,13 @@ def test_a_real_rank_that_stops_stepping_starts_the_command_once_when_the_server
         rank = subprocess.Popen(
             [sys.executable, "-c", _STALLING_RANK], cwd=work, stdout=rank_log, stderr=subprocess.STDOUT,
             env={**clean, "RANK": "0", "LOCAL_RANK": "0", "WORLD_SIZE": "1", "TENSORQUILL_ENDPOINT": server.endpoint,
-                 "TQ_RUN_ID": run_id, "TQ_STEPS": "40", "PYTHONUNBUFFERED": "1"},
+                 "TQ_RUN_ID": run_id, "TQ_STEPS": "300", "PYTHONUNBUFFERED": "1"},
         )
         processes.append(rank)
         until(lambda: status().get("summary") == "active" and status()["ranks"][0]["last_step"] is not None,
               "the rank's first stored steps")
+        # Started while the rank is still stepping (300 steps take 3 s or more), so each has its
+        # first look behind it before the stall begins.
         watchers = {name: watcher(name) for name in outputs}
 
         # The rank stops stepping. The server calls it silent, a warning, and both watchers write
@@ -1013,8 +1068,9 @@ def test_a_real_rank_that_stops_stepping_starts_the_command_once_when_the_server
         assert rank.poll() is None  # its process lives
         last_step = status()["ranks"][0]["last_step"]
 
-        # No rank sends anything, and the server goes on writing its status: that is how the
-        # severity reaches a watcher of a job that sends nothing more.
+        # No step arrives (the rank's heartbeats do, every 0.5 s), and the server goes on writing
+        # its status: three more writes are seen here. That is how the severity reaches a watcher
+        # of a job that takes no more steps.
         written = {status().get("written_at_ms")}
         until(lambda: written.add(status().get("written_at_ms")) or len(written) >= 4, "the status written again")
 

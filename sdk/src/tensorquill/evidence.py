@@ -1785,7 +1785,9 @@ def thresholds_line(evidence: Mapping[str, Any]) -> str | None:
     It reads what the evidence lists as applied: `detection.thresholds` for one rank of a
     server's store, whether the server judged or this process did, and `thresholds` in the
     all-ranks view, or every set of `thresholds_by_rank` with its ranks when the judged ranks
-    differ. Evidence that lists none (a local file, whose options the caller typed) gives None.
+    differ. Evidence with neither gives None. That is a local file's (`build_evidence`): there
+    the caller gave the options itself, and the evidence holds three of the five as keys of
+    their own (`overload_threshold`, `starve_window`, `starve_ratio`) and not the other two.
     """
     if evidence.get("view") == ALL_RANKS_VIEW:
         who = "the server applied"
