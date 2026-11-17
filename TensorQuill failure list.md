@@ -9,7 +9,7 @@ Each entry says whether the loss curve shows the problem, how it was noticed and
 | # | Failure | Loss curve shows it? | TensorQuill today | Priority |
 | --- | --- | --- | --- | --- |
 | 1 | Replicated weights drift apart across GPUs | No | Built (`replica_every=50`), two-GPU NCCL run pending | High |
-| 2 | Silent data corruption on a faulty GPU | Usually not | Same detector as 1 | High |
+| 2 | Silent data corruption on a faulty GPU | Usually not | Partly: the replica check sees corruption that leaves replicas different (in the optimizer step or in memory). A corrupted gradient reaches every replica alike and is not seen | High |
 | 3 | MoE routing collapse: dead or overloaded experts | No, or late | Detected (top-k diversity drop and 50-step starved window) | High |
 | 4 | Weights not updating at all | Flat or slow loss, cause unclear | Detected (50-step float64 weight check, 3 unchanged checks; each parameter named at its own onset) | High |
 | 5 | Loss spikes from gradient outliers | Yes, but not the cause | Detected (5× 50-step median on `clip_grad_norm` or `grad_norm`, or one parameter at 5× its own median 3 steps in a row) | High |
@@ -40,13 +40,13 @@ Each kind is an invariant, an anomaly or an observation (`INCIDENT_CLASSES`, Nov
 
 ### 2. Silent data corruption on a faulty GPU
 
-**What happened.** A faulty GPU computes wrong values without raising an error. Meta attributed 6 of 419 unexpected interruptions in a 54-day Llama 3 405B snapshot to silent data corruption. A study of faulty nodes found pre-training loss stayed close to healthy nodes while parameters drifted gradually; fine-tuning sometimes produced spikes or, in one case, zero test accuracy. Faults that flip exponent or sign bits can cause NaNs, short spikes, or lasting parameter divergence.
+**What happened.** A faulty GPU computes wrong values without raising an error. Meta attributed 6 of 419 unexpected interruptions in a 54-day Llama 3 405B snapshot to silent data corruption. A study of faulty nodes found pre-training loss stayed close to healthy nodes while parameters drifted gradually away from a separate healthy run of the same job (not from the other replicas inside one job); fine-tuning sometimes produced spikes or, in one case, zero test accuracy. Faults that flip exponent or sign bits can cause NaNs, short spikes, or lasting parameter divergence.
 
 **How it is noticed.** Production teams hash or compare weights across data-parallel replicas (Laguna) or compare outputs of replicas that saw the same batch (SDCHunter, which reports 40 incidents caught and says synthetic GEMM stress tests miss over 60% of faulty GPUs).
 
-**Signal.** The same cross-replica fingerprints as entry 1, plus NaN and spike detection.
+**Signal.** It depends on where the wrong value enters. Corruption in the optimizer step, in memory, or anywhere after the gradients are reduced leaves one replica different from the others, and the cross-replica fingerprints of entry 1 see it. A corrupted gradient is different: it is reduced with the others and the same wrong result goes back to every rank, so "the corrupted value no longer identifies its source" (SCOUT, p. 1) and the replicas stay equal. Finding that takes recomputing and comparing: SCOUT replays a sampled layer on every replica and compares the outputs, and SDCHunter compares outputs of replicas that saw the same batch. NaN and spike detection catch only the loud cases.
 
-**TensorQuill today.** Same detector as entry 1. The default tolerance of 1e-6 is a guess and must be checked against healthy multi-GPU runs, where nondeterminism alone may exceed it.
+**TensorQuill today.** Partly. `replica_drift` (entry 1) reports corruption that makes one replica's weights differ. It does not see a corrupted gradient, because every replica then applies the same wrong update: equal replicas do not rule out corruption. Nothing in TensorQuill replays a computation to compare it (corrected Nov 17, 2026; this entry used to say "same detector as entry 1"). The default tolerance of 1e-6 is a guess and must be checked against healthy multi-GPU runs, where nondeterminism alone may exceed it.
 
 ### 3. MoE routing collapse
 
@@ -104,9 +104,9 @@ Each kind is an invariant, an anomaly or an observation (`INCIDENT_CLASSES`, Nov
 
 **How it is noticed.** Per-layer kurtosis or the ratio of the maximum to a typical value; sustained low kurtosis predicted stable FP8 training in one study.
 
-**Signal.** A fourth-moment (kurtosis) statistic per layer, which is as cheap as the statistics TensorQuill already computes.
+**Signal.** Kurtosis as the FP8 study defines it: the fourth moment over the squared variance of each token's vector, not centred, averaged over all tokens (p. 5). That is one more pass over each output than TensorQuill makes today. In the one diverging run the study shows, the early sign was in the query, key and value tensors: their kurtosis left its trend at about 3B tokens, the gradient norm spiked from 12B and the loss diverged at 15B (p. 6).
 
-**TensorQuill today.** Detected in full capture, relative to each module's own history: a sudden jump in the largest value or spread (5× the recent median), and drift of the outlier ratio `abs_max / std` or of the spread (3× from the module's early level). Healthy Granite raises nothing, although its middle blocks already carry outliers 740–840 times the standard deviation. Kurtosis is not captured; `abs_max / std` tracks the same outliers without a second pass over each output. **Limit (A100, SmolLM2-360M, Nov 15, 2026):** the summary is of the whole block output, so on a model that already has massive activations (`abs_max` about 20,000, `std` 31 to 37) two ordinary channels scaled 100× moved it 1.1 times and were not reported, although the loss went from 2.3 to 6.9; growth of the massive channels or of the whole block is reported. Per-channel statistics would see it and are not captured. A spike that reaches many blocks lists the first one in the model first, then the rest by ratio, since a change in one block travels down the residual stream and the largest ratio is in the last block.
+**TensorQuill today.** Detected in full capture, relative to each module's own history: a sudden jump in the largest value or spread (5× the recent median), and drift of the outlier ratio `abs_max / std` or of the spread (3× from the module's early level). Healthy Granite raises nothing, although its middle blocks already carry outliers 740–840 times the standard deviation. Kurtosis is not captured, and `abs_max / std` is not a stand-in for it: the ratio is taken over a whole block output and is set by its single largest value, where the study's kurtosis is per token and averaged, and its early sign was on the query, key and value tensors, which TensorQuill does not hook. TensorQuill makes no claim to that early sign (corrected Nov 17, 2026; this entry used to say the ratio "tracks the same outliers"). **Limit (A100, SmolLM2-360M, Nov 15, 2026):** the summary is of the whole block output, so on a model that already has massive activations (`abs_max` about 20,000, `std` 31 to 37) two ordinary channels scaled 100× moved it 1.1 times and were not reported, although the loss went from 2.3 to 6.9; growth of the massive channels or of the whole block is reported. Per-channel statistics would see it and are not captured. A spike that reaches many blocks lists the first one in the model first, then the rest by ratio, since a change in one block travels down the residual stream and the largest ratio is in the last block.
 
 ### 9. NaN or Inf
 
@@ -198,6 +198,7 @@ Questions that help:
 - [Understanding Silent Data Corruption in LLM Training](https://arxiv.org/html/2502.12340v1)
 - [Exploring Silent Data Corruption as a Reliability Challenge in LLM Training](https://arxiv.org/abs/2604.00726)
 - [SDCHunter, OSDI '26](https://www.usenix.org/system/files/osdi26-zheng.pdf)
+- [SCOUT: Symmetric Consensus Outlier Detection for Failure Localization in LLM Pre-Training](https://arxiv.org/abs/2608.11034), read Nov 17, 2026 (pp. 1–3)
 - [Laguna M.1/XS.2 Technical Report](https://arxiv.org/pdf/2605.27605)
 - [DeepSeek-V3 Technical Report](https://arxiv.org/pdf/2412.19437)
 - [Z-loss in LLMs: a story of expert collapse and specialization](https://alltoall.notion.site/z-loss-in-llms-a-story-of-expert-collapse-and-specialization)
