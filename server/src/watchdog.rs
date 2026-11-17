@@ -1186,6 +1186,15 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
             .min()
             .unwrap_or(newest));
         incident["ranks"] = json!(stopped);
+        // The ranks that are not stopped, briefly, as Python's `_progress_incidents` lists them.
+        incident["other_ranks"] = ranks
+            .iter()
+            .filter(|rank| !matches!(state(rank).as_str(), "silent" | "lost" | "unresponsive"))
+            .map(|rank| {
+                json!({"rank": rank["rank"], "state": rank["state"], "last_step": rank["last_step"], "attempt": rank["attempt"]})
+            })
+            .collect::<Vec<_>>()
+            .into();
         incident["newest_step"] = json!(newest);
     }
     vec![incident]
@@ -1311,6 +1320,12 @@ mod tests {
                 vec![rank(0, "active", 90), rank(1, "lost", 40), rank(2, "silent", 60)]
             ))),
             (json!("rank_silent"), json!("suspected_hang"), Some(json!([1])))
+        );
+        // `rank_silent` lists the ranks that are not stopped, briefly, as Python does.
+        let silent = incidents(&status("degraded", vec![rank(0, "active", 90), rank(2, "silent", 60)]));
+        assert_eq!(
+            silent[0]["other_ranks"],
+            json!([{"rank": 0, "state": "active", "last_step": 90, "attempt": null}])
         );
         // No lost rank: a suspected hang, with no `lost_ranks`.
         assert_eq!(

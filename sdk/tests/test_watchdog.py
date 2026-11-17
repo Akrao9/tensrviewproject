@@ -672,6 +672,8 @@ def test_a_lost_rank_labels_the_stall_when_it_explains_it():
     assert _rule("degraded", (0, "active", 90), (1, "lost", 40), (2, "silent", 60)) == (
         "rank_silent", "suspected_hang", [1])
     assert _rule("stalled", (0, "silent", 40)) == ("job_stalled", "suspected_hang", None)
+    [silent] = detect_watchdog_incidents(_status("degraded", [_rank(0, "active", 90), _rank(2, "silent", 60, severity="critical")]))
+    assert silent["other_ranks"] == [{"rank": 0, "state": "active", "last_step": 90, "attempt": 1}]
     # The summary says it is not a hang, and names the lost rank; a suspected hang keeps its sentence.
     text = _text(detect_watchdog_incidents(_status("degraded", [_rank(0, "active", 90), _rank(1, "lost", 40, stream="dropped", severity="critical")])))
     assert "The connection of rank 1 dropped and did not come back: read as a lost connection, not a hang." in text

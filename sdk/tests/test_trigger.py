@@ -636,18 +636,16 @@ def test_a_silent_rank_beside_stepping_ranks_is_one_episode_and_a_rank_that_join
     for newest in range(90, 300, 10):
         fired = run.look("degraded", _ranked(0, "active", newest), _ranked(1, "silent", 40), _ranked(2, "active", newest))
         assert fired == (1 if newest == 90 else 0)
-    # Rank 2 falls silent too: it joins. Rank 1 then recovers while rank 2 is still critical: the
-    # episode goes on, since a rank of it is still where it stopped. Nothing fires.
+    # Rank 2 falls silent too: it joins. Rank 1 then recovers while rank 2 is still critical:
+    # rank 1 stored a step beyond the one it stalled at, so the episode is over, and rank 2's
+    # stall fires, once.
     assert run.look("degraded", _ranked(0, "active", 300), _ranked(1, "silent", 40), _ranked(2, "silent", 290)) == 0
-    assert run.look("degraded", _ranked(0, "active", 310), _ranked(1, "active", 310), _ranked(2, "silent", 290)) == 0
-    # Rank 2 then stops altogether with the job while rank 1, which had stepped past 40, stops
-    # again at 320: rank 1 stored a step beyond the one it stalled at, so that episode is over
-    # and this stall fires, once.
-    assert run.look("stalled", _ranked(0, "silent", 320), _ranked(1, "silent", 320), _ranked(2, "silent", 290)) == 1
+    assert run.look("degraded", _ranked(0, "active", 310), _ranked(1, "active", 310), _ranked(2, "silent", 290)) == 1
+    # The job then stops with rank 2 still at 290: that episode, no second firing.
     assert run.look("stalled", _ranked(0, "silent", 320), _ranked(1, "silent", 320), _ranked(2, "silent", 290)) == 0
-    # The run steps past 320 and stalls again: a new episode.
+    # Rank 2 steps past 290 and the job stalls again: a new episode.
     assert run.look("stalled", _ranked(0, "silent", 400), _ranked(1, "silent", 400), _ranked(2, "silent", 400)) == 1
-    assert run.fired() == [("rank_silent", 40), ("job_stalled", 320), ("job_stalled", 400)]
+    assert run.fired() == [("rank_silent", 40), ("rank_silent", 290), ("job_stalled", 400)]
 
     # The case the author named: a silent rank that becomes a stalled job, with the silent rank
     # where it stopped, is one episode, however far the others had stepped meanwhile.
@@ -657,6 +655,33 @@ def test_a_silent_rank_beside_stepping_ranks_is_one_episode_and_a_rank_that_join
     assert other.look("degraded", _ranked(0, "active", 500), _ranked(1, "silent", 40)) == 0
     assert other.look("stalled", _ranked(0, "silent", 520), _ranked(1, "silent", 40)) == 0
     assert _settle(other.trigger, lambda: len(calls()) == before + 1)
+
+
+def test_a_rank_that_recovered_ends_its_episode_and_another_ranks_later_stall_fires(tmp_path, hook):
+    """Rank 1 stalls and fires, recovers and steps on (it is no longer in the stall); later rank 2
+    stalls. Rank 1's progress, read from the stall's `other_ranks`, ended its episode: rank 2's
+    stall fires. A rank of the episode that is only `reconnecting` (a server restart) has not
+    stepped, and ends nothing. A stall that fired before any step was stored ends on the first."""
+    command, calls = hook
+    run = _Looks(tmp_path, command, calls)
+    assert run.look("degraded", _ranked(0, "active", 90), _ranked(1, "silent", 40), _ranked(2, "active", 90)) == 1
+    # Rank 2 stops while rank 1 is only reconnecting: it joins, nothing ends, nothing fires.
+    assert run.look("degraded", _ranked(0, "active", 120), _ranked(1, "reconnecting", 40), _ranked(2, "silent", 110)) == 0
+    # Rank 1 steps on: its episode is over, and rank 2's stall, critical, fires.
+    assert run.look("degraded", _ranked(0, "active", 150), _ranked(1, "active", 150), _ranked(2, "silent", 110)) == 1
+    assert run.look("degraded", _ranked(0, "active", 160), _ranked(1, "active", 160), _ranked(2, "silent", 110)) == 0
+    assert run.fired() == [("rank_silent", 40), ("rank_silent", 110)]
+    again = _Looks(tmp_path, command, calls, name="again")
+    before = len(calls())
+    assert again.look("degraded", _ranked(0, "active", 90), _ranked(1, "silent", 40), _ranked(2, "active", 90)) == 1
+    assert again.look("degraded", _ranked(0, "active", 150), _ranked(1, "active", 150), _ranked(2, "active", 150)) == 0
+    assert again.look("degraded", _ranked(0, "active", 300), _ranked(1, "active", 300), _ranked(2, "silent", 200)) == 1
+    assert _settle(again.trigger, lambda: len(calls()) == before + 2)
+    # Nothing stored when it fired (`last_step` null): the first stored step is progress.
+    empty = _Looks(tmp_path, command, calls, name="empty")
+    assert empty.look("stalled", _ranked(0, "silent", None)) == 1
+    assert empty.look("stalled", _ranked(0, "silent", None)) == 0
+    assert empty.look("stalled", _ranked(0, "silent", 9)) == 1
 
 
 def test_a_stall_named_at_warning_does_not_fire_again_at_critical_in_its_episode(tmp_path, hook):

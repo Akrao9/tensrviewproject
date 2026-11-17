@@ -35,8 +35,10 @@ a stall is next listed and shows one of:
 - progress. For an episode opened by `job_stalled`, the run's step: any rank has stored a step
   beyond the highest one stored when it fired (a lagging rank catching up below that does not
   end it). For one opened by `rank_silent`, the stopped rank's own step: a rank of the episode
-  has stored a step beyond the one it stopped at. The ranks that go on stepping beside a silent
-  rank are not in its episode and do not end it, however many looks;
+  has stored a step beyond the one it stopped at, whether it is still stopped or has recovered
+  (a `rank_silent` lists the ranks not stopped under `other_ranks`). The ranks that go on
+  stepping beside a silent rank are not in its episode and do not end it, however many looks.
+  A rank that stored nothing when it fired ends it with its first stored step;
 - a new attempt: the `attempt` the server's status gives a rank of the episode differs from
   the one it had. The server takes it from the new attempt's first stored batch, so a job
   started again that hangs before it stores anything is not seen as one. A status that gives no
@@ -44,12 +46,12 @@ a stall is next listed and shows one of:
 
 Then the next stall at `critical` fires again, under an id of its own. So a silent rank whose
 job then stops altogether (`rank_silent`, then `job_stalled`) is one episode. A rank that stops
-during an open episode joins it, at the step it stopped at; the episode goes on while a rank of
-it is still where it stopped, even if the first rank recovers, and ends once one of its ranks
-steps past its own step. A server restart is neither progress nor an attempt: the stall is not
-listed during the restored ranks' fresh window, and nothing is decided until it is. (`wandb`'s
-`run.alert` holds an alert back by its title and a wait time, not by the step it was raised at;
-`torch.distributed.elastic` counts a restart of the worker group as a new round.) The status is
+during an open episode joins it, at the step it stopped at; the episode ends once any rank of it
+steps past its own step, so a first rank that recovers while a joined one is still stuck ends it,
+and the joined rank's stall then fires. A rank that is only `reconnecting` has not stepped. A
+server restart is neither progress nor an attempt: the stall is not listed during the restored
+ranks' fresh window, and nothing is decided until it is. (`wandb`'s `run.alert` holds an alert
+back by its title and a wait time, not by the step it was raised at.) The status is
 the only source: a watcher of a local file given a status with `watchdog=` reads the same
 fields from it, and the records' own `attempt` is not used. A state file written before episodes
 were kept (keyed by rank, kind and step, or by the run) loads: its last stall is the open
@@ -202,6 +204,17 @@ def _stopped(incident: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
             found[str(entry.get("rank"))] = {"last_step": _number(entry.get("last_step")),
                                              "attempt": entry.get("attempt")}
     return found
+
+
+def _others(incident: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """The ranks a `rank_silent` lists as not stopped (`other_ranks`), as `_stopped` gives them."""
+    return {str(e.get("rank")): {"last_step": _number(e.get("last_step")), "attempt": e.get("attempt")}
+            for e in incident.get("other_ranks") or () if isinstance(e, Mapping)}
+
+
+def _beyond(now: int | None, before: int | None) -> bool:
+    """A stored step beyond `before`; a baseline of None (nothing stored then) is below any step."""
+    return now is not None and (before is None or now > before)
 
 
 def _run_step(incident: Mapping[str, Any]) -> int | None:
@@ -477,7 +490,10 @@ class Trigger:
             self._episode = {**self._open_episode(stall, episode.get("delivery")), "adopted": True}
             return
         members = episode.setdefault("ranks", {})
-        for rank, now in stopped.items():
+        # Every rank the stall says something of: stopped, and (for `rank_silent`) the others, so
+        # a rank of the episode that has recovered is seen stepping on.
+        seen = {**_others(stall), **stopped}
+        for rank, now in seen.items():
             before = members.get(rank)
             if before is not None and now["attempt"] is not None and before.get("attempt") is not None \
                     and now["attempt"] != before["attempt"]:
@@ -486,16 +502,14 @@ class Trigger:
         if episode.get("kind") == "job_stalled":
             # The run's step: the stall is over once any rank has stored a step beyond the
             # highest one stored when it fired.
-            step, then = _run_step(stall), episode.get("run_step")
-            if step is not None and then is not None and step > then:
+            if _beyond(_run_step(stall), episode.get("run_step")):
                 self._episode = None
                 return
         else:
             # `rank_silent`: each stopped rank's own step. The ranks that go on stepping beside
             # it are not in the episode and do not end it.
-            for rank, now in stopped.items():
-                before = (members.get(rank) or {}).get("last_step")
-                if before is not None and now["last_step"] is not None and now["last_step"] > before:
+            for rank, now in seen.items():
+                if rank in members and _beyond(now["last_step"], members[rank].get("last_step")):
                     self._episode = None
                     return
         for rank, now in stopped.items():
