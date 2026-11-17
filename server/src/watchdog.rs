@@ -711,7 +711,9 @@ impl Watchdog {
     /// from the earlier attempt's last batch. Its clocks start now (`restarted`), and a stream
     /// still dropped is `reconnecting` for that window. The same attempt is a beat as any other,
     /// whatever the stream did (a reconnect is not a new attempt). A lower one is a process of an
-    /// earlier attempt still beating: false, and the beat is not taken.
+    /// earlier attempt still beating: false, and the beat is not taken. The SDK sends this beat
+    /// before its stream's first connection; a stream opened before it (a sender that waited
+    /// longer than its hold) is judged from the earlier attempt's last batch until it comes.
     pub fn attempt_seen(&self, key: &Key, attempt: i64, now: Instant) -> bool {
         let window = self.config.start_limit;
         self.with(key, now, |p| {
@@ -723,7 +725,10 @@ impl Watchdog {
             if known {
                 p.attempt_since = Some(now);
                 p.restarted = Some(now);
-                p.fresh = Some((now.checked_add(window).unwrap_or(now), RankState::Lost));
+                // Only a stream that is not open yet waits for this window; one already open is
+                // judged by the rules for an open stream, and a later drop by those for a drop.
+                p.fresh =
+                    (p.stream == Stream::Dropped).then(|| (now.checked_add(window).unwrap_or(now), RankState::Lost));
                 p.stepped = false;
                 p.step_seconds.clear();
                 p.work = None;
@@ -2194,6 +2199,27 @@ mod tests {
         assert!(status["ranks"][0].get("attempt_without_steps").is_none());
         // Its first gap is from its first beat (800 s), not from the earlier attempt's last batch.
         assert_eq!(status["restart"][0]["gaps_seconds"], json!([5.0, 800.0]));
+    }
+
+    #[test]
+    fn a_new_attempt_seen_while_its_stream_is_open_and_then_killed_is_lost_after_the_floor() {
+        // The stream opened before the beat that names the attempt; the new process is killed 30 s
+        // later, before its first batch. It is lost after the floor from the drop, not held as
+        // reconnecting for the start window.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 5));
+        dog.stream_ended(&key(0), false, at(t0, 6));
+        dog.stream_opened(&key(0), at(t0, 400));
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 401)));
+        dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, 401));
+        assert_eq!(states(&dog, at(t0, 402)), ["starting"]);
+        dog.stream_ended(&key(0), false, at(t0, 431));
+        assert_eq!(states(&dog, at(t0, 431 + 59)), ["reconnecting"]);
+        assert_eq!(states(&dog, at(t0, 431 + 61)), ["lost"]);
+        assert_eq!(rank_field(&dog, at(t0, 431 + 61), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 431 + 181), "severity"), "critical");
     }
 
     #[test]

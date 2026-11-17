@@ -31,6 +31,10 @@ BATCH_BYTES = 4 * 1024 * 1024
 BACKOFF_BASE = 0.1
 BACKOFF_CAP = 30.0
 HEARTBEAT_SECONDS = 15.0
+# At most this long, a new process's first heartbeat waits for the session to name its attempt,
+# and its stream waits for that beat, so the server knows a job started again before the stream
+# opens (see `Heartbeat`). Background threads only: training never waits for it.
+FIRST_BEAT_HOLD_SECONDS = 2.0
 STACK_SECONDS = 60.0  # no work for this long: the heartbeat carries where each thread is
 STACK_FRAMES = 40  # frames kept of the main thread, innermost first
 STACK_OTHER_FRAMES = 4  # and of each other thread
@@ -377,6 +381,7 @@ class FlightSender:
         poll_seconds: float = POLL_SECONDS,
         backoff_base: float = BACKOFF_BASE,
         backoff_cap: float = BACKOFF_CAP,
+        hold: threading.Event | None = None,
     ) -> None:
         import pyarrow.flight  # noqa: F401  fail here, at init, when pyarrow is missing
 
@@ -416,6 +421,7 @@ class FlightSender:
         self._pid = os.getpid()
         self._closing = threading.Event()
         self._deadline = math.inf
+        self._hold = hold  # set once the heartbeat has named the attempt (or given up waiting)
         self._thread = threading.Thread(
             target=self._run, name=f"tensorquill-flight-rank{rank}", daemon=True
         )
@@ -459,6 +465,11 @@ class FlightSender:
     # Everything below runs on the sender thread.
 
     def _run(self) -> None:
+        if self._hold is not None:
+            # The first connection waits for the heartbeat that names the attempt, a moment at most.
+            deadline = time.monotonic() + FIRST_BEAT_HOLD_SECONDS + 1.0
+            while not self._hold.is_set() and not self._closing.is_set() and time.monotonic() < deadline:
+                self._hold.wait(0.05)
         attempt = 0
         retried_on_close = False
         while True:
@@ -689,7 +700,9 @@ class Heartbeat:
     `unresponsive` and has no stack.
 
     Each beat also carries the session's `attempt` (the one its records carry), from the moment
-    the session hands over its work counter, and that beat goes at once. So the server knows a
+    the session hands over its work counter, and that beat goes at once. The first beat waits for
+    it, `FIRST_BEAT_HOLD_SECONDS` at most, and the stream's first connection waits for the first
+    beat (`first_sent`), so a new process names its attempt before its stream opens. So the server knows a
     job that was started again before the new attempt stores any step, and gives it a start
     window of its own (see `watchdog.rs`). It is read once, so a beat costs nothing more."""
 
@@ -727,6 +740,7 @@ class Heartbeat:
         self._pid = os.getpid()
         self._changed = threading.Event()
         self._stopped = threading.Event()
+        self.first_sent = threading.Event()  # the first beat was tried
         self.sent = 0
         self._thread = threading.Thread(target=self._run, name=f"tensorquill-heartbeat-rank{rank}", daemon=True)
         self._thread.start()
@@ -774,6 +788,8 @@ class Heartbeat:
 
         headers = [(b"authorization", f"Bearer {self._token}".encode())] if self._token else []
         client = None
+        if self._counter is None:
+            self._changed.wait(FIRST_BEAT_HOLD_SECONDS)  # the session names its attempt in a moment
         while not self._stopped.is_set():
             # Clear first, so a phase change made while this beat is being sent wakes the next wait.
             self._changed.clear()
@@ -800,6 +816,7 @@ class Heartbeat:
                 self.sent += 1
             except BaseException:  # noqa: BLE001  a missed beat is the server's to notice
                 client = None
+            self.first_sent.set()
             self._changed.wait(self.interval)
 
 
@@ -870,19 +887,22 @@ def attach(
             "endpoint= streams the local .jsonl file, so the sink must be a JsonlSink "
             f"(or left as the default), not {type(sink).__name__}"
         )
+    heartbeat = None
     try:
+        # The heartbeat first: the stream's first connection waits for its first beat.
+        if heartbeat_seconds:
+            heartbeat = Heartbeat(
+                endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs, interval=heartbeat_seconds,
+                stack_seconds=stack_seconds,
+            )
         sender = FlightSender(
             path, endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs,
-            world_size=world_size, manifest=manifest,
+            world_size=world_size, manifest=manifest, hold=heartbeat.first_sent if heartbeat else None,
         )
     except ImportError as error:
+        if heartbeat is not None:
+            heartbeat.close()
         raise ImportError(
             'endpoint= needs pyarrow: pip install pyarrow'
         ) from error
-    heartbeat = None
-    if heartbeat_seconds:
-        heartbeat = Heartbeat(
-            endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs, interval=heartbeat_seconds,
-            stack_seconds=stack_seconds,
-        )
     return StreamingSink(sink, sender, heartbeat)

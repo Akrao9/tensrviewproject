@@ -1765,7 +1765,7 @@ def test_a_new_attempt_that_hangs_before_it_passes_the_old_step_fires_again(tmp_
 
 
 
-def _restarted_job(tmp_path, command, calls, *, old_sender=False):
+def _restarted_job(tmp_path, command, calls, *, old_sender=False, view="all"):
     """A job that stalls and fires, is killed, and is started again (a new attempt) that hangs
     before it stores a step. Silent after 2 s, critical 6 s later; a new attempt starts for 4 s.
     Returns what the status and the stall firings said, and when the new attempt started."""
@@ -1778,7 +1778,7 @@ def _restarted_job(tmp_path, command, calls, *, old_sender=False):
         first = job.rank(0, 1, TQ_STEPS="100", **old)
         job.until(lambda: (job.status().get("ranks") or [{}])[0].get("last_step") == 99, "the first attempt's steps")
         old_attempt = job.status()["ranks"][0]["attempt"]
-        log = job.watcher(output, "--rank", "all", "--on-incident", command())
+        log = job.watcher(output, *(("--rank", "all") if view == "all" else ()), "--on-incident", command())
         job.until(stalls, "the first firing", 90.0)
         first.kill()
         first.wait(20)
@@ -1798,12 +1798,20 @@ def _restarted_job(tmp_path, command, calls, *, old_sender=False):
         job.close()
 
 
-def test_a_job_started_again_that_hangs_before_its_first_stored_step_fires_after_its_start_window(tmp_path, hook):
+@pytest.mark.parametrize("view", ["all", "one"])
+def test_a_job_started_again_that_hangs_before_its_first_stored_step_fires_after_its_start_window(tmp_path, hook, view):
     """The heartbeats carry the attempt (Nov 17, 2026): the server sees the new attempt before it
     stores anything and gives it the start window of a new rank; the status shows the attempt,
-    so the trigger's episode re-arms, and the hang fires once it is critical (4 + 6 s), not before."""
+    so the trigger's episode re-arms, and the hang fires once it is critical (4 + 6 s), not before.
+    The new process's stream opens only after the beat that names the attempt, so the rank never
+    reads as an open stream of the old attempt. With `--rank all` and with one rank's watcher."""
     command, calls = hook
-    found = _restarted_job(tmp_path, command, calls)
+    found = _restarted_job(tmp_path, command, calls, view=view)
+    # From the server's first status that shows the killed process's stream dropped on.
+    dropped = next(n for n, (_, r, _) in enumerate(found["seen"]) if r.get("stream") == "dropped")
+    gap = [(t, r) for t, r, _ in found["seen"][dropped:]
+           if r.get("stream") == "open" and r.get("attempt") == found["old_attempt"]]
+    assert not gap, gap[:3]
     new = [(t, r) for t, r, _ in found["seen"] if r.get("attempt") not in (None, found["old_attempt"])]
     assert new, "the new attempt never showed in the status"
     first_seen, rank = new[0]
