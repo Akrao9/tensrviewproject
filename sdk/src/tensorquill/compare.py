@@ -61,13 +61,21 @@ def _is_step(value: Any) -> bool:
 
 
 def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
-    from .evidence import build_evidence, load_records
+    from .evidence import _Tail, build_evidence, load_records
 
     files: Mapping[int, Path] = run.get("files") or {}
     if not files:
         raise _runs.RunLookupError(f"run {run['run_id']} has a manifest and no records yet: nothing to compare")
     path = files.get(rank) if rank is not None and rank in files else files[min(files)]
-    records = load_records(path, all_attempts=True)
+    unfinished = False
+    try:
+        records = load_records(path, all_attempts=True)
+    except ValueError:
+        # A line the job is still writing, or one torn by a killed process: the whole lines are
+        # read, as the watcher reads them, and the result says so.
+        tail = _Tail(Path(path), None)
+        tail.poll()
+        records, unfinished = tail.records, True
     held = sorted({int(r.get("rank", 0)) for r in records})
     ranks = sorted(set(files) | set(held))
     # The rank asked for; a run with one rank is read on the rank it has, and says which.
@@ -81,7 +89,8 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
     return {
         "evidence": evidence, "last_step": max(steps) if steps else None,
         "read_from": {"path": str(path), "kind": "local records", "rank": picked, "ranks": ranks,
-                      "judged_by": "the Python detectors, here, with the default thresholds"},
+                      "judged_by": "the Python detectors, here, with the default thresholds",
+                      **({"unfinished_lines_left_out": True} if unfinished else {})},
         "records": {"path": str(path), "rank": picked},
     }
 
@@ -507,6 +516,7 @@ def summary_text(result: Mapping[str, Any]) -> str:
             f"{run['run_state'] or 'state unknown'}, "
             + (f"last step {run['last_step']}, " if run["last_step"] is not None else "")
             + f"{run['incidents']} incident{'s' if run['incidents'] != 1 else ''}; {rank}{of} from {read['path']}"
+            + (" (a line that is not whole was left out: the run may still be going)" if read.get("unfinished_lines_left_out") else "")
         )
 
     setup = result["setup"]

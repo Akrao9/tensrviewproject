@@ -1,15 +1,22 @@
 """A read-only MCP server over TensorQuill's evidence files, for a team's coding agent.
 
-    python -m tensorquill.mcp_server PATH [--records CAPTURE]
+    python -m tensorquill.mcp_server PATH [--records CAPTURE] [--runs FOLDER]
 
 `PATH` is an `evidence.json`, a `.jsonl` capture from `tensorquill.init`, or a run folder in a
 `tensorquill-server` store (`runs/<run_id>`). The server speaks the Model Context Protocol
-over stdio and offers four tools:
+over stdio and offers six tools:
 
     list_incidents         what the detectors found, with the run state and what was not checked
     get_incident           one incident in full
     get_series             one layer's, parameter's, router's or logged scalar's values over a step range
     get_all_ranks_status   every rank of a run folder: judged, unknown, clean, with incidents
+    list_runs              the runs kept beside this one, by project
+    compare_runs           two or more of those runs: setup, what was checked, incidents
+
+The first four answer about the run at `PATH`. The last two read the folder that run is kept
+in (`--runs` names another): the folder of a capture or evidence file, or the `runs/` folder
+of the store for a run folder. They take run IDs and names found there and never a path, so a
+tool argument cannot point the server at another part of the disk.
 
 It reads the path again at every call, so it follows a run that is still going. It writes no
 file, starts no process and opens no connection, and nothing in it can pause, stop or change a
@@ -38,6 +45,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from . import __version__
+from . import compare as _compare
+from . import runs as _runs
 from .evidence import (
     ALL_RANKS_VIEW,
     _discover_rank_folders,
@@ -65,6 +74,9 @@ MAX_INCIDENTS = 200
 WHERE_NAMES = 12  # names listed in an incident's `where`; the incident itself has them all
 TOP_EXPERTS = 8
 PER_RANK_ROWS = 64
+DEFAULT_RUNS = 50
+MAX_RUNS = 200
+MAX_COMPARED = 8
 
 PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS = -32700, -32600, -32601, -32602
 
@@ -82,6 +94,9 @@ INSTRUCTIONS = (
     " the run state, the incidents and what was not checked. Then get_incident for the one you are explaining,"
     " and get_series for the layer, parameter or router it names. For a run folder with several ranks,"
     " get_all_ranks_status says which ranks are judged and which are unknown; an unknown rank is not a clean one."
+    " To set this run against another, list_runs gives the runs kept beside it and compare_runs compares them by"
+    " run ID or name: read what differs in what was checked before the incidents, since a kind one run did not"
+    " look for cannot be called absent there."
     " An incident of class `observation` claims no failure. A check listed under not_checked was not made, so"
     " its absence from the incidents says nothing. Name the step, the layer or parameter and the kind in your"
     " diagnosis. These tools cannot change the run, and neither should you: pausing, stopping or changing it"
@@ -159,9 +174,10 @@ class Source:
     """The path the server was started on. Every call looks at it again; what was read is kept
     only while the file's size and time of change stay the same."""
 
-    def __init__(self, path: str | Path, records: str | Path | None = None) -> None:
+    def __init__(self, path: str | Path, records: str | Path | None = None, runs: str | Path | None = None) -> None:
         self.path = Path(path)
         self.records_path = Path(records) if records is not None else None
+        self.runs_path = Path(runs) if runs is not None else None
         self._kept: dict[Any, tuple[Any, Any]] = {}
 
     def _keep(self, key: Any, stamp: Any, make: Callable[[], Any]) -> Any:
@@ -188,6 +204,24 @@ class Source:
             own = _rank_number(path.resolve().name)
             return ("store", path.resolve().parent, own) if own is not None else ("store", path, None)
         return ("capture" if path.suffix == ".jsonl" else "evidence"), path, None
+
+    def runs_folder(self) -> Path:
+        """Where `list_runs` and `compare_runs` look: the folder given at start (`--runs`), or
+        the one this run is kept in. For a run folder of a store that is the `runs/` folder
+        beside it; for a capture or an evidence file it is the file's own folder."""
+        if self.runs_path is not None:
+            folder = self.runs_path
+        else:
+            path = self.path if self.path.exists() else self.path.absolute()
+            if path.is_dir():
+                path = path.resolve()
+                folder = path.parent.parent if _rank_number(path.name) is not None else path.parent
+            else:
+                folder = path.parent
+        if not folder.is_dir():
+            raise ToolError(f"{folder} is not a folder: there are no runs to list. Start the server with --runs FOLDER "
+                            "to name the folder of local files or the store the runs are kept in.")
+        return folder
 
     # Evidence files -----------------------------------------------------------------------
 
@@ -958,6 +992,63 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
     return answer
 
 
+# --- Other runs -----------------------------------------------------------------------------
+
+_ROW_KEYS = ("project", "name", "run_id", "group", "tags", "has_manifest", "source", "started", "run_state", "last_step",
+             "incidents", "first_incident", "kinds_checked", "ranks", "evidence")
+
+
+def _text_argument(arguments: Mapping[str, Any], name: str) -> str | None:
+    value = arguments.get(name)
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ToolError(f"`{name}` must be a string that is not empty, not {value!r}.")
+    return value
+
+
+def list_runs(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    folder = source.runs_folder()
+    project = _text_argument(arguments, "project")
+    limit = _integer(arguments, "limit", minimum=1, maximum=MAX_RUNS) or DEFAULT_RUNS
+    try:
+        rows = _runs.list_runs(folder, None)
+    except (OSError, ValueError) as error:
+        raise ToolError(f"the runs at {folder} cannot be listed ({error}).") from None
+    projects: dict[str, int] = {}
+    for row in rows:
+        projects[row["project"]] = projects.get(row["project"], 0) + 1
+    if project is not None:
+        if project not in projects:
+            known = ", ".join(f"{name} ({count})" for name, count in projects.items()) or "none"
+            raise ToolError(f"no run of project {project!r} at {folder}. Projects there: {known}.")
+        rows = [row for row in rows if row["project"] == project]
+    shown = rows[:limit]
+    return {
+        "folder": str(folder),
+        "projects": projects,
+        "count": len(rows),
+        **({"shown": len(shown), "note": f"{len(rows) - len(shown)} more runs: pass project= or a larger limit"}
+           if len(shown) < len(rows) else {}),
+        # A row says nothing it did not read: `run_state` null with `evidence.state` "missing"
+        # means no evidence file was written for that run, not that the run is clean.
+        "runs": [{key: row[key] for key in _ROW_KEYS if key in row} for row in shown],
+    }
+
+
+def compare_runs(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    folder = source.runs_folder()
+    wanted = arguments.get("runs")
+    if not isinstance(wanted, list) or not 2 <= len(wanted) <= MAX_COMPARED or not all(isinstance(w, str) and w for w in wanted):
+        raise ToolError(f"`runs` must be a list of 2 to {MAX_COMPARED} run IDs or names, as list_runs gives them.")
+    project = _text_argument(arguments, "project")
+    rank = _integer(arguments, "rank", minimum=0)
+    try:
+        return _compare.compare_runs(*wanted, source=folder, project=project, rank=rank, paths=False)
+    except (ValueError, OSError, RuntimeError) as error:
+        # A run that is not there, a name that fits several runs (the message lists their IDs),
+        # or records that cannot be read.
+        raise ToolError(f"{error} (the runs are looked up at {folder}; list_runs shows them)") from None
+
+
 # --- The tools, as the protocol lists them --------------------------------------------------
 
 _RANK = {
@@ -1068,10 +1159,61 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
         "annotations": {"title": "Get the all-ranks status", **_READ_ONLY},
     },
+    {
+        "name": "list_runs",
+        "title": "List runs",
+        "description": (
+            "The runs kept in the same folder or store as this one, by project: each run's name, run ID, run state,"
+            " last step, incidents by class, first incident (kind and step), how many of the kinds were checked, and"
+            " start time. The run ID is the identity; a name is a label and may repeat. It reads each run's manifest"
+            " and its small evidence or report files only, and runs no detector: a local run whose evidence file was"
+            " never written has `run_state` null and `evidence.state` \"missing\", which is not \"clean\". A run"
+            " with `has_manifest` false was recorded before runs had a project, and is listed under"
+            " `uncategorized` with its run ID as its name."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Only this project's runs."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_RUNS,
+                          "description": f"How many runs to list (default {DEFAULT_RUNS})."},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {"title": "List runs", **_READ_ONLY},
+    },
+    {
+        "name": "compare_runs",
+        "title": "Compare runs",
+        "description": (
+            "Compare two or more of the runs list_runs gives, each named by run ID or by name (a name that fits"
+            " several runs is refused with their IDs; a path is never taken). The answer has four parts, to be read in"
+            " this order. `setup`: the project, group, world size, versions and config keys that differ. `checked`:"
+            " the kinds one run checked and another did not configure, could not judge, or has not had enough"
+            " history for. `incidents`: by kind and what the incident names, with the runs that show it (`in`), each"
+            " run's `first_step`, and `absent_from`, which says for each other run whether it looked: only"
+            " `checked` there means that run looked, with enough history, and found none. `divergence`: where two"
+            " runs part, which this version does not build. One rank of each run is read (`rank`, default the"
+            " lowest); `incidents.other_ranks_not_compared` lists a run's ranks that were not read. Local files are"
+            " judged here; a run in a server's store is read from the server's report."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "runs": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": MAX_COMPARED,
+                         "description": "Run IDs or names, as list_runs gives them. The first is A, the second B."},
+                "project": {"type": "string", "description": "Look names up in this project only."},
+                "rank": {"type": "integer", "minimum": 0, "description": "The rank read of every run (default: each run's lowest)."},
+            },
+            "required": ["runs"],
+            "additionalProperties": False,
+        },
+        "annotations": {"title": "Compare runs", **_READ_ONLY},
+    },
 )
 _HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "list_incidents": list_incidents, "get_incident": get_incident, "get_series": get_series,
-    "get_all_ranks_status": get_all_ranks_status,
+    "get_all_ranks_status": get_all_ranks_status, "list_runs": list_runs, "compare_runs": compare_runs,
 }
 
 
@@ -1286,7 +1428,8 @@ def serve(source: Source, reader: Any, writer: Any) -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="python -m tensorquill.mcp_server",
-        description="A read-only MCP server (stdio) over one run's TensorQuill evidence: four tools, no write action.",
+        description="A read-only MCP server (stdio) over one run's TensorQuill evidence, and the runs kept beside it: "
+        "six tools, no write action.",
     )
     parser.add_argument(
         "path", type=Path,
@@ -1298,6 +1441,11 @@ def main(argv: list[str] | None = None) -> None:
         help="for an evidence.json: the .jsonl capture or run folder its step records are in, for get_series "
         "(default: x.jsonl beside x.evidence.json, or an all-ranks view's own run folder)",
     )
+    parser.add_argument(
+        "--runs", type=Path,
+        help="the folder of local files or the store that list_runs and compare_runs read (default: the folder "
+        "PATH is in, or the runs/ folder of the store for a run folder)",
+    )
     args = parser.parse_args(argv)
     # Only protocol messages may reach the client: anything a library prints goes to stderr.
     reader, writer = sys.stdin.buffer, sys.stdout.buffer
@@ -1308,7 +1456,7 @@ def main(argv: list[str] | None = None) -> None:
         pass
     sys.stdout = sys.stderr
     try:
-        serve(Source(args.path, args.records), reader, writer)
+        serve(Source(args.path, args.records, args.runs), reader, writer)
     except (BrokenPipeError, KeyboardInterrupt):
         pass
 

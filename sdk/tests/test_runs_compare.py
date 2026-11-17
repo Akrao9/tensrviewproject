@@ -481,6 +481,19 @@ def test_a_run_of_many_ranks_is_read_on_rank_0_and_says_the_others_were_not_comp
     assert on_one["incidents"]["other_ranks_not_compared"] == {"B": [0]}
 
 
+def test_a_capture_that_is_still_being_written_is_compared_on_its_whole_lines_and_says_so(tmp_path):
+    folder = tmp_path / "out"
+    local_run(folder, "done", project="p", name="done")
+    going = local_run(folder, "going", spiked("going"), project="p", name="going")
+    with going.open("a") as file:
+        file.write('{"schema_version": 1, "run_id": "going", "rank": 0, "step": 60, "an unfinished li')
+    result = tensorquill.compare_runs("done", "going", source=folder)
+    assert result["runs"][1]["read_from"]["unfinished_lines_left_out"] is True and result["runs"][1]["last_step"] == 59
+    assert "unfinished_lines_left_out" not in result["runs"][0]["read_from"]
+    assert [(e["kind"], e["in"]) for e in result["incidents"]["entries"]] == [("grad_spike", ["B"])]
+    assert "the run may still be going" in result["summary"]
+
+
 def test_runs_given_as_paths_a_store_read_from_its_report_and_a_report_that_cannot_be_used(tmp_path):
     store = hand_store(tmp_path / "store", {
         "run-1": ({"project": "granite", "name": "baseline", "config": {"lr": 0.01}}, []),

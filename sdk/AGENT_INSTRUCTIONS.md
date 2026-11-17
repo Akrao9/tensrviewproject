@@ -22,7 +22,9 @@ Most agent hosts take an entry like this one:
 {"mcpServers": {"tensorquill": {"command": "python", "args": ["-m", "tensorquill.mcp_server", "PATH"]}}}
 ```
 
-The server has four tools and all four only read: `list_incidents`, `get_incident`, `get_series` and `get_all_ranks_status`. It reads `PATH` again at every call, so the answers follow a run that is still going. No answer is longer than about 50 KB.
+The server has six tools and all six only read. Four answer about the run at `PATH`: `list_incidents`, `get_incident`, `get_series` and `get_all_ranks_status`. Two look at the runs kept beside it: `list_runs` and `compare_runs`. It reads `PATH` again at every call, so the answers follow a run that is still going. No answer is longer than about 50 KB.
+
+"Beside it" is the folder `PATH` is in, or for a run folder the store's `runs/` folder. Add `--runs FOLDER` to the command to name another folder of local files or another store. The two tools take run IDs and names found there, never a path.
 
 ## When you are woken
 
@@ -64,6 +66,26 @@ For a run folder, also name the ranks from `on_ranks`. When `numbers_differ` is 
 - A value that is not a number is the string `"nan"`, `"inf"` or `"-inf"`.
 - A router's series comes with `first_flagged_step` when the detectors' per-step samples are available.
 - An answer that was cut says where, under `truncated`.
+
+## Comparing this run with another
+
+Compare when a person asks for it, or when the run you are explaining has a partner: the same job before a change, or a run of the same project that did not fail.
+
+1. **Call `list_runs`.** It lists the runs kept beside this one by project, each with its name, run ID, run state, last step and first incident. The run ID is the identity. A name is a label and may repeat, so use the ID when two runs share a name. A row whose `run_state` is null with `evidence.state` `missing` is a run nobody has judged yet, not a clean one.
+2. **Call `compare_runs` with two or more IDs or names.** The first is called A, the second B. Read its four parts in order:
+   - `setup`: what differs between the runs' manifests, such as a `config` key. A run listed under `no_manifest` was recorded before runs had a project, and its setup is not known.
+   - `checked`: the kinds one run checked and another did not. Read this before the incidents.
+   - `incidents`: each entry says which runs show it (`in`), each run's `first_step`, and what it names in each run (`where`).
+   - `divergence`: where two runs part. This version does not build it, and says so. Do not supply a step yourself.
+3. **For an incident in one run only, read `absent_from` before you call it a difference.** It gives one word for each run that does not show the incident:
+   - `checked`: that run looked, with enough history, and found none. Only this is a real difference between the runs.
+   - `not_configured` or `unavailable`: that run never looked. Write "B was not checked for it", never "B does not have it".
+   - `not_enough_history`: that run's rule had too few records to fire.
+   - `ended_before_step`: that run stopped before the step where the other first shows it.
+   - `not_said`: that run's evidence does not say what was checked.
+4. **Say which rank was read.** One rank of each run is compared, and each run's `read_from` names it. When `incidents.other_ranks_not_compared` lists ranks, say that incidents on those ranks were not compared.
+
+A difference in `setup` beside a difference in `incidents` is a lead, not a cause. Say that the runs differ in both, and leave the conclusion to the series and to a person.
 
 ## The three classes
 
