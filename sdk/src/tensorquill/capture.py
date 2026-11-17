@@ -201,12 +201,20 @@ def _not_indices(idx: Any, device: torch.device) -> str | None:
     return None
 
 
+def _count_width(spec: Router) -> int:
+    """Slots in a router's counts buffer: one per expert, and for an `indices=` router one more
+    for the indices that match no expert (`_router_hook`, judged in `flush`)."""
+    return spec.n_experts + (spec.indices is not None)
+
+
 def _router_hook(
     counts: torch.Tensor, expert_ids: torch.Tensor, spec: Router, problems: list[str] | None = None
 ) -> Callable[..., None]:
-    def refuse(why: str) -> None:
+    def refuse(why: Callable[[], str]) -> None:
+        # Built only the first time: a refused router's hook still runs on every forward, and
+        # the text may format a user's exception or a shape.
         if problems is not None and not problems:
-            problems.append(why)
+            problems.append(why())
 
     def hook(module: nn.Module, args: Any, output: Any) -> None:
         if _recomputing():
@@ -214,23 +222,23 @@ def _router_hook(
         if spec.indices is not None:
             # The user's function: one that raises, or returns what cannot be expert indices,
             # refuses this router and never raises into training. Checked from types and
-            # shapes only; its values are judged in `flush`, from the slot below, after the
+            # shapes only; its values are judged in `flush`, from the last slot of `counts`, after the
             # copy to the CPU that is made anyway.
             try:
                 idx = spec.indices(output)
             except Exception as error:  # noqa: BLE001
-                refuse(f"its indices= function raised {_short(error)}")
+                refuse(lambda: f"its indices= function raised {_short(error)}")
                 return
             wrong = _not_indices(idx, counts.device)
             if wrong is not None:
-                refuse(wrong)
+                refuse(lambda: wrong)
                 return
             tokens, chosen = _tokens(args), idx.numel()
             if tokens and type(chosen) is int and (chosen < tokens or chosen % tokens):
-                refuse(
+                refuse(lambda: (
                     f"its indices= function returned shape {tuple(idx.shape)}, which is not expert indices for "
                     f"the {tokens} tokens it was called on"
-                )
+                ))
                 return
         else:
             idx = _first_tensor(output, integer=True)
@@ -242,10 +250,10 @@ def _router_hook(
                 # depends on the data; the session warns once and this router is not counted.
                 tokens, chosen = _tokens(args), idx.numel()
                 if tokens and type(chosen) is int and (chosen < tokens or chosen % tokens):
-                    refuse(
+                    refuse(lambda: (
                         f"its output's first integer tensor has shape {tuple(idx.shape)}, which is not expert "
                         f"indices for the {tokens} tokens it was called on"
-                    )
+                    ))
                     return
             if idx is None:
                 logits = _first_tensor(output, integer=False)
@@ -262,10 +270,14 @@ def _router_hook(
             return
         # Fixed output shape: `bincount` would make the shape depend on the data.
         # Accumulate across gradient-accumulation microbatches; `_commit` zeroes `counts`.
-        # The last slot counts the indices outside 0..n_experts-1, which match no expert:
-        # device work only, read in `flush` with the counts (no sync here).
         hits = (idx.detach().reshape(-1, 1) == expert_ids).sum(0)
-        counts.add_(torch.cat([hits, (idx.numel() - hits.sum()).reshape(1)]))
+        if spec.indices is None:
+            counts.add_(hits)
+        else:
+            # An `indices=` router's buffer has a last slot for the indices outside
+            # 0..n_experts-1, which match no expert (`_count_width`): device work only, read in
+            # `flush` with the counts (no sync here). Default routers keep the work they had.
+            counts.add_(torch.cat([hits, (idx.numel() - hits.sum()).reshape(1)]))
 
     return hook
 
@@ -525,8 +537,7 @@ class Session:
         self._weight_dtypes: dict[str, int] = {}
         self._spread: torch.Tensor | None = None
         self._counts = {
-            # One slot per expert, and a last one for indices that match no expert (`_router_hook`).
-            name: torch.zeros(spec.n_experts + 1, dtype=torch.int64, device=self.device)
+            name: torch.zeros(_count_width(spec), dtype=torch.int64, device=self.device)
             for name, spec in self._routers.items()
         }
         self._expert_ids = {
@@ -1104,9 +1115,10 @@ class Session:
         shape guard alone judges, as before."""
         offset = 0
         for name, spec in self._routers.items():
-            size = n * (spec.n_experts + 1)
+            width = _count_width(spec)
+            size = n * width
             if spec.indices is not None and not self._router_problems[name]:
-                outside = counts[offset : offset + size].reshape(n, spec.n_experts + 1)[:, -1].tolist()
+                outside = counts[offset : offset + size].reshape(n, width)[:, -1].tolist()
                 bad = next((i for i, v in enumerate(outside) if v), None)
                 if bad is not None:
                     self._router_problems[name].append(
@@ -1461,9 +1473,10 @@ class Session:
         moe: dict[str, list[list[int]]] = {}
         offset = 0
         for name, spec in self._routers.items():
-            size = n * (spec.n_experts + 1)
+            width = _count_width(spec)
+            size = n * width
             if not refused or name not in refused:
-                moe[name] = counts[offset : offset + size].reshape(n, spec.n_experts + 1)[:, : spec.n_experts].tolist()
+                moe[name] = counts[offset : offset + size].reshape(n, width)[:, : spec.n_experts].tolist()
             offset += size
 
         records = []

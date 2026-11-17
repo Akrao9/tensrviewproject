@@ -269,8 +269,10 @@ def test_an_indices_function_that_returns_the_wrong_shape_is_refused(tmp_path):
         (lambda out: out.float(), "its indices= function returned a float32 tensor, not integer expert indices"),
         (lambda out: out > 3, "its indices= function returned a bool tensor"),
         (lambda out: out.tolist(), "its indices= function returned list, not a tensor"),
+        # On another device than the counts, `==` would raise in the hook: refused instead.
+        (lambda out: out.to("meta"), "its indices= function returned a tensor on meta, not on cpu where the counts are"),
     ],
-    ids=["float", "bool", "list"],
+    ids=["float", "bool", "list", "device"],
 )
 def test_an_indices_function_that_returns_no_integer_tensor_is_refused(tmp_path, indices, start):
     records, _ = _refused_by_indices(tmp_path, indices)
