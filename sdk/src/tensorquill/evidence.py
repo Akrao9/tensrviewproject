@@ -562,6 +562,16 @@ def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str
     sender all look the same. The server's `--silent-seconds` is the pause it tolerates.
     `stuck_at` lists, for each stopped rank whose process sent its stack, where its main
     thread was (see `stuck_at`); it narrows the cause and does not change the assessment.
+
+    `assessment` labels a stall: `lost_connection` when a rank's stream dropped and did not
+    come back (a killed or crashed process, an out-of-memory kill among them, or a network
+    failure) and that explains the stall: every stopped rank is lost, or the whole job has
+    stopped (`job_stalled`) and at least one rank is lost, since ranks of a job that stops
+    together wait for the one that is gone (a collective cannot finish without it).
+    `suspected_hang` when a stopped rank is still connected and no lost rank explains it,
+    a lost rank beside a silent one while other ranks step among them. `lost_ranks` names the
+    lost ranks whenever there are any. `ranks_never_connected` when no rank stopped. The server
+    builds the same incidents (`progress_incidents` in `watchdog.rs`).
     The stacks themselves stay in the status file: an incident's `ranks` are without them.
     Each carries its `class`, as the server's `watchdog.json` writes it.
     """
@@ -580,11 +590,12 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
               if place is not None]
     ranks = [{k: v for k, v in r.items() if k != "stack"} for r in full]
     stopped = [r for r in ranks if r.get("state") in ("silent", "lost", "unresponsive")]
+    lost = [r.get("rank") for r in stopped if r.get("state") == "lost"]
     # Never "confirmed" from the stream alone: that takes a second source (see build_evidence).
-    if any(r.get("state") in ("silent", "unresponsive") for r in stopped):
-        assessment = "suspected_hang"
-    elif stopped:
+    if stopped and (len(lost) == len(stopped) or (lost and status["summary"] == "stalled")):
         assessment = "lost_connection"
+    elif stopped:
+        assessment = "suspected_hang"
     else:
         assessment = "ranks_never_connected"
     severity = "critical" if any(r.get("severity") == "critical" for r in stopped) else "warning"
@@ -597,6 +608,8 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
         "critical_seconds": status.get("critical_seconds"),
         "world_size": status.get("world_size"),
     }
+    if lost:
+        common["lost_ranks"] = lost
     if places:
         common["stuck_at"] = places
     if status["summary"] == "stalled":
@@ -4372,7 +4385,8 @@ def _describe_stream(incident: Mapping[str, Any]) -> str:
         return (
             f"Job stalled after step {incident['step']}: {count}"
             f" has sent a new step for at least {quiet:.0f} s ({'; '.join(reasons)})."
-            " A hang, a long evaluation or checkpoint pause, or a killed job can look the same from here." + tail
+            + (_lost_text(incident) if incident.get("assessment") == "lost_connection" else
+               " A hang, a long evaluation or checkpoint pause, or a killed job can look the same from here.") + tail
         )
     parts = []
     for r in incident["ranks"][:4]:
@@ -4385,7 +4399,23 @@ def _describe_stream(incident: Mapping[str, Any]) -> str:
                      " (if only some ranks call tensorquill.init, ignore this)")
     return (
         f"Ranks out of step with the job: {'; '.join(parts)} while others reached step {incident['newest_step']}."
-        " A hung rank, a killed process or a stuck telemetry sender look the same to the server." + tail
+        + (_lost_text(incident) if incident.get("assessment") == "lost_connection" else
+           " A hung rank, a killed process or a stuck telemetry sender look the same to the server.") + tail
+    )
+
+
+def _lost_text(incident: Mapping[str, Any]) -> str:
+    """What a stall labelled `lost_connection` is, in place of the sentence that says a hang and a
+    killed job look the same: the connection of a rank went and did not come back."""
+    lost = [r for r in incident.get("lost_ranks") or () if r is not None]
+    who = (f"rank{'s' if len(lost) != 1 else ''} {', '.join(str(r) for r in lost[:8])}"
+           + (f" and {len(lost) - 8} more" if len(lost) > 8 else "")) if lost else "the stopped ranks"
+    waiting = len(lost) < len([r for r in incident.get("ranks", ()) if r.get("state") in ("silent", "lost", "unresponsive")])
+    return (
+        f" The connection of {who} dropped and did not come back: read as a lost connection, not a hang."
+        " The process was most likely killed or crashed (an out-of-memory kill looks like this), or the network to the"
+        " server failed; look at the job's own logs and exit status first."
+        + (" The ranks still connected are most likely waiting for it." if waiting else "")
     )
 
 

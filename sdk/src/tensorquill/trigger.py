@@ -4,7 +4,8 @@
         --on-incident 'my-agent "Explain the $TENSORQUILL_INCIDENT_KIND incident in $TENSORQUILL_EVIDENCE"'
     python -m tensorquill store/runs/r --rank all --watch --webhook https://example.com/hooks/tensorquill
 
-**What fires.** An incident is new when its rank, kind and step have not fired before. By
+**What fires.** An incident is new when its rank, kind and step have not fired before, and a
+stall when the run has had none fire (below). By
 default the invariants (`evidence.INCIDENT_CLASSES`) fire, and so does a stall that has reached
 `critical`: a `job_stalled` or `rank_silent` incident (`STALL_KINDS`) whose `severity` is
 `critical`, whatever its `assessment`. `--fire-anomalies` adds the anomalies, whose thresholds
@@ -22,14 +23,36 @@ gets is `observation`. The server calls a stopped rank `critical` after its `--c
 (900) or three of the rank's own silence thresholds, if that is longer, and gives a severity only
 to a rank that is silent, unresponsive or lost: a rank in a declared evaluation or checkpoint
 phase is `paused`, has none, and so cannot make a stall `critical`. A stall named with
-`--fire-kind` fires at `warning` and not again when it becomes `critical`, since the key is the
-same; one not named fires once, when it becomes `critical`. A stall whose kind or step changes
-is another incident and fires again: a silent rank at `critical` whose job then stops altogether
-(`rank_silent`, then `job_stalled`), or a second rank that falls silent at an earlier step.
+`--fire-kind` fires at `warning` and not again when it becomes `critical`; one not named fires
+once, when it becomes `critical`.
+
+**One firing for one stall** (decided Nov 17, 2026). A stall is keyed by the run, not by rank,
+kind and step: the first stall of a run that fires is the only one. A silent rank whose job then
+stops altogether (`rank_silent`, then `job_stalled`) and a second rank that falls silent at an
+earlier step are the same event, and fire nothing more. (`wandb`'s `run.alert` holds an alert
+back by its title within a run in the same way, not by the step it was raised at.) What this
+rule does after a run recovers is not decided: a run that stalled, fired, stepped again and then
+stalls a second time fires nothing for the second stall, since its run has had one. Delete the
+state file to be told of it. A state file written before this rule is read under it: a stall
+it lists, of either kind, at any step, is the run's stall, so an upgrade does not fire again.
+
+**A lost connection.** A stall's `assessment` says what the server saw: `suspected_hang` when a
+stopped rank's stream is still open (it is connected and does not step), `lost_connection` when
+a rank's stream dropped and did not come back, as it does when the process is killed (an
+out-of-memory kill among them) or the network fails. A killed job keeps firing, labelled so:
+the command gets `TENSORQUILL_INCIDENT_ASSESSMENT`, the document gets `assessment`, and the
+summary says the connection was lost and that this is not read as a hang.
 
 **What has fired** is kept in a small state file beside the evidence (`run.evidence.json` and
 `run.evidence.compact.json` both give `run.evidence.fired.json`), so a watcher that is
 restarted does not fire again. Delete the file to start over.
+
+**The compact file.** On the command line a trigger turns on `--compact` (decided Nov 17, 2026),
+so the agent that is woken reads the compact evidence: the watcher writes the full file as
+before, and the trigger writes `<name>.compact.json` beside it on every look and names that one
+in `TENSORQUILL_EVIDENCE` and `evidence`. With `--compact` or `--compact-window` given, the
+watcher writes the compact file alone, as it always has, and that is the one named.
+`Trigger(compact_window=...)` does the same from Python; it is off by default there.
 
 **The command** is one string, run by the shell. It gets:
 
@@ -37,7 +60,9 @@ restarted does not fire again. Delete the file to start over.
 - in its environment, `TENSORQUILL_EVIDENCE` (the evidence file's absolute path),
   `TENSORQUILL_RUN_ID`, `TENSORQUILL_INCIDENT_ID`, `TENSORQUILL_INCIDENT_KIND`,
   `TENSORQUILL_INCIDENT_CLASS`, `TENSORQUILL_INCIDENT_STEP`, `TENSORQUILL_INCIDENT_RANKS`
-  (`0`, `0-3, 7`, or empty for an incident of the whole run) and `TENSORQUILL_INCIDENT_SUMMARY`.
+  (`0`, `0-3, 7`, or empty for an incident of the whole run), `TENSORQUILL_INCIDENT_SUMMARY`
+  and `TENSORQUILL_INCIDENT_ASSESSMENT` (a stall's `suspected_hang`, `lost_connection`,
+  `ranks_never_connected` or `confirmed_hang`; empty for an incident without one).
 
 Nothing is added to the command line: parameter and module names come from the job, and text
 from a job has no place in a string a shell parses. (Child processes get their context through
@@ -60,7 +85,8 @@ a repeat. The body:
     {"event": "incident", "version": 1, "id": "<run_id>/rank0/non_finite/412", "attempt": 1,
      "sent_at_ms": ..., "run_id": ..., "evidence": "<absolute path>", "run_state": "unhealthy",
      "kind": "non_finite", "class": "invariant", "step": 412, "rank": 0, "ranks": [0],
-     "new_ranks": [0], "summary": "<one line>", "incident": {<as in the evidence file>}}
+     "new_ranks": [0], "assessment": null, "summary": "<one line>",
+     "incident": {<as in the evidence file>}}
 
 `rank` is null and `ranks` lists them when several ranks share the incident; `ranks` is empty
 for an incident of the whole run. Numbers that are not finite are null, so the body is strict JSON.
@@ -138,6 +164,12 @@ def _step_key(step: Any) -> Any:
     return step if step is None or isinstance(step, (int, str)) else str(step)
 
 
+def _fired_key(rank: Any, kind: Any, step: Any) -> tuple[Any, ...]:
+    """What a firing holds back: a stall, the run's next stall of either kind at any step (one
+    firing for one stall); any other incident, the same kind at the same step on the same rank."""
+    return ("stall",) if kind in STALL_KINDS else (rank, kind, step)
+
+
 def _who(ranks: Iterable[Any]) -> str:
     numbers = [r for r in ranks if isinstance(r, int)]
     if not numbers:
@@ -150,9 +182,10 @@ class Trigger:
 
     `watch(..., trigger=Trigger("my-command"))` calls `tick()` on every look and
     `look(evidence, path)` after every write; neither ever raises. Invariants fire, and a
-    stall at `critical` (`STALL_KINDS`); `anomalies` adds the anomalies, `kinds` any kinds by
-    name, a stall at `warning` among them. `state_path` replaces the state file beside the
-    evidence. `log` gets each line this prints.
+    stall at `critical` (`STALL_KINDS`), once a run; `anomalies` adds the anomalies, `kinds` any
+    kinds by name, a stall at `warning` among them. `state_path` replaces the state file beside
+    the evidence. `compact_window` writes the compact evidence beside the full file at each look
+    and hands that one over (the command line sets it). `log` gets each line this prints.
     """
 
     def __init__(
@@ -167,6 +200,7 @@ class Trigger:
         retry_seconds: float = RETRY_SECONDS,
         webhook_timeout: float = WEBHOOK_TIMEOUT,
         command_wait: float = COMMAND_WAIT_SECONDS,
+        compact_window: int | None = None,
         log: Callable[[str], None] | None = None,
     ) -> None:
         if not command and not webhook:
@@ -196,7 +230,10 @@ class Trigger:
         self._state_path = Path(state_path) if state_path is not None else None
         self._loaded = False
         self._deliveries: list[dict[str, Any]] = []
-        self._fired: set[tuple[Any, Any, Any]] = set()
+        self._fired: set[tuple[Any, ...]] = set()
+        # Set: the evidence written is the full file, and this writes the compact one beside it.
+        self.compact_window = compact_window
+        self._compact_failed = False
         self._units: list[dict[str, Any]] = []
         self._evidence_path: Path | None = None
         self._run_id = ""
@@ -215,8 +252,11 @@ class Trigger:
             self._evidence_path = Path(path).resolve()
             if not self._loaded:
                 if self._state_path is None:
+                    # From the file the watcher wrote, so the name is the one it always was.
                     self._state_path = state_path_for(self._evidence_path)
                 self._load()
+            if self.compact_window is not None:
+                self._evidence_path = self._write_compact(evidence, self._evidence_path)
             self._run_id = str(evidence.get("run_id") or self._evidence_path.name)
             found = evidence.get("run_state")
             self._run_state = found.get("state") if isinstance(found, Mapping) else None
@@ -227,6 +267,24 @@ class Trigger:
             self._work()
         except Exception as error:  # a trigger never stops the watcher
             self._log(f"trigger: {type(error).__name__}: {error}; the watcher goes on")
+
+    def _write_compact(self, evidence: Mapping[str, Any], path: Path) -> Path:
+        """The compact evidence, written beside the full file at `path`; `path` itself when it
+        cannot be written, which is said once."""
+        from .compact import write_compact
+
+        try:
+            written = write_compact(evidence, path, window=self.compact_window).resolve()
+        except Exception as error:
+            if not self._compact_failed:
+                self._log(f"trigger: the compact evidence beside {path} could not be written"
+                          f" ({type(error).__name__}: {error}); the full file is handed over instead")
+            self._compact_failed = True
+            return path
+        if self._compact_failed:
+            self._log(f"trigger: the compact evidence is written again: {written}")
+        self._compact_failed = False
+        return written
 
     def tick(self) -> None:
         """A look of the watcher, written or not: see how started commands ended, and make
@@ -292,7 +350,8 @@ class Trigger:
         except Exception:  # an incident shaped as this version does not expect
             summary = f"Incident at step {incident.get('step')}: {kind}"
         return {"kind": kind, "class": incident_class(kind), "step": _step_key(incident.get("step")),
-                "ranks": ranks, "incident": incident, "summary": summary}
+                "ranks": ranks, "incident": incident, "summary": summary,
+                "assessment": incident.get("assessment")}
 
     def _collect(self, evidence: Mapping[str, Any], rank: int | None) -> list[dict[str, Any]]:
         """The incidents of `evidence` that the options let fire, each with the ranks it is on."""
@@ -313,10 +372,11 @@ class Trigger:
         return [unit for unit in units if unit is not None]
 
     def _enqueue(self) -> None:
-        """A firing for each incident with a rank that has not fired before, for those ranks."""
+        """A firing for each incident with a rank that has not fired before, for those ranks;
+        for a stall, once a run (`_fired_key`)."""
         targets = [name for name, given in (("command", self.command), ("webhook", self.webhook)) if given]
         for unit in self._units:
-            new = [r for r in unit["ranks"] if (r, unit["kind"], unit["step"]) not in self._fired]
+            new = [r for r in unit["ranks"] if _fired_key(r, unit["kind"], unit["step"]) not in self._fired]
             if not new:
                 continue
             numbers = [r for r in new if isinstance(r, int)]
@@ -324,19 +384,24 @@ class Trigger:
             self._deliveries.append({
                 "id": f"{self._run_id}/{who}/{unit['kind']}/{unit['step']}",
                 "kind": unit["kind"], "step": unit["step"], "ranks": new,
+                **({"assessment": unit["assessment"]} if unit["assessment"] is not None else {}),
                 "first_seen_ms": int(time.time() * 1000),
                 **{target: {"status": "pending", "attempts": 0} for target in targets},
             })
-            self._fired.update((r, unit["kind"], unit["step"]) for r in new)
+            self._fired.update(_fired_key(r, unit["kind"], unit["step"]) for r in new)
         self._save()
 
     def _unit_for(self, delivery: Mapping[str, Any]) -> dict[str, Any] | None:
         """The incident a firing is for, in the evidence last looked at; None once a resumed
-        run has rolled it back, and then nothing is sent for it."""
+        run has rolled it back, and then nothing is sent for it. A stall's firing is for the
+        run's stall as it reads now: a try still to make for a `rank_silent` that has become a
+        `job_stalled` sends the `job_stalled` (under the firing's own id)."""
         ranks = set(delivery["ranks"])
         for unit in self._units:
             if unit["kind"] == delivery["kind"] and unit["step"] == delivery["step"] and ranks & set(unit["ranks"]):
                 return unit
+        if delivery["kind"] in STALL_KINDS:
+            return next((unit for unit in self._units if unit["kind"] in STALL_KINDS), None)
         return None
 
     # --- Making the tries ------------------------------------------------------------------
@@ -365,7 +430,8 @@ class Trigger:
         self._save()
 
     def _label(self, delivery: Mapping[str, Any]) -> str:
-        return f"trigger: {delivery['kind']} at step {delivery['step']} ({_who(delivery['ranks'])})"
+        lost = " (lost connection)" if delivery.get("assessment") == "lost_connection" else ""
+        return f"trigger: {delivery['kind']}{lost} at step {delivery['step']} ({_who(delivery['ranks'])})"
 
     def _payload(self, delivery: Mapping[str, Any], unit: Mapping[str, Any], target: str) -> dict[str, Any]:
         ranks = [r for r in unit["ranks"] if isinstance(r, int)]
@@ -384,6 +450,7 @@ class Trigger:
             "rank": ranks[0] if len(ranks) == 1 else None,
             "ranks": ranks,
             "new_ranks": [r for r in delivery["ranks"] if isinstance(r, int)],
+            "assessment": unit["assessment"],
             "summary": unit["summary"],
             "incident": unit["incident"],
         })
@@ -445,6 +512,7 @@ class Trigger:
             "TENSORQUILL_INCIDENT_STEP": "" if payload["step"] is None else str(payload["step"]),
             "TENSORQUILL_INCIDENT_RANKS": _rank_ranges(payload["ranks"]),
             "TENSORQUILL_INCIDENT_SUMMARY": str(payload["summary"]).replace("\x00", ""),
+            "TENSORQUILL_INCIDENT_ASSESSMENT": str(payload["assessment"] or ""),
         }
         try:
             # From a file, not a pipe: a command that never reads its input must not block the watcher.
@@ -508,7 +576,8 @@ class Trigger:
             for delivery in deliveries:
                 delivery["step"] = _step_key(delivery["step"])
                 for rank in delivery["ranks"]:
-                    self._fired.add((rank, delivery["kind"], delivery["step"]))
+                    # A stall fired under the key of an earlier version is the run's stall now.
+                    self._fired.add(_fired_key(rank, delivery["kind"], delivery["step"]))
         except (ValueError, KeyError, TypeError) as error:
             self._fired.clear()
             self._log(f"trigger: {self._state_path} is not a state file this version reads ({error}): nothing"
@@ -546,9 +615,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--on-incident",
         metavar="COMMAND",
         help="with --watch: a shell command started once for each new incident (new: its rank, kind and step have "
-        "not fired before; kept in <evidence>.fired.json beside the evidence, so a restarted watcher does not fire "
-        "again). It gets the incident as JSON on standard input and TENSORQUILL_EVIDENCE (the evidence file), "
-        "TENSORQUILL_INCIDENT_KIND, _CLASS, _STEP, _RANKS, _SUMMARY, _ID and TENSORQUILL_RUN_ID in its environment; "
+        "not fired before, and for a stall, once a run; kept in <evidence>.fired.json beside the evidence, so a "
+        "restarted watcher does not fire again). Turns on --compact: the full evidence is written as before and "
+        "the compact file beside it is the one handed over. It gets the incident as JSON on standard input and "
+        "TENSORQUILL_EVIDENCE (the compact evidence file), TENSORQUILL_INCIDENT_KIND, _CLASS, _STEP, _RANKS, "
+        "_SUMMARY, _ASSESSMENT, _ID and TENSORQUILL_RUN_ID in its environment; "
         "nothing is added to the command line. It is not waited for or stopped, one runs at a time, and a start "
         "that fails or an exit status other than 0 is tried again on later looks, 4 tries in all. Invariants fire, "
         "and a stalled job or silent rank once the server calls it critical; --fire-anomalies and --fire-kind add "
@@ -559,7 +630,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="URL",
         help="with --watch: an http(s) URL that gets one POST of JSON for each new incident (the same document "
         "the command gets on standard input), with --webhook-timeout seconds, no redirects followed, and the same "
-        "tries as --on-incident. Nothing is sent anywhere without this option",
+        "tries as --on-incident. Turns on --compact, as --on-incident does. Nothing is sent anywhere without this "
+        "option",
     )
     parser.add_argument(
         "--webhook-timeout", type=float, default=WEBHOOK_TIMEOUT, metavar="SECONDS",
@@ -578,7 +650,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="KIND",
         help="with --on-incident or --webhook: this kind fires too, whatever its class (repeat the option for more); "
         "the only way an observation fires, but for a stall: job_stalled and rank_silent fire with no option once "
-        "their severity is critical, and from their warning when named here (once, not again at critical)",
+        "their severity is critical, and from their warning when named here (once a run, not again at critical)",
     )
 
 
@@ -591,10 +663,15 @@ def from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Trig
         return None
     if not args.watch:
         parser.error("--on-incident and --webhook fire as incidents appear, so they need --watch")
+    # The agent that is woken reads the compact evidence: with no --compact the watcher writes the
+    # full file as before and the trigger writes the compact one beside it.
+    from .compact import DEFAULT_WINDOW
+
+    beside = DEFAULT_WINDOW if getattr(args, "compact_window", None) is None else None
     try:
         trigger = Trigger(
             args.on_incident, args.webhook, anomalies=args.fire_anomalies, kinds=args.fire_kind,
-            webhook_timeout=args.webhook_timeout,
+            webhook_timeout=args.webhook_timeout, compact_window=beside,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -606,4 +683,7 @@ def from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Trig
              *sorted(set(args.fire_kind))]
     targets = [name for name, given in (("the command", args.on_incident), ("the webhook", args.webhook)) if given]
     print(f"trigger: each new incident fires {' and '.join(targets)} once; firing: {', '.join(fires)}", flush=True)
+    if beside is not None:
+        print("trigger: hands over the compact evidence (<evidence>.compact.json), written beside the full file",
+              flush=True)
     return trigger
