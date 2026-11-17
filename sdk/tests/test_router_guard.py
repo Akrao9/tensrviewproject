@@ -426,3 +426,218 @@ def test_the_server_reads_an_indices_router_counted_and_then_refused_as_python_d
     assert entry["step"] == 4 and entry["reason"].endswith(INDICES_FIX)
     assert rust["kind_checks"] == python["kind_checks"] and rust["samples"] == python["samples"]
     assert all(rust["kind_checks"][kind]["value"] == "unavailable" for kind in MOE_KINDS)
+
+
+# --- What the counting could not read: refused, never raised into training ---------------------
+#
+# A default router (or a named inner module) whose output the counting cannot read used to raise
+# into the training loop: an integer tensor or logits on another device than the counts (a model
+# split across GPUs), a `top_k` above the number of experts, uint32 indices, float8 logits, a
+# sparse tensor or a DTensor. Logits of another width than `n_experts` raised nothing and wrote
+# zeros that read as a router that routed no token. Each is now refused as the shape guard
+# refuses, from types, devices and shapes alone, so the same under `torch.compile`. On CPU,
+# `meta` stands in for another device; `mps` is a real one where the machine has it.
+
+DEVICE_FIX = (
+    "To count it, pass routers={NAME: tensorquill.Router(8, 2, indices=...)} with a function that returns the "
+    "chosen expert indices from its output on cpu, where the counts are"
+)
+COMPILED = pytest.mark.parametrize("compile_backend", [None, "eager"], ids=["eager", "compiled"])
+
+
+class Emits(nn.Module):
+    """A router whose output is `make(logits)`, so a test can give it any output."""
+
+    def __init__(self, make) -> None:
+        super().__init__()
+        self.w_g = nn.Linear(16, EXPERTS, bias=False)
+        self.make = make
+
+    def forward(self, x):
+        return self.make(self.w_g(x))
+
+
+class Inner(nn.Module):
+    """A router with an inner module, `inner`, whose output is `make(logits)`; the router itself
+    returns indices on the CPU."""
+
+    def __init__(self, make) -> None:
+        super().__init__()
+        self.inner = Emits(make)
+        self.gate = nn.Linear(16, EXPERTS, bias=False)
+
+    def forward(self, x):
+        self.inner(x)
+        return self.gate(x).topk(TOP_K, dim=-1).indices
+
+
+def _refused(tmp_path, router, name, spec, compile_backend=None, steps=4):
+    """Run, expecting `name` refused and said once, never raised: every step trains and is written.
+    Returns the reason as the record gives it."""
+    with pytest.warns(RuntimeWarning, match=f"not counting the router {name!r}") as caught:
+        records = _run(tmp_path, router, {name: spec}, steps=steps, compile_backend=compile_backend)
+    said = [str(w.message) for w in caught if "not counting the router" in str(w.message)]
+    assert len(said) == 1 and len(records) == steps and _no_entry(records, name)
+    assert [r["step"] for r in records if "moe_refused" in r] == [0]
+    why = records[0]["moe_refused"][name]
+    assert said[0] == f"TensorQuill is not counting the router {name!r}: {why}. Its expert loads are not recorded."
+    [entry] = [e for e in tensorquill.build_evidence(records)["not_checked"] if e["check"] == "router"]
+    assert entry["reason"] == f"router {name} is not counted: {why}" and entry["routers"] == [name]
+    return why
+
+
+ELSEWHERE = ["meta"] + (["mps"] if torch.backends.mps.is_available() else [])
+
+
+@COMPILED
+@pytest.mark.parametrize("device", ELSEWHERE)
+@pytest.mark.parametrize(
+    ("make", "what"),
+    [
+        (lambda logits: logits.topk(TOP_K, dim=-1).indices, "its output's first integer tensor"),
+        (lambda logits: logits, "its output's first floating-point tensor"),
+    ],
+    ids=["indices", "logits"],
+)
+def test_a_router_whose_output_is_on_another_device_is_refused_not_raised(tmp_path, make, what, device,
+                                                                           compile_backend):
+    """It raised into training before (`==` across devices). The fix it names is the one that
+    holds: an inner module's logits would be on that device too, so only `indices=` is offered."""
+    on = str(torch.empty(0, device=device).device)
+    why = _refused(tmp_path, Emits(lambda logits: make(logits).to(device)), "router", Router(EXPERTS, TOP_K),
+                   compile_backend)
+    assert why == f"{what} is on {on}, not on cpu where the counts are. {DEVICE_FIX.replace('NAME', repr('router'))}"
+
+
+@COMPILED
+def test_a_named_inner_module_on_another_device_is_refused_the_same_way(tmp_path, compile_backend):
+    why = _refused(tmp_path, Inner(lambda logits: logits.to("meta")), "router.inner", Router(EXPERTS, TOP_K),
+                   compile_backend)
+    assert why == (
+        "its output's first floating-point tensor is on meta, not on cpu where the counts are. "
+        + DEVICE_FIX.replace("NAME", repr("router.inner"))
+    )
+
+
+@COMPILED
+@pytest.mark.parametrize(
+    ("make", "shape"),
+    [
+        (lambda logits: torch.cat([logits, logits], dim=-1), "(6, 20, 16)"),  # 16 wide for 8 experts
+        (lambda logits: (logits @ torch.ones(EXPERTS, 16), logits), "(6, 20, 16)"),  # (hidden, logits), as a block
+        (lambda logits: logits.sum(), "()"),
+    ],
+    ids=["wider", "hidden-first", "scalar"],
+)
+def test_logits_whose_last_dimension_is_not_the_experts_are_refused_not_counted_as_zeros(
+    tmp_path, make, shape, compile_backend
+):
+    """Before, nothing was counted and every record carried eight zeros for the router."""
+    why = _refused(tmp_path, Emits(make), "router", Router(EXPERTS, TOP_K), compile_backend)
+    assert why == (
+        f"its output has no integer tensor and its first floating-point tensor has shape {shape}, which is not "
+        f"logits for its 8 experts. {DEFAULT_FIX}"
+    )
+
+
+@COMPILED
+def test_a_top_k_above_the_experts_is_refused_with_its_own_fix(tmp_path, compile_backend):
+    why = _refused(tmp_path, Emits(lambda logits: logits), "router", Router(EXPERTS, 10), compile_backend)
+    assert why == (
+        "its top_k is 10 but it has 8 experts. To count it, pass routers={'router': tensorquill.Router(n_experts, "
+        "top_k)} with its number of experts and a top_k of at most that number"
+    )
+
+
+@COMPILED
+@pytest.mark.parametrize(
+    ("make", "start"),
+    [
+        (lambda logits: logits.topk(TOP_K, dim=-1).indices.to(torch.uint32),
+         "its output's first integer tensor is uint32, which TensorQuill cannot count"),
+        (lambda logits: logits.to(torch.float8_e4m3fn),
+         "its output's first floating-point tensor is float8_e4m3fn, which TensorQuill cannot count"),
+        (lambda logits: logits.topk(TOP_K, dim=-1).indices.reshape(-1, TOP_K).to_sparse(),
+         "its output's first integer tensor is a sparse_coo tensor, not a dense one"),
+    ],
+    ids=["uint32", "float8", "sparse"],
+)
+def test_a_tensor_the_counting_cannot_read_is_refused_not_raised(tmp_path, make, start, compile_backend):
+    why = _refused(tmp_path, Emits(make), "router", Router(EXPERTS, TOP_K), compile_backend)
+    assert why == f"{start}. {DEFAULT_FIX}"
+
+
+@COMPILED
+def test_an_indices_function_that_returns_uint32_is_refused_not_raised(tmp_path, compile_backend):
+    records, said = _refused_by_indices(tmp_path, lambda out: out.to(torch.uint32), compile_backend=compile_backend)
+    assert _no_entry(records)
+    assert _one_refusal(records) == (
+        f"the tensor its indices= function returned is uint32, which TensorQuill cannot count. {INDICES_FIX}"
+    )
+
+
+def test_a_dtensor_is_refused_not_raised(tmp_path):
+    """Tensor parallelism can hand a router's output out as a DTensor; `==` with the plain expert
+    numbers raised. One process, gloo, so it runs on CPU."""
+    dist = pytest.importorskip("torch.distributed")
+    if not dist.is_available() or dist.is_initialized():
+        pytest.skip("needs torch.distributed and no process group yet")
+    from torch.distributed.tensor import DTensor, Replicate, init_device_mesh
+
+    dist.init_process_group("gloo", rank=0, world_size=1, store=dist.HashStore())
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        for compile_backend in (None, "eager"):
+            torch._dynamo.reset()
+            router = Emits(lambda logits: DTensor.from_local(logits, mesh, [Replicate()]))
+            why = _refused(tmp_path / str(compile_backend), router, "router", Router(EXPERTS, TOP_K), compile_backend)
+            assert why == f"its output's first floating-point tensor is a DTensor, not a plain tensor. {DEFAULT_FIX}"
+    finally:
+        dist.destroy_process_group()
+
+
+def test_in_eager_mode_anything_else_the_counting_raises_on_refuses_the_router(tmp_path):
+    """The checks are what keep a compiled hook from raising; in eager mode whatever they do not
+    foresee is caught as well. A nested tensor of indices is one: reading its shape raises."""
+    def nested(logits):
+        return torch.nested.nested_tensor([logits[0].topk(TOP_K, dim=-1).indices, logits[1, :5].argsort(dim=-1)])
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="The PyTorch API of nested tensors")
+        why = _refused(tmp_path, Emits(nested), "router", Router(EXPERTS, TOP_K))
+    assert why.startswith("counting its output raised RuntimeError: ") and why.endswith(DEFAULT_FIX)
+
+
+@COMPILED
+@pytest.mark.parametrize(
+    ("make", "spec", "routed"),
+    [
+        (lambda logits: logits.topk(TOP_K, dim=-1).indices.int(), Router(EXPERTS, TOP_K), 120 * TOP_K),
+        (lambda logits: logits.topk(TOP_K, dim=-1).indices.to(torch.uint8), Router(EXPERTS, TOP_K), 120 * TOP_K),
+        (lambda logits: logits.half(), Router(EXPERTS, TOP_K), 120 * TOP_K),
+        (lambda logits: (logits.softmax(-1), logits), Router(EXPERTS, TOP_K), 120 * TOP_K),
+        # An integer router's top_k is only written down: above the experts it is counted as before.
+        (lambda logits: logits.topk(TOP_K, dim=-1).indices, Router(EXPERTS, 12), 120 * TOP_K),
+        # No tensor at all: nothing counted and nothing refused, as before (zeros).
+        (lambda logits: None, Router(EXPERTS, TOP_K), 0),
+    ],
+    ids=["int32", "uint8", "float16", "weights-then-logits", "int-top_k-above", "no-tensor"],
+)
+def test_what_was_counted_before_is_counted_as_before(tmp_path, make, spec, routed, compile_backend):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        records = _run(tmp_path, Emits(make), {"router": spec}, compile_backend=compile_backend)
+    assert _routed(records) == [routed] * 4 and not any("moe_refused" in r for r in records)
+
+
+def test_the_server_reads_a_router_refused_for_its_device_as_python_does(tmp_path):
+    binary = _binary()
+    with pytest.warns(RuntimeWarning, match="not counting the router 'router'"):
+        records = _run(tmp_path, Emits(lambda logits: logits.to("meta")), {"router": Router(EXPERTS, TOP_K)})
+    python = tensorquill.build_evidence(records)
+    rust = tensorquill.build_evidence(records, detectors="rust", server_binary=binary)
+    assert rust["detectors"] == "rust"
+    [entry] = [e for e in rust["not_checked"] if e["check"] == "router"]
+    assert entry == next(e for e in python["not_checked"] if e["check"] == "router")
+    assert entry["reason"].endswith(DEVICE_FIX.replace("NAME", repr("router")))
+    assert rust["kind_checks"] == python["kind_checks"]
