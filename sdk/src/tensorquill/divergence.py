@@ -28,6 +28,7 @@ part" has the measurements). They are read when `first_divergence` is called.
 from __future__ import annotations
 
 import math
+import re
 import statistics
 from typing import Any, Iterable, Mapping
 
@@ -59,11 +60,13 @@ MIN_EARLY_SAMPLES = 2
 
 #: Record keys that are wall-clock readings: two identical runs differ in them from step 0.
 WALL_CLOCK_KEYS = ("ts", "data_wait", "step_time", "system")
-#: A logged scalar whose name holds one of these is taken as a wall-clock reading.
-WALL_CLOCK_WORDS = (
-    "time", "duration", "elapsed", "latency", "throughput", "per_sec", "per_second", "/sec", "/s",
-    "_ms", "_sec", "_secs", "seconds", "speed", "runtime", "memory", "mem_", "gpu_util", "eta",
-)
+#: A logged scalar is taken as a wall-clock reading when one of these is a whole word of its name
+#: (`perf/step_time_ms`, `tokens_per_sec`). Whole words only: `val_mse` and `train/beta` are series.
+WALL_CLOCK_WORDS = frozenset((
+    "time", "times", "timing", "duration", "elapsed", "latency", "throughput", "ms", "sec", "secs", "second",
+    "seconds", "speed", "runtime", "walltime", "wallclock", "memory", "mem", "util", "utilization", "fps",
+))
+_WORD_BREAKS = re.compile(r"[^a-z0-9]+")
 #: Record keys that identify a record and are not series.
 _IDENTITY_KEYS = ("schema_version", "run_id", "rank", "attempt", "step")
 
@@ -100,8 +103,7 @@ def _finite_or_none(value: float | None) -> float | None:
 
 
 def _is_wall_clock(name: str) -> bool:
-    lowered = name.lower()
-    return any(word in lowered for word in WALL_CLOCK_WORDS)
+    return not WALL_CLOCK_WORDS.isdisjoint(_WORD_BREAKS.split(name.lower()))
 
 
 class _Run:

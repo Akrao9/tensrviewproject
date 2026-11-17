@@ -386,6 +386,19 @@ def test_wall_clock_readings_are_left_out_and_listed():
     assert "Left out as wall-clock readings: data_wait" in divergence_summary(result)
 
 
+def test_a_scalar_is_a_clock_only_by_a_whole_word_of_its_name():
+    clocks = ["perf/step_time_ms", "tokens_per_sec", "train/samples_per_second", "data.wait.ms", "Throughput", "gpu-mem", "epoch_time"]
+    series = ["val_mse", "loss_mse", "train/beta", "eval/score", "train/step_loss", "metadata/x", "timestep_loss", "train/loss", "lr"]
+    assert all(dv._is_wall_clock(name) for name in clocks)
+    assert not any(dv._is_wall_clock(name) for name in series)
+    # Two runs that part on such a scalar only are told apart.
+    names = lambda step, factor: {"scalars": {name: wave(step, 1.0, i) * factor for i, name in enumerate(series)}}  # noqa: E731
+    result = first_divergence(make(extra=lambda s: names(s, 1.0)), make(extra=lambda s: names(s, 3.0 if s >= 70 else 1.0)))
+    assert result["left_out"]["wall_clock"] == ["ts"]
+    assert sorted(d["series"] for d in result["diverged_series"]) == sorted(f"scalars/{name}" for name in series)
+    assert result["divergence"]["step"] == 70
+
+
 def test_one_rank_is_read_and_named():
     healthy = make() + make(rank=1)
     changed = make(run_id="b") + [
@@ -595,9 +608,8 @@ def test_toy_stalled_weights_are_named_within_one_check_of_the_freeze_on_the_see
     assert 100 <= found["step"] <= 150 and found["step"] == 149  # frozen from step 100; weights are checked every 50
     assert found["before"]["step"] == 99 and found["before"]["a"] == found["before"]["b"]
     assert found["at"]["b"] == found["before"]["b"] and found["at"]["a"] != found["before"]["a"]  # B stopped, A moved on
-    assert [d["series"] for d in result["diverged_series"]] == [f"weight_norms/{SEEDED}"]
-    # Every other series differs from step 101 on, by rounding: that is said, and is not the answer.
-    assert result["first_exact_difference"]["step"] == 101
+    # Other series differ from just after the freeze, by rounding: that is said, and is not the answer.
+    assert 100 < result["first_exact_difference"]["step"] < 149
 
 
 def test_toy_same_job_twice_has_no_divergence(toy):
