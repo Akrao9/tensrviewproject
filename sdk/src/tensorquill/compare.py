@@ -76,6 +76,8 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
         tail = _Tail(Path(path), None)
         tail.poll()
         records, unfinished = tail.records, True
+    if not records:
+        raise _runs.RunLookupError(f"run {run['run_id']} has no whole record in {path} yet: nothing to compare")
     held = sorted({int(r.get("rank", 0)) for r in records})
     ranks = sorted(set(files) | set(held))
     # The rank asked for; a run with one rank is read on the rank it has, and says which.

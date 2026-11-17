@@ -505,6 +505,9 @@ def test_a_capture_that_is_still_being_written_is_compared_on_its_whole_lines_an
     assert "unfinished_lines_left_out" not in result["runs"][0]["read_from"]
     assert [(e["kind"], e["in"]) for e in result["incidents"]["entries"]] == [("grad_spike", ["B"])]
     assert "the run may still be going" in result["summary"]
+    (folder / "empty.rank0.jsonl").write_text("")
+    with pytest.raises(ValueError, match="run empty has no whole record"):
+        tensorquill.compare_runs("done", "empty", source=folder)
 
 
 def test_runs_given_as_paths_a_store_read_from_its_report_and_a_report_that_cannot_be_used(tmp_path):
