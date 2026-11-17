@@ -74,7 +74,7 @@ jobs:
           cache-dependency-path: sdk/pyproject.toml
       - name: Install
         run: |
-          pip install "torch==2.14.*" --index-url https://download.pytorch.org/whl/cpu
+          pip install "torch==2.15.*" --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[dev,lightning,huggingface,rerun,flight,nvml]"
       - name: Tests
         run: pytest -ra
@@ -106,7 +106,7 @@ jobs:
           cargo test --manifest-path ../server/Cargo.toml --no-default-features --lib
       - name: Install
         run: |
-          pip install "torch==2.14.*" --index-url https://download.pytorch.org/whl/cpu
+          pip install "torch==2.15.*" --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[dev,flight]"
           pip install 'moto[server]' boto3  # the S3 emulator for test_object_store_e2e.py
       - name: Sender and end-to-end tests
