@@ -137,7 +137,7 @@ def _stats_hook(
         # maximum propagates NaN, so a later clean microbatch cannot hide it.
         amax = torch.maximum(xf.abs().amax(), buf[row, 2])
         zfrac = (x == 0).float().mean()
-        buf[row] = torch.where(
+        stats = torch.where(
             stat_idx == 0,
             mean,
             torch.where(
@@ -150,6 +150,10 @@ def _stats_hook(
                 ),
             ),
         )
+        if torch.compiler.is_compiling():
+            _set_row_compiled(buf, row, stats)
+        else:
+            buf[row] = stats
 
     return hook
 
@@ -348,13 +352,15 @@ def _router_hook(
         # Fixed output shape: `bincount` would make the shape depend on the data.
         # Accumulate across gradient-accumulation microbatches; `_commit` zeroes `counts`.
         hits = (idx.detach().reshape(-1, 1) == expert_ids).sum(0)
-        if spec.indices is None:
-            counts.add_(hits)
-        else:
+        if spec.indices is not None:
             # An `indices=` router's buffer has a last slot for the indices outside
             # 0..n_experts-1, which match no expert (`_count_width`): device work only, read in
             # `flush` with the counts (no sync here). Default routers keep the work they had.
-            counts.add_(torch.cat([hits, (idx.numel() - hits.sum()).reshape(1)]))
+            hits = torch.cat([hits, (idx.numel() - hits.sum()).reshape(1)])
+        if torch.compiler.is_compiling():
+            _add_compiled(counts, hits)
+        else:
+            counts.add_(hits)
 
     def hook(module: nn.Module, args: Any, output: Any) -> None:
         if _recomputing() or _evaluating(module, phase):
@@ -371,6 +377,64 @@ def _router_hook(
             refuse(lambda: f"counting its output raised {_short(error)}")
 
     return hook
+
+
+# The two writes below are what a hook does to its buffer when it is compiled. Dynamo puts each
+# call into the graph as one opaque node instead of tracing its body.
+#
+# Under a backend that runs Dynamo's graph as it is (`backend="eager"`, or a custom backend that
+# returns `gm.forward`), the body runs at execution time on the real buffer. A block wrapped in
+# `torch.utils.checkpoint.checkpoint` (reentrant or not: Dynamo runs both as non-reentrant) then
+# runs as one region whose tensor inputs include the buffer, lifted from the hook's closure, and
+# non-reentrant checkpointing saves every input with its version. Bumping the buffer's version in
+# the forward made `backward()` raise "modified by an inplace operation". The region's forward is
+# also replayed in eager mode during backward, from the graph, where `_recomputing()` was decided
+# at trace time; a replayed write would count the same tokens twice.
+#
+# So on a real buffer the write keeps the buffer's version (nothing differentiable reads it) and
+# is skipped while the autograd engine runs, as `_recomputing()` does in eager mode. `_commit`
+# keeps the versions too when it zeroes the buffers, for an optimizer step taken between a
+# forward and its backward. Under AOTAutograd (aot_eager, Inductor) the body is traced on fake
+# tensors instead and adds exactly the operations the hook added before, so those graphs are
+# unchanged.
+
+
+def _real(buf: torch.Tensor) -> bool:
+    # The buffers are plain tensors; tracing passes fake or functional tensor subclasses.
+    return type(buf) is torch.Tensor
+
+
+def _restore_versions(tensors: Sequence[torch.Tensor], versions: Sequence[int]) -> None:
+    """Set each tensor's autograd version back, what `torch.autograd._unsafe_preserve_version_counter`
+    does on exit. Private API, so best effort: without it the version stays bumped, as before."""
+    try:
+        torch._C._autograd._unsafe_set_version_counter(tuple(tensors), tuple(versions))
+    except Exception:  # noqa: BLE001
+        try:  # older releases take one tensor at a time
+            for tensor, version in zip(tensors, versions):
+                torch._C._autograd._unsafe_set_version_counter(tensor, version)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@torch.compiler.allow_in_graph
+def _add_compiled(counts: torch.Tensor, hits: torch.Tensor) -> None:
+    if not _real(counts):
+        counts.add_(hits)
+    elif torch._C._current_graph_task_id() == -1:
+        version = counts._version
+        counts.add_(hits)
+        _restore_versions((counts,), (version,))
+
+
+@torch.compiler.allow_in_graph
+def _set_row_compiled(buf: torch.Tensor, row: int, stats: torch.Tensor) -> None:
+    if not _real(buf):
+        buf[row] = stats
+    elif torch._C._current_graph_task_id() == -1:
+        version = buf._version
+        buf[row] = stats
+        _restore_versions((buf,), (version,))
 
 
 def _mark_static(buf: torch.Tensor) -> None:
@@ -464,7 +528,10 @@ def _recomputing() -> bool:
 
     Recomputation runs eagerly inside the autograd engine (PyTorch disables Dynamo for
     it), so a hook firing then would count the same tokens and activations twice. Under
-    compilation the check is skipped: a compiled forward is never a recomputation.
+    compilation the check is skipped here, since it would be decided once at trace time;
+    a compiled block that is checkpointed can still be replayed when the backend runs
+    Dynamo's graph as it is, and `_add_compiled` and `_set_row_compiled` check for that
+    when they run.
     """
     return not torch.compiler.is_compiling() and torch._C._current_graph_task_id() != -1
 
@@ -1282,6 +1349,9 @@ class Session:
             self._record_weights()
         row = len(self._steps)
         has_act = self._act.numel() > 0
+        # The buffers the forward hooks write; their versions are kept over the zeroing below.
+        hooked = ([self._act] if has_act else []) + self._counts_list
+        hooked_versions = [buf._version for buf in hooked]
         if has_act and self._grads_recorded:
             torch._foreach_copy_((self._ring_act[row], self._ring_grad[row]), (self._act, self._grad))
             torch._foreach_zero_((self._act, self._grad))
@@ -1309,6 +1379,8 @@ class Session:
                 [ring[row] for ring in self._ring_counts_list], self._counts_list
             )
             torch._foreach_zero_(self._counts_list)
+        if hooked:
+            _restore_versions(hooked, hooked_versions)
         self._grads_recorded = False
         self._spread_recorded = 0
         probe_due = self._cadence_probe()
