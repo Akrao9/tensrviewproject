@@ -31,7 +31,7 @@ Four things none of the alternatives states, as read on Nov 16, 2026:
 1. **Multi-GPU failures.** Weight drift between replicas, silent or stuck ranks, and resume mismatches. None of the three debuggers detects them: NeuralDBG only warns under DDP, and LLM-Training-Debugger records rank but says multi-rank is untested.
 2. **Measured cost under `torch.compile`.** Zero graph breaks and recompiles are checked in CI on CPU and were measured on single-GPU runs. A 1% overhead gate applies. None of the three debuggers publishes a measured compile cost.
 3. **Attention and MoE routing together.** The probe reads attention alongside FlashAttention, which never materialises the attention matrix.
-4. **Layer-level evidence for any agent.** A JSON file and four read-only MCP tools, built Nov 16, 2026, for whichever agent, tracker and cloud the team has. The trackers' MCP servers carry only what was logged, and NeuralDBG's does not read a live run.
+4. **Layer-level evidence for any agent.** A JSON file and six read-only MCP tools, built Nov 16 and 17, 2026, for whichever agent, tracker and cloud the team has. The trackers' MCP servers carry only what was logged, and NeuralDBG's does not read a live run.
 
 Points 1 and 2 become public claims only after results 1 and 3 under Prove.
 
@@ -54,26 +54,26 @@ This page is the short front page of the plan. Decisions and measurements are st
 
 ## Build: the agent loop
 
-Five pieces turn the evidence files into continuous monitoring by an agent. They are built in this order, and each has one done test. All five were built on Nov 16, 2026. The done tests of pieces 3 and 4 are still open, because no live agent has been tried. A sixth piece, comparing runs, joined the first release on Nov 16, 2026 and is not built.
+Five pieces turn the evidence files into continuous monitoring by an agent. They are built in this order, and each has one done test. All five were built on Nov 16, 2026. The done tests of pieces 3 and 4 are still open, because no live agent has been tried. A sixth piece, comparing runs, joined the first release on Nov 16, 2026 and was built on Nov 17, 2026.
 
 1. **Say what was checked.** Each evidence file gives every kind one of three values: checked, not configured or unavailable. Only unavailable degrades the run, and the summary carries the count, such as "9 of 32 kinds checked".
-   - Built Nov 16, 2026 as `kind_checks` in `evidence.json` and in the server's report. A router-only Granite capture reads "4 of 32 kinds checked". The done test is met in tests. Open: the all-ranks view does not carry the key yet. Decided Nov 16, 2026 and being built: a kind still counts as checked from its first record, and each kind also says whether its rule has enough history yet, so too few attention probes no longer degrade a run.
+   - Built Nov 16, 2026 as `kind_checks` in `evidence.json` and in the server's report. A router-only Granite capture reads "4 of 32 kinds checked". The done test is met in tests. The all-ranks view carries the key since Nov 17, 2026. Built Nov 17, 2026: a kind still counts as checked from its first record, and each kind also says whether its rule has enough history yet, so too few attention probes no longer degrade a run.
    - Done when a router-only capture lists the weight and activation checks as not configured and still reads `healthy`, and a failed probe reads `degraded`.
 2. **Compact evidence.** The agent's file holds the incidents and a short window of steps around each, with no per-step samples.
    - Done when a 10,000-step MoE run gives a file under 1 MB (proposed line; the full file is 86 MB today).
    - Built Nov 16, 2026 as `--compact`. The done test is met: the same run gives 198 KB with a window of 5 steps, and 1 MB holds a window of up to 28.
 3. **A trigger.** `--watch` takes `--on-incident <command>` and a webhook URL, and fires once per new incident. It does not fire on a change of run state, because incidents never close. Invariants fire by default, and anomalies are opt-in until thresholds are tuned.
    - Done when a seeded failure starts the agent with no human step.
-   - Built Nov 16, 2026, with `--fire-anomalies` and `--fire-kind` to widen what fires. The done test is open: in tests a planted failure starts a command once, but no agent has been started by it. Decided Nov 16, 2026 and being built: a stall that reaches `critical` fires by default, and a `warning` stall fires only when its kind is named. A local run with no server cannot detect a hang.
-4. **A read-only MCP server** over the same files, with four tools: list incidents, get one incident, get a series for one layer or parameter, and get the all-ranks status.
+   - Built Nov 16, 2026, with `--fire-anomalies` and `--fire-kind` to widen what fires. The done test is open: in tests a planted failure starts a command once, but no agent has been started by it. Built Nov 17, 2026: a stall that reaches `critical` fires by default, and a `warning` stall fires only when its kind is named. One stall fires once per run. A killed job still fires and reads as a lost connection, not a hang. With a trigger set, the compact evidence is always written. A local run with no server cannot detect a hang.
+4. **A read-only MCP server** over the same files, with six tools: list incidents, get one incident, get a series for one layer or parameter, get the all-ranks status, list runs and compare runs.
    - Done when a fresh agent session names the step, layer and kind for each fixture through it alone.
    - Built Nov 16, 2026 as `python -m tensorquill.mcp_server`. The done test is open: a scripted client names the kind, step and layer on all seven fixtures through the four tools, but no agent session has used them.
 5. **Explain only.** The agent writes its diagnosis next to the incident. Pausing, stopping or changing a run needs a person's approval.
    - Done when the agent's instructions and tools offer no write action on the run.
-   - Written Nov 16, 2026 as `sdk/AGENT_INSTRUCTIONS.md`. The done test is met: the instructions and the four tools offer no write action on the run.
+   - Written Nov 16, 2026 as `sdk/AGENT_INSTRUCTIONS.md`. The done test is met: the instructions and the six tools offer no write action on the run.
 6. **Projects, run names and comparing runs.** A run gets a project and a name beside its ID, as in W&B. `runs` lists a project's runs, and `compare` sets two or more side by side: what differs in the setup, what was checked, the incidents, and for a paired run the first step and layer where they part. Scalar charts and sweeps stay with MLflow and W&B.
    - Done when a healthy run and a seeded run compare as one incident in the second only, on the seeded parameter, and a router-only run against a full capture reports the difference in what was checked before any incident.
-   - Accepted Nov 16, 2026 for the first release; the design is in v3. Not built.
+   - Accepted Nov 16, 2026 for the first release; the design is in v3. Built Nov 17, 2026, reading every rank of a run. The done test is met in tests on toy runs; no real GPU capture and no job of more than two ranks has been compared.
 
 TensorQuill itself still only reports. Nothing in the SDK or server blocks or stops training.
 
@@ -104,7 +104,7 @@ Five results make the claims credible, and none has been run yet. Pass lines are
 | 1 | Two-GPU run over NCCL: `replica_check.py` and the three `seeded_failures.py` commands | Every seeded case caught within one flush or check interval, on the seeded parameter. No drift reported on healthy steps at `1e-6` | Passes on CPU only |
 | 2 | One of the author's real jobs | At least 1,000 steps, with a real anomaly found or zero false incidents | Not run. nanochat and nanoMoE are noted as candidates; whether they count as the author's own job is not decided |
 | 3 | Head-to-head on the Granite run under `torch.compile`: TensorQuill, NeuralDBG and `wandb.watch` | TensorQuill router-only at 1.0% or less, with 0 graph breaks and 0 recompiles after warmup. All three tools' numbers are published, whatever they show | Not run |
-| 4 | Agent benchmark on at least 8 real captures that carry loss and gradient curves | The agent names the exact step, layer or parameter, and kind in 85% of trials, and beats scalar-only data by 30 points | Not run. The Gate 1 harness on the 7 fixtures is the rehearsal, scored by its own pre-registered rules and without the Rune arm. Loss is now logged in the four GPU scripts, but router-only captures carry no gradient norm, so these runs need full capture |
+| 4 | Agent benchmark on at least 8 real captures that carry loss and gradient curves | The agent names the exact step, layer or parameter, and kind in 85% of trials, and beats scalar-only data by 30 points | Not run. The Gate 1 harness on the 7 fixtures is the rehearsal, scored by its own pre-registered rules and without the Rune arm. Since Nov 17, 2026 its gate is the evidence arm against stock Rerun with the same evidence: accuracy within 5 points, and no more tool calls at the median. Loss is now logged in the four GPU scripts, but router-only captures carry no gradient norm, so these runs need full capture |
 | 5 | Public release | On PyPI and crates.io, and 3 outside engineers run it on their own jobs | Packaging prepared, nothing uploaded |
 
 Results 2 and 5 decide whether the product is wanted. Results 1, 3 and 4 decide what it may claim.
@@ -128,9 +128,9 @@ Four weeks from Nov 16, 2026, in this order. The weeks are a proposal; move them
 - [x] Write the explain-only agent instructions (piece 5)
 - [ ] Rehearse the agent benchmark on the Gate 1 harness: seven fixtures, its own scoring, no Rune arm
 - [ ] Try the MCP server and the trigger with a live agent on a planted failure (the done tests of pieces 3 and 4)
-- [ ] Say what was checked in the all-ranks view
-- [ ] Build piece 6: project and run name, the `runs` listing, `compare` and its two MCP tools
-- [ ] Finish the two changes decided Nov 16, 2026: each kind says whether its rule has enough history, and a `critical` stall fires the trigger (in progress)
+- [ ] Say what was checked in the all-ranks view (done Nov 17, 2026)
+- [ ] Build piece 6: project and run name, the `runs` listing, `compare` and its two MCP tools (done Nov 17, 2026)
+- [ ] Finish the two changes decided Nov 16, 2026: each kind says whether its rule has enough history, and a `critical` stall fires the trigger (done Nov 17, 2026)
 
 **Week 3: the comparison**
 
@@ -142,7 +142,7 @@ Four weeks from Nov 16, 2026, in this order. The weeks are a proposal; move them
 
 **Week 4: release**
 
-- [ ] Time the 64-rank benchmark again with exact number parsing on the live path
+- [ ] Time the 64-rank benchmark again with exact number parsing on the live path (done Nov 17, 2026: about 4 ms more detector time per flush of 64 ranks)
 - [ ] Claim `tensorquill` on PyPI and `tensorquill-server` on crates.io, then publish
 - [ ] Post the demo: a planted failure that the agent names by step and layer
 - [ ] Get three outside engineers to run it on their own jobs
@@ -176,14 +176,14 @@ Two decisions are still the author's to make, two were settled on Nov 16, 2026, 
 | --- | --- |
 | A debugger or tracker ships measured compile-safe capture, multi-GPU checks or its own agent first. LLM-Training-Debugger's v0.2 list names multi-node runs, Flight Recorder hangs, attention and MoE | Result 3, rerun before release; lead with multi-GPU failures and open evidence |
 | Nobody outside wants it | Result 5; no hosted work before it |
-| The agent reads "no incidents" as healthy | Build piece 1, built Nov 16, 2026, with a per-kind note of whether its rule has enough history (in progress); the agent benchmark has to show it works |
+| The agent reads "no incidents" as healthy | Build piece 1, built Nov 16, 2026, with a per-kind note of whether its rule has enough history (built Nov 17, 2026); the agent benchmark has to show it works |
 | Thresholds tuned on Granite and SmolLM2-360M raise false alarms elsewhere | Result 2, on the author's own job; until then anomalies do not fire the trigger by default |
 | Moving detectors to one Rust copy changes their answers | Golden files hold Python's answers, and the parity tests stay until each Python duplicate is deleted |
 | A probe flush of about 150 ms delays a live acknowledgement; 620 ms was seen once | Logged as an open gap in v3; looked at after results 1 and 2 |
 
 ## Sources
 
-- TensorQuill v3 — Product and Build Plan, Nov 13, 2026 (state as of Nov 16, 2026), for every TensorQuill figure and for the tracker, ARIA and Pluto rows
+- TensorQuill v3 — Product and Build Plan, Nov 13, 2026 (state as of Nov 17, 2026), for every TensorQuill figure and for the tracker, ARIA and Pluto rows
 - A check of this page against `main` and against clones of the three debugger repositories, Nov 16, 2026: code and docs read, nothing run
 - [NeuralDBG repository](https://github.com/LambdaSection/NeuralDBG)
 - [MoEWatch v0.1 announcement](https://forum.fossunited.org/t/moewatch-v0-1-open-source-diagnostics-for-moe-routing-failure/9532)
