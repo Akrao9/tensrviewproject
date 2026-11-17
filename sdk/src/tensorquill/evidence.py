@@ -1796,7 +1796,7 @@ def thresholds_line(evidence: Mapping[str, Any]) -> str | None:
                 ranks = [r for r in found.get("ranks") or () if isinstance(r, int)]
                 off = _off_default(found.get("thresholds"))
                 if off:
-                    named.append(f"rank{'s' if len(ranks) != 1 else ''} {_rank_ranges(ranks, 8)}: {', '.join(off)}")
+                    named.append(f"on rank{'s' if len(ranks) != 1 else ''} {_rank_ranges(ranks, 8)}: {', '.join(off)}")
             off = ["; ".join(named)] if named else []
         else:
             off = _off_default(evidence.get("thresholds"))

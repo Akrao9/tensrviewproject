@@ -114,12 +114,12 @@ def test_ranks_judged_by_different_thresholds_are_each_named_with_their_ranks():
     evidence = all_ranks(by_rank[0]["thresholds"], by_rank)
     # The ranks judged by the defaults are not named: nothing differs for them.
     assert thresholds_line(evidence) == (
-        PREFIX + "the server applied ranks 0-1: starve_window 20 (default: 50); rank 3: overload_threshold 0.5"
+        PREFIX + "the server applied on ranks 0-1: starve_window 20 (default: 50); on rank 3: overload_threshold 0.5"
         " (default: 0.35), top_k 2 (default: what the run recorded)."
     )
     # The first set at the defaults and another not: still said, though `thresholds` alone is the defaults.
     swapped = all_ranks(dict(THRESHOLD_DEFAULTS), [by_rank[1], by_rank[0]])
-    assert thresholds_line(swapped) == PREFIX + "the server applied ranks 0-1: starve_window 20 (default: 50)."
+    assert thresholds_line(swapped) == PREFIX + "the server applied on ranks 0-1: starve_window 20 (default: 50)."
 
 
 # --- a real server started with `--thresholds`, and one at the defaults ---------------------------
@@ -182,7 +182,7 @@ def test_the_all_ranks_view_says_so_and_at_the_defaults_does_not(tmp_path, store
     assert run.server.terminate() == 0
     evidence, summary = store.all_ranks(run, tmp_path / "mixed.json")
     assert len(evidence["thresholds_by_rank"]) == 2
-    assert summary.splitlines()[-1] == SERVER_LINE.replace("the server applied ", "the server applied ranks 0-1: ")
+    assert summary.splitlines()[-1] == SERVER_LINE.replace("the server applied ", "the server applied on ranks 0-1: ")
 
     quiet = store.Run(tmp_path / "defaults", *store.FAST)
     for rank in range(2):
