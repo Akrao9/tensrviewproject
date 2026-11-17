@@ -101,7 +101,7 @@ The summary's line "N of 32 kinds checked" is the count, and it names the kinds 
 - One unavailable rank makes the kind unavailable for the run, and the run `degraded`, as for one rank.
 - The summary's count line names the same things: "6 of 32 kinds checked on the 3 judged ranks of 4 (rank 3 not judged, so not counted), 1 of them without enough history yet (grad_spike 5 of 13 records on rank 2), 26 not configured, 1 of them checked on some ranks only (stalled_weights on rank 0)".
 - When there is no `kinds`, `kinds_not_stated` gives the reason: no rank is judged, or a judged rank's report was written by a server that does not say what it checked. Then nothing is counted for the run, and the summary says "What was checked is not stated". Say so, and do not infer it.
-- `duplicate_batches` is compared by the server, and its status names the ranks it compared only when it finds a duplicate. Read `checked` for it as "every judged rank recorded its batches and a status was read", not as proof that every rank was compared.
+- The invariant `duplicate_batches` is compared by the server, and its status names the ranks it compared only when it finds a duplicate. Read `checked` for it as "every judged rank recorded its batches and a status was read", not as proof that every rank was compared.
 
 A check listed under `not_checked` was not made, and each entry gives the reason. It is not a finding of "nothing wrong". Every unavailable kind is named by one of these entries, or by the reason `no_status`.
 
