@@ -70,6 +70,7 @@ pub struct IngestConfig {
     pub critical: Duration,
     /// A pause with no sign of work is a suspected hang after this long.
     pub pause_limit: Duration,
+    pub start_limit: Duration,
     /// How often `runs/<run_id>/watchdog.json` is rewritten. Zero turns the watchdog's file off.
     pub watchdog_interval: Duration,
     /// An unfinished run's status is rewritten at least this often although nothing in it
@@ -96,6 +97,7 @@ impl Default for IngestConfig {
             silent_factor: crate::watchdog::DEFAULT_SILENT_FACTOR,
             critical: crate::watchdog::DEFAULT_CRITICAL,
             pause_limit: crate::watchdog::DEFAULT_PAUSE_LIMIT,
+            start_limit: crate::watchdog::DEFAULT_START_LIMIT,
             watchdog_interval: DEFAULT_WATCHDOG_INTERVAL,
             status_refresh: DEFAULT_WATCHDOG_INTERVAL * 3,
             detect: true,
@@ -204,6 +206,7 @@ impl Ingest {
             silent_factor: config.silent_factor,
             critical: config.critical,
             pause_limit: config.pause_limit,
+            start_limit: config.start_limit,
             abandon: config.abandon_after,
         });
         Arc::new(Self {

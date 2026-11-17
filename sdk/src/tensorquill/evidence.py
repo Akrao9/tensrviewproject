@@ -3658,13 +3658,26 @@ def _describe_stream(incident: Mapping[str, Any]) -> str:
         ranks = incident["ranks"]
         quiet = max((r.get("seconds_since_progress") or 0 for r in ranks), default=0)
         reasons = sorted({_how_stopped(r) for r in ranks})
+        count = f"none of {len(ranks)} rank{'s' if len(ranks) != 1 else ''}"
+        if ranks and all(r.get("last_step") is None for r in ranks):
+            # Nothing was ever stored: the capture holds `every` steps before it writes any.
+            worked = [r["work"] for r in ranks if isinstance(r.get("work"), int) and r["work"] > 0]
+            return (
+                f"Job stalled before its first batch was stored: {count} has sent a step in {quiet:.0f} s"
+                + (f", and the heartbeats' work counter stands at {max(worked)}" if worked else "")
+                + f" ({'; '.join(reasons)})."
+                " A hang, a long startup (compilation, a data load), or a killed job can look the same from here." + tail
+            )
         return (
-            f"Job stalled after step {incident['step']}: none of {len(ranks)} rank{'s' if len(ranks) != 1 else ''}"
+            f"Job stalled after step {incident['step']}: {count}"
             f" has sent a new step for at least {quiet:.0f} s ({'; '.join(reasons)})."
             " A hang, a long evaluation or checkpoint pause, or a killed job can look the same from here." + tail
         )
     parts = []
     for r in incident["ranks"][:4]:
+        if r.get("last_step") is None:
+            parts.append(f"rank {r['rank']} has had no step stored yet ({_how_stopped(r)})")
+            continue
         parts.append(f"rank {r['rank']} sent no new step since step {r['last_step']} ({_how_stopped(r)})")
     if incident["missing_ranks"]:
         parts.append("ranks " + ", ".join(str(r) for r in incident["missing_ranks"][:8]) + " never connected"

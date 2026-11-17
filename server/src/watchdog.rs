@@ -15,6 +15,16 @@
 //! - `lost`: it dropped and did not come back for longer than the floor.
 //! - `finished`: the stream ended cleanly, as `close()` does.
 //!
+//! Before a rank's first batch is stored there is no step to count from, and the capture holds
+//! `every` steps before it writes any, so a job can hang with nothing stored. Such a rank is
+//! `starting`, and that is bounded two ways. Once its heartbeats' work counter has risen while
+//! it said `train`, it has taken a training step and the counter is its progress: it is
+//! `silent` when the counter has stood still for longer than its threshold. Until then (it is
+//! compiling, loading data, in its first collective, or it sends no heartbeat) it is `starting`
+//! for `--start-seconds` since its last sign of work, then `silent`, and critical
+//! `--critical-seconds` after that. A slow first batch is therefore never a stop while its
+//! steps are seen, and a slow first step gets a warning first.
+//!
 //! The run's summary is `stalled` when no rank is active and some are silent or lost,
 //! `degraded` when some are silent, lost or never connected while another is active,
 //! `finished` when every rank finished, and `active` otherwise. The server writes it to
@@ -65,6 +75,8 @@ pub const DEFAULT_SILENT_FLOOR: Duration = Duration::from_secs(300);
 pub const DEFAULT_SILENT_FACTOR: f64 = 5.0;
 pub const DEFAULT_CRITICAL: Duration = Duration::from_secs(900);
 pub const DEFAULT_PAUSE_LIMIT: Duration = Duration::from_secs(1800);
+/// How long a rank that has shown no training step may stay `starting` (see `WatchdogConfig::start_limit`).
+pub const DEFAULT_START_LIMIT: Duration = Duration::from_secs(1800);
 /// A run with no stream open and nothing heard for this long is given up (see `WatchdogConfig::abandon`).
 pub const DEFAULT_ABANDON: Duration = Duration::from_secs(72 * 3600);
 /// A rank is critical after this many times its own silence threshold, if that is longer than
@@ -87,6 +99,11 @@ pub struct WatchdogConfig {
     /// A pause (a phase other than training) with no sign of work counts as a suspected hang
     /// after this long. A pause whose work counter moves is not limited.
     pub pause_limit: Duration,
+    /// Before its first stored batch, a rank whose work counter has shown no training step (it
+    /// is compiling, loading data, in its first collective, or sends no heartbeat) is `starting`
+    /// for at most this long since its last sign of work, then `silent`: a warning, and
+    /// critical `critical` later. A rank whose counter shows steps is judged by the counter.
+    pub start_limit: Duration,
     /// A run with no stream open, whose ranks have all been disconnected or finished for this
     /// long, is abandoned. Zero never gives a run up.
     pub abandon: Duration,
@@ -99,6 +116,7 @@ impl Default for WatchdogConfig {
             silent_factor: DEFAULT_SILENT_FACTOR,
             critical: DEFAULT_CRITICAL,
             pause_limit: DEFAULT_PAUSE_LIMIT,
+            start_limit: DEFAULT_START_LIMIT,
             abandon: DEFAULT_ABANDON,
         }
     }
@@ -115,7 +133,8 @@ pub enum Stream {
 pub enum RankState {
     Active,
     /// The stream is open but no batch has arrived yet: the first one carries `every` steps,
-    /// so a slow job takes a long time to send it. Not a stop.
+    /// so a slow job takes a long time to send it. Not a stop, while the rank's work counter
+    /// moves or, before its first training step, for `start_limit`.
     Starting,
     /// No new step, but the rank declared a phase other than training (evaluation, a
     /// checkpoint), its heartbeats continue, and its work counter moves or the pause is
@@ -164,6 +183,13 @@ pub struct Progress {
     /// when it last moved.
     work: Option<i64>,
     work_moved: Instant,
+    /// The counter rose while the rank said it was training: it has taken a training step.
+    /// Until its first batch is stored, the counter is then its progress.
+    stepped: bool,
+    /// Seconds per unit of work at the counter's last few rises in training, before the first
+    /// stored batch: the time since the counter last moved (the first time, since the rank was
+    /// first seen) over how far it rose. All there is to judge a slow job by until a batch arrives.
+    step_seconds: VecDeque<f64>,
     /// Where the process's threads were at its last heartbeat, when its work had stood still
     /// long enough for it to say (see `Heartbeat` in the SDK). Kept after the heartbeats stop.
     stack: Option<Value>,
@@ -192,6 +218,8 @@ impl Progress {
             heartbeat_interval: 0.0,
             work: None,
             work_moved: now,
+            stepped: false,
+            step_seconds: VecDeque::new(),
             stack: None,
             pauses: HashMap::new(),
             created: now,
@@ -209,19 +237,35 @@ impl Progress {
 
     /// The typical time between progress events: the median of the last few gaps.
     fn cadence(&self) -> Option<f64> {
-        if self.gaps.is_empty() {
-            return None;
-        }
-        let mut gaps: Vec<f64> = self.gaps.iter().copied().collect();
-        gaps.sort_by(|a, b| a.total_cmp(b));
-        Some(gaps[gaps.len() / 2])
+        median(&self.gaps)
     }
 
     /// The quiet time after which a rank that has been stepping is called silent: the floor, or
-    /// a multiple of the rank's own time between batches if that is longer.
+    /// a multiple of the rank's own time between batches if that is longer. Before the first
+    /// stored batch the time between batches is not known: the multiple is then of the rank's
+    /// time per step as its work counter showed it, and never under three heartbeat intervals,
+    /// because the server sees the counter once a beat.
     pub fn threshold(&self, config: &WatchdogConfig) -> f64 {
         let floor = config.silent_floor.as_secs_f64();
+        if self.last_step.is_none() {
+            let step = median(&self.step_seconds).unwrap_or(0.0);
+            return floor
+                .max(step * config.silent_factor)
+                .max(self.heartbeat_interval * HEARTBEAT_STALE_INTERVALS);
+        }
         floor.max(self.cadence().map_or(0.0, |gap| gap * config.silent_factor))
+    }
+
+    /// An open stream with no stored batch whose counter has shown no training step: the rank
+    /// is under `start_limit`, not under its threshold.
+    fn before_its_first_step(&self) -> bool {
+        self.stream == Stream::Open && self.last_step.is_none() && !self.stepped
+    }
+
+    /// When the rank last showed a sign of work: its counter moved or it changed its phase
+    /// (at first, when it was first seen).
+    fn last_sign(&self) -> Instant {
+        self.work_moved.max(self.phase_since)
     }
 
     pub fn state(&self, now: Instant, config: &WatchdogConfig) -> RankState {
@@ -243,11 +287,27 @@ impl Progress {
                 let heartbeat = self.heartbeat_age(now);
                 let frozen = heartbeat.is_some_and(|age| age > self.stale_after(config));
                 if self.last_step.is_none() {
-                    // Before the first batch there is no cadence to judge by.
-                    return if frozen {
-                        RankState::Unresponsive
-                    } else {
+                    // Before the first batch there is no cadence of batches to judge by.
+                    if frozen {
+                        return RankState::Unresponsive;
+                    }
+                    if !self.stepped {
+                        // No training step yet (or no counter): bounded, as a pause with no sign of work is.
+                        let idle = now.saturating_duration_since(self.last_sign());
+                        return if idle <= config.start_limit {
+                            RankState::Starting
+                        } else {
+                            RankState::Silent
+                        };
+                    }
+                    // It has stepped: the counter is its progress until a batch is stored.
+                    let still = now.saturating_duration_since(self.work_moved).as_secs_f64();
+                    return if still <= self.threshold(config) {
                         RankState::Starting
+                    } else if self.phase != TRAIN && self.pause_is_alive(now, config) {
+                        RankState::Paused
+                    } else {
+                        RankState::Silent
                     };
                 }
                 if now.saturating_duration_since(self.last_progress).as_secs_f64() <= self.threshold(config) {
@@ -288,13 +348,34 @@ impl Progress {
     }
 
     /// Seconds the rank has gone without what makes it `state`: for a stopped rank, the time
-    /// since it last made progress (or, if its stream dropped, since it dropped).
-    fn quiet_seconds(&self, now: Instant) -> f64 {
+    /// since it last made progress (or, if its stream dropped, since it dropped). A rank called
+    /// silent before its first stored batch has made none: the time since its counter last
+    /// moved, or since its last sign of work if it has not taken a training step.
+    fn quiet_seconds(&self, state: RankState, now: Instant) -> f64 {
         let since = match self.stream {
             Stream::Dropped => self.last_change,
+            Stream::Open if state == RankState::Silent && self.last_step.is_none() => {
+                if self.stepped {
+                    self.work_moved
+                } else {
+                    self.last_sign()
+                }
+            }
             _ => self.last_progress,
         };
         now.saturating_duration_since(since).as_secs_f64()
+    }
+
+    /// The quiet time after which a stopped rank is critical: the configured time, or three
+    /// silence thresholds of this rank if that is longer, so a rank that is slow by nature still
+    /// gets a warning first. A rank called silent before its first training step was given
+    /// `start_limit` first, and is critical the configured time after that.
+    fn critical_after(&self, state: RankState, config: &WatchdogConfig) -> f64 {
+        let critical = config.critical.as_secs_f64();
+        if state == RankState::Silent && self.before_its_first_step() {
+            return config.start_limit.as_secs_f64() + critical;
+        }
+        critical.max(CRITICAL_THRESHOLDS * self.threshold(config))
     }
     /// Seconds since the stream dropped or finished, none while a stream is open.
     fn disconnected_seconds(&self, now: Instant) -> Option<f64> {
@@ -315,6 +396,8 @@ impl Progress {
             "heartbeat_interval_seconds": self.heartbeat_interval,
             "work": self.work,
             "work_still_seconds": before(self.work_moved),
+            "stepped": self.stepped,
+            "step_seconds": self.step_seconds.iter().copied().map(round3).collect::<Vec<_>>(),
             "gaps_seconds": self.gaps.iter().copied().map(round3).collect::<Vec<_>>(),
             "pauses": self.pauses.iter().map(|(phase, stats)| (phase.clone(), json!({
                 "count": stats.count,
@@ -384,6 +467,15 @@ impl Progress {
             heartbeat_interval: seconds(&carry["heartbeat_interval_seconds"])?.clamp(0.0, 3600.0),
             work: carry["work"].as_i64(),
             work_moved: ago(now, seconds(&carry["work_still_seconds"])?),
+            // Absent from a status written before these were kept: no step seen, no times.
+            stepped: carry["stepped"].as_bool().unwrap_or(false),
+            step_seconds: carry["step_seconds"]
+                .as_array()
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter_map(seconds)
+                .take(GAPS_KEPT)
+                .collect(),
             stack: entry.get("stack").filter(|stack| stack.is_object()).cloned(),
             pauses,
             created: ago(now, seconds(&carry["age_seconds"])?),
@@ -406,6 +498,16 @@ impl Progress {
             },
         })
     }
+}
+
+/// The middle of a few times (the upper of two), none of none.
+fn median(times: &VecDeque<f64>) -> Option<f64> {
+    if times.is_empty() {
+        return None;
+    }
+    let mut times: Vec<f64> = times.iter().copied().collect();
+    times.sort_by(|a, b| a.total_cmp(b));
+    Some(times[times.len() / 2])
 }
 
 fn round3(value: f64) -> f64 {
@@ -529,7 +631,23 @@ impl Watchdog {
         now: Instant,
     ) {
         self.with(key, now, |p| {
-            if work.is_some() && work != p.work {
+            // The first report is the counter's value, not a movement, unless it is already above zero.
+            let moved = work.is_some() && work != p.work && (p.work.is_some() || work > Some(0));
+            if let (true, Some(count)) = (moved, work) {
+                // A rise while the rank said `train` is a training step (a tick in another phase is
+                // work, and not a step). The phase is the one it was in as the counter rose.
+                let rise = count.saturating_sub(p.work.unwrap_or(0));
+                let training = p.phase == TRAIN && (p.work.is_some() || phase == TRAIN);
+                if rise > 0 && training {
+                    if p.last_step.is_none() {
+                        let elapsed = now.saturating_duration_since(p.work_moved).as_secs_f64();
+                        p.step_seconds.push_back(elapsed / rise as f64);
+                        if p.step_seconds.len() > GAPS_KEPT {
+                            p.step_seconds.pop_front();
+                        }
+                    }
+                    p.stepped = true;
+                }
                 p.work_moved = now;
             }
             // The newest word wins: a beat with no stack says the rank is working again.
@@ -654,10 +772,8 @@ pub fn run_status(
         .iter()
         .zip(&states)
         .map(|((rank, p), state)| {
-            let quiet = p.quiet_seconds(now);
-            // Critical after the configured time, or three silence thresholds of this rank if that
-            // is longer, so a rank that is slow by nature still gets a warning first.
-            let critical = config.critical.as_secs_f64().max(CRITICAL_THRESHOLDS * p.threshold(config));
+            let quiet = p.quiet_seconds(*state, now);
+            let critical = p.critical_after(*state, config);
             let severity = match state {
                 RankState::Silent | RankState::Lost | RankState::Unresponsive => {
                     Some(if quiet > critical { "critical" } else { "warning" })
@@ -672,6 +788,7 @@ pub fn run_status(
                 "severity": severity,
                 "attempt": p.attempt,
                 "last_step": p.last_step,
+                "work": p.work,
                 "seconds_since_progress": (now.saturating_duration_since(p.last_progress).as_secs_f64() * 10.0).round() / 10.0,
                 "stream": match p.stream {
                     Stream::Open => "open",
@@ -708,6 +825,7 @@ pub fn run_status(
         "silent_floor_seconds": config.silent_floor.as_secs_f64(),
         "silent_factor": config.silent_factor,
         "critical_seconds": config.critical.as_secs_f64(),
+        "start_seconds": config.start_limit.as_secs_f64(),
         "pauses": pauses.iter().map(|(phase, stats)| (phase.to_string(), json!({
             "count": stats.count,
             "total_seconds": (stats.total * 10.0).round() / 10.0,
@@ -1194,6 +1312,7 @@ mod tests {
             silent_factor: 5.0,
             critical: Duration::from_secs(floor * 3),
             pause_limit: Duration::from_secs(floor * 10),
+            start_limit: Duration::from_secs(floor * 10),
             abandon: Duration::from_secs(floor * 100),
         }
     }
@@ -1413,19 +1532,241 @@ mod tests {
     }
 
     #[test]
-    fn before_the_first_batch_a_rank_is_starting_not_stopped() {
-        // The first batch carries `every` steps, so a slow job sends it late.
+    fn before_its_first_step_a_rank_is_starting_for_the_start_limit_then_silent() {
+        // No training step yet (compiling, loading data, its first collective): starting for the
+        // start limit (600 s here), then a suspected hang, critical 180 s after that.
+        let t0 = Instant::now();
+        let new = |beats_until: u64| {
+            let dog = Watchdog::new(config(60));
+            dog.stream_opened(&key(0), t0);
+            for second in (5..beats_until).step_by(15) {
+                dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, second));
+            }
+            dog
+        };
+        let dog = new(2000);
+        assert_eq!(states(&dog, at(t0, 590)), ["starting"]);
+        assert_eq!(summary(&dog, at(t0, 590)), "active");
+        assert_eq!(rank_field(&dog, at(t0, 590), "severity"), Value::Null);
+        assert_eq!(states(&dog, at(t0, 610)), ["silent"]);
+        assert_eq!(summary(&dog, at(t0, 610)), "stalled");
+        assert_eq!(rank_field(&dog, at(t0, 610), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 770), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 790), "severity"), "critical");
+        let status = &dog.statuses(at(t0, 790), true)["run"];
+        assert_eq!(
+            (&status["ranks"][0]["last_step"], &status["ranks"][0]["work"]),
+            (&Value::Null, &json!(0))
+        );
+        assert_eq!(status["start_seconds"], 600.0);
+        let stall = &status["incidents"][0];
+        assert_eq!(
+            (&stall["kind"], &stall["step"], &stall["severity"], &stall["assessment"]),
+            (
+                &json!("job_stalled"),
+                &json!(0),
+                &json!("critical"),
+                &json!("suspected_hang")
+            )
+        );
+        // The first stored batch ends it, however late.
+        dog.batch(&key(0), 1, Some(49), Some(1), at(t0, 800));
+        assert_eq!(states(&dog, at(t0, 801)), ["active"]);
+        assert_eq!(rank_field(&dog, at(t0, 801), "severity"), Value::Null);
+        // A process that froze during startup is still caught by its heartbeats stopping.
+        let dog = new(100);
+        assert_eq!(states(&dog, at(t0, 200)), ["unresponsive"]);
+        // A rank that sends no heartbeat has no counter: the same limit.
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        assert_eq!(states(&dog, at(t0, 590)), ["starting"]);
+        assert_eq!(states(&dog, at(t0, 610)), ["silent"]);
+        assert_eq!(rank_field(&dog, at(t0, 610), "heartbeat_age_seconds"), Value::Null);
+    }
+
+    #[test]
+    fn a_rank_that_steps_and_then_stops_before_its_first_batch_is_silent_then_critical() {
+        // 40 steps, then nothing, with `every` at 50: no batch was ever stored. The heartbeats go
+        // on and their counter stands at 40.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60)); // critical after 180 s
+        dog.stream_opened(&key(0), t0);
+        for second in (5..1000).step_by(15) {
+            let work = if second < 35 { 0 } else { 40 };
+            dog.heartbeat(&key(0), "train", 15.0, Some(work), None, at(t0, second));
+        }
+        // The counter last moved at 35 s; the threshold is the 60 s floor.
+        assert_eq!(states(&dog, at(t0, 90)), ["starting"]);
+        assert_eq!(rank_field(&dog, at(t0, 90), "severity"), Value::Null);
+        assert_eq!(states(&dog, at(t0, 100)), ["silent"]);
+        assert_eq!(rank_field(&dog, at(t0, 100), "severity"), "warning");
+        assert_eq!(summary(&dog, at(t0, 100)), "stalled");
+        assert_eq!(rank_field(&dog, at(t0, 210), "severity"), "warning"); // 175 s still
+        assert_eq!(rank_field(&dog, at(t0, 220), "severity"), "critical"); // 185 s
+        let status = &dog.statuses(at(t0, 220), true)["run"];
+        assert_eq!(
+            (&status["ranks"][0]["last_step"], &status["ranks"][0]["work"]),
+            (&Value::Null, &json!(40))
+        );
+        assert_eq!(status["incidents"][0]["kind"], "job_stalled");
+        // It was not the start limit that caught it (600 s here).
+        assert!(dog.statuses(at(t0, 220), true)["run"]["restart"][0]["stepped"] == true);
+    }
+
+    #[test]
+    fn a_first_report_above_zero_is_a_rank_that_has_stepped() {
+        // The steps were taken before the first heartbeat arrived.
         let t0 = Instant::now();
         let dog = Watchdog::new(config(60));
         dog.stream_opened(&key(0), t0);
-        for second in (5..2000).step_by(15) {
-            dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, second));
+        for second in (5..400).step_by(15) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(40), None, at(t0, second));
         }
-        assert_eq!(states(&dog, at(t0, 1500)), ["starting"]);
+        assert_eq!(states(&dog, at(t0, 60)), ["starting"]);
+        assert_eq!(states(&dog, at(t0, 70)), ["silent"]);
+    }
+
+    #[test]
+    fn a_floor_shorter_than_the_heartbeats_does_not_call_a_stepping_rank_silent_between_them() {
+        // The server sees the counter once a beat (15 s here): with a floor of 2 s the threshold
+        // is three beats, or a healthy rank would be silent between any two.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(2));
+        dog.stream_opened(&key(0), t0);
+        for second in (1..200).step_by(15) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(second as i64 / 2), None, at(t0, second));
+            assert_eq!(states(&dog, at(t0, second + 14)), ["starting"], "at {second} s");
+        }
+        assert_eq!(states(&dog, at(t0, 196 + 44)), ["starting"]);
+    }
+
+    #[test]
+    fn a_slow_first_batch_is_not_a_stop_while_the_counter_moves() {
+        let t0 = Instant::now();
+        // A step every 30 s: 50 of them take 1,500 s, far past the start limit (600 s) and the
+        // critical time (180 s), and nothing is said.
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        for second in (5..1500).step_by(15) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(second as i64 / 30), None, at(t0, second));
+            assert_eq!(states(&dog, at(t0, second + 14)), ["starting"], "at {second} s");
+        }
         assert_eq!(summary(&dog, at(t0, 1500)), "active");
-        assert_eq!(rank_field(&dog, at(t0, 1500), "severity"), Value::Null);
-        // A process that froze during startup is still caught by its heartbeats stopping.
-        assert_eq!(states(&dog, at(t0, 2100)), ["unresponsive"]);
+        dog.batch(&key(0), 1, Some(49), Some(1), at(t0, 1500));
+        assert_eq!(states(&dog, at(t0, 1501)), ["active"]);
+        // A step every 400 s, slower than the floor: the time to the first step sets the threshold
+        // (5 x 410 s as the server saw it), so the waits between steps are not stops.
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        for second in (5..3000).step_by(15) {
+            dog.heartbeat(
+                &key(0),
+                "train",
+                15.0,
+                Some((second as i64 / 400).min(3)),
+                None,
+                at(t0, second),
+            );
+            assert_eq!(states(&dog, at(t0, second + 14)), ["starting"], "at {second} s");
+        }
+        // It stopped at step 3, seen at 1,205 s: silent 5 x 400 s later, critical after three of those.
+        for second in (3005..9000).step_by(15) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(3), None, at(t0, second));
+        }
+        assert_eq!(states(&dog, at(t0, 1205 + 1900)), ["starting"]);
+        assert_eq!(states(&dog, at(t0, 1205 + 2100)), ["silent"]);
+        assert_eq!(rank_field(&dog, at(t0, 1205 + 5900), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 1205 + 6100), "severity"), "critical");
+    }
+
+    #[test]
+    fn a_slow_first_step_is_warned_of_and_not_called_critical_early() {
+        // 700 s to the first step (a long compilation), with a start limit of 600 s: a warning from
+        // 600 s that the first step ends. Critical would have come at 780 s.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        let mut said = Vec::new();
+        for second in (5..1000).step_by(15) {
+            let work = if second < 700 {
+                0
+            } else {
+                (second as i64 - 700) / 15 + 1
+            };
+            dog.heartbeat(&key(0), "train", 15.0, Some(work), None, at(t0, second));
+            let severity = rank_field(&dog, at(t0, second + 10), "severity");
+            if said.last() != Some(&severity) {
+                said.push(severity);
+            }
+        }
+        assert_eq!(said, [Value::Null, json!("warning"), Value::Null]);
+        assert_eq!(states(&dog, at(t0, 999)), ["starting"]);
+    }
+
+    #[test]
+    fn work_in_another_phase_before_the_first_step_is_a_sign_of_work_and_not_a_step() {
+        // Lightning's sanity validation: ticks in `eval` for 1,000 s, then `train` and a first step
+        // that takes long. The ticks keep it starting; the limit counts from the last of them.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60)); // start limit 600 s
+        dog.stream_opened(&key(0), t0);
+        for second in (5..1000).step_by(15) {
+            dog.heartbeat(&key(0), "eval", 15.0, Some(second as i64), None, at(t0, second));
+            assert_eq!(states(&dog, at(t0, second + 14)), ["starting"]);
+        }
+        for second in (1000..2000).step_by(15) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(990), None, at(t0, second));
+        }
+        assert_eq!(dog.statuses(at(t0, 1500), true)["run"]["restart"][0]["stepped"], false);
+        assert_eq!(states(&dog, at(t0, 1590)), ["starting"]); // 600 s from the change of phase at 1,000 s
+        assert_eq!(states(&dog, at(t0, 1610)), ["silent"]);
+        assert_eq!(rank_field(&dog, at(t0, 1610), "severity"), "warning");
+    }
+
+    #[test]
+    fn a_declared_pause_before_the_first_batch_is_a_pause() {
+        // 30 steps, then an evaluation that does not tick: paused up to the pause limit, as later on.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60)); // pause limit 600 s
+        dog.stream_opened(&key(0), t0);
+        dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, 5));
+        dog.heartbeat(&key(0), "train", 15.0, Some(30), None, at(t0, 20));
+        for second in (30..900).step_by(15) {
+            dog.heartbeat(&key(0), "eval", 15.0, Some(30), None, at(t0, second));
+        }
+        assert_eq!(states(&dog, at(t0, 60)), ["starting"]);
+        assert_eq!(states(&dog, at(t0, 300)), ["paused"]);
+        assert_eq!(rank_field(&dog, at(t0, 300), "severity"), Value::Null);
+        assert_eq!(states(&dog, at(t0, 700)), ["silent"]);
+    }
+
+    #[test]
+    fn what_a_rank_showed_before_its_first_batch_survives_a_restart() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        for second in (5..200).step_by(15) {
+            let work = if second < 35 { 0 } else { 40 };
+            dog.heartbeat(&key(0), "train", 15.0, Some(work), None, at(t0, second));
+        }
+        let before = dog.statuses(at(t0, 80), true)["run"].clone();
+        assert_eq!(before["ranks"][0]["state"], "starting");
+        assert_eq!(before["restart"][0]["step_seconds"], json!([0.875])); // 35 s over 40 steps
+        let now = Instant::now();
+        let fresh = restarted(&before, 60, now);
+        fresh.stream_opened(&key(0), now);
+        fresh.heartbeat(&key(0), "train", 15.0, Some(40), None, at(now, 1));
+        // 45 s still when the server stopped: silent 15 s into the new one, not after a start limit.
+        assert_eq!(states(&fresh, at(now, 10)), ["starting"]);
+        assert_eq!(states(&fresh, at(now, 20)), ["silent"]);
+        // A status written before these were kept is still taken up, as a rank that has not stepped.
+        let mut older = before.clone();
+        for field in ["stepped", "step_seconds"] {
+            older["restart"][0].as_object_mut().unwrap().remove(field);
+        }
+        let fresh = restarted(&older, 60, now);
+        fresh.stream_opened(&key(0), now);
+        assert_eq!(states(&fresh, at(now, 20)), ["starting"]);
     }
 
     #[test]
