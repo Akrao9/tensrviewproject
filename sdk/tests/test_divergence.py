@@ -480,6 +480,54 @@ def test_a_series_recorded_every_fifty_steps_is_judged_when_the_runs_are_identic
     }
 
 
+@pytest.mark.parametrize("freeze, step, before", [(30, 49, None), (60, 99, 49), (85, 99, 49), (90, 99, 49), (100, 149, 99)])
+def test_a_series_recorded_every_fifty_steps_that_parts_before_its_second_sample_is_named_at_its_first_sample_out(
+        freeze, step, before):
+    # The runs are identical up to step 29 on every series (no weight norm is recorded there), and the
+    # parameter stops moving at `freeze`. A sample at which the runs differ is where they part, never
+    # their early agreement: before Nov 18, 2026 the first two samples stood in whatever they held, and
+    # a freeze at step 30 to 75 was "not comparable" (so "no divergence"), at 90 named at step 199.
+    steps = range(400)
+    moving = {"w1": lambda s: 1.0 + 0.001 * s}
+    frozen = {"w1": lambda s: 1.0 + 0.001 * min(s, freeze)}
+    result = strict(first_divergence(make(steps, weights=moving), make(steps, run_id="b", weights=frozen)))
+    assert result["early"]["identical"] is True
+    found = result["divergence"]
+    assert (result["answer"], found["step"], found["series"]) == ("diverged", step, "weight_norms/w1")
+    early = result["series"]["weight_norms/w1"]["early"]
+    # The series' own movement is still its first two samples' (one record to the next, 50 steps apart).
+    assert early["own_movement"] == pytest.approx(0.001 * ((99 - 49) + (min(99, freeze) - min(49, freeze))) / 2)
+    assert (early["largest_difference"], early["ratio"]) == (0.0, 0.0)
+    if before is None:
+        # Its first sample is out already: no sample of it agrees, and the reason says what came before.
+        assert found["before"] is None and (early["samples"], early["last_step"]) == (0, None)
+        assert "(the first sample of this series in both runs; every series was the same in both runs up to step 29)" in (
+            result["reason"])
+    else:
+        assert found["before"]["step"] == before and found["before"]["a"] == found["before"]["b"]
+        assert early["samples"] == (before - 49) // 50 + 1 and early["last_step"] == before
+    if step == 149:  # both stand-in samples agree: as before, and said as before
+        assert set(early) == {"samples", "last_step", "largest_difference", "typical_difference", "own_movement", "ratio"}
+    else:
+        assert (early["movement_samples"], early["movement_last_step"]) == (2, 99)
+
+
+def test_a_sparse_series_with_one_sample_in_the_early_steps_takes_only_samples_that_agree_as_its_agreement():
+    # Recorded every 25 steps: step 24 is inside the early steps, 49 is a stand-in. The parameter stops
+    # moving at 35, so 49 is already out: it is judged, and the answer is there, with 24 before it.
+    steps = range(300)
+
+    def every_25(freeze):
+        return lambda s: {"weight_norms": {"w1": 1.0 + 0.001 * min(s, freeze)}} if s % 25 == 24 else {}
+
+    result = strict(first_divergence(make(steps, extra=every_25(1000)), make(steps, run_id="b", extra=every_25(35))))
+    found = result["divergence"]
+    assert result["early"]["identical"] is True
+    assert (result["answer"], found["series"], found["step"], found["before"]["step"]) == ("diverged", "weight_norms/w1", 49, 24)
+    early = result["series"]["weight_norms/w1"]["early"]
+    assert (early["samples"], early["last_step"], early["movement_samples"], early["movement_last_step"]) == (1, 24, 2, 49)
+
+
 def test_that_series_is_not_compared_when_the_runs_differ_early():
     steps = range(400)
     noise = jitter(3, 1e-6)
@@ -632,3 +680,36 @@ def test_toy_the_seeded_runs_against_each_other_part_at_the_first_fault(toy):
     result = first_divergence(toy["grad_spike"], toy["stalled_weights"])
     assert result["answer"] == "diverged" and result["divergence"]["step"] == 149
     assert result["divergence"]["name"] == SEEDED
+
+
+@pytest.fixture(scope="module")
+def frozen_early(toy, tmp_path_factory):
+    """`seeded_failures.py --toy --case stalled_weights` with the parameter frozen before the second
+    weight check (step 99): from step 40, and from step 60."""
+    import seeded_failures as sf  # on the path since `toy`
+
+    root = tmp_path_factory.mktemp("frozen-early")
+    runs = {}
+    for freeze in (40, 60):
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                sf.main(["--toy", "--out", str(root / str(freeze)), "--case", "stalled_weights", "--freeze-step", str(freeze),
+                         "--steps", "300"])
+            except SystemExit:
+                pass  # its own verdict on the stall detector, not what is tested here
+        runs[freeze] = tensorquill.load_records(root / str(freeze) / "stalled_weights" / "stalled_weights.jsonl")
+    return runs
+
+
+@pytest.mark.parametrize("freeze, step, before", [(40, 49, None), (60, 99, 49)])
+def test_toy_weights_frozen_before_the_second_check_are_named_at_the_first_check_that_differs(toy, frozen_early, freeze, step,
+                                                                                               before):
+    # Before Nov 18, 2026 both were "no divergence": the seeded parameter's first two weight checks
+    # stood in as the runs' early agreement though the runs had parted before the second.
+    result = strict(first_divergence(toy["healthy"], frozen_early[freeze]))
+    found = result["divergence"]
+    assert result["early"]["identical"] is True and freeze < result["first_exact_difference"]["step"] <= freeze + 1
+    assert result["answer"] == "diverged" and (found["kind"], found["name"], found["step"]) == ("weight_norms", SEEDED, step)
+    assert (found["before"] or {}).get("step") == before
+    if before is not None:
+        assert found["before"]["a"] == found["before"]["b"]
