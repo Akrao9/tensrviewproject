@@ -67,7 +67,7 @@ def test_init_writes_the_manifest_beside_the_records_with_every_field(toy_moe, t
         "tags": ["moe", "bf16"], "world_size": 1, "sdk_version": tensorquill.__version__,
         "torch_version": str(torch.__version__), "run_id_source": "explicit", "config": {"lr": 0.01, "layers": 4},
     }
-    assert [p.name for p in sorted(tmp_path.iterdir())] == ["run-1.rank0.jsonl", "run-1.run.json"]
+    assert [p.name for p in sorted(tmp_path.iterdir())] == ["run-1.rank0.end.json", "run-1.rank0.jsonl", "run-1.run.json"]
     assert ev.build_evidence(path)["run"] == {"project": "granite", "name": "baseline", "run_id": "run-1"}
 
 
@@ -122,7 +122,8 @@ def test_the_run_block_changes_none_of_the_keys_the_golden_files_freeze(toy_moe,
     assert with_manifest["run"] != without["run"]
     for key in GOLDEN_KEYS:
         assert with_manifest.get(key) == without.get(key), key
-    assert {k for k in with_manifest if with_manifest[k] != without.get(k)} == {"run"}
+    # `run_end` is read from the file, which a list of records does not name (row S4).
+    assert {k for k in with_manifest if with_manifest[k] != without.get(k)} == {"run", "run_end"}
 
 
 def test_a_run_recorded_before_the_manifest_still_reads(toy_moe, tmp_path):
@@ -302,7 +303,8 @@ def test_a_two_process_run_writes_one_manifest_and_both_ranks_read_it(tmp_path):
         said[rank] = out.strip()
     assert said == {0: "manifest", 1: "none"}
     out = tmp_path / "tensorquill-out"
-    assert sorted(p.name for p in out.iterdir()) == ["two.rank0.jsonl", "two.rank1.jsonl", "two.run.json"]
+    assert sorted(p.name for p in out.iterdir()) == [
+        "two.rank0.end.json", "two.rank0.jsonl", "two.rank1.end.json", "two.rank1.jsonl", "two.run.json"]
     written = json.loads((out / "two.run.json").read_text())
     assert (written["world_size"], written["name"], written["config"]) == (2, "pair", {"lr": 0.01})
     block = {"project": "granite", "name": "pair", "run_id": "two"}
@@ -325,7 +327,7 @@ def test_another_rank_checks_its_arguments_and_writes_nothing(toy_moe, tmp_path,
     session = tensorquill.init(toy_moe, run_id="r", project="granite")
     session.close()
     assert session.manifest is None
-    assert [p.name for p in (tmp_path / "tensorquill-out").iterdir()] == ["r.rank1.jsonl"]
+    assert sorted(p.name for p in (tmp_path / "tensorquill-out").iterdir()) == ["r.rank1.end.json", "r.rank1.jsonl"]
 
 
 # --- The sender ---------------------------------------------------------------------------------

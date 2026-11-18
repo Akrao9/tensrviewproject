@@ -110,8 +110,8 @@ def test_a_capture_file_reaches_parquet_unchanged(tmp_path, toy_moe, monkeypatch
         assert tensorquill.build_evidence(stored) == tensorquill.build_evidence(written)
         assert tensorquill.load_records(store / "runs" / "e2e") == written
         # (This server writes no status. A store is expected to have one, a local file is not.)
-        assert tensorquill.build_evidence(store / "runs" / "e2e") == tensorquill.build_evidence(
-            path, watchdog=store / "runs" / "e2e" / "watchdog.json"
+        assert tensorquill.build_evidence(store / "runs" / "e2e") == _without_end(tensorquill.build_evidence(
+            path, watchdog=store / "runs" / "e2e" / "watchdog.json")
         )
     finally:
         assert server.terminate() == 0
@@ -584,11 +584,18 @@ def test_a_pause_with_no_sign_of_work_is_limited_and_one_that_ticks_is_not(tmp_p
         assert server.terminate() == 0
 
 
+def _without_end(evidence: dict) -> dict:
+    """A local file's evidence less its end marker, which a server's store has not (row S4).
+    The file here was closed by its session, so the marker must say so."""
+    assert evidence["run_end"]["state"] == "closed", evidence["run_end"]
+    return {k: v for k, v in evidence.items() if k != "run_end"}
+
+
 def _without_status(evidence: dict) -> dict:
     """The evidence less what only a run with the server's status has: the status, whether the stall
     kinds were checked, and the reason the run state gives when a status was expected and is absent
-    (`no_status`)."""
-    out = {k: v for k, v in evidence.items() if k not in ("watchdog", "run_state", "kind_checks")}
+    (`no_status`); and the end marker, which only a local file has (`run_end`)."""
+    out = {k: v for k, v in evidence.items() if k not in ("watchdog", "run_state", "kind_checks", "run_end")}
     reasons = [r for r in evidence["run_state"]["reasons"] if r["code"] != "no_status"]
     out["run_state_reasons"] = reasons
     out["kind_checks"] = {k: v for k, v in evidence["kind_checks"].items() if k not in ("job_stalled", "rank_silent")}

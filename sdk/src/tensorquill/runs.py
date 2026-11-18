@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import manifest as _manifest
+from .sink import read_end_marker
 
 DEFAULT_SOURCE = "tensorquill-out"  # where `tensorquill.init` writes without a sink
 VERBS = ("runs", "compare")
@@ -554,12 +555,32 @@ def run_row(run: Mapping[str, Any]) -> dict[str, Any]:
         "kinds_checked": None,
     }
     row.update(_local_row(run) if run["source"] == "local" else _store_row(run))
+    if run["source"] == "local" and run.get("files"):
+        row["end"] = _local_end(run["files"])
     # None when the files cannot say without being read whole; `rank_count_not_known` says why.
     row["rank_count"] = None if row.get("rank_count_not_known") else len(row.get("ranks") or ())
     if row["started"] is None:
         row["started"] = row.get("started_from_records")
     row.pop("started_from_records", None)
     return row
+
+
+def _local_end(files: Mapping[int, Path]) -> dict[str, Any]:
+    """Whether every rank's session closed its file (`sink.read_end_marker`). `closed` only when
+    each file has a marker that matches it; otherwise `not_closed`, with the ranks: still running,
+    killed or never closed look the same from the files. A store's run has no such cell: the
+    server's status says how each stream ended."""
+    ends = {number: read_end_marker(path) for number, path in files.items()}
+    closed = sorted(n for n, end in ends.items() if end["state"] == "closed")
+    raised = sorted(n for n, end in ends.items() if end["state"] == "closed" and end.get("outcome") == "raised")
+    other = sorted(n for n in ends if n not in closed)
+    found: dict[str, Any] = {"state": "closed" if not other else "not_closed", "closed_ranks": closed}
+    if raised:
+        found["raised_ranks"] = raised
+    if other:
+        found["not_closed_ranks"] = other
+        found["detail"] = ends[other[0]]["detail"]
+    return found
 
 
 def list_runs(source: str | Path = DEFAULT_SOURCE, project: str | None = None) -> list[dict[str, Any]]:
@@ -599,13 +620,25 @@ def _cells(row: Mapping[str, Any]) -> list[str]:
         f"{first['kind']} at step {first['step']}" if first else ("-" if row.get("incidents") is not None else "?"),
         f"{checked['checked']} of {checked['of']}" if checked else "?",
         str(row.get("started") or "?").replace("T", " ").rstrip("Z"),
+        _end_text(row.get("end")),
     ]
+
+
+def _end_text(end: Any) -> str:
+    """`closed`, `closed, raised` (closed by an exception), `not closed` (running, killed or
+    never closed: the files cannot tell which), or `-` for a store's run (see its state)."""
+    if not isinstance(end, Mapping):
+        return "-"
+    if end.get("state") == "closed":
+        return "closed, raised" if end.get("raised_ranks") else "closed"
+    return "not closed"
 
 
 def listing_text(rows: list[Mapping[str, Any]], source: str | Path, project: str | None = None) -> str:
     if not rows:
         return f"no runs at {source}" + (f" in project {project!r}" if project is not None else "")
-    header = ["name", "run ID", "state", "ranks", "last step", "incidents", "first incident", "kinds checked", "started (UTC)"]
+    header = ["name", "run ID", "state", "ranks", "last step", "incidents", "first incident", "kinds checked", "started (UTC)",
+              "end"]
     lines: list[str] = []
     notes: list[str] = []
     projects: dict[str, list[Mapping[str, Any]]] = {}

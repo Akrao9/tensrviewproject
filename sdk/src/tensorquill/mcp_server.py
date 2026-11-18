@@ -47,6 +47,7 @@ from typing import Any, Callable, Iterable, Mapping
 from . import __version__
 from . import compare as _compare
 from . import runs as _runs
+from .sink import read_end_marker
 from .evidence import (
     ALL_RANKS_VIEW,
     _discover_rank_folders,
@@ -276,7 +277,10 @@ class Source:
             except (KeyError, TypeError, ValueError) as error:
                 raise ToolError(f"the detectors could not read the records in {path} ({error!r}).") from None
 
-        return self._keep(("evidence", path, rank), _stamp(path), build)
+        evidence = self._keep(("evidence", path, rank), _stamp(path), build)
+        # Read at every call, not kept: the marker is written after the last record, so the file's
+        # stamp does not move when it appears.
+        return {**evidence, "run_end": read_end_marker(path)} if path.suffix == ".jsonl" else evidence
 
     # One rank's step records, for series ------------------------------------------------
 
@@ -593,6 +597,8 @@ def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, An
     _kinds(opened, answer)
     if isinstance(evidence.get("detection"), dict):
         answer["detection"] = evidence["detection"]
+    if isinstance(evidence.get("run_end"), dict):
+        answer["run_end"] = evidence["run_end"]  # a local file: whether its session closed it
     summary = _summary(evidence)
     if summary:
         answer["summary"] = summary
@@ -984,6 +990,8 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
     _kinds(opened, answer)
     if isinstance(evidence.get("watchdog"), dict):
         answer["watchdog"] = evidence["watchdog"]
+    if isinstance(evidence.get("stopped_stacks"), dict):
+        answer["stopped_stacks"] = evidence["stopped_stacks"]
     if rank is not None:
         answer["rank"] = _rank_entry(evidence, rank)
     elif len(rows) <= PER_RANK_ROWS:
@@ -1012,7 +1020,7 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
 
 _ROW_KEYS = ("project", "name", "run_id", "group", "tags", "has_manifest", "source", "started", "run_state", "last_step",
              "incidents", "first_incident", "kinds_checked", "ranks", "evidence", "rank_count", "ranks_with_incidents",
-             "kinds_not_stated", "rank_count_not_known")
+             "kinds_not_stated", "rank_count_not_known", "end")
 
 
 def _text_argument(arguments: Mapping[str, Any], name: str) -> str | None:
@@ -1096,7 +1104,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " reason), what was checked is not stated: do not infer it. A not_checked entry or an unknown rank"
             " means that part was not judged."
             " For a run folder the incidents are grouped across ranks, and `rank` keeps one rank's; `kinds` is"
-            " then the whole run's, read as get_all_ranks_status describes."
+            " then the whole run's, read as get_all_ranks_status describes. For a local .jsonl file, `run_end` says"
+            " whether its session closed it: any state but `closed` means not known to have finished (still running,"
+            " killed or never closed look the same)."
         ),
         "inputSchema": {
             "type": "object",
@@ -1179,7 +1189,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " verdict either), and an incident of that kind stands for the ranks that show it. `kinds.not_enough_history` gives the fewest"
             " `records` any judged rank has and the ranks still warming up. When a judged rank's report does not"
             " say what was checked, or no rank is judged, there is no `kinds`: `kinds_not_stated` gives the reason,"
-            " and nothing is to be inferred. `per_rank[].kinds` counts each rank's own 25 kinds. `rank`"
+            " and nothing is to be inferred. `per_rank[].kinds` counts each rank's own 25 kinds. While ranks are"
+            " stopped, `stopped_stacks` groups those that sent a stack by where their main thread was and names an odd"
+            " group only when one is clearly apart (`verdict`); it is an observation, never the cause (see its"
+            " `caveats`), and the ranks with no stack are listed, not compared. `rank`"
             " gives one rank's entry in full. On one rank's capture or evidence file this is an error that says so."
         ),
         "inputSchema": {

@@ -726,9 +726,13 @@ def test_a_stall_is_one_run_level_incident_and_the_ranks_are_still_judged(tmp_pa
     lines = summary.splitlines()
     assert lines[0] == ("No incidents in the ranks' step records on any of the 3 ranks: every rank's report from"
                         " tensorquill-server is current through step 59.")
-    assert lines[1].startswith("Job stalled after step 59: none of 3 ranks has sent a new step") and len(lines) == 4
-    assert lines[2] == "By class: observation job_stalled (observations claim no failure and do not make the run unhealthy)"
-    assert lines[3] == "6 of 33 kinds checked on all 3 ranks, 27 not configured"
+    assert lines[1].startswith("Job stalled after step 59: none of 3 ranks has sent a new step") and len(lines) == 5
+    # No heartbeats here, so no stacks: said plainly, and no rank is named (row S4).
+    assert lines[2] == ("Stacks: no stopped rank sent its stack, so nothing is said about where they are. Ranks 0-2 sent"
+                        " no stack (an unresponsive rank cannot), so they are not compared.")
+    assert evidence["stopped_stacks"]["verdict"] == "no_stacks"
+    assert lines[3] == "By class: observation job_stalled (observations claim no failure and do not make the run unhealthy)"
+    assert lines[4] == "6 of 33 kinds checked on all 3 ranks, 27 not configured"
     assert (stall["class"], evidence["run_state"]["state"]) == ("observation", "unknown")
 
 

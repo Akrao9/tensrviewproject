@@ -867,12 +867,14 @@ def test_evidence_from_parquet_parts_equals_evidence_from_the_jsonl_file(toy_moe
         # none, which is what a local file reads when a status is named and cannot be read.
         # The file alone has no status to miss: its stall kinds are not configured.
         from_store = tensorquill.build_evidence(source)
-        assert from_store == tensorquill.build_evidence(path, watchdog=run_dir / "watchdog.json")
+        local = tensorquill.build_evidence(path, watchdog=run_dir / "watchdog.json")
+        assert local.pop("run_end")["state"] == "closed"  # only a local file has an end marker (row S4)
+        assert from_store == local
         assert from_store["kind_checks"]["job_stalled"]["value"] == "unavailable"
         alone = tensorquill.build_evidence(path)
         assert alone["kind_checks"]["job_stalled"]["value"] == "not_configured"
         assert {k: v for k, v in from_store.items() if k not in ("kind_checks", "run_state")} == {
-            k: v for k, v in alone.items() if k not in ("kind_checks", "run_state")
+            k: v for k, v in alone.items() if k not in ("kind_checks", "run_state", "run_end")
         }
     assert [r["step"] for r in tensorquill.load_records(run_dir)] == list(range(130))
     one_part = sorted(run_dir.rglob("part-*.parquet"))[0]
@@ -903,7 +905,7 @@ def test_watch_follows_a_growing_jsonl_file_and_new_parquet_parts(tmp_path):
     out = watch(path, interval=0.0, polls=6, on_update=grow)
     assert out == tmp_path / "w.rank0.evidence.json"
     assert seen == [20, 40, 41]  # one rebuild per change, none while nothing changed
-    assert json.loads(out.read_text()) == tensorquill.build_evidence(records[:41])
+    assert json.loads(out.read_text()) == tensorquill.build_evidence(records[:41], records_file=path)
 
     pytest.importorskip("pyarrow.parquet")
     run_dir = tmp_path / "store" / "runs" / "r"
