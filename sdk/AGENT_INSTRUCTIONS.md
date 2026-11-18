@@ -100,6 +100,40 @@ Each incident carries a `class`. Read it from the tool's answer; do not work it 
 
 A kind the tools mark `unclassified` is one this version does not know. The run state counts it as a failure, and so should you.
 
+## Before you call it a fault
+
+These are healthy causes, or causes outside what TensorQuill sees, that look like a fault in the evidence. Each says where it comes from. Name the ones that could apply in the diagnosis, and say which the evidence cannot rule out.
+
+**Router load.** Before you read the MoE imbalance kind or the starved-experts kind as a fault, ask how the model picks its experts, and say in the diagnosis that you asked:
+
+- **Router counts are the routing only when the model picks the plain top-k of the hooked scores.** For a router whose output has no integer tensor, TensorQuill counts the top-k of the scores it hooks. A per-expert balancing bias used only for the choice (DeepSeek-V3, Motif 3, Mamoda2.5), noise added to the router logits after the hooked module, or a capacity limit applied after it makes those counts wrong, and a healthy model then shows overloaded and dead experts. The evidence does not say how a router was read, so ask a person or read the model's code. If the model does any of these, the counts are not evidence of a fault until the router is declared with an `indices=` function that applies the bias, or the module that returns the chosen experts is hooked instead.
+- **A narrow data domain routes unevenly in a healthy MoE.** On one domain an expert can take nearly all tokens, and the first MoE layer settles later than the others (OLMoE). Check whether the batch or the fine-tune is one domain and whether only the first layer is affected. A large routing shift during fine-tuning is the unusual thing.
+- **A healthy run can route very unevenly inside one sequence.** In one paper's measurement, a model trained with a balancing bias and no balancing loss used about half the experts or fewer per sequence and still trained as well (Omi, Sen and Farhadi); DeepSeek-V3 also names imbalance within sequences and small batches. On steps of very few sequences, the dead-expert rule could then fire on a healthy run; that is a reading of the rule, not a run.
+- **Padding tokens all route to the same experts**, because they reach the router as the same vector; this is correct counting, and one report had about 5% padding in training (Laguna).
+- **New tokens with untrained embeddings** brought gradient spikes and dead experts in one report (Laguna).
+- **Routing can be frozen on purpose** in later stages: Motif 3 froze the router and its biases for its post-training stages, and DeepSeek-V3 stopped updating its bias for the last part of training. A change in load then comes from the hidden states, with nothing balancing it.
+- **A shared expert is not seen.** It takes every token without the router, so no MoE kind would report it degrading.
+
+**Gradients and activations.**
+
+- **When `grad_spike` fires, an anomaly, look at the batch.** In one model's training, batches at spikes held long repeats of one short token pattern, and removing such documents cut the spikes (OLMo 2). Not every such batch spikes, and TensorQuill does not read token content.
+- **A shift at a learning-rate change is expected**, and so is one after a restart with a changed setup: long runs are restarted with new data mixes, context lengths and code as routine (one team reports 28 restarts in 10 days on one job, ByteRobust). Check for either before you read activation drift or a weight trend as a fault.
+- **Fused BF16 attention can corrupt the backward pass once attention logits are very large.** One preprint saw it on one non-standard 450M model; a plain 102M transformer did not reach that regime, and the backward error was shared by every fused BF16 attention backend tried, not one kernel (Chen et al., arXiv 2609.34272). Name it as a possibility when the attention rules fired before the gradient norm grew, not as the cause.
+- **A reduction done in low precision can be wrong on every rank with no hardware fault.** One team's BF16 all-reduce of the LM head's gradient across tensor-parallel ranks became the main source of numerical error as the logits grew (Laguna). Every rank gets the same wrong sum, so the drift check cannot see it.
+
+**Hardware or software.**
+
+- **A fault that vanishes under full capture is not gone.** Instrumentation changes timing and load; in published cases it lowered error rates on faulty GPUs and stopped 4 of 20 bugs reproducing (Zheng et al., Ma et al., OpGuard).
+- **A rerun tells hardware from data and code only with the same seed and the same data order.** A faulty GPU spiked at different steps on each rerun from one checkpoint, or not at all (Zheng et al.); a data spike showed under one data order and not another (OLMo 2). One team reports that a deterministic rerun usually shows a faulty node within 1,000 seconds and rarely after 10,000 (Elsen et al.).
+- The same team's opinion, passed on as an opinion: a modern transformer going from fine to NaN in one step almost never happens without a hardware problem (Elsen et al.). Say it is an opinion if you use it.
+- **Under full sharding alone the drift check has nothing to compare.** With FSDP full shard or ZeRO stage 3 no parameter is held twice; with hybrid sharding the check covers the replicated dimension only.
+
+**Stalls and hangs.**
+
+- **The rank that reports a collective timeout is often a victim.** PyTorch's Flight Recorder post, from Meta's fleet, says the first rank to raise the timeout is rarely the cause and almost all timeouts there came from ranks falling out of step.
+- **What a stuck collective's record says, by the same post:** a missing rank or a state mismatch points to a CPU-side stall or a code path that differs across ranks (data loading, checkpointing, compilation, an `except` that swallows an error, one rank running out of data early), or a hung GPU kernel; a size or dtype mismatch to wrong arguments; a different collective type or call stack to code paths that differ; all ranks started and none finished to the network. TensorQuill labels a collective with a missing rank a hang, where the post counts it as a desync. Give these as candidates from one company's experience. Do not name the rank that caused a hang from them.
+- **A stall's stacks do not include worker processes.** The stacks are the Python threads of the rank's own process. A data-loader worker or a checkpoint writer is a process of its own, so a stall caused there shows only as the main thread waiting.
+
 ## What was checked, and what "not checked" means
 
 "No incidents" covers only the kinds that were checked with enough history. Every evidence file gives each of the 33 kinds one of three values, and says whether the kind's rule has had enough history. `list_incidents` lists them under `kinds` (the file itself has them under `kind_checks`, with how many records carried each kind's input, how many its rule needs, and what the kind is judged from):
