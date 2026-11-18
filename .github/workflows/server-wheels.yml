@@ -21,9 +21,11 @@ on:
         options: [none, testpypi, pypi]
         default: none
 
+# A run started by hand is in its own group and is never cancelled: a push to main must not stop
+# an upload half way, which could leave PyPI with the fallback wheel and no platform wheels.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 permissions:
   contents: read
