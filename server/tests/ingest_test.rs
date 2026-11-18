@@ -382,6 +382,48 @@ async fn a_resumed_attempt_keeps_the_steps_it_writes_again() {
     assert_eq!(server.ingest.buffered_bytes(), 0);
 }
 
+/// `(attempt, last_step, gaps)` of rank 0 in the status, once its last step is `step`.
+async fn progress_at(server: &TestServer, step: i64) -> (i64, i64, usize) {
+    until(&format!("last_step {step}"), || {
+        server
+            .ingest
+            .watchdog_statuses()
+            .get(RUN)
+            .is_some_and(|status| status["ranks"][0]["last_step"] == step)
+    })
+    .await;
+    let status = &server.ingest.watchdog_statuses()[RUN];
+    (
+        status["ranks"][0]["attempt"].as_i64().unwrap(),
+        status["ranks"][0]["last_step"].as_i64().unwrap(),
+        status["restart"][0]["gaps_seconds"].as_array().unwrap().len(),
+    )
+}
+
+/// The status's `last_step` is the newest attempt's once that attempt stores rows, also when it
+/// resumed from a checkpoint below the steps an earlier attempt reached, and when one batch ends
+/// an attempt and starts the next. (Until Nov 18, 2026 it was the highest step of any attempt,
+/// so a resumed job read as the old attempt's step until it passed it.) Each batch is one gap,
+/// however many attempts it holds, so the stall timing is what it was.
+#[tokio::test]
+async fn the_status_follows_the_newest_attempts_step_once_it_stores_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), watch_config(60_000), None).await;
+    let mut put = open_attempts(&server).await;
+    put.send(attempt_batch(&rows(100, 0..150)), 1000).await;
+    assert_eq!(progress_at(&server, 149).await, (100, 149, 1));
+    // Resumed from the checkpoint at step 100.
+    put.send(attempt_batch(&rows(200, 100..110)), 1100).await;
+    assert_eq!(progress_at(&server, 109).await, (200, 109, 2));
+    // One batch that ends attempt 200 and starts attempt 300 from step 50.
+    let mut tail = rows(200, 110..120);
+    tail.extend(rows(300, 50..60));
+    put.send(attempt_batch(&tail), 1200).await;
+    assert_eq!(progress_at(&server, 59).await, (300, 59, 3));
+    // A part holds one attempt: each change of attempt wrote the rows before it.
+    assert_eq!(put.finish().await, vec![1000, 1100, 1200]);
+}
+
 #[tokio::test]
 async fn a_restarted_server_reads_its_watermark_from_the_parquet_footers() {
     let dir = tempfile::tempdir().unwrap();
@@ -431,15 +473,21 @@ async fn exceeding_the_128_mib_quota_returns_resource_exhausted() {
     first.send(batch_with(0, [0], &wide), 1).await;
     let mut second = open(&server, 1).await;
     second.send(batch_with(1, [0], &wide), 1).await;
-    assert!(first.no_ack_within(Duration::from_millis(300)).await);
-    assert!(second.no_ack_within(Duration::from_millis(300)).await);
-    assert!(server.ingest.buffered_bytes() >= 100 * 1024 * 1024);
+    // Both rows are buffered, however long reading 100 MiB takes on a loaded machine (a fixed
+    // wait here failed under load).
+    until_within("both 50 MiB rows buffered", SLOW_BOUND, || {
+        server.ingest.buffered_bytes() >= 100 * 1024 * 1024
+    })
+    .await;
 
     // A third rank's 50 MiB would pass 128 MiB: refused, and nothing of it is kept.
     let mut third = open(&server, 2).await;
     third.send(batch_with(2, [0], &wide), 1).await;
     assert_eq!(third.ack().await, Err(Code::ResourceExhausted));
     assert!(server.ingest.buffered_bytes() <= DEFAULT_QUOTA_BYTES);
+    // While the third was refused, neither of the first two was written or acknowledged.
+    assert!(first.no_ack_within(Duration::from_millis(100)).await);
+    assert!(second.no_ack_within(Duration::from_millis(100)).await);
 
     // Once a buffer is written there is room, and the retry is accepted.
     assert_eq!(first.finish().await, vec![1]);
@@ -449,6 +497,90 @@ async fn exceeding_the_128_mib_quota_returns_resource_exhausted() {
     assert_eq!(second.finish().await, vec![1]);
     assert_eq!(server.ingest.buffered_bytes(), 0);
     assert_eq!(stored_steps(dir.path()).len(), 3);
+}
+
+/// The status that ended a refused stream as the client read it, with the errors under it.
+async fn refusal(put: &mut Put) -> String {
+    match tokio::time::timeout(SLOW_BOUND, put.acks.next())
+        .await
+        .expect("no reply")
+    {
+        Some(Err(FlightError::Tonic(status))) => {
+            let mut text = format!("{:?}: {}", status.code(), status.message());
+            let mut source = std::error::Error::source(&*status);
+            while let Some(error) = source {
+                text += &format!(" <- {error}");
+                source = error.source();
+            }
+            text
+        }
+        other => format!("not a status: {other:?}"),
+    }
+}
+
+/// A refused stream's sender is told why, read through a real client, while it still has
+/// batches queued behind the refused one: its DATA is in flight when the server stops reading
+/// and drops the request stream, before the error is sent. The review of Nov 18, 2026 (RUST-01)
+/// held that this order would show as `Unknown: h2 protocol error: error reading a body from
+/// connection`. It does not: dropping the request body alone resets nothing while the response
+/// is open (h2 0.4.20, `RecvStream::drop`), the status goes out as trailers, and the reset that
+/// follows is `NO_ERROR`, which hyper reads as the end of the body. Many streams at once, on a
+/// runtime with several threads as the binary has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_stream_is_told_its_status_while_more_batches_are_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let wide = "x".repeat(1024 * 1024); // one 1 MiB row
+    let config = IngestConfig {
+        quota_bytes: 3 * 1024 * 1024 / 2,
+        ..manual()
+    };
+    let server = start(dir.path(), config, None).await;
+    // One rank holds 1 MiB, so every other rank's 1 MiB row is over the quota.
+    let mut holder = open(&server, 1000).await;
+    holder.send(batch_with(1000, [0], &wide), 1).await;
+    until_within("the holder's row buffered", SLOW_BOUND, || {
+        server.ingest.buffered_bytes() >= 1024 * 1024
+    })
+    .await;
+
+    let (rounds, at_once, queued): (i32, i32, i64) = (25, 8, 8);
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for round in 0..rounds {
+        let mut streams = Vec::new();
+        for slot in 0..at_once {
+            let rank = round * at_once + slot;
+            let address = server.address.clone();
+            let wide = wide.clone();
+            streams.push(tokio::spawn(async move {
+                let mut put = open_at(&address, RUN, rank, None).await;
+                if slot % 2 == 0 {
+                    // Refused for its quota.
+                    put.send(batch_with(rank, [0], &wide), 1).await;
+                } else {
+                    // Refused as a bad batch: rows of another rank.
+                    put.send(batch_with(rank + 1, [0], &wide), 1).await;
+                }
+                for step in 1..=queued {
+                    put.send(batch_with(rank, [step], &wide), step + 1).await;
+                }
+                refusal(&mut put).await
+            }));
+        }
+        for stream in streams {
+            *seen.entry(stream.await.unwrap()).or_default() += 1;
+        }
+    }
+    let half = (rounds * at_once / 2) as usize;
+    let expected = BTreeMap::from([
+        (
+            "InvalidArgument: a row belongs to another run or rank than the descriptor".to_string(),
+            half,
+        ),
+        ("ResourceExhausted: ingest buffer full".to_string(), half),
+    ]);
+    assert_eq!(seen, expected);
+    assert_eq!(holder.finish().await, vec![1]);
+    assert_eq!(server.ingest.buffered_bytes(), 0);
 }
 
 #[tokio::test]
@@ -567,15 +699,44 @@ async fn bad_requests_are_invalid_argument() {
     assert!(part_files(dir.path()).is_empty());
 }
 
-/// The real binary: `SIGTERM` must write what is buffered before the process exits.
+/// A JSON file the server writes, or `Null` while there is none.
+fn json_file(path: &Path) -> serde_json::Value {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// The `code` of each reason in a status's `run_state`.
+fn run_state_codes(status: &serde_json::Value) -> Vec<String> {
+    status["run_state"]["reasons"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|reason| reason["code"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// The real binary: `SIGTERM` must write what is buffered before the process exits, and only
+/// then the last status, so the last `watchdog.json` and `incidents.json` both cover the last
+/// part stored. (Until Nov 18, 2026 the stopped status was written before the buffers were.)
 #[cfg(unix)]
 #[tokio::test]
 async fn sigterm_flushes_buffered_rows_before_exit() {
     use std::io::{BufRead, BufReader};
 
     let dir = tempfile::tempdir().unwrap();
+    // A part only at the end of a stream or at shutdown; the status rewritten every 0.1 s.
     let mut child = Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
-        .args(["--listen", "127.0.0.1:0", "--store"])
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--flush-seconds",
+            "3600",
+            "--watchdog-seconds",
+            "0.1",
+        ])
+        .arg("--store")
         .arg(dir.path())
         .env_remove("TENSORQUILL_TOKEN")
         .stdout(Stdio::piped())
@@ -589,11 +750,21 @@ async fn sigterm_flushes_buffered_rows_before_exit() {
 
     let mut put = open_at(&format!("http://{address}"), RUN, 0, None).await;
     put.send(batch(0, 0..50), 4242).await;
+    // The server has the rows once its status names their last step. Waited for, not slept on:
+    // a signal sent before the rows arrive would find nothing to write.
+    let status_path = dir.path().join("runs").join(RUN).join("watchdog.json");
+    until_within("the batch taken", SLOW_BOUND, || {
+        json_file(&status_path)["ranks"][0]["last_step"] == 49
+    })
+    .await;
     assert!(
-        put.no_ack_within(Duration::from_millis(500)).await,
+        put.no_ack_within(Duration::from_millis(200)).await,
         "50 steps are only buffered"
     );
     assert!(part_files(dir.path()).is_empty());
+    let live = json_file(&status_path);
+    assert_eq!(live["server_running"], true);
+    assert!(run_state_codes(&live).contains(&"no_steps".to_string()), "{live}");
 
     assert!(Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
@@ -608,6 +779,20 @@ async fn sigterm_flushes_buffered_rows_before_exit() {
     assert_eq!(
         part_names(dir.path()),
         ["runs/run-a/rank=0/attempt=0/part-00000000-00000049.parquet"]
+    );
+    // The detectors judged that part ...
+    let incidents = json_file(&dir.path().join("runs").join(RUN).join("rank=0").join("incidents.json"));
+    assert_eq!(incidents["last_step"], 49, "{incidents}");
+    // ... before the last status was written: it says the server stopped, and rank 0 judged.
+    let stopped = json_file(&status_path);
+    assert_eq!(
+        (stopped["summary"].as_str(), stopped["server_running"].as_bool()),
+        (Some("server_stopped"), Some(false))
+    );
+    let codes = run_state_codes(&stopped);
+    assert!(
+        !codes.iter().any(|code| code == "no_steps" || code == "ranks_unknown"),
+        "{stopped}"
     );
 }
 
@@ -649,14 +834,25 @@ fn rank_states(server: &TestServer) -> Vec<(i64, String, String)> {
         .collect()
 }
 
-async fn until(what: &str, mut ready: impl FnMut() -> bool) {
-    for _ in 0..100 {
-        if ready() {
-            return;
-        }
+async fn until(what: &str, ready: impl FnMut() -> bool) {
+    until_within(what, Duration::from_secs(5), ready).await;
+}
+
+/// How long to wait for something a loaded machine is slow to do (reading 100 MiB in a debug
+/// build beside other builds). Only a failing test waits this long.
+const SLOW_BOUND: Duration = Duration::from_secs(120);
+
+/// Waits until `ready`, looking every 50 ms, and fails after `bound`. A state the server reaches
+/// on its own time is waited for this way, never with a fixed sleep.
+async fn until_within(what: &str, bound: Duration, mut ready: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !ready() {
+        assert!(
+            started.elapsed() < bound,
+            "timed out after {bound:?} waiting for {what}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("timed out waiting for {what}");
 }
 
 fn world_metadata(rank: i32, world_size: i32, end: i64) -> String {
@@ -1211,7 +1407,15 @@ async fn buffered_ranks(server: &TestServer, ranks: i32) -> Vec<Put> {
         put.send(batch(rank, 0..10), 100).await;
         puts.push(put);
     }
-    until("every batch is buffered", || server.ingest.buffered_bytes() > 0).await;
+    // Every rank's batch is taken (the watchdog hears of a batch once its rows are buffered),
+    // however slow the machine; then every buffer is older than a 50 ms flush interval.
+    until_within("every batch is buffered", SLOW_BOUND, || {
+        server.ingest.watchdog_statuses().get(RUN).is_some_and(|status| {
+            let seen = status["ranks"].as_array().unwrap();
+            seen.len() == ranks as usize && seen.iter().all(|rank| rank["last_step"] == 9)
+        })
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     puts
 }
@@ -1260,6 +1464,56 @@ async fn ranks_are_written_concurrently_so_a_slow_store_does_not_serialise_them(
     assert!(server.ingest.buffered_bytes() > 0);
     assert!(names_in(&store).await.is_empty());
     drop(puts);
+}
+
+/// A JSON object in `store`, or `Null` while there is none.
+async fn json_in(store: &TestStore, path: &str) -> serde_json::Value {
+    match store.inner.get(&object_store::path::Path::from(path)).await {
+        Ok(found) => serde_json::from_slice(&found.bytes().await.unwrap()).unwrap(),
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
+/// A stop that comes while the timed flush is judging a part it has just stored: the flush is let
+/// finish, so that part's `incidents.json` is written, and the stopped status is written last,
+/// with the rank judged. (Until Nov 18, 2026 the flusher was aborted, which could leave the
+/// report behind the part for good, and the stopped status was written before the buffers.)
+#[tokio::test]
+async fn a_stop_lets_a_flush_in_progress_finish_and_writes_the_stopped_status_last() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let config = IngestConfig {
+        flush_interval: Duration::from_millis(50),
+        watchdog_interval: Duration::from_millis(50),
+        ..manual()
+    };
+    let ingest = Ingest::new(Storage::new(store.clone(), "".into()), config);
+    let tasks = [ingest.spawn_flusher(), ingest.spawn_watchdog()];
+    let server = serve_ingest(ingest, None).await;
+    // Every request to the store takes 300 ms, so the detectors' read of a part and the write of
+    // its incidents.json take the better part of a second after the part is acknowledged.
+    store.knobs.delay_ms.store(300, Ordering::SeqCst);
+    let mut put = open(&server, 0).await;
+    put.send(batch(0, 0..10), 100).await;
+    assert_eq!(put.ack().await, Ok(100), "stored by the timed flush");
+    assert!(json_in(&store, "runs/run-a/rank=0/incidents.json").await.is_null());
+
+    server.ingest.stop(tasks).await.unwrap();
+    let incidents = json_in(&store, "runs/run-a/rank=0/incidents.json").await;
+    assert_eq!(incidents["last_step"], 9, "{incidents}");
+    let status = json_in(&store, "runs/run-a/watchdog.json").await;
+    assert_eq!(
+        (status["summary"].as_str(), status["server_running"].as_bool()),
+        (Some("server_stopped"), Some(false))
+    );
+    let codes = run_state_codes(&status);
+    assert!(
+        !codes.iter().any(|code| code == "no_steps" || code == "ranks_unknown"),
+        "{status}"
+    );
+    // Nothing is taken after the stop.
+    put.send(batch(0, 10..20), 200).await;
+    assert_eq!(put.ack().await, Err(Code::Unavailable));
 }
 
 #[tokio::test]

@@ -239,15 +239,13 @@ async fn run(args: Args) -> Result<(), Error> {
     let flusher = ingest.spawn_flusher();
     let watchdog = ingest.spawn_watchdog();
     // Open streams never end on their own, so do not wait for them: on a signal, stop
-    // taking batches, write what is buffered, and exit.
+    // taking batches, let a flush in progress finish, write and judge what is buffered, then
+    // write each status to say the server stopped (not a stale verdict), and exit.
     tokio::select! {
         result = serve(listener, ingest.clone(), token, tls, std::future::pending()) => result?,
         _ = terminated() => {}
     }
-    flusher.abort();
-    watchdog.abort();
-    ingest.write_watchdog_stopped().await; // each status says the server stopped, not a stale verdict
-    ingest.shutdown().await?;
+    ingest.stop([flusher, watchdog]).await?;
     Ok(())
 }
 

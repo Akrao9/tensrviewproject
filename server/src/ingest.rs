@@ -202,6 +202,8 @@ pub struct Ingest {
     config: IngestConfig,
     used: AtomicUsize,
     closed: AtomicBool,
+    /// Set by `stop`: the timed flush and the status writer end after the round they are in.
+    stopping: tokio::sync::watch::Sender<bool>,
     buffers: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<RankBuffer>>>>,
     watchdog: Watchdog,
     /// What was last written per run and when, so an unchanged status is not written again
@@ -237,6 +239,7 @@ impl Ingest {
             manifests: Mutex::new(HashMap::new()),
             used: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
+            stopping: tokio::sync::watch::Sender::new(false),
             buffers: Mutex::new(HashMap::new()),
         })
     }
@@ -282,10 +285,12 @@ impl Ingest {
         if self.closed.load(Ordering::SeqCst) {
             return Err(Status::unavailable("the server is shutting down"));
         }
-        let mut progressed: Option<(i64, i64)> = None; // (attempt, highest step kept)
+        // The last attempt that kept rows, the newest in the sender's file, and its own highest
+        // step kept: a batch that ends one attempt and starts the next is the next one's progress.
+        let mut progressed: Option<(i64, i64)> = None;
         for (attempt, batch) in split_by_attempt(batch)? {
             if let Some(last) = self.accept_attempt(key, attempt, batch, &mut buffer).await? {
-                progressed = Some((attempt, progressed.map_or(last, |(_, step)| step.max(last))));
+                progressed = Some((attempt, last));
             }
         }
         self.watchdog.batch(
@@ -507,6 +512,11 @@ impl Ingest {
         futures::stream::iter(self.all_buffers())
             .for_each_concurrent(FLUSH_CONCURRENCY, |(key, buffer)| async move {
                 let mut buffer = buffer.lock().await;
+                if *self.stopping.borrow() {
+                    // After `stop`, a rank this round has not started on is left to `shutdown`,
+                    // so a stop waits for the writes in progress, not for a whole round.
+                    return;
+                }
                 if buffer
                     .since
                     .is_some_and(|since| since.elapsed() >= self.config.flush_interval)
@@ -519,20 +529,26 @@ impl Ingest {
             .await;
     }
 
-    /// Runs `flush_due` until the returned task is aborted.
+    /// Runs `flush_due` until `stop`, which lets a round in progress finish.
     pub fn spawn_flusher(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let ingest = self.clone();
+        let mut stopping = self.stopping.subscribe();
         let period = (self.config.flush_interval / 10).clamp(Duration::from_millis(10), Duration::from_secs(1));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(period);
             loop {
-                ticker.tick().await;
+                // The stop is looked for between rounds only, never during one.
+                tokio::select! {
+                    biased;
+                    _ = stopping.wait_for(|stop| *stop) => return,
+                    _ = ticker.tick() => {}
+                }
                 ingest.flush_due().await;
             }
         })
     }
 
-    /// Refuses new batches and writes everything buffered. Called on `SIGTERM`. Ranks are
+    /// Refuses new batches and writes everything buffered. Called on `SIGTERM`, by `stop`. Ranks are
     /// written concurrently, so the time taken does not grow with the number of ranks; with
     /// a failing store it is bounded by the store's retry time, not multiplied by the ranks.
     pub async fn shutdown(&self) -> Result<(), Status> {
@@ -546,6 +562,25 @@ impl Ingest {
             .collect()
             .await;
         results.into_iter().collect::<Result<Vec<_>, _>>().map(|_| ())
+    }
+
+    /// The end of serving, on `SIGTERM`, in the order that leaves the store consistent. No batch
+    /// is taken from here on. The timed flush and the status writer (`tasks`, from
+    /// `spawn_flusher` and `spawn_watchdog`) finish the round they are in and end: a flush is
+    /// never cut between storing a part and judging it, which would leave that rank's
+    /// `incidents.json` behind its parts. Then every buffer is written and judged (`shutdown`),
+    /// and only then is each run's status written to say the server stopped, so the last
+    /// `watchdog.json` comes after the last part and its `incidents.json`. The status is written
+    /// even when a buffer could not be, and that error is returned after it.
+    pub async fn stop(&self, tasks: impl IntoIterator<Item = tokio::task::JoinHandle<()>>) -> Result<(), Status> {
+        self.closed.store(true, Ordering::SeqCst);
+        self.stopping.send_replace(true);
+        for task in tasks {
+            let _ = task.await;
+        }
+        let flushed = self.shutdown().await;
+        self.write_watchdog_stopped().await;
+        flushed
     }
 
     /// Stops acknowledging on a stream that has ended, which also lets its response end.
@@ -793,10 +828,12 @@ impl Ingest {
         }
     }
 
-    /// Runs `write_watchdog` every `watchdog_interval` until the returned task is aborted.
-    /// With an interval of zero no file is written and the task ends at once.
+    /// Runs `write_watchdog` every `watchdog_interval` until `stop`, which lets a write in
+    /// progress finish, so no live status can land after the stopped one. With an interval of
+    /// zero no file is written and the task ends at once.
     pub fn spawn_watchdog(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let ingest = self.clone();
+        let mut stopping = self.stopping.subscribe();
         tokio::spawn(async move {
             let period = ingest.config.watchdog_interval;
             if period.is_zero() {
@@ -804,7 +841,11 @@ impl Ingest {
             }
             let mut ticker = tokio::time::interval(period);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    biased;
+                    _ = stopping.wait_for(|stop| *stop) => return,
+                    _ = ticker.tick() => {}
+                }
                 ingest.write_watchdog().await;
             }
         })
