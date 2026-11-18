@@ -53,9 +53,14 @@ AGREE_RATIO = 0.2
 STAY_SHARE = 0.5
 #: Early samples a series needs when every series of the two runs is identical in the early
 #: steps. One recorded less often than every step (weight norms, every 50) has fewer inside them;
-#: its first samples then stand in. When the runs differ at all in the early steps, a series
-#: needs samples on half of them (`EARLY_STEPS // 2`), or how far apart it normally is cannot be
-#: told and it is not compared: weight norms judged on two noisy samples named a wrong step.
+#: its first samples then stand in: always for its own movement, and for the runs' early
+#: agreement only while the two runs are still the same there. A stand-in sample at which they
+#: differ is where they part, not how far apart they normally are, so it and every sample after
+#: it is judged (before Nov 18, 2026 it was taken as agreement, and a parameter frozen between the
+#: early steps and the second weight check was never named). When the runs differ at all in the
+#: early steps, a series needs samples on half of them (`EARLY_STEPS // 2`), or how far apart it
+#: normally is cannot be told and it is not compared: weight norms judged on two noisy samples
+#: named a wrong step.
 MIN_EARLY_SAMPLES = 2
 
 #: Record keys that are wall-clock readings: two identical runs differ in them from step 0.
@@ -232,18 +237,23 @@ def _judge(a: Mapping[int, float], b: Mapping[int, float], early_last: int, iden
             "why": f"{n_early} of its samples fall in the early steps (up to step {early_last}; {EARLY_STEPS // 2} are "
                    "needed) and the runs are not identical there, so how far apart it normally is cannot be told",
         }
-    n_early = max(n_early, MIN_EARLY_SAMPLES)
-    if len(steps) < n_early + SUSTAIN:
+    n_stand_in = max(n_early, MIN_EARLY_SAMPLES)
+    if len(steps) < n_stand_in + SUSTAIN:
         return {
             **out, "status": "not_comparable",
-            "why": f"{len(steps)} common steps: {n_early} early ones and {SUSTAIN} more are needed",
+            "why": f"{len(steps)} common steps: {n_stand_in} early ones and {SUSTAIN} more are needed",
         }
-    early, later = steps[:n_early], steps[n_early:]
+    n_agree = n_stand_in
+    if identical:
+        # The runs were the same on every series up to `early_last`. A stand-in sample after it
+        # counts as their agreement only while they are still the same there.
+        n_agree = next((i for i, s in enumerate(steps[:n_stand_in]) if not _same(a[s], b[s])), n_stand_in)
+    stand_in, early, later = steps[:n_stand_in], steps[:n_agree], steps[n_agree:]
     gaps = [_gap(a[s], b[s]) for s in early]
-    moves = _movement([a[s] for s in early]) + _movement([b[s] for s in early])
+    moves = _movement([a[s] for s in stand_in]) + _movement([b[s] for s in stand_in])
     movement = statistics.median(moves) if moves else 0.0
-    largest = max(gaps)
-    typical = statistics.median(gaps)
+    largest = max(gaps, default=0.0)
+    typical = statistics.median(gaps) if gaps else 0.0
     if not math.isfinite(largest):
         ratio = math.inf
     elif movement > 0:
@@ -251,11 +261,13 @@ def _judge(a: Mapping[int, float], b: Mapping[int, float], early_last: int, iden
     else:
         ratio = 0.0 if largest == 0 else math.inf
     out["early"] = {
-        "samples": n_early, "last_step": early[-1],
+        "samples": n_agree, "last_step": early[-1] if early else None,
         "largest_difference": _finite_or_none(largest),
         "typical_difference": _finite_or_none(typical),
         "own_movement": movement,
         "ratio": _finite_or_none(ratio),
+        # When a stand-in sample already differed: the samples the movement was measured on.
+        **({"movement_samples": n_stand_in, "movement_last_step": stand_in[-1]} if n_agree < n_stand_in else {}),
     }
     out["_ratio"], out["_moves"] = ratio, movement > 0
     out["_first_exact"] = next((s for s in steps if not _same(a[s], b[s])), None)
@@ -305,13 +317,15 @@ def _judge(a: Mapping[int, float], b: Mapping[int, float], early_last: int, iden
     if run_start is None:
         return out
     onset = later[run_start]
-    before = steps[n_early + run_start - 1]
+    # None when the onset is the series' first common sample (a sparse series whose first sample,
+    # after early steps in which the runs were identical, already differs).
+    before = steps[n_agree + run_start - 1] if n_agree + run_start else None
     first = [_gap(a[s], b[s]) for s in later[run_start:run_start + SUSTAIN]]
     size = statistics.median(first)
     non_finite = not math.isfinite(size)
     out.update(
         status="diverged", step=onset,
-        before={"step": before, "a": _json_number(a[before]), "b": _json_number(b[before])},
+        before=None if before is None else {"step": before, "a": _json_number(a[before]), "b": _json_number(b[before])},
         at={"step": onset, "a": _json_number(a[onset]), "b": _json_number(b[onset])},
         difference=_finite_or_none(_gap(a[onset], b[onset])),
         size=None if non_finite else size,
@@ -360,7 +374,9 @@ def first_divergence(
 
     - `answer`: `"diverged"`, `"no_divergence"` or `"no_answer"`, and `reason`, a sentence.
     - `divergence`: for `"diverged"`, the step, the series (`kind`, `name`, `stat`), both runs'
-      values at the last common step before it and at it, the line it crossed and by how much.
+      values at the last common step before it (`before`; None when it is the series' first
+      common sample, which only a sparse series of runs identical in the early steps can be)
+      and at it, the line it crossed and by how much.
     - `diverged_series`: every series that left, first step first.
     - `series`: for each series, what was compared, on how many common steps, and how it ended.
     - `not_comparable`: series in one run only, too short, or not agreeing early, each with why.
@@ -524,9 +540,13 @@ def first_divergence(
         by = f"{entry['times_threshold']:.3g} times its line"
         if entry["in_own_movement"] is not None:
             by += f", {entry['in_own_movement']:.3g} times the series' own step-to-step movement"
+    earlier = (
+        f"at step {before['step']}: A {before['a']}, B {before['b']}" if before is not None else
+        f"the first sample of this series in both runs; every series was the same in both runs up to step {early_last}"
+    )
     result["reason"] = (
         f"The runs part at step {entry['step']}, first on the {what}: A {at['a']}, B {at['b']} "
-        f"(at step {before['step']}: A {before['a']}, B {before['b']}), {by}, and it stayed out for "
+        f"({earlier}), {by}, and it stayed out for "
         f"{entry['sustained']} records in a row ({entry['out_share']:.0%} of its records from there on). "
         + (f"{len(together)} more series left at the same step. " if together else "")
         + f"{len(left)} of {compared} compared series left in all. This is where to look first, not a cause."

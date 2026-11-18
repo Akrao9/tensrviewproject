@@ -18,8 +18,10 @@ The result has four parts, in this order, and the printed summary keeps the orde
    configured, unavailable or not yet with enough history in another is listed here, before
    any incident, so "no incident" in one run is never set against "not looked for" in another.
 3. `incidents`: by kind and what the incident names (the layer and router, the parameters,
-   the modules), with the runs that show it and each run's first step. For a run that does
-   not show it, the entry says whether that run looked.
+   the modules; for the run's own incidents, such as a stall or a stuck collective, how it
+   stopped or which collective, with each run's ranks in `where`), with the runs that show it
+   and each run's first step. For a run that does not show it, the entry says whether that
+   run looked.
 4. `divergence`: where two runs part (`where_runs_part`, which calls `divergence.first_divergence`).
 
 Every rank of each run is read, unless `rank=` names one rank to read of every run. A run of
@@ -98,6 +100,11 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
         raise _runs.RunLookupError(f"run {run['run_id']} has a manifest and no records yet: nothing to compare")
     path = files.get(rank) if rank is not None and rank in files else files[min(files)]
     records, unfinished = _read_local(path)
+    if rank is None and len(files) > 1:
+        # Every rank's file is read, whether or not the lowest rank's holds a whole record yet:
+        # a rank whose process has written none is unknown there, never a reason to compare
+        # nothing while the other ranks have records.
+        return _open_local_all_ranks(run, files, path, records, unfinished)
     if not records:
         raise _runs.RunLookupError(f"run {run['run_id']} has no whole record in {path} yet: nothing to compare")
     held = sorted({_rank_of(r) for r in records})
@@ -148,6 +155,9 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
             number = _rank_of(record)
             if paths.setdefault(number, str(path)) == str(path):  # a rank is read from the first file that holds it
                 by_rank.setdefault(number, []).append(record)
+    if not by_rank:
+        names = ", ".join(sorted({p.name for p in files.values()}))
+        raise _runs.RunLookupError(f"run {run['run_id']} has no whole record in any of its files ({names}) yet: nothing to compare")
     unknown = {n: f"its file {files[n].name} holds no whole record yet" for n in files if n not in by_rank}
     per_rank = {}
     for number, own in sorted(by_rank.items()):
@@ -159,7 +169,7 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
     ranks = sorted(set(per_rank) | set(unknown))
     return {
         "evidence": _all_ranks_run(combined), "last_step": last.get("max") if isinstance(last, Mapping) else None,
-        "read_from": {"path": str(first.parent if len(set(paths.values())) > 1 else first), "kind": "local records",
+        "read_from": {"path": str(first.parent if len(set(files.values())) > 1 else first), "kind": "local records",
                       "rank": None, "ranks": ranks, "all_ranks": True,
                       "judged_ranks": combined["judged_ranks"], "unknown_ranks": combined["unknown_ranks"],
                       **({"unknown_why": unknown} if unknown else {}),
@@ -526,6 +536,32 @@ def compare_checked(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[
 # --- Part 3: the incidents ------------------------------------------------------------------
 
 
+# The run's own kinds: from the server's status, the checks across ranks, and the sources read
+# beside the records. The all-ranks view never groups them across ranks, so
+# `evidence._incident_identity` does not know them; their identity here is `_run_level_parts`.
+RUN_LEVEL_KINDS = ("job_stalled", "rank_silent", "duplicate_batches", "memory_imbalance", "collective_hang",
+                   "collective_desync", "traincheck_violation")
+_STALL_KINDS = ("job_stalled", "rank_silent")
+_COLLECTIVE_KINDS = ("collective_hang", "collective_desync")
+# A hang is suspected from the status alone and confirmed when Flight Recorder dumps given beside
+# it show a stuck collective: the same stall, whether or not dumps were given.
+_HANG_ASSESSMENTS = ("suspected_hang", "confirmed_hang")
+
+
+def _run_level_parts(incident: Mapping[str, Any]) -> list[Any]:
+    """What names one of the run's own incidents and stays the same whenever the run is read."""
+    kind = incident.get("kind")
+    if kind in _STALL_KINDS:
+        assessment = incident.get("assessment")
+        return ["hang" if assessment in _HANG_ASSESSMENTS else assessment]
+    if kind in _COLLECTIVE_KINDS:
+        group = incident.get("group") if isinstance(incident.get("group"), Mapping) else {}
+        return [incident.get("collective"), group.get("id"), group.get("desc"), group.get("size")]
+    if kind == "traincheck_violation":
+        return sorted({str(v.get("display_name")) for v in incident.get("violations") or () if isinstance(v, Mapping)})
+    return []  # duplicate_batches, memory_imbalance: the ranks are each run's own, in `where`
+
+
 def incident_identity(incident: Mapping[str, Any]) -> str:
     """What makes two runs' incidents "the same": the kind and what it names, without the step.
 
@@ -534,9 +570,20 @@ def incident_identity(incident: Mapping[str, Any]) -> str:
     fault at different steps. For the two MoE kinds it is cut down to the layer and router:
     which experts are overloaded or starved differs from run to run on the same router, and
     each run's own experts are listed in the entry.
+
+    The run's own kinds (`RUN_LEVEL_KINDS`) carry readings of the moment they were read (times,
+    seconds since progress, severity, steps, byte counts, sequence numbers), so their identity is
+    what names the fault and stays the same whenever the run is read, and the ranks they name are
+    each run's own, listed in the entry (`incident_where`), as which ranks show a per-rank
+    incident is: a stall (`job_stalled`, `rank_silent`) by how it stopped, a hang (suspected or
+    confirmed) or a lost connection; a stuck collective (`collective_hang`, `collective_desync`)
+    by the collective and its process group; `traincheck_violation` by the invariants violated;
+    `duplicate_batches` and `memory_imbalance` by the kind alone.
     """
     from .evidence import ATTN_KINDS, _incident_identity
 
+    if incident.get("kind") in RUN_LEVEL_KINDS:
+        return json.dumps([incident["kind"], _run_level_parts(incident)], sort_keys=True, default=str)
     kind, _, parts = json.loads(_incident_identity(incident))
     if kind == "moe_imbalance" and isinstance(parts, list):
         parts = parts[:2]
@@ -552,7 +599,7 @@ def incident_identity(incident: Mapping[str, Any]) -> str:
 def _name(item: Any) -> Any:
     if not isinstance(item, Mapping):
         return item
-    for key in ("name", "module", "rank"):
+    for key in ("name", "module", "rank", "display_name"):
         if key in item:
             return item[key]
     if "expert" in item:
@@ -560,14 +607,29 @@ def _name(item: Any) -> Any:
     return dict(item)
 
 
+_WHERE_LISTS = ("overloaded", "dead", "parameters", "modules", "layers", "gradients", "experts", "ranks", "missing_ranks",
+                "violations")
+
+
 def incident_where(incident: Mapping[str, Any]) -> dict[str, Any]:
     """What an incident names: the MoE layer and router with its experts, and the parameters,
-    modules, layers, gradients or experts. At most eight names of each, with the count beyond."""
+    modules, layers, gradients or experts. For the run's own kinds: the collective and its
+    process group, how a stall stopped (`assessment`), the ranks, the ranks missing (never
+    connected, or not in the stuck collective) and the invariants violated. At most eight
+    names of each list, with the count beyond."""
+    kind = incident.get("kind")
     where: dict[str, Any] = {}
     for key in ("layer", "router"):
         if incident.get(key) is not None:
             where[key] = incident[key]
-    for key in ("overloaded", "dead", "parameters", "modules", "layers", "gradients", "experts"):
+    if kind in _COLLECTIVE_KINDS:
+        group = incident.get("group") if isinstance(incident.get("group"), Mapping) else {}
+        for key, value in (("collective", incident.get("collective")), ("group", group.get("desc") or group.get("id"))):
+            if value is not None:
+                where[key] = value
+    if kind in _STALL_KINDS and incident.get("assessment") is not None:
+        where["assessment"] = incident["assessment"]
+    for key in _WHERE_LISTS:
         value = incident.get(key)
         names = list(value) if isinstance(value, Mapping) else [_name(i) for i in value] if isinstance(value, list) else None
         if names is None or not (names or key in ("overloaded", "dead")):
@@ -677,7 +739,9 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_
     is in a server's store, whose parts are not opened then) or `ranks_differ`. It is for paired
     runs, so `no_answer` is common and correct, and no step is ever given without `diverged`.
     Of the rule's per-series table only the series that do not agree are kept: on a 700-series
-    model the whole table is half a megabyte.
+    model the whole table is half a megabyte. A `.jsonl` file the job is still writing is read on
+    its whole lines, as parts 2 and 3 read it; `unfinished_lines_left_out` names the runs (and
+    ranks) where a line was left out, and `detail` ends by saying so.
     """
     if len(opened) != 2:
         return {"state": "not_asked", "detail": f"where runs part is answered for two runs only, and {len(opened)} were given"}
@@ -696,22 +760,50 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_
         return {"state": "ranks_differ", "detail": f"where the two runs part compares one rank of each run, and rank {ranks[0]} of "
                 f"{labels[0]} and rank {ranks[1]} of {labels[1]} were read"}
     from .divergence import divergence_summary, first_divergence
-    from .evidence import load_records
 
     try:
-        records = [load_records(run["records"]["path"], rank=run["records"]["rank"]) for run in opened]
+        read = [_step_records(run["records"]["path"], run["records"]["rank"]) for run in opened]
     except (OSError, ValueError, ImportError) as error:  # ImportError: a store's parts need pyarrow
         return {"state": "no_records", "detail": f"the step records could not be read for where the runs part ({error})"}
-    found = first_divergence(records[0], records[1], rank=ranks[0])
+    left_out = {label: [rank] for label, rank, (_, torn) in zip(labels, ranks, read) if torn}
+    found = first_divergence(read[0][0], read[1][0], rank=ranks[0])
     lines = divergence_summary(found)
     series = found.get("series") or {}
     kept = {name: entry for name, entry in series.items() if entry.get("status") != "agrees"}
     return {
-        "state": found["answer"], "detail": found["reason"], "lines": lines,
+        "state": found["answer"], "detail": found["reason"] + _left_out_text(left_out, of_ranks=False), "lines": lines,
         "labels": {"a": labels[0], "b": labels[1]},
         **{key: value for key, value in found.items() if key not in ("answer", "reason", "series")},
         "series": kept, "series_agreeing": len(series) - len(kept),
+        **({"unfinished_lines_left_out": left_out} if left_out else {}),
     }
+
+
+def _step_records(path: str | Path, rank: int) -> tuple[list[dict[str, Any]], bool]:
+    """One rank's step records for part 4, as `load_records(path, rank=rank)` reads them, and
+    whether a line that is not whole was left out: a `.jsonl` file the job is still writing (or
+    one with a line torn by a killed process) is read on its whole lines, as `_open_local` reads
+    it, with the attempts resolved as `load_records` resolves them."""
+    from .evidence import _Tail, load_records, resolve_attempts
+
+    try:
+        return load_records(path, rank=rank), False
+    except ValueError:
+        source = Path(path)
+        if source.is_dir() or source.suffix == ".parquet":
+            raise
+        tail = _Tail(source, rank)
+        tail.poll()
+        return resolve_attempts(tail.records), True
+
+
+def _left_out_text(left_out: Mapping[str, list[int]], *, of_ranks: bool) -> str:
+    """The sentence part 4's `detail` ends with when a line that is not whole was left out."""
+    if not left_out:
+        return ""
+    whose = " and ".join(f"{label}'s records" + (f" ({_rank_text(ranks)})" if of_ranks else "")
+                         for label, ranks in left_out.items())
+    return f" A line that is not whole was left out of {whose}: the run{'s' if len(left_out) > 1 else ''} may still be going."
 
 
 def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[str, Any]:
@@ -725,7 +817,6 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
     in brief: a rank without an answer carries its reason when it is not the chosen rank's.
     """
     from .divergence import divergence_summary, first_divergence
-    from .evidence import load_records
 
     # Each run's step records by rank, and its ranks: all of them, whether or not a rank has
     # records yet, so that a run of two ranks is never taken for a run of one.
@@ -750,12 +841,18 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
                 "detail": "where the two runs part needs both runs' step records of a rank, and no rank has them in both"}
     answers: dict[int, dict[str, Any]] = {}
     summaries: dict[int, str] = {}
+    torn_in: dict[str, list[int]] = {}
     for rank in compared:
         try:
-            pair = [load_records(own[rank], rank=rank) for own in paths]
+            read = [_step_records(own[rank], rank) for own in paths]
         except (OSError, ValueError, ImportError) as error:  # ImportError: a store's parts need pyarrow
             return {"state": "no_records", "detail": f"the step records of rank {rank} could not be read for where the runs "
                                                      f"part ({error})"}
+        for label, (_, torn) in zip(labels, read):
+            if torn:
+                torn_in.setdefault(label, []).append(rank)
+        pair = [records for records, _ in read]
+        del read
         found = first_divergence(pair[0], pair[1], rank=rank)
         summaries[rank] = divergence_summary(found)
         series = found.get("series") or {}
@@ -787,6 +884,8 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
     if without:
         detail += (f" Not compared: {_rank_text(sorted(without))}, with no step records yet in "
                    + "; ".join(f"rank {rank}: {' and '.join(missing)}" for rank, missing in sorted(without.items())[:8]) + ".")
+    left_out = {label: torn_in[label] for label in labels if label in torn_in}
+    detail += _left_out_text(left_out, of_ranks=True)
     chosen = answers[picked]
     brief = []
     for rank, found in answers.items():
@@ -804,6 +903,7 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
         "ranks_compared": sorted(answers),
         **({"ranks_without_records": without} if without else {}),
         "by_rank": brief,
+        **({"unfinished_lines_left_out": left_out} if left_out else {}),
     }
 
 
@@ -894,11 +994,14 @@ def _where_text(where: Mapping[str, Any]) -> str:
     if "layer" in where or "router" in where:
         parts.append(" ".join(str(x) for x in (f"layer {where['layer']}" if "layer" in where else None,
                                                f"router {where['router']}" if "router" in where else None) if x))
-    for key in ("overloaded", "dead", "parameters", "modules", "layers", "gradients", "experts"):
+    for key in ("collective", "group", "assessment"):
+        if where.get(key) is not None:
+            parts.append(f"{key} {where[key]}")
+    for key in _WHERE_LISTS:
         if where.get(key):
             more = where.get(f"{key}_count")
             names = ", ".join(str(n) if not isinstance(n, Mapping) else json.dumps(n, sort_keys=True) for n in where[key])
-            parts.append(f"{key} {names}" + (f" and {more - len(where[key])} more" if more else ""))
+            parts.append(f"{key.replace('_', ' ')} {names}" + (f" and {more - len(where[key])} more" if more else ""))
     return "; ".join(parts)
 
 
