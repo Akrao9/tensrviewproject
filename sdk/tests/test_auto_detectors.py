@@ -450,3 +450,26 @@ def test_the_all_ranks_view_runs_no_detector_and_asks_for_no_binary(tmp_path, mo
         status, _, err = run_main(monkeypatch, capsys, tmp_path, "--rank", "all", *typed)
         assert (status, err) == (0, "")
     assert [o["rank"] for o in asked] == ["all", "all"]
+
+
+def test_the_hint_does_not_say_to_install_what_is_installed_without_a_binary(tmp_path, monkeypatch, nowhere):
+    """On a platform with no binary wheel, `pip install tensorquill-server` has already brought the
+    near-empty wheel (tagged `py3-none-any`): the message says to build from source, not to install."""
+    assert sd.INSTALL_HINT in str(pytest.raises(RuntimeError, sd.server_binary).value)  # not installed at all
+
+    site = tmp_path / "site"
+    info = site / "tensorquill_server-0.0.1.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text("Metadata-Version: 2.4\nName: tensorquill-server\nVersion: 0.0.1\n", encoding="utf-8")
+    (info / "WHEEL").write_text("Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(site))
+    message = str(pytest.raises(RuntimeError, sd.server_binary).value)
+    assert "has none for this platform" in message and "cargo build --release" in message and sd.BINARY_ENV in message
+    assert sd.INSTALL_HINT not in message
+    # `auto` still falls back, and `--watch` still stops, with that message.
+    chosen, why = sd.resolve_detectors("auto")
+    assert chosen == "python" and "has none for this platform" in why
+
+    # A platform wheel whose binary cannot be found (a `pip install --target`) keeps the plain hint.
+    (info / "WHEEL").write_text("Wheel-Version: 1.0\nTag: py3-none-macosx_11_0_arm64\n", encoding="utf-8")
+    assert sd.INSTALL_HINT in str(pytest.raises(RuntimeError, sd.server_binary).value)

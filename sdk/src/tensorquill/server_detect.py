@@ -106,11 +106,30 @@ def binary_protocol(binary: str | os.PathLike[str]) -> int:
     return answer
 
 
+def _only_the_fallback_wheel() -> bool:
+    """Whether `tensorquill-server` is installed as the wheel for platforms without a binary
+    (tagged `py3-none-any`, holding no program). False when the package is not installed."""
+    from importlib import metadata
+
+    try:
+        wheel = metadata.distribution(BINARY_NAME).read_text("WHEEL") or ""
+    except Exception:  # not installed, or metadata that cannot be read: the plain install hint
+        return False
+    return "Tag: py3-none-any" in wheel
+
+
 def server_binary(binary: str | os.PathLike[str] | None = None) -> str:
     """The `tensorquill-server` to run (`find_binary`), once it has reported this module's
     `PROTOCOL`. Raises `RuntimeError` when there is none, or it reports another number or none."""
     chosen = find_binary(binary)
     if not chosen:
+        if _only_the_fallback_wheel():
+            # Installing again would bring the same wheel: say what does bring a binary here.
+            raise RuntimeError(
+                "the Rust detectors need the tensorquill-server binary, and the tensorquill-server package installed "
+                "here has none for this platform (its wheels with the binary are for Linux x86_64, Linux arm64 and "
+                f"macOS arm64): build it from source (cargo build --release in server/) and set {BINARY_ENV} to its path"
+            )
         raise RuntimeError(
             f"the Rust detectors need the tensorquill-server binary and none was found: {INSTALL_HINT} (wheels for "
             f"Linux x86_64, Linux arm64 and macOS arm64), or build it (cargo build --release in server/) and set "

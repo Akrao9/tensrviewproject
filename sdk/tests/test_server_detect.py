@@ -750,7 +750,9 @@ def run_cli(*args: str) -> subprocess.CompletedProcess:
 def test_the_command_line_takes_the_incidents_from_rust(tmp_path):
     capture = tmp_path / "run.jsonl"
     capture.write_text("".join(json.dumps(r) + "\n" for r in everything()), encoding="utf-8")
-    plain = run_cli(str(capture), "-o", str(tmp_path / "python.json"))
+    # `plain` is the Python detectors' read, which was the default until Nov 17, 2026. One read is now
+    # `auto` (Rust when this file can run), so the Python side of the comparison is asked for by name.
+    plain = run_cli(str(capture), "-o", str(tmp_path / "python.json"), "--detectors", "python")
     rust = run_cli(str(capture), "-o", str(tmp_path / "rust.json"), "--detectors", "rust")
     assert plain.returncode == 0 and rust.returncode == 0, rust.stderr
     written = json.loads((tmp_path / "rust.json").read_text(encoding="utf-8"))
@@ -767,7 +769,8 @@ def test_the_command_lines_thresholds_go_to_rust(tmp_path):
     capture = tmp_path / "run.jsonl"
     capture.write_text("".join(json.dumps(r) + "\n" for r in everything()), encoding="utf-8")
     options = ("--top-k", "2", "--overload-threshold", "0.5")
-    plain = run_cli(str(capture), "-o", str(tmp_path / "python.json"), *options)
+    # As above: the Python side is asked for by name, since one read no longer defaults to it.
+    plain = run_cli(str(capture), "-o", str(tmp_path / "python.json"), "--detectors", "python", *options)
     rust = run_cli(str(capture), "-o", str(tmp_path / "rust.json"), "--detectors", "rust", *options)
     assert plain.returncode == 0 and rust.returncode == 0, rust.stderr
     python_evidence = json.loads((tmp_path / "python.json").read_text(encoding="utf-8"))

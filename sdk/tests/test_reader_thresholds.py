@@ -340,20 +340,31 @@ def test_each_of_the_five_flags_reaches_the_detectors_on_a_local_file(tmp_path):
 
     capture = tmp_path / "run.jsonl"
     capture.write_text("".join(json.dumps(r) + "\n" for r in everything()), encoding="utf-8")
-    done = cli(str(capture), "-o", str(tmp_path / "five.json"), *flags(APPLIED), cwd=tmp_path)
+    # `--detectors python` is typed for the first half: it holds each flag to what `build_evidence` gives
+    # with the same option, and that is the Python detectors'. Until Nov 17, 2026 they were the command
+    # line's default for one read; now it is `auto`, which is Rust wherever this file can run.
+    python = ("--detectors", "python")
+    done = cli(str(capture), "-o", str(tmp_path / "five.json"), *python, *flags(APPLIED), cwd=tmp_path)
     assert done.returncode == 0, done.stderr
     written = json.loads((tmp_path / "five.json").read_text(encoding="utf-8"))
     assert text(written) == text(tensorquill.build_evidence(everything(), **APPLIED))
     assert text(written) != text(tensorquill.build_evidence(everything()))
     # One at a time, each flag gives what its option gives, and with none the defaults stand.
     for name in THRESHOLD_NAMES:
-        done = cli(str(capture), "-o", str(tmp_path / "one.json"), FLAGS[name], str(APPLIED[name]), cwd=tmp_path)
+        done = cli(str(capture), "-o", str(tmp_path / "one.json"), *python, FLAGS[name], str(APPLIED[name]), cwd=tmp_path)
         assert done.returncode == 0, done.stderr
         written = json.loads((tmp_path / "one.json").read_text(encoding="utf-8"))
         assert text(written) == text(tensorquill.build_evidence(everything(), **{name: APPLIED[name]})), name
-    done = cli(str(capture), "-o", str(tmp_path / "none.json"), cwd=tmp_path)
+    done = cli(str(capture), "-o", str(tmp_path / "none.json"), *python, cwd=tmp_path)
     written = json.loads((tmp_path / "none.json").read_text(encoding="utf-8"))
     assert text(written) == text(tensorquill.build_evidence(everything()))
+    # With no `--detectors` the read is `auto`: the Rust detectors here, saying so and warning of nothing.
+    auto = cli(str(capture), "-o", str(tmp_path / "auto.json"), *flags(APPLIED), cwd=tmp_path)
+    assert (auto.returncode, auto.stderr) == (0, "")
+    typed = cli(str(capture), "-o", str(tmp_path / "typed.json"), "--detectors", "rust", *flags(APPLIED), cwd=tmp_path)
+    assert typed.returncode == 0, typed.stderr
+    assert text(json.loads((tmp_path / "auto.json").read_text(encoding="utf-8"))) == text(
+        json.loads((tmp_path / "typed.json").read_text(encoding="utf-8")))
     # The same five through the Rust detectors.
     rust = cli(str(capture), "-o", str(tmp_path / "rust.json"), "--detectors", "rust", *flags(APPLIED), cwd=tmp_path)
     assert rust.returncode == 0, rust.stderr
