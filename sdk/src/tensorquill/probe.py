@@ -298,7 +298,27 @@ def _attention_stats(
     `max_logit` is the largest finite visible pre-softmax score per head. The map averages
     sample 0's valid rows over heads, sums keys and averages query rows within each bin of
     at most `map_size` × `map_size`; rows of the map with no valid query are zero.
+
+    It runs inside the user's forward, perhaps under autocast, whose `matmul` would cast the
+    float32 query and key back to FP16 or BF16 (scores above 65,504 then overflow to Inf in
+    FP16 and are counted invalid). So it runs with autocast off (`_autocast_off`), as the
+    head's numbers do. The probe's other work inside the forward, the histograms
+    (`_histogram`: `isfinite`, `aminmax`, `histc`), calls no op that autocast casts to a lower
+    precision on the CPU, CUDA or MPS (PyTorch's `autocast_mode.cpp`).
     """
+    with _autocast_off(query.device):
+        return _attention_stats_fp32(query, key, attn_mask, is_causal, scale, map_size)
+
+
+def _attention_stats_fp32(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    is_causal: bool,
+    scale: float | None,
+    map_size: int,
+) -> dict[str, Any]:
+    """`_attention_stats`, which calls it with autocast off."""
     q = query.detach().float()
     k = key.detach().float()
     if q.ndim == 3:

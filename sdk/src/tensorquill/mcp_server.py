@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from . import __version__
+from . import compact as _compact
 from . import compare as _compare
 from . import runs as _runs
 from .sink import read_end_marker
@@ -341,15 +342,19 @@ class Source:
 
     def _records_beside(self, path: Path, document: Mapping[str, Any]) -> Path | None:
         """Where an evidence file's step records are: `--records`, the capture the command line
-        writes it next to (`x.jsonl` for `x.evidence.json`), or an all-ranks view's run folder."""
+        writes it next to (`x.jsonl` for `x.evidence.json`, and for `x.evidence.compact.json`,
+        the compact file `--compact` writes and a trigger hands an agent), or an all-ranks view's
+        run folder."""
         if self.records_path is not None:
             if not self.records_path.exists():
                 raise ToolError(f"{self.records_path}, given as --records, does not exist.")
             return self.records_path
-        if path.name.endswith(".evidence.json"):
-            capture = path.with_name(path.name[: -len(".evidence.json")] + ".jsonl")
-            if capture.is_file():
-                return capture
+        for ending in (".evidence.compact.json", ".evidence.json"):
+            if path.name.endswith(ending):
+                capture = path.with_name(path.name[: -len(ending)] + ".jsonl")
+                if capture.is_file():
+                    return capture
+                break
         folder = document.get("run_folder")
         if document.get("view") == ALL_RANKS_VIEW and isinstance(folder, str) and Path(folder).is_dir():
             return Path(folder)
@@ -884,6 +889,10 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
     held = source.rank_records(rank)
     origin: dict[str, Any]
     evidence: Mapping[str, Any] | None = None
+    # Compact evidence that left samples out (`compact._omits`): with the records held, a router's
+    # series is read from them and only its flags from this file's samples (CLI-06, Nov 18, 2026).
+    window: Mapping[str, Any] | None = None
+    compact_note: str | None = None
     if held is None:
         opened = source.open(rank)
         if opened["shape"] != "rank":
@@ -892,10 +901,20 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
                 " start the server on the run folder (runs/<run_id>), or with --records, to read series."
             )
         evidence, names, origin = opened["evidence"], _sample_names(opened["evidence"]), {"records": None}
+        omits = _compact._omits(evidence) is not None
         what = (
-            f"the evidence file {source.path}, which has only its routers' samples (start the server on the"
-            " .jsonl capture or the run folder, or with --records, for layers and parameters)"
+            f"the {'compact ' if omits else ''}evidence file {source.path}, which has only its routers' samples"
+            f"{' of the steps it keeps' if omits else ''} (start the server on the .jsonl capture or the run folder,"
+            " or with --records, for layers and parameters)"
         )
+        if omits:
+            sampled = evidence["compact"].get("sampled_steps") or [None, None]
+            compact_note = (
+                "This series is read from this file's samples alone, so its steps, recorded and over_range cover only"
+                f" the steps it keeps, not the run, whose samples run from step {sampled[0]} to {sampled[-1]}. The"
+                f" file is {_compact.describe(evidence)}. For every step, start the server on the .jsonl capture or"
+                " the run folder, or with --records."
+            )
     else:
         records, names, origin = held
         what = f"rank {origin['rank']}'s step records"
@@ -905,6 +924,8 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
                 evidence = source.capture_evidence(path, origin["rank"])
             elif path_kind == "evidence" and source.document(path).get("view") != ALL_RANKS_VIEW:
                 evidence = source.document(path)
+                if _compact._omits(evidence) is not None:
+                    window, evidence = evidence, None
     kind = _resolve(name, kind, names, what)
     if expert is not None and kind != "router":
         raise ToolError(f"`expert` is for a router's series; {name!r} is a {kind}.")
@@ -912,6 +933,19 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
         rows = _sample_rows(name, evidence, expert)
     else:
         rows = _rows(kind, name, records if held is not None else (), expert)
+        if window is not None and kind == "router":
+            # The flags are the detectors' as this file has them: a rebuild from the records could
+            # use other thresholds or detectors than the ones that wrote it.
+            kept = dict(_sample_rows(name, window, None))
+            for step, point in rows:
+                if step in kept:
+                    point.update(overloaded=kept[step]["overloaded"], dead=kept[step]["dead"])
+            compact_note = (
+                "The routing at every recorded step is read from the step records. overloaded, dead and"
+                " first_flagged_step are the detectors' flags from the evidence file's own samples, so they cover only"
+                " the steps it keeps, and first_flagged_step is the first flagged among those. The file is"
+                f" {_compact.describe(window)}."
+            )
     if not rows:
         raise ToolError(f"no step carries values for the {kind} {name!r} yet.")
     columns = list(dict.fromkeys(column for _, point in rows for column in point))
@@ -929,6 +963,7 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
         raise ToolError(
             f"the {kind} {name!r} has no recorded step between {start if start is not None else first} and"
             f" {end if end is not None else last}: it is recorded at {len(rows)} steps, from {first} to {last}."
+            + (f" {compact_note}" if compact_note is not None and held is None else "")
         )
     stride = math.ceil(len(inside) / max_points)
     while True:
@@ -946,6 +981,8 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
             flagged = [step for step, point in inside if point.get("overloaded") or point.get("dead")]
             if flagged:
                 answer["first_flagged_step"] = flagged[0]
+        if compact_note is not None:
+            answer["compact"] = compact_note
         if stride > 1:
             answer["note"] = (
                 f"every {stride}th recorded step is shown; over_range covers every recorded step in the range, so a"
@@ -1150,7 +1187,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " thinned to every nth recorded step, with the stride reported, and `over_range` gives the minimum,"
             " maximum (with their steps) and median over every recorded step in the range, so a one-step spike is"
             " not lost. Narrow `start` and `end` to see each step. Numbers have six significant digits; a NaN or"
-            ' Inf is the string "nan", "inf" or "-inf".'
+            ' Inf is the string "nan", "inf" or "-inf". A router\'s series from compact evidence that left steps'
+            " out says under `compact` which steps it covers."
         ),
         "inputSchema": {
             "type": "object",
@@ -1498,7 +1536,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--records", type=Path,
         help="for an evidence.json: the .jsonl capture or run folder its step records are in, for get_series "
-        "(default: x.jsonl beside x.evidence.json, or an all-ranks view's own run folder)",
+        "(default: x.jsonl beside x.evidence.json or x.evidence.compact.json, or an all-ranks view's own run folder)",
     )
     parser.add_argument(
         "--runs", type=Path,

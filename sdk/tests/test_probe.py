@@ -235,6 +235,54 @@ def test_nan_scores_are_reported_as_invalid_not_as_concentrated_attention():
     assert broken["invalid_rows"] == 8 and all(math.isnan(v) for v in broken["entropy"])
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_attention_stats_are_float32_under_autocast(dtype):
+    """SDK-09 (Nov 18, 2026): the probe's attention statistics run inside the user's forward,
+    perhaps under autocast, whose `matmul` would cast the float32 query and key back down. Logits
+    near 37,000 under FP16 overflowed to Inf (10 rows counted invalid, a max_logit of 13,456);
+    under BF16 they were rounded. They are float32 whatever autocast the forward runs under."""
+    torch.manual_seed(0)
+    q, k = torch.randn(1, 2, 8, 16) * 120, torch.randn(1, 2, 8, 16) * 120
+    plain = probe_mod._attention_stats(q, k, None, False, None, 8)
+    assert max(plain["max_logit"]) > 30_000 and plain["invalid_rows"] == 0
+    with torch.autocast("cpu", dtype=dtype):
+        under = probe_mod._attention_stats(q, k, None, False, None, 8)
+        assert torch.is_autocast_enabled("cpu")  # left as the forward had it
+    assert under["invalid_rows"] == 0
+    assert under["max_logit"] == pytest.approx(plain["max_logit"], rel=1e-6)
+    assert under["entropy"] == pytest.approx(plain["entropy"], rel=1e-5, abs=1e-6)
+
+
+def test_a_probe_run_under_bf16_autocast_reads_the_attention_in_float32():
+    """The same through a probe run whose `fn` enters autocast: the scores of the query and key
+    the model handed to SDPA (float32 here, from no autocast op) are not rounded to BF16."""
+
+    class Attend(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(32, 16)
+
+        def forward(self, ids):
+            x = (self.embed(ids) * 40).view(ids.shape[0], ids.shape[1], 2, 8).transpose(1, 2)
+            return F.scaled_dot_product_attention(x, x.flip(-2), x, is_causal=True)
+
+    torch.manual_seed(0)
+    model, ids = Attend(), torch.randint(0, 32, (2, 12))
+
+    def under_autocast(m):
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            m(ids)
+
+    state = probe_mod.ProbeState()
+    state.head_off = True
+    found = probe_mod.run_probe(model, under_autocast, state, [])["attention"]["attention"]
+    x = (model.embed(ids) * 40).view(2, 12, 2, 8).transpose(1, 2).detach()
+    max_logit, entropy, _, _ = _reference(x, x.flip(-2))
+    assert found["invalid_rows"] == 0
+    assert found["max_logit"] == pytest.approx(max_logit.tolist(), rel=1e-6)
+    assert found["entropy"] == pytest.approx(entropy.tolist(), rel=1e-4, abs=1e-6)
+
+
 def test_a_failing_probe_keeps_the_step_and_records_the_error():
     model = Toy()
     calls = []
