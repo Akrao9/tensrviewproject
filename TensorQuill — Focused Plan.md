@@ -47,7 +47,7 @@ Five lines of work stop now. A sixth, new detector kinds, was lifted on Nov 17, 
 | --- | --- | --- |
 | New detector kinds | Lifted by the author on Nov 17, 2026. It had stopped at the 32 built; new kinds are now added one at a time | Returned on Nov 17, 2026 by the author's decision. Its condition, a real job showing a failure none of them catches, was not met |
 | Rune viewer app | Postponed, confirmed Nov 16, 2026; Rerun stays the viewer | Outside users ask for views Rerun cannot give |
-| Second copy of each detector | One Rust implementation for the 28 server kinds, called from Python; each Python duplicate is deleted as it is replaced. The four Python-only kinds stay as they are. State on Nov 16, 2026: the Rust path is built and opt-in for one read, watching, the all-ranks view, the thresholds and the MoE samples. Python is still the default, and no Python copy is deleted yet | Not applicable: this is a simplification, not a pause |
+| Second copy of each detector | One Rust implementation for the 28 server kinds, called from Python; each Python duplicate is deleted as it is replaced. The four Python-only kinds stay as they are. State on Nov 16, 2026: the Rust path is built and opt-in for one read, watching, the all-ranks view, the thresholds and the MoE samples. Python is still the default, and no Python copy is deleted yet. Decided Nov 17, 2026: the Python detectors stay through the release, and whether to delete them is decided after it | Not applicable: this is a simplification, not a pause |
 | Real-AWS and GCS runs, and the `s3://` reader | Postponed; the store code is built and stays | A user asks for a cloud store |
 | Hosted tier, SSO, pricing | Postponed | Three outside teams run the SDK |
 | RL, robotics, diffusion and multimodal packs | Not in this plan | A user brings a workload |
@@ -81,7 +81,7 @@ TensorQuill itself still only reports. Nothing in the SDK or server blocks or st
 
 ## Detector changes
 
-No new kinds are added. Labelling the 32 kinds is done, and one change to replica drift follows the two-GPU run.
+No new kinds were added while the freeze held; it was lifted on Nov 17, 2026. Labelling the 32 kinds is done, and one change to replica drift is planned for after the release.
 
 1. **Label every kind** as invariant, anomaly or observation. Done Nov 16, 2026: all 32 are labelled in Python and Rust with a parity test, as 12 invariants, 11 anomalies and 9 observations.
    - Invariants are rules that must always hold, such as replica drift, repeated steps, duplicate batches, non-finite values and collective desync.
@@ -107,13 +107,53 @@ Five results make the claims credible, and none has been run yet. Pass lines are
 | 2 | One of the author's real jobs | At least 1,000 steps, with a real anomaly found or zero false incidents | Not run. nanochat and nanoMoE are noted as candidates; whether they count as the author's own job is not decided |
 | 3 | Head-to-head on the Granite run under `torch.compile`: TensorQuill, NeuralDBG and `wandb.watch` | TensorQuill router-only at 1.0% or less, with 0 graph breaks and 0 recompiles after warmup. All three tools' numbers are published, whatever they show | Not run |
 | 4 | Agent benchmark on at least 8 real captures that carry loss and gradient curves | The agent names the exact step, layer or parameter, and kind in 85% of trials, and beats scalar-only data by 30 points | Not run. The Gate 1 harness on the 7 fixtures is the rehearsal, scored by its own pre-registered rules and without the Rune arm. Since Nov 17, 2026 its gate is the evidence arm against stock Rerun with the same evidence: accuracy within 5 points, and no more tool calls at the median. Loss is now logged in the four GPU scripts, but router-only captures carry no gradient norm, so these runs need full capture |
-| 5 | Public release | On PyPI and crates.io, and 3 outside engineers run it on their own jobs | Packaging prepared, nothing uploaded |
+| 5 | Public release | Both packages on PyPI, the server as wheels, and 3 outside engineers run it on their own jobs | The SDK wheel is prepared and the server's wheels are not built. Nothing uploaded. crates.io was dropped on Nov 17, 2026 |
 
 Results 2 and 5 decide whether the product is wanted. Results 1, 3 and 4 decide what it may claim.
 
+## Release plan
+
+Decided Nov 17, 2026. One pure-Python SDK and one Rust server wheel, both on PyPI, built for Linux first; then proof runs; then the release. Pushing `main`, the first Linux CI run and the small fixes are done. Nothing in steps 2 to 6 is built or run yet. The v3 plan holds the full entry.
+
+1. **Record the decisions in the plan.** Done Nov 17, 2026: the packaging decision is logged in v3, the stale lines are fixed, and the detector count is checked against the code as 28 in the server and 4 in Python.
+2. **Packaging.**
+   - Publish `tensorquill-server` as maturin wheels for Linux x86_64, Linux arm64 and macOS arm64, plus a near-empty fallback wheel for every other platform.
+   - Check that the Linux wheels are tagged `manylinux_2_17`, and build arm64 on a native runner.
+   - Keep `tensorquill` pure Python. It depends on the server package by version range, with no platform markers.
+   - The binary reports one protocol number, and the SDK checks it.
+   - `--watch` requires the Rust binary and stops with the install hint; `--detectors python` overrides that. One-shot reads use `auto` and fall back to Python with one warning.
+   - Keep the Python detectors, and do not start the deletion of the Python duplicates.
+   - Document `uvx --from tensorquill tensorquill-mcp`.
+   - Test a clean install from TestPyPI in a Linux container. Then upload a 0.0.x of each package with trusted publishing, which also claims the names.
+   - Create the GitHub organization and transfer the repository.
+3. **Proof without a GPU.**
+   - Run nanoMoE on the Mac past 1,000 steps with the balance loss on and off, then `compare` the two.
+   - Run a live agent on a planted failure through the MCP tools.
+   - Run the watchdog once at its real default timings.
+   - Send 512 to 1,024 simulated ranks into the server and record flush time and memory per rank. Label the result synthetic, on CPU.
+4. **Proof on GPUs.**
+   - In Colab on the RTX PRO 6000: the three seeded-failure commands, the bf16 cases, the Granite head-to-head against NeuralDBG and `wandb.watch`, and the group C cell (GPU memory, NVML and data wait).
+   - On a rental: only the two-GPU NCCL run.
+   - Copy each run's `.jsonl` and evidence files out of Colab before the session ends, named by GPU.
+5. **Agent benchmark.** Enter the model and time limit under Amendments, then run the trial.
+6. **Release.**
+   - Run `gpu_check.py` in Colab by hand. No GPU job runs in CI.
+   - Cut the README to a short quickstart.
+   - Add a framework table (DDP, FSDP2, ZeRO, Megatron, Lightning, HF Trainer), each row labelled run on GPUs, CPU only, or not run.
+   - Move the measurements to a benchmarks file.
+   - Publish both packages, post the demo, and get three outside engineers to run it.
+
+**After the release**
+
+- Keep or delete the Python detectors based on maintenance cost. Deleting them means adding wheels for the remaining platforms and making the binary required.
+- Make replica drift name the rank, and move the attention maps out of `probe_json`.
+- Add a container image when a user asks.
+
+The new detector kinds, lifted the same day, are not placed in these steps. Whether the first one is built before the release is not decided.
+
 ## Next actions
 
-Four weeks from Nov 16, 2026, in this order. The weeks are a proposal; move them as results come in.
+Replaced on Nov 17, 2026 by the release plan above. The four weeks from Nov 16, 2026 are kept below as the record of what was planned.
 
 **Week 1: GPU runs and a real job**
 
@@ -170,7 +210,7 @@ Two decisions are still the author's to make, two were settled on Nov 16, 2026, 
 - **Settled: the Rune viewer is postponed.** Confirmed Nov 16, 2026. This reverses the v3 decision of Nov 14, 2026 that the app is built either way. Rerun stays the viewer until outside users ask for views it cannot give.
 - **Price.** Per seat or per GPU-hour, decided only after result 5.
 - **Do nanochat and nanoMoE count as result 2?** Both can meet the pass line, but they are other people's training code, and result 2 asks for one of the author's real jobs.
-- **Settled: Python reaches the Rust detectors through the server binary.** `tensorquill-server` has a `detect` subcommand that Python runs as a subprocess. The SDK wheel stays pure Python. Offline detection needs the binary on PATH until it ships as per-platform wheels. A PyO3 extension was not chosen, because detection is one pass over a file and the wheel would need a build per platform.
+- **Settled: Python reaches the Rust detectors through the server binary.** `tensorquill-server` has a `detect` subcommand that Python runs as a subprocess. The SDK wheel stays pure Python. Offline detection needs the binary on PATH until it ships as per-platform wheels, which the release plan of Nov 17, 2026 schedules. A PyO3 extension was not chosen, because detection is one pass over a file and the wheel would need a build per platform.
 
 **Risks**
 
