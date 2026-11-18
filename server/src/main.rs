@@ -11,6 +11,13 @@ use tensorquill_server::server::{check_bind, serve, Tls};
 use tensorquill_server::storage::{Error, Storage, StoreOptions};
 use tokio::net::TcpListener;
 
+/// The one number the Python SDK checks before it runs this binary (`tensorquill-server protocol`).
+/// It goes up by one whenever what `detect` reads, takes or prints changes in a way an SDK built
+/// for the old number would get wrong: a kind added or removed, a threshold or option added, a
+/// report key renamed or dropped. `PROTOCOL` in `sdk/src/tensorquill/server_detect.py` is the
+/// same number, and a test in `sdk/tests/test_protocol.py` holds the two together.
+const PROTOCOL: u32 = 1;
+
 /// Self-hosted TensorQuill ingest: Arrow Flight DoPut in, partitioned Parquet out.
 #[derive(Parser)]
 #[command(name = "tensorquill-server", version, subcommand_negates_reqs = true)]
@@ -113,6 +120,9 @@ enum Command {
         #[arg(long)]
         run: bool,
     },
+    /// Print the protocol number and exit: one whole number on a line of its own. The Python SDK
+    /// runs a binary only when this is the number it was built for.
+    Protocol,
 }
 
 /// `tensorquill-server detect`: the report goes to standard output as one line of JSON.
@@ -250,6 +260,10 @@ async fn main() -> ExitCode {
             run,
             &Arc::new(args.thresholds.take().unwrap_or_default()),
         ),
+        Some(Command::Protocol) => {
+            println!("{PROTOCOL}");
+            Ok(())
+        }
         None => run(args).await,
     };
     match outcome {

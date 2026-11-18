@@ -315,6 +315,9 @@ def test_the_command_lines_watcher_of_one_rank(tmp_path, typed, source, state):
     process = subprocess.Popen(
         [sys.executable, "-m", "tensorquill", str(folder), "--watch", "--interval", "0.2", "-o", str(out), *typed],
         cwd=tmp_path, stdout=subprocess.PIPE, text=True, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
+        # Since Nov 17, 2026 `--watch` needs the Rust detectors' binary before its first look: it is told where
+        # the binary this test's server runs from is, as an installed tensorquill-server would be found.
+        env={"TENSORQUILL_SERVER_BIN": str(BINARY), **os.environ},
     )
     try:
         deadline = time.monotonic() + 60

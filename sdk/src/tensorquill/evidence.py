@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import time
+import warnings
 from collections import deque
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -2415,10 +2416,20 @@ def _grace_alert_key(status: Mapping[str, Any] | None, status_age: float | None,
     )
 
 
-def _detectors_option(detectors: Any) -> str:
-    if detectors not in ("python", "rust"):
-        raise ValueError(f"detectors must be 'python' or 'rust', not {detectors!r}")
-    return str(detectors)
+def _detectors_option(detectors: Any, server_binary: Any = None) -> str:
+    """`detectors` as "python" or "rust". "auto" is decided here, once: Rust when the server
+    binary and `pyarrow` are there, and otherwise Python with one `RuntimeWarning` that says
+    what is missing and what installs it (`server_detect.resolve_detectors`)."""
+    if detectors not in ("auto", "python", "rust"):
+        raise ValueError(f"detectors must be 'auto', 'python' or 'rust', not {detectors!r}")
+    if detectors != "auto":
+        return str(detectors)
+    from .server_detect import resolve_detectors
+
+    chosen, why = resolve_detectors("auto", server_binary)
+    if why is not None:
+        warnings.warn(why, RuntimeWarning, stacklevel=3)
+    return chosen
 
 
 def _stat_key(path: Path) -> tuple[int, int] | None:
@@ -2515,6 +2526,8 @@ def watch(
     `.jsonl` file, and for a server's store when its report cannot be used. Each rebuild sends
     every record read so far, as the Python detectors read them all again. A missing binary or
     `pyarrow` raises `RuntimeError` before the first look, not at the first rebuild.
+    `detectors="auto"` is decided once, before the first look, as `build_evidence` decides it.
+    The default here is "python"; the command line's `--watch` asks for "rust" (`main`).
 
     `compact_window` writes the compact file instead of the full one (`compact.compact_evidence`,
     that many recorded steps each side of a MoE incident), as `<name>.compact.json` unless
@@ -2531,7 +2544,11 @@ def watch(
             trigger=trigger, **build_options,
         )
     source = Path(source)
-    if _detectors_option(build_options.get("detectors", "python")) == "rust":
+    # "auto" is decided once, here: every rebuild then uses the same detectors, and a fallback
+    # to Python is warned of once and not at every rebuild.
+    build_options["detectors"] = _detectors_option(
+        build_options.get("detectors", "python"), build_options.get("server_binary"))
+    if build_options["detectors"] == "rust":
         # Said now, while someone is at the keyboard, not at the first rebuild hours into a run.
         from .server_detect import rust_ready
 
@@ -3607,12 +3624,13 @@ def watch_all_ranks(
     five given here (`overload_threshold`, `drift_tolerance`, `starve_window`, `starve_ratio`,
     `top_k`) must be the one a rank's server applied, or that rank is `other_thresholds`.
     `flight_recorder` and `traincheck` are read once for the run and their incidents are run-level.
-    `detectors` ("python" or "rust") is accepted and changes nothing: every rank's incidents are
+    `detectors` ("auto", "python" or "rust") is accepted and changes nothing: every rank's incidents are
     the Rust detectors' already, from its server's report, and no detector runs here, so the
     server binary is not needed. Returns the evidence path, or None if nothing was written.
     """
     source = _all_ranks_source(source)
-    _detectors_option(build_options.pop("detectors", "python"))
+    if build_options.pop("detectors", "python") not in ("auto", "python", "rust"):
+        raise ValueError("detectors must be 'auto', 'python' or 'rust'")
     build_options.pop("server_binary", None)
     if not server_reports:
         raise ValueError(
@@ -3992,19 +4010,23 @@ def build_evidence(
 
     `detectors="rust"` takes the incidents of the server's kinds (`SERVER_KINDS`) from the
     Rust detectors, run here on the same records through `tensorquill-server detect`
-    (`server_binary`, else `TENSORQUILL_SERVER_BIN`, else the one on `PATH`; needs `pyarrow`).
+    (`server_binary`, else where `server_detect.find_binary` looks; needs `pyarrow`).
     The five options above go to it as one JSON object (`--thresholds`), and a value the
     Rust rules refuse (a negative number, a window or `top_k` below 1) raises `ValueError`.
     The per-step `samples` come from that run too (`detect --samples`), so no MoE rule runs
     here. The weight trends, the router names and sizes and the kinds read from other files
     are still made here. The evidence then carries `"detectors": "rust"`.
+    `detectors="auto"` is "rust" when that binary reports the protocol number this package was
+    built for and `pyarrow` is installed, and otherwise "python" with one `RuntimeWarning`
+    naming what is missing and what installs it. The default stays "python": a library call
+    starts no process and gives the same evidence on every machine unless it is asked to. The
+    command line's default for one read is "auto" (`main`).
 
     When one of the five options is not the default, the evidence lists all five as `thresholds`
     (the name a server's report gives them), and `thresholds_line` names those that differ. At
     the defaults there is no such key, so that evidence is what it was before the key.
     """
-    if detectors not in ("python", "rust"):
-        raise ValueError(f"detectors must be 'python' or 'rust', not {detectors!r}")
+    detectors = _detectors_option(detectors, server_binary)  # "auto" becomes one of the two here
     every_attempt = load_records(source, rank=rank, all_attempts=True)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
@@ -5277,7 +5299,7 @@ def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             on_update=report, report_grace=args.report_grace, **args.thresholds,
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
             traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
-            detectors=args.detectors,
+            detectors=args.detectors or "auto",  # nothing runs here, so no binary is asked for
         )
     except ValueError as error:
         parser.error(str(error))
@@ -5398,12 +5420,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--detectors",
-        choices=("python", "rust"),
-        default="python",
-        help="rust: take the incidents of the server's kinds from the Rust detectors, run on this file through "
-        "`tensorquill-server detect` (the binary on PATH or named by TENSORQUILL_SERVER_BIN; needs pyarrow). "
-        "With --watch they run on every rebuild made here, over every record read so far. With --rank all the "
-        "option changes nothing: that view takes every rank's incidents from its server's report and runs no detector",
+        choices=("auto", "python", "rust"),
+        help="whose detectors run here. rust: the incidents of the server's kinds come from the Rust detectors, "
+        "run on this file through `tensorquill-server detect` (the binary named by TENSORQUILL_SERVER_BIN, else the "
+        "one `pip install tensorquill-server` put beside this Python, else the one on PATH; needs pyarrow, "
+        "`pip install 'tensorquill[flight]'`). python: the Python detectors, which need neither. auto, the default "
+        "for one read: rust when the binary and pyarrow are there, and otherwise python with one warning that says "
+        "what to install. --watch needs the Rust detectors and stops before its first look when they are missing; "
+        "only `--detectors python` makes it watch with the Python ones. With --watch the detectors run on every "
+        "rebuild made here, over every record read so far. With --rank all the option changes nothing: that view "
+        "takes every rank's incidents from its server's report and runs no detector, so it needs no binary",
     )
     from . import compact as _compact, trigger as _trigger
 
@@ -5441,6 +5467,17 @@ def main() -> None:
                     print(state)
             print(f"updated {path}", flush=True)
 
+        # A watcher judges with the Rust detectors unless it is told `--detectors python`: a missing
+        # binary or pyarrow stops it here, before the first look, with what to install.
+        detectors = "python" if args.detectors == "python" else "rust"
+        if detectors == "rust":
+            from .server_detect import rust_ready
+
+            try:
+                rust_ready()
+            except RuntimeError as error:
+                parser.error(f"--watch needs the Rust detectors: {error}. To watch with the Python detectors, "
+                             "add --detectors python")
         print(f"watching {args.input} every {args.interval:g} s; Ctrl-C to stop", flush=True)
         try:
             watch(
@@ -5449,24 +5486,31 @@ def main() -> None:
                 server_reports=not args.recompute, report_grace=args.report_grace, **args.thresholds,
                 flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
                 traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
-                detectors=args.detectors,
+                detectors=detectors,
             )
         except (RuntimeError, ValueError) as error:
-            # The Rust path's own refusals: no binary, no pyarrow, thresholds its rules refuse.
-            if args.detectors != "rust":
+            # The Rust path's own refusals: a binary that fails, thresholds its rules refuse.
+            if detectors != "rust":
                 raise
             parser.error(str(error))
         return
 
+    # One read: the Rust detectors when they are installed, and otherwise the Python ones, said once.
+    from .server_detect import resolve_detectors
+
+    detectors, fallback = resolve_detectors(args.detectors or "auto")
+    if fallback is not None:
+        print(f"tensorquill: warning: {fallback}. `--detectors python` asks for the Python detectors without this "
+              "warning", file=sys.stderr)
     records = load_records(args.input, rank=rank, all_attempts=True)
     try:
         evidence = build_evidence(
             records, **args.thresholds, watchdog=_watchdog_beside(args.input),
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
-            traincheck=args.traincheck, detectors=args.detectors, run_manifest=args.input,
+            traincheck=args.traincheck, detectors=detectors, run_manifest=args.input,
         )
     except (RuntimeError, ValueError) as error:
-        if args.detectors != "rust":
+        if detectors != "rust":
             raise
         parser.error(str(error))
     out_json = _write_output(

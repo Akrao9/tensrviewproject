@@ -176,7 +176,10 @@ def test_the_command_line_wakes_the_command_with_no_human_step(tmp_path, hook):
     _write(source, _records(range(20)))
     watcher = subprocess.Popen(
         [sys.executable, "-m", "tensorquill", str(source), "--watch", "--interval", "0.1", "--compact",
-         "--on-incident", command()],
+         "--on-incident", command(),
+         # Since Nov 17, 2026 `--watch` needs the Rust detectors unless this is typed. The test is of the
+         # trigger and runs without the binary; tests/test_watch_rust.py fires it through the Rust detectors.
+         "--detectors", "python"],
         cwd=tmp_path, env={**os.environ, "PYTHONPATH": str(SRC)}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True,
     )
@@ -1281,6 +1284,9 @@ def test_a_real_rank_that_stops_stepping_starts_the_command_once_when_the_server
     clean = {k: v for k, v in os.environ.items()
              if k not in ("TENSORQUILL_TOKEN", "TENSORQUILL_TLS_CA", "MLFLOW_RUN_ID", "TORCHELASTIC_RUN_ID")}
     clean["PYTHONPATH"] = str(SRC)
+    # Since Nov 17, 2026 `--watch` needs the Rust detectors' binary before its first look: it is told where
+    # the binary this test's server runs from is, as an installed tensorquill-server would be found.
+    clean.setdefault("TENSORQUILL_SERVER_BIN", str(e2e.BINARY))
     processes: list[subprocess.Popen] = []
     logs = []
 
@@ -1480,6 +1486,9 @@ class _RealJob:
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ("TENSORQUILL_TOKEN", "TENSORQUILL_TLS_CA", "MLFLOW_RUN_ID", "TORCHELASTIC_RUN_ID")}
         self.env["PYTHONPATH"] = str(SRC)
+        # Since Nov 17, 2026 `--watch` needs the Rust detectors' binary before its first look: it is told where
+        # the binary this test's server runs from is, as an installed tensorquill-server would be found.
+        self.env.setdefault("TENSORQUILL_SERVER_BIN", str(e2e.BINARY))
         self.processes: list[subprocess.Popen] = []
         self.logs: list = []
         self.servers = [e2e.Server(self.store, 0, *flags)]

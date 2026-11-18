@@ -130,7 +130,10 @@ def test_the_command_line_gives_the_same_evidence_and_recording(fixture, exporte
     directory, _ = exported[fixture.name]
     subprocess.run(
         [sys.executable, "-m", "tensorquill", str(directory / f"{fixture.name}.jsonl"),
-         "-o", str(tmp_path / "evidence.json"), "--rerun", str(tmp_path / "run.rrd")],
+         "-o", str(tmp_path / "evidence.json"), "--rerun", str(tmp_path / "run.rrd"),
+         # The exported evidence is the Python detectors'. Since Nov 17, 2026 one read uses the Rust ones
+         # when the server binary is installed (and then says `"detectors": "rust"`), so the engine is named.
+         "--detectors", "python"],
         check=True, capture_output=True, cwd=tmp_path,
     )
     assert (tmp_path / "evidence.json").read_bytes() == (directory / f"{fixture.name}.evidence.json").read_bytes()

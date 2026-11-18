@@ -54,6 +54,14 @@ if wheels:
         meta = [n for n in names if n.endswith(".dist-info/METADATA")]
         if meta:
             check_metadata(z.read(meta[0]).decode(), "wheel METADATA")
+            # The server package by a version range, on every platform: no marker after it.
+            required = re.findall(r"^Requires-Dist: (tensorquill-server\b.*)$", z.read(meta[0]).decode().split("\n\n", 1)[0], re.M)
+            check(len(required) == 1 and ";" not in required[0] and ">=" in required[0] and "<" in required[0],
+                  f"wheel METADATA: expected one tensorquill-server requirement with a version range and no marker, found {required}")
+        scripts = [n for n in names if n.endswith(".dist-info/entry_points.txt")]
+        entry_points = z.read(scripts[0]).decode() if scripts else ""
+        for script in ("tensorquill = tensorquill.evidence:main", "tensorquill-mcp = tensorquill.mcp_server:main"):
+            check(script in entry_points, f"wheel: console script `{script}` missing")
 
 if sdists:
     with tarfile.open(sdists[0]) as t:

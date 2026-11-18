@@ -26,7 +26,11 @@ classifiers = [
     "Topic :: Software Development :: Debuggers",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dependencies = ["torch>=2.6"]
+# `tensorquill-server` is the Rust server as a wheel: it puts the `tensorquill-server` binary beside
+# the interpreter, where `server_detect.find_binary` looks. No platform marker: a platform without
+# a binary wheel gets the near-empty one, and the Python detectors do the work there. The range
+# is the 0.0 series, which reports the protocol number this package checks (`server_detect.PROTOCOL`).
+dependencies = ["torch>=2.6", "tensorquill-server>=0.0.1,<0.1"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
@@ -39,6 +43,8 @@ nvml = ["nvidia-ml-py"]
 
 [project.scripts]
 tensorquill = "tensorquill.evidence:main"
+# The read-only MCP server (stdio): `uvx --from tensorquill tensorquill-mcp PATH`.
+tensorquill-mcp = "tensorquill.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

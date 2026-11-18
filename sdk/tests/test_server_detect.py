@@ -29,7 +29,7 @@ pytest.importorskip("pyarrow")
 
 import tensorquill  # noqa: E402
 from tensorquill.evidence import SERVER_KINDS  # noqa: E402
-from tensorquill.server_detect import BINARY_ENV, server_binary, server_report  # noqa: E402
+from tensorquill.server_detect import BINARY_ENV, PROTOCOL, server_binary, server_report  # noqa: E402
 
 import test_attention  # noqa: E402
 import test_data_server  # noqa: E402
@@ -296,13 +296,20 @@ def test_a_binary_that_gives_no_samples_or_other_routers_is_refused(monkeypatch,
     monkeypatch.setenv(BINARY_ENV, str(BINARY))
 
     # A binary from before `--samples`: it refuses the flag, or (if it ignored it) prints no samples.
+    # Since Nov 17, 2026 a binary is asked for its protocol number first, and one from before
+    # `--samples` has none, so it is refused there (tests/test_auto_detectors.py). These two
+    # stand-ins answer `protocol` with this SDK's number, to reach the checks made on what
+    # `detect` itself answers: those stay, beside the number, for a binary that reports the
+    # number and does not do what the number promises.
+    protocol = f'if [ "$1" = protocol ]; then echo {PROTOCOL}; exit 0; fi\n'
     old = tmp_path / "old-server"
-    old.write_text("#!/bin/sh\necho \"error: unexpected argument '--samples' found\" >&2\nexit 2\n", encoding="utf-8")
+    old.write_text("#!/bin/sh\n" + protocol + "echo \"error: unexpected argument '--samples' found\" >&2\nexit 2\n",
+                   encoding="utf-8")
     old.chmod(0o755)
     with pytest.raises(RuntimeError, match="too old to have `detect`, `--thresholds` or `--samples`"):
         server_report(moe_edges(), samples=True, binary=old)
     silent = tmp_path / "silent-server"
-    silent.write_text("#!/bin/sh\ncat > /dev/null\necho '{\"incidents\": []}'\n", encoding="utf-8")
+    silent.write_text("#!/bin/sh\n" + protocol + "cat > /dev/null\necho '{\"incidents\": []}'\n", encoding="utf-8")
     silent.chmod(0o755)
     with pytest.raises(RuntimeError, match="without samples"):
         server_report(moe_edges(), samples=True, binary=silent)
@@ -690,6 +697,9 @@ def test_an_unknown_engine_and_a_missing_binary_say_so(monkeypatch, tmp_path):
         tensorquill.build_evidence(moe_edges(), detectors="server")
     monkeypatch.delenv(BINARY_ENV)
     monkeypatch.setenv("PATH", str(tmp_path))
+    # Since Nov 17, 2026 the binary is also looked for beside the interpreter, where an installed
+    # tensorquill-server wheel puts it: this test is about there being none anywhere.
+    monkeypatch.setattr("tensorquill.server_detect._beside_interpreter", lambda: None)
     with pytest.raises(RuntimeError, match=BINARY_ENV):
         tensorquill.build_evidence(moe_edges(), detectors="rust")
     with pytest.raises(RuntimeError, match="is not a file"):

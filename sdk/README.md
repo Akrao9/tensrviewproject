@@ -465,9 +465,17 @@ export TENSORQUILL_SERVER_BIN=$PWD/server/target/release/tensorquill-server
 python -m tensorquill tensorquill-out/RUN.rank0.jsonl --detectors rust
 ```
 
+**Which detectors run (Nov 17, 2026).** `--detectors` takes `auto`, `python` or `rust`.
+
+- *One read* (`python -m tensorquill run.jsonl`) uses `auto`: the Rust detectors when the binary and `pyarrow` are there, and otherwise the Python detectors with one warning on standard error that says what to install. `--detectors python` gives the Python detectors without the warning, and `--detectors rust` stops when the Rust ones cannot run.
+- *`--watch`* needs the Rust detectors. Without the binary or `pyarrow` it stops before its first look, with exit status 2 and what to install; only `--detectors python` makes it watch with the Python ones. `--rank all` runs no detector, so it asks for no binary.
+- *The binary* is looked for in `TENSORQUILL_SERVER_BIN`, then beside the Python that is running (where `pip install tensorquill-server` puts it; `tensorquill` depends on that package), then on `PATH`. It is run only when `tensorquill-server protocol` prints the number this package was built for (`server_detect.PROTOCOL`); another number, or none, counts as no binary, and the message says to upgrade both packages.
+- *In Python* the default is unchanged: `build_evidence` and `watch` use `detectors="python"` and start no process, and `detectors="auto"` chooses as one read does, with a `RuntimeWarning`.
+- *Not yet true of an install:* `tensorquill-server` is not on PyPI, so until it is the binary comes from `cargo build`. `pyarrow` is the `flight` extra and not a dependency, so a plain `pip install tensorquill` will warn on each read and refuse `--watch` until `pip install 'tensorquill[flight]'`.
+
 In Python it is `tensorquill.build_evidence(records, detectors="rust")`, and `tensorquill.server_detect.server_report(records)` gives the report itself.
 
-- **What it needs:** the binary, on `PATH` or named by `TENSORQUILL_SERVER_BIN`, and `pyarrow` (the `flight` extra). The records travel as an Arrow stream in the schema the sender uses.
+- **What it needs:** the binary (found as above) and `pyarrow` (the `flight` extra). The records travel as an Arrow stream in the schema the sender uses.
 - **What comes from Rust:** the incidents of the 25 per-rank kinds, with their scalars, the `not_checked` entries, what was checked for those 25 kinds (`kind_checks`), and the per-step MoE `samples`. The evidence then carries `"detectors": "rust"`.
 - **What is still made in Python:** the router names and sizes, the weight trends, the run state, and the kinds read from other files (the server's status, TrainCheck, the Flight Recorder). No MoE rule runs in Python on this path.
 - **The samples** are an option of the subcommand, `tensorquill-server detect --samples` (`server_report(records, samples=True)`): one more key in the report, `samples`, with one entry for every record and router as `build_evidence` lists them. Without the option the report is unchanged, and the server's own `incidents.json` never has them.
@@ -476,7 +484,7 @@ In Python it is `tensorquill.build_evidence(records, detectors="rust")`, and `te
   - *Equal to Python's with no tolerance:* every field of every sample is the same value of the same type, a float the same double.
 - **Thresholds:** the five options of `build_evidence` (`overload_threshold`, `drift_tolerance`, `starve_window`, `starve_ratio`, `top_k`) go to the Rust rules, and each has a flag on the command line (`--overload-threshold`, `--drift-tolerance`, `--starve-window`, `--starve-ratio`, `--top-k`). See "Detector thresholds" below.
 - **Limits:**
-  - The default is still `detectors="python"`.
+  - In Python the default is still `detectors="python"`; on the command line it is `auto` for one read and `rust` for `--watch` (above).
   - A binary built from other thresholds than the SDK's, or one that lacks any of the 25 kinds, is refused.
 - **Checked** in `tests/test_server_detect.py`: both paths give the same evidence on 57 record sets and on the seven Gate 1 fixtures. The record sets plant every one of the 25 kinds and every kind of `not_checked` entry, and include resumes and restarts written a stretch at a time and the edge cases of the server parity tests. Run by hand on eight recorded GPU captures (the seven of Nov 15, 2026 and an older Granite one; five hold 15,600 real MoE samples each), both paths give the same incidents, `not_checked`, `kind_checks` and run state, and the same samples with no tolerance.
   - The samples are compared field by field on those sets, at each of the 18 threshold option sets and with a `top_k` for one router. A difference is reported by step, router and field. The golden files (`tests/golden/`) hold the Rust samples to 1e-12, because a file may have been written on another platform.
@@ -778,7 +786,7 @@ python -m tensorquill compare baseline after-the-fix --source tensorquill-out
 
 ## For a coding agent: a read-only MCP server
 
-Built Nov 16, 2026. `python -m tensorquill.mcp_server PATH` serves one run's evidence to a coding agent over MCP (stdio). `PATH` is an `evidence.json`, a `.jsonl` capture, or a run folder in a server's store (`runs/<run_id>`). It needs no package beyond the SDK: the part of the protocol it uses (revision 2025-06-18) is written out in `mcp_server.py`.
+Built Nov 16, 2026. `python -m tensorquill.mcp_server PATH` serves one run's evidence to a coding agent over MCP (stdio). Installed, it is also the `tensorquill-mcp` command, so an agent's MCP configuration can start it with no install step once the package is on PyPI: `uvx --from tensorquill tensorquill-mcp PATH` (not run yet: nothing is published). `PATH` is an `evidence.json`, a `.jsonl` capture, or a run folder in a server's store (`runs/<run_id>`). It needs no package beyond the SDK: the part of the protocol it uses (revision 2025-06-18) is written out in `mcp_server.py`.
 
 It has six tools, and all six only read. Four answer about the run at `PATH`; `list_runs` and `compare_runs` (Nov 17, 2026) read the folder that run is kept in, or the one named with `--runs FOLDER`, and take run IDs and names found there, never a path:
 
@@ -793,7 +801,7 @@ It has six tools, and all six only read. Four answer about the run at `PATH`; `l
 
 - **It follows a live run.** The path is read again at every call.
 - **Answers are bounded.** No reply is longer than 50 KB. A long series is thinned to 200 points with the stride reported, and the minimum, maximum and median are still taken over every recorded step.
-- **For a run folder it runs no detector.** The incidents come from the server's own reports, and only `get_series` opens the Parquet parts, which needs `pyarrow`. `compare_runs` keeps to this: a rank whose report is not current is unknown, and a run with no current report on any rank is refused with the reason. On local files it runs the Python detectors, as `list_incidents` does on a capture.
+- **For a run folder it runs no detector.** The incidents come from the server's own reports, and only `get_series` opens the Parquet parts, which needs `pyarrow`. `compare_runs` keeps to this: a rank whose report is not current is unknown, and a run with no current report on any rank is refused with the reason. On local files it runs the Python detectors, as `list_incidents` does on a capture; it never starts the server binary, whatever is installed.
 - **The page to give the agent** is [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md): which tool to call first, how to name the step, the layer or parameter and the kind, what the three classes and "not checked" mean, and that it explains and takes no action on the run.
 - **Checked** in `tests/test_mcp_server.py` (36 tests): a scripted client using only the first four tools recovers the kind, the first step and the layer, parameter or module of all seven Gate 1 fixtures; the size cap on a 10,000-step run; a two-rank run folder, by hand and through the real server; every error case.
 - **Not checked:** no live agent has used it.
