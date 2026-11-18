@@ -34,7 +34,7 @@ BINARY_NAME = "tensorquill-server"
 # takes or prints changes in a way the other side would get wrong (a kind added or removed, a
 # threshold or option added, a report key renamed or dropped). Only the same number is taken:
 # a larger one is a newer binary whose reports this module was not written for.
-PROTOCOL = 1
+PROTOCOL = 2
 INSTALL_HINT = "pip install tensorquill-server"
 DETECTOR_CHOICES = ("auto", "python", "rust")
 _BATCH_ROWS = 500

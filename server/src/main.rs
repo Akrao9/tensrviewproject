@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 /// for the old number would get wrong: a kind added or removed, a threshold or option added, a
 /// report key renamed or dropped. `PROTOCOL` in `sdk/src/tensorquill/server_detect.py` is the
 /// same number, and a test in `sdk/tests/test_protocol.py` holds the two together.
-const PROTOCOL: u32 = 1;
+const PROTOCOL: u32 = 2;
 
 /// Self-hosted TensorQuill ingest: Arrow Flight DoPut in, partitioned Parquet out.
 #[derive(Parser)]
