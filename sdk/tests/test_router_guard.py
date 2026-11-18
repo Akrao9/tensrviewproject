@@ -20,6 +20,7 @@ import warnings
 import pytest
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 import tensorquill
 from tensorquill.capture import Router
@@ -622,10 +623,8 @@ def test_in_eager_mode_anything_else_the_counting_raises_on_refuses_the_router(t
         (lambda logits: (logits.softmax(-1), logits), Router(EXPERTS, TOP_K), 120 * TOP_K),
         # An integer router's top_k is only written down: above the experts it is counted as before.
         (lambda logits: logits.topk(TOP_K, dim=-1).indices, Router(EXPERTS, 12), 120 * TOP_K),
-        # No tensor at all: nothing counted and nothing refused, as before (zeros).
-        (lambda logits: None, Router(EXPERTS, TOP_K), 0),
     ],
-    ids=["int32", "uint8", "float16", "weights-then-logits", "int-top_k-above", "no-tensor"],
+    ids=["int32", "uint8", "float16", "weights-then-logits", "int-top_k-above"],
 )
 def test_what_was_counted_before_is_counted_as_before(tmp_path, make, spec, routed, compile_backend):
     with warnings.catch_warnings():
@@ -645,3 +644,133 @@ def test_the_server_reads_a_router_refused_for_its_device_as_python_does(tmp_pat
     assert entry == next(e for e in python["not_checked"] if e["check"] == "router")
     assert entry["reason"].endswith(DEVICE_FIX.replace("NAME", repr("router")))
     assert rust["kind_checks"] == python["kind_checks"]
+
+
+# --- A router whose output holds nothing the counting can read ----------------------------------
+
+
+class _Opaque:
+    """A router output the capture cannot look inside: not a tensor, tuple, list or dict."""
+
+    def __init__(self, logits) -> None:
+        self.logits = logits
+
+
+@COMPILED
+@pytest.mark.parametrize(
+    ("make", "what"),
+    [
+        (lambda logits: None, "its output, a NoneType, holds no integer or floating-point tensor at its top level"),
+        (_Opaque, "its output, a _Opaque, holds no integer or floating-point tensor at its top level"),
+        (lambda logits: ((logits,),), "its output, a tuple, holds no integer or floating-point tensor at its top level"),
+        (lambda logits: logits > 0, "its output is a bool tensor, not expert indices or logits"),
+    ],
+    ids=["none", "object", "nested", "bool"],
+)
+def test_a_router_whose_output_holds_no_tensor_is_refused_not_counted_as_zeros(tmp_path, make, what, compile_backend):
+    """Before, nothing was counted and nothing refused: every record carried eight zeros for the
+    router, which read as a router that routed no token. Now it is refused as any router the
+    counting cannot read is, and the MoE kinds read `unavailable` with the reason."""
+    why = _refused(tmp_path, Emits(make), "router", Router(EXPERTS, TOP_K), compile_backend)
+    assert why == f"{what}. {DEFAULT_FIX}"
+
+
+# --- An `indices=` function under activation checkpointing --------------------------------------
+
+
+class _CheckpointedRouter(nn.Module):
+    """A router whose logits feed the loss inside a block that may be checkpointed, so a hook that
+    changed the autograd graph would change the loss or the gradients."""
+
+    def __init__(self, checkpointing: str | None) -> None:
+        super().__init__()
+        self.embed = nn.Linear(4, 16)
+        self.router = nn.Linear(16, EXPERTS, bias=False)
+        self.proj = nn.Linear(EXPERTS, EXPERTS, bias=False)
+        self.head = nn.Linear(16, 1)
+        self.checkpointing = checkpointing
+
+    def _block(self, hidden):
+        weights = self.router(hidden).softmax(-1).topk(TOP_K, dim=-1).values.sum(-1, keepdim=True)
+        return hidden * weights
+
+    def forward(self, x):
+        hidden = self.embed(x)
+        if self.checkpointing is None:
+            hidden = self._block(hidden)
+        else:
+            hidden = checkpoint(self._block, hidden, use_reentrant=self.checkpointing == "reentrant")
+        return self.head(hidden).pow(2).mean()
+
+
+def _losses_and_grads(checkpointing, indices, steps=3, compile_backend=None):
+    """Losses, gradients and final parameters of a few steps, with the router hooked by `indices`
+    (a function of the model) or unhooked (None), and the routed tokens the records give."""
+    torch.manual_seed(0)
+    model = _CheckpointedRouter(checkpointing)
+    sink = tensorquill.MemorySink()
+    session = None
+    if indices is not None:
+        spec = Router(EXPERTS, TOP_K, indices=indices(model))
+        session = tensorquill.init(model, sink=sink, routers={"router": spec}, every=1)
+    stepped = torch.compile(model, backend=compile_backend) if compile_backend else model
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    losses, grads = [], []
+    for _ in range(steps):
+        optimizer.zero_grad()
+        loss = stepped(torch.randn(6, 20, 4))
+        loss.backward()
+        losses.append(loss.detach().clone())
+        # `proj` is read only by one `indices=` function, so its gradient stays None.
+        grads.append({name: None if p.grad is None else p.grad.clone() for name, p in model.named_parameters()})
+        optimizer.step()
+    if session is not None:
+        session.close()
+    params = {name: p.detach().clone() for name, p in model.named_parameters()}
+    return losses, grads, params, _routed(sink.records), sink.records
+
+
+# Each one leaves the router's output attached: before, each built autograd nodes that saved tensors
+# in the forward, which the recomputation (where the hook does not run) did not save again.
+NOT_DETACHED = {
+    "topk": lambda model: lambda out: out.topk(TOP_K, dim=-1).indices,
+    "softmax-topk": lambda model: lambda out: out.softmax(-1).topk(TOP_K, dim=-1).indices,
+    # Reads a parameter beside the output: detaching the output alone would not be enough.
+    "reads-a-parameter": lambda model: lambda out: (out @ model.proj.weight).topk(TOP_K, dim=-1).indices,
+}
+
+
+@pytest.mark.parametrize("checkpointing", [None, "non-reentrant", "reentrant"])
+@pytest.mark.parametrize("indices", list(NOT_DETACHED), ids=list(NOT_DETACHED))
+def test_an_indices_function_that_does_not_detach_leaves_training_as_it_was(checkpointing, indices):
+    """Under non-reentrant checkpointing in eager mode, an `indices=` function that did not detach
+    the router's output made `backward()` raise a CheckpointError. The hook now reads it without
+    building any autograd graph, so the user's function does not have to detach: training runs,
+    every token is counted once, and the loss and every gradient equal those of an unhooked run."""
+    hooked = _losses_and_grads(checkpointing, NOT_DETACHED[indices])
+    plain = _losses_and_grads(checkpointing, None)
+    assert hooked[3] == [120 * TOP_K] * 3
+    assert all("moe_refused" not in r for r in hooked[4])
+    for got, want in zip(hooked[0], plain[0]):
+        assert torch.equal(got, want)
+    for got, want in zip(hooked[1], plain[1]):
+        assert got.keys() == want.keys()
+        assert all(
+            got[name] is None and want[name] is None
+            if got[name] is None or want[name] is None
+            else torch.equal(got[name], want[name])
+            for name in got
+        )
+    assert all(torch.equal(hooked[2][name], plain[2][name]) for name in plain[2])
+    # The detached view leaves the router's output, which the model goes on to use, attached.
+    assert plain[1][0]["router.weight"].abs().sum() > 0
+
+
+@pytest.mark.parametrize("checkpointing", ["non-reentrant", "reentrant"])
+@pytest.mark.parametrize("compile_backend", ["eager", "aot_eager"])
+def test_under_torch_compile_an_indices_function_that_does_not_detach_records_what_eager_records(
+    checkpointing, compile_backend
+):
+    compiled = _losses_and_grads(checkpointing, NOT_DETACHED["topk"], compile_backend=compile_backend)
+    eager = _losses_and_grads(checkpointing, NOT_DETACHED["topk"])
+    assert compiled[3] == eager[3] == [120 * TOP_K] * 3
