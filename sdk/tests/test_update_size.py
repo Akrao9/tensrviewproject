@@ -833,3 +833,29 @@ def test_the_record_sets_reach_each_branch_of_the_rule():
     assert (values["update size, still warming up"]["value"], values["update size, still warming up"]["enough_history"]) == ("checked", False)
     # The scalars logged on the step come with the incident, as for every kind.
     assert spikes(found["update size, a jump"])[0]["scalars"]["train/loss"]["value"] == 2.0 - 105 / 2000
+
+
+def test_adam_and_adamw_are_both_read_whichever_way_pytorch_relates_them():
+    # AdamW is a subclass of Adam only from PyTorch 2.7; in 2.6 it is a class of its own, and a
+    # check for Adam alone refused every AdamW there. Classes are matched, never names.
+    from tensorquill.capture import _not_adam
+
+    class Plain(torch.optim.Adam):
+        pass
+
+    class PlainW(torch.optim.AdamW):
+        pass
+
+    class OwnStep(torch.optim.Adam):
+        def step(self, closure=None):
+            return super().step(closure)
+
+    class Adam(torch.optim.SGD):  # another optimizer that only shares the name
+        pass
+
+    params = lambda: nn.Linear(2, 1).parameters()  # noqa: E731
+    for cls in (torch.optim.Adam, torch.optim.AdamW, Plain, PlainW):
+        assert _not_adam(cls(params(), lr=0.01)) is None, cls
+    assert _not_adam(OwnStep(params(), lr=0.01)).startswith("OwnStep changes Adam's step")
+    assert _not_adam(_Lookahead(params(), lr=0.01)).startswith("_Lookahead changes Adam's step")
+    assert _not_adam(Adam(params(), lr=0.01)).startswith("Adam is not Adam or AdamW")
