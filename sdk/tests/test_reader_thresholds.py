@@ -343,6 +343,11 @@ def test_each_of_the_six_flags_reaches_the_detectors_on_a_local_file(tmp_path):
 
     capture = tmp_path / "run.jsonl"
     capture.write_text("".join(json.dumps(r) + "\n" for r in everything()), encoding="utf-8")
+    # What `build_evidence` gives for this file read by the command line, which since S4 also says
+    # whether a session closed the file (`run_end`; this one was written directly, so not).
+    def local(**options):
+        return tensorquill.build_evidence(everything(), records_file=capture, **options)
+
     # `--detectors python` is typed for the first half: it holds each flag to what `build_evidence` gives
     # with the same option, and that is the Python detectors'. Until Nov 17, 2026 they were the command
     # line's default for one read; now it is `auto`, which is Rust wherever this file can run.
@@ -350,17 +355,17 @@ def test_each_of_the_six_flags_reaches_the_detectors_on_a_local_file(tmp_path):
     done = cli(str(capture), "-o", str(tmp_path / "five.json"), *python, *flags(APPLIED), cwd=tmp_path)
     assert done.returncode == 0, done.stderr
     written = json.loads((tmp_path / "five.json").read_text(encoding="utf-8"))
-    assert text(written) == text(tensorquill.build_evidence(everything(), **APPLIED))
-    assert text(written) != text(tensorquill.build_evidence(everything()))
+    assert text(written) == text(local(**APPLIED))
+    assert text(written) != text(local())
     # One at a time, each flag gives what its option gives, and with none the defaults stand.
     for name in THRESHOLD_NAMES:
         done = cli(str(capture), "-o", str(tmp_path / "one.json"), *python, FLAGS[name], str(APPLIED[name]), cwd=tmp_path)
         assert done.returncode == 0, done.stderr
         written = json.loads((tmp_path / "one.json").read_text(encoding="utf-8"))
-        assert text(written) == text(tensorquill.build_evidence(everything(), **{name: APPLIED[name]})), name
+        assert text(written) == text(local(**{name: APPLIED[name]})), name
     done = cli(str(capture), "-o", str(tmp_path / "none.json"), *python, cwd=tmp_path)
     written = json.loads((tmp_path / "none.json").read_text(encoding="utf-8"))
-    assert text(written) == text(tensorquill.build_evidence(everything()))
+    assert text(written) == text(local())
     # With no `--detectors` the read is `auto`: the Rust detectors here, saying so and warning of nothing.
     auto = cli(str(capture), "-o", str(tmp_path / "auto.json"), *flags(APPLIED), cwd=tmp_path)
     # Not `stderr == ""`: another library may warn there (PyTorch does when NumPy is not installed).
@@ -374,4 +379,4 @@ def test_each_of_the_six_flags_reaches_the_detectors_on_a_local_file(tmp_path):
     assert rust.returncode == 0, rust.stderr
     written = json.loads((tmp_path / "rust.json").read_text(encoding="utf-8"))
     assert written.pop("detectors") == "rust"
-    assert differences(tensorquill.build_evidence(everything(), **APPLIED), written, "evidence") == []
+    assert differences(local(**APPLIED), written, "evidence") == []

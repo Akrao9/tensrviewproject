@@ -136,12 +136,25 @@ def test_the_command_line_gives_the_same_evidence_and_recording(fixture, exporte
          "--detectors", "python"],
         check=True, capture_output=True, cwd=tmp_path,
     )
-    assert (tmp_path / "evidence.json").read_bytes() == (directory / f"{fixture.name}.evidence.json").read_bytes()
+    # Since S4 (Nov 18, 2026) the command line also says whether a session closed a `.jsonl` file
+    # (`run_end`). The exporter does not pass the file, so the Gate 1 materials built from it stay as
+    # they were; these files were written by a sink, not a session, so the command line says "not
+    # closed". Without that key, written the same way, its evidence is byte for byte the export's.
+    read = json.loads((tmp_path / "evidence.json").read_text(encoding="utf-8"))
+    assert read.pop("run_end")["state"] == "not_closed"
+    tensorquill.evidence.write_evidence(read, tmp_path / "without_run_end.json")
+    assert (tmp_path / "without_run_end.json").read_bytes() == \
+        (directory / f"{fixture.name}.evidence.json").read_bytes()
     ours, theirs = RrdReader(directory / f"{fixture.name}.rrd").store(), RrdReader(tmp_path / "run.rrd").store()
     # The files differ in their start time and IDs (and in how Rerun splits them into chunks),
-    # so compare what they hold.
-    held = logged(ours)
-    assert held and held == logged(theirs)
+    # so compare what they hold. The command line's summary has one more line, the "Run end:" one.
+    held, theirs_held = logged(ours), logged(theirs)
+    summary = ("/incident/summary", "TextDocument:text")
+    (step, (text,)), = theirs_held[summary]  # one static row holding one string
+    kept = [line for line in text.split("\n") if not line.startswith("Run end: ")]
+    assert len(kept) == text.count("\n")
+    theirs_held[summary] = [(step, ["\n".join(kept)])]
+    assert held and held == theirs_held
 
 
 @pytest.mark.parametrize("fixture", FIXTURES, ids=NAMES)
