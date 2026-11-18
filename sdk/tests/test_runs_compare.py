@@ -1106,3 +1106,175 @@ def test_a_file_named_for_its_rank_or_of_one_rank_is_counted_as_before(tmp_path)
     assert (row["rank_count"], row["run_state"], row["kinds_checked"]) == (None, "unknown", None)
     assert (row["evidence"]["state"], row["evidence"]["rank"]) == ("ranks_unknown", None)
     assert "may hold several ranks (its first and last records name rank 0)" in row["evidence"]["detail"]
+
+
+# --- Run-level incidents, a lowest rank with nothing whole yet, live files in part 4 ----------
+# (the outside review of Nov 18, 2026: CLI-01, CLI-02, CLI-03)
+
+
+def stall_status(seconds: float, step: int, states: tuple[str, ...] = ("silent", "silent"), **more) -> dict:
+    """A server's `watchdog.json` for a job whose ranks are in `states`, read `seconds` after the
+    last progress: what changes with the moment it is read is the time, the seconds and the severity."""
+    ranks = [{"rank": rank, "attempt": 1, "last_step": step if state != "active" else step + 50,
+              "seconds_since_progress": seconds + rank if state != "active" else 0.5,
+              "stream": "dropped" if state == "lost" else "open", "state": state, "phase": "train",
+              "heartbeat_age_seconds": 3.0, "severity": None if state == "active" else "critical" if seconds > 1500 else "warning"}
+             for rank, state in enumerate(states)]
+    summary = "stalled" if "active" not in states else "degraded"
+    return {"schema_version": 1, "run_id": "r", "written_at_ms": int(1.7e12 + seconds * 1000), "silent_floor_seconds": 300.0,
+            "critical_seconds": 1500.0, "silent_factor": 5.0, "world_size": len(states), "missing_ranks": [],
+            "summary": summary, "ranks": ranks, **more}
+
+
+def test_run_level_incidents_are_the_same_fault_whatever_their_readings_and_where_names_their_ranks():
+    from tensorquill.evidence_system import detect_memory_imbalance
+    from tensorquill.invariants import traincheck_incident
+
+    same = lambda one, two: cmp.incident_identity(one) == cmp.incident_identity(two)  # noqa: E731
+    # A job that stalled, read at two moments: other steps, times, seconds, severity and stacks.
+    (early,) = ev.detect_watchdog_incidents(stall_status(400.0, 99))
+    (late,) = ev.detect_watchdog_incidents(stall_status(2600.0, 140))
+    assert early["kind"] == late["kind"] == "job_stalled" and early["severity"] != late["severity"]
+    assert same(early, {**late, "stuck_at": [{"rank": 0, "function": "wait", "file": "train.py", "line": 7}]})
+    # Flight Recorder dumps given in one run only make its hang confirmed: the same kind of stall.
+    assert same(early, {**late, "assessment": "confirmed_hang", "corroborated_by": "collective_hang"})
+    # A rank whose connection dropped is another kind of stall.
+    (lost,) = ev.detect_watchdog_incidents(stall_status(400.0, 99, ("silent", "lost")))
+    assert lost["assessment"] == "lost_connection" and not same(early, lost)
+    assert cmp.incident_where(early) == {"assessment": "suspected_hang", "ranks": [0, 1]}
+    assert cmp.incident_where(lost) == {"assessment": "lost_connection", "ranks": [0, 1]}
+
+    # One rank silent while the other steps on: which rank stopped is each run's own, in `where`.
+    (one,) = ev.detect_watchdog_incidents(stall_status(900.0, 349, ("active", "silent")))
+    (two,) = ev.detect_watchdog_incidents(stall_status(3000.0, 610, ("silent", "active")))
+    assert one["kind"] == two["kind"] == "rank_silent" and same(one, two)
+    assert (cmp.incident_where(one), cmp.incident_where(two)) == (
+        {"assessment": "suspected_hang", "ranks": [1]}, {"assessment": "suspected_hang", "ranks": [0]})
+
+    # A stuck collective: the collective and its group, never the sequence number or the dumps.
+    hang = {"kind": "collective_hang", "step": 99, "problems": 1, "dumped_ranks": [0, 1], "incomplete_dumps": [],
+            "type": "hang", "group": {"id": "0", "desc": "default_pg", "size": 2}, "collective": "all_reduce",
+            "collective_seq_id": 12, "state": "scheduled", "expected_ranks": [0, 1], "missing_ranks": [1],
+            "all_ranks_entered": False, "buffer_start": 0, "mismatch": None}
+    assert same(hang, {**hang, "step": 4000, "collective_seq_id": 812, "buffer_start": 300, "dumped_ranks": [0],
+                       "incomplete_dumps": [1], "state": "started", "missing_ranks": [0]})
+    assert not same(hang, {**hang, "collective": "broadcast"})
+    assert not same(hang, {**hang, "group": {"id": "1", "desc": "tp", "size": 2}})
+    assert not same(hang, {**hang, "kind": "collective_desync", "type": "desync"})
+    assert cmp.incident_where(hang) == {"collective": "all_reduce", "group": "default_pg", "missing_ranks": [1]}
+
+    # Duplicated batches and a memory imbalance: the ranks are in `where`, the counts and bytes nowhere.
+    dup = {"kind": "duplicate_batches", "step": 5, "ranks": [0, 1], "duplicated_steps": 3, "ranks_compared": [0, 1, 2, 3]}
+    assert same(dup, {**dup, "step": 9, "ranks": [2, 3], "duplicated_steps": 40}) and cmp.incident_where(dup) == {"ranks": [0, 1]}
+    heavy = detect_memory_imbalance({0: {"step": 59, "peak_allocated": 2 * 10**9}, 1: {"step": 59, "peak_allocated": 2 * 10**10}})
+    heavier = detect_memory_imbalance({0: {"step": 99, "peak_allocated": 2 * 10**9}, 1: {"step": 99, "peak_allocated": 3 * 10**10}})
+    assert heavy["kind"] == "memory_imbalance" and heavy["peak_allocated"] != heavier["peak_allocated"]
+    assert same(heavy, heavier) and cmp.incident_where(heavy) == {"ranks": [1]}
+
+    # TrainCheck: the invariants violated, never when or how often.
+    def violated(*names, first=3):
+        return traincheck_incident({"files": [f"run-{first}/violations_summary.json"], "distinct_invariants_violated": len(names),
+                                    "first_violation_step": first, "violations": [
+                                        {"display_name": name, "relation_type": "APIContain", "first_step": first + i,
+                                         "last_step": first + 9, "occurrences": 4 + i} for i, name in enumerate(names)]}, step=99)
+
+    assert same(violated("grad_norm_bounds", "lr_positive"), violated("lr_positive", "grad_norm_bounds", first=40))
+    assert not same(violated("grad_norm_bounds"), violated("grad_norm_bounds", "lr_positive"))
+    assert cmp.incident_where(violated("grad_norm_bounds", "lr_positive")) == {"violations": ["grad_norm_bounds", "lr_positive"]}
+    # The summary prints what `where` has.
+    assert cmp._where_text(cmp.incident_where(hang)) == "collective all_reduce; group default_pg; missing ranks 1"
+    assert cmp._where_text(cmp.incident_where(early)) == "assessment suspected_hang; ranks 0, 1"
+
+
+def test_two_runs_that_stalled_the_same_way_at_other_moments_are_one_entry_with_each_runs_ranks(tmp_path):
+    store = ranked_store(tmp_path / "store", {run: {0: ([], checks()), 1: ([], checks())} for run in ("run-1", "run-2")})
+    for run, seconds in (("run-1", 400.0), ("run-2", 2600.0)):
+        (store / "runs" / run / "watchdog.json").write_text(json.dumps(stall_status(seconds, 59)))
+    result = tensorquill.compare_runs("run-1", "run-2", source=store)
+    (entry,) = [e for e in result["incidents"]["entries"] if e["kind"] == "job_stalled"]
+    assert entry["in"] == ["A", "B"] and result["incidents"]["in_all"] == [result["incidents"]["entries"].index(entry)]
+    assert entry["where"] == {"A": {"assessment": "suspected_hang", "ranks": [0, 1]},
+                              "B": {"assessment": "suspected_hang", "ranks": [0, 1]}}
+    assert "both: job_stalled (" in result["summary"] and "first at A step 59, B step 59: assessment suspected_hang; ranks 0, 1" in (
+        result["summary"])
+
+
+def test_two_runs_with_the_same_memory_imbalance_at_other_readings_are_one_entry(tmp_path):
+    folder = tmp_path / "out"
+    for run, heavy in (("c", 2e10), ("d", 3e10)):
+        for rank, peak in ((0, 2e9), (1, heavy)):
+            local_run(folder, run, [{**r, "system": cuda(peak)} for r in dense(60, run=run, rank=rank)], rank=rank,
+                      project="p", name=run, world_size=2)
+    result = tensorquill.compare_runs("c", "d", source=folder)
+    (entry,) = result["incidents"]["entries"]
+    assert (entry["kind"], entry["in"], entry["where"]) == ("memory_imbalance", ["A", "B"], {"A": {"ranks": [1]}, "B": {"ranks": [1]}})
+    assert "both: memory_imbalance (" in result["summary"] and ": ranks 1" in result["summary"]
+
+
+def test_a_run_whose_lowest_rank_has_no_whole_record_yet_is_read_on_the_ranks_that_have_one(tmp_path):
+    folder = tmp_path / "out"
+    for rank in (0, 1):
+        local_run(folder, "a", dense(60, run="a", rank=rank), rank=rank, project="p", name="a", world_size=2)
+    local_run(folder, "b", dense(60, run="b", rank=1, spike=(40, "blocks.1.weight", 60.0)), rank=1, project="p", name="b",
+              world_size=2)
+    # Rank 0 has written the start of its first line only: no whole record yet.
+    lowest = folder / "b.rank0.jsonl"
+    lowest.write_text('{"schema_version": 1, "run_id": "b", "rank": 0, "st')
+    result = tensorquill.compare_runs("a", "b", source=folder)
+    read = result["runs"][1]["read_from"]
+    assert (read["all_ranks"], read["ranks"], read["judged_ranks"], read["unknown_ranks"]) == (True, [0, 1], [1], [0])
+    assert read["path"] == str(folder) and read["unfinished_in"] == [str(lowest)]
+    assert read["unknown_why"] == {0: "its file b.rank0.jsonl holds no whole record yet"}
+    (entry,) = result["incidents"]["entries"]
+    assert (entry["kind"], entry["in"], entry["ranks"]) == ("grad_spike", ["B"], {"B": [1]})
+    assert result["incidents"]["other_ranks_not_compared"] == {"B": [0]}
+    part = result["divergence"]
+    assert (part["state"], part["ranks_compared"], part["ranks_without_records"]) == ("no_divergence", [1], {0: ["B"]})
+    # A run none of whose files holds a whole record is still refused.
+    (folder / "b.rank1.jsonl").write_text("")
+    with pytest.raises(ValueError, match="run b has no whole record"):
+        tensorquill.compare_runs("a", "b", source=folder)
+
+
+def torn(path: Path, run: str, rank: int = 0) -> None:
+    """The start of a line the job is still writing."""
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps({"schema_version": 1, "run_id": run, "rank": rank, "attempt": 2, "step": 999})[:40])
+
+
+def test_where_two_runs_part_reads_a_live_file_on_its_whole_lines_and_says_one_was_left_out(tmp_path):
+    folder = tmp_path / "out"
+    local_run(folder, "a", dense(120, run="a"), project="p", name="a")
+    going = local_run(folder, "b", drifted("b", 0), project="p", name="b")
+    whole = tensorquill.compare_runs("a", "b", source=folder)["divergence"]
+    assert (whole["state"], whole["divergence"]["step"]) == ("diverged", 70) and "unfinished_lines_left_out" not in whole
+    torn(going, "b")
+    live = tensorquill.compare_runs("a", "b", source=folder)
+    part = live["divergence"]
+    # The same answer as on the file without the line it is still writing, and it says one was left out.
+    assert {k: v for k, v in part.items() if k not in ("detail", "unfinished_lines_left_out")} == (
+        {k: v for k, v in whole.items() if k != "detail"})
+    assert part["unfinished_lines_left_out"] == {"B": [0]}
+    assert part["detail"] == whole["detail"] + " A line that is not whole was left out of B's records: the run may still be going."
+    assert part["detail"] in live["summary"]
+
+
+def test_where_runs_of_several_ranks_part_reads_a_live_resumed_file_as_its_whole_lines_resolved(tmp_path):
+    folder = tmp_path / "out"
+    for rank in (0, 1):
+        local_run(folder, "c", dense(120, run="c", rank=rank), rank=rank, project="p", name="c", world_size=2)
+    local_run(folder, "d", dense(120, run="d"), project="p", name="d", world_size=2)
+    # Rank 1 of D ran to step 119 drifting from step 60, then resumed from step 50 without the drift and has
+    # reached step 100: what the first attempt wrote from step 50 on was rolled back.
+    first = [{**r, "attempt": 1} for r in drifted("d", 1, start=60)]
+    again = [{**r, "attempt": 2} for r in dense(101, run="d", rank=1)[50:]]
+    resumed = local_run(folder, "d", first + again, rank=1)
+    whole = tensorquill.compare_runs("c", "d", source=folder)["divergence"]
+    assert whole["state"] == "no_divergence" and whole["ranks_compared"] == [0, 1]
+    torn(resumed, "d", rank=1)
+    part = tensorquill.compare_runs("c", "d", source=folder)["divergence"]
+    assert {k: v for k, v in part.items() if k not in ("detail", "unfinished_lines_left_out")} == (
+        {k: v for k, v in whole.items() if k != "detail"})
+    assert part["unfinished_lines_left_out"] == {"B": [1]}
+    assert part["detail"] == whole["detail"] + (" A line that is not whole was left out of B's records (rank 1): the run may "
+                                                "still be going.")

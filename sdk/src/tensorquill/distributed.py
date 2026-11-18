@@ -26,9 +26,19 @@ def unwrap_local(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _as_real(p: torch.Tensor) -> torch.Tensor:
+    """`p` as real numbers: a complex tensor as its real pairs (`torch.view_as_real`, a view, after
+    resolving a conjugate view to the values it shows), so its norm is |z|'s and its sum and
+    projection read both parts, as `capture._read_updates` reads Adam's moments; any other
+    tensor as it is."""
+    return torch.view_as_real(p.resolve_conj()) if p.is_complex() else p
+
+
 def _sum_f64(p: torch.Tensor) -> torch.Tensor:
     # p.sum(dtype=float64) on a bf16 tensor copies the whole tensor to float64 first.
     # Apple MPS rejects float64, so move chunks to CPU before widening when on MPS.
+    # A complex tensor's sum is that of its real and imaginary parts together.
+    p = _as_real(p)
     flat = p.reshape(-1)
     out_device = torch.device("cpu") if p.device.type == "mps" else p.device
     if flat.numel() == 0:
@@ -41,7 +51,9 @@ def _sum_f64(p: torch.Tensor) -> torch.Tensor:
 def _norms_f64(tensors: list[torch.Tensor]) -> torch.Tensor:
     # _foreach_norm's fused CUDA kernel requires each call's list to share one
     # device and dtype, and be contiguous; mixed dtypes fall back to per-tensor
-    # vector_norm, which copies bf16 tensors to float64 first.
+    # vector_norm, which copies bf16 tensors to float64 first. A complex tensor's norm is
+    # that of its real pairs, which is |z|'s.
+    tensors = [_as_real(p) for p in tensors]
     norms: list[torch.Tensor | None] = [None] * len(tensors)
     groups: dict[tuple[torch.device, torch.dtype], list[tuple[int, torch.Tensor]]] = {}
     foreach = getattr(torch, "_foreach_norm", None)
@@ -87,8 +99,9 @@ def _projection_weights(start: int, count: int, seed: int, device: torch.device)
 
 def _projection_f64(p: torch.Tensor, seed: int) -> torch.Tensor:
     """`sum_i w_i * p_i` in float64 with the seeded weights `w`; a swap of two unequal
-    elements changes it, where a norm and a sum do not."""
-    flat = p.reshape(-1)
+    elements changes it, where a norm and a sum do not. A complex tensor is projected as its
+    real pairs, so a change in either part moves it."""
+    flat = _as_real(p).reshape(-1)
     device = torch.device("cpu") if p.device.type == "mps" else p.device
     if flat.numel() == 0:
         return torch.zeros((), dtype=F64, device=device)
@@ -108,7 +121,8 @@ def parameter_fingerprints(params: Iterable[torch.Tensor], *, projection: bool =
     The projection is a dot product with fixed pseudo-random weights, so it catches changes
     that keep the norm and the sum, such as two elements swapping places. It is a screen:
     a change that keeps all three values is possible, just far less likely, and equal
-    fingerprints are not proof that tensors are equal.
+    fingerprints are not proof that tensors are equal. A complex tensor is read as its real
+    pairs (`torch.view_as_real`): the same three values as the float tensor of those pairs.
     """
     local = [unwrap_local(p) for p in params]
     if not local:

@@ -81,19 +81,75 @@ def test_launcher_job_id_is_shared_by_every_rank(monkeypatch):
     assert resolve_run().run_id == "run-5c1e"
 
 
-def test_generated_id_is_broadcast_from_rank_zero(monkeypatch):
+def test_rank_zeros_run_id_and_source_are_broadcast(monkeypatch):
+    # Under torch.distributed rank 0 resolves the whole order and broadcasts (ID, source);
+    # every rank calls the broadcast, whatever it sees itself. Two real processes run in
+    # test_run_id_ranks.py; this checks what each rank sends and keeps.
+    import torch.distributed as dist
+
+    clear(monkeypatch)
+    rank = {"now": 1}
+    sent = []
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: rank["now"])
+
+    def broadcast(box, src=0):
+        sent.append((rank["now"], src, list(box)))
+        if rank["now"] != 0:
+            box[0] = ("run-from-rank-0", "wandb")
+
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    # Rank 1 sees a launcher ID, and still takes rank 0's.
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "5c1e")
+    assert resolve_run() == tensorquill.RunInfo("run-from-rank-0", "wandb", 1)
+    assert sent == [(1, 0, [None])]
+    # Rank 0 sends what it resolves: its W&B run over the launcher's ID.
+    rank["now"] = 0
+    monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(run=types.SimpleNamespace(id="w-0")))
+    assert resolve_run() == tensorquill.RunInfo("w-0", "wandb", 0)
+    assert sent[-1] == (0, 0, [("w-0", "wandb")])
+    # A run_id passed in is used as given, with no collective.
+    assert resolve_run("mine") == tensorquill.RunInfo("mine", "explicit", 0)
+    assert len(sent) == 2
+
+
+def test_rank_zero_passes_over_a_tracker_that_raises(monkeypatch):
+    import pytest
     import torch.distributed as dist
 
     clear(monkeypatch)
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda group=None: 1)
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda box, src=0: None)
 
-    def broadcast(box, src=0):
-        box[0] = "run-from-rank-0"
+    def active_run():
+        raise RuntimeError("tracking server unreachable")
 
-    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
-    assert resolve_run() == tensorquill.RunInfo("run-from-rank-0", "generated", 1)
+    monkeypatch.setitem(sys.modules, "mlflow", types.SimpleNamespace(active_run=active_run))
+    monkeypatch.setenv("SLURM_JOB_ID", "9")
+    with pytest.warns(RuntimeWarning, match="could not read the tracker's run"):
+        assert resolve_run() == tensorquill.RunInfo("run-slurm9", "launcher", 0)
+
+
+def test_tracker_run_without_a_process_group_is_warned(monkeypatch, recwarn):
+    # Several ranks and no process group: rank 0's W&B run cannot be shared, so a rank that
+    # does not see it (here, one with the launcher's ID) writes under another ID. Say so.
+    import pytest
+
+    clear(monkeypatch)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "5c1e")
+    monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(run=types.SimpleNamespace(id="w-3")))
+    with pytest.warns(RuntimeWarning, match="rank 0 of 2 took the run ID 'w-3' from the W&B run"):
+        assert resolve_run() == tensorquill.RunInfo("w-3", "wandb", 0)
+    # MLFLOW_RUN_ID is the environment's, which every rank of a job is given: no warning.
+    recwarn.clear()
+    monkeypatch.setenv("MLFLOW_RUN_ID", "e-3")
+    assert resolve_run().source == "env"
+    assert not [w for w in recwarn if "cannot be shared" in str(w.message)]
 
 
 def test_ranks_with_no_shared_id_are_warned(monkeypatch, recwarn):

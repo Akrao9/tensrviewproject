@@ -3001,8 +3001,11 @@ def watch(
             grace_key = _grace_alert_key(status, status_age, other_stamp)
             if report_look is not None:
                 report = report_look["report"]
+                # The look's state is part of it: a file written inside the wait says the report
+                # is not current, and is rewritten once the same report is current again.
                 seen = (
                     "server",
+                    report_look["state"],
                     report["attempt"],
                     report.get("last_step"),
                     report.get("steps"),
@@ -3125,7 +3128,7 @@ def _ranks_without_folder(folders: Mapping[int, Path], status: Mapping[str, Any]
 class _RankMemory:
     """What the all-ranks watcher keeps about one rank between looks, as the single-rank
     watcher keeps it for its one rank: whether the rank's report was ever seen current, since
-    when it has been behind, and the key it had the last time it was current."""
+    when it has been behind, and its look the last time it was current."""
 
     def __init__(self) -> None:
         self.reset()
@@ -3133,7 +3136,7 @@ class _RankMemory:
     def reset(self) -> None:
         self.was_current = False
         self.waiting_since: float | None = None
-        self.last_current_key: Any = None
+        self.last_current_look: dict[str, Any] | None = None
 
 
 def _rank_look(
@@ -3872,11 +3875,11 @@ def _look_at_ranks(
     memory: dict[int, _RankMemory],
     thresholds: Mapping[str, Any],
     report_grace: float,
-) -> tuple[dict[int, Path], dict[int, dict[str, Any]], tuple[Any, ...], tuple[Any, ...]]:
+) -> tuple[dict[int, Path], dict[int, dict[str, Any]], tuple[Any, ...]]:
     """One look at every rank of a run folder: its `rank=<n>` folders, each rank's look
-    (`_rank_look`), and the two keys the watcher compares with what it last wrote: every
-    rank's own, and the same with a rank inside its wait held at the key it had when last
-    current. `memory` is what the watcher keeps about each rank between looks, updated here;
+    (`_rank_look`), and the key the watcher compares with what it last wrote, every rank's.
+    A rank inside its wait is given as its look when it was last current, in the looks and in
+    the key. `memory` is what the watcher keeps about each rank between looks, updated here;
     an empty one is a first look."""
     folders = _discover_rank_folders(source)
     absent = _ranks_without_folder(folders, status)
@@ -3885,20 +3888,22 @@ def _look_at_ranks(
         del memory[gone]
     now = time.monotonic()
     looks: dict[int, dict[str, Any]] = {}
-    full: list[tuple[int, Any]] = []
-    calm: list[tuple[int, Any]] = []
+    keys: list[tuple[int, Any]] = []
     for number in numbers:
         held = memory.setdefault(number, _RankMemory())
         look, in_grace = _rank_look(folders.get(number), absent.get(number), held, thresholds, report_grace, now)
-        looks[number] = look
-        key = _rank_key(look)
         if look["state"] == "current":
-            held.last_current_key = key
-        full.append((number, key))
-        # A rank inside its wait is a moment between a part and its report, as the
-        # single-rank watcher treats it: it alone does not cause a write.
-        calm.append((number, held.last_current_key if in_grace else key))
-    return folders, looks, tuple(full), tuple(calm)
+            held.last_current_look = look
+        elif in_grace and held.last_current_look is not None:
+            # A rank inside its wait is a moment between a part and its report, as the
+            # single-rank watcher treats it: it alone does not cause a write, and in a write
+            # that another rank or the status causes it reads as its last current report, as
+            # the single-rank watcher writes from its last current report. Before Nov 18, 2026
+            # it was written as not judged for that moment.
+            look = held.last_current_look
+        looks[number] = look
+        keys.append((number, _rank_key(look)))
+    return folders, looks, tuple(keys)
 
 
 def _all_ranks_whole(
@@ -3957,7 +3962,7 @@ def all_ranks_evidence(
         "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": top_k,
         "update_window": update_window,
     })
-    folders, looks, _, _ = _look_at_ranks(source, status, {}, thresholds, REPORT_GRACE_SECONDS)
+    folders, looks, _ = _look_at_ranks(source, status, {}, thresholds, REPORT_GRACE_SECONDS)
     other_sources = {"traincheck": traincheck, "flight_recorder": flight_recorder,
                      "flight_recorder_prefix": flight_recorder_prefix}
     return _all_ranks_whole(source, folders, looks, status, _status_age(status), other_sources)
@@ -3983,7 +3988,10 @@ def watch_all_ranks(
     the run's `watchdog.json`: nothing else, so a look of 64 ranks stays cheap, and no part is
     opened and no detector run here, in any state. The file is replaced by rename, and only
     when something changed: a rank's report (attempt, last step, steps, rebuilds), a rank's
-    state, the ranks present, or the status. The evidence is `{"view": "all_ranks", ...}`, not
+    state, the ranks present, or the status. A rank whose report was current and is then behind,
+    missing or unreadable is waited for `report_grace` seconds from that moment, as one rank's
+    watcher waits, and reads as its last current report meanwhile; behind for longer, it is
+    `stale`. The evidence is `{"view": "all_ranks", ...}`, not
     the per-rank evidence: see `_all_ranks_evidence` and the README for its keys.
 
     A rank's incidents count only while its report is current (`read_server_report`); a rank
@@ -4029,13 +4037,14 @@ def watch_all_ranks(
             status = read_watchdog(status_file)
             status_age = status_clock.check(status)
             stamp = (_status_stamp(status, status_age), _other_sources_stamp(**other_sources))
-            folders, looks, full, calm = _look_at_ranks(source, status, memory, thresholds, report_grace)
+            folders, looks, keys = _look_at_ranks(source, status, memory, thresholds, report_grace)
             if not looks and status is None:
                 continue
-            # Compared with what was written, not with the last look: a rank written while it
-            # was in a wait, which then comes back with the key it had before, is rewritten.
-            seen, calmed = (full, stamp), (calm, stamp)
-            if seen == emitted or calmed == emitted:
+            # Compared with what was written, not with the last look: a rank inside its wait is
+            # written and compared as its last current look, so one that comes back with the
+            # report it had is no news.
+            seen = (keys, stamp)
+            if seen == emitted:
                 continue
             evidence = _all_ranks_whole(source, folders, looks, status, status_age, other_sources)
             path = Path(output) if output else Path(f"{evidence['run_id']}.all-ranks.evidence.json")

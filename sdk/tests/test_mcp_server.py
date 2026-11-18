@@ -37,6 +37,7 @@ from pathlib import Path
 import pytest
 
 import tensorquill
+from tensorquill import compact
 from tensorquill import evidence as ev
 from tensorquill import mcp_server
 
@@ -423,6 +424,86 @@ def test_an_evidence_file_answers_from_what_is_written_and_reads_series_beside_i
     # With --records it reads the capture named.
     client = start(alone, "--records", str(out / "seeded" / "seeded.jsonl"))
     assert client.call("get_series", name="layers.31.router")["records"].endswith("seeded.jsonl")
+
+
+def test_a_compact_evidence_file_reads_the_capture_beside_it(tmp_path):
+    """CLI-05 (Nov 18, 2026): the trigger hands an agent `<name>.evidence.compact.json`
+    (`$TENSORQUILL_EVIDENCE`), and a server started on it found no `<name>.jsonl` beside it,
+    as it does for `<name>.evidence.json`, so it had no layer or parameter series."""
+    capture = write_capture(tmp_path / "x.jsonl", dense(60, spike=(40, "blocks.1.weight", 60.0)))
+    handed = compact.write_compact(ev.build_evidence(capture), tmp_path / "x.evidence.json")
+    assert handed.name == "x.evidence.compact.json" and not (tmp_path / "x.evidence.json").exists()
+    series = mcp_server.get_series(mcp_server.Source(handed), {"name": "blocks.1.weight"})
+    assert series["records"] == str(capture) and series["over_range"]["grad_norm"]["max_step"] == 40
+    assert series["recorded"]["steps"] == 60 and "compact" not in series
+
+
+ROUTER = "blocks.0.router"
+
+
+def moe(steps: int, collapse_at: int, experts: int = 8) -> list[dict]:
+    """Step records of one router that routes evenly, then from `collapse_at` sends every token to
+    two experts: a `moe_imbalance` at that step."""
+    from tensorquill.capture import _router_stats
+
+    out = []
+    for step in range(steps):
+        counts = [64 + (step * 7 + e * 13) % 9 for e in range(experts)]
+        if step >= collapse_at:
+            total = sum(counts)
+            counts = [total // 2, total - total // 2] + [0] * (experts - 2)
+        out.append({"schema_version": 1, "run_id": "moe", "rank": 0, "attempt": 1, "step": step, "ts": 1.7e9 + step,
+                    "grad_norm": 1.0, "moe": {ROUTER: counts}, "moe_top_k": {ROUTER: 2},
+                    "moe_stats": {ROUTER: _router_stats(counts)}})
+    return out
+
+
+def test_a_routers_series_from_compact_evidence_is_the_whole_run_when_the_records_are_held(tmp_path):
+    """CLI-06 (Nov 18, 2026): with the step records held (`--records`, or the capture beside a
+    compact file), a router's series came from the compact file's samples, which cover only a
+    window around each MoE incident. It is read from the records, every step; the detectors'
+    flags come from the file's own samples (the file may have been written with other thresholds
+    or detectors than a rebuild would use), and the answer says they cover the kept steps only.
+    With the compact file alone, the series is its window, and the answer says so."""
+    (tmp_path / "beside").mkdir()
+    capture = write_capture(tmp_path / "beside" / "m.jsonl", moe(80, 60))
+    evidence = ev.build_evidence(capture)
+    assert [(i["kind"], i["step"]) for i in evidence["incidents"]] == [("moe_imbalance", 60)]
+    handed = compact.write_compact(evidence, capture.with_suffix(".evidence.json"), window=2)
+    assert json.loads(handed.read_text())["compact"]["kept_steps"] == [[58, 62]]
+    alone = tmp_path / "alone.evidence.compact.json"
+    alone.write_bytes(handed.read_bytes())
+    whole = mcp_server.get_series(mcp_server.Source(capture), {"name": ROUTER, "expert": 1})  # the capture itself
+    assert whole["recorded"] == {"first_step": 0, "last_step": 79, "steps": 80} and whole["first_flagged_step"] == 60
+
+    # Alone, with --records naming the capture; and beside the capture, as the trigger leaves it.
+    for source in (mcp_server.Source(alone, records=capture), mcp_server.Source(handed)):
+        series = mcp_server.get_series(source, {"name": ROUTER, "expert": 1})
+        assert series["records"] == str(capture)
+        assert series["recorded"] == whole["recorded"] and series["steps"] == whole["steps"]
+        for column in ("diversity", "largest_share", "expert_share"):
+            assert series["values"][column] == whole["values"][column], column
+        # The flags are the file's own, at the steps it keeps, and said to be.
+        at = {step: index for index, step in enumerate(series["steps"])}
+        assert [series["values"]["overloaded"][at[s]] is not None for s in (57, 58, 62, 63)] == [False, True, True, False]
+        assert series["over_range"]["overloaded"]["recorded"] == 5 and series["first_flagged_step"] == 60
+        assert "steps 58-62" in series["compact"] and "flags" in series["compact"]
+
+    # Alone: the window, said to be one, here and when a range falls outside it.
+    series = mcp_server.get_series(mcp_server.Source(alone), {"name": ROUTER})
+    assert series["records"] is None and series["steps"] == [58, 59, 60, 61, 62]
+    assert "steps 58-62" in series["compact"] and "80 recorded steps" in series["compact"]
+    with pytest.raises(mcp_server.ToolError, match="steps 58-62"):
+        mcp_server.get_series(mcp_server.Source(alone), {"name": ROUTER, "start": 0, "end": 40})
+    # The full evidence, beside its capture and alone: its own samples, every step, as before.
+    full = capture.with_suffix(".evidence.json")
+    ev.write_evidence(evidence, full)
+    full_alone = tmp_path / "full.evidence.json"
+    full_alone.write_bytes(full.read_bytes())
+    for source in (mcp_server.Source(full), mcp_server.Source(full_alone)):
+        series = mcp_server.get_series(source, {"name": ROUTER, "expert": 1})
+        assert {k: series[k] for k in ("recorded", "steps", "values", "first_flagged_step")} == {
+            k: whole[k] for k in ("recorded", "steps", "values", "first_flagged_step")} and "compact" not in series
 
 
 def test_an_older_evidence_file_gets_its_classes_and_says_it_has_no_run_state(start, tmp_path):

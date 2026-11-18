@@ -47,7 +47,7 @@ Five lines of work stop now. A sixth, new detector kinds, was lifted on Nov 17, 
 | --- | --- | --- |
 | New detector kinds | Lifted by the author on Nov 17, 2026. It had stopped at the 32 built; new kinds are now added one at a time | Returned on Nov 17, 2026 by the author's decision. Its condition, a real job showing a failure none of them catches, was not met |
 | Rune viewer app | Postponed, confirmed Nov 16, 2026; Rerun stays the viewer | Outside users ask for views Rerun cannot give |
-| Second copy of each detector | One Rust implementation for the 28 server kinds, called from Python; each Python duplicate is deleted as it is replaced. The four Python-only kinds stay as they are. State on Nov 16, 2026: the Rust path is built and opt-in for one read, watching, the all-ranks view, the thresholds and the MoE samples. Python is still the default, and no Python copy is deleted yet. Decided Nov 17, 2026: the Python detectors stay through the release, and whether to delete them is decided after it | Not applicable: this is a simplification, not a pause |
+| Second copy of each detector | One Rust implementation for the server kinds (28 then; 29 since the update-size kind was added on Nov 18, 2026), called from Python; each Python duplicate is deleted as it is replaced. The four Python-only kinds stay as they are. State on Nov 16, 2026: the Rust path is built and opt-in for one read, watching, the all-ranks view, the thresholds and the MoE samples. Python is still the default, and no Python copy is deleted yet. Decided Nov 17, 2026: the Python detectors stay through the release, and whether to delete them is decided after it | Not applicable: this is a simplification, not a pause |
 | Real-AWS and GCS runs, and the `s3://` reader | Postponed; the store code is built and stays | A user asks for a cloud store |
 | Hosted tier, SSO, pricing | Postponed | Three outside teams run the SDK |
 | RL, robotics, diffusion and multimodal packs | Not in this plan | A user brings a workload |
@@ -81,9 +81,9 @@ TensorQuill itself still only reports. Nothing in the SDK or server blocks or st
 
 ## Detector changes
 
-No new kinds were added while the freeze held; it was lifted on Nov 17, 2026. Labelling the 32 kinds is done, and one change to replica drift is planned for after the release.
+No new kinds were added while the freeze held; it was lifted on Nov 17, 2026, and the first new kind, update size per parameter, was built on Nov 18, 2026, making 33. Labelling the kinds is done, and one change to replica drift is planned for after the release.
 
-1. **Label every kind** as invariant, anomaly or observation. Done Nov 16, 2026: all 32 are labelled in Python and Rust with a parity test, as 12 invariants, 11 anomalies and 9 observations.
+1. **Label every kind** as invariant, anomaly or observation. Done Nov 16, 2026: all 32 are labelled in Python and Rust with a parity test, as 12 invariants, 11 anomalies and 9 observations. The update-size kind, added Nov 18, 2026, is a twelfth anomaly: 33 in all.
    - Invariants are rules that must always hold, such as replica drift, repeated steps, duplicate batches, non-finite values and collective desync.
    - Anomalies compare a signal with its own recent history, such as gradient spikes, activation spikes and drift, and memory growth.
    - Observations record something that may be intended, such as the resume checks, GPU throttling and memory imbalance.
@@ -95,7 +95,7 @@ No new kinds were added while the freeze held; it was lifted on Nov 17, 2026. La
    - Why: [SCOUT](https://arxiv.org/pdf/2608.11034) attributes a fault to the rank that disagrees with a strict majority of its replicas, which takes at least three ranks.
    - Done when a three-process CPU run with one drifted rank names that rank, and a two-rank run reports drift without naming one.
 
-The freeze on new kinds was lifted on Nov 17, 2026. New kinds are built one at a time, in this order: update size per parameter, a cross-rank activation compare (the check for corruption that replica drift cannot see), per-token routing entropy, output-logit growth in the language-model head, slow ranks as an observation, and hidden expert collapse (an expert still gets tokens but adds less and less). The v3 plan holds the build list with what each needs first.
+The freeze on new kinds was lifted on Nov 17, 2026. New kinds are built one at a time, in this order: update size per parameter (built Nov 18, 2026, opt-in); a cross-rank activation compare, the check for corruption that replica drift cannot see (its design is the author's to choose, below); per-token routing entropy; the gap between BF16 and FP32 logits in the language-model head, not the growth of the logits, which happens in healthy runs too (the head's numbers are recorded since Nov 18, 2026, and the kind waits for those numbers from a real run to set its line); slow ranks as an observation; and, last, hidden expert collapse (an expert still gets tokens but adds less and less), which has a design source and a statistic but no reported case. The v3 plan holds the build list with what each needs first.
 
 ## Prove
 
@@ -107,15 +107,15 @@ Five results make the claims credible, and none has been run yet. Pass lines are
 | 2 | One of the author's real jobs | At least 1,000 steps, with a real anomaly found or zero false incidents | Not run. nanochat and nanoMoE are noted as candidates; whether they count as the author's own job is not decided |
 | 3 | Head-to-head on the Granite run under `torch.compile`: TensorQuill, NeuralDBG and `wandb.watch` | TensorQuill router-only at 1.0% or less, with 0 graph breaks and 0 recompiles after warmup. All three tools' numbers are published, whatever they show | Not run |
 | 4 | Agent benchmark on at least 8 real captures that carry loss and gradient curves | The agent names the exact step, layer or parameter, and kind in 85% of trials, and beats scalar-only data by 30 points | Not run. The Gate 1 harness on the 7 fixtures is the rehearsal, scored by its own pre-registered rules and without the Rune arm. Since Nov 17, 2026 its gate is the evidence arm against stock Rerun with the same evidence: accuracy within 5 points, and no more tool calls at the median. Loss is now logged in the four GPU scripts, but router-only captures carry no gradient norm, so these runs need full capture |
-| 5 | Public release | Both packages on PyPI, the server as wheels, and 3 outside engineers run it on their own jobs | The SDK wheel is prepared and the server's wheels are not built. Nothing uploaded. crates.io was dropped on Nov 17, 2026 |
+| 5 | Public release | Both packages on PyPI, the server as wheels, and 3 outside engineers run it on their own jobs | The SDK wheel is prepared. The server's wheels for Linux x86_64, Linux arm64 and macOS arm64, and a fallback wheel, are built by CI; the first run passed on Nov 18, 2026. Nothing uploaded. crates.io was dropped on Nov 17, 2026 |
 
 Results 2 and 5 decide whether the product is wanted. Results 1, 3 and 4 decide what it may claim.
 
 ## Release plan
 
-Decided Nov 17, 2026. One pure-Python SDK and one Rust server wheel, both on PyPI, built for Linux first; then proof runs; then the release. Pushing `main`, the first Linux CI run and the small fixes are done. Nothing in steps 2 to 6 is built or run yet. The v3 plan holds the full entry.
+Decided Nov 17, 2026. One pure-Python SDK and one Rust server wheel, both on PyPI, built for Linux first; then proof runs; then the release. Pushing `main`, the first Linux CI run and the small fixes are done. Built on Nov 18, 2026: the packaging of step 2 except the uploads, the TestPyPI container test and the GitHub organization (the server wheels, the protocol number, the SDK finding the binary, auto, the dependency and the tensorquill-mcp script), and the simulated ranks of step 3. Nothing else in steps 2 to 6 is built or run yet. The v3 plan holds the full entry.
 
-1. **Record the decisions in the plan.** Done Nov 17, 2026: the packaging decision is logged in v3; the audience and gap text, "seventeen kinds", the crates.io lines and the CI row are fixed; and the detector count is checked against the code as 28 in the server and 4 in Python. Other status rows in v3 still carry their Nov 16 state and were not re-read.
+1. **Record the decisions in the plan.** Done Nov 17, 2026: the packaging decision is logged in v3; the audience and gap text, "seventeen kinds", the crates.io lines and the CI row are fixed; and the detector count is checked against the code as 28 in the server and 4 in Python (29 and 4 since Nov 18, 2026). Other status rows in v3 still carry their Nov 16 state and were not re-read.
 2. **Packaging.**
    - Publish `tensorquill-server` as maturin wheels for Linux x86_64, Linux arm64 and macOS arm64, plus a near-empty fallback wheel for every other platform.
    - Check that the Linux wheels are tagged `manylinux_2_17`, and build arm64 on a native runner.
@@ -149,7 +149,7 @@ Decided Nov 17, 2026. One pure-Python SDK and one Rust server wheel, both on PyP
 - Make replica drift name the rank, and move the attention maps out of `probe_json`.
 - Add a container image when a user asks.
 
-The new detector kinds, lifted the same day, are not placed in these steps. Whether the first one is built before the release is not decided.
+The new detector kinds, lifted the same day, are not placed in these steps. The first, update size per parameter, was built and merged on Nov 18, 2026, and is opt-in.
 
 ## Next actions
 
@@ -193,7 +193,7 @@ Replaced on Nov 17, 2026 by the release plan above. The four weeks from Nov 16, 
 
 Capability grows along one line, from detecting a failure to repairing it, and not sideways into a tracker. Steps 3 to 5 start only after result 5, when outside users ask for them.
 
-1. **Detect.** Built: 32 incident kinds.
+1. **Detect.** Built: 33 incident kinds.
 2. **Explain.** The agent loop in this plan, built Nov 16, 2026 and not yet tried with a live agent.
 3. **Act, with approval.** Pause a run, roll back to the last good checkpoint, or change the learning rate.
 4. **Learn across runs.** Name the failures that recur and warn before they happen. Comparing runs moved into the first release on Nov 16, 2026 (build piece 6), and LLM-Training-Debugger already finds the first step where two runs diverge and the outlier in a batch of runs.
@@ -203,13 +203,16 @@ Not planned: charts of scalars across runs, a hosted page of runs, artifact and 
 
 ## Risks and open decisions
 
-Two decisions are still the author's to make, two were settled on Nov 16, 2026, and six risks each have one answer in this plan.
+Five decisions are still the author's to make, two were settled on Nov 16, 2026, and seven risks each have one answer in this plan.
 
 **Decisions**
 
 - **Settled: the Rune viewer is postponed.** Confirmed Nov 16, 2026. This reverses the v3 decision of Nov 14, 2026 that the app is built either way. Rerun stays the viewer until outside users ask for views it cannot give.
 - **Price.** Per seat or per GPU-hour, decided only after result 5.
 - **Do nanochat and nanoMoE count as result 2?** Both can meet the pass line, but they are other people's training code, and result 2 asks for one of the author's real jobs.
+- **How the cross-rank activation compare gets its inputs.** The same probe batch on every rank, or a forward compared with its recomputation. Recommended Nov 18, 2026: the probe batch, which works on any model; the recomputation works only where the user turns on activation checkpointing. Its limit: it sees only probe steps and only the forward, so it catches a GPU whose arithmetic stays wrong, not a passing fault.
+- **Do the Gate 1 fixtures carry the run-end line?** Recommended: no. The line only says the fixture files were never closed by a session, it answers none of the scored questions, and adding it would change preregistered materials. They are left without it.
+- **How a two-way desync is worded.** PyTorch's analyzer calls any rank that differs from the rank it compares against the culprit, for any number of ranks. Recommended: say which rank issued which collective against which, name the odd rank only when three or more ranks show one clearly apart, and with two ranks say that nothing shows which is at fault.
 - **Settled: Python reaches the Rust detectors through the server binary.** `tensorquill-server` has a `detect` subcommand that Python runs as a subprocess. The SDK wheel stays pure Python. Offline detection needs the binary on PATH until it ships as per-platform wheels, which the release plan of Nov 17, 2026 schedules. A PyO3 extension was not chosen, because detection is one pass over a file and the wheel would need a build per platform.
 
 **Risks**
@@ -222,6 +225,7 @@ Two decisions are still the author's to make, two were settled on Nov 16, 2026, 
 | Thresholds tuned on Granite and SmolLM2-360M raise false alarms elsewhere | Result 2, on the author's own job; until then anomalies do not fire the trigger by default |
 | Moving detectors to one Rust copy changes their answers | Golden files hold Python's answers, and the parity tests stay until each Python duplicate is deleted |
 | A probe flush of about 150 ms delays a live acknowledgement; 620 ms was seen once | Logged as an open gap in v3; looked at after results 1 and 2 |
+| TensorQuill itself stops or hangs a training run | An outside review of the code found four such bugs, confirmed on CPU on Nov 18, 2026: a complex parameter, blocks on two devices, a tracker on rank 0 only, and the Accelerate adapter. They are being fixed, each with a test that fails before its fix, with the review's other confirmed bugs, in six parallel lanes |
 
 ## Sources
 
@@ -232,5 +236,6 @@ Two decisions are still the author's to make, two were settled on Nov 16, 2026, 
 - [LLM-Training-Debugger repository](https://github.com/YanKaFei/LLM-Training-Debugger)
 - [TrainCheck, OSDI '25](https://www.usenix.org/conference/osdi25/presentation/jiang) for 18 of 20, and its [slides](https://web.eecs.umich.edu/~ryanph/slides/traincheck_osdi25_slides.pdf); the paper (arXiv 2506.14813, p. 11) gives the baseline as 2 of 20, read Nov 17, 2026
 - [SCOUT: failure localization in LLM pre-training](https://arxiv.org/pdf/2608.11034), read Nov 16, 2026
-- [Motif 3: Technical Report](https://arxiv.org/pdf/2608.09119) and [Mechanism-Aligned Observability for Training Instability of Large Language Models](https://arxiv.org/html/2606.28116), for the later candidates; the first from search excerpts only, the second read in full on Nov 17, 2026
-- A review of 22 papers and the two SageMaker Debugger repositories, Nov 17, 2026, for the SCOUT and SageMaker Debugger rows and the corrected TrainCheck figure; the corrections were checked against the cited pages
+- [Motif 3: Technical Report](https://arxiv.org/pdf/2608.09119) and [Mechanism-Aligned Observability for Training Instability of Large Language Models](https://arxiv.org/html/2606.28116), for the later candidates; both read in full, the second on Nov 17, 2026 and the first on Nov 18, 2026
+- A review of the papers (22 on Nov 17, 2026; 50 papers and posts by Nov 18, 2026) and the two SageMaker Debugger repositories, for the SCOUT and SageMaker Debugger rows and the corrected TrainCheck figure; the corrections were checked against the cited pages
+- An outside review of the code at commit 78f8f7e, Nov 18, 2026: its 27 high-severity findings were checked on main the same day, 12 reproduced on CPU, 10 confirmed by reading and 4 found not to hold; the 60 others are not checked

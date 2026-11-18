@@ -780,6 +780,46 @@ def test_a_state_file_of_the_earlier_key_still_loads_and_its_stall_does_not_fire
     assert [d["id"] for d in trigger.deliveries] == ["r/rank0/rank_silent/40", "r/rank0/non_finite/12", "r/rank0/non_finite/14"]
 
 
+def test_a_state_file_given_by_name_is_read_before_the_first_tick_can_write_it(tmp_path, hook):
+    """DET-01 (Nov 18, 2026): both watchers call `tick()` before their first `look()`, and a
+    trigger given `state_path=` used to save its empty state at that tick, before reading the
+    file, so a restarted watcher fired again for every incident and stall episode it listed.
+    The file is read when the trigger is made. The command line passes no `state_path` (it is
+    taken from the evidence at the first look), which the last lines hold unchanged."""
+    command, calls = hook
+    source, status_file = tmp_path / "w.jsonl", tmp_path / "watchdog.json"
+    _write(source, _with(_records(range(41)), 30, **NAN))
+    status_file.write_text(json.dumps(STALLED["job_stalled"][1]))
+    state = tmp_path / "kept" / "mine.fired.json"
+    first = Trigger(command(), state_path=state)
+    watch(source, interval=0.02, polls=3, watchdog=status_file, trigger=first)
+    assert _settle(first, lambda: len(calls()) == 2 and all(
+        d["command"]["status"] == "done" for d in first.deliveries))
+    first.close(wait=20)
+    assert sorted(c["payload"]["kind"] for c in calls()) == ["job_stalled", "non_finite"]
+    saved = state.read_text()
+    assert json.loads(saved)["episode"]["kind"] == "job_stalled" and len(json.loads(saved)["deliveries"]) == 2
+
+    # A restarted watcher given the same file: nothing fires again, and the file is as it was.
+    again = Trigger(command(), state_path=state)
+    watch(source, interval=0.02, polls=3, watchdog=status_file, trigger=again)
+    again.close(wait=5)
+    assert len(calls()) == 2 and state.read_text() == saved
+
+    # Read when the trigger is made: a tick or a close before any look writes nothing over it.
+    early = Trigger(command(), state_path=state)
+    assert early.deliveries == json.loads(saved)["deliveries"]
+    early.tick()
+    early.close()
+    assert state.read_text() == saved
+
+    # With no `state_path`, as the command line makes it: nothing is read or written before a look.
+    plain = Trigger(command())
+    plain.tick()
+    plain.close()
+    assert plain.deliveries == [] and not state_path_for(tmp_path / "w.evidence.json").exists()
+
+
 def test_a_critical_stall_in_a_status_that_is_no_longer_written_still_fires(tmp_path, hook):
     """Pinned as what is, not as what must be: a server killed while a run was stalled leaves its
     last `watchdog.json`, and a watcher started later fires once for the stall it lists. The
@@ -1769,7 +1809,9 @@ def test_a_new_attempt_that_hangs_before_it_passes_the_old_step_fires_again(tmp_
         job.close()
     assert len(calls()) == 2
     (rank,) = status["ranks"]
-    assert rank["attempt"] == new_attempt and rank["last_step"] == 99  # the highest stored step, of the old attempt
+    # The new attempt's own step, below the old attempt's 99 (until Nov 18, 2026 the status kept the
+    # highest step of any attempt, 99, until the new one passed it).
+    assert rank["attempt"] == new_attempt and rank["last_step"] == 29
     payload = calls()[1]["payload"]
     assert (payload["kind"], payload["incident"]["severity"]) == ("job_stalled", "critical")
     assert payload["incident"]["ranks"][0]["attempt"] == new_attempt

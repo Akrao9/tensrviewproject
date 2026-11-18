@@ -13,7 +13,7 @@ from typing import Any
 import torch
 from accelerate import Accelerator
 
-from .capture import Session
+from .capture import Session, _clip_is_l2, _clips_session
 
 _active: list["Watch"] = []
 _originals: tuple[Any, Any, Any, Any] | None = None
@@ -61,9 +61,11 @@ def watch_accelerator(
     or the returned `Watch` is closed.
 
     - **Clipping.** The norm `accelerator.clip_grad_norm_` returns, before clipping, is
-      recorded as `clip_grad_norm`. Accelerate 1.16 stopped clipping through
-      `torch.nn.utils.clip_grad_norm_`, which is what TensorQuill wraps by default; this
-      records the norm once on either version.
+      recorded as `clip_grad_norm` when the parameters passed include any of the session's
+      trainable ones (a LoRA model's first parameter is frozen) and the norm is L2
+      (`norm_type` 2, the default; another norm type records nothing). Accelerate 1.16
+      stopped clipping through `torch.nn.utils.clip_grad_norm_`, which is what TensorQuill
+      wraps by default; this records the norm once on either version.
     - **Loss.** The loss passed to `accelerator.backward` is logged as `loss_name` for
       each optimizer step: the mean over gradient-accumulation microbatches. It stays a
       tensor on the device, with no sync. `loss_name=None` turns this off.
@@ -94,9 +96,11 @@ def watch_accelerator(
         session.watch_loaders()
     close = session.close
 
-    def close_and_unwatch() -> None:
+    def close_and_unwatch(*args: Any, **kwargs: Any) -> None:
+        # Whatever `close` takes is passed on: `Session.__exit__` calls
+        # `close(_exception=...)`, which the end marker records.
         try:
-            close()
+            close(*args, **kwargs)
         finally:
             watch.close()
 
@@ -128,15 +132,12 @@ def _clip_grad_norm(self: Any, parameters: Any, *args: Any, **kwargs: Any) -> An
         _restore_if_unused()
         return norm
     parameters = list(parameters)
-    first = next(iter(parameters), None)
-    sessions = [
-        w.session for w in _live()
-        if w.session._clip_watched and first is not None and id(first) in w.session._param_ids
-    ]
+    # The same match and the same norm rule as torch's wrapper (`capture._clips_session`,
+    # `capture._clip_is_l2`): any of the session's trainable parameters, an L2 norm only.
+    sessions = [w.session for w in _live() if w.session._clip_watched and _clips_session(w.session, parameters)]
     before = [s._clip_calls for s in sessions]
     norm = original(self, parameters, *args, **kwargs)
-    norm_type = args[1] if len(args) > 1 else kwargs.get("norm_type", 2)
-    if norm is not None and norm_type == 2:
+    if norm is not None and _clip_is_l2(args, kwargs):
         for session, calls in zip(sessions, before):
             # Accelerate up to 1.15 clips through `torch.nn.utils.clip_grad_norm_`, which
             # TensorQuill already wraps; record only when that did not happen.

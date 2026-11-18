@@ -680,8 +680,10 @@ def test_a_rank_between_a_part_and_its_report_is_no_news_but_is_not_left_stuck_o
     flicker["calls"] = {2, 3}
     assert len(count_writes(run, tmp_path / "a", 6)) == 1
 
-    # But if something else is written while it is behind, the file says so, and it must be rewritten
-    # when the rank comes back with the report it had: the comparison is with what was written.
+    # And if something else is written while it is inside its wait, it reads there as its last current
+    # report, as the single-rank watcher writes from its last current report: judged, not unknown for
+    # that moment (before Nov 18, 2026 it was written as behind and rewritten on the next look).
+    # Back with the report it had, it is no news: the comparison is with what was written.
     calls.clear()
     flicker["calls"] = {2}
 
@@ -690,9 +692,10 @@ def test_a_rank_between_a_part_and_its_report_is_no_news_but_is_not_left_stuck_o
             run.send(2, steady(110)[60:])  # a change on another rank, found on the next look
 
     seen = count_writes(run, tmp_path / "b", 5, between=more)
-    assert len(seen) == 3
-    assert entry(seen[1], 1)["detection"]["state"] == "behind" and seen[1]["judged_ranks"] == [0, 2]
-    assert entry(seen[2], 1)["detection"]["state"] == "current" and seen[2]["judged_ranks"] == [0, 1, 2]
+    assert len(seen) == 2
+    assert entry(seen[1], 2)["detection"]["report_last_step"] == 109
+    assert entry(seen[1], 1)["detection"]["state"] == "current" and seen[1]["judged_ranks"] == [0, 1, 2]
+    assert entry(seen[1], 1)["detection"]["report_last_step"] == entry(seen[0], 1)["detection"]["report_last_step"]
     assert run.server.terminate() == 0
 
 

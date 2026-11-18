@@ -83,11 +83,15 @@
 //! `silent`, critical `--critical-seconds` later; `reconnecting` for that window while its stream
 //! is not open), not from the earlier attempt's last batch. `last_step` stays the highest stored,
 //! of any attempt. The attempt's first batch ends that, and its first gap is measured from the
-//! beat. A beat of the same attempt (a reconnect) changes nothing. While the new attempt has
-//! stored nothing, a beat of a lower attempt (a process of an earlier attempt still alive) is
-//! ignored and an earlier attempt's rows sent late raise `last_step` without being progress; at
-//! other times a lower attempt is taken as before (a restart on a host whose clock is behind). A beat that names no attempt (an older sender) is
-//! taken as before, and its new attempt is known from its first stored batch.
+//! beat. From that batch on, `last_step` is the new attempt's own, also when it resumed from a
+//! checkpoint below the steps the earlier attempt reached (until Nov 18, 2026 it stayed the
+//! highest of any attempt until the new one passed it). A beat of the same attempt (a reconnect)
+//! changes nothing. While the new attempt has stored nothing, a beat of a lower attempt (a
+//! process of an earlier attempt still alive) is ignored and an earlier attempt's rows sent late
+//! raise `last_step` without being progress; at other times a lower attempt is taken as before (a
+//! restart on a host whose clock is behind), and its step is the rank's. A beat that names no
+//! attempt (an older sender) is taken as before, and its new attempt is known from its first
+//! stored batch.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
@@ -800,8 +804,9 @@ impl Watchdog {
         });
     }
 
-    /// A batch arrived. `new_last` is the highest step among the rows kept, `None` when every
-    /// row was one the server already had.
+    /// A batch arrived. `new_last` is the highest step among the rows of `attempt` kept, `None`
+    /// when every row was one the server already had. A batch that holds the end of one attempt
+    /// and the start of the next is one call, for the later attempt: one gap, as any batch.
     pub fn batch(&self, key: &Key, attempt: i64, new_last: Option<i64>, world_size: Option<i32>, now: Instant) {
         self.with(key, now, |p| {
             if world_size.is_some() {
@@ -826,6 +831,10 @@ impl Watchdog {
                 } else {
                     p.created
                 };
+                // A new attempt's first stored rows (one that resumed from an earlier checkpoint
+                // stores steps below the earlier attempt's): its step is the rank's from here on.
+                // Decided before `attempt` is taken, which a heartbeat may already have raised.
+                let new_attempt = attempt != p.attempt || p.attempt_since.is_some();
                 p.attempt_since = None;
                 let gap = now.saturating_duration_since(from).as_secs_f64();
                 p.gaps.push_back(gap);
@@ -833,7 +842,10 @@ impl Watchdog {
                     p.gaps.pop_front();
                 }
                 p.attempt = attempt;
-                p.last_step = Some(p.last_step.map_or(step, |last| last.max(step)));
+                p.last_step = Some(match p.last_step {
+                    Some(last) if !new_attempt => last.max(step),
+                    _ => step,
+                });
                 p.last_progress = now;
             }
         });
@@ -2142,11 +2154,12 @@ mod tests {
         assert_eq!(states(&dog, at(t0, 402)), ["silent"]);
         assert_eq!(rank_field(&dog, at(t0, 402), "severity"), "critical");
         assert_eq!(rank_field(&dog, at(t0, 402), "attempt"), 1);
-        // Its first batch, of attempt 2 and below the old highest step: active, attempt 2.
+        // Its first batch, of attempt 2 and below the old highest step: active, attempt 2, and its
+        // step (until Nov 18, 2026 the status kept the old attempt's 99).
         dog.batch(&key(0), 2, Some(29), Some(1), at(t0, 450));
         assert_eq!(states(&dog, at(t0, 451)), ["active"]);
         assert_eq!(rank_field(&dog, at(t0, 451), "attempt"), 2);
-        assert_eq!(rank_field(&dog, at(t0, 451), "last_step"), 99);
+        assert_eq!(rank_field(&dog, at(t0, 451), "last_step"), 29);
     }
 
     #[test]
@@ -2200,13 +2213,56 @@ mod tests {
             (&json!(2), &json!(true), &json!(120))
         );
         assert_eq!(status["ranks"][0]["severity"], "critical");
-        // Its first batch, below the old highest step: active, and judged by its batches from now.
+        // Its first batch, below the old highest step: active, and judged by its batches from now;
+        // its step is the rank's from here on, below the late rows' 120.
         dog.batch(&key(0), 2, Some(29), Some(1), at(t0, 1200));
         let status = &dog.statuses(at(t0, 1201), true)["run"];
         assert_eq!(status["ranks"][0]["state"], "active");
         assert!(status["ranks"][0].get("attempt_without_steps").is_none());
+        assert_eq!(status["ranks"][0]["last_step"], 29);
         // Its first gap is from its first beat (800 s), not from the earlier attempt's last batch.
         assert_eq!(status["restart"][0]["gaps_seconds"], json!([5.0, 800.0]));
+        dog.batch(&key(0), 2, Some(59), Some(1), at(t0, 1230));
+        assert_eq!(rank_field(&dog, at(t0, 1231), "last_step"), 59);
+    }
+
+    #[test]
+    fn last_step_is_the_newest_attempts_once_it_stores_rows_and_stall_timing_is_unchanged() {
+        // config(60): floor 60 s, critical 180 s. Attempt 1 reaches step 119; attempt 2 resumes
+        // from the checkpoint at step 100, with no attempt in its heartbeats (an older sender).
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        for (second, step) in [(10, 39), (20, 79), (30, 119)] {
+            dog.batch(&key(0), 1, Some(step), Some(1), at(t0, second));
+        }
+        dog.batch(&key(0), 2, Some(109), Some(1), at(t0, 40));
+        let status = &dog.statuses(at(t0, 41), true)["run"];
+        assert_eq!(
+            (&status["ranks"][0]["attempt"], &status["ranks"][0]["last_step"]),
+            (&json!(2), &json!(109))
+        );
+        // The same gaps, states and severities as before last_step followed the attempt: a batch
+        // is progress whatever its step, and the clocks are those of the batches.
+        assert_eq!(status["restart"][0]["gaps_seconds"], json!([10.0, 10.0, 10.0, 10.0]));
+        assert_eq!(states(&dog, at(t0, 99)), ["active"]);
+        assert_eq!(states(&dog, at(t0, 101)), ["silent"]);
+        assert_eq!(rank_field(&dog, at(t0, 219), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 221), "severity"), "critical");
+        // A resend of rows already stored (no step kept) changes nothing.
+        dog.batch(&key(0), 2, None, Some(1), at(t0, 230));
+        assert_eq!(rank_field(&dog, at(t0, 231), "last_step"), 109);
+        // A lower attempt once the newer one has stored rows is taken as a job started again
+        // (a host whose clock is behind), as it was before: its step is the rank's.
+        dog.batch(&key(0), 1, Some(5), Some(1), at(t0, 240));
+        assert_eq!(
+            (
+                rank_field(&dog, at(t0, 241), "attempt"),
+                rank_field(&dog, at(t0, 241), "last_step")
+            ),
+            (json!(1), json!(5))
+        );
+        assert_eq!(states(&dog, at(t0, 241)), ["active"]);
     }
 
     #[test]
