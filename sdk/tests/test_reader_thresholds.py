@@ -363,7 +363,8 @@ def test_each_of_the_six_flags_reaches_the_detectors_on_a_local_file(tmp_path):
     assert text(written) == text(tensorquill.build_evidence(everything()))
     # With no `--detectors` the read is `auto`: the Rust detectors here, saying so and warning of nothing.
     auto = cli(str(capture), "-o", str(tmp_path / "auto.json"), *flags(APPLIED), cwd=tmp_path)
-    assert (auto.returncode, auto.stderr) == (0, "")
+    # Not `stderr == ""`: another library may warn there (PyTorch does when NumPy is not installed).
+    assert auto.returncode == 0 and "Python detectors" not in auto.stderr and "tensorquill" not in auto.stderr, auto.stderr
     typed = cli(str(capture), "-o", str(tmp_path / "typed.json"), "--detectors", "rust", *flags(APPLIED), cwd=tmp_path)
     assert typed.returncode == 0, typed.stderr
     assert text(json.loads((tmp_path / "auto.json").read_text(encoding="utf-8"))) == text(

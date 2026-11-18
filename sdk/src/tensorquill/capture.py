@@ -2060,12 +2060,16 @@ def _not_adam(optimizer: Any) -> str | None:
     so an optimizer that keeps other state, or steps another way, would be misread.
     """
     name = type(optimizer).__name__
+    # Walk from the optimizer's own class towards PyTorch's: reaching Adam or AdamW before any
+    # class that defines its own step means the step is PyTorch's. AdamW is named beside Adam
+    # because it is a class of its own, with its own step, in PyTorch before 2.7.
+    own = (torch.optim.Adam, torch.optim.AdamW)
     for cls in type(optimizer).__mro__:
-        if cls is torch.optim.Adam:
+        if cls in own:
             return None
-        if cls is not torch.optim.AdamW and any(method in vars(cls) for method in ("step", "_init_group")):
+        if any(method in vars(cls) for method in ("step", "_init_group")):
             break
-    if isinstance(optimizer, torch.optim.Adam):
+    if isinstance(optimizer, own):
         return f"{name} changes Adam's step, so its update is not known to be Adam's"
     return (
         f"{name} is not Adam or AdamW: the update size is worked out from the two moments Adam keeps "

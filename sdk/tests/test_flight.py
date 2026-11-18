@@ -43,7 +43,12 @@ class Store:
 
     def _read(self, name: str) -> list[dict]:
         path = self.root / name
-        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        if not path.exists():
+            return []
+        # The stand-in server appends while the test reads: a last line without its newline is
+        # still being written, and is read on the next look.
+        text = path.read_text()
+        return [json.loads(line) for line in text[: text.rfind("\n") + 1].splitlines()]
 
     @property
     def rows(self) -> list[dict]:
