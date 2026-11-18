@@ -115,7 +115,7 @@ Results 2 and 5 decide whether the product is wanted. Results 1, 3 and 4 decide 
 
 Decided Nov 17, 2026. One pure-Python SDK and one Rust server wheel, both on PyPI, built for Linux first; then proof runs; then the release. Pushing `main`, the first Linux CI run and the small fixes are done. Nothing in steps 2 to 6 is built or run yet. The v3 plan holds the full entry.
 
-1. **Record the decisions in the plan.** Done Nov 17, 2026: the packaging decision is logged in v3, the stale lines are fixed, and the detector count is checked against the code as 28 in the server and 4 in Python.
+1. **Record the decisions in the plan.** Done Nov 17, 2026: the packaging decision is logged in v3; the audience and gap text, "seventeen kinds", the crates.io lines and the CI row are fixed; and the detector count is checked against the code as 28 in the server and 4 in Python. Other status rows in v3 still carry their Nov 16 state and were not re-read.
 2. **Packaging.**
    - Publish `tensorquill-server` as maturin wheels for Linux x86_64, Linux arm64 and macOS arm64, plus a near-empty fallback wheel for every other platform.
    - Check that the Linux wheels are tagged `manylinux_2_17`, and build arm64 on a native runner.
