@@ -1450,7 +1450,12 @@ class Session:
         last = self._next_step - 1 if self._steps_committed else None
         if event == "save":
             manifest["after_step"] = last
-            if self._steps:  # the step it follows is still in the ring: record it there
+            # The step it follows is the newest in the ring, which is written only when the next
+            # step ends or the session closes (`_commit`): record it there. The ring is empty
+            # only before the first step, or after an explicit `flush()` with no step since; the
+            # save then waits for the next step's record (its `after_step` still names the step it
+            # followed), and is not written if the session closes first: no record is invented.
+            if self._steps:
                 row = self._ring_checkpoint[-1] or {}
                 row["save"] = manifest
                 self._ring_checkpoint[-1] = row
@@ -1551,6 +1556,13 @@ class Session:
     @torch.no_grad()
     def _commit(self, step: int | None) -> None:
         current = self._next_step if step is None else step
+        if len(self._steps) == self.every:
+            # A full ring is written when the next step needs a row, not as soon as it fills:
+            # until then the newest step is still in it, so what arrives for that step after it
+            # ended (a checkpoint saved right after it, `_record_manifest`; the update of an
+            # optimizer that steps after the lead, `_after_optimizer_step`) is written on its own
+            # record. `close()` writes it otherwise. The records reach the sink one step later.
+            self.flush()
         self._say_router_problems(stacklevel=4)
         if (
             not self._spread_recorded
@@ -1656,8 +1668,6 @@ class Session:
             # The step is complete before the probe runs, so a failing probe loses only
             # its own result, recorded against the step, and never the step.
             self._ring_probe[-1] = self._probe()
-        if len(self._steps) == self.every:
-            self.flush()
 
     def _cadence_probe(self) -> bool:
         return self._probe_fn is not None and self._cadence(self.probe_every)

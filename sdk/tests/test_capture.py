@@ -355,7 +355,9 @@ def test_cpu_flush_owns_single_stats_buffer(layers, grads):
                 model.zero_grad(set_to_none=True)
                 model(torch.tensor([[sample]])).sum().backward()
                 session.step()
-                assert entered.wait(timeout=5)
+            # The first step was written when the second ended, which then took its ring row:
+            # the block being decoded must not see that row.
+            assert entered.wait(timeout=5)
         finally:
             gate.set()
 

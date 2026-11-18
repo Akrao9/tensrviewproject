@@ -380,15 +380,16 @@ def test_checkpoint_manifests_say_what_a_save_holds_and_where(tmp_path):
         model(torch.zeros(1, 4)).sum().backward()
         opt.step()
         sched.step()
-        if step in (3, 5):  # after step 3 the ring was just flushed (every=4); after 5 it holds the step
+        if step in (3, 5):  # after step 3 the ring is full (every=4); after 5 it is not
             session.checkpoint({
                 "model": model.state_dict(), "optimizer": opt.state_dict(), "lr_scheduler": sched.state_dict(),
                 "scaler": scaler.state_dict(), "rng_state": torch.get_rng_state(), "step": step + 1,
             })
     session.close()
     records = read(tmp_path)
-    assert "checkpoint" not in records[3]
-    save = records[4]["checkpoint"]["save"]  # recorded with the next step, saying which it follows
+    # Each on the record of the step it follows: a full ring is written when the next step ends.
+    assert [r["step"] for r in records if "checkpoint" in r] == [3, 5]
+    save = records[3]["checkpoint"]["save"]
     assert save["after_step"] == 3 and records[5]["checkpoint"]["save"]["after_step"] == 5
     components = save["components"]
     assert list(components) == ["model", "optimizer", "scheduler", "scaler", "rng"]
