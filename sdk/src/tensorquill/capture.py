@@ -1214,9 +1214,11 @@ class Session:
         self._stepped = True
         # An optimizer that steps after the lead ended the step (two optimizers on one model,
         # `opt1.step(); opt2.step()`: Muon and AdamW, a GAN's two halves in one module) belongs to
-        # that step, which is still the newest in the ring (`_commit`): what it changes is written
-        # on that step's record, not the next one's. Under a loss scaler, `scaler.update()` ends
-        # the step after every optimizer has stepped, so nothing follows there.
+        # that step: while it is still the newest in the ring, what it changes is written on that
+        # step's record, not the next one's. When that step filled the ring, it is already written
+        # (`_commit`), and the update is read as before lane R2, for the next record (review finding
+        # SDK-06, open there). Under a loss scaler, `scaler.update()` ends the step after every
+        # optimizer has stepped, so nothing follows there.
         follows = not self._leading and not self._commit_on_update and bool(self._steps)
         if self.updates:
             # Every optimizer that holds some of this model's parameters, not only the lead.
@@ -1280,7 +1282,8 @@ class Session:
 
     def _run_owed_probe(self) -> None:
         """The newest step's probe, held until every optimizer of its iteration stepped: run at the
-        lead's next step, or when the next step ends, the ring is flushed or the session closes."""
+        lead's next step, or when the next step ends, the ring is flushed or the session closes.
+        A step that fills the ring is probed at once (`_commit`), since it is written then."""
         self._probe_owed = False
         if not self._steps:
             return
@@ -1299,7 +1302,8 @@ class Session:
 
     def _follows(self, optimizer: Any) -> bool:
         """Whether `optimizer` steps after the lead ended the step, so what it brings belongs to
-        the newest step in the ring (for the Lightning callback's loss)."""
+        the newest step in the ring (for the Lightning callback's loss). False once that step
+        has been written (it filled the ring): the loss then goes to the next step, as before."""
         lead = self._lead() if self._lead is not None else None
         return (
             lead is not None and optimizer is not lead and self.auto_step and not self._commit_on_update
@@ -1739,11 +1743,11 @@ class Session:
         last = self._next_step - 1 if self._steps_committed else None
         if event == "save":
             manifest["after_step"] = last
-            # The step it follows is the newest in the ring, which is written only when the next
-            # step ends or the session closes (`_commit`): record it there. The ring is empty
-            # only before the first step, or after an explicit `flush()` with no step since; the
-            # save then waits for the next step's record (its `after_step` still names the step it
-            # followed), and is not written if the session closes first: no record is invented.
+            # The step it follows is still in the ring: record it there. The ring is empty before
+            # the first step, after the step that filled it (`_commit` writes a full ring at once)
+            # and after an explicit `flush()`; the save then waits for the next step's record (its
+            # `after_step` still names the step it followed), and is not written if the session
+            # closes first: no record is invented (review finding SDK-07, open).
             if self._steps:
                 row = self._ring_checkpoint[-1] or {}
                 row["save"] = manifest
@@ -1847,13 +1851,6 @@ class Session:
         current = self._next_step if step is None else step
         if self._probe_owed:
             self._run_owed_probe()  # the previous step's, before this one becomes the newest
-        if len(self._steps) == self.every:
-            # A full ring is written when the next step needs a row, not as soon as it fills:
-            # until then the newest step is still in it, so what arrives for that step after it
-            # ended (a checkpoint saved right after it, `_record_manifest`; the update of an
-            # optimizer that steps after the lead, `_after_optimizer_step`) is written on its own
-            # record. `close()` writes it otherwise. The records reach the sink one step later.
-            self.flush()
         self._say_router_problems(stacklevel=4)
         if (
             not self._spread_recorded
@@ -1973,15 +1970,22 @@ class Session:
             # A committed training step is training stepping: whatever pause was announced is over.
             # This also clears a phase left behind by a callback that missed its end.
             self.set_phase("train")
+        full = len(self._steps) == self.every
         if probe_due:
             # The step is complete before the probe runs, so a failing probe loses only
             # its own result, recorded against the step, and never the step.
-            if self._followers:
+            if self._followers and not full:
                 # Other optimizers step after the lead in this run: the probe waits until they
                 # have (`_run_owed_probe`), so it reads the model as the whole step left it.
                 self._probe_owed = True
             else:
                 self._ring_probe[-1] = self._probe()
+        if full:
+            # Written as soon as it fills, so a run that hangs or is killed in the next step has
+            # every step it took on disk. What arrives for this step after it ended (a save
+            # right after it, the update of an optimizer that steps after the lead) finds no row
+            # in the ring: as before lane R2, see `_record_manifest` and `_after_optimizer_step`.
+            self.flush()
 
     def _cadence_probe(self) -> bool:
         return self._probe_fn is not None and self._cadence(self.probe_every)

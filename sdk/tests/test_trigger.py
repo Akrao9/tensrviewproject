@@ -1280,8 +1280,7 @@ import torch, tensorquill
 from torch import nn
 
 model = nn.Linear(8, 1)
-# `every=10`: steps leave the device ten at a time; the flush after the loop puts every step in
-# the file before the stop (the newest step otherwise waits in the ring for the next one).
+# `every=10`: steps leave the device ten at a time, so every step is in the file before the stop.
 session = tensorquill.init(model, run_id=os.environ["TQ_RUN_ID"], every=10, heartbeat_seconds=0.5, stack_seconds=1.0)
 session._sink.sender._batch_seconds, session._sink.sender._backoff_cap = 0.25, 0.5
 optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -1292,7 +1291,6 @@ for _ in range(int(os.environ["TQ_STEPS"])):
     session.log({"train/loss": loss})
     optimizer.step()
     time.sleep(0.01)
-session.flush()
 print("stopped stepping", flush=True)
 
 def stuck_here():
@@ -1486,12 +1484,10 @@ while (os.path.exists(stop) is False) if stop else step < steps:
     optimizer.step()
     step += 1
     time.sleep(0.01)
-# Steps leave the device ten at a time: the last ones are flushed before the stop (the newest
-# step otherwise waits in the ring until the next one ends).
+# Steps leave the device ten at a time: the last ones are flushed before the stop.
 while step % 10:
     session.log({"train/loss": torch.tensor(0.0)})
     step += 1
-session.flush()
 print("stopped stepping", flush=True)
 resume = os.environ.get("TQ_RESUME")
 if resume:
@@ -1504,7 +1500,6 @@ if resume:
         session.log({"train/loss": loss})
         optimizer.step()
         time.sleep(0.01)
-    session.flush()
     print("stopped stepping again", flush=True)
 
 def stuck_here():
