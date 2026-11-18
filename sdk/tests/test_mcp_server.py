@@ -584,11 +584,11 @@ def test_the_all_ranks_status_says_what_was_checked_for_the_run_and_never_counts
     assert kinds["differs_by_rank"] == {"stalled_weights": {"checked": "0", "not_configured": "1"}}
     assert (kinds["judged_ranks"], kinds["ranks_not_counted"]) == ("0-1", "")
     assert [row["kinds"] for row in status["per_rank"]] == [
-        {"checked": 4, "not_enough_history": 0, "not_configured": 21, "unavailable": 0},
-        {"checked": 3, "not_enough_history": 0, "not_configured": 22, "unavailable": 0},
+        {"checked": 4, "not_enough_history": 0, "not_configured": 22, "unavailable": 0},
+        {"checked": 3, "not_enough_history": 0, "not_configured": 23, "unavailable": 0},
     ]
     assert status["summary"].splitlines()[-1] == (
-        "5 of 32 kinds checked on both ranks, 27 not configured, 1 of them checked on some ranks only"
+        "5 of 33 kinds checked on both ranks, 28 not configured, 1 of them checked on some ranks only"
         " (stalled_weights on rank 0)"
     )
     assert client.call("list_incidents")["kinds"] == kinds
@@ -712,8 +712,8 @@ def test_a_path_that_does_not_exist_is_an_error_until_it_does(start, tmp_path):
     assert kinds["not_enough_history"] == dict.fromkeys(
         ("activation_drift", "dead_activations"), {"records": 30, "records_needed": 60})
     assert not set(kinds["checked"]) & set(kinds["not_enough_history"]) and "history_not_stated" not in kinds
-    assert len(kinds["checked"]) + len(kinds["not_enough_history"]) + len(kinds["not_configured"]) == 32
-    assert (f"{len(kinds['checked']) + 2} of 32 kinds checked, 2 of them without enough history yet"
+    assert len(kinds["checked"]) + len(kinds["not_enough_history"]) + len(kinds["not_configured"]) == 33
+    assert (f"{len(kinds['checked']) + 2} of 33 kinds checked, 2 of them without enough history yet"
             " (activation_drift 30 of 60 records, dead_activations 30 of 60)") in listed["summary"]
     assert client.call("get_series", name="loss")["range"]["end"] == 29
 
@@ -813,7 +813,7 @@ def test_list_runs_gives_the_runs_beside_this_one_by_project(start, kept):
     rows = {row["run_id"]: row for row in listed["runs"]}
     assert (rows["run-2"]["name"], rows["run-2"]["run_state"], rows["run-2"]["first_incident"]) == (
         "after-the-fix", "unhealthy", {"kind": "grad_spike", "step": 40})
-    assert rows["run-1"]["incidents"] == {} and rows["run-1"]["kinds_checked"]["of"] == 32
+    assert rows["run-1"]["incidents"] == {} and rows["run-1"]["kinds_checked"]["of"] == 33
     # No evidence file was written for run-3: nothing is said of it, and that is not "clean".
     assert (rows["run-3"]["run_state"], rows["run-3"]["incidents"], rows["run-3"]["evidence"]["state"]) == (None, None, "missing")
     assert (rows["old-run"]["project"], rows["old-run"]["name"], rows["old-run"]["has_manifest"]) == ("uncategorized", "old-run", False)

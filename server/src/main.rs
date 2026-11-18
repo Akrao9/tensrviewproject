@@ -79,10 +79,11 @@ struct Args {
     #[arg(long)]
     no_detect: bool,
     /// Detector thresholds as one JSON object, for the server's detectors and for `detect`. Keys:
-    /// overload_threshold (0.35), drift_tolerance (1e-6), starve_window (50), starve_ratio (0.1) and
-    /// top_k (null: what the run recorded; a number for every router, or an object of router name
-    /// to number). A key left out keeps the default shown. Refused: an unknown key, a negative or
-    /// non-finite number, a window or top_k below 1. Every report lists the values applied.
+    /// overload_threshold (0.35), drift_tolerance (1e-6), starve_window (50), starve_ratio (0.1),
+    /// update_window (100) and top_k (null: what the run recorded; a number for every router, or an
+    /// object of router name to number). A key left out keeps the default shown. Refused: an unknown
+    /// key, a negative or non-finite number, a window or top_k below 1. Every report lists
+    /// the values applied.
     #[arg(long, global = true, value_name = "JSON", value_parser = Thresholds::parse)]
     thresholds: Option<Thresholds>,
     /// How long a failing request to S3 or GCS is retried before the stream is told the store is unavailable

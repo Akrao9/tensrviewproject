@@ -27,13 +27,15 @@ import tensorquill
 from tensorquill.evidence import THRESHOLD_DEFAULTS, THRESHOLD_NAMES, incident_summary, thresholds_line
 
 # Every one differs from its default (the values of `test_reader_thresholds.APPLIED`).
-APPLIED = {"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": 2}
+APPLIED = {"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": 2,
+           "update_window": 30}
 NAMED = {
     "overload_threshold": "overload_threshold 0.5 (default: 0.35)",
     "drift_tolerance": "drift_tolerance 0.001 (default: 1e-06)",
     "starve_window": "starve_window 20 (default: 50)",
     "starve_ratio": "starve_ratio 0.5 (default: 0.1)",
     "top_k": "top_k 2 (default: what the run recorded)",
+    "update_window": "update_window 30 (default: 100)",
 }
 PREFIX = "Thresholds that are not the defaults: "
 SERVER_LINE = PREFIX + "the server applied " + ", ".join(NAMED[name] for name in THRESHOLD_NAMES) + "."
@@ -105,7 +107,7 @@ def test_only_the_threshold_that_differs_is_named_with_its_value_and_the_default
     assert thresholds_line(one_rank(values, "python")) == f"{PREFIX}the detectors ran here with {NAMED[name]}."
 
 
-def test_all_five_are_named_in_one_line_in_their_usual_order():
+def test_all_six_are_named_in_one_line_in_their_usual_order():
     for evidence in (one_rank(APPLIED), all_ranks(APPLIED)):
         assert thresholds_line(evidence) == SERVER_LINE and "\n" not in SERVER_LINE
         assert incident_summary(evidence).count(PREFIX) == 1
@@ -164,7 +166,7 @@ def test_one_ranks_evidence_from_a_server_with_other_thresholds_says_so_and_at_t
     assert thresholds_line(here) == PREFIX + "the detectors ran here with " + ", ".join(
         NAMED[name] for name in THRESHOLD_NAMES if name != "starve_window") + "."
 
-    # At the defaults, given as nothing and as an empty object: the five are listed and no line is printed.
+    # At the defaults, given as nothing and as an empty object: the six are listed and no line is printed.
     for name, thresholds in (("none", None), ("empty", {})):
         folder = store.judged_by(tmp_path / name, thresholds).incidents_file.parent
         evidence = store.one_look(folder, tmp_path / f"{name}.json")
@@ -249,13 +251,14 @@ def test_the_command_line_prints_the_line_for_every_look_it_reports(tmp_path, st
 
 # --- a local file: the detectors ran here with the options typed -----------------------------------
 #
-# `build_evidence` lists the five it ran with as `thresholds` (the name a server's report gives
+# `build_evidence` lists the six it ran with as `thresholds` (the name a server's report gives
 # them) only when one is not the default, so the line is printed for a local `.jsonl` file and
 # for a store's parts read without `--watch`, and at the defaults the evidence and what is
 # printed are what they were.
 
 FLAGS = {"overload_threshold": "--overload-threshold", "drift_tolerance": "--drift-tolerance",
-         "starve_window": "--starve-window", "starve_ratio": "--starve-ratio", "top_k": "--top-k"}
+         "starve_window": "--starve-window", "starve_ratio": "--starve-ratio", "top_k": "--top-k",
+         "update_window": "--update-window"}
 # Each typed at its default value (`top_k`'s default, what the run recorded, has no value to type).
 TYPED_DEFAULTS = {name: value for name, value in THRESHOLD_DEFAULTS.items() if value is not None}
 ONE_READ_MODES = {"plain": [], "rank": ["--rank", "0"], "compact": ["--compact"]}

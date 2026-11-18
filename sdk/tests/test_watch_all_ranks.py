@@ -173,7 +173,7 @@ def without_count(summary: str) -> list[str]:
     then, so a test whose server has only just started does not fix the count's words; the
     tests of the count itself are at the end of this file and in test_kind_checks.py."""
     *lines, last = summary.splitlines()
-    assert re.match(r"\d+ of 32 kinds checked on (both ranks|all \d+ ranks), ", last), last
+    assert re.match(r"\d+ of 33 kinds checked on (both ranks|all \d+ ranks), ", last), last
     return lines
 
 
@@ -546,7 +546,7 @@ def test_after_a_kill_every_report_stands_and_the_status_is_called_old(tmp_path)
     lines = summary.splitlines()
     assert lines[0].startswith("No incidents detected on any of the 3 ranks")
     # A status that is too old was still read, so the stall kinds count as checked; the run state says `unknown`.
-    assert lines[1] == "6 of 32 kinds checked on all 3 ranks, 26 not configured"
+    assert lines[1] == "6 of 33 kinds checked on all 3 ranks, 27 not configured"
     assert lines[2].startswith("The server's status was last written") and "Nothing is watching this run for stalls" in lines[2]
 
 
@@ -562,7 +562,7 @@ def test_a_stopped_server_qualifies_the_headline(tmp_path):
     assert evidence["watchdog"]["summary"] == "server_stopped"
     assert summary.splitlines() == [
         "No incidents detected on any of the 2 ranks: every rank's report from tensorquill-server is current through step 59.",
-        "6 of 32 kinds checked on both ranks, 26 not configured",
+        "6 of 33 kinds checked on both ranks, 27 not configured",
         "The server has stopped: nothing is watching this run for stalls, and no new steps are stored.",
     ]
 
@@ -728,7 +728,7 @@ def test_a_stall_is_one_run_level_incident_and_the_ranks_are_still_judged(tmp_pa
                         " tensorquill-server is current through step 59.")
     assert lines[1].startswith("Job stalled after step 59: none of 3 ranks has sent a new step") and len(lines) == 4
     assert lines[2] == "By class: observation job_stalled (observations claim no failure and do not make the run unhealthy)"
-    assert lines[3] == "6 of 32 kinds checked on all 3 ranks, 26 not configured"
+    assert lines[3] == "6 of 33 kinds checked on all 3 ranks, 27 not configured"
     assert (stall["class"], evidence["run_state"]["state"]) == ("observation", "unknown")
 
 
@@ -983,7 +983,7 @@ def test_when_every_rank_has_a_different_incident_the_summary_is_still_a_few_lin
     assert lines[2] == "  - rank 0 only: NaN or Inf at step 100 in blk0" and lines[9] == "  - rank 7 only: NaN or Inf at step 107 in blk7"
     assert lines[10] == "  - and 56 more distinct incidents on other ranks (non_finite x56); see incident_groups in the evidence file"
     assert lines[11] == "By class: invariant non_finite"
-    assert re.match(r"\d+ of 32 kinds checked on all 64 ranks, ", lines[12]) and len(lines[12]) < 400, lines[12]
+    assert re.match(r"\d+ of 33 kinds checked on all 64 ranks, ", lines[12]) and len(lines[12]) < 400, lines[12]
     # Common and partial together: ten incidents on every rank and one extra on rank 5 only.
     run = fabricated_run(tmp_path / "g", 64, 2000, template, lambda rank: template["incidents"] + (
         [{"kind": "non_finite", "step": 9, "layers": ["x"], "gradients": []}] if rank == 5 else []))
@@ -1051,8 +1051,8 @@ def test_what_was_checked_is_said_for_the_run_from_the_servers_own_reports(tmp_p
     assert [("kind_counts" in entry(evidence, rank)) for rank in range(4)] == [True, True, True, False]
     assert (entry(evidence, 0)["kind_counts"]["checked"], entry(evidence, 1)["kind_counts"]["checked"]) == (5, 4)
     assert summary.splitlines()[-1] == (
-        "6 of 32 kinds checked on the 3 judged ranks of 4 (rank 3 not judged, so not counted), 1 of them without enough"
-        " history yet (grad_spike 5 of 13 records on rank 2), 26 not configured, 1 of them checked on some ranks only"
+        "6 of 33 kinds checked on the 3 judged ranks of 4 (rank 3 not judged, so not counted), 1 of them without enough"
+        " history yet (grad_spike 5 of 13 records on rank 2), 27 not configured, 1 of them checked on some ranks only"
         " (stalled_weights on rank 0)"
     )
     # The public look and the MCP tool give the same object.

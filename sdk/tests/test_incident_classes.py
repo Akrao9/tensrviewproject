@@ -28,7 +28,7 @@ EXPECTED = {
         "traincheck_violation",
     ],
     "anomaly": [
-        "moe_imbalance", "starved_experts", "grad_spike", "activation_spike", "activation_drift", "dead_activations",
+        "moe_imbalance", "starved_experts", "grad_spike", "update_spike", "activation_spike", "activation_drift", "dead_activations",
         "attention_collapse", "attention_uniform", "attention_logit_growth", "memory_growth", "input_starvation",
     ],
     "observation": [
@@ -51,7 +51,7 @@ def test_every_kind_has_the_class_its_rule_supports():
 
 def test_the_table_has_every_kind_reported_and_no_other():
     every = set(ev.SERVER_KINDS) | STREAM_KINDS | PYTHON_ONLY
-    assert len(every) == 32
+    assert len(every) == 33
     assert set(ev.INCIDENT_CLASSES) == every
 
 

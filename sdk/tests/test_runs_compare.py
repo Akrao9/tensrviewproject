@@ -87,7 +87,7 @@ def test_two_runs_of_one_project_are_listed_under_it_by_name_and_an_older_run_un
         "healthy", 59, {}, None)
     assert (fixed["run_state"], fixed["incidents"], fixed["first_incident"]) == (
         "unhealthy", {"anomaly": 1}, {"kind": "grad_spike", "step": 40})
-    assert fixed["kinds_checked"]["of"] == 32 and 0 < fixed["kinds_checked"]["checked"] < 32
+    assert fixed["kinds_checked"]["of"] == 33 and 0 < fixed["kinds_checked"]["checked"] < 33
     assert (baseline["started"], baseline["has_manifest"], baseline["source"]) == ("2026-11-17T10:00:00Z", True, "local")
     assert baseline["evidence"]["state"] == "current"
     # No manifest: its start is its first record's time.
@@ -339,7 +339,7 @@ def test_a_router_only_run_against_a_full_capture_run_says_what_was_checked_befo
         assert differs[kind] == {"A": "not_configured", "B": "checked"}, kind
     assert "moe_imbalance" not in differs and "starved_experts" not in differs  # both runs watch the router
     assert result["checked"]["ranks_read"] == {"A": 0, "B": 0}
-    assert result["checked"]["same"] + len(differs) == 32
+    assert result["checked"]["same"] + len(differs) == 33
 
     (nan,) = [entry for entry in result["incidents"]["entries"] if entry["kind"] == "non_finite"]
     assert nan["in"] == ["B"] and nan["first_step"] == {"B": 50} and nan["where"]["B"]["layers"] == [layer]
@@ -449,7 +449,7 @@ def test_a_healthy_run_and_a_seeded_run_compare_as_one_incident_in_the_second_on
     assert entry["absent_from"] == {"A": "checked"}, "the healthy run looked, with enough history, and found none"
     assert result["incidents"]["only_in"] == {"A": [], "B": [0]} and result["incidents"]["in_all"] == []
     # The same capture settings, so nothing differs in what was checked; the seed is in the config.
-    assert result["checked"]["differs"] == [] and result["checked"]["same"] == 32
+    assert result["checked"]["differs"] == [] and result["checked"]["same"] == 33
     assert {"field": "config.case", "values": {"A": "healthy", "B": case}} in result["setup"]["differs"]
     assert "3. Incidents: 0 in A only, 1 in B only, 0 in both" in result["summary"]
     assert f"B only: {case} ({entry['class']}), first at B step {step}: parameters {SEEDED}" in result["summary"]
@@ -624,7 +624,7 @@ def test_the_listing_reads_every_ranks_evidence_file_and_a_rank_without_one_is_u
     row = {r["run_id"]: r for r in tensorquill.list_runs(folder)}["two"]
     assert (row["run_state"], row["incidents"], row["first_incident"], row["ranks_with_incidents"]) == (
         "unhealthy", {"anomaly": 1}, {"kind": "grad_spike", "step": 40}, [1])
-    assert row["evidence"]["state"] == "current" and "rank" not in row["kinds_checked"] and row["kinds_checked"]["of"] == 32
+    assert row["evidence"]["state"] == "current" and "rank" not in row["kinds_checked"] and row["kinds_checked"]["of"] == 33
     # A run of one rank is listed as before, with its rank count.
     one = rows["one"]
     assert (one["rank_count"], one["ranks"], one["evidence"]["rank"], one["evidence"]["state"]) == (1, [0], 0, "current")
@@ -750,7 +750,7 @@ def test_runs_of_several_ranks_in_a_store_are_compared_and_listed_from_the_all_r
     assert (rows["run-2"]["rank_count"], rows["run-2"]["incidents"], rows["run-2"]["ranks_with_incidents"]) == (
         2, {"anomaly": 1, "invariant": 1}, [1])
     # What was checked is the whole run's, by the all-ranks rule, and names no rank.
-    assert "rank" not in rows["run-2"]["kinds_checked"] and rows["run-2"]["kinds_checked"]["of"] == 32
+    assert "rank" not in rows["run-2"]["kinds_checked"] and rows["run-2"]["kinds_checked"]["of"] == 33
     view = ev.all_ranks_evidence(store / "runs" / "run-2")
     assert rows["run-2"]["kinds_checked"] == runs_module._kinds_checked(view["kind_checks"])
     assert rows["run-2"]["run_state"] == view["run_state"]["state"] == "unhealthy"
@@ -843,7 +843,7 @@ def test_two_runs_in_a_real_servers_store_are_listed_and_compared_by_name(tmp_pa
     rows = tensorquill.list_runs(store, project="granite")
     assert [(row["name"], row["run_id"], row["source"], row["last_step"]) for row in rows] == [
         ("cheap", "run-1", "store", 39), ("debug", "run-2", "store", 39)]
-    assert all(row["run_state"] in ev.RUN_STATES and row["kinds_checked"]["of"] == 32 for row in rows)
+    assert all(row["run_state"] in ev.RUN_STATES and row["kinds_checked"]["of"] == 33 for row in rows)
     assert rows[0]["kinds_checked"]["checked"] < rows[1]["kinds_checked"]["checked"]
     assert rows[0]["kinds_checked"]["rank"] == 0  # until the all-ranks view says what was checked
     listed = cli("runs", str(store), "--project", "granite", cwd=tmp_path)

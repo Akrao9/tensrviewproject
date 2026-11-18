@@ -64,6 +64,10 @@ PROBE_EVERY = 1000
 # Blocks of `every` steps waiting for the writer thread before training waits for it.
 WRITER_QUEUE = 8
 FOREIGN_STEPS_WARNING = 10  # optimizer steps on other parameters before warning that none was counted
+# Why the update size was not read (`updates=True`), by what it is said about: an optimizer's
+# class name, or one of these two.
+UPDATES_HOOKS_OFF = "auto_step=False"
+UPDATES_NO_OPTIMIZER = "no optimizer"
 # Settings per capture mode. Router load is the always-on signal; layer statistics and
 # gradient and weight norms are a debugging mode, as in Composer's ActivationMonitor,
 # wandb.watch and Lightning's grad_norm.
@@ -692,6 +696,7 @@ class Session:
         replica_params: Any = None,
         system: bool = False,
         data_wait: bool = False,
+        updates: bool = False,
     ) -> None:
         if hasattr(model, "_orig_mod"):
             raise ValueError("call tensorquill.init(model) before torch.compile(model)")
@@ -734,6 +739,7 @@ class Session:
         params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
         self._params = [p for _, p in params]
         self._param_ids = {id(p) for p in self._params}
+        self._param_index = {id(p): index for index, p in enumerate(self._params)}
         self.param_names = [name for name, _ in params]
         # The parameters the cross-GPU drift check compares: every trainable parameter by
         # default (data parallelism), or only the replicated ones under tensor parallelism.
@@ -797,6 +803,18 @@ class Session:
         self._foreign_steps = 0
         self._clip_calls = 0  # lets an outer wrapper see that an inner one already recorded
         self._ring_clip_seen: list[bool] = []
+        # The size of the optimizer's update to each parameter (`updates=True`): its RMS and
+        # whether it was read this step, and the ring. Empty when the option is off.
+        self.updates = bool(updates)
+        self._update = torch.zeros(n_params if self.updates else 0, 2, **f32)
+        self._ring_update = torch.zeros(every, *self._update.shape, **f32)
+        self._update_recorded = False
+        self._ring_update_seen: list[bool] = []
+        # Why an optimizer's update is not read, said once on a record (`update_not_read`), and
+        # what each optimizer seen is: None for one that is read.
+        self._update_why: dict[str, str] = {}
+        self._update_why_written: set[str] = set()
+        self._update_readable: weakref.WeakKeyDictionary[Any, str | None] = weakref.WeakKeyDictionary()
         self._ring_spread: torch.Tensor | None = None
         self._ring_spread_seen: list[int] = []  # columns recorded at each step; 0 if none
         if replica_group is not None and self._replica_params:
@@ -940,8 +958,13 @@ class Session:
         return {"state": "known", "unheld": unheld, "unheld_count": len(unheld)}
 
     def _should_record_grads(self) -> bool:
-        # Weight checks need the step's gradient norms, so they also turn gradients on.
-        return self._cadence(self.grad_every) or self._should_check_weights()
+        # Weight checks need the step's gradient norms, so they also turn gradients on. So does
+        # the update size: its rule reads the rise of the total gradient norm before clipping,
+        # which the record has already when clipping was seen this step (`clip_grad_norm`).
+        return (
+            self._cadence(self.grad_every) or self._should_check_weights()
+            or (self.updates and not self._clip_recorded)
+        )
 
     def _should_check_weights(self) -> bool:
         return self._cadence(self.weight_every)
@@ -1008,6 +1031,10 @@ class Session:
             self._step_depth -= 1
             return
         self._step_depth, self._outer_frame = 0, None
+        if self.updates:
+            # Every optimizer that holds some of this model's parameters, not only the lead: one
+            # that steps after the lead has ended the step is read into the next record.
+            self._read_updates(optimizer)
         if not self._leading:
             return
         if self._grads_after_step and not self._grads_recorded and self._should_record_grads():
@@ -1145,6 +1172,113 @@ class Session:
                 self._prev_weight = current
             else:
                 self._prev_weight.copy_(current)
+
+    def record_updates(self, optimizer: Any) -> None:
+        """Read the size of the update `optimizer` has just applied to each of this model's
+        parameters, for this step's record (`update_rms`). Needs `init(..., updates=True)`.
+
+        Called automatically after every `optimizer.step()` with `auto_step`. Call it yourself
+        after the step with `auto_step=False`. An optimizer that is not Adam or AdamW is not
+        read, and the record says why once (`update_not_read`). It never raises.
+        """
+        if not self.updates:
+            raise RuntimeError("pass updates=True to tensorquill.init to record update sizes")
+        if not self._closed:
+            self._read_updates(optimizer)
+
+    @torch.no_grad()
+    def _read_updates(self, optimizer: Any) -> None:
+        # Adam's update to a parameter, without weight decay, is lr * m_hat / (sqrt(v_hat) + eps)
+        # (torch/optim/adam.py: the single-tensor, foreach and fused paths all apply
+        # `step_size * exp_avg / (sqrt(exp_avg_sq) / sqrt(1 - beta2**t) + eps)` with
+        # `step_size = lr / (1 - beta1**t)`, and amsgrad reads `max_exp_avg_sq` for the second
+        # moment). Both moments are the optimizer's own state after the step, so nothing is kept
+        # of the weights. One parameter at a time: the only temporary is one tensor of that
+        # parameter's size. Every value stays on its device, so no sync is added.
+        try:
+            known = optimizer in self._update_readable
+        except TypeError:  # not hashable or not weakly referenceable: judged each time
+            known = False
+        why = self._update_readable[optimizer] if known else _not_adam(optimizer)
+        name = type(optimizer).__name__
+        if not known:
+            try:
+                self._update_readable[optimizer] = why
+            except TypeError:
+                pass
+        if why is not None:
+            self._update_why.setdefault(name, why)
+            return
+        try:
+            found: list[tuple[int, torch.Tensor]] = []
+            corrections: dict[tuple[float, float, float], tuple[float, float]] = {}
+            for group in optimizer.param_groups:
+                lr, (beta1, beta2), eps = group["lr"], group["betas"], group["eps"]
+                second = "max_exp_avg_sq" if group.get("amsgrad") else "exp_avg_sq"
+                for param in group["params"]:
+                    index = self._param_index.get(id(param))
+                    state = optimizer.state.get(param) if index is not None else None
+                    # Adam leaves a parameter without a gradient alone, so its state is the last
+                    # step's that had one: not this step's update.
+                    if not state or param.grad is None:
+                        continue
+                    first, moment = state["exp_avg"], state[second]
+                    if first.numel() == 0:
+                        continue
+                    if first.is_complex():
+                        first, moment = torch.view_as_real(first), torch.view_as_real(moment)
+                    if first.dtype in _LOW_PRECISION:
+                        first, moment = first.float(), moment.float()
+                    steps = state["step"]
+                    update = torch.sqrt(moment)  # the one temporary
+                    on_device = any(isinstance(v, torch.Tensor) and v.device.type != "cpu" for v in (steps, beta1, beta2))
+                    if not on_device:
+                        # The usual case off the fused and capturable paths: the step count is on the
+                        # CPU, so the bias corrections are plain numbers, worked out once for each count.
+                        count = max(float(steps), 1.0)
+                        key = (count, float(beta1), float(beta2))
+                        if key not in corrections:
+                            corrections[key] = (math.sqrt(1 - key[2] ** count), 1 / (1 - key[1] ** count))
+                        root, first_correction = corrections[key]
+                        # m / (sqrt(v) / root + eps) is root * m / (sqrt(v) + eps * root): one pass fewer.
+                        update.add_(eps * root)
+                        torch.div(first, update, out=update)
+                        rms = torch.linalg.vector_norm(update) * (lr * (root * first_correction / math.sqrt(update.numel())))
+                    else:
+                        # On the device (fused, capturable): tensor arithmetic, so nothing is synced.
+                        if not isinstance(steps, torch.Tensor):
+                            steps = torch.tensor(float(steps))
+                        # At least 1: under a loss scaler the fused step takes its count back when it
+                        # skips, and 1 - beta**0 would divide by zero.
+                        steps = steps.clamp(min=1)
+                        if steps.device.type != "mps":  # float64, as PyTorch works these out; MPS has none
+                            steps = steps.double()
+                        update.div_(((1 - beta2**steps) ** 0.5).to(update.dtype)).add_(eps)
+                        torch.div(first, update, out=update)
+                        norm = torch.linalg.vector_norm(update)
+                        step_size = torch.as_tensor(lr / (1 - beta1**steps)).to(norm.dtype)
+                        rms = norm * step_size / math.sqrt(update.numel())
+                    found.append((index, rms.reshape(())))
+            if not found:
+                return
+            by_device: dict[torch.device, list[tuple[int, torch.Tensor]]] = {}
+            for index, rms in found:
+                by_device.setdefault(rms.device, []).append((index, rms))
+            for items in by_device.values():
+                stacked = torch.stack([rms for _, rms in items]).to(self._update).abs_()
+                self._update.index_copy_(
+                    0, self._index(tuple(index for index, _ in items)),
+                    torch.stack((stacked, torch.ones_like(stacked)), dim=1),
+                )
+            self._update_recorded = True
+        except Exception as error:  # noqa: BLE001
+            # Nothing here may end a training step: a state this cannot read (or no memory for
+            # the temporary) is said once, and that optimizer is not read again.
+            self._update_why.setdefault(name, f"reading its state failed ({_short(error)})")
+            try:
+                self._update_readable[optimizer] = self._update_why[name]
+            except TypeError:
+                pass
 
     @torch.no_grad()
     def record_grad_norm(self, norm: torch.Tensor | float) -> None:
@@ -1417,6 +1551,24 @@ class Session:
             self._clip.zero_()
         self._ring_clip_seen.append(self._clip_recorded)
         self._clip_recorded = False
+        if self.updates:
+            if self._update_recorded:
+                self._ring_update[row].copy_(self._update)
+                self._update.zero_()
+            elif not self.auto_step:
+                self._update_why.setdefault(
+                    UPDATES_HOOKS_OFF,
+                    "the optimizer hooks are off, so call session.record_updates(optimizer) after each optimizer.step()",
+                )
+            elif self._lead is None:
+                # A step ended by `scaler.update()` with no optimizer of this model seen stepping.
+                self._update_why.setdefault(
+                    UPDATES_NO_OPTIMIZER,
+                    "no optimizer that has stepped holds this model's parameters (DeepSpeed ZeRO, Megatron-LM and "
+                    "FSDP1 step flattened or copied parameters), so there is no Adam state to read for them",
+                )
+            self._ring_update_seen.append(self._update_recorded)
+            self._update_recorded = False
         if self._spread_recorded and self._spread is not None and self._ring_spread is not None:
             self._ring_spread[row].copy_(self._spread)
             self._spread.zero_()
@@ -1496,6 +1648,7 @@ class Session:
             self._ring_grad_seen = []
             self._ring_weight_seen = []
             self._ring_clip_seen = []
+            self._ring_update_seen = []
             self._ring_spread_seen = []
             self._ring_data = []
             self._ring_checkpoint = []
@@ -1532,6 +1685,10 @@ class Session:
         )
         clips = _cpu_copy(self._ring_clip[:n]) if any(self._ring_clip_seen) else None
         clip_seen = self._ring_clip_seen
+        update_seen, self._ring_update_seen = self._ring_update_seen, []
+        updates = _cpu_copy(self._ring_update[:n]) if any(update_seen) else None
+        update_why = {name: why for name, why in self._update_why.items() if name not in self._update_why_written}
+        self._update_why_written.update(update_why)
         grad_seen = self._ring_grad_seen
         weight_seen = self._ring_weight_seen
         spread_seen = self._ring_spread_seen
@@ -1562,7 +1719,7 @@ class Session:
         block = (
             steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
             spread_seen, scalars, probes, stamps, amps, data_rows, checkpoints, waits, system,
-            refused, announce,
+            refused, announce, updates, update_seen, update_why,
         )
         try:
             self._queue.put_nowait(block)
@@ -1709,6 +1866,9 @@ class Session:
         system: dict[str, Any] | None = None,
         refused: Mapping[str, str] | None = None,
         announce: Mapping[str, str] | None = None,
+        updates: torch.Tensor | None = None,
+        update_seen: list[bool] | None = None,
+        update_why: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
         split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
@@ -1725,6 +1885,7 @@ class Session:
         spread_rows = (
             spreads.reshape(n, len(self.replica_names), FINGERPRINT_WIDTH).tolist() if spreads is not None else None
         )
+        update_rows = updates.reshape(n, n_params, 2).tolist() if updates is not None and n_params > 0 else None
         moe: dict[str, list[list[int]]] = {}
         offset = 0
         for name, spec in self._routers.items():
@@ -1773,6 +1934,10 @@ class Session:
                     ]
             if clips is not None and clip_seen[i]:
                 record["clip_grad_norm"] = math.sqrt(float(clips[i]))
+            if update_rows is not None and update_seen and update_seen[i]:
+                # The RMS of the optimizer's update to each parameter it stepped (weight decay
+                # left out): the L2 norm of the update over the square root of its size.
+                record["update_rms"] = {name: rms for name, (rms, seen) in zip(self.param_names, update_rows[i]) if seen}
             if lrs[i] is not None:
                 record["lr"] = lrs[i]
             if amps is not None and amps[i]:
@@ -1808,6 +1973,10 @@ class Session:
             # Once per router and session: the reason it is not counted, so a reader of the
             # records (the evidence, the server) can say MoE was not checked for it.
             records[0]["moe_refused"] = dict(announce)
+        if update_why and records:
+            # Once for each: why an optimizer's update size is not in these records, so a reader
+            # can say the update size was not checked, and not that nothing was found.
+            records[0]["update_not_read"] = dict(update_why)
         if system and records:
             records[-1]["system"] = system
         return records
@@ -1883,6 +2052,27 @@ def _router_stats(counts: list[int]) -> dict[str, Any]:
     }
 
 
+def _not_adam(optimizer: Any) -> str | None:
+    """Why `optimizer`'s update size cannot be read from its state, or None for Adam and AdamW.
+
+    Only `torch.optim.Adam` and `torch.optim.AdamW` are read, and a subclass of either that
+    leaves the step alone: the update is worked out from the two moments by Adam's formula,
+    so an optimizer that keeps other state, or steps another way, would be misread.
+    """
+    name = type(optimizer).__name__
+    for cls in type(optimizer).__mro__:
+        if cls is torch.optim.Adam:
+            return None
+        if cls is not torch.optim.AdamW and any(method in vars(cls) for method in ("step", "_init_group")):
+            break
+    if isinstance(optimizer, torch.optim.Adam):
+        return f"{name} changes Adam's step, so its update is not known to be Adam's"
+    return (
+        f"{name} is not Adam or AdamW: the update size is worked out from the two moments Adam keeps "
+        "(exp_avg and exp_avg_sq), which this optimizer does not have"
+    )
+
+
 def _learning_rates(optimizer: Any) -> list[float] | None:
     # A tensor learning rate on the GPU (capturable optimizers) would need a device sync
     # to read, so it is left out rather than stalling the step.
@@ -1944,6 +2134,7 @@ def init(
     endpoint: str | None = None,
     system: bool = False,
     data_wait: bool = False,
+    updates: bool = False,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -2041,6 +2232,14 @@ def init(
             `DataLoader`s during training as `data_wait`, with `step_time`, on each step
             (`session.watch_loaders()`). The Hugging Face and Lightning callbacks turn it
             on. For other loaders wrap them: `session.time_data(loader)`.
+        updates: record the size of the optimizer's update to each parameter on every step,
+            as `update_rms`: the RMS of `lr * m_hat / (sqrt(v_hat) + eps)`, read from Adam's or
+            AdamW's own state right after the step, with no copy of the weights (weight decay
+            is not part of it). The `update_spike` rule reads it. Off by default: it reads
+            every parameter's two moment tensors on every step, and that cost is not measured
+            on a GPU. It also records the total gradient norm on every step, which the rule
+            needs (per-parameter gradient norms, unless clipping was seen that step). Any
+            other optimizer is not read, and the evidence says so (`not_checked`).
     """
     mode = capture if capture is not None else ("routers" if routers else "full")
     if mode not in CAPTURE_MODES:
@@ -2105,6 +2304,7 @@ def init(
         replica_params=replica_params,
         system=system,
         data_wait=data_wait,
+        updates=updates,
     )
     session.manifest = run_manifest  # the run manifest rank 0 wrote; None on every other rank
     return session

@@ -87,6 +87,11 @@ pub const SPIKE_MIN_HISTORY: usize = 10;
 /// Recorded steps in a row a parameter must stay at `SPIKE_FACTOR` times its own median to be
 /// reported on its own; a single such step is ordinary (see `SPIKE_SUSTAIN` in `evidence.py`).
 pub const SPIKE_SUSTAIN: u32 = 3;
+/// `update_spike` (Altenbernd et al., arXiv 2604.00726, eq. 13): the sensitivity, and how many
+/// of the last unflagged step-to-step changes of the largest RMS update make the baseline (the
+/// `update_window` option).
+pub const UPDATE_ALPHA: f64 = 0.05;
+pub const UPDATE_WINDOW: usize = 100;
 pub const ACT_SPIKE_FACTOR: f64 = 5.0;
 pub const ACT_WINDOW: usize = 50;
 pub const ACT_MIN_HISTORY: usize = 10;
@@ -114,10 +119,11 @@ const ATTN_MODULES: usize = 20;
 /// that the GPU memory, NVML and data-wait kinds (`detect/system.rs`) come between
 /// `non_finite` and `replica_drift`, as in [`RankDetectors::incidents`]. Python's
 /// cross-rank `memory_imbalance` is not here: the detectors see one rank at a time.
-pub const PORTED: [&str; 25] = [
+pub const PORTED: [&str; 26] = [
     "moe_imbalance",
     "starved_experts",
     "grad_spike",
+    "update_spike",
     "stalled_weights",
     "repeated_steps",
     "loss_scale_trouble",
@@ -148,10 +154,11 @@ pub const NOT_PORTED: [&str; 3] = ["collective_hang", "collective_desync", "trai
 /// `test_incident_classes.py` holds the two identical): `invariant` (should never happen, by a
 /// fixed rule), `anomaly` (judged against the run's own baseline) or `observation` (context that
 /// claims no failure). Every kind either language reports, the server's or not, is here.
-pub const INCIDENT_CLASSES: [(&str, &str); 32] = [
+pub const INCIDENT_CLASSES: [(&str, &str); 33] = [
     ("moe_imbalance", "anomaly"),
     ("starved_experts", "anomaly"),
     ("grad_spike", "anomaly"),
+    ("update_spike", "anomaly"),
     ("stalled_weights", "invariant"),
     ("repeated_steps", "invariant"),
     ("loss_scale_trouble", "invariant"),
@@ -202,9 +209,10 @@ pub fn with_classes(incidents: &mut [Value]) {
 
 /// What each input count counts, as a report names it under `needs`: `INPUT_NEEDS` in
 /// `evidence.py`, which is the reference.
-pub const INPUT_NEEDS: [(&str, &str); 15] = [
+pub const INPUT_NEEDS: [(&str, &str); 16] = [
     ("moe", "moe: a router's expert counts"),
     ("grad_total", "grad_norm or clip_grad_norm"),
+    ("update", "update_rms with grad_norm or clip_grad_norm (updates=True)"),
     ("weight_check", "weights_unchanged with grad_norms (full capture)"),
     ("steps", "step records"),
     ("loss_scale", "step_skipped (scaler=)"),
@@ -222,10 +230,11 @@ pub const INPUT_NEEDS: [(&str, &str); 15] = [
 
 /// The input each kind of [`PORTED`] is judged from, in that order: `KIND_INPUTS` in
 /// `evidence.py` (`test_kind_checks.py` holds the two identical).
-pub const KIND_INPUTS: [(&str, &str); 25] = [
+pub const KIND_INPUTS: [(&str, &str); 26] = [
     ("moe_imbalance", "moe"),
     ("starved_experts", "moe"),
     ("grad_spike", "grad_total"),
+    ("update_spike", "update"),
     ("stalled_weights", "weight_check"),
     ("repeated_steps", "steps"),
     ("loss_scale_trouble", "loss_scale"),
@@ -255,13 +264,15 @@ pub const KIND_INPUTS: [(&str, &str); 25] = [
 /// reference and gives the definition and each kind's rules: for each rule of the kind, the
 /// fewest rows it can report an incident on, and the kind needs the largest of those. A kind
 /// with one rule and no warm-up needs 1. `starved_experts` needs the window a run is judged
-/// with ([`records_needed`]).
-pub const RECORDS_NEEDED: [(&str, u64); 25] = [
+/// with and `update_spike` the baseline it is judged with ([`records_needed`]).
+pub const RECORDS_NEEDED: [(&str, u64); 26] = [
     // The diversity drop of a top-k router (k >= 3): its earlier samples and the one judged.
     ("moe_imbalance", OVERLOAD_MIN_HISTORY as u64 + 1),
     ("starved_experts", STARVE_WINDOW as u64),
     // One parameter: its earlier norms, then `SPIKE_SUSTAIN` in a row (the total needs 11).
     ("grad_spike", SPIKE_MIN_HISTORY as u64 + SPIKE_SUSTAIN as u64),
+    // One row to compare the first with, the changes that make the first baseline, and the one judged.
+    ("update_spike", UPDATE_WINDOW as u64 + 2),
     ("stalled_weights", STALL_STEPS as u64),
     ("repeated_steps", 1),
     // Skips in a row (a scale below the floor needs 1).
@@ -292,16 +303,29 @@ pub const RECORDS_NEEDED: [(&str, u64); 25] = [
 ];
 
 /// [`RECORDS_NEEDED`] for one kind as a run applies it: `starved_experts` needs the
-/// `starve_window` the run is judged with, every other kind its constant.
+/// `starve_window` the run is judged with, `update_spike` its `update_window` and two rows
+/// more, every other kind its constant.
 pub fn records_needed(kind: &str, thresholds: &Thresholds) -> u64 {
     if kind == "starved_experts" {
         return thresholds.starve_window as u64;
+    }
+    if kind == "update_spike" {
+        return thresholds.update_window as u64 + 2;
     }
     RECORDS_NEEDED
         .iter()
         .find(|(known, _)| *known == kind)
         .map_or(1, |(_, needed)| *needed)
 }
+
+/// What a kind's clean check does not show, said in its `kind_checks` entry as `note` when the
+/// kind is `checked`: `KIND_NOTES` in `evidence.py`, which is the reference.
+pub const KIND_NOTES: [(&str, &str); 1] = [(
+    "replica_drift",
+    "equal replicas do not rule out silent data corruption: a corrupted gradient is reduced with the others \
+     and the same wrong result goes back to every rank, so the replicas stay equal (SCOUT, arXiv 2608.11034, \
+     pp. 1 and 3)",
+)];
 
 /// The kinds a `not_checked` entry stands for when it lists none itself.
 const CHECK_KINDS: [(&str, &str); 3] = [
@@ -319,7 +343,7 @@ pub enum TopK {
 }
 
 /// The detector options a run can set: `build_evidence`'s `overload_threshold`,
-/// `drift_tolerance`, `starve_window`, `starve_ratio` and `top_k`. The default is the value
+/// `drift_tolerance`, `starve_window`, `starve_ratio`, `top_k` and `update_window`. The default is the value
 /// each rule has always applied. They arrive as one JSON object, on `tensorquill-server
 /// --thresholds` for the server's detectors and on `tensorquill-server detect --thresholds`.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -335,6 +359,9 @@ pub struct Thresholds {
     pub starve_ratio: f64,
     /// Experts chosen per token, in place of the recorded `moe_top_k`.
     pub top_k: Option<TopK>,
+    /// How many of the last unflagged step-to-step changes of the update size make the baseline
+    /// of `update_spike`.
+    pub update_window: usize,
 }
 
 impl Default for Thresholds {
@@ -345,6 +372,7 @@ impl Default for Thresholds {
             starve_window: STARVE_WINDOW,
             starve_ratio: STARVE_RATIO,
             top_k: None,
+            update_window: UPDATE_WINDOW,
         }
     }
 }
@@ -352,7 +380,7 @@ impl Default for Thresholds {
 impl Thresholds {
     /// Reads the JSON object given on the command line. A key left out keeps its default
     /// and `"top_k": null` means the recorded value. Refused: anything but an object, a key
-    /// that is not one of the five, a value of the wrong type, a number that is negative or
+    /// that is not one of the six, a value of the wrong type, a number that is negative or
     /// not finite, a window below 1 and a `top_k` below 1.
     pub fn parse(text: &str) -> Result<Self, String> {
         let value: Value = serde_json::from_str(text).map_err(|error| format!("not JSON: {error}"))?;
@@ -374,6 +402,9 @@ impl Thresholds {
         }
         if thresholds.starve_window < 1 {
             return Err("starve_window must be at least 1".to_string());
+        }
+        if thresholds.update_window < 1 {
+            return Err("update_window must be at least 1".to_string());
         }
         let chosen: Vec<i64> = match &thresholds.top_k {
             None => Vec::new(),
@@ -412,6 +443,8 @@ impl Thresholds {
             "spike_factor": SPIKE_FACTOR,
             "spike_window": SPIKE_WINDOW,
             "spike_sustain": SPIKE_SUSTAIN,
+            "update_window": self.update_window,
+            "update_alpha": UPDATE_ALPHA,
             "activation_spike_factor": ACT_SPIKE_FACTOR,
             "activation_drift_factor": ACT_DRIFT_FACTOR,
             "activation_dead_rise": ACT_DEAD_RISE,
@@ -673,6 +706,9 @@ struct Columns<'a> {
     replica_spread_values: Option<&'a Float64Array>,
     extra: Option<&'a StringArray>,
     grad_norms: Option<MapColumn<'a, Float64Array>>,
+    /// The RMS of the optimizer's update to each parameter. A sender from before the column
+    /// has none, and `update_spike` is then not configured.
+    update_rms: Option<MapColumn<'a, Float64Array>>,
     scalars: Option<MapColumn<'a, Float64Array>>,
     moe_top_k: Option<MapColumn<'a, Int32Array>>,
     moe_counts: Option<MapColumn<'a, ListArray>>,
@@ -706,6 +742,7 @@ impl<'a> Columns<'a> {
             clip_grad_norm: column(batch, "clip_grad_norm"),
             step_skipped: column(batch, "step_skipped"),
             grad_norms: MapColumn::new(batch, "grad_norms"),
+            update_rms: MapColumn::new(batch, "update_rms"),
             scalars: MapColumn::new(batch, "scalars"),
             moe_top_k: MapColumn::new(batch, "moe_top_k"),
             moe_counts: moe_counts.filter(|_| moe_count_values.is_some()),
@@ -1730,6 +1767,175 @@ impl Gradients {
             first["spike_steps"] = json!(self.spike_steps);
             out.push(first);
         }
+    }
+}
+
+// --- update_spike --------------------------------------------------------------------------
+
+/// The last row that could be judged: what the next one is compared with.
+struct UpdateRow {
+    attempt: i64,
+    largest: f64,
+    total: f64,
+    own: Vec<(String, f64)>,
+}
+
+/// Python's `detect_update_spikes` and `update_not_read_not_checked`.
+#[derive(Default)]
+struct Updates {
+    /// Whether any record so far had `clip_grad_norm`; the total is read from it from then on.
+    clips: bool,
+    before: Option<UpdateRow>,
+    /// The last `update_window` changes that were not flagged.
+    recent: VecDeque<f64>,
+    first: Option<Value>,
+    spikes: u64,
+    spike_steps: Vec<i64>,
+    /// How many rows carried `update_rms` and a gradient total: the `update` input count.
+    carried: u64,
+    /// Optimizers whose update size the capture could not read (`update_not_read`, said once
+    /// on a record), each with the first step it was said on and why.
+    not_read: BTreeMap<String, (i64, String)>,
+}
+
+impl Updates {
+    fn row(&mut self, attempt: i64, step: i64, columns: &Columns, row: usize, window: usize) {
+        // `update_not_read` travels in `extra_json`, which is parsed only on a row that names it.
+        if let Some(extra) = text(columns.extra, row).filter(|extra| extra.contains("\"update_not_read\"")) {
+            let extra: Option<Value> = serde_json::from_str(extra).ok();
+            if let Some(said) = extra
+                .as_ref()
+                .and_then(|extra| extra.get("update_not_read"))
+                .and_then(Value::as_object)
+            {
+                for (name, why) in said {
+                    let why = why.as_str().map_or_else(|| why.to_string(), str::to_owned);
+                    self.not_read.entry(name.clone()).or_insert((step, why));
+                }
+            }
+        }
+        if !self.clips && value(columns.clip_grad_norm, row).is_some() {
+            // As for `grad_spike`: the pre-clipping norm is the total for the whole run once
+            // any record has it, and the records before clipping began have none.
+            self.clips = true;
+            self.before = None;
+            self.recent.clear();
+            self.first = None;
+            self.spikes = 0;
+            self.spike_steps.clear();
+        }
+        let Some(sizes) = &columns.update_rms else { return };
+        let entries = sizes.row(row);
+        let either = value(columns.grad_norm, row).is_some() || value(columns.clip_grad_norm, row).is_some();
+        self.carried += u64::from(either && !entries.is_empty());
+        if flag(columns.step_skipped, row) {
+            return; // the loss scaler skipped the step: the optimizer's state did not move
+        }
+        let total = value(
+            if self.clips {
+                columns.clip_grad_norm
+            } else {
+                columns.grad_norm
+            },
+            row,
+        );
+        let Some(total) = total.filter(|total| total.is_finite()) else {
+            return;
+        };
+        let own: Vec<(String, f64)> = entries
+            .filter(|entry| !sizes.values.is_null(*entry) && sizes.values.value(*entry).is_finite())
+            .map(|entry| (sizes.keys.value(entry).to_owned(), sizes.values.value(entry)))
+            .collect();
+        if own.is_empty() {
+            return;
+        }
+        let largest = own.iter().map(|(_, size)| *size).fold(f64::NEG_INFINITY, f64::max);
+        if let Some(before) = self.before.as_ref().filter(|before| before.attempt == attempt) {
+            let (change, rise) = ((largest - before.largest).abs(), (total - before.total).max(0.0));
+            if self.recent.len() < window {
+                self.recent.push_back(change);
+            } else {
+                // The mean of the last `window` unflagged changes, summed as Python's `fsum` sums.
+                let baseline = fsum(self.recent.iter().copied()) / window as f64;
+                let threshold = (rise > 0.0 && baseline > 0.0).then(|| baseline / (UPDATE_ALPHA * rise.sqrt()));
+                if let Some(threshold) = threshold.filter(|threshold| change > *threshold) {
+                    self.spikes += 1;
+                    if self.spike_steps.len() < 20 {
+                        self.spike_steps.push(step);
+                    }
+                    if self.first.is_none() {
+                        let mut moved: Vec<(f64, &str, f64, f64)> = own
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(at, (name, size))| {
+                                let was = match before.own.get(at) {
+                                    Some((known, was)) if known == name => Some(*was),
+                                    _ => before.own.iter().find(|(known, _)| known == name).map(|(_, was)| *was),
+                                }?;
+                                Some(((size - was).abs(), name.as_str(), *size, was))
+                            })
+                            .collect();
+                        moved.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+                        let parameters: Vec<Value> = moved
+                            .iter()
+                            .take(10)
+                            .map(|(change, name, size, was)| {
+                                json!({"name": name, "update_rms": size, "previous": was, "change": change})
+                            })
+                            .collect();
+                        self.first = Some(json!({
+                            "kind": "update_spike",
+                            "step": step,
+                            "update_rms": largest,
+                            "previous": before.largest,
+                            "change": change,
+                            "baseline": baseline,
+                            "threshold": threshold,
+                            "grad_norm": total,
+                            "grad_norm_before": before.total,
+                            "grad_rise": rise,
+                            "parameters": parameters,
+                        }));
+                    }
+                } else {
+                    // Every change that is not flagged joins the baseline, whether or not the
+                    // gradient norm rose; a flagged one never does.
+                    self.recent.pop_front();
+                    self.recent.push_back(change);
+                }
+            }
+        }
+        self.before = Some(UpdateRow {
+            attempt,
+            largest,
+            total,
+            own,
+        });
+    }
+
+    fn incidents(&self, out: &mut Vec<Value>) {
+        if let Some(mut first) = self.first.clone() {
+            first["spike_count"] = json!(self.spikes);
+            first["spike_steps"] = json!(self.spike_steps);
+            out.push(first);
+        }
+    }
+
+    /// The `update_size` entry of `not_checked`: Python's `update_not_read_not_checked`.
+    fn not_read_not_checked(&self) -> Option<Value> {
+        let step = self.not_read.values().map(|(step, _)| *step).min()?;
+        let reason: Vec<String> = self
+            .not_read
+            .iter()
+            .map(|(name, (_, why))| format!("{name}: {why}"))
+            .collect();
+        Some(json!({
+            "check": "update_size",
+            "kinds": ["update_spike"],
+            "optimizers": self.not_read.keys().collect::<Vec<_>>(),
+            "reason": reason.join("; "),
+            "step": step,
+        }))
     }
 }
 
@@ -2980,6 +3186,7 @@ impl Inputs {
 pub struct RankDetectors {
     moe: Moe,
     gradients: Gradients,
+    updates: Updates,
     stalled: Stalled,
     loss_scale: LossScale,
     activations: Activations,
@@ -3060,6 +3267,8 @@ impl RankDetectors {
             self.inputs.row(&columns, row, !layers.is_empty(), data.is_some());
             self.moe.row(step, &columns, row, &self.thresholds);
             self.gradients.row(step, &columns, row, &mut self.scalars);
+            self.updates
+                .row(self.attempt, step, &columns, row, self.thresholds.update_window);
             self.stalled.row(step, &columns, row);
             self.loss_scale.row(step, &columns, row);
             self.activations.row(step, layers);
@@ -3087,6 +3296,7 @@ impl RankDetectors {
                         self.moe.first.as_mut(),
                         None, // starved experts: several steps make up the one incident
                         self.gradients.first.as_mut(),
+                        self.updates.first.as_mut(),
                         self.stalled.first.as_mut(),
                         self.loss_scale.first.as_mut(),
                         self.non_finite.first.as_mut(),
@@ -3143,15 +3353,16 @@ impl RankDetectors {
         self.observe(batch);
     }
 
-    /// Which incidents exist: MoE imbalance, starved experts, a gradient spike, stalled
-    /// weights, loss-scale trouble, a non-finite value and replica drift, and how many
-    /// activation kinds.
-    fn reported(&self) -> ([bool; 7], usize) {
+    /// Which incidents exist: MoE imbalance, starved experts, a gradient spike, an update
+    /// spike, stalled weights, loss-scale trouble, a non-finite value and replica drift, and
+    /// how many activation kinds.
+    fn reported(&self) -> ([bool; 8], usize) {
         (
             [
                 self.moe.first.is_some(),
                 !self.moe.starved.is_empty(),
                 self.gradients.first.is_some(),
+                self.updates.first.is_some(),
                 self.stalled.first.is_some(),
                 self.loss_scale.first.is_some(),
                 self.non_finite.first.is_some(),
@@ -3188,6 +3399,7 @@ impl RankDetectors {
         let mut out = Vec::new();
         self.moe.incidents(&mut out);
         self.gradients.incidents(&mut out);
+        self.updates.incidents(&mut out);
         self.stalled.incidents(&mut out);
         self.attempts.incidents(true, &mut out);
         self.loss_scale.incidents(&mut out);
@@ -3230,16 +3442,18 @@ impl RankDetectors {
         out.extend(self.attention.probe_not_checked());
         self.system.not_checked(&mut out);
         out.extend(self.moe.refused_not_checked());
+        out.extend(self.updates.not_read_not_checked());
         out
     }
 
     /// How many rows carried each input, in the order of [`INPUT_NEEDS`]: Python's
     /// `input_counts`, over the rows that count.
-    fn input_counts(&self) -> [u64; 15] {
+    fn input_counts(&self) -> [u64; 16] {
         let [cuda, nvml, data_wait] = self.system.inputs();
         [
             self.moe.judged_rows,
             self.inputs.grad_total,
+            self.updates.carried,
             self.inputs.weight_check,
             self.rows,
             self.loss_scale.recorded,
@@ -3287,7 +3501,7 @@ impl RankDetectors {
                     .iter()
                     .any(|(check, stands_for)| item["check"] == *check && *stands_for == kind),
             };
-            let entry = match not_checked.iter().find(names) {
+            let mut entry = match not_checked.iter().find(names) {
                 Some(item) => json!({
                     "value": "unavailable", "records": records, "records_needed": needed,
                     "enough_history": enough, "needs": needs,
@@ -3298,6 +3512,12 @@ impl RankDetectors {
                     "records": records, "records_needed": needed, "enough_history": enough, "needs": needs,
                 }),
             };
+            if let Some((_, note)) = KIND_NOTES
+                .iter()
+                .find(|(noted, _)| *noted == kind && entry["value"] == "checked")
+            {
+                entry["note"] = json!(note);
+            }
             checks.insert(kind.to_string(), entry);
         }
         Value::Object(checks)
@@ -3597,6 +3817,7 @@ mod tests {
             (0.35, 1e-6, 50, 0.1)
         );
         assert_eq!(usual.top_k, None);
+        assert_eq!(usual.update_window, 100);
         let applied = usual.applied();
         assert_eq!(applied["overload_threshold"], 0.35);
         assert_eq!(applied["drift_tolerance"], 1e-6);
@@ -3610,6 +3831,10 @@ mod tests {
             (&applied["spike_sustain"], &applied["input_window"]),
             (&json!(3), &json!(20))
         );
+        assert_eq!(
+            (&applied["update_window"], &applied["update_alpha"]),
+            (&json!(100), &json!(0.05))
+        );
         // One key changes only itself, and a null top_k is the recorded value.
         let one = Thresholds::parse(r#"{"starve_window": 10, "top_k": null}"#).unwrap();
         let expected = Thresholds {
@@ -3620,9 +3845,9 @@ mod tests {
     }
 
     #[test]
-    fn thresholds_take_each_of_the_five_keys_and_list_what_was_applied() {
+    fn thresholds_take_each_of_the_six_keys_and_list_what_was_applied() {
         let text = r#"{"overload_threshold": 1, "drift_tolerance": 0.001, "starve_window": 20,
-                       "starve_ratio": 0.25, "top_k": 2}"#;
+                       "starve_ratio": 0.25, "top_k": 2, "update_window": 30}"#;
         let all = Thresholds::parse(text).unwrap();
         assert_eq!(all.overload_threshold, 1.0); // a whole number is a number
         assert_eq!((all.top_k_for("any"), all.top_k_for("other")), (Some(2), Some(2)));
@@ -3633,6 +3858,7 @@ mod tests {
             ("starve_window", json!(20)),
             ("starve_ratio", json!(0.25)),
             ("top_k", json!(2)),
+            ("update_window", json!(30)),
         ] {
             assert_eq!(applied[name], value, "{name}");
         }
@@ -3666,6 +3892,9 @@ mod tests {
             (r#"{"starve_window": 0}"#, "starve_window must be at least 1"),
             (r#"{"starve_window": 2.5}"#, "invalid type"),
             (r#"{"starve_window": -1}"#, "invalid value"),
+            (r#"{"update_window": 0}"#, "update_window must be at least 1"),
+            (r#"{"update_window": 2.5}"#, "invalid type"),
+            (r#"{"update_alpha": 0.1}"#, "unknown field `update_alpha`"), // listed in a report, but not an option
             (r#"{"top_k": 0}"#, "top_k must be at least 1, got 0"),
             (r#"{"top_k": {"a": 2, "b": -1}}"#, "top_k must be at least 1, got -1"),
             (r#"{"top_k": "two"}"#, "TopK"),
@@ -4024,8 +4253,8 @@ mod tests {
         let kinds: Vec<&str> = RECORDS_NEEDED.iter().map(|(kind, _)| *kind).collect();
         assert_eq!(kinds, PORTED);
         // By hand from the rules, not from the constants: evidence.py lists each kind's rules.
-        let by_hand: [u64; 25] = [
-            11, 50, 13, 3, 1, 10, 1, 1, 1, 4, 4, 11, 60, 60, 4, 4, 4, 1, 1, 6, 1, 1, 2, 1, 21,
+        let by_hand: [u64; 26] = [
+            11, 50, 13, 102, 3, 1, 10, 1, 1, 1, 4, 4, 11, 60, 60, 4, 4, 4, 1, 1, 6, 1, 1, 2, 1, 21,
         ];
         for ((kind, needed), expected) in RECORDS_NEEDED.iter().zip(by_hand) {
             assert_eq!(*needed, expected, "{kind}");
@@ -4034,6 +4263,9 @@ mod tests {
         let narrow = Arc::new(Thresholds::parse(r#"{"starve_window": 7}"#).unwrap());
         assert_eq!(records_needed("starved_experts", &narrow), 7);
         assert_eq!(records_needed("moe_imbalance", &narrow), 11);
+        let short = Arc::new(Thresholds::parse(r#"{"update_window": 30}"#).unwrap());
+        assert_eq!(records_needed("update_spike", &short), 32);
+        assert_eq!(records_needed("starved_experts", &short), 50);
         let rows: Vec<MoeRow> = (0..7).map(|step| (1, step, vec![("a", vec![40, 40])])).collect();
         let checks = judge(0, &[moe_rows(&rows, 1)], &narrow).unwrap().kind_checks();
         assert_eq!(checks["starved_experts"]["records_needed"], 7);
@@ -4090,7 +4322,7 @@ mod tests {
         let checks = detectors.kind_checks();
         assert_eq!(checks.as_object().unwrap().len(), PORTED.len());
         assert_eq!(values(&checks, "checked"), ["repeated_steps"]);
-        assert_eq!(values(&checks, "not_configured").len(), 24);
+        assert_eq!(values(&checks, "not_configured").len(), 25);
         assert_eq!(
             checks["repeated_steps"],
             json!({
@@ -4256,6 +4488,152 @@ mod tests {
         assert!(error.contains("no rows"), "{error}");
         let error = detect_stream(&b"{\"step\": 0}\n"[..], &usual()).err().unwrap();
         assert!(error.contains("not an Arrow IPC stream"), "{error}");
+    }
+
+    /// A step, its total gradient norm and each parameter's update RMS.
+    type UpdateTestRow<'a> = (i64, f64, &'a [(&'a str, f64)]);
+
+    /// Rows with a total gradient norm, each parameter's update RMS and, when given, what the
+    /// capture said it could not read (`extra_json`).
+    fn update_rows(rows: &[UpdateTestRow], extra: &[Option<&str>]) -> RecordBatch {
+        use arrow::array::{Float64Builder, MapBuilder, StringBuilder};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let mut sizes = MapBuilder::new(None, StringBuilder::new(), Float64Builder::new());
+        for (_, _, own) in rows {
+            for (name, size) in own.iter() {
+                sizes.keys().append_value(name);
+                sizes.values().append_value(*size);
+            }
+            sizes.append(!own.is_empty()).unwrap();
+        }
+        let sizes = sizes.finish();
+        let schema = Schema::new(vec![
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("rank", DataType::Int32, false),
+            Field::new("attempt", DataType::Int64, false),
+            Field::new("step", DataType::Int64, false),
+            Field::new("grad_norm", DataType::Float64, true),
+            Field::new("update_rms", sizes.data_type().clone(), true),
+            Field::new("extra_json", DataType::Utf8, true),
+        ]);
+        let said = |at: usize| extra.get(at).copied().flatten();
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|_| "run"))),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|_| 0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|_| 1))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(Float64Array::from_iter_values(rows.iter().map(|row| row.1))),
+                Arc::new(sizes),
+                Arc::new(StringArray::from(
+                    (0..rows.len()).map(said).collect::<Vec<Option<&str>>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_update_spike_is_a_jump_past_the_baseline_on_a_step_whose_gradient_norm_rose() {
+        let short = Arc::new(Thresholds::parse(r#"{"update_window": 4}"#).unwrap());
+        // Six rows: one to compare the first with, four changes of 0.001 that make the first
+        // baseline, and a fifth that is judged, not flagged, and takes the oldest one's place.
+        let quiet: [(&str, f64); 2] = [("a", 0.010), ("b", 0.002)];
+        let other: [(&str, f64); 2] = [("a", 0.011), ("b", 0.002)];
+        let jumped: [(&str, f64); 2] = [("a", 0.011), ("b", 0.300)];
+        let rows: Vec<UpdateTestRow> = (0..6)
+            .map(|step| (step, 1.0, if step % 2 == 0 { &quiet[..] } else { &other[..] }))
+            .collect();
+        assert!(judge(0, &[update_rows(&rows, &[])], &short)
+            .unwrap()
+            .incidents()
+            .is_empty());
+        // The jump with a gradient norm that fell is not flagged; with one that rose it is.
+        let mut fell = rows.clone();
+        fell.push((6, 0.5, &jumped[..]));
+        assert!(judge(0, &[update_rows(&fell, &[])], &short)
+            .unwrap()
+            .incidents()
+            .is_empty());
+        let mut rose = rows.clone();
+        rose.push((6, 5.0, &jumped[..]));
+        // The fall back at step 7, with no rise in the norm, is not flagged and joins the baseline:
+        // it raises it, and the same jump at step 8 is then under the limit.
+        rose.push((7, 1.0, &quiet[..]));
+        rose.push((8, 5.0, &jumped[..]));
+        let detectors = judge(0, &[update_rows(&rose, &[])], &short).unwrap();
+        let incidents = detectors.incidents();
+        assert_eq!(incidents.len(), 1, "{incidents:?}");
+        let found = &incidents[0];
+        assert_eq!(
+            (&found["kind"], &found["class"], &found["step"]),
+            (&json!("update_spike"), &json!("anomaly"), &json!(6))
+        );
+        // The limit is baseline / (alpha * sqrt(rise)) = 0.001 / (0.05 * 2) = 0.01.
+        assert!((found["baseline"].as_f64().unwrap() - 0.001).abs() < 1e-12);
+        assert!((found["threshold"].as_f64().unwrap() - 0.01).abs() < 1e-12);
+        assert_eq!(
+            (&found["grad_rise"], &found["spike_steps"], &found["spike_count"]),
+            (&json!(4.0), &json!([6]), &json!(1))
+        );
+        assert_eq!(found["parameters"][0]["name"], "b");
+        assert_eq!(found["parameters"].as_array().unwrap().len(), 2);
+        let check = &detectors.kind_checks()["update_spike"];
+        assert_eq!(
+            (
+                &check["value"],
+                &check["records"],
+                &check["records_needed"],
+                &check["enough_history"]
+            ),
+            (&json!("checked"), &json!(9), &json!(6), &json!(true))
+        );
+    }
+
+    #[test]
+    fn an_optimizer_that_was_not_read_makes_the_update_kind_unavailable_and_says_why() {
+        let none: [(&str, f64); 0] = [];
+        let rows: Vec<UpdateTestRow> = (0..3).map(|step| (step, 1.0, &none[..])).collect();
+        let said = r#"{"update_not_read":{"SGD":"SGD is not Adam or AdamW"}}"#;
+        let detectors = judge(0, &[update_rows(&rows, &[None, Some(said), None])], &usual()).unwrap();
+        let not_checked = detectors.not_checked();
+        let entry = not_checked.iter().find(|item| item["check"] == "update_size").unwrap();
+        assert_eq!(
+            entry,
+            &json!({
+                "check": "update_size", "kinds": ["update_spike"], "optimizers": ["SGD"],
+                "reason": "SGD: SGD is not Adam or AdamW", "step": 1,
+            })
+        );
+        let check = &detectors.kind_checks()["update_spike"];
+        assert_eq!(
+            (&check["value"], &check["records"], &check["reason"]),
+            (
+                &json!("unavailable"),
+                &json!(0),
+                &json!("SGD: SGD is not Adam or AdamW")
+            )
+        );
+        // A sender from before the column, or a run that never asked: not configured, no entry.
+        let plain = judge(0, &[key_rows(&steps("run", 0, 1, 0..3))], &usual()).unwrap();
+        assert_eq!(plain.kind_checks()["update_spike"]["value"], "not_configured");
+        assert!(plain.not_checked().iter().all(|item| item["check"] != "update_size"));
+    }
+
+    #[test]
+    fn a_checked_replica_drift_says_what_equal_replicas_do_not_rule_out() {
+        let plain = judge(0, &[key_rows(&steps("run", 0, 1, 0..3))], &usual()).unwrap();
+        let checks = plain.kind_checks();
+        // Only a checked kind carries a note, and only the kinds of `KIND_NOTES`.
+        assert!(checks
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|check| check.get("note").is_none()));
+        assert!(KIND_NOTES[0]
+            .1
+            .contains("equal replicas do not rule out silent data corruption"));
     }
 
     #[test]

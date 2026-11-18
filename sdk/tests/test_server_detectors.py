@@ -257,7 +257,7 @@ def test_the_server_reports_what_python_reports_after_every_stretch(tmp_path):
     # One rebuild, for the first part after the server started; every later part was added
     # to the state that was kept.
     assert document["rebuilds"] == 1
-    assert set(document["checked"]) == PORTED | set(tensorquill.evidence.ATTN_KINDS) | set(SYSTEM_KINDS)
+    assert set(document["checked"]) == PORTED | set(tensorquill.evidence.ATTN_KINDS) | set(SYSTEM_KINDS) | {"update_spike"}
     # What the server cannot check is listed the way Python's evidence lists it.
     assert [(n["check"], n["kinds"]) for n in document["not_checked"]] == [
         ("flight_recorder", ["collective_hang", "collective_desync"]), ("traincheck", ["traincheck_violation"])]

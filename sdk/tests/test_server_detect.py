@@ -9,7 +9,7 @@ tolerance: every field of every sample must be the same value of the same type
 (`sample_differences`). The two places where the paths differ on purpose are pinned further
 down.
 
-The five threshold options go to the Rust rules as the server's one `--thresholds` JSON
+The six threshold options go to the Rust rules as the server's one `--thresholds` JSON
 object. `CASES` stays at the defaults; the options have their own table (`OPTIONS`).
 
 Needs `pyarrow` (the `flight` extra) and the server binary
@@ -36,6 +36,7 @@ import test_data_server  # noqa: E402
 import test_evidence_system  # noqa: E402
 from test_flight_e2e import BINARY  # noqa: E402
 from test_server_detectors import differences, edges, everything, moe_edges, one_parameter, record, wobble  # noqa: E402
+from test_update_size import UPDATE_CASES, quiet, step as update_step  # noqa: E402
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
 BAKEOFF = Path(__file__).resolve().parents[2] / "experiments" / "moe-bakeoff"
@@ -155,6 +156,8 @@ def cases() -> dict[str, list[dict]]:
     unloadable[3]["checkpoint"] = {"save": {"components": test_data_server.FULL, "after_step": 30}}
     out["a resume from a checkpoint it cannot have loaded"] = unloadable + [row(s, 2, tag(s)) for s in range(5, 12)]
     out["no run id and no attempt"] = [{"step": s, "ts": float(s), "grad_norm": wobble(s)} for s in range(30)]
+    # The size of the optimizer's update: each branch of its rule, and what could not be read.
+    out.update(UPDATE_CASES)
     return out
 
 
@@ -166,7 +169,7 @@ def test_the_cases_reach_every_kind_the_server_has():
     assert set(SERVER_KINDS) <= seen, set(SERVER_KINDS) - seen
     # And the checks that could not be made, which the Rust path lists in Python's place.
     listed = {n["check"] for records in CASES.values() for n in tensorquill.build_evidence(records).get("not_checked", [])}
-    assert {"resume_lr", "resume_data", "resume_state", "probe", "cuda_memory", "nvml"} <= listed, listed
+    assert {"resume_lr", "resume_data", "resume_state", "probe", "cuda_memory", "nvml", "update_size"} <= listed, listed
     assert "attention" not in listed, "too few probes is not a check that failed"
 
 
@@ -356,7 +359,7 @@ def test_a_router_only_capture_and_a_failed_probe_read_the_same_through_rust():
     assert router["run_state"] == {"state": "healthy", "reasons": []}
     from tensorquill.evidence import incident_summary
 
-    assert incident_summary(router).splitlines()[:2] == ["No incidents detected.", "3 of 32 kinds checked, 29 not configured"]
+    assert incident_summary(router).splitlines()[:2] == ["No incidents detected.", "3 of 33 kinds checked, 30 not configured"]
     failed = tensorquill.build_evidence(CHECK_SETS["probes, one failed"], detectors="rust")
     assert failed["run_state"]["state"] == "degraded" and [n["check"] for n in failed["not_checked"]] == ["probe"]
     assert failed["kind_checks"]["attention_collapse"] == {
@@ -391,6 +394,7 @@ def test_the_report_gives_pythons_value_for_every_kind_and_every_value_is_reache
     can_fail = {
         "resume_lr_change", "resume_data_mismatch", "resume_incomplete", "attention_collapse", "attention_uniform",
         "attention_logit_growth", "memory_growth", "memory_pressure", "allocator_retries", "hardware_errors", "gpu_throttled",
+        "update_spike",
     }
     assert {kind for kind, found in reached.items() if "unavailable" in found} == can_fail
 
@@ -415,7 +419,7 @@ def test_the_rust_path_takes_each_kinds_value_from_the_report(monkeypatch):
     monkeypatch.setattr(module, "server_report", other)
     evidence = tensorquill.build_evidence(moe_edges(), detectors="rust")
     assert evidence["kind_checks"]["grad_spike"] == made_up
-    assert len(evidence["kind_checks"]) == 32 and evidence["kind_checks"]["job_stalled"]["value"] == "not_configured"
+    assert len(evidence["kind_checks"]) == 33 and evidence["kind_checks"]["job_stalled"]["value"] == "not_configured"
     # And the comparison names it: this is what a wrong value in the Rust report looks like.
     found = both(moe_edges())
     assert found and all(d.startswith("kind_checks.grad_spike") for d in found), found
@@ -488,7 +492,7 @@ def test_attempts_out_of_order_in_the_input_are_read_oldest_first_as_a_store_hol
 # --- what the Rust path refuses -------------------------------------------------------------
 
 
-# --- the five options, through `--thresholds` -------------------------------------------------
+# --- the six options, through `--thresholds` --------------------------------------------------
 
 OPTIONS: list[dict] = (
     [{"overload_threshold": v} for v in (0.0, 0.2, 0.5, 0.9)]
@@ -538,6 +542,19 @@ def test_an_option_reaches_the_rust_rules_and_gives_pythons_result(option):
     assert moved, "this value changes no incident on any record set"
 
 
+@pytest.mark.parametrize("warmup", [1, 4, 11, 12, 500])
+def test_the_update_window_reaches_the_rust_rules_and_gives_pythons_result(warmup):
+    # Thirteen records with a jump on the last: found with a baseline of up to eleven changes.
+    records = quiet(12) + [update_step(12, small=0.3, total=4.5)]
+    assert both(records, update_window=warmup) == []
+    rust = tensorquill.build_evidence(records, detectors="rust", update_window=warmup)
+    assert bool([i for i in rust["incidents"] if i["kind"] == "update_spike"]) is (warmup <= 11)
+    assert rust["kind_checks"]["update_spike"]["records_needed"] == warmup + 2
+    # And on the long sets, where a shorter baseline moves the incident.
+    for name in ("update size, a jump", "update size, what is left out", "update size, a resume"):
+        assert both(UPDATE_CASES[name], update_window=warmup) == [], name
+
+
 # One router of a record set, and a value for it other than the one recorded on every row,
 # chosen because the override moves an incident there.
 ONE_ROUTER = {
@@ -571,9 +588,10 @@ def test_a_top_k_for_one_router_stands_against_the_value_recorded_on_every_row(n
 def test_the_report_lists_the_thresholds_it_applied():
     usual = server_report(everything())["thresholds"]
     assert (usual["overload_threshold"], usual["drift_tolerance"], usual["starve_window"], usual["starve_ratio"]) == (0.35, 1e-6, 50, 0.1)
-    assert usual["top_k"] is None
+    assert usual["top_k"] is None and (usual["update_window"], usual["update_alpha"]) == (100, 0.05)
     assert server_report(everything(), thresholds={})["thresholds"] == usual  # every key left out
-    asked = {"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": {"r1": 2}}
+    asked = {"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": {"r1": 2},
+             "update_window": 30}
     applied = server_report(everything(), thresholds=asked)["thresholds"]
     assert {name: applied[name] for name in asked} == asked
     assert {name: value for name, value in applied.items() if name not in asked} == {
@@ -586,6 +604,7 @@ def test_the_report_lists_the_thresholds_it_applied():
 
 @pytest.mark.parametrize("option, reason", [
     ({"starve_window": 0}, "starve_window must be at least 1"),
+    ({"update_window": 0}, "update_window must be"),
     ({"top_k": 0}, "top_k must be at least 1"),
     ({"top_k": {"r1": 0}}, "top_k must be at least 1"),
     ({"overload_threshold": -0.1}, "overload_threshold must be a finite number of at least 0"),
