@@ -92,6 +92,10 @@ class Router:
     the router was called on, with values in `0..n_experts-1`. One that raises, or returns
     anything else, has its router refused for the session (`_router_hook`), never an error
     in training.
+
+    The function need not detach: it is called with grad off, on a detached view of the
+    output, so it changes nothing in the model's autograd graph (activation checkpointing
+    included). A router whose output holds no integer or floating-point tensor is refused.
     """
 
     n_experts: int
@@ -100,6 +104,20 @@ class Router:
     # `top_k` is also written into every record as `moe_top_k`, because the detectors
     # need it to judge expert shares: in a top-8 router no expert can exceed 1/8 of the
     # assignments. Set it when `indices` returns top-k indices.
+
+
+def _detached(output: Any) -> Any:
+    """The output as an `indices=` function is given it (`_router_hook`): a tensor, or a plain
+    tuple, list or dict of what it holds, detached; any other output as it is. Only the top
+    level, as `_first_tensor` reads it, and only the exact container types, so a named tuple or
+    a model's own output class reaches the function unchanged."""
+    if isinstance(output, torch.Tensor):
+        return output.detach()
+    if type(output) in (tuple, list):
+        return type(output)(x.detach() if isinstance(x, torch.Tensor) else x for x in output)
+    if type(output) is dict:
+        return {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in output.items()}
+    return output
 
 
 def _first_tensor(output: Any, *, integer: bool) -> torch.Tensor | None:
@@ -290,8 +308,14 @@ def _router_hook(
             # refuses this router and never raises into training. Checked from types and
             # shapes only; its values are judged in `flush`, from the last slot of `counts`, after the
             # copy to the CPU that is made anyway.
+            # Read with grad off, on a detached view of the output, so the function builds no
+            # autograd graph and saves nothing for backward, whether or not it detaches: under
+            # non-reentrant checkpointing the recomputation, where this hook does not run, must
+            # save the same tensors as the forward, or `backward()` raises. The model's own
+            # output keeps its graph.
             try:
-                idx = spec.indices(output)
+                with torch.no_grad():
+                    idx = spec.indices(_detached(output))
             except Exception as error:  # noqa: BLE001
                 refuse(lambda: f"its indices= function raised {_short(error)}")
                 return
@@ -329,7 +353,14 @@ def _router_hook(
             else:
                 logits = _first_tensor(output, integer=False)
                 if logits is None:
-                    # No tensor to read: nothing is counted and nothing refused, as before.
+                    # Nothing to read: counting nothing would write zeros that read as a router
+                    # that routed no token. Only the top level is looked in (`_first_tensor`).
+                    refuse(lambda: (
+                        f"its output is a {str(output.dtype).removeprefix('torch.')} tensor, not expert indices or logits"
+                        if isinstance(output, torch.Tensor)
+                        else f"its output, a {type(output).__name__}, holds no integer or floating-point tensor "
+                        f"at its top level"
+                    ))
                     return
                 # Logits of another width are not this router's: counting nothing would write
                 # zeros that read as a router that routed no token.
