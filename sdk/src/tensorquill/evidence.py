@@ -596,6 +596,46 @@ def weight_norm_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     return {"baseline_step": int(first["step"]), "latest_step": int(last["step"]), "kinds": summary}
 
 
+HEAD_NUMBERS = ("norm", "mean", "log_z", "gap", "gap_relative")
+
+
+def head_logit_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The probe's language-model head numbers over the run (`probe` records' `head`): for
+    each number its first and latest value and the lowest and highest in between.
+
+    Numbers only, with no threshold and no incident. The logit norm grows in healthy AdamW
+    runs too (Chen et al., arXiv 2610.38277, p. 2), the mean has drifted both ways in
+    published runs, so it is signed and given as values, not ratios, and a cutoff for the
+    BF16-to-FP32 `gap` needs real failing runs to set. Probes that did not read the head
+    are counted under `not_read` with the first one's step and reason. Returns None when
+    no probe carries a `head` entry (no probe, a failed one, or `probe_head=False`).
+    """
+    seen: list[tuple[int, dict[str, Any]]] = []
+    for record in sorted(records, key=lambda r: r["step"]):
+        probe = record.get("probe")
+        if isinstance(probe, dict) and "error" not in probe and isinstance(probe.get("head"), dict):
+            seen.append((int(record["step"]), probe["head"]))
+    if not seen:
+        return None
+    read = [(step, head) for step, head in seen if "not_read" not in head]
+    trends: dict[str, Any] = {"probes": len(seen), "read": len(read)}
+    if read:
+        trends.update(module=read[-1][1].get("module"), first_step=read[0][0], latest_step=read[-1][0])
+        numbers: dict[str, Any] = {}
+        for name in HEAD_NUMBERS:
+            series = [(step, value) for step, head in read if (value := _finite(head.get(name))) is not None]
+            if series:
+                values = [value for _, value in series]
+                numbers[name] = {"first": series[0][1], "latest": series[-1][1], "lowest": min(values),
+                                 "highest": max(values), "probes": len(series)}
+        trends["numbers"] = numbers
+    skipped = [(step, head) for step, head in seen if "not_read" in head]
+    if skipped:
+        trends["not_read"] = {"probes": len(skipped), "first_step": skipped[0][0],
+                              "reason": str(skipped[0][1]["not_read"])}
+    return trends
+
+
 def _watchdog_beside(source: Any) -> Path | None:
     if not isinstance(source, (str, Path)) or not Path(source).is_dir():
         return None
@@ -4338,6 +4378,7 @@ def build_evidence(
 
     run_id = records[0].get("run_id") if records else None
     trends = weight_norm_trends(records)
+    head_trends = head_logit_trends(records)
     memory = latest_memory(records)
     evidence = {
         "schema_version": 1,
@@ -4363,6 +4404,7 @@ def build_evidence(
         **({"detectors": "rust"} if from_rust is not None else {}),
         **({"not_checked": not_checked} if not_checked else {}),
         **({"weight_trends": trends} if trends else {}),
+        **({"head_trends": head_trends} if head_trends else {}),
         **({"memory": memory} if memory else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
         **({"traincheck": traincheck_summary} if traincheck_summary else {}),

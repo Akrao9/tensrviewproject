@@ -43,7 +43,7 @@ from .data import (
 )
 from . import datawait
 from .distributed import FINGERPRINT_WIDTH, replica_spread, unwrap_local
-from .probe import ProbeState, install_probe_hooks, probe_callable, run_probe
+from .probe import ProbeState, find_head, install_head_hook, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink
 from .system import SystemPart, SystemReadings
 from . import manifest as _manifest
@@ -697,6 +697,7 @@ class Session:
         system: bool = False,
         data_wait: bool = False,
         updates: bool = False,
+        probe_head: str | bool | None = None,
     ) -> None:
         if hasattr(model, "_orig_mod"):
             raise ValueError("call tensorquill.init(model) before torch.compile(model)")
@@ -847,6 +848,12 @@ class Session:
         self._probe_state = ProbeState()
         if self._probe_fn is not None:
             self._handles += install_probe_hooks(_select_layers(model, "blocks"), self._probe_state)
+            head, found_by, note = find_head(model, probe_head)
+            state = self._probe_state
+            state.head_name, state.head_found_by, state.head_note = head, found_by, note
+            state.head_off = probe_head is False
+            if head is not None:
+                self._handles += install_head_hook(dict(model.named_modules())[head], state)
 
         self._steps: list[int] = []
         self._ring_lr: list[list[float] | None] = []
@@ -2133,6 +2140,7 @@ def init(
     stack_seconds: float | None = 60.0,
     probe: Any = None,
     probe_every: int = PROBE_EVERY,
+    probe_head: str | bool | None = None,
     scaler: Any = None,
     replica_params: Any = None,
     endpoint: str | None = None,
@@ -2210,6 +2218,12 @@ def init(
             right after the step's statistics are recorded, and restores each module's
             training flag and the random number generator state afterwards.
         probe_every: steps between probe passes (default 1000).
+        probe_head: the language-model head the probe reads output-logit numbers from
+            (`head` in the probe record: norm, signed mean, log Z, and the gap between
+            BF16 and FP32 logits on the same hidden states; numbers only, no incident).
+            A module name, which must be a plain `nn.Linear`; by default the module
+            `model.get_output_embeddings()` returns, if the model has that method, and
+            otherwise the head is recorded as not read, with the reason. `False` turns it off.
         scaler: the run's `torch.amp.GradScaler`. Each record then says whether the scaler
             skipped the optimizer step on Inf or NaN gradients (`step_skipped`) and the loss
             scale used (`grad_scale`), and with `auto_step` the step ends at
@@ -2304,6 +2318,7 @@ def init(
         replica_projection=replica_projection,
         probe=probe,
         probe_every=probe_every,
+        probe_head=probe_head,
         scaler=scaler,
         replica_params=replica_params,
         system=system,
