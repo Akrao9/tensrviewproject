@@ -339,4 +339,118 @@ I read the text of each PDF as extracted by `pdftotext`, which was already insta
 
 **TensorQuill.** Read: the focused plan in full; `sdk/README.md` lines 1–307 and the sections on thresholds, attention rules and "Things to know"; the failure list in full; `sdk/AGENT_INSTRUCTIONS.md` in full; `INCIDENT_CLASSES` and the constants in `evidence.py`; the parts of `capture.py` and `distributed.py` cited above. The v3 plan was searched, not read. No test in the repository was run. Proposal 2 was reproduced once, on CPU, with a toy model and router counts only. Finding W7 comes from reading the rule and the papers; one toy from-scratch run on CPU did not trigger it (2.62× against a 3× cutoff), which neither confirms nor settles it. Both scripts ran from a scratch folder with the repository's `.venv` and wrote nothing into the repository.
 
-**Not in the folder.** Papers the plans cite that I did not see: Motif 3 (2608.09119), SDCHunter, the Laguna report, OLMo 2 and the others in the failure list's sources.
+**Not in the folder.** Papers the plans cite that I did not see: Motif 3 (2608.09119), the Laguna report and the others in the failure list's sources. SDCHunter and OLMo 2 were not there on Nov 17; they were added on Nov 18 and are covered in section 7.
+
+---
+
+## 7. Second batch: twelve more papers, read on Nov 18, 2026
+
+Twelve PDFs were added to `../researchpapers/` after sections 1 to 6 were written. I read them to check `Training failure research survey.md`, which cites them. This section records what they say and where that survey goes further than they do. The survey file itself was left unchanged, at the author's request. Sections 1 to 6 are as they were, except the last line of section 6.
+
+**How they were read.** First pages in full, then keyword passes over the remaining main pages, with tables read from layout-preserving text. Figures were not viewed. The long appendices of OLMoE (63 pages) and OLMo 2 (58 pages) are unread.
+
+### The papers
+
+| Paper | What it shows | Bearing on TensorQuill |
+| --- | --- | --- |
+| **SDCs in the Wild: Characterizing and Diagnosing SDC-defective GPUs in Production LLM Training.** Zheng, Wang, Zhang, Han and 15 others (Shanghai Jiao Tong University, ByteDance Seed). OSDI '26 | Measured on 23 defective GPUs from production. On real traces, loss and gradient-norm monitoring covered 25.0% of them, vendor hardware tools 30.0%, the paper's SDCHunter 100% (Table 5). Under injection: loss 16% after 127 steps, gradient norm 17% after 109, SDCHunter 91% after 3 steps at 3.9% overhead (Table 6). Loss-based methods named the faulty device in 0% of cases (Table 7). ECC counts, clocks, thermals and machine-check exceptions showed nothing (p. 7). Synthetic stress tests miss over 60% (p. 2) | Backs finding W1 with production numbers. Loss, gradient and non-finite checks are low-recall for corruption, and clean hardware telemetry does not rule it out |
+| **Safeguarding LLM Training at Scale: Online SDC Detection and Insights from 35 Million GPU Hours** (AEGIS). Lei, Zheng, Li and 14 others (Tsinghua, ByteDance). OSDI '26 | Measured in production: 18 incidents on 13 GPUs in 3.5e7 GPU-hours; only 3 of the 18 showed as a visible failure (p. 11). Every incident reproduced on the same GPU (pp. 13–14). Vendor diagnostics caught 2 of 8 known-faulty machines, AEGIS 8 of 8 (Table 2). A checksum accumulated in bfloat16 needs about 10,000 times the perturbation that a float32 one does (p. 13) | An online detector exists at under 3% cost. Two of its three mechanisms are within reach of a hook library (below) |
+| **OpGuard: Bitwise Alignment for Precise and General Debugging of Production LLM Training.** Zhou, Zhao, Zhu, Wang, Bai, Zhang, Wang, Lin, Huang (University of Michigan, ByteDance Seed). OSDI '26 | Compares a faulty run with a reference run and reports the first model-level operator whose output is not bit-for-bit equal. Measured: 20 production bugs diagnosed (p. 3); 21 machines with corruption that had passed vendor pre-flight checks (p. 13); online mode about 1.00 to 1.01 times, trusted mode 1.25 to 1.45 times, full mode about 1.8 to 1.95 times (p. 14) | It instruments compiled code (below). A model for `compare_runs`: name the first boundary that differs |
+| **CCL-D: A High-Precision Diagnostic System for Slow and Hang Anomalies in Large-Scale Model Training.** Gu, Wang, Fu, Sun and others (University of Chinese Academy of Sciences, Ant Group). PPoPP '26 | Measured on a 4,000-GPU cluster over a year: hang diagnosis from 47 hours to 6 minutes, slow from 74 hours to 2 minutes (pp. 9–10); overhead 0.12% to 0.95% (p. 11). Of hangs, 11.8% were Not-Entered, 58.9% Inconsistent and 29.3% Hardware-Fault (p. 4). It works by extending the communication library | Rules for the slow-rank candidate and for `collective_hang`; published support for the 300-second silence default (below) |
+| **Greyhound: Hunting Fail-Slows in Hybrid-Parallel Training at Scale.** Wu, Wang, Yu, Yang, Wu, Duan, Yang, Wang, Qu, Zhang (HKUST, Alibaba). USENIX ATC '25 | Measured: 16 of 27 large jobs hit a fail-slow, average completion time up 34.59% (p. 5). Change-point detection on iteration time, then a check that the mean moved by 10%: 100% accuracy on computation fail-slows and 99.1% on communication, with 2.3% missed (p. 11). Overhead 0.39% on average, 1.1% at most. Change-point detection alone gave 18% to 34% false positives. A communication group is suspect when its time exceeds the median of comparable groups by over 10% (p. 7) | A trigger for the slow-rank candidate. The 100% rests on 6 positive cases among 392 single-node jobs, and locating the slow part pauses the job (p. 8) |
+| **Evolution of Aegis: Fault Diagnosis for AI Model Training Service in Production.** Dong, Qian, Zhang and others (Alibaba Cloud). NSDI '25 | Measured: 100 to 230 critical failures a week (p. 3); 73% of failed tasks fail in the first 10 minutes (p. 10); 71% of "distributed" failures turn out not to be the network (p. 7). An outlier is a host above the mean plus two standard deviations for ten minutes (p. 10) | The same timing inversion as CCL-D: a group whose communication time is under 0.8 of the typical is the slow computer (p. 10) |
+| **Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts.** Wang, Gao, Zhao, Sun, Dai (DeepSeek-AI, Peking University). Preprint, 2024 | Defines MaxVio as the largest expert load over the expected load, minus one. Measured on 64 experts with 6 active: 0.04 with bias-based balancing against 0.72 (1B model) and 0.52 (3B) with an auxiliary loss, counted over a validation set (Table 2, p. 6). The paper gives the 3B model's training as 200B tokens in three places and 300B in its conclusion | The one MoE balance measure with published good and poor values. It must be reported with its scope: per batch or over a whole set |
+| **OLMoE: Open Mixture-of-Experts Language Models.** Muennighoff, Soldaini, Groeneveld and others (Allen Institute for AI and others). ICLR 2025 per the survey; arXiv v2, Mar 2025 | Without the load-balancing loss, "initially all tokens in the first layer are assigned to the 6th expert" and the other experts stay unused (p. 13). After 1% of pretraining, up to about 60% of top-8 routing already matches the final checkpoint (p. 19) | A from-scratch MoE collapse that needs no injected fault: the proof run for `moe_imbalance` on nanoMoE |
+| **2 OLMo 2 Furious.** OLMo Team (Allen Institute for AI). Technical report, v3 Oct 2025 | Defines a spike score: the share of values at least seven standard deviations from a rolling average of the last 1,000 (p. 14). A new initialisation took the gradient-norm score from 0.40 to 0.03. Gradient spikes often came before loss spikes (p. 10) | A second, published definition to report `grad_spike` against, beside EnergyCal's (proposal 7) |
+| **TTrace: Lightweight Error Checking and Diagnosis for Distributed Training.** Jiang, Zhu, Zhang and others (New York University, Amazon Web Services). Preprint, v2 Jan 2026 | Compares a distributed run's tensors with a trusted single-device reference, with tolerances derived from an analysis of rounding error. Found 11 known and 3 new silent bugs in Megatron-LM; one in 54 seconds against 6 hours 40 minutes from loss curves | A second bug set for proposal 5. Its tolerance approach is disputed by OpGuard (below) |
+| **Grokking or Glitching? How Low-Precision Drives Slingshot Loss Spikes.** Liu, Cao, Li, Zhou (Tsinghua, University of Tokyo). Preprint, v5 Nov 2026 | In float32 the gradient of the correct class rounds to exactly zero once its logit leads the others by `23·ln 2`, about 16 (p. 3). Classifier updates went from about 1e-5 to two modes at ±4e-4 at the spike (p. 7). Casting only the loss computation to float64 removes the spikes (p. 2) | A CPU-scale reproduction for proposals 8 and 10, and a second mechanism beside Chen et al. for output-logit trouble |
+| **Understanding Silent Data Corruption in LLM Training** (the ACL 2025 version of row 4 in section 3). Ma, Pei, Lausen, Karypis | Same paper, published in the Proceedings of the 63rd Annual Meeting of the ACL, pages 20372–20394 | Confirms the venue. Its finding on checksums is that they missed corruption: they flagged errors on one node only |
+
+None of the three ByteDance systems appears to be released; I found no code link in any of them.
+
+### What changes in sections 1 and 2
+
+- **W1 is stronger.** It rested on reasoning from four papers. Zheng et al. and Lei et al. now give production numbers for the same point: 3 of 18 incidents visible, and 25% coverage for loss and gradient norms.
+- **W6 needs one more name.** OpGuard's wrappers "preserve the original execution mode (eager, torch.compile, CUDA Graphs)" (p. 8), and it reports at least 95% kernel coverage on a compiled pretraining pipeline (p. 14). Its overhead figures are not split by compilation, so TensorQuill can still be first to publish an overhead number under `torch.compile`. It cannot say that no other tool instruments compiled code.
+- **W9 has three more supporters.** All three ByteDance papers compare replicas bit for bit under enforced determinism. OpGuard measured what a tolerance costs: without determinism controls and with a tolerance of `1e-3`, it placed the fault exactly in 7 of 20 cases (p. 13). It also reports that TTrace flagged 11 of its 20 cases and misses corruption smaller than its tolerance (p. 12).
+- **Proposal 9 has two concrete designs.** Neither is SDCHunter as built, which is diagnosis by replay after an alert: half the data-parallel groups re-run the identical batch as the other half (pp. 3, 10–12).
+  - *A shared probe batch.* TensorQuill's probe pass already runs one fixed batch; if every rank ran the same one, their block statistics could be compared across ranks. This is my reading, not a published method.
+  - *Forward against recomputation.* AEGIS fingerprints an operator's output in the forward pass and again when the backward pass recomputes it, and treats any difference as corruption (p. 8). TensorQuill's hooks already see recomputation under activation checkpointing, and skip it.
+  - AEGIS's third mechanism is out of reach: its checksum comes from the float32 accumulator inside the matmul kernel (p. 7).
+  - Its 0.86% overhead is with sampling tuned to a budget. Unsampled, it averages 1.61% or 2.35% and peaks at 2.6% (p. 12).
+- **The slow-rank candidate is half reachable.** Flight Recorder's per-collective durations can support the compute-slow rule, where the rank that spends least time in the collective is the slow one (CCL-D p. 7, Aegis p. 10). The communication-slow rule and the hardware-hang rule need send and receive counters inside the communication library, which CCL-D and Aegis both customise.
+- **`collective_hang` should not assume one rule.** In CCL-D the rank whose counter did not advance is the root cause only for Not-Entered hangs, 11.8% of the total. For Inconsistent hangs "the non-hang ranks are the root cause", and for Hardware-Fault hangs it is the rank with the fewest send and receive counts (p. 7).
+- **The 300-second silence default now has a source.** CCL-D sets its hang bound at five minutes because "97% of cases exceeding this limit cannot recover" (p. 8). Section 2 could only say the default was in the same range as other systems.
+- **Section 5 gains two bug sets,** neither with a repository link I could find: TTrace's 11 to 14 Megatron-LM bugs, and OpGuard's 10 open-source issues from Megatron-LM, DeepSpeed and others (p. 12).
+
+### Where the survey goes further than these papers
+
+| Survey statement | What the paper says |
+| --- | --- |
+| "The rank with the lowest collective sequence number is the hang's root cause" (summary and finding 5) | True for 11.8% of CCL-D's hangs. See `collective_hang` above |
+| K2 "should follow SDCHunter" | SDCHunter is replay after an alert, on a deterministic job. AEGIS is the online detector |
+| "Any in-process checksum must accumulate in float32 or wider" (finding 2) | Correct as a constraint, but AEGIS meets it inside the kernel, where a hook cannot go |
+| Ma et al. found "false positives on healthy nodes in bf16" (finding 2) | Ma et al. report misses. The false-positive description is AEGIS's, when citing them (p. 4) |
+| K2 "must be tolerance-based" | The three ByteDance papers are bitwise, and OpGuard measured the loss from a tolerance |
+| "No surveyed tool reports instrumentation overhead under torch.compile" | Holds narrowly. OpGuard runs under it and reports coverage there |
+| Greyhound: "100% accuracy on computation fail-slows" | Six positive cases |
+| Aegis's 0.8 and 1.5 cut-offs "should be verified in the paper" | Verified, in the direction the survey gives |
+| OLMoE: all tokens go to one expert, "then a second" | The first half is in the text. The second is only in a figure I did not view |
+
+Every number the survey quotes from these twelve papers matched the PDF.
+
+### Not read or not verified
+
+- Figures in all twelve.
+- OLMoE beyond pages 1–22 and OLMo 2 beyond pages 1–16.
+- The appendix of Liu et al., which holds the model size and seed the survey's seeded recipe quotes.
+- OLMo 2's z-loss weight, which the survey notes is given two ways; the equation did not survive text extraction.
+- Whether any of these systems has released code beyond what the PDFs say.
+
+---
+
+## Appendix: the script behind proposal 2
+
+Run on Nov 17, 2026 from a scratch folder with the repository's `.venv`, against the code as it was that day. It writes `tensorquill-out/` into the folder it is run from, so do not run it from the repository root. Each step routes 10 tokens. Three evaluation batches run inside `session.phase("eval")` between steps 1 and 2. It printed `[0, 3, 3, 4]` for steps 0, 1 and 3, and `[0, 9, 15, 16]` for step 2.
+
+```python
+import json, glob, torch, torch.nn as nn
+import tensorquill
+
+class Router(nn.Module):
+    def __init__(self, d, n): super().__init__(); self.lin = nn.Linear(d, n)
+    def forward(self, x): return self.lin(x)          # float logits, last dim = n_experts
+class Block(nn.Module):
+    def __init__(self, d, n):
+        super().__init__(); self.router = Router(d, n); self.experts = nn.ModuleList(nn.Linear(d, d) for _ in range(n))
+    def forward(self, x):
+        idx = self.router(x).argmax(-1)
+        out = torch.zeros_like(x)
+        for e, lin in enumerate(self.experts): out = out + lin(x) * (idx == e).unsqueeze(-1)
+        return out
+class Net(nn.Module):
+    def __init__(self): super().__init__(); self.blocks = nn.ModuleList([Block(8, 4)])
+    def forward(self, x):
+        for b in self.blocks: x = b(x)
+        return x
+
+torch.manual_seed(0)
+model = Net()
+session = tensorquill.init(model, routers={"blocks.0.router": 4}, run_id="evalcheck", every=1)
+opt = torch.optim.SGD(model.parameters(), lr=0.0)   # lr 0: routing identical every step
+x = torch.randn(2, 5, 8)                              # 10 tokens per training step
+def step():
+    loss = model(x).mean(); opt.zero_grad(); loss.backward(); opt.step()
+step(); step()
+with session.phase("eval"):
+    model.eval()
+    with torch.no_grad():
+        for _ in range(3): model(torch.randn(2, 5, 8))   # 30 eval tokens
+    model.train()
+step(); step()
+session.close()
+for f in glob.glob("tensorquill-out/*.jsonl"):
+    for line in open(f):
+        r = json.loads(line); print(r.get("step"), r.get("moe"))
+```
+
