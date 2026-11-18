@@ -41,11 +41,11 @@ The tracker, ARIA and Pluto rows are carried over from the v3 competitor check o
 
 ## Freeze
 
-Six lines of work stop now. Each returns only when its condition is met.
+Five lines of work stop now. A sixth, new detector kinds, was lifted on Nov 17, 2026. Each returns only when its condition is met.
 
 | Work | Decision | Returns when |
 | --- | --- | --- |
-| New detector kinds | Stop at the 32 built | A real job shows a failure none of them catches |
+| New detector kinds | Lifted by the author on Nov 17, 2026. It had stopped at the 32 built; new kinds are now added one at a time | Returned on Nov 17, 2026 by the author's decision. Its condition, a real job showing a failure none of them catches, was not met |
 | Rune viewer app | Postponed, confirmed Nov 16, 2026; Rerun stays the viewer | Outside users ask for views Rerun cannot give |
 | Second copy of each detector | One Rust implementation for the 28 server kinds, called from Python; each Python duplicate is deleted as it is replaced. The four Python-only kinds stay as they are. State on Nov 16, 2026: the Rust path is built and opt-in for one read, watching, the all-ranks view, the thresholds and the MoE samples. Python is still the default, and no Python copy is deleted yet | Not applicable: this is a simplification, not a pause |
 | Real-AWS and GCS runs, and the `s3://` reader | Postponed; the store code is built and stays | A user asks for a cloud store |
