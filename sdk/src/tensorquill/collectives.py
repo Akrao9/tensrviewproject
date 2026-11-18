@@ -26,6 +26,15 @@ from pathlib import Path
 from typing import Any
 
 
+def _by_rank(item: tuple[str, Any]) -> tuple[int, int, str]:
+    """Sort key for the loader's `{file name: dump}`: the dump's rank, then the name."""
+    name, dump = item
+    try:
+        return (0, int(dump["rank"]), name)
+    except (KeyError, TypeError, ValueError):
+        return (1, 0, name)  # a dump with no readable rank goes last, by name
+
+
 def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None) -> dict[str, Any]:
     """Run PyTorch's Flight Recorder analyzer over the per-rank dumps in `trace_dir`.
 
@@ -57,6 +66,12 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
         details, version = read_dir(config)
     except (AssertionError, EOFError, OSError, ValueError, pickle.UnpicklingError) as error:
         raise ValueError(f"no readable Flight Recorder dumps in {directory}: {error}") from error
+    # The loader lists the dumps in the order the file system gives (`os.walk`), and the
+    # analyzer takes the first rank it reads as the reference: where two ranks disagree, the
+    # one it calls the culprit, and the collective it names, followed that order, which
+    # differs between machines. In rank order the same dumps give the same answer everywhere.
+    # It is no more right for that: with two ranks that disagree, nothing says which is at fault.
+    details = dict(sorted(details.items(), key=_by_rank))
 
     # The analyzer reports what it finds through a logger that prints to the console;
     # take the messages instead of printing them.

@@ -1,4 +1,5 @@
 import json
+import os
 import pickle
 import sys
 
@@ -64,6 +65,24 @@ def test_ranks_that_issued_different_collectives_are_a_desync(tmp_path):
                                           "expert_count": 0, "router_names": []})
     assert "Ranks issued different collectives at all_reduce #2" in text and "Culprit rank 1" in text
 
+
+
+@pytest.mark.parametrize("listed", ["as the disk gives", "reversed"])
+def test_the_same_dumps_give_the_same_answer_whatever_order_the_disk_lists_them(tmp_path, monkeypatch, listed):
+    # PyTorch's loader lists the dumps with `os.walk`, whose order is the file system's (on CI's
+    # Linux runners it differed from run to run), and its analyzer takes the first rank it reads as
+    # the reference. TensorQuill puts the dumps in rank order first, so where two ranks disagree the
+    # same rank and collective are named on every machine; not that this says which one is at fault.
+    if listed == "reversed":
+        walk = os.walk
+        monkeypatch.setattr(os, "walk", lambda top, *a, **k: (
+            (root, dirs, sorted(files, reverse=True)) for root, dirs, files in walk(top, *a, **k)))
+    ok = _entry(0, "all_reduce", 1)
+    directory = _write(tmp_path, [ok, _entry(1, "all_reduce", 2, "scheduled")], [ok, _entry(1, "all_gather", 2, "scheduled")])
+    problem = analyze_flight_recorder(directory)["problem"]
+    assert problem["type"] == "desync"
+    assert (problem["collective"], problem["collective_seq_id"]) == ("all_reduce", 2)
+    assert "Culprit rank 1" in problem["mismatch"]
 
 def test_every_rank_entering_but_not_finishing_points_at_the_network_not_one_rank(tmp_path):
     ok = _entry(0, "all_reduce", 1)

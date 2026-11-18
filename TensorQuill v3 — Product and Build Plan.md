@@ -1644,6 +1644,7 @@ State as of Nov 16, 2026.
     - `sdk/RUN_ON_YOUR_JOB.md` still says a router that returns only logits needs only `top_k`, without S7's caveat.
     - The trigger does not read `stopped_stacks`, and a local run of several ranks has no status, so no stacks are grouped there.
     - Nothing here ran on a GPU, a real model or PyTorch 2.6. Nothing is pushed.
+  - *CI on the merged tree (`78f8f7e`, run 44377712206).* 11 of 13 jobs passed, both PyTorch 2.6 jobs among them, so 2.6 stays supported with no version-specific code. Two PyTorch 2.15 jobs failed on one test that no lane touched, `test_ranks_that_issued_different_collectives_are_a_desync`. PyTorch's Flight Recorder loader lists the dumps in the file system's order (`os.walk`), and its analyzer takes the first rank it reads as the reference, so where two ranks issued different collectives the rank it calls the culprit, and the collective it names, followed the runner's disk. Reproduced here by listing the dumps in reverse. Fixed at the author's word: `analyze_flight_recorder` puts the dumps in rank order before the analyzer reads them, and a new test runs the same dumps listed both ways (it fails without the fix). This makes the answer the same on every machine, not more right: with two ranks that disagree nothing says which is at fault, and the summary still quotes PyTorch's "Culprit rank N". Whether to soften that wording for two ranks is the author's.
 
 ## Sources
 
