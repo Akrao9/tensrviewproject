@@ -1,0 +1,214 @@
+name: Server wheels
+
+# Builds `tensorquill-server` as Python wheels with maturin: Linux x86_64 and arm64 (tagged
+# manylinux_2_17), macOS arm64, and the fallback wheel every other platform gets. Each wheel is
+# checked, then installed where pip has both it and the fallback to choose from.
+#
+# Nothing here uploads unless the workflow is started by hand with `publish` set. The upload uses
+# PyPI trusted publishing: no token or password is stored in this repository or passed to a job.
+
+on:
+  push:
+    branches: [main]
+    paths: ["server/**", ".github/workflows/server-wheels.yml"]
+  pull_request:
+    paths: ["server/**", ".github/workflows/server-wheels.yml"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Upload the wheels after they pass (trusted publishing; `pypi` only from main)
+        type: choice
+        options: [none, testpypi, pypi]
+        default: none
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: manylinux_2_17_x86_64
+            runner: ubuntu-latest
+            target: x86_64
+            manylinux: "2014"
+          # A native arm64 runner: the build runs in the arm64 manylinux2014 image, with no emulation.
+          - platform: manylinux_2_17_aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64
+            manylinux: "2014"
+          - platform: macosx_arm64
+            runner: macos-15
+            target: aarch64
+            manylinux: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the wheel
+        # On Linux the action runs maturin inside quay.io/pypa/manylinux2014_<arch> (glibc 2.17),
+        # which is what makes the wheel manylinux_2_17. On macOS it runs on the runner itself.
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          working-directory: server
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist
+      - name: Check the wheel's tag and contents
+        run: |
+          ls -l server/dist
+          test "$(ls server/dist/*.whl | wc -l)" -eq 1
+          python server/packaging/check_wheel.py wheel server/dist/*.whl ${{ matrix.platform }}
+      - name: Install and run on glibc 2.17
+        # The oldest system the tag promises. The image is the one the wheel was built in, used
+        # here only for its old glibc and its Python.
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD/server/dist:/dist:ro" quay.io/pypa/manylinux2014_${{ matrix.target }} bash -ec '
+            ldd --version | head -n 1
+            /opt/python/cp312-cp312/bin/python -m venv /tmp/venv
+            /tmp/venv/bin/pip install --no-index /dist/*.whl
+            /tmp/venv/bin/tensorquill-server --help
+            /tmp/venv/bin/tensorquill-server detect --help
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: server/dist/*.whl
+          if-no-files-found: error
+
+  fallback:
+    name: Fallback wheel
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: built
+      - name: Make it from each platform wheel; the three results must be the same file
+        run: |
+          n=0
+          for wheel in built/*.whl; do
+            n=$((n + 1))
+            python server/packaging/fallback_wheel.py "$wheel" "fallback-$n"
+          done
+          test "$n" -eq 3
+          cmp fallback-1/*.whl fallback-2/*.whl
+          cmp fallback-1/*.whl fallback-3/*.whl
+          python server/packaging/check_wheel.py wheel fallback-1/*.whl any
+      - name: Metadata renders on PyPI
+        run: |
+          python -m pip install twine
+          twine check --strict built/*.whl fallback-1/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-any
+          path: fallback-1/*.whl
+          if-no-files-found: error
+
+  install:
+    # pip is offered every wheel, as it is on PyPI, and must take the platform's own where there
+    # is one and the fallback elsewhere. A job that only ran `pip install` would pass on any
+    # platform, because the fallback always installs; so each job checks which wheel was taken.
+    name: Install, ${{ matrix.runner }} expects ${{ matrix.platform }}
+    needs: [build, fallback]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: manylinux_2_17_x86_64
+          - runner: ubuntu-24.04-arm
+            platform: manylinux_2_17_aarch64
+          - runner: macos-15
+            platform: macosx_arm64
+          - runner: windows-latest
+            platform: any
+          - runner: macos-15-intel
+            platform: any
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - name: Install into a clean environment
+        run: |
+          ls -l dist
+          test "$(ls dist/*.whl | wc -l)" -eq 4
+          python -m venv venv
+          if [ -d venv/Scripts ]; then bin=venv/Scripts; else bin=venv/bin; fi
+          "$bin/python" -m pip install --no-index --find-links dist tensorquill-server
+          "$bin/python" server/packaging/check_wheel.py installed ${{ matrix.platform }}
+          echo "bin=$bin" >> "$GITHUB_ENV"
+      - name: Run the binary
+        if: matrix.platform != 'any'
+        run: |
+          "$bin/tensorquill-server" --help
+          "$bin/tensorquill-server" detect --help
+      - name: Alpine (musl) gets the fallback
+        if: matrix.platform == 'manylinux_2_17_x86_64'
+        run: |
+          docker run --rm -v "$PWD:/work:ro" python:3.12-alpine sh -ec '
+            python -m venv /tmp/venv
+            /tmp/venv/bin/pip install --no-index --find-links /work/dist tensorquill-server
+            /tmp/venv/bin/python /work/server/packaging/check_wheel.py installed any
+          '
+
+  publish:
+    # Runs only when a person starts the workflow and picks a target. The upload is authorized by
+    # PyPI trusted publishing: PyPI checks this repository, this file's name (server-wheels.yml)
+    # and the environment name (testpypi or pypi) against the publisher set up on the project.
+    name: Publish to ${{ inputs.publish }}
+    needs: [build, fallback, install]
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.publish == 'testpypi' || (inputs.publish == 'pypi' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: ${{ inputs.publish }}
+    permissions:
+      id-token: write # the short-lived identity PyPI exchanges for an upload; no stored secret
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - run: ls -l dist && test "$(ls dist/*.whl | wc -l)" -eq 4
+      - name: Upload to TestPyPI
+        if: inputs.publish == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+      - name: Upload to PyPI
+        if: inputs.publish == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1

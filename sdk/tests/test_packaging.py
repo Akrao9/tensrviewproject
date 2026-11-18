@@ -107,7 +107,26 @@ def test_sdist_is_kept_to_source():
 def test_server_license_matches_the_sdk():
     package = _toml(SERVER / "Cargo.toml")["package"]
     assert package["license"] == LICENSE_EXPRESSION
-    assert "license-file" not in package, "`license` and `license-file` together confuse the crates.io license check"
+    assert "license-file" not in package, "the license is the SPDX expression alone, as in both pyproject.toml files"
+
+
+@needs_server
+def test_server_wheel_metadata_matches_the_crate():
+    """The server goes to PyPI as maturin wheels (server/pyproject.toml), not to crates.io."""
+    pyproject = _toml(SERVER / "pyproject.toml")
+    project = pyproject["project"]
+    assert project["name"] == _toml(SERVER / "Cargo.toml")["package"]["name"] == "tensorquill-server"
+    assert project["license"] == LICENSE_EXPRESSION
+    assert project["license-files"] == LICENSE_FILES
+    assert not [c for c in project.get("classifiers", []) if c.startswith("License ::")]
+    # One version number: maturin reads it from Cargo.toml when it is dynamic here.
+    assert "version" not in project and project["dynamic"] == ["version"]
+    assert pyproject["tool"]["maturin"]["bindings"] == "bin", "the wheel's content is the binary, as a script"
+    assert pyproject["build-system"]["build-backend"] == "maturin"
+    assert (SERVER / project["readme"]).is_file()
+    # The wheel has no Python in it, so its floor must not be tighter than the SDK's.
+    floor = lambda spec: tuple(int(n) for n in re.fullmatch(r">=(\d+)\.(\d+)", spec).groups())
+    assert floor(project["requires-python"]) <= floor(_project()["requires-python"])
 
 
 @needs_server
@@ -139,5 +158,9 @@ def test_no_contact_metadata_the_owner_has_not_chosen():
         for key in ("authors", "repository", "homepage", "documentation"):
             assert key not in package, f"server [package] {key} is set; the owner picks it at first publish"
         texts["server/Cargo.toml"] = (SERVER / "Cargo.toml").read_text()
+        server_project = _toml(SERVER / "pyproject.toml")["project"]
+        for key in ("authors", "maintainers", "urls"):
+            assert key not in server_project, f"server [project] {key} is set; the owner picks it at first publish"
+        texts["server/pyproject.toml"] = (SERVER / "pyproject.toml").read_text()
     for name, text in texts.items():
         assert not re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text), f"{name} contains an email address"
