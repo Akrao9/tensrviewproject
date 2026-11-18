@@ -95,7 +95,7 @@ No new kinds are added. Labelling the 32 kinds is done, and one change to replic
    - Why: [SCOUT](https://arxiv.org/pdf/2608.11034) attributes a fault to the rank that disagrees with a strict majority of its replicas, which takes at least three ranks.
    - Done when a three-process CPU run with one drifted rank names that rank, and a two-rank run reports drift without naming one.
 
-The first candidates when the freeze lifts are hidden expert collapse (an expert still gets tokens but adds less and less), per-token routing entropy, slow ranks and update size per parameter.
+The freeze on new kinds was lifted on Nov 17, 2026. New kinds are built one at a time, in this order: update size per parameter, a cross-rank activation compare (the check for corruption that replica drift cannot see), per-token routing entropy, output-logit growth in the language-model head, slow ranks as an observation, and hidden expert collapse (an expert still gets tokens but adds less and less). The v3 plan holds the build list with what each needs first.
 
 ## Prove
 

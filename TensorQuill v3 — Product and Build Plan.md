@@ -303,6 +303,42 @@ Where they meet: lanes 1 and 3 both add a key to the all-ranks view and both cha
 
 **Three wait on something outside the code:** D1 on the two-GPU run, B1 on the amendments, and G1 on results 1 and 2.
 
+**Build list, as it stands on Nov 17, 2026, after the freeze on new kinds was lifted** (Decisions: "The freeze on new detector kinds is lifted"). It replaces nothing above: the rows above stay as the record of what was built. Kinds are built one at a time, each to done before the next. Names of new kinds are working names.
+
+*New kinds, in build order.*
+
+| # | Build | From | Main files | Needs first | Done when |
+| --- | --- | --- | --- | --- | --- |
+| K1 | **Update size per parameter** (`update_spike`, an anomaly). Each step, the norm of Adam's update to each parameter, read from the optimizer's own state with no copy of the weights; an incident when a parameter's update jumps against its own recent history. Opt-in, and it does not fire the trigger by default | Altenbernd et al., arXiv 2604.00726, pp. 6-9; review proposal list, second candidate | `capture.py`, `flight.py`, `ingest.rs`, `detect.rs`, `evidence.py`, golden files | Nothing. A CPU prototype is running to choose the rule | On a CPU toy a seeded gradient fault fires at its step and names the parameter; clean toy runs over several seeds stay silent; an optimizer without Adam's moments is `not_checked` with its reason; Python and the server agree on the golden cases |
+| K2 | **Cross-rank activation compare** (an anomaly). At the same step, compare one per-layer activation statistic across data-parallel ranks and name the rank far from the others' median. This is the check for corruption that `replica_drift` cannot see | TrainSDC, arXiv 2608.30769, pp. 4-5, 10-11; review proposal 9 | The all-ranks view in `evidence.py`, the cross-rank part of the server, tests | K1 merged (both add a kind to the same tables). At least three ranks | A three-process CPU run with one rank's activations corrupted names that rank, and a clean one stays silent. A real multi-GPU run is the author's |
+| K3 | **Per-token routing entropy** (an anomaly). The mean entropy of each token's routing distribution before top-k, per router, judged against the router's own history | arXiv 2606.28116, pp. 5-6, 8; first candidate in the review | The router hook in `capture.py`, `flight.py`, the MoE part of `detect.rs`, `evidence.py` | Its cost under `torch.compile`, measured first. Needs the router's logits: a router given by `indices=` cannot be judged and is `not_checked` | The compile cost is logged; a seeded collapse of per-token entropy with load unchanged fires on a CPU toy; healthy toys stay silent |
+| K4 | **Two probe numbers for the language-model head, with no incident:** the output-logit norm and mean, and the gap between BF16 and FP32 logits on the same hidden states. Numbers only, as `weight_trends` is | Chen et al., arXiv 2610.38277, pp. 2, 7-8; review proposal 8 | `probe.py`, `flight.py`, `evidence.py` | Nothing | The numbers are in the probe record and the evidence on a CPU toy, and the probe's cost is re-timed |
+| K5 | **Output-logit growth in the head** (an anomaly) | The same paper, pp. 1-2, 5-8; review proposal 10 | `detect.rs`, `evidence.py` | K4, and K4's numbers from a real run to set the threshold | Set when K4's numbers exist |
+| K6 | **Slow ranks, as an observation.** Per-collective timing from the flight recorder, with tokens per rank per step beside it | SCOUT p. 3; Lin et al. pp. 5, 9-12; MegaScale pp. 8, 12 | `flight.py`, the all-ranks view | A multi-rank run to see real timings | A three-process CPU run with one slowed rank names it |
+| K7 | **Hidden expert collapse.** Last: one case report supports it, and it needs expert outputs, which nothing captures today | Sha, arXiv 2605.19378, p. 12 | Not designed | A user or a real job that shows it | Not set |
+
+*Not new kinds: small code that can start now.*
+
+| # | Build | From | Needs first |
+| --- | --- | --- | --- |
+| S1 | Detach inside the `indices=` path, so a function that does not detach no longer makes non-reentrant checkpointing raise in eager mode | Open item of "Three lanes merged" | Nothing |
+| S2 | Refuse a router whose output holds no tensor, in place of writing zeros | The same | Nothing |
+| S3 | `kind_checks` says that equal replicas do not rule out corruption | Review proposal 1, the part left open | Nothing. It moves the golden files and the Gate 1 fixtures, so it goes in with K1, which moves them too |
+| S4 | An end marker when a local run closes, and stopped ranks grouped by stack with the odd group named | Review proposal 6; ByteRobust p. 8 | Nothing |
+| S5 | Gate 1: a time-limit field in the answer format, and a verdict rule for a correct trial with no tool-call count | Open item of the Gate 1 amendment | The author's model and time limit |
+| S6 | A median-and-MAD score recorded beside each ratio, so result 2 can compare rules without new captures | Review proposal 7 (ii) | Nothing |
+
+*Measurements, not builds.*
+
+| # | Run | From | Needs first |
+| --- | --- | --- | --- |
+| M1 | The detectors against SCOUT's fault injector and TrainCheck's 20 reproduced bugs, to state how many each catches | Review proposal 5 | A multi-rank job for the SCOUT part; the TrainCheck part runs on CPU |
+| M2 | `activation_drift` on a model trained from scratch (nanoMoE or nanochat), where the review predicts it fires on a healthy run | Review proposal 7 (i), finding W7 | The author's word on whether these runs count as result 2 |
+
+*Waiting on something outside the code:* D1 (replica drift names the rank, by strict majority with an "inconclusive" answer; the two-GPU run), G1 (attention maps out of `probe_json`; results 1 and 2), R5 (Rust as the default; held until after the release).
+
+*What can run at the same time.* K1 to K3 and K5 each add a kind to the same tables in `evidence.py` and `detect.rs` and move the same golden files, so they go one after another. S1 and S2 (the router hook), S4 (stall evidence and the writer), K4 (the probe) and M1's TrainCheck part touch other files and can each run beside K1.
+
 ### File boundaries and test plan for remaining work
 
 | Step | Path | Action | One-line purpose | Required tests and assertions |
@@ -1301,7 +1337,8 @@ State as of Nov 16, 2026.
   - *What it allows.* New incident kinds, built one at a time, each to done (Python, the server, tests, the documents and the counts) before the next starts.
   - *What it does not change.* The other five frozen lines stay frozen. Nothing blocks, pauses or ends training. A new anomaly kind does not fire the trigger by default, as today.
   - *Order, by what can be verified here.* First: update size per parameter, which is the only candidate that can be tested end to end on CPU (Altenbernd et al., arXiv 2604.00726, pp. 6-9). The cross-rank activation compare (TrainSDC, arXiv 2608.30769) closes the gap the corrected failure-list entry 2 names, and needs a multi-rank job to test. Per-token routing entropy needs its cost under `torch.compile` measured first. Output-logit growth in the head waits for numbers from real runs. Slow ranks would be an observation. Hidden expert collapse has one case report and needs expert outputs, which nothing captures.
-  - *Focused plan.* The freeze row and the sentence above the table are changed in the doc (revision 62) and in the local copy. The line "The first candidates when the freeze lifts are hidden expert collapse ..." is left as written: its order differs from the review's and it is the author's to reword.
+  - *Focused plan.* The freeze row and the sentence above the table are changed in the doc (revision 62) and in the local copy. The line that began "The first candidates when the freeze lifts are hidden expert collapse ..." was replaced at the author's request the same day (revision 63) by the build order below, which puts hidden expert collapse last, as the review does.
+  - *Build list.* Under "What is left to build, and what can run at the same time": rows K1 to K7 for the new kinds, S1 to S6 for small code that can start, M1 and M2 for measurements.
   - *Not decided.* Which candidates after the first are built at all, and whether a kind built without a real-run calibration ships on by default.
 
 ## Sources
