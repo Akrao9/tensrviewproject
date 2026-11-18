@@ -243,7 +243,8 @@ def test_ranks_with_no_stack_are_said_plainly_and_never_compared():
     found = ev.group_stopped_stacks(status(rank(0, in_collective()), rank(1, in_collective()),
                                            rank(2, state="unresponsive")))
     assert found["verdict"] == "all_alike" and found["ranks_without_stack"] == [2]
-    assert "Rank 2 sent no stack (an unresponsive rank cannot), so it is not compared." in ev.stopped_stacks_line(found)
+    assert ("Rank 2 sent no stack (no heartbeat, stopped for less than `stack_seconds`, or unresponsive), so it is"
+            " not compared.") in ev.stopped_stacks_line(found)
     # No stopped rank at all: nothing to say, no block.
     assert ev.group_stopped_stacks(status(rank(0, state="active"), summary="active")) is None
     assert ev.group_stopped_stacks(None) is None
@@ -269,7 +270,7 @@ def test_what_is_and_is_not_clearly_odd(stacks, verdict):
 
 def test_what_the_same_stack_means():
     same = ev.stack_signature
-    # A library's waiting loop moves between its lines from beat to beat: the same wait.
+    # A library's line is not compared (its versions may differ between hosts): the same wait.
     assert same(rank(0, in_loader(queue_line=180))) == same(rank(1, in_loader(queue_line=171)))
     # Two lines of the job's own code are two calls.
     assert same(rank(0, in_collective(line=7))) != same(rank(1, in_collective(line=9)))
@@ -324,3 +325,34 @@ def test_a_stack_that_arrives_or_moves_is_news_and_a_timing_is_not():
     assert stamp(arrived, None) == stamp(later, None)
     moved = status(rank(0, in_loader()), rank(1))
     assert stamp(arrived, None) != stamp(moved, None)
+
+
+def test_the_all_ranks_watcher_rewrites_when_a_stack_arrives_and_not_when_only_its_timing_moves(tmp_path):
+    """The ranks went silent before their stacks came (a stack comes after `stack_seconds` without
+    work): the arrival must be written, and the next beat's longer `unchanged_seconds` must not."""
+    silent = status(rank(0), rank(1), rank(2))
+    folder = all_ranks_store(tmp_path, silent)
+    arrived = status(rank(0, in_collective()), rank(1, in_collective()), rank(2, in_loader()))
+    later = json.loads(json.dumps(arrived))
+    for entry in later["ranks"]:
+        entry["stack"]["unchanged_seconds"] += 15
+    written: list[str] = []
+
+    class Ticks:
+        looks = 0
+
+        def tick(self):
+            Ticks.looks += 1
+            if Ticks.looks == 3:
+                (folder / "watchdog.json").write_text(json.dumps(arrived))
+            if Ticks.looks == 5:
+                (folder / "watchdog.json").write_text(json.dumps(later))
+
+        def look(self, evidence, path, rank=None):
+            pass
+
+    def update(evidence, path):
+        written.append(evidence["stopped_stacks"]["verdict"])
+
+    ev.watch(folder, rank="all", interval=0.0, polls=6, on_update=update, trigger=Ticks())
+    assert written == ["no_stacks", "odd_group"]

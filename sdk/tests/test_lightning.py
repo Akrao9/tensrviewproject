@@ -98,6 +98,15 @@ def test_callback_closes_the_session_when_fitting_fails(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="boom"):
         _trainer(tmp_path, callback, logger=False).fit(Broken())
     assert callback.session is None
+    # With a file, the end marker says the fit raised, not that it closed normally (row S4).
+    from tensorquill.sink import read_end_marker
+
+    path = tmp_path / "broken.rank0.jsonl"
+    callback = TensorQuillCallback(sink=tensorquill.JsonlSink(path))
+    with pytest.raises(RuntimeError, match="boom"):
+        _trainer(tmp_path, callback, logger=False).fit(Broken())
+    end = read_end_marker(path)
+    assert (end["state"], end["outcome"], end["exception"]) == ("closed", "raised", "RuntimeError")
 
 
 @pytest.mark.skipif(not torch.distributed.is_available(), reason="needs torch.distributed")

@@ -675,9 +675,13 @@ def stuck_at(rank: Mapping[str, Any]) -> dict[str, Any] | None:
 #     name: ranks on other hosts may have other install prefixes and checkout folders, and the
 #     heartbeat keeps only a path's last 200 characters;
 #   - the line, for frames of the job's own code and TensorQuill's, and not for a library's or
-#     Python's: ranks parked in the same wait are sampled at different beats, and a library's
-#     waiting loop (a queue `get` with a timeout, `Condition.wait`) moves between its lines, while
-#     in the job's code two lines are two different calls (a `loss.item()` and a `barrier()`).
+#     Python's: in the job's code two lines are two different calls (a `loss.item()` and a
+#     `barrier()`), while a library's line numbers differ between versions, and the hosts of one
+#     job may not all have the same patch release. The cost: two ranks blocked at two lines of
+#     the same library function, reached the same way, are one group. (Measured Nov 18, 2026 on
+#     `thread_stacks` itself, 12 samples each: a main thread in a `queue.get(timeout=...)` loop,
+#     `Event.wait()`, an `Event.wait(timeout)` loop and a `time.sleep` loop each kept one line in
+#     every sample, so the line is not dropped because waits move; they did not.)
 # The whole kept depth, not the innermost few frames: two ranks in the same collective reached
 # from different places in the job (one from the forward, one from the optimizer step) are a
 # mismatch worth seeing, and the outer frames all ranks share never split a group. A stack
@@ -801,7 +805,7 @@ def stopped_stacks_line(found: Mapping[str, Any] | None) -> str | None:
     tail = ""
     if without:
         tail = (f" Rank{'s' if len(without) != 1 else ''} {_rank_ranges(without, 8)} sent no stack"
-                " (an unresponsive rank cannot), so"
+                " (no heartbeat, stopped for less than `stack_seconds`, or unresponsive), so"
                 f" {'they are' if len(without) != 1 else 'it is'} not compared.")
 
     def place(group: Mapping[str, Any]) -> str:
