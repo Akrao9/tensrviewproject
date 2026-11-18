@@ -89,7 +89,7 @@ def test_a_current_report_with_no_incidents_is_said_to_be_current(tmp_path, monk
         "Incidents are from tensorquill-server's report for rank 0: the server's report is current through"
         " step 119 of attempt 1 (120 steps judged).",
     ]
-    assert len(lines) == 3 and " of 32 kinds checked" in lines[1]
+    assert len(lines) == 3 and " of 33 kinds checked" in lines[1]
     assert list(evidence["kind_checks"]) == list(tensorquill.build_evidence(healthy(range(120)))["kind_checks"])
     # The two sources the server never has are not listed as unchecked on every look.
     assert "not_checked" not in evidence
@@ -180,9 +180,9 @@ def test_the_incidents_of_a_current_report_are_python_s_and_the_summary_shows_th
         k: v for k, v in alone.items() if k not in ("job_stalled", "rank_silent")
     }
     checked = sum(1 for check in here.values() if check["value"] == "checked")
-    assert len(counted(ours)) == 1 and counted(ours)[0].startswith(f"{checked} of 32 kinds checked")
+    assert len(counted(ours)) == 1 and counted(ours)[0].startswith(f"{checked} of 33 kinds checked")
     in_python = checked - (2 if stall == "checked" else 0)
-    assert len(counted(expected)) == 1 and counted(expected)[0].startswith(f"{in_python} of 32 kinds checked")
+    assert len(counted(expected)) == 1 and counted(expected)[0].startswith(f"{in_python} of 33 kinds checked")
     assert any("not finite" in line for line in ours)
     assert stream.server.terminate() == 0
 

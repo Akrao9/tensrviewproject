@@ -10,7 +10,7 @@ watcher, the all-ranks view and the command line:
 - refuse: one given differs. The one-rank watcher then runs the detectors here with it and
   keeps the server's values for the rest; the all-ranks view lists the rank as unknown.
 
-Also here: the command line has a flag for each of the five, and `--rank all` takes `--top-k`.
+Also here: the command line has a flag for each of the six, and `--rank all` takes `--top-k`.
 
 Needs `pyarrow` (the `flight` extra) and the server binary
 (`cargo build --manifest-path server/Cargo.toml`, or `TENSORQUILL_SERVER_BIN`).
@@ -43,11 +43,14 @@ from test_watch_all_ranks import Run  # noqa: E402
 pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
 
 # Every one differs from its default, and together they change what `everything()` reports.
-APPLIED = {"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": 2}
+APPLIED = {"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": 2,
+           "update_warmup": 30}
 # One value of each that the server did not apply.
-OTHER = {"overload_threshold": 0.35, "drift_tolerance": 1e-6, "starve_window": 50, "starve_ratio": 0.1, "top_k": 3}
+OTHER = {"overload_threshold": 0.35, "drift_tolerance": 1e-6, "starve_window": 50, "starve_ratio": 0.1, "top_k": 3,
+         "update_warmup": 1000}
 FLAGS = {"overload_threshold": "--overload-threshold", "drift_tolerance": "--drift-tolerance",
-         "starve_window": "--starve-window", "starve_ratio": "--starve-ratio", "top_k": "--top-k"}
+         "starve_window": "--starve-window", "starve_ratio": "--starve-ratio", "top_k": "--top-k",
+         "update_warmup": "--update-warmup"}
 STARTED: list[Server] = []
 
 
@@ -123,7 +126,7 @@ def test_a_reader_that_gives_no_threshold_takes_the_servers(tmp_path):
 
 
 @pytest.mark.parametrize("given", [APPLIED, *({name: APPLIED[name]} for name in THRESHOLD_NAMES)],
-                         ids=["all five", *THRESHOLD_NAMES])
+                         ids=["all six", *THRESHOLD_NAMES])
 def test_a_reader_that_gives_the_applied_thresholds_is_current(tmp_path, given):
     folder = judged_by(tmp_path).incidents_file.parent
     assert read_server_report(folder, **given)["state"] == "current"
@@ -290,7 +293,7 @@ def test_the_command_line_gives_only_the_thresholds_typed(tmp_path):
     assert evidence["judged_ranks"] == [0, 1] and evidence["thresholds"] == APPLIED
     assert "other_thresholds" not in adopt.stdout
 
-    # Match: all five have a flag, `--top-k` among them with `--rank all`.
+    # Match: all six have a flag, `--top-k` among them with `--rank all`.
     match = cli(str(run.folder), "--rank", "all", *flags(APPLIED), cwd=cwd)
     assert match.returncode == 0, match.stderr
     assert json.loads(written.read_text(encoding="utf-8"))["judged_ranks"] == [0, 1]
@@ -331,7 +334,7 @@ def test_the_command_lines_watcher_of_one_rank(tmp_path, typed, source, state):
     assert evidence["detection"]["thresholds"] == expected and kinds_and_steps(evidence["incidents"]) == here(**expected)
 
 
-def test_each_of_the_five_flags_reaches_the_detectors_on_a_local_file(tmp_path):
+def test_each_of_the_six_flags_reaches_the_detectors_on_a_local_file(tmp_path):
     def text(evidence):  # a logged NaN is in these incidents: as text it equals itself
         return json.dumps(evidence, sort_keys=True)
 
@@ -351,7 +354,7 @@ def test_each_of_the_five_flags_reaches_the_detectors_on_a_local_file(tmp_path):
     done = cli(str(capture), "-o", str(tmp_path / "none.json"), cwd=tmp_path)
     written = json.loads((tmp_path / "none.json").read_text(encoding="utf-8"))
     assert text(written) == text(tensorquill.build_evidence(everything()))
-    # The same five through the Rust detectors.
+    # The same six through the Rust detectors.
     rust = cli(str(capture), "-o", str(tmp_path / "rust.json"), "--detectors", "rust", *flags(APPLIED), cwd=tmp_path)
     assert rust.returncode == 0, rust.stderr
     written = json.loads((tmp_path / "rust.json").read_text(encoding="utf-8"))

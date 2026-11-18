@@ -241,7 +241,7 @@ def test_evidence_with_no_incidents_keeps_no_samples_and_reads_the_same():
     assert marker["around"] == [] and marker["kept_steps"] == []
     assert marker["samples"] == {"total": 120, "kept": 0, "omitted": 120}
     assert marker["moe_flagged"] == {"samples": 0, "last_step": None}
-    assert incident_summary(small) == incident_summary(full) == "No incidents detected.\n5 of 32 kinds checked, 27 not configured"
+    assert incident_summary(small) == incident_summary(full) == "No incidents detected.\n5 of 33 kinds checked, 28 not configured"
     assert run_state_line(small) == run_state_line(full)
     with pytest.raises(SamplesOmitted, match="no step, since no MoE incident is listed"):
         tensorquill.expert_load_table(small, 10, 1)

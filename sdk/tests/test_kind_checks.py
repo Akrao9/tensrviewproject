@@ -8,7 +8,7 @@
   that could not be read, a server's store with no progress status).
 
 Only `unavailable` makes the run `degraded`, and the summary carries the count
-("3 of 32 kinds checked"). A kind is `checked` from its first record, so each kind also says
+("3 of 33 kinds checked"). A kind is `checked` from its first record, so each kind also says
 whether its rule has had enough history: `records` against `records_needed`, and
 `enough_history`. A rule that is still warming up (too few probes among them) does not
 degrade the run, and the summary and the listing by value name it apart from the kinds
@@ -157,7 +157,7 @@ def test_a_router_only_capture_reads_healthy_and_lists_what_it_cannot_show():
         "needs": "weights_unchanged with grad_norms (full capture)",
     }
     # The summary says how much of the list "no incidents" covers.
-    assert ev.incident_summary(evidence).splitlines()[:2] == ["No incidents detected.", "3 of 32 kinds checked, 29 not configured"]
+    assert ev.incident_summary(evidence).splitlines()[:2] == ["No incidents detected.", "3 of 33 kinds checked, 30 not configured"]
     assert ev.run_state_line(evidence) == "Run state: healthy"
 
 
@@ -240,7 +240,7 @@ def test_a_failed_probe_reads_degraded_and_says_which_kinds_it_leaves_unjudged()
             **checked(5, kind, "probe with attention (probe=)", "unavailable"), "check": "probe", "reason": entry["reason"],
         }
     summary = ev.incident_summary(evidence).splitlines()
-    assert summary[1] == "1 of 32 kinds checked, 28 not configured, 3 unavailable (attention_collapse, attention_uniform, attention_logit_growth)"
+    assert summary[1] == "1 of 33 kinds checked, 29 not configured, 3 unavailable (attention_collapse, attention_uniform, attention_logit_growth)"
     assert summary[2] == f"Not checked (probe): {entry['reason']}"
     assert ev.run_state_line(evidence) == "Run state: degraded (not checked: probe)"
 
@@ -266,8 +266,8 @@ def test_too_few_probes_are_checked_without_enough_history_and_do_not_degrade_th
     # "Nothing found" is not said for them: the summary and the listing by value set them apart.
     assert ev.incident_summary(evidence).splitlines() == [
         "No incidents detected.",
-        "4 of 32 kinds checked, 3 of them without enough history yet (attention_collapse 3 of 4 records,"
-        " attention_uniform 3 of 4, attention_logit_growth 3 of 4), 28 not configured",
+        "4 of 33 kinds checked, 3 of them without enough history yet (attention_collapse 3 of 4 records,"
+        " attention_uniform 3 of 4, attention_logit_growth 3 of 4), 29 not configured",
     ]
     listed = ev.kinds_by_value(evidence)
     assert listed["checked"] == ["repeated_steps"]
@@ -374,13 +374,13 @@ def test_a_status_that_was_named_and_cannot_be_read_is_unavailable_and_degrades(
             "reason": "no progress status (the server's watchdog.json): whether the job is still making progress is not checked",
         }
     assert evidence["run_state"]["state"] == "degraded" and codes(evidence) == ["no_status"]
-    assert ev.incident_summary(evidence).splitlines()[1] == "3 of 32 kinds checked, 27 not configured, 2 unavailable (job_stalled, rank_silent)"
+    assert ev.incident_summary(evidence).splitlines()[1] == "3 of 33 kinds checked, 28 not configured, 2 unavailable (job_stalled, rank_silent)"
 
     read = tensorquill.build_evidence(router_only(), watchdog=ACTIVE)
     # A status that was read is whole: the server waited out its own thresholds before writing it.
     assert all(read["kind_checks"][kind] == {"value": "checked", "enough_history": True, "needs": STATUS_NEEDS} for kind in STALLS)
     assert read["run_state"] == {"state": "healthy", "reasons": []}
-    assert ev.incident_summary(read).splitlines()[1] == "5 of 32 kinds checked, 27 not configured"
+    assert ev.incident_summary(read).splitlines()[1] == "5 of 33 kinds checked, 28 not configured"
 
 
 def test_a_servers_store_without_its_status_is_unavailable_and_degrades(tmp_path):
@@ -444,7 +444,7 @@ def test_a_file_that_was_given_is_checked_or_unavailable_and_one_that_was_not_is
         assert (evidence["kind_checks"][kind]["check"], evidence["kind_checks"][kind]["reason"]) == (check, entry["reason"])
     assert evidence["run_state"]["state"] == "degraded" and codes(evidence) == ["not_checked"]
     assert ev.checked_counts(evidence) == {
-        "kinds": 32, "checked": 3, "not_configured": 26, "unavailable": 3,
+        "kinds": 33, "checked": 3, "not_configured": 26, "unavailable": 3,
         "unavailable_kinds": ["collective_hang", "collective_desync", "traincheck_violation"],
         "not_enough_history": 0, "not_enough_history_kinds": [], "history_not_stated": 0,
     }
@@ -459,17 +459,17 @@ def test_the_count_is_out_of_every_kind_and_evidence_without_the_key_has_no_line
     checks = {"grad_spike": {"value": "checked", "enough_history": True}, "non_finite": {"value": "unavailable"},
               "not_a_kind": {"value": "checked"}}
     assert ev.checked_counts({"kind_checks": checks}) == {
-        "kinds": 32, "checked": 1, "not_configured": 0, "unavailable": 1, "unavailable_kinds": ["non_finite"],
+        "kinds": 33, "checked": 1, "not_configured": 0, "unavailable": 1, "unavailable_kinds": ["non_finite"],
         "not_enough_history": 0, "not_enough_history_kinds": [], "history_not_stated": 0,
     }
-    assert ev.checked_line({"kind_checks": checks}) == "1 of 32 kinds checked, 0 not configured, 1 unavailable (non_finite)"
+    assert ev.checked_line({"kind_checks": checks}) == "1 of 33 kinds checked, 1 not configured, 1 unavailable (non_finite)"
     # With incidents the line follows them.
     evidence = tensorquill.build_evidence(
         [{"run_id": "r", "step": s, "ts": float(s), "grad_norm": 1.0 if s != 40 else 80.0} for s in range(60)]
     )
     lines = ev.incident_summary(evidence).splitlines()
     assert [i["kind"] for i in evidence["incidents"]] == ["grad_spike"]
-    assert "3 of 32 kinds checked, 29 not configured" in lines and lines.index("3 of 32 kinds checked, 29 not configured") > 0
+    assert "3 of 33 kinds checked, 30 not configured" in lines and lines.index("3 of 33 kinds checked, 30 not configured") > 0
 
 
 def test_the_kinds_by_value_are_names_with_a_reason_for_each_unavailable_one(tmp_path):
@@ -489,7 +489,7 @@ def test_the_command_line_prints_the_count(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr("sys.argv", ["tensorquill", str(path)])
     ev.main()
     printed = capsys.readouterr().out
-    assert "No incidents detected.\n3 of 32 kinds checked, 29 not configured\n" in printed
+    assert "No incidents detected.\n3 of 33 kinds checked, 30 not configured\n" in printed
     assert "Run state: healthy" in printed
     written = json.loads(path.with_suffix(".evidence.json").read_text(encoding="utf-8"))
     assert written["kind_checks"]["job_stalled"]["value"] == "not_configured" and written["run_state"]["state"] == "healthy"
@@ -632,8 +632,8 @@ def test_a_kind_can_report_through_a_faster_rule_before_it_has_enough_history():
     assert evidence["run_state"]["state"] == "unhealthy"
     # The incident stands, and the line and the listing say so beside the count.
     assert ev.checked_line(evidence) == (
-        "2 of 32 kinds checked, 1 of them without enough history yet"
-        " (loss_scale_trouble 1 of 10 records but reported by a faster rule), 30 not configured"
+        "2 of 33 kinds checked, 1 of them without enough history yet"
+        " (loss_scale_trouble 1 of 10 records but reported by a faster rule), 31 not configured"
     )
     assert ev.kinds_by_value(evidence)["not_enough_history"] == {
         "loss_scale_trouble": {"records": 1, "records_needed": 10, "reported": True},
@@ -672,10 +672,10 @@ def test_a_file_from_before_the_field_is_never_read_as_enough_history(tmp_path):
     assert listed["history_not_stated"] == ["moe_imbalance", "starved_experts", "repeated_steps"]
     assert ev.checked_counts(old)["history_not_stated"] == 3 and ev.checked_counts(old)["not_enough_history"] == 0
     assert ev.checked_line(old) == (
-        "3 of 32 kinds checked, 3 of them with no word on their history (an older version wrote this), 29 not configured"
+        "3 of 33 kinds checked, 3 of them with no word on their history (an older version wrote this), 30 not configured"
     )
     # A current file with every checked kind past its warm-up says nothing more than the count.
-    assert ev.checked_line(evidence) == "3 of 32 kinds checked, 29 not configured"
+    assert ev.checked_line(evidence) == "3 of 33 kinds checked, 30 not configured"
 
 
 # --- The all-ranks view: what was checked for the whole run ---------------------------------
@@ -799,7 +799,7 @@ def test_a_kind_checked_on_one_rank_only_is_not_checked_for_the_run_and_names_th
     assert counts["checked"] + counts["not_configured"] + counts["unavailable"] == counts["kinds"] == 32
     assert (counts["checked"], counts["unavailable"]) == (6, 0)
     assert summary.splitlines()[-1] == count_line(summary) == (
-        "6 of 32 kinds checked on both ranks, 26 not configured, 1 of them checked on some ranks only"
+        "6 of 33 kinds checked on both ranks, 27 not configured, 1 of them checked on some ranks only"
         " (stalled_weights on rank 0)"
     )
     # Per rank: each rank's own count of the server's 25 kinds shows who differs.
@@ -828,7 +828,7 @@ def test_a_rank_that_is_not_judged_is_named_and_is_in_no_value(tmp_path):
         named += [*check.get("not_enough_history_ranks", ()), *check.get("history_not_stated_ranks", ())]
         assert 1 not in named, f"{kind} counts rank 1, which is not judged"
     assert count_line(summary) == (
-        "6 of 32 kinds checked on the 1 judged rank of 2 (rank 1 not judged, so not counted), 26 not configured"
+        "6 of 33 kinds checked on the 1 judged rank of 2 (rank 1 not judged, so not counted), 27 not configured"
     )
     assert (status["kinds"]["judged_ranks"], status["kinds"]["ranks_not_counted"]) == ("0", "1")
     assert evidence["run_state"]["state"] == "unknown"
@@ -838,7 +838,7 @@ def test_a_rank_that_is_not_judged_is_named_and_is_in_no_value(tmp_path):
     fall_behind(other, 1)
     evidence, summary, _ = three_ways(other, tmp_path)
     assert evidence["kind_checks"]["stalled_weights"]["value"] == "checked"
-    assert count_line(summary).startswith("7 of 32 kinds checked on the 1 judged rank of 2 (rank 1 not judged")
+    assert count_line(summary).startswith("7 of 33 kinds checked on the 1 judged rank of 2 (rank 1 not judged")
 
 
 def test_no_judged_rank_means_no_count(tmp_path):
@@ -863,8 +863,8 @@ def test_a_rank_short_of_history_makes_the_kind_short_for_the_run_and_is_named(t
     assert ev.kind_history(checks["grad_spike"]) == "not_enough"
     assert ev.kind_history(checks["non_finite"]) == "enough" and checks["non_finite"]["records"] == 5
     assert count_line(summary) == (
-        "6 of 32 kinds checked on both ranks, 1 of them without enough history yet (grad_spike 5 of 13 records on"
-        " rank 1), 26 not configured"
+        "6 of 33 kinds checked on both ranks, 1 of them without enough history yet (grad_spike 5 of 13 records on"
+        " rank 1), 27 not configured"
     )
     kinds = status["kinds"]
     assert kinds["not_enough_history"] == {"grad_spike": {"records": 5, "records_needed": 13, "ranks": "1"}}
@@ -1001,7 +1001,7 @@ def test_the_stall_kinds_are_the_runs_and_a_store_without_its_status_is_degraded
         check = evidence["kind_checks"][kind]
         assert (check["value"], check["check"], check["enough_history"]) == ("unavailable", "status", False)
         assert "ranks" not in check
-    assert count_line(summary) == "4 of 32 kinds checked on both ranks, 26 not configured, 2 unavailable (job_stalled, rank_silent)"
+    assert count_line(summary) == "4 of 33 kinds checked on both ranks, 27 not configured, 2 unavailable (job_stalled, rank_silent)"
     assert evidence["run_state"]["state"] == "degraded"
     assert [r["code"] for r in evidence["run_state"]["reasons"] if r["state"] == "degraded"] == ["no_status"]
 
@@ -1031,7 +1031,7 @@ def test_the_memory_comparison_is_checked_only_when_every_judged_rank_is_in_it(t
     evidence, summary, _ = three_ways(alone, tmp_path)
     assert evidence["kind_checks"]["memory_imbalance"] == {"value": "not_configured", "enough_history": False, "needs": needs}
     assert evidence["kind_checks"]["memory_pressure"]["value"] == "checked"
-    assert count_line(summary).startswith("9 of 32 kinds checked on the only rank, ")
+    assert count_line(summary).startswith("9 of 33 kinds checked on the only rank, ")
     # A rank whose memory could not be read is unavailable for the comparison, not unconfigured.
     failed = {"check": "cuda", "kinds": ["memory_growth", "memory_pressure", "allocator_retries"], "reason": "no CUDA"}
     broken = hand_store(tmp_path / "broken", {0: steps(60, **CUDA), 1: steps(60)}, not_checked={1: [failed]})
@@ -1067,7 +1067,7 @@ def test_the_count_line_stays_short_with_many_ranks_and_many_kinds(tmp_path):
     evidence, summary, status = three_ways(hand_store(tmp_path, ranks), tmp_path)
     line = count_line(summary)
     assert "checked on some ranks only (stalled_weights on ranks 1, 3, 5, 7, and 4 more, " in line and ", and " in line
-    assert line.startswith("6 of 32 kinds checked on all 16 ranks, 26 not configured, ") and len(line) < 700
+    assert line.startswith("6 of 33 kinds checked on all 16 ranks, 27 not configured, ") and len(line) < 700
     assert len(status["kinds"]["differs_by_rank"]) > ev.CHECKED_LINE_KINDS  # the listing has them all
 
 
@@ -1078,4 +1078,4 @@ def test_one_ranks_evidence_and_its_count_are_what_they_were(tmp_path):
     one = ev._report_evidence(folder / "rank=1", look, ev.read_watchdog(folder / "watchdog.json"))
     assert one["kind_checks"]["stalled_weights"] == checked(0, "stalled_weights", "weights_unchanged with grad_norms (full capture)", "not_configured")
     assert "ranks" not in json.dumps(one["kind_checks"]) and "kind_checks_not_stated" not in one
-    assert ev.checked_line(one) == "6 of 32 kinds checked, 26 not configured"
+    assert ev.checked_line(one) == "6 of 33 kinds checked, 27 not configured"

@@ -124,6 +124,7 @@ _FIELDS: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "scalars": ("scalars", _map(_float)),
     "grad_norms": ("grad_norms", _map(_float)),
     "weight_norms": ("weight_norms", _map(_float)),
+    "update_rms": ("update_rms", _map(_float)),
     "moe_top_k": ("moe_top_k", _map(_int)),
     "moe": ("moe_counts", _map(_list(_int))),
     "replica_spread": ("replica_spread", _map(_list(_float))),
@@ -166,6 +167,7 @@ def flight_schema() -> Any:
             pa.field("scalars", pa.map_(pa.string(), f64)),
             pa.field("grad_norms", pa.map_(pa.string(), f64)),
             pa.field("weight_norms", pa.map_(pa.string(), f64)),
+            pa.field("update_rms", pa.map_(pa.string(), f64)),
             pa.field("moe_top_k", pa.map_(pa.string(), pa.int32())),
             pa.field("moe_counts", pa.map_(pa.string(), pa.list_(pa.int64()))),
             pa.field("replica_spread", pa.map_(pa.string(), pa.list_(f64))),
@@ -252,7 +254,7 @@ def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 _MAP_COLUMNS = frozenset(
-    {"scalars", "grad_norms", "weight_norms", "moe_top_k", "moe_counts", "replica_spread"}
+    {"scalars", "grad_norms", "weight_norms", "update_rms", "moe_top_k", "moe_counts", "replica_spread"}
 )
 
 

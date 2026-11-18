@@ -27,13 +27,15 @@ import tensorquill
 from tensorquill.evidence import THRESHOLD_DEFAULTS, THRESHOLD_NAMES, incident_summary, thresholds_line
 
 # Every one differs from its default (the values of `test_reader_thresholds.APPLIED`).
-APPLIED = {"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": 2}
+APPLIED = {"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": 2,
+           "update_warmup": 30}
 NAMED = {
     "overload_threshold": "overload_threshold 0.5 (default: 0.35)",
     "drift_tolerance": "drift_tolerance 0.001 (default: 1e-06)",
     "starve_window": "starve_window 20 (default: 50)",
     "starve_ratio": "starve_ratio 0.5 (default: 0.1)",
     "top_k": "top_k 2 (default: what the run recorded)",
+    "update_warmup": "update_warmup 30 (default: 1000)",
 }
 PREFIX = "Thresholds that are not the defaults: "
 SERVER_LINE = PREFIX + "the server applied " + ", ".join(NAMED[name] for name in THRESHOLD_NAMES) + "."
@@ -105,7 +107,7 @@ def test_only_the_threshold_that_differs_is_named_with_its_value_and_the_default
     assert thresholds_line(one_rank(values, "python")) == f"{PREFIX}the detectors ran here with {NAMED[name]}."
 
 
-def test_all_five_are_named_in_one_line_in_their_usual_order():
+def test_all_six_are_named_in_one_line_in_their_usual_order():
     for evidence in (one_rank(APPLIED), all_ranks(APPLIED)):
         assert thresholds_line(evidence) == SERVER_LINE and "\n" not in SERVER_LINE
         assert incident_summary(evidence).count(PREFIX) == 1

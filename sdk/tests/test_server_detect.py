@@ -349,7 +349,7 @@ def test_a_router_only_capture_and_a_failed_probe_read_the_same_through_rust():
     assert router["run_state"] == {"state": "healthy", "reasons": []}
     from tensorquill.evidence import incident_summary
 
-    assert incident_summary(router).splitlines()[:2] == ["No incidents detected.", "3 of 32 kinds checked, 29 not configured"]
+    assert incident_summary(router).splitlines()[:2] == ["No incidents detected.", "3 of 33 kinds checked, 30 not configured"]
     failed = tensorquill.build_evidence(CHECK_SETS["probes, one failed"], detectors="rust")
     assert failed["run_state"]["state"] == "degraded" and [n["check"] for n in failed["not_checked"]] == ["probe"]
     assert failed["kind_checks"]["attention_collapse"] == {

@@ -588,7 +588,7 @@ def test_the_all_ranks_status_says_what_was_checked_for_the_run_and_never_counts
         {"checked": 3, "not_enough_history": 0, "not_configured": 22, "unavailable": 0},
     ]
     assert status["summary"].splitlines()[-1] == (
-        "5 of 32 kinds checked on both ranks, 27 not configured, 1 of them checked on some ranks only"
+        "5 of 33 kinds checked on both ranks, 28 not configured, 1 of them checked on some ranks only"
         " (stalled_weights on rank 0)"
     )
     assert client.call("list_incidents")["kinds"] == kinds
@@ -713,7 +713,7 @@ def test_a_path_that_does_not_exist_is_an_error_until_it_does(start, tmp_path):
         ("activation_drift", "dead_activations"), {"records": 30, "records_needed": 60})
     assert not set(kinds["checked"]) & set(kinds["not_enough_history"]) and "history_not_stated" not in kinds
     assert len(kinds["checked"]) + len(kinds["not_enough_history"]) + len(kinds["not_configured"]) == 32
-    assert (f"{len(kinds['checked']) + 2} of 32 kinds checked, 2 of them without enough history yet"
+    assert (f"{len(kinds['checked']) + 2} of 33 kinds checked, 2 of them without enough history yet"
             " (activation_drift 30 of 60 records, dead_activations 30 of 60)") in listed["summary"]
     assert client.call("get_series", name="loss")["range"]["end"] == 29
 

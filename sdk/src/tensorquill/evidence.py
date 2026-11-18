@@ -66,6 +66,16 @@ SPIKE_MIN_HISTORY = 10
 # times in a row never, while every seeded fault held it from its seeded step on. So a
 # parameter is reported on its own only when it stays there this many recorded steps in a row.
 SPIKE_SUSTAIN = 3
+# A jump in the size of the optimizer's update (`update_spike`), by the rule of Altenbernd et
+# al. (arXiv 2604.00726, eqs. 8 to 13). R is the largest RMS update over the parameters on a
+# step (`update_rms`, with `init(..., updates=True)`). A step is flagged when R changed from
+# the step before by more than `baseline / (UPDATE_ALPHA * sqrt(rise))`: `baseline` is the mean
+# of that change over the first UPDATE_WARMUP steps that could be compared, and `rise` is how
+# far the total gradient norm before clipping rose from the step before (a norm that did not
+# rise flags nothing). The paper takes the mean over the run's learning-rate warm-up, which a
+# reader of the records does not know; the `update_warmup` option stands in for its length.
+UPDATE_ALPHA = 0.05
+UPDATE_WARMUP = 1000
 # Activation detectors compare each watched module with its own history, because trained
 # LLMs carry large outliers by design: on healthy Granite the largest value in middle
 # blocks was 740-840 times the standard deviation. Healthy Granite (650 steps, 24 blocks)
@@ -404,6 +414,105 @@ def detect_grad_spikes(
     if first is None:
         return None
     return {"kind": "grad_spike", **first, "spike_count": len(spikes), "spike_steps": spikes[:20]}
+
+
+def detect_update_spikes(
+    records: list[dict[str, Any]], *, warmup: int = UPDATE_WARMUP, alpha: float = UPDATE_ALPHA
+) -> dict[str, Any] | None:
+    """Return the first jump in the size of the optimizer's update and the parameters whose
+    own update moved most, or None.
+
+    Each record's `update_rms` gives the RMS of Adam's update to each parameter; `R` is the
+    largest of them. A record is compared with the last one before it that could be judged, in
+    the same attempt: `change` is how far `R` moved (either way) and `rise` how far the total
+    gradient norm rose (0 when it fell). The first `warmup` changes make the baseline, their
+    mean, and are not judged. After that a record is flagged when `rise > 0` and
+    `change > baseline / (alpha * sqrt(rise))` (Altenbernd et al., arXiv 2604.00726, eq. 13).
+
+    The total is the pre-clipping `clip_grad_norm` whenever the run clips and `grad_norm`
+    otherwise, as for `grad_spike`. Left out, and never used as the record before: a step the
+    loss scaler skipped (the optimizer's state did not move), a record without `update_rms`
+    or without a finite total, and values that are not finite. A total that is not finite is
+    `non_finite`'s to report, not this rule's.
+
+    `parameters` names up to ten parameters by how far their own RMS update moved from the
+    record before, largest first, so the incident says where the jump is.
+    """
+    key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
+    before: tuple[Any, float, float, dict[str, float]] | None = None  # attempt, R, total, each parameter's
+    seen = 0
+    summed = 0.0
+    first: dict[str, Any] | None = None
+    spikes: list[int] = []
+    for record in sorted(records, key=lambda r: r["step"]):
+        if record.get("step_skipped"):
+            continue
+        sizes = record.get("update_rms")
+        total = _finite(record.get(key))
+        if not isinstance(sizes, Mapping) or total is None:
+            continue
+        own = {str(name): size for name, size in ((n, _finite(v)) for n, v in sizes.items()) if size is not None}
+        if not own:
+            continue
+        largest = max(own.values())
+        attempt = record.get("attempt", 0)
+        if before is not None and before[0] == attempt:
+            change, rise = abs(largest - before[1]), max(0.0, total - before[2])
+            if seen < warmup:
+                summed += change
+                seen += 1
+            else:
+                baseline = summed / warmup
+                threshold = baseline / (alpha * math.sqrt(rise)) if rise > 0 and baseline > 0 else None
+                if threshold is not None and change > threshold:
+                    step = int(record["step"])
+                    spikes.append(step)
+                    if first is None:
+                        moved = sorted(
+                            ({"name": name, "update_rms": size, "previous": before[3][name],
+                              "change": abs(size - before[3][name])}
+                             for name, size in own.items() if name in before[3]),
+                            key=lambda p: (-p["change"], p["name"]),
+                        )
+                        first = {
+                            "step": step, "update_rms": largest, "previous": before[1], "change": change,
+                            "baseline": baseline, "threshold": threshold, "grad_norm": total,
+                            "grad_norm_before": before[2], "grad_rise": rise, "parameters": moved[:10],
+                        }
+        before = (attempt, largest, total, own)
+    if first is None:
+        return None
+    return {"kind": "update_spike", **first, "spike_count": len(spikes), "spike_steps": spikes[:20]}
+
+
+def update_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The `update_size` entry of `not_checked`: optimizers whose update size was asked for
+    (`init(..., updates=True)`) and could not be read.
+
+    The update size is read from Adam's and AdamW's own state. Any other optimizer, one that
+    steps copies of the weights, or a loop whose optimizer hooks are off and that never calls
+    `session.record_updates`, leaves no `update_rms`, and the capture says why once, under
+    `update_not_read` on the first record it wrote after it knew. Without this entry such a
+    run would read "no update spike", which is not "update size checked". The server writes
+    the same entry (detect.rs).
+    """
+    first: dict[str, tuple[int, str]] = {}
+    for record in records:
+        said = record.get("update_not_read")
+        if not isinstance(said, Mapping):
+            continue
+        for name, why in said.items():
+            first.setdefault(str(name), (int(record["step"]), str(why)))
+    if not first:
+        return None
+    names = sorted(first)
+    return {
+        "check": "update_size",
+        "kinds": ["update_spike"],
+        "optimizers": names,
+        "reason": "; ".join(f"{name}: {first[name][1]}" for name in names),
+        "step": min(step for step, _ in first.values()),
+    }
 
 
 def _spiking_parameters(
@@ -1347,8 +1456,8 @@ class _Tail:
 
 # The kinds `tensorquill-server` works out itself and writes to a rank's `incidents.json`.
 SERVER_KINDS = (
-    "moe_imbalance", "starved_experts", "grad_spike", "stalled_weights", "repeated_steps", "loss_scale_trouble",
-    "resume_lr_change", "resume_data_mismatch", "resume_incomplete", "data_stalled", "epoch_order_repeated",
+    "moe_imbalance", "starved_experts", "grad_spike", "update_spike", "stalled_weights", "repeated_steps",
+    "loss_scale_trouble", "resume_lr_change", "resume_data_mismatch", "resume_incomplete", "data_stalled", "epoch_order_repeated",
     "activation_spike", "activation_drift", "dead_activations", *ATTN_KINDS, "non_finite", "replica_drift",
     *SYSTEM_KINDS,
 )
@@ -1364,6 +1473,7 @@ INCIDENT_CLASSES: dict[str, str] = {
     "moe_imbalance": "anomaly",
     "starved_experts": "anomaly",
     "grad_spike": "anomaly",
+    "update_spike": "anomaly",
     "stalled_weights": "invariant",
     "repeated_steps": "invariant",
     "loss_scale_trouble": "invariant",
@@ -1447,6 +1557,7 @@ KIND_CHECK_VALUES = ("checked", "not_configured", "unavailable")
 INPUT_NEEDS: dict[str, str] = {
     "moe": "moe: a router's expert counts",
     "grad_total": "grad_norm or clip_grad_norm",
+    "update": "update_rms with grad_norm or clip_grad_norm (updates=True)",
     "weight_check": "weights_unchanged with grad_norms (full capture)",
     "steps": "step records",
     "loss_scale": "step_skipped (scaler=)",
@@ -1464,8 +1575,8 @@ INPUT_NEEDS: dict[str, str] = {
 # The input each of the server's kinds is judged from. `KIND_INPUTS` in server/src/detect.rs
 # must be this table, and test_kind_checks.py holds the two identical.
 KIND_INPUTS: dict[str, str] = {
-    "moe_imbalance": "moe", "starved_experts": "moe", "grad_spike": "grad_total", "stalled_weights": "weight_check",
-    "repeated_steps": "steps", "loss_scale_trouble": "loss_scale", "resume_lr_change": "lr",
+    "moe_imbalance": "moe", "starved_experts": "moe", "grad_spike": "grad_total",
+    "update_spike": "update", "stalled_weights": "weight_check", "repeated_steps": "steps", "loss_scale_trouble": "loss_scale", "resume_lr_change": "lr",
     "resume_data_mismatch": "data", "resume_incomplete": "checkpoint", "data_stalled": "data",
     "epoch_order_repeated": "data", "activation_spike": "layers", "activation_drift": "layers",
     "dead_activations": "layers", "attention_collapse": "attention", "attention_uniform": "attention",
@@ -1489,6 +1600,8 @@ KIND_INPUTS: dict[str, str] = {
 #   grad_spike            the total: SPIKE_MIN_HISTORY earlier norms and the one judged, 11;
 #                         one parameter: SPIKE_MIN_HISTORY earlier norms, then SPIKE_SUSTAIN in
 #                         a row
+#   update_spike          one record to compare the first with, the `update_warmup` option
+#                         (UPDATE_WARMUP) changes that make the baseline, and the one judged
 #   stalled_weights       STALL_STEPS weight checks in a row
 #   loss_scale_trouble    a scale below the floor 1; SCALE_SKIP_RUN skips in a row
 #   data_stalled          no batch: DATA_STALL_STEPS steps in a row, 3; the same batch: the
@@ -1522,6 +1635,7 @@ RECORDS_NEEDED: dict[str, int] = {
     "moe_imbalance": OVERLOAD_MIN_HISTORY + 1,
     "starved_experts": STARVE_WINDOW,
     "grad_spike": SPIKE_MIN_HISTORY + SPIKE_SUSTAIN,
+    "update_spike": UPDATE_WARMUP + 2,
     "stalled_weights": STALL_STEPS,
     "repeated_steps": 1,
     "loss_scale_trouble": SCALE_SKIP_RUN,
@@ -1554,6 +1668,7 @@ _CHECK_KINDS: dict[str, tuple[str, ...]] = {
     "resume_state": ("resume_incomplete",),
     "attention": ATTN_KINDS,
     "probe": ATTN_KINDS,
+    "update_size": ("update_spike",),
     "flight_recorder": ("collective_hang", "collective_desync"),
     "traincheck": ("traincheck_violation",),
 }
@@ -1578,6 +1693,7 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
         total = record.get("grad_norm") is not None or record.get("clip_grad_norm") is not None
         norms, layers = bool(record.get("grad_norms")), bool(record.get("layers"))
         counts["grad_total"] += total
+        counts["update"] += total and isinstance(record.get("update_rms"), Mapping) and bool(record["update_rms"])
         counts["weight_check"] += record.get("weights_unchanged") is not None and norms
         counts["loss_scale"] += record.get("step_skipped") is not None
         counts["lr"] += _lr_values(record) is not None
@@ -1621,14 +1737,31 @@ def _unavailable(entry: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
     return {"value": "unavailable", **extra, "check": entry.get("check"), "reason": entry.get("reason")}
 
 
-def records_needed(starve_window: int = STARVE_WINDOW) -> dict[str, int]:
+def records_needed(starve_window: int = STARVE_WINDOW, update_warmup: int = UPDATE_WARMUP) -> dict[str, int]:
     """`RECORDS_NEEDED` as a run applies it: `starved_experts` needs the window the run was
-    judged with (the `starve_window` option), every other kind its constant."""
-    return {**RECORDS_NEEDED, "starved_experts": int(starve_window)}
+    judged with (the `starve_window` option) and `update_spike` the baseline it was judged with
+    (the `update_warmup` option, and two records more); every other kind its constant."""
+    return {**RECORDS_NEEDED, "starved_experts": int(starve_window), "update_spike": int(update_warmup) + 2}
+
+
+# What a kind's clean check does not show, said in its `kind_checks` entry as `note` when the
+# kind is `checked`. `KIND_NOTES` in server/src/detect.rs must be this table.
+KIND_NOTES: dict[str, str] = {
+    "replica_drift": (
+        "equal replicas do not rule out silent data corruption: a corrupted gradient is reduced with the others"
+        " and the same wrong result goes back to every rank, so the replicas stay equal (SCOUT, arXiv 2608.11034,"
+        " pp. 1 and 3)"
+    ),
+}
+
+
+def _noted(kind: str, value: Any) -> dict[str, str]:
+    return {"note": KIND_NOTES[kind]} if kind in KIND_NOTES and value == "checked" else {}
 
 
 def kind_checks(
-    counts: Mapping[str, int], not_checked: Iterable[Mapping[str, Any]], *, starve_window: int = STARVE_WINDOW
+    counts: Mapping[str, int], not_checked: Iterable[Mapping[str, Any]], *, starve_window: int = STARVE_WINDOW,
+    update_warmup: int = UPDATE_WARMUP,
 ) -> dict[str, dict[str, Any]]:
     """The value of each of the server's kinds (`KIND_INPUTS`), from how many records carried
     its input (`input_counts`) and the checks that could not be made.
@@ -1639,13 +1772,14 @@ def kind_checks(
     record carried the input and `not_configured` when none did.
 
     Every entry also has `records`, `records_needed` (`RECORDS_NEEDED`, with the
-    `starve_window` the run was judged with) and `enough_history`, which is `records >=
-    records_needed` whatever the value. A kind is `checked` from its first record, so it is
-    `enough_history` that says whether "nothing found" is a verdict yet.
+    `starve_window` and the `update_warmup` the run was judged with) and `enough_history`,
+    which is `records >= records_needed` whatever the value. A kind is `checked` from its first
+    record, so it is `enough_history` that says whether "nothing found" is a verdict yet. A
+    checked kind whose clean check leaves something open says so under `note` (`KIND_NOTES`).
     `tensorquill-server` gives the same object in its report (`kind_checks`).
     """
     named = _kinds_not_checked(not_checked)
-    needed = records_needed(starve_window)
+    needed = records_needed(starve_window, update_warmup)
     checks: dict[str, dict[str, Any]] = {}
     for kind, counter in KIND_INPUTS.items():
         records = int(counts.get(counter, 0))
@@ -1654,7 +1788,8 @@ def kind_checks(
         if kind in named:
             checks[kind] = _unavailable(named[kind], **history)
         else:
-            checks[kind] = {"value": "checked" if records > 0 else "not_configured", **history}
+            value = "checked" if records > 0 else "not_configured"
+            checks[kind] = {"value": value, **history, **_noted(kind, value)}
     return checks
 
 
@@ -1727,7 +1862,7 @@ def checked_counts(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     Of the checked kinds, `not_enough_history` counts those whose rule is still warming up,
     named under `not_enough_history_kinds`, and `history_not_stated` those whose entry does
     not say (a file from before `enough_history`). None for evidence without the key.
-    `kinds` is every kind this version knows (32)."""
+    `kinds` is every kind this version knows (33)."""
     checks = evidence.get("kind_checks")
     if not isinstance(checks, Mapping):
         return None
@@ -1781,7 +1916,7 @@ def _reported_kinds(evidence: Mapping[str, Any]) -> set[Any]:
 
 
 def checked_line(evidence: Mapping[str, Any]) -> str | None:
-    """`9 of 32 kinds checked, 2 of them without enough history yet (grad_spike 5 of 13
+    """`9 of 33 kinds checked, 2 of them without enough history yet (grad_spike 5 of 13
     records, ...), 21 not configured, 2 unavailable (...)`, for the summary; None for
     evidence that does not say what was checked. The part about history is there only when a
     checked kind is still warming up, or when the file does not say. A warming-up kind that
@@ -1890,16 +2025,17 @@ def _top_k_option(top_k: int | Mapping[str, int] | None) -> int | dict[str, int]
     return {str(name): int(k) for name, k in top_k.items()}
 
 
-# The five detector options: `build_evidence`'s, and the keys of the server's `--thresholds`.
-THRESHOLD_NAMES = ("overload_threshold", "drift_tolerance", "starve_window", "starve_ratio", "top_k")
+# The six detector options: `build_evidence`'s, and the keys of the server's `--thresholds`.
+THRESHOLD_NAMES = ("overload_threshold", "drift_tolerance", "starve_window", "starve_ratio", "top_k", "update_warmup")
 THRESHOLD_DEFAULTS: dict[str, Any] = {
     "overload_threshold": OVERLOAD_THRESHOLD, "drift_tolerance": DRIFT_TOLERANCE,
     "starve_window": STARVE_WINDOW, "starve_ratio": STARVE_RATIO, "top_k": None,
+    "update_warmup": UPDATE_WARMUP,
 }
 
 
 def _given_thresholds(options: Mapping[str, Any]) -> dict[str, Any]:
-    """The thresholds a caller gave: those of the five that are in `options` and not None.
+    """The thresholds a caller gave: those of the six that are in `options` and not None.
     None is "not given" for every one of them, `top_k` included."""
     return {
         name: _top_k_option(options[name]) if name == "top_k" else options[name]
@@ -1912,7 +2048,7 @@ def _count(value: Any) -> bool:
 
 
 def applied_thresholds(report: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The five thresholds a server's report says it applied (its `thresholds`), in the shape
+    """The six thresholds a server's report says it applied (its `thresholds`), in the shape
     `build_evidence` takes them. One the report does not list reads as the default: a server
     from before `--thresholds` applied the defaults and listed no `top_k`."""
     listed = (report or {}).get("thresholds")
@@ -1922,8 +2058,9 @@ def applied_thresholds(report: Mapping[str, Any] | None) -> dict[str, Any]:
         value = listed.get(name)
         if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
             out[name] = value
-    if _count(listed.get("starve_window")):
-        out["starve_window"] = listed["starve_window"]
+    for name in ("starve_window", "update_warmup"):
+        if _count(listed.get(name)):
+            out[name] = listed[name]
     top_k = listed.get("top_k")
     if _count(top_k):
         out["top_k"] = top_k
@@ -1948,7 +2085,7 @@ def _threshold_text(value: Any) -> str:
 
 
 def _off_default(values: Any) -> list[str]:
-    """`name value (default: D)` for each of the five thresholds in `values` that is not the default."""
+    """`name value (default: D)` for each of the six thresholds in `values` that is not the default."""
     values = values if isinstance(values, Mapping) else {}
     return [
         f"{name} {_threshold_text(values[name])} (default: {_threshold_text(THRESHOLD_DEFAULTS[name])})"
@@ -1959,7 +2096,7 @@ def _off_default(values: Any) -> list[str]:
 
 def thresholds_line(evidence: Mapping[str, Any]) -> str | None:
     """One line that names every applied threshold that is not the default, with its value and
-    the default; None when all five are the defaults.
+    the default; None when all six are the defaults.
 
     A reader of a server's report takes the thresholds the server applied (`read_server_report`),
     so a run judged by other values than the defaults must say so wherever it is summarised.
@@ -1967,7 +2104,7 @@ def thresholds_line(evidence: Mapping[str, Any]) -> str | None:
     server's store, whether the server judged or this process did, and `thresholds` in the
     all-ranks view, or every set of `thresholds_by_rank` with its ranks when the judged ranks
     differ. Evidence with no `detection` (a local `.jsonl` file, or a store's parts read without
-    `--watch`) is `build_evidence`'s: it lists the five as `thresholds` only when one is not the
+    `--watch`) is `build_evidence`'s: it lists the six as `thresholds` only when one is not the
     default, so at the defaults it lists none and gives None, as evidence from before the key does.
     """
     if evidence.get("view") == ALL_RANKS_VIEW:
@@ -2004,6 +2141,7 @@ def read_server_report(
     starve_window: int | None = None,
     starve_ratio: float | None = None,
     top_k: int | Mapping[str, int] | None = None,
+    update_warmup: int | None = None,
 ) -> dict[str, Any]:
     """Read a rank's `incidents.json` from a server's store and say whether it can be used.
 
@@ -2074,6 +2212,7 @@ def read_server_report(
     asked = _given_thresholds({
         "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
         "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": top_k,
+        "update_warmup": update_warmup,
     })
     # A server started with `--thresholds` lists what it applied, `top_k` among them (null: what
     # the run recorded). A server from before that option has no `top_k` there, which reads the same.
@@ -2159,7 +2298,7 @@ def _report_evidence(
         "starve_ratio": applied.get("starve_ratio", STARVE_RATIO),
         "incidents": incidents,
         "samples": [],
-        # `thresholds`: the five the server judged by, which a reader takes unless it gave its own.
+        # `thresholds`: the six the server judged by, which a reader takes unless it gave its own.
         "detection": {**_detection(look, "server", None), "moe_flagged": report.get("moe_flagged"),
                       "thresholds": applied_thresholds(report)},
         **({"not_checked": not_checked} if not_checked else {}),
@@ -2822,7 +2961,7 @@ def _incident_identity(incident: Mapping[str, Any]) -> str:
                       sorted(incident.get("dead") or ())]
     elif kind == "starved_experts":
         parts = sorted(([e.get("layer"), e.get("router"), e.get("expert")] for e in incident.get("experts") or ()), key=repr)
-    elif kind == "grad_spike":
+    elif kind in ("grad_spike", "update_spike"):
         parts = sorted(str(p.get("name")) for p in incident.get("parameters") or ())
     elif kind == "stalled_weights":
         parts = sorted(str(name) for name in incident.get("parameters") or ())
@@ -2910,7 +3049,7 @@ def _group_incidents(looks: Mapping[int, Mapping[str, Any]], judged: list[int]) 
 
 # --- What was checked, for the whole run --------------------------------------------------
 #
-# The all-ranks view carries `kind_checks` too: one entry for each of the 32 kinds, with the
+# The all-ranks view carries `kind_checks` too: one entry for each of the 33 kinds, with the
 # same three values and the same `enough_history` as one rank's evidence, so `checked_counts`,
 # `kinds_by_value` and `kind_history` read it as they read a rank's. The rule (`run_kind_checks`):
 #
@@ -2998,6 +3137,8 @@ def _run_check(by_rank: Mapping[int, Mapping[str, Any]], needs: str) -> dict[str
         **({"records": min(seen)} if len(seen) == len(by_rank) else {}),
         **({"records_needed": max(needed)} if len(needed) == len(by_rank) else {}),
         "needs": needs,
+        **({"note": noted} if (noted := next((c["note"] for c in by_rank.values() if isinstance(c.get("note"), str)), None))
+           and value == "checked" else {}),
         **({key: first_unavailable.get(key) for key in ("check", "reason")} if first_unavailable is not None else {}),
         **({"ranks": ranks} if len(ranks) > 1 else {}),
         **({"not_enough_history_ranks": warming} if warming else {}),
@@ -3216,7 +3357,7 @@ def all_ranks_checked_line(evidence: Mapping[str, Any]) -> str | None:
     """The all-ranks summary's count line, or the line that says why there is no count; None
     for evidence that says neither (an older version wrote it).
 
-    `7 of 32 kinds checked on both ranks, 1 of them without enough history yet (grad_spike 5
+    `7 of 33 kinds checked on both ranks, 1 of them without enough history yet (grad_spike 5
     of 13 records on rank 1), 25 not configured, 1 of them checked on some ranks only
     (stalled_weights on rank 0)`. A kind is counted as checked only when every judged rank
     checked it; ranks are named wherever the judged ranks differ, and the ranks that are not
@@ -3543,6 +3684,7 @@ def all_ranks_evidence(
     starve_window: int | None = None,
     starve_ratio: float | None = None,
     top_k: int | Mapping[str, int] | None = None,
+    update_warmup: int | None = None,
 ) -> dict[str, Any]:
     """One look at every rank of a run: the evidence `watch(source, rank="all")` writes on its
     first look, returned and not written.
@@ -3567,6 +3709,7 @@ def all_ranks_evidence(
     thresholds = _given_thresholds({
         "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
         "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": top_k,
+        "update_warmup": update_warmup,
     })
     folders, looks, _, _ = _look_at_ranks(source, status, {}, thresholds, REPORT_GRACE_SECONDS)
     other_sources = {"traincheck": traincheck, "flight_recorder": flight_recorder,
@@ -3961,6 +4104,7 @@ def build_evidence(
     detectors: str = "python",
     server_binary: str | os.PathLike[str] | None = None,
     run_manifest: str | Path | Mapping[str, Any] | None = None,
+    update_warmup: int = UPDATE_WARMUP,
 ) -> dict[str, Any]:
     """Build viewer-neutral detector evidence from captured step records.
 
@@ -3989,22 +4133,27 @@ def build_evidence(
     before it was recorded: one value for every router, or a value per router name.
     `overload_threshold` is the base assignment-share threshold for top-1 and top-2.
     Top-3 and higher use a per-router baseline once ten unflagged samples are available.
+    `update_warmup` is how many step-to-step changes of the update size make the baseline of
+    `update_spike` (`detect_update_spikes`): it stands in for the length of the run's
+    learning-rate warm-up, which the rule's paper averages over.
 
     `detectors="rust"` takes the incidents of the server's kinds (`SERVER_KINDS`) from the
     Rust detectors, run here on the same records through `tensorquill-server detect`
     (`server_binary`, else `TENSORQUILL_SERVER_BIN`, else the one on `PATH`; needs `pyarrow`).
-    The five options above go to it as one JSON object (`--thresholds`), and a value the
+    The six options above go to it as one JSON object (`--thresholds`), and a value the
     Rust rules refuse (a negative number, a window or `top_k` below 1) raises `ValueError`.
     The per-step `samples` come from that run too (`detect --samples`), so no MoE rule runs
     here. The weight trends, the router names and sizes and the kinds read from other files
     are still made here. The evidence then carries `"detectors": "rust"`.
 
-    When one of the five options is not the default, the evidence lists all five as `thresholds`
+    When one of the six options is not the default, the evidence lists all six as `thresholds`
     (the name a server's report gives them), and `thresholds_line` names those that differ. At
     the defaults there is no such key, so that evidence is what it was before the key.
     """
     if detectors not in ("python", "rust"):
         raise ValueError(f"detectors must be 'python' or 'rust', not {detectors!r}")
+    if isinstance(update_warmup, bool) or not isinstance(update_warmup, int) or update_warmup < 1:
+        raise ValueError(f"update_warmup must be a whole number of at least 1, not {update_warmup!r}")
     every_attempt = load_records(source, rank=rank, all_attempts=True)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
@@ -4025,6 +4174,7 @@ def build_evidence(
         asked = {
             "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
             "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": _top_k_option(top_k),
+            "update_warmup": update_warmup,
         }
         report = server_report(every_attempt, thresholds=asked, binary=server_binary, samples=True)
         absent = [kind for kind in SERVER_KINDS if kind not in (report.get("checked") or ())]
@@ -4093,7 +4243,10 @@ def build_evidence(
         starved_hit = detect_starved_experts(samples)
         if starved_hit is not None:
             incidents.append(starved_hit)
-        for detector in (detect_grad_spikes, detect_stalled_weights, detect_repeated_steps, detect_loss_scale_trouble):
+        for detector in (
+            detect_grad_spikes, lambda found: detect_update_spikes(found, warmup=update_warmup), detect_stalled_weights,
+            detect_repeated_steps, detect_loss_scale_trouble,
+        ):
             # Only this detector looks at what a later attempt replaced.
             detector_records = every_attempt if detector is detect_repeated_steps else records
             hit = detector(detector_records)
@@ -4117,7 +4270,11 @@ def build_evidence(
         refused = refused_routers_not_checked(records)
         if refused is not None:
             not_checked.append(refused)
-        rank_checks = kind_checks(input_counts(records), not_checked, starve_window=starve_window)
+        not_read = update_not_read_not_checked(records)
+        if not_read is not None:
+            not_checked.append(not_read)
+        rank_checks = kind_checks(
+            input_counts(records), not_checked, starve_window=starve_window, update_warmup=update_warmup)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
     # A status is expected where a server stores the run (a directory of its parts, or one
     # part) or when one was named. A local file or a list of records has no server to miss.
@@ -4167,11 +4324,12 @@ def build_evidence(
         "top_k": router_top_k,
         "starve_window": starve_window,
         "starve_ratio": starve_ratio,
-        # The five the detectors ran with, under the name a server's report lists them by, and
+        # The six the detectors ran with, under the name a server's report lists them by, and
         # only when one is not the default: evidence at the defaults is what it was before.
         **({"thresholds": ran_with} if _off_default(ran_with := {
             "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
             "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": _top_k_option(top_k),
+            "update_warmup": update_warmup,
         }) else {}),
         "incidents": incidents,
         "samples": samples,
@@ -4456,6 +4614,18 @@ def _describe_attention(incident: Mapping[str, Any]) -> str:
 
 def _describe(incident: Mapping[str, Any]) -> str | None:
     kind = incident["kind"]
+    if kind == "update_spike":
+        where = ""
+        if incident.get("parameters"):
+            top = incident["parameters"][0]
+            where = f", most in {top['name']} ({top['previous']:.3g} to {top['update_rms']:.3g})"
+        count = incident.get("spike_count", 1)
+        return (
+            f"Update-size jump at step {incident['step']}: the largest RMS update moved {incident['change']:.3g}"
+            f" from the step before ({incident['previous']:.3g} to {incident['update_rms']:.3g}), against a usual"
+            f" {incident['baseline']:.3g} and a limit of {incident['threshold']:.3g} for a gradient norm that rose"
+            f" {incident['grad_rise']:.3g}{where}; {count} step{'s' if count != 1 else ''} flagged"
+        )
     if kind == "grad_spike":
         if incident.get("trigger") == "parameter":
             top = incident["parameters"][0]
@@ -5395,6 +5565,11 @@ def main() -> None:
         "--top-k",
         type=int,
         help="experts chosen per token, for captures made before moe_top_k was recorded",
+    )
+    parser.add_argument(
+        "--update-warmup",
+        type=int,
+        help="step-to-step changes of the update size that make the baseline of update_spike (default: 1000)",
     )
     parser.add_argument(
         "--detectors",
