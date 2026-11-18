@@ -1414,6 +1414,62 @@ State as of Nov 16, 2026.
   - *Wording for the agent instructions and README, not written yet.* New row S8.
   - *Not applied.* The focused plan's build-order line still names "output-logit growth" and "hidden expert collapse" as kinds; it is the author's to change. The review's count of TrainCheck bugs TensorQuill might catch (up to seven of 20, untested) is not in a row. Nothing here was run on a GPU or a real model.
 
+- [x] **Server wheels (built Nov 17, 2026; nothing uploaded, and the workflow has not run).** Part 2 of "Packaging and the release plan", the wheel half: `tensorquill-server` is packaged with maturin, a workflow builds and checks the wheels, and the `crate` CI job is gone. The protocol number, the SDK's lookup of the binary and its dependency on this package are other work and are not in this entry.
+  - **What was added.**
+    - `server/pyproject.toml`: maturin with `bindings = "bin"`, so the wheel's content is the compiled program, as a script. The distribution is `tensorquill-server`, `Apache-2.0 OR MIT`, with both license files, no authors and no URLs. `server/README.md` is new and is the PyPI page text.
+    - `server/packaging/fallback_wheel.py` makes the fallback wheel; `check_wheel.py` checks a wheel file, or which wheel pip installed; `testpypi_install.sh` is the container test. All three use the standard library or plain shell.
+    - `.github/workflows/server-wheels.yml`: jobs `build` (three platforms), `fallback`, `install` and `publish`.
+  - **Departures from the task as given.**
+    - `sdk/tests/test_packaging.py` gains one test that pins the server's wheel metadata to the crate's, and the no-contact-metadata test now reads `server/pyproject.toml` too. The task named only the comment in that file.
+    - `server/Cargo.toml`: its comment said there is no server README and gave `cargo package` as the reason for the license list. A README now exists, so the comment is reworded. Nothing else in the file changed.
+    - `server/README.md` was not asked for. Without it the PyPI page is empty, and it is where a user reads what the fallback is.
+    - `twine` was installed into the same throwaway venv as maturin to run `twine check`. The author's yes named maturin only.
+  - **Decisions.**
+    - *Version.* The number is written once, in `server/Cargo.toml`. `dynamic = ["version"]` makes maturin read it from there, and `check_wheel.py` fails a wheel whose version is not the crate's. The fallback wheel copies its `METADATA` from a built wheel, so it cannot carry another number. How maturin turns a Cargo pre-release (`0.1.0-alpha.1`) into a Python version was not checked: use plain `x.y.z` numbers until it is.
+    - *What the fallback wheel holds.* `METADATA`, the two license files, `WHEEL` and `RECORD`: five files, about 6 KB, tagged `py3-none-any`. It has no program and no stand-in script. A stand-in named `tensorquill-server` was considered and rejected: the SDK would find a file with the program's name that is not the program, and every caller would have to tell the two apart.
+    - *What a user on such a platform sees* (Windows, Intel macOS, Alpine and other musl Linux, glibc older than 2.17). `pip install tensorquill-server`, or the SDK that depends on it, succeeds. There is no `tensorquill-server` command. The SDK can tell this case from "not installed": `importlib.metadata.distribution("tensorquill-server").read_text("WHEEL")` has the line `Tag: py3-none-any`. The README says to build from source with `cargo build --release`.
+    - *The fallback is made from a built wheel, not built on its own.* Its `METADATA` is then byte for byte the platform wheels'. The `fallback` job makes it from each of the three wheels and fails unless the three results are the same file.
+    - *No sdist is published.* With a `py3-none-any` wheel in the release pip never reaches a source archive, and one would need its own contents check.
+    - *`requires-python = ">=3.8"`.* The wheel holds no Python. The floor is looser than the SDK's 3.10 so that it can never block an SDK install, and the new test fails if it becomes tighter.
+    - *`manylinux_2_17` by building inside the `manylinux2014` image* (glibc 2.17), which is what `PyO3/maturin-action` does with `manylinux: 2014`, and not with `--zig`. `rerun` builds in a manylinux container too (`reusable_build_and_upload_wheels.yml`, at `manylinux_2_28`). arm64 uses the `ubuntu-24.04-arm` runner; the action's image table maps an arm64 host with an `aarch64` target to `quay.io/pypa/manylinux2014_aarch64`, so nothing is emulated.
+    - *The `crate` job is removed, not replaced inside `ci.yml`.* Its replacement is the new workflow. `cargo package` and `cargo publish --dry-run` are no longer run anywhere. `Cargo.toml` keeps its `include` list; only its comment changed.
+    - *The comment in `test_packaging.py`.* The assertion message said `license` with `license-file` confuses the crates.io check. That is still true of crates.io but is no longer the reason, so the message now says the license is the SPDX expression alone. The assertion is unchanged.
+    - *Publishing.* The `publish` job runs only when the workflow is started by hand with `publish` set to `testpypi` or `pypi`, and `pypi` only from `main`. It uses `pypa/gh-action-pypi-publish` with `id-token: write` on that job alone and no secret. It was not started.
+  - **pip takes the platform wheel over the fallback.** Read in the project venv (pip 26.3 and the copy of `packaging` 26.3 it carries in `pip/_vendor`):
+    - `pip/_vendor/packaging/tags.py`, `compatible_tags` (line 605; the two `yield` lines are 635 and 637) yields `py3x-none-<platform>` for every platform before any `-none-any` tag, and `sys_tags` puts those after the interpreter's own tags.
+    - `pip/_internal/index/package_finder.py`, `CandidateEvaluator._sort_key` (line 516; the tag position is taken at line 556 and returned at 577) ranks a wheel by the position of its best tag in that list, lower first, when the versions are equal.
+    - Measured on this Mac with pip 26.3's copy: `py3-none-macosx_11_0_arm64` is at position 690 and `py3-none-any` at 1271 of 1284; for a Linux x86_64 list, `py3-none-manylinux_2_17_x86_64` is at 3 and `py3-none-any` at 44.
+    - Run with both wheels in one directory and `--no-index --find-links`: pip 24.0 and pip 26.3 take the macOS wheel here; `pip download --platform` takes the fallback for `win_amd64`, `macosx_10_12_x86_64` and `musllinux_1_2_x86_64`, and the macOS wheel for `macosx_14_0_arm64`.
+    - The Linux pick, on a stand-in: the macOS wheel copied and retagged `manylinux_2_17_x86_64.manylinux2014_x86_64`, beside the fallback. `pip download --platform manylinux_2_17_x86_64` (pip 26.3) takes the stand-in, and takes the fallback for `musllinux_1_2_x86_64` and `manylinux_2_17_aarch64`. `check_wheel.py` passes the stand-in's tags and file name with `objdump` off the path, and fails copies tagged `manylinux_2_28_x86_64`, `linux_x86_64`, both `2_17` and `2_28`, and the stand-in when told to expect arm64. With `objdump` on the path it fails the stand-in, because a macOS program has no GLIBC symbols.
+    - Not checked: `uv` and other installers, and the pick on a real Linux system; the `install` job checks that on both Linux runners, on Windows, on Intel macOS and in Alpine.
+  - **Where the program lands.** pip puts it in the environment's scripts directory, `sysconfig.get_path("scripts")`: `<venv>/bin/tensorquill-server` (checked in a clean venv). A `--target` install puts it in `<target>/bin/` (checked). A `--user` install should put it in `sysconfig.get_path("scripts", f"{os.name}_user")` (not checked). On Windows there is no wheel with the program.
+  - **Verified on macOS arm64** (maturin 1.16.0 in a throwaway venv, which the author allowed; Rust 1.100.0).
+    - `maturin build --release --locked` gives `tensorquill_server-0.0.1-py3-none-macosx_11_0_arm64.whl`, 7 MB: the program, `METADATA`, `WHEEL`, both licenses, `RECORD`, and a CycloneDX bill of materials that maturin adds by default.
+    - Installed into a clean venv from a directory that also held the fallback: pip took the macOS wheel, and `tensorquill-server --help` and `detect --help` run from the venv.
+    - The fallback alone installs into a clean venv, leaves no program, passes `pip check` and uninstalls. Making it twice gives the same bytes.
+    - `twine check --strict` passes on both wheels (twine installed in the throwaway venv; see the departures). `check_wheel.py` passes on both, and fails each when told to expect another platform.
+    - `test_packaging.py`: 20 passed. The whole SDK suite was not run: no module under `sdk/src` changed.
+    - `git status` after the builds shows no stray files: the cargo target directory was outside the repository, and `Cargo.lock` did not change.
+  - **Not verified, until the workflow's first run.**
+    - Both Linux builds. Docker is not installed on this machine, so no Linux wheel was built, no `manylinux_2_17` tag was seen, and the `objdump` check of GLIBC symbol versions never ran.
+    - Whether the crate's C dependencies build in the `manylinux2014` image. `tonic`'s `tls-aws-lc` and `zstd` compile C, and that image has an old compiler. This is the likeliest first failure. The ways out are a newer compiler through the action's `before-script-linux`, or `--zig`.
+    - The `ubuntu-24.04-arm`, `macos-15`, `macos-15-intel` and `windows-latest` runners; the labels are from GitHub's runner table. The whole of the `install` job, including its Windows shell lines.
+    - The workflow's syntax beyond a YAML parse: `actionlint` is not installed. Whether the `publish` job's `environment: ${{ inputs.publish }}` is accepted when the job is skipped on a push.
+    - Whether the action passes `--manylinux` to maturin from its `manylinux` input: the part of its source that would show it was not read in full. The tag is enforced by `check_wheel.py` either way.
+    - The `publish` job, trusted publishing, and how PyPI renders the page. Whether the concurrency rule keeps a push from cancelling a run started by hand: hand-started runs are in their own group with cancelling off, read from the documented meaning of `concurrency` and not seen to work.
+    - `testpypi_install.sh`: only its shell syntax, and the commands it issues with a stand-in for `docker`, on bash 3.2.
+    - Whether `tensorquill-server` is free on PyPI and TestPyPI. Asking would send the project's name to an outside service, so it is left to the author.
+  - **Do not upload a wheel built on a laptop.** The locally built program contains 829 strings with the home directory in them (panic locations in the cargo registry), and the bill of materials names the checkout path four times. The wheels to upload are the workflow's.
+  - **The author's steps.**
+    1. Push, and read the first run of "Server wheels".
+    2. On TestPyPI, add a pending trusted publisher for the project `tensorquill-server`: this repository, workflow `server-wheels.yml`, environment `testpypi`. Create the `testpypi` environment in the repository settings.
+    3. Start the workflow by hand with `publish: testpypi`. Afterwards the project's files page must list four wheels. If it lists fewer, the upload stopped part way: with only the `py3-none-any` wheel there, every install succeeds and no one gets the program. A file name cannot be uploaded twice, so raise the version and publish again.
+    4. With Docker running: `server/packaging/testpypi_install.sh`. It passes only if a glibc container gets the `manylinux_2_17` wheel and runs the program, and an Alpine container gets the fallback.
+    5. The same publisher on PyPI with environment `pypi`, then `publish: pypi` from `main`.
+  - **Lines this makes stale, not edited here.**
+    - In this plan: the Gates 3 to 4 row ("the server's wheels are not built"); the release bullet under next actions, which still says to read the first run of the `crate` job; "nothing removes them yet" in "Packaging and the release plan"; and "The repository has no maturin configuration" in the same entry.
+    - In the focused plan: result 5 ("the server's wheels are not built"), and the checklist line "Claim `tensorquill` on PyPI and `tensorquill-server` on crates.io, then publish".
+
 ## Sources
 
 - [TechInformed: OpenAI buying Neptune](https://techinformed.com/openai-buying-neptune-ai-in-all-stock-deal-what-it-means-for-ai-architecture/)

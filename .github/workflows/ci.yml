@@ -139,21 +139,6 @@ jobs:
           TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
         run: bash packaging/smoke.sh "$RUNNER_TEMP"/dist/*.whl examples/toy_moe.py
 
-  crate:
-    # Dry run only: nothing is uploaded, and no registry token is in this job's environment.
-    # New and never run on Linux, so it does not fail the workflow yet.
-    name: Package the server crate
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: server
-    steps:
-      - uses: actions/checkout@v4
-      - run: cargo package --list
-      - run: cargo publish --dry-run
-
   gpu:
     # GitHub's free runners have no GPU, so this runs only when started by hand, on a
     # self-hosted runner that already has a CUDA build of PyTorch. It is never started

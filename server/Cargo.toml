@@ -6,8 +6,9 @@ description = "Self-hosted ingest server for TensorQuill: Arrow Flight DoPut in,
 license = "Apache-2.0 OR MIT"
 keywords = ["pytorch", "observability", "arrow-flight", "parquet", "training"]
 categories = ["development-tools::profiling", "network-programming"]
-# No `readme`, `repository` or `homepage` yet: there is no server README, and the project owner
-# chooses the URLs at first publish. Licenses are listed so `cargo package` ships them.
+# No `repository` or `homepage` yet: the project owner chooses the URLs at first publish. The
+# README is named in pyproject.toml, which is what builds the wheels for PyPI; this crate is not
+# published to crates.io. Licenses are listed so `cargo package` ships them.
 include = [
     "src/**/*.rs",
     "tests/**/*.rs",
