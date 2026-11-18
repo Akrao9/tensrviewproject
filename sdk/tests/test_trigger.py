@@ -1764,7 +1764,9 @@ def test_a_new_attempt_that_hangs_before_it_passes_the_old_step_fires_again(tmp_
         job.close()
     assert len(calls()) == 2
     (rank,) = status["ranks"]
-    assert rank["attempt"] == new_attempt and rank["last_step"] == 99  # the highest stored step, of the old attempt
+    # The new attempt's own step, below the old attempt's 99 (until Nov 18, 2026 the status kept the
+    # highest step of any attempt, 99, until the new one passed it).
+    assert rank["attempt"] == new_attempt and rank["last_step"] == 29
     payload = calls()[1]["payload"]
     assert (payload["kind"], payload["incident"]["severity"]) == ("job_stalled", "critical")
     assert payload["incident"]["ranks"][0]["attempt"] == new_attempt
