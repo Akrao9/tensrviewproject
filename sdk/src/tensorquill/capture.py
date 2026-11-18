@@ -135,7 +135,9 @@ def _stats_hook(
             std = torch.zeros_like(mean)
         # Retain the largest magnitude across forwards until the optimizer step.
         # maximum propagates NaN, so a later clean microbatch cannot hide it.
-        amax = torch.maximum(xf.abs().amax(), buf[row, 2])
+        peak = xf.abs().amax()
+        kept = _row_max_compiled(buf, row) if torch.compiler.is_compiling() else buf[row, 2]
+        amax = torch.maximum(peak, kept)
         zfrac = (x == 0).float().mean()
         stats = torch.where(
             stat_idx == 0,
@@ -396,7 +398,8 @@ def _router_hook(
 # keeps the versions too when it zeroes the buffers, for an optimizer step taken between a
 # forward and its backward. Under AOTAutograd (aot_eager, Inductor) the body is traced on fake
 # tensors instead and adds exactly the operations the hook added before, so those graphs are
-# unchanged.
+# unchanged. There the hook's read and write of its buffer are traced outside the checkpointed
+# block's recompute set (`_NotRecomputed`), which PyTorch 2.6 needs and later versions do not.
 
 
 def _real(buf: torch.Tensor) -> bool:
@@ -417,10 +420,44 @@ def _restore_versions(tensors: Sequence[torch.Tensor], versions: Sequence[int]) 
             pass
 
 
+class _NotRecomputed:
+    """While AOTAutograd traces a hook's write: leave the write out of a checkpointed block's
+    recompute set.
+
+    Dynamo marks every node of a block wrapped in `torch.utils.checkpoint.checkpoint` as "must
+    recompute", the hook's write among them, and the mark reaches the nodes AOTAutograd traces
+    through `torch.fx.traceback`'s current metadata. PyTorch 2.6's partitioner then saves every
+    graph input such a node reads for the backward pass, so it saved the hook's buffer, though
+    nothing in backward reads it. The next write to the buffer (a second forward before the
+    backward, or the zeroing at a step) then made `backward()` raise "modified by an inplace
+    operation". PyTorch 2.9 and later no longer save an input backward does not use. The write
+    needs no recomputing: it has no gradient and backward never reads the buffer.
+
+    Private API, so best effort: where the metadata cannot be reached the write is traced as it
+    was."""
+
+    __slots__ = ("_meta", "_tag")
+
+    def __enter__(self) -> None:
+        self._meta = None
+        try:
+            meta = torch.fx.traceback.get_current_meta()
+            if "recompute" in meta:
+                self._tag = meta.pop("recompute")
+                self._meta = meta
+        except Exception:  # noqa: BLE001
+            self._meta = None
+
+    def __exit__(self, *exc: object) -> None:
+        if self._meta is not None:
+            self._meta["recompute"] = self._tag
+
+
 @torch.compiler.allow_in_graph
 def _add_compiled(counts: torch.Tensor, hits: torch.Tensor) -> None:
     if not _real(counts):
-        counts.add_(hits)
+        with _NotRecomputed():
+            counts.add_(hits)
     elif torch._C._current_graph_task_id() == -1:
         version = counts._version
         counts.add_(hits)
@@ -428,9 +465,19 @@ def _add_compiled(counts: torch.Tensor, hits: torch.Tensor) -> None:
 
 
 @torch.compiler.allow_in_graph
+def _row_max_compiled(buf: torch.Tensor, row: int) -> torch.Tensor:
+    """The largest magnitude a layer's row holds so far: the hook's one read of its buffer."""
+    if not _real(buf):
+        with _NotRecomputed():
+            return buf[row, 2]
+    return buf[row, 2]
+
+
+@torch.compiler.allow_in_graph
 def _set_row_compiled(buf: torch.Tensor, row: int, stats: torch.Tensor) -> None:
     if not _real(buf):
-        buf[row] = stats
+        with _NotRecomputed():
+            buf[row] = stats
     elif torch._C._current_graph_task_id() == -1:
         version = buf._version
         buf[row] = stats

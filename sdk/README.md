@@ -841,7 +841,7 @@ The ingest server needs a Rust toolchain. `test_flight.py` needs only `pyarrow` 
 cargo test --manifest-path server/Cargo.toml
 ```
 
-CI ([ci.yml](../.github/workflows/ci.yml)) runs the tests on every push and pull request, on Python 3.11 and 3.12 with PyTorch 2.6, 2.10 and 2.14 (CPU builds), and once more with the Lightning, Hugging Face and Rerun extras installed. It also runs `gpu_check.py --skip-overhead`, which on CPU uses the `aot_eager` backend. The real GPU gate is a separate job, started by hand from the Actions tab with `gpu` ticked; it needs a self-hosted runner with a CUDA build of PyTorch, and none is registered yet.
+CI ([ci.yml](../.github/workflows/ci.yml)) runs the tests on every push and pull request, on Python 3.11 and 3.12 with PyTorch 2.6, 2.10, 2.14 and 2.15, and on Python 3.13 and 3.14 with PyTorch 2.15 (CPU builds), and once more with the Lightning, Hugging Face and Rerun extras installed. It also runs `gpu_check.py --skip-overhead`, which on CPU uses the `aot_eager` backend. The real GPU gate is a separate job, started by hand from the Actions tab with `gpu` ticked; it needs a self-hosted runner with a CUDA build of PyTorch, and none is registered yet.
 
 The `Trainer` callback has its own acceptance check, a dense model fine-tuned through `transformers.Trainer` with `torch_compile=True`, clipping and fp16, with the same seeded fault as `dense_outlier_check.py` (`--fault`, default `massive`). It exits non-zero unless every step, loss and clipping norm is recorded and agrees with what `Trainer` logs, the detector finds the outlier, and nothing recompiles:
 
