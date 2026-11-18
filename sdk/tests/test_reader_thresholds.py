@@ -266,9 +266,9 @@ def test_ranks_judged_by_different_thresholds_are_both_taken_and_the_evidence_sa
     lines = summary.splitlines()
     at = next(i for i, line in enumerate(lines) if line.startswith("The judged ranks were not all judged by the same thresholds"))
     assert lines[at + 1] == ("  - ranks 0-1: overload_threshold 0.5, drift_tolerance 0.001, starve_window 20,"
-                             " starve_ratio 0.5, top_k 2")
+                             " starve_ratio 0.5, top_k 2, update_warmup 30")
     assert lines[at + 2] == ("  - rank 2: overload_threshold 0.35, drift_tolerance 1e-06, starve_window 50,"
-                             " starve_ratio 0.1, top_k None")
+                             " starve_ratio 0.1, top_k None, update_warmup 1000")
     # A reader that gives the first server's values is refused for the rank the second one judged.
     given, _ = all_ranks(run, tmp_path / "given.json", **APPLIED)
     assert given["ranks_by_state"] == {"current": [0, 1], "other_thresholds": [2]} and "thresholds_by_rank" not in given

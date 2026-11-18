@@ -72,8 +72,8 @@ _IDENTITY_KEYS = ("schema_version", "run_id", "rank", "attempt", "step")
 
 # Ties at the first step go to the series nearest the start of the step's own work: a block's
 # output changes before the loss computed from it and the gradients computed from that, and the
-# weight check comes after the optimizer's step.
-_KIND_ORDER = {"layers": 0, "moe": 0, "scalars": 1, "grad_norms": 2, "grad_norm": 3, "weight_norms": 4}
+# size of the optimizer's update and the weight check come after the optimizer's step.
+_KIND_ORDER = {"layers": 0, "moe": 0, "scalars": 1, "grad_norms": 2, "grad_norm": 3, "update_rms": 4, "weight_norms": 5}
 _NON_FINITE = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}
 
 
@@ -154,7 +154,7 @@ class _Run:
                         self.wall_clock.add(f"scalars/{name}")
                     else:
                         self._put("scalars", str(name), None, step, scalar)
-            elif key in ("grad_norms", "weight_norms") and isinstance(value, Mapping):
+            elif key in ("grad_norms", "weight_norms", "update_rms") and isinstance(value, Mapping):
                 for name, norm in value.items():
                     self._put(key, str(name), None, step, norm)
             elif key == "layers" and isinstance(value, Mapping):
@@ -513,7 +513,7 @@ def first_divergence(
     what = {
         "layers": f"activation {entry['stat']} of {where}", "moe": f"router {entry['stat']} of {where}",
         "scalars": f"logged scalar {where}", "grad_norms": f"gradient norm of {where}",
-        "weight_norms": f"weight norm of {where}", "grad_norm": "total gradient norm" + (" after clipping" if entry["name"] else ""),
+        "weight_norms": f"weight norm of {where}", "update_rms": f"update size of {where}", "grad_norm": "total gradient norm" + (" after clipping" if entry["name"] else ""),
     }.get(entry["kind"], series_id)
     at, before = entry["at"], entry["before"]
     if entry["non_finite"]:

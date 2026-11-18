@@ -166,7 +166,7 @@ def test_one_ranks_evidence_from_a_server_with_other_thresholds_says_so_and_at_t
     assert thresholds_line(here) == PREFIX + "the detectors ran here with " + ", ".join(
         NAMED[name] for name in THRESHOLD_NAMES if name != "starve_window") + "."
 
-    # At the defaults, given as nothing and as an empty object: the five are listed and no line is printed.
+    # At the defaults, given as nothing and as an empty object: the six are listed and no line is printed.
     for name, thresholds in (("none", None), ("empty", {})):
         folder = store.judged_by(tmp_path / name, thresholds).incidents_file.parent
         evidence = store.one_look(folder, tmp_path / f"{name}.json")
@@ -248,13 +248,14 @@ def test_the_command_line_prints_the_line_for_every_look_it_reports(tmp_path, st
 
 # --- a local file: the detectors ran here with the options typed -----------------------------------
 #
-# `build_evidence` lists the five it ran with as `thresholds` (the name a server's report gives
+# `build_evidence` lists the six it ran with as `thresholds` (the name a server's report gives
 # them) only when one is not the default, so the line is printed for a local `.jsonl` file and
 # for a store's parts read without `--watch`, and at the defaults the evidence and what is
 # printed are what they were.
 
 FLAGS = {"overload_threshold": "--overload-threshold", "drift_tolerance": "--drift-tolerance",
-         "starve_window": "--starve-window", "starve_ratio": "--starve-ratio", "top_k": "--top-k"}
+         "starve_window": "--starve-window", "starve_ratio": "--starve-ratio", "top_k": "--top-k",
+         "update_warmup": "--update-warmup"}
 # Each typed at its default value (`top_k`'s default, what the run recorded, has no value to type).
 TYPED_DEFAULTS = {name: value for name, value in THRESHOLD_DEFAULTS.items() if value is not None}
 ONE_READ_MODES = {"plain": [], "rank": ["--rank", "0"], "compact": ["--compact"]}

@@ -20,6 +20,15 @@ and fails unless the real capture and `build_evidence` report it in time, on tha
   149, ...). PASS when the incident lists the seeded parameter with an onset at the first step
   those 3 checks could show it or within one check interval (50 steps) after.
 
+- `update_spike` (`--case update_spike`, not part of `both` or `all`): the same seeded gradient,
+  times `--factor` (10,000 unless given) from `--seed-step`, with `init(..., updates=True)`, which
+  records the size of AdamW's update to each parameter from the optimizer's own state. PASS when
+  the `update_spike` incident is at the seeded step and the parameter whose update moved most is
+  the seeded one. The rule's baseline is the first `--update-warmup` step-to-step changes (200
+  here, so that it ends before the default seed step of 250; the detector's own default is 1,000).
+  Adam divides by the gradient's own size, so one bad gradient moves a parameter only a few
+  learning rates: x100 on one parameter is often under the rule's limit, and x10,000 is not.
+
 Each case prints a PASS or FAIL line, with the numbers behind it, and the exit status is 1 if either
 fails.
 
@@ -63,6 +72,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dense_outlier_check import FLUSH_EVERY, MODEL, build_models, load_batches, train_step  # noqa: E402
 
 CASES = ("grad_spike", "stalled_weights")
+UPDATE = "update_spike"  # its own case: `both` and `all` are the two above, as on the GPU runs so far
+UPDATE_FACTOR = 1e4
 HEALTHY = "healthy"  # nothing planted: the run the seeded ones are compared with
 PROJECT = "seeded-failures"
 DEFAULT_PARAMETER = "self_attn.k_proj.weight"  # suffix; the block is the middle one unless --layer says
@@ -234,6 +245,34 @@ def judge_grad_spike(
     )
 
 
+def judge_update_spike(evidence: dict[str, Any], seeded: str, seed_step: int, factor: float) -> Verdict:
+    """PASS when the `update_spike` incident is at `seed_step` and the parameter whose own update
+    moved most is `seeded`."""
+    incident = next((i for i in evidence["incidents"] if i["kind"] == UPDATE), None)
+    check = evidence["kind_checks"][UPDATE]
+    notes = [f"update_spike: {check['value']}, {check['records']} of {check['records_needed']} records"
+             + (f" ({check['reason']})" if check.get("reason") else "")]
+    if incident is None:
+        return Verdict(UPDATE, False, f"no update_spike incident (gradient of {seeded} x{factor:g} from step {seed_step})", notes)
+    names = [p["name"] for p in incident["parameters"]]
+    notes.append(
+        f"the largest RMS update went {incident['previous']:.3g} to {incident['update_rms']:.3g}: a change of "
+        f"{incident['change']:.3g} against a limit of {incident['threshold']:.3g} (usual change {incident['baseline']:.3g}, "
+        f"gradient norm up {incident['grad_rise']:.3g}); {incident['spike_count']} step(s) flagged, first {incident['spike_steps'][:6]}"
+    )
+    where = f"step {incident['step']}, seeded from step {seed_step}"
+    if incident["step"] != seed_step:
+        return Verdict(UPDATE, False, f"update_spike is at {where}", notes)
+    if not names or names[0] != seeded:
+        return Verdict(UPDATE, False, f"update_spike at {where} names {names[:1] or 'no parameter'} first, not {seeded}", notes)
+    top = incident["parameters"][0]
+    return Verdict(
+        UPDATE, True,
+        f"update_spike at {where}, names {seeded} first (its update went {top['previous']:.3g} to {top['update_rms']:.3g}; gradient x{factor:g})",
+        notes,
+    )
+
+
 def unchanged_streak_start(records: list[dict[str, Any]], seeded: str, consecutive: int = STALL_STEPS) -> int | None:
     """The first step at which `seeded` had been exactly unchanged on `consecutive` weight checks
     in a row with a finite, non-zero gradient: what the capture saw, whatever the incident says."""
@@ -328,7 +367,7 @@ def steps_for(case: str, args) -> int:
     The healthy run takes as many as the longer seeded case, so it reaches every step they do."""
     if case == HEALTHY:
         return max(steps_for(seeded, args) for seeded in CASES)
-    needed = args.seed_step if case == "grad_spike" else first_visible_stall(args.freeze_step)
+    needed = args.seed_step if case in ("grad_spike", UPDATE) else first_visible_stall(args.freeze_step)
     return (needed // FLUSH_EVERY + 2) * FLUSH_EVERY
 
 
@@ -357,11 +396,13 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
         print(f"{name} holds {100 * share:.2f}% of the total gradient norm: x100 on it moves the total x{total_ratio(100, share):.2f}"
               f" (the total rule fires at x{SPIKE_FACTOR:g}); using x{factor:g}, which moves it x{total_ratio(factor, share):.1f}."
               f" --factor 100 tests the one-parameter rule instead")
-    scale = GradientScale(seeded, factor) if case == "grad_spike" else None
+    if case == UPDATE and factor is None:
+        factor = UPDATE_FACTOR
+    scale = GradientScale(seeded, factor) if case in ("grad_spike", UPDATE) else None
     jsonl = out / f"{case}.jsonl"
     out.mkdir(parents=True)
     planted: dict[str, Any] = {"case": case, "parameter": name, "dtype": str(dtype), "lr": args.lr, "steps": steps}
-    if case == "grad_spike":
+    if case in ("grad_spike", UPDATE):
         planted.update(seed_step=args.seed_step, factor=factor)
         print(f"Seeding {name} ({dtype}): gradient x{factor:g} from step {args.seed_step}, {steps} steps", flush=True)
     elif case == HEALTHY:
@@ -372,7 +413,7 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
     try:
         with tensorquill.init(
             model, run_id=f"seeded-{case}", capture="full", every=FLUSH_EVERY, weights=WEIGHT_EVERY,
-            sink=tensorquill.JsonlSink(jsonl), project=PROJECT, name=case, config=planted,
+            sink=tensorquill.JsonlSink(jsonl), project=PROJECT, name=case, config=planted, updates=case == UPDATE,
         ) as session:
             assert name in session.param_names, f"{name} is not captured"
             for step in range(steps):
@@ -386,11 +427,13 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
             scale.remove()
 
     records = tensorquill.load_records(jsonl)
-    evidence = tensorquill.build_evidence(records)
+    evidence = tensorquill.build_evidence(records, **({"update_warmup": args.update_warmup} if case == UPDATE else {}))
     print(f"\n--- Detection ({case}) ---")
     print(tensorquill.incident_summary(evidence))
     if case == "grad_spike":
         verdict = judge_grad_spike(evidence, records, name, args.seed_step, factor)
+    elif case == UPDATE:
+        verdict = judge_update_spike(evidence, name, args.seed_step, factor)
     elif case == HEALTHY:
         kinds = sorted({incident["kind"] for incident in evidence["incidents"]})
         verdict = Verdict(case, not kinds, "no incident, with nothing planted" if not kinds else
@@ -407,8 +450,12 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--case", choices=[*CASES, "both", HEALTHY, "all"], default="both",
-                        help="both: the two seeded cases; healthy: nothing planted; all: healthy, then both")
+    parser.add_argument("--case", choices=[*CASES, UPDATE, "both", HEALTHY, "all"], default="both",
+                        help="both: grad_spike and stalled_weights; healthy: nothing planted; all: healthy, then both; "
+                             "update_spike: the seeded gradient read as the size of the optimizer's update")
+    parser.add_argument("--update-warmup", type=int, default=200,
+                        help="update_spike: step-to-step changes that make the rule's baseline; the seed step must come "
+                             "at least two steps after them (default: 200; the detector's default is 1000)")
     parser.add_argument("--out", type=Path, required=True, help="new directory; each case writes a folder in it")
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -440,7 +487,13 @@ def main(argv: list[str] | None = None) -> None:
         if case == HEALTHY:
             continue
         # A spike in one parameter is known once it has lasted SPIKE_SUSTAIN recorded steps.
-        need = args.seed_step + SPIKE_SUSTAIN if case == "grad_spike" else first_visible_stall(args.freeze_step) + 1
+        if case == UPDATE:
+            if args.update_warmup < 1 or args.seed_step < args.update_warmup + 1:
+                parser.error(f"--seed-step {args.seed_step} is inside the baseline: update_spike is first judged at step "
+                             f"{args.update_warmup + 1} with --update-warmup {args.update_warmup}")
+            need = args.seed_step + 1
+        else:
+            need = args.seed_step + SPIKE_SUSTAIN if case == "grad_spike" else first_visible_stall(args.freeze_step) + 1
         if args.steps and args.steps < need:
             parser.error(f"--steps {args.steps} ends before {case} can be seen; it needs at least {need}")
 

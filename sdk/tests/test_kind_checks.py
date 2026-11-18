@@ -40,7 +40,8 @@ MOE_NEEDS, STATUS_NEEDS = "moe: a router's expert counts", "the server's progres
 # What each of the server's kinds needs, by hand from its rules (`RECORDS_NEEDED` in evidence.py
 # lists them). The Rust unit test `what_each_kind_needs_is_these_numbers_...` has the same list.
 BY_HAND = {
-    "moe_imbalance": 11, "starved_experts": 50, "grad_spike": 13, "stalled_weights": 3, "repeated_steps": 1,
+    "moe_imbalance": 11, "starved_experts": 50, "grad_spike": 13, "update_spike": 1002, "stalled_weights": 3,
+    "repeated_steps": 1,
     "loss_scale_trouble": 10, "resume_lr_change": 1, "resume_data_mismatch": 1, "resume_incomplete": 1,
     "data_stalled": 4, "epoch_order_repeated": 4, "activation_spike": 11, "activation_drift": 60,
     "dead_activations": 60, "attention_collapse": 4, "attention_uniform": 4, "attention_logit_growth": 4,
@@ -93,7 +94,7 @@ def test_every_kind_gets_a_value_and_the_servers_kinds_each_have_an_input():
     assert tuple(ev.KIND_INPUTS) == ev.SERVER_KINDS
     assert set(ev.KIND_INPUTS.values()) == set(ev.INPUT_NEEDS)
     checks = tensorquill.build_evidence(router_only())["kind_checks"]
-    assert list(checks) == list(ev.INCIDENT_CLASSES) and len(checks) == 32
+    assert list(checks) == list(ev.INCIDENT_CLASSES) and len(checks) == 33
     for kind, check in checks.items():
         assert check["value"] in ev.KIND_CHECK_VALUES and isinstance(check["needs"], str) and check["needs"]
         assert ("records" in check) == ("records_needed" in check) == (kind in ev.SERVER_KINDS), kind
@@ -127,13 +128,15 @@ def test_what_each_kind_needs_is_the_same_numbers_here_by_hand_and_in_rust():
     assert ev.records_needed() == BY_HAND
     # The window a run is judged with, not the default one.
     assert ev.records_needed(7) == {**BY_HAND, "starved_experts": 7}
+    # And the baseline it is judged with: one record to compare the first with, and the one judged.
+    assert ev.records_needed(update_warmup=30) == {**BY_HAND, "update_spike": 32}
     source = DETECT_RS.read_text(encoding="utf-8")
     # The table names the kinds in order; its numbers are expressions over the rules' constants,
     # which a Rust unit test holds to the list it has by hand. That list is read here.
-    table = re.search(r"pub const RECORDS_NEEDED: \[\(&str, u64\); 25\] = \[(.*?)\n\];", source, re.S)
+    table = re.search(r"pub const RECORDS_NEEDED: \[\(&str, u64\); 26\] = \[(.*?)\n\];", source, re.S)
     assert table, "RECORDS_NEEDED is not in server/src/detect.rs in the shape this test reads"
     assert re.findall(r'^    \("([a-z_]+)",', table.group(1), re.M) == list(BY_HAND)
-    by_hand = re.search(r"let by_hand: \[u64; 25\] = \[(.*?)\];", source, re.S)
+    by_hand = re.search(r"let by_hand: \[u64; 26\] = \[(.*?)\];", source, re.S)
     assert by_hand, "the Rust unit test's list is not in the shape this test reads"
     assert [int(n) for n in re.findall(r"\d+", by_hand.group(1))] == list(BY_HAND.values())
 
@@ -349,7 +352,7 @@ def test_a_kind_named_by_a_not_checked_entry_is_unavailable_however_many_records
     assert checks["hardware_errors"]["enough_history"] is True and checks["memory_growth"]["enough_history"] is False
     assert checks["memory_growth"]["value"] == "checked" and checks["repeated_steps"]["value"] == "checked"
     assert [kind for kind, check in checks.items() if check["value"] == "unavailable"] == ["resume_lr_change", "hardware_errors"]
-    assert sum(check["value"] == "not_configured" for check in checks.values()) == 25 - 2 - 5
+    assert sum(check["value"] == "not_configured" for check in checks.values()) == 26 - 2 - 5
 
 
 # --- the progress status: the rule that changed -------------------------------------------------
@@ -444,7 +447,7 @@ def test_a_file_that_was_given_is_checked_or_unavailable_and_one_that_was_not_is
         assert (evidence["kind_checks"][kind]["check"], evidence["kind_checks"][kind]["reason"]) == (check, entry["reason"])
     assert evidence["run_state"]["state"] == "degraded" and codes(evidence) == ["not_checked"]
     assert ev.checked_counts(evidence) == {
-        "kinds": 33, "checked": 3, "not_configured": 26, "unavailable": 3,
+        "kinds": 33, "checked": 3, "not_configured": 27, "unavailable": 3,
         "unavailable_kinds": ["collective_hang", "collective_desync", "traincheck_violation"],
         "not_enough_history": 0, "not_enough_history_kinds": [], "history_not_stated": 0,
     }
@@ -462,7 +465,7 @@ def test_the_count_is_out_of_every_kind_and_evidence_without_the_key_has_no_line
         "kinds": 33, "checked": 1, "not_configured": 0, "unavailable": 1, "unavailable_kinds": ["non_finite"],
         "not_enough_history": 0, "not_enough_history_kinds": [], "history_not_stated": 0,
     }
-    assert ev.checked_line({"kind_checks": checks}) == "1 of 33 kinds checked, 1 not configured, 1 unavailable (non_finite)"
+    assert ev.checked_line({"kind_checks": checks}) == "1 of 33 kinds checked, 0 not configured, 1 unavailable (non_finite)"
     # With incidents the line follows them.
     evidence = tensorquill.build_evidence(
         [{"run_id": "r", "step": s, "ts": float(s), "grad_norm": 1.0 if s != 40 else 80.0} for s in range(60)]
@@ -476,7 +479,7 @@ def test_the_kinds_by_value_are_names_with_a_reason_for_each_unavailable_one(tmp
     assert ev.kinds_by_value({"incidents": []}) is None
     evidence = tensorquill.build_evidence(probed(fail_at=(30,)), watchdog=tmp_path / "watchdog.json")
     found = ev.kinds_by_value(evidence)
-    assert found["checked"] == ["repeated_steps"] and len(found["not_configured"]) == 26
+    assert found["checked"] == ["repeated_steps"] and len(found["not_configured"]) == 27
     assert found["not_enough_history"] == {} and "history_not_stated" not in found
     assert list(found["unavailable"]) == [*ATTENTION, *STALLS]
     assert found["unavailable"]["attention_uniform"].startswith("1 of 6 probes failed")
@@ -546,6 +549,14 @@ def boundary() -> dict[str, tuple[str, list[dict], dict]]:
             _each([{"grad_norm": 1000.0, "grad_norms": {"big": 1000.0, "small": 1.0}}] * 10
                   + [{"grad_norm": 1001.25, "grad_norms": {"big": 1000.0, "small": 50.0}}] * 3),
             {"trigger": "parameter", "sustained": 3},
+        ),
+        # The largest update moves 0.001 a step for the 1,000 changes of the baseline; then the gradient norm
+        # rises by 1 and the small parameter's update jumps past 0.001 / (0.05 * sqrt(1)) = 0.02.
+        "update_spike": (
+            "update_spike",
+            _each([{"grad_norm": 1.0, "update_rms": {"big": 0.010 + 0.001 * (step % 2), "small": 0.002}} for step in range(1001)]
+                  + [{"grad_norm": 2.0, "update_rms": {"big": 0.010, "small": 0.3}}]),
+            {"spike_count": 1, "grad_rise": 1.0},
         ),
         "stalled_weights": (
             "stalled_weights", _each([{"grad_norm": 1.0, "grad_norms": {"w": 1.0}, "weights_unchanged": ["w"]}] * 3), {"consecutive": 3},
@@ -796,15 +807,15 @@ def test_a_kind_checked_on_one_rank_only_is_not_checked_for_the_run_and_names_th
     assert "ranks" not in checks["moe_imbalance"] and checks["moe_imbalance"]["value"] == "not_configured"
     assert checks["job_stalled"] == {"value": "checked", "enough_history": True, "needs": STATUS_NEEDS}
     counts = ev.checked_counts(evidence)
-    assert counts["checked"] + counts["not_configured"] + counts["unavailable"] == counts["kinds"] == 32
+    assert counts["checked"] + counts["not_configured"] + counts["unavailable"] == counts["kinds"] == 33
     assert (counts["checked"], counts["unavailable"]) == (6, 0)
     assert summary.splitlines()[-1] == count_line(summary) == (
         "6 of 33 kinds checked on both ranks, 27 not configured, 1 of them checked on some ranks only"
         " (stalled_weights on rank 0)"
     )
-    # Per rank: each rank's own count of the server's 25 kinds shows who differs.
+    # Per rank: each rank's own count of the server's 26 kinds shows who differs.
     per_rank = {entry["rank"]: entry["kind_counts"] for entry in evidence["ranks"]}
-    assert (per_rank[0]["kinds"], per_rank[0]["checked"], per_rank[1]["checked"]) == (25, 5, 4)
+    assert (per_rank[0]["kinds"], per_rank[0]["checked"], per_rank[1]["checked"]) == (26, 5, 4)
     assert evidence["run_state"]["state"] == "healthy"  # a kind that is not configured degrades nothing
     kinds = status["kinds"]
     assert "stalled_weights" in kinds["not_configured"] and "stalled_weights" not in kinds["checked"]

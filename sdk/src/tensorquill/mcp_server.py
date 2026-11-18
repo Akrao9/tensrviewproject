@@ -710,7 +710,8 @@ def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
 def _names(records: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, None]]:
     """The names step records carry, by kind, in the order they first appear."""
     found: dict[str, dict[str, None]] = {kind: {} for kind in SERIES_KINDS}
-    fields = (("layers", "layer"), ("grad_norms", "parameter"), ("weight_norms", "parameter"), ("moe", "router"), ("scalars", "scalar"))
+    fields = (("layers", "layer"), ("grad_norms", "parameter"), ("weight_norms", "parameter"), ("update_rms", "parameter"),
+              ("moe", "router"), ("scalars", "scalar"))
     for record in records:
         for field, kind in fields:
             value = record.get(field)
@@ -789,7 +790,7 @@ def _rows(kind: str, name: str, records: Iterable[Mapping[str, Any]], expert: in
         elif kind == "parameter":
             point = {
                 column: (record.get(field) or {})[name]
-                for field, column in (("grad_norms", "grad_norm"), ("weight_norms", "weight_norm"))
+                for field, column in (("grad_norms", "grad_norm"), ("weight_norms", "weight_norm"), ("update_rms", "update_rms"))
                 if isinstance(record.get(field), Mapping) and name in record[field]
             } or None
         elif kind == "router":
@@ -1132,7 +1133,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "name": "get_series",
         "title": "Get a series",
         "description": (
-            "The recorded values of one layer (module: mean, std, abs_max, zero_frac), parameter (grad_norm,"
+            "The recorded values of one layer (module: mean, std, abs_max, zero_frac), parameter (grad_norm, update_rms,"
             " weight_norm), MoE router (diversity, largest share and expert, experts with no tokens; `expert` adds"
             " that expert's share) or logged scalar (such as the loss, or grad_norm and lr for the whole model) over"
             f" a step range. At most `max_points` points come back (default {DEFAULT_POINTS}): a longer range is"

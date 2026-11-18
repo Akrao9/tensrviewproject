@@ -328,7 +328,7 @@ def test_a_report_from_a_server_older_than_kind_checks_gives_evidence_that_does_
     stream.send(healthy(range(60)))
     assert stream.server.terminate() == 0
     evidence, summary = look(stream, tmp_path)
-    assert evidence["detection"]["source"] == "server" and len(evidence["kind_checks"]) == 32
+    assert evidence["detection"]["source"] == "server" and len(evidence["kind_checks"]) == 33
     assert "kinds checked" in summary
     # The same report as an older server wrote it: without the key.
     report = json.loads(stream.incidents_file.read_text())
