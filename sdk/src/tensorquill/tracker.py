@@ -38,6 +38,13 @@ def resolve_run(run_id: str | None = None) -> RunInfo:
     launcher's job ID (torchrun, SLURM), and otherwise a generated unique ID, so separate
     runs never append to the same file.
 
+    Under `torch.distributed` with several ranks, rank 0 resolves it and broadcasts it, with
+    where it came from, to every rank: a tracker's run usually exists on rank 0 only, and the
+    other ranks would otherwise take the launcher's ID or wait for a generated one that rank 0
+    never sends. That broadcast is a collective, so every rank must call `tensorquill.init`
+    (one broadcast each) unless `run_id` is passed, which is used as given with no collective;
+    pass the same one on every rank. The order above is rank 0's.
+
     `mlflow.active_run()` is thread-local and is None when the run was created through
     `MlflowClient` (PyTorch Lightning's `MLFlowLogger` does that, and only on rank 0), so
     those setups must pass `run_id` explicitly.
@@ -45,20 +52,66 @@ def resolve_run(run_id: str | None = None) -> RunInfo:
     rank = _rank()
     if run_id:
         return RunInfo(run_id, "explicit", rank)
+    dist = sys.modules.get("torch.distributed")
+    if dist is not None and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        # Whether to broadcast depends only on what every rank sees alike (no run_id passed,
+        # the process group and its size), never on a tracker or the environment, so every
+        # rank enters the same collective. Rank 0 resolves the whole order before it.
+        box: list[Any] = [_resolve_here(rank) if rank == 0 else None]
+        dist.broadcast_object_list(box, src=0)
+        shared_id, source = box[0]
+        return RunInfo(shared_id, source, rank)
     found = tracker_run_id()
     if found is not None:
+        if found[1] in ("mlflow", "wandb") and _world_size() > 1:
+            _warn_tracker_unshared(found)
         return RunInfo(found[0], found[1], rank)
     shared = _launcher_run_id()
     if shared is not None:
         return RunInfo(shared, "launcher", rank)
-    return RunInfo(_shared_generated_id(), "generated", rank)
+    return RunInfo(_unshared_generated_id(), "generated", rank)
+
+
+def _resolve_here(rank: int) -> tuple[str, str]:
+    """(run ID, source) by the whole order, on the rank that broadcasts it. Never raises: the
+    other ranks are waiting in the broadcast, so a tracker that fails is passed over."""
+    try:
+        found = tracker_run_id()
+    except Exception as error:  # noqa: BLE001  the other ranks wait on this rank
+        warnings.warn(
+            f"tensorquill.init on rank {rank} could not read the tracker's run ({type(error).__name__}: {error}), "
+            "so the run ID is the launcher's or a generated one. Pass run_id= to name the run.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+        found = None
+    if found is not None:
+        return found
+    shared = _launcher_run_id()
+    if shared is not None:
+        return shared, "launcher"
+    return generate_run_id(), "generated"
+
+
+def _warn_tracker_unshared(found: tuple[str, str]) -> None:
+    # Several ranks and no process group: this rank's tracker run cannot be shared, and a rank
+    # that does not see it (a tracker usually runs on rank 0 only) takes another ID.
+    tracker = {"mlflow": "MLflow", "wandb": "W&B"}[found[1]]
+    warnings.warn(
+        f"tensorquill.init on rank {_rank()} of {_world_size()} took the run ID {found[0]!r} from the {tracker} "
+        "run, and torch.distributed is not initialized, so it cannot be shared: a rank that does not see that "
+        "run writes under another ID. Call tensorquill.init after init_process_group, or pass the same run_id= "
+        "on every rank.",
+        RuntimeWarning,
+        stacklevel=4,
+    )
 
 
 def tracker_run_id() -> tuple[str, str] | None:
     """The tracker run this process can see, as (run ID, source), with no collective call.
 
     A tracker's run often exists on rank 0 only, so a caller with several ranks should
-    read it there and broadcast it.
+    read it there and broadcast it, as `resolve_run` does under `torch.distributed`.
     """
     env = os.environ.get("MLFLOW_RUN_ID")
     if env:
@@ -143,18 +196,11 @@ def _world_size() -> int:
     return int(value) if value is not None and value.isdigit() and int(value) > 0 else 1
 
 
-def _shared_generated_id() -> str:
-    # Every rank must use the same ID, or one run's files split under different names.
-    # With torch.distributed initialized, rank 0's ID is broadcast: a collective, so it
-    # needs every rank to call tensorquill.init, which per-rank capture does anyway.
+def _unshared_generated_id() -> str:
+    # Reached only without a process group of several ranks (`resolve_run` broadcasts rank 0's
+    # ID under one), so nothing here can share the ID.
     run_id = generate_run_id()
-    dist = sys.modules.get("torch.distributed")
-    if dist is not None and dist.is_available() and dist.is_initialized():
-        if dist.get_world_size() > 1:
-            box = [run_id]
-            dist.broadcast_object_list(box, src=0)
-            run_id = box[0]
-    elif _world_size() > 1:
+    if _world_size() > 1:
         # Several ranks, nothing to share an ID through yet: each rank picks its own, so the
         # job is written as one run per rank, each missing the others, and nothing says so.
         warnings.warn(

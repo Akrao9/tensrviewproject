@@ -659,17 +659,46 @@ def _clip_grad_norm_wrapper(parameters: Any, *args: Any, **kwargs: Any) -> Any:
     if not isinstance(parameters, torch.Tensor):
         parameters = list(parameters)
     total_norm = _clip_original(parameters, *args, **kwargs)  # type: ignore[misc]
-    first = parameters if isinstance(parameters, torch.Tensor) else next(iter(parameters), None)
-    for session in list(_clip_sessions):
-        if first is not None and id(first) in session._param_ids:
-            session.record_grad_norm(total_norm)
+    if _clip_is_l2(args, kwargs):
+        for session in list(_clip_sessions):
+            if _clips_session(session, parameters):
+                session.record_grad_norm(total_norm)
     return total_norm
+
+
+def _clip_is_l2(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
+    """Whether a `clip_grad_norm_(parameters, max_norm, norm_type=2.0, ...)` call computes an
+    L2 norm, the only kind recorded. Torch's and Accelerate's both take `norm_type` after
+    `max_norm`, and torch reads it with `float()`, so `2`, `2.0` and `"2"` are L2. Another
+    norm is not recorded: `record_grad_norm` adds up the squares of a step's norms into one
+    L2 total, which means nothing for an L1 or max norm."""
+    norm_type = args[1] if len(args) > 1 else kwargs.get("norm_type", 2.0)
+    try:
+        return float(norm_type) == 2.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _clips_session(session: "Session", parameters: Any) -> bool:
+    """Whether the parameters given to `clip_grad_norm_` (a list, or one tensor) include any
+    of `session`'s trainable ones. Not the first alone: in a LoRA or PEFT model the first is a
+    frozen base weight, and the Hugging Face `Trainer` clips `model.parameters()`. The walk
+    stops at the first trainable parameter, a few in for such a model."""
+    if isinstance(parameters, torch.Tensor):
+        return id(parameters) in session._param_ids
+    return not session._param_ids.isdisjoint(map(id, parameters))
 
 
 def _watch_clipping(session: "Session") -> None:
     """Record the norm `torch.nn.utils.clip_grad_norm_` returns while `session` is open.
 
-    The norm is computed anyway when gradients are clipped, so recording it is free.
+    The norm is computed anyway when gradients are clipped, so recording it is free. A call
+    counts for the session when any of its parameters is one of the session's trainable
+    ones, so a model whose first parameter is frozen (LoRA, PEFT) is covered. Only an L2 norm
+    (`norm_type` 2, the default) is recorded: a call with another norm type records nothing
+    as `clip_grad_norm`, and a run with no recorded `clip_grad_norm` has its spikes judged on
+    `grad_norm` where that is recorded, which is read after clipping, so a spike that
+    clipping flattened can go unseen.
     Lightning calls `torch.nn.utils.clip_grad_norm_` and discards the result, so this
     also covers Lightning's `gradient_clip_val`. Callers that bound the function before
     `init` (`from torch.nn.utils import clip_grad_norm_`) bypass it; they, and Megatron,
