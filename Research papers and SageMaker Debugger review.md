@@ -2,9 +2,9 @@
 
 Nov 17, 2026. A review of the 22 papers in `../researchpapers/`, of AWS's `smdebug` library in `../sagemaker-debugger/` and of its rule configurations in `../sagemaker-debugger-rulesconfig/` (cloned and added later the same day), read against TensorQuill as it is on `main` today. Nothing in the repository was changed. This file is new and untracked.
 
-**State on Nov 18, 2026.** The folder now holds 48 papers and posts (49 files; one paper is there in two versions), and the file has grown in five passes. Sections 1 to 6 are the first pass, of Nov 17: first pages and keyword search over the first 22 papers. Section 7 covers twelve more papers the same way. Sections 8 and 9 are page-by-page reads, of the twelve and of the first 22, and they correct the earlier sections. Section 10 reads eleven more papers and posts added on Nov 18, two of them in part, and corrects section 9 in one place that matters. Where sections disagree, the later one is right; the corrected rows are marked in place. Section 11 reads the three papers section 10 listed as missing and the pages section 10 skipped, and corrects section 10 in eight places. Sections 1 to 9 are committed (`2fe4a91`). Sections 10 and 11, their appendices and their marks are not committed. The code was last read at `b11b2c6`.
+**State on Nov 18, 2026.** The folder now holds 50 papers and posts (51 files; one paper is there in two versions), and the file has grown in six passes. Sections 1 to 6 are the first pass, of Nov 17: first pages and keyword search over the first 22 papers. Section 7 covers twelve more papers the same way. Sections 8 and 9 are page-by-page reads, of the twelve and of the first 22, and they correct the earlier sections. Section 10 reads eleven more papers and posts added on Nov 18, two of them in part, and corrects section 9 in one place that matters. Where sections disagree, the later one is right; the corrected rows are marked in place. Section 11 reads the three papers section 10 listed as missing and the pages section 10 skipped, and corrects section 10 in eight places. Section 12, a sixth pass, reads the DeepSeekMoE paper and reports a web search for a source for plan row K7; its last part reads the one paper that search turned up and the user then added (Omi, Sen, Farhadi), which makes 50 papers and posts in 51 files. It overturns nothing in sections 1 to 11. Sections 1 to 11 are committed (`2fe4a91`, `d2f67b5`). Section 12 and its marks are not committed. The code was last read at `b11b2c6`.
 
-**Where to start.** Section 1 for the ten proposals. Section 2 for what TensorQuill claims that the papers do not support, with F1 and F2 from section 8. Then the two corrections tables: C1 to C7 in section 8 and D1 to D9 in section 9. Two of the D rows change plan rows K5 and K7. **Section 10 takes one of those back in part: hidden expert collapse (K7) now has a source, row E1.** Section 10 also has three gaps in built kinds, H1 to H3, two of them run on CPU. **Section 11 corrects section 10 (rows J1 to J8): the BF16 attention finding H8 has four limits, and Laguna gives a second reported expert collapse, the first said to end in divergence.** It adds a fourth gap, M1.
+**Where to start.** Section 1 for the ten proposals. Section 2 for what TensorQuill claims that the papers do not support, with F1 and F2 from section 8. Then the two corrections tables: C1 to C7 in section 8 and D1 to D9 in section 9. Two of the D rows change plan rows K5 and K7. **Section 10 takes one of those back in part: hidden expert collapse (K7) now has a source, row E1.** Section 10 also has three gaps in built kinds, H1 to H3, two of them run on CPU. **Section 11 corrects section 10 (rows J1 to J8): the BF16 attention finding H8 has four limits, and Laguna gives a second reported expert collapse, the first said to end in divergence.** It adds a fourth gap, M1. **Section 12 is the place for plan row K7: two more papers read, no failure case and no threshold found, and two limits on any future rule (rows P4 and P6).**
 
 **How to read it.** Page numbers are PDF pages. "Measured" means the paper reports a number from an experiment. "Claims" means the paper says it without a number, or from one run. What I did not read is listed per paper at the end. TensorQuill facts come from the focused plan, the v3 plan, `sdk/README.md`, the failure list and the code under `sdk/src/tensorquill/`.
 
@@ -18,6 +18,7 @@ Nov 17, 2026. A review of the 22 papers in `../researchpapers/`, of AWS's `smdeb
 - **Added later on Nov 18, 2026.** The first 22 papers have now been read page by page (section 9); one of them, the INT8 inference paper, only in part. Section 9 makes nine corrections to sections 1 to 8. Three overturn a statement, and the plan copied two of those: the one source for hidden expert collapse does not show it, and output-logit growth also happens in stable runs. It finds no new capture defect.
 - **Added last on Nov 18, 2026 (section 10).** Eleven more papers and posts, nine read through their main body and two in part (DeepSeek-V3, Motif 3). One earlier correction is taken back in part: Motif 3 names hidden expert collapse and gives monitors for it, so plan row K7 is not "without a source" (E1); it still has no reported case. The routing finding F1 now has two first-hand sources (E2), and "the rank that reports a timeout is often a victim" is first-hand (E3). Three gaps in built kinds: the attention-logit rule misses a slow rise (H1, reproduced on `main`), the replica check does not say which ranks agree (H2, read), and a fault in Adam's state is seen by neither `update_spike` nor the weights-not-updating check (H3, run on CPU; the second rule's condition emulated). No new capture defect.
 - **Added last of all on Nov 18, 2026 (section 11).** The three missing papers (Laguna, Mamoda2.5, LLMFT) and every page section 10 skipped. Laguna reports an expert collapse that ran to divergence, kind not stated; it is the second reported collapse after Motif 3's, and hidden collapse still has no reported case (J1). Laguna runs a replica hash check and says it mainly catches silent data corruption, with one example and no counts; it also caught four software faults (M2). A weight corrupted in memory is judged by no rule on its norm (M1, run on CPU). LLMFT's detector was never scored on healthy training. No new capture defect.
+- **Added after that on Nov 18, 2026 (section 12).** DeepSeekMoE read in full: it names routing collapse as a risk and reports no collapse and no load number, so it supports no threshold. A web search for a paper showing hidden expert collapse found no failure case. One paper (Omi, Sen, Farhadi, arXiv 2506.14038) measures how alike expert outputs are at checkpoints through training while every expert stays in use. It was then added and read in full: it reports no failed run and gives no threshold, and it corrects four things the first account of it said. K7 still has no reported failure.
 
 ---
 
@@ -721,7 +722,7 @@ The "Not read" column is as it stood after this pass. Section 11's table says wh
 
 **Public material these papers point to (for section 5).** He et al. publish their fault-injection framework (`github.com/YLab-UChicago/FIdelityTraining`, their reference [1]); it is TensorFlow and models an accelerator that is not a GPU. FALCON says its cluster trace "will be released upon publication" (p. 1, footnote); I did not check whether it was. Motif 3 points to a training example repository with reference implementations of its system optimisations (reference [42]); I did not open it. Chen et al.'s failing run is a seeded, matched recipe (16 GPUs, seed 42, 11,930 updates) and so the closest thing here to a reproducible late-training failure, at a cost no CPU check can meet. None of this was downloaded.
 
-**Not in the folder, so still unchecked.** Mamoda2.5, the Laguna report, LLMFT (Yu et al.) and the Dai et al. paper on DeepSeekMoE that DeepSeek-V3 builds on. (The first three were added later and are read in section 11.)
+**Not in the folder, so still unchecked.** Mamoda2.5, the Laguna report, LLMFT (Yu et al.) and the Dai et al. paper on DeepSeekMoE that DeepSeek-V3 builds on. (The first three were added later and are read in section 11; the fourth in section 12.)
 
 **Not done in this pass.** No GPU run. No run of TensorQuill on any failure these papers describe. No reading of figure images except through their captions. No edit to the plans, the README or the agent instructions: plan row K7 and its "Decisions" paragraph still say "without a source".
 
@@ -831,9 +832,128 @@ Mamoda2.5 reports no training failure of any kind, and no expert-load number. Fo
 
 **Public material (for section 5).** LLMFT gives two Zenodo records for its injection tool and its detector (DOIs 10.5281/zenodo.15279193 and 15279226, p. 14); both are TensorFlow 2.8 code for small fine-tuning runs. Laguna XS.2's weights are on Hugging Face under Apache 2.0 (p. 1); a released model, not a failure set. Chen et al. say their kernel errors "can be reproduced from the captures alone" (p. 18); I did not find where the captures are published. None of this was downloaded or opened.
 
-**Not in the folder.** Dai et al., the DeepSeekMoE paper (arXiv 2401.06066). Section 10 lists it; the three other papers on that list are the ones read here.
+**Not in the folder.** Dai et al., the DeepSeekMoE paper (arXiv 2401.06066). Section 10 lists it; the three other papers on that list are the ones read here. (It was added later and is read in section 12.)
 
 **Not done in this pass.** No GPU run. No run of TensorQuill on a failure these papers describe. No reading of figure images. No edit to the plans, the README or the agent instructions: plan row K7 still says "without a source", which E1 asks to take back. Nothing is committed.
+
+## 12. DeepSeekMoE, and a web search for a source for K7 (Nov 18, 2026, sixth pass)
+
+Two things happened after section 11. The DeepSeekMoE paper was added to the folder (Dai et al., arXiv 2401.06066v1, 33 pages). And the user asked for a web search for a paper that shows hidden expert collapse, which is what plan row K7 lacks. The folder then held 50 files and 49 distinct papers and posts; with the paper added afterwards, 51 and 50.
+
+**The answer in two lines.** No paper found shows hidden expert collapse as a failure in a training run. One paper comes close enough to be worth downloading: it measures how alike the experts' outputs are, through training, in runs whose load looks balanced.
+
+**How this was done.** DeepSeekMoE: I read all 33 pages. pp. 1-11 as plain text, with Tables 1 and 2 one cell per line; pp. 12-24 and 31-33 with the page layout kept and no filter, which covers Tables 3 to 10. pp. 24-30 are the reference list, scanned only. Figures 1 and 3 to 7 are charts, and I could not read their values. Page numbers are PDF pages, found by extracting each page on its own: the charts in this PDF put false page breaks into a whole-file extract. I checked five other papers read with the same page printer (Laguna, Mamoda2.5, LLMFT, DeepSeek-V3, Motif 3); their page breaks match their page counts. I did not run that check on the papers of sections 7 to 10. The web search: four searches, with no detail about this project in them. Five papers came up. **I did not read those five** (one of them, Omi, Sen, Farhadi, was added afterwards and is read in full at the end of this section, which corrects what is said of it here). A fetch helper read their arXiv HTML pages and answered eight fixed questions with short quotes; I saw only its report. Every statement about them below is at that distance, and each should be re-checked when the PDF is in the folder. Nothing was downloaded.
+
+### What K7 needs, and what each found paper gives
+
+The test: experts still receive tokens, while their outputs shrink or become copies of each other. A paper passes fully if it has (a) an occurrence in a training run, (b) the statistic in a failing run and a healthy one, (c) a cost, (d) a threshold with a lead time or a false-alarm rate.
+
+| Paper | What it measures | (a) Occurrence | (b) Signal | (c) Cost | (d) Threshold | Verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| Omi, Sen, Farhadi, "Load Balancing Mixture of Experts with Similarity Preserving Routers", arXiv 2506.14038 | Mean pairwise cosine similarity of all experts' outputs on the same token ("PES"), on 4M sampled tokens, per layer, through training | In part. Two runs with the standard balancing loss (627M and 3.14B total parameters, 32 experts, top-4). Similarity is higher than with their method. No run is said to fail | Yes. The lowest PES of any layer: 0.0255 against 0.0044, and 0.0241 against 0.0028. The other layers are higher; their values are in a figure the helper did not report. Curves over training | Perplexity 14.086 against 13.685, and 8.517 against 8.304. The link is a correlation: the two runs also differ in the loss used | None | **Closest. Now in the folder and read: see "Omi, Sen, Farhadi, read in full" below, which corrects this row** |
+| Do, Le, Tran, "SimSMoE", arXiv 2406.15883 | CKA between the outputs of two experts, on tokens routed to both | Weak. Figures only; the helper found no numbers for the baseline | No numbers | Bits per character 1.11 against 1.08 and similar, for the method, not for the collapse | A CKA level of 0.5 (range 0.3 to 0.7), used to switch a training loss on. Not tested as a detector | Second. A candidate statistic that, as I understand the helper's description, needs only the experts a token already used |
+| Chi et al., "On the Representation Collapse of Sparse Mixture of Experts", arXiv 2204.09179 | The hidden states that go into the router, not the experts' outputs | Yes, a curve over 125K steps on a 12-layer encoder with 32 experts | No numbers in the text | Not measured for the collapse | None | A different failure from K7. Worth having because later papers cite it for "collapse" |
+| Guo, Lu et al., "Advancing Expert Specialization for Better MoE", arXiv 2505.22323 | Expert overlap and routing variance, at the end of a short fine-tune (about 550 steps, LoRA) | End of run only | Partial | Benchmark scores for their method | None | Not a training-run source |
+| Li et al., "Expert Divergence Learning for MoE-based Language Models", arXiv 2603.00054 | How much the loss rises when a layer's routing is shuffled; routing per data domain | At checkpoints | Figures only | Benchmark averages 35.59 against 36.34 to 36.65 | None | Not about expert outputs |
+
+Three things follow for K7.
+
+- **K7 still has no reported failure.** The closest paper shows experts that are more alike under one balancing loss than under another, alongside a perplexity gap of about 0.2 to 0.4. No run in it is said to collapse or fail. The numbers I have are each run's least-similar layer (0.0255 at most); how alike the worst layer gets is in a figure I have not seen.
+- **It does show that a load monitor cannot see this** (corrected by P1 below: the usage number is for one run). In the same two runs the paper's own usage measure is 1.0, which is perfect, while similarity is six to nine times higher than in the other arm. That measure is per sequence, not the per-expert share TensorQuill records. So the statement "load looks healthy while experts overlap" is supported, at one remove.
+- **The statistic is expensive.** PES runs every expert on every sampled token. The paper puts that at a multiplier of 3.6 to 4.9 on floating-point work; the helper did not say against what base (the base is a normal forward pass: P2 below). TensorQuill captures router scores, not expert outputs, so K7 needs a new capture either way. SimSMoE's version compares only experts that a token was already routed to. If that is right, it needs no extra expert passes, which would make it the cheaper design to test first. That is my inference from the helper's report, not something I read.
+
+**No threshold comes out of any of the five.** If K7 is built, its numbers have to come from TensorQuill's own seeded runs.
+
+### DeepSeekMoE: what the 33 pages say
+
+Before reading it I wrote that this paper "is not what K7 needs". Having read it, that holds, with one useful addition (N2).
+
+| # | What the paper says | Kind of evidence | Effect on TensorQuill |
+| --- | --- | --- | --- |
+| N1 | Routing collapse is named as a risk, with a citation to Shazeer et al. 2017: "the model always selects only a few experts, preventing other experts from sufficient training" (p. 7). No collapse is reported in any of its runs | A definition and a citation. No occurrence, no load number anywhere in the paper | It supports the wording of `moe_imbalance` and `starved_experts`. It supports no threshold. `OVERLOAD_THRESHOLD = 0.35` and `STARVE_RATIO = 0.1` stay TensorQuill's own |
+| N2 | Redundancy between experts is tested on a finished model: for each token, mask the experts with the highest routing probability, route to the next ones, and measure the loss. The model that loses more is said to be less redundant (p. 13, Figure 4) | One comparison of two trained models, DeepSeekMoE 2B and GShard×1.5 (2.8B of expert parameters). The values are in a chart I could not read. Done at evaluation, not during training | Not a K7 source: nothing is tracked through training and nothing fails. It is a test for redundancy that needs no expert outputs, only a change to the routing at evaluation. TensorQuill does not run evaluations, so this is a note for later, not a proposal |
+| N3 | Disabling the one shared expert and activating one more routed expert raises the loss from 1.808 to 2.414 (p. 13) | Measured, one model | A shared expert is always on and never passes through the router. TensorQuill's router hook cannot see it: it has no load to count. If a shared expert degraded, no MoE kind would say so. Not a defect; a limit to state |
+| N4 | The first layer is kept dense in the 16B and 145B models "since we observe that the load balance status converges especially slower for the first layer" (p. 15; the 145B model does the same, p. 21) | The lab's observation. No number, no curve | A second report that early layers balance late (Motif 3, in E1, reported routing collapse in early layers). For routers with top-k of 3 or more, `moe_imbalance` compares a router with its own recent history, so a slow start should not fire it; smaller top-k uses the fixed share. I ran neither case |
+| N5 | The balance loss weight was 0.01 for the 2B model, 0.001 for 16B, and 0.003 plus a device-level 0.05 for 145B. For 16B, a higher weight "will compromise the model performance" (pp. 9, 15, 22) | Settings, and one claim with no number | The weight varies by a factor of ten between sizes of one design. A healthy load pattern is not one fixed shape. This agrees with DeepSeek-V3 moving to a bias with a very small loss (section 11) |
+| N6 | No tokens are dropped in the 2B and 16B runs (pp. 8, 15). The 145B run spreads experts over 4 devices and the paper does not say (p. 22) | Stated | Nothing. Token dropping is a GShard feature TensorQuill does not model |
+| N7 | Routing is softmax over a dot product with an expert centroid, then top-k; the gate weight is the softmax score (p. 4, equations 3 to 5). No bias | Design | For this design the hooked scores are the real routing, so finding F1 does not apply. F1 applies to DeepSeek-V3, which added the bias later |
+
+**Wrong or unsupported in the paper.**
+
+| Claim | Why it does not carry |
+| --- | --- |
+| "DeepSeekMoE exhibits lower redundancy among routed experts" (p. 13) | It rests on one chart of two models that differ in expert size and count (16 experts against 63). A model with more, smaller experts losing more when its top choices are masked may reflect the masking ratio and not redundancy. No second measure is given |
+| "nearly approaches the performance of its dense counterpart ... the upper bound of MoE models" (pp. 1, 11) | One pair of runs; no repeats are reported. Loss 1.808 against 1.806. On RACE the dense model is ahead by 2.3 and 1.3 points (Table 2) |
+| Comparable with DeepSeek 67B "using only 28.5% (maybe even 18.2%) of computations" (p. 1) | The 145B model was trained for 13,000 steps on 245B tokens, which the paper itself calls preliminary (pp. 21-22). In Table 6 (p. 23) it trails the dense model on MMLU by 5.7 points and on HumanEval by 4.3 |
+
+**What this changes in sections 1 to 11.** Nothing is overturned. Three lines move:
+
+- The "Not in the folder" lines in sections 10 and 11 no longer hold for Dai et al.; both are marked.
+- E1 and J1 stand: K7 has a design source (Motif 3) and no reported case. This section adds one paper, added to the folder afterwards, that measures the underlying quantity.
+- Row E6 named "Dai et al." by mistake for another paper. The real Dai et al. is now read, and it has nothing on hidden-state geometry.
+
+**Read table.**
+
+| Source | Read | Not read |
+| --- | --- | --- |
+| Dai et al., DeepSeekMoE, arXiv 2401.06066v1 | All 33 pages. pp. 1-11 as plain text; pp. 12-24 and 31-33 in layout, unfiltered (Tables 3 to 10) | Values in Figures 1 and 3 to 7 (charts). Tables 1 and 2 were read one cell per line, not in layout. pp. 24-30, the reference list, scanned only |
+| The five papers found on the web (Omi, Sen, Farhadi since read in full: see the last read table of this section) | Nothing by me. A helper read the arXiv HTML and reported with quotes | Everything, at first hand. The helper marked parts it had only as a summary: Chi et al. section 6 and appendices; Guo et al. Appendix E; Omi et al. Table 5; Li et al. Appendix H |
+
+**Worth downloading, in order.** arXiv 2506.14038 (Omi, Sen, Farhadi), since added. Then 2406.15883 (SimSMoE). Then 2204.09179 (Chi et al.), for the definition. The other two add little.
+
+### Omi, Sen, Farhadi, read in full (added later on Nov 18, 2026)
+
+The user added the paper: `2506.14038v2.pdf`, 15 pages, version 2 of Oct 11, 2025. The helper had read version 1. I read all 15 pages with the page layout kept and no filter, one page at a time. p. 10 holds the limitations and the conclusion; the reference list runs from there to p. 13. Figures 1 to 5 are charts; I read their captions and not their values.
+
+**The verdict on K7 does not change.** No run in the paper fails with its experts still in use. What the paper measures is a difference between two balancing losses, not a failure.
+
+**Four corrections to what this section said above, from the helper's report.**
+
+| # | Said above | What the page says | Effect |
+| --- | --- | --- | --- |
+| P1 | Usage is 1.0 "in the same two runs" | Table 3 (p. 6) gives usage for the large model only: 1.000 with the standard loss, 0.991 with theirs. For the medium model the paper says only that all experts are used on the validation set (Figure 2, p. 7) | "Load looks fine while similarity is higher" rests on one run for the usage number, and on a chart for the other. This may be a difference between versions and not the helper's error: its table numbers do not match version 2's, and I did not check version 1 |
+| P2 | The base of the "3.6 to 4.9 times" cost was not known | It is one forward pass with every expert run on every token, against a normal pass (p. 5). The ratio of total to active parameters without embeddings gives the same two numbers: 550M/153M = 3.6 and 2,986M/607M = 4.9 (my arithmetic from Table 1) | The cost is per measured token, at checkpoints, offline. The paper does not compute it during training steps |
+| P3 | The link between similarity and perplexity came from one pair of runs per size | For the medium model there are five runs of each: perplexity 14.051 with a standard deviation of 0.026 against 13.691 with 0.039 (p. 7). The large model has one run of each | The perplexity gap is solid at the medium size. It is still a gap between two losses, so similarity is not shown to be its cause |
+| P4 | The reported number is each run's least-similar layer, the rest unknown | Confirmed, with the reason: the minimum over layers is used for "filtering out spikes in a single individual layer (common with LBL)"; they saw no dips by layer, "primarily jumps" (p. 8) | **One layer far above the others in expert similarity is common with the standard loss.** A K7 rule that compares layers with each other would fire on it. How far above is in Figure 3(a), which I could not read. The paper gives no count and does not say whether those runs were otherwise healthy |
+
+**What else the paper has that bears on TensorQuill.**
+
+| # | What the paper says | Kind of evidence | Effect on TensorQuill |
+| --- | --- | --- | --- |
+| P5 | With no balancing loss, the number of distinct experts used on the validation set falls during training (Figure 2, p. 7). "The no-loss baseline was truncated early" | Two runs, shown as charts. No numbers in the text; the runs were stopped, so no cost is given | A routing collapse seen in training, of the visible kind. `starved_experts` is the matching kind. Not K7 |
+| P6 | With a routing bias alone (the method of Wang et al.) and no auxiliary loss, a sequence uses 0.505 of the experts (softmax) or 0.381 (sigmoid), and perplexity is as good or better: 13.708 and 13.618 against 14.086 for the standard loss. Adding the standard loss to the bias brings usage back to 0.997 and perplexity to 14.154 and 14.015 (Table 8, p. 14; Table 4, p. 8). All experts are still used over the validation set. The paper notes DeepSeek-V3 always pairs the bias with a loss (p. 9) | Measured, medium model, one run each | **A healthy run can be very uneven inside a sequence.** I read the rule in `evidence.py`: for a top-4 router, "overloaded" needs a drop against the router's own history, so steady unevenness does not fire it. The dead-expert path is different: it fires when a quarter or more of the experts get no token in a step. A step is a whole batch, so that needs a step of very few sequences. With such steps, a run like this one could raise `moe_imbalance` and be fine. Read, not run. Agrees with J7 (DeepSeek-V3, p. 28). Second-hand on the same page: Qiu et al. report the bias method is sensitive to the per-device batch size (p. 9) |
+| P7 | That bias is added to the scores for choosing experts and "is not used in the weighting of the experts" (p. 14) | The paper's description of Wang et al.'s method, and its own implementation of it | One more description of the design behind finding F1. Second-hand for Wang et al.; first-hand for this paper's runs |
+| P8 | The two arms differ in the router's weights, not in load: the Gram matrix of the router is 0.0311 from the identity with the standard loss and 2.1e-8 with theirs (Table 3); per layer in Tables 9 and 10 (p. 15), up to 0.1385 in the last layer of the large model | Measured | Nothing to act on. It shows the similarity measure tracks a design choice |
+| P9 | All parameters are in bfloat16; training uses DDP on 8 devices (p. 4) | Setup | Nothing |
+
+**Wrong or unsupported in the paper.**
+
+| Claim | Why it does not carry |
+| --- | --- |
+| The standard loss "exacerbates redundancy during the majority of training" (Figure 3 caption, p. 7) | It rests on the sign of a rate of change read from a chart of one large run. No numbers, no second seed at that size |
+| "Redundancy occurs when many distinct experts see similar tokens" (p. 7) | Stated as the mechanism. The paper measures neither which tokens the experts see nor how similar they are |
+| "over 13 standard deviations lower ... very statistically significant" (p. 7) | The difference is 0.360 and the larger of the two deviations is 0.039, so the gap is real. The "13" divides by one arm's deviation from five runs; it is not a test |
+| "36% faster convergence" (pp. 1, 6) | Read off the loss curves: about 50B tokens against 78.6B, and 12.7B against 19.9B. No tolerance for "the same loss" is given |
+| Table 6 (p. 8) gives perplexity 8.317 and 8.536 with nothing dropped; Table 4 gives 8.304 and 8.517 for the same models | The paper does not explain the difference |
+| Their similarity measure "correlates" with the masking test of Dai et al. (Figure 4, pp. 7, 9) | One chart, one model size, two points of comparison |
+
+**What this means for K7, in three lines.**
+
+- A source for the statistic exists: mean pairwise cosine similarity of expert outputs, per layer, on a fixed sample of tokens, at checkpoints.
+- No source for a failure, a threshold, a lead time or a false-alarm rate exists in the folder. P4 adds a known source of false alarms.
+- The statistic needs every expert run on the sampled tokens. That is an offline check at checkpoints, not a hook on a training step.
+
+**Read table for this part.**
+
+| Source | Read | Not read |
+| --- | --- | --- |
+| Omi, Sen, Farhadi, arXiv 2506.14038v2 | All 15 pages in layout, unfiltered; Tables 1 to 10 and the code in Figure 6 | Values in Figures 1 to 5. The references (pp. 10-13) were read through. Version 1 was not compared with version 2 |
+
+The four other papers from the web search are still not in the folder and still not read by me.
+
+**Not done in this pass.** No download. No run. No edit to the plans: K7 still says "without a source". Section 12 is not committed.
+
+---
 
 ## Appendix: the script behind proposal 2
 
