@@ -833,6 +833,8 @@ python3 -m venv .venv
 .venv/bin/python -m pip install 'torch==2.14.1' -e './sdk[dev,rerun]'
 ```
 
+Until `tensorquill-server` is on PyPI, pip cannot resolve the SDK's dependency on it, so `-e './sdk[...]'` here and in the commands below fails: install with `pip install -r <(python sdk/packaging/requirements.py dev rerun)` and then `pip install --no-deps -e sdk`, as CI does.
+
 That environment skips the Lightning, Hugging Face, Accelerate and streaming tests. Before committing a change to an adapter or to streaming, run the tests with every extra installed and the server built, as CI does: `pip install -e './sdk[dev,lightning,huggingface,rerun,flight]'` and `cargo build --manifest-path server/Cargo.toml`. A change once passed locally and failed there because only the project environment was used.
 
 For CUDA dogfooding, use the training job's PyTorch build and CUDA environment.

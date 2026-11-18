@@ -226,3 +226,26 @@ def test_ci_installs_the_sdk_through_the_helper_and_nowhere_resolves_the_unpubli
     text = workflow.read_text(encoding="utf-8")
     assert not re.search(r"^\s*pip install -e ", text, re.M), "`pip install -e .` cannot resolve tensorquill-server yet"
     assert text.count("pip install --no-deps -e .") == text.count("pip install -r <(python packaging/requirements.py") >= 1
+
+
+def test_the_install_helper_reads_a_built_wheels_requirements(tmp_path):
+    """The `--wheel` mode `packaging/smoke.sh` uses, on metadata written as setuptools writes it."""
+    import subprocess
+    import sys
+    import zipfile
+
+    def listed(name: str, *requires: str) -> subprocess.CompletedProcess:
+        wheel = tmp_path / name
+        metadata = "Metadata-Version: 2.4\nName: tensorquill\nVersion: 0.0.1\n" + "".join(
+            f"Requires-Dist: {line}\n" for line in requires) + "\nThe long description, which may say Requires-Dist: x\n"
+        with zipfile.ZipFile(wheel, "w") as z:
+            z.writestr("tensorquill-0.0.1.dist-info/METADATA", metadata)
+        return subprocess.run([sys.executable, str(SDK / "packaging" / "requirements.py"), "--wheel", str(wheel)],
+                              capture_output=True, text=True, timeout=60)
+
+    done = listed("good.whl", "torch>=2.6", "tensorquill-server<0.1,>=0.0.1", 'pytest; extra == "dev"',
+                  'pyarrow>=17; extra == "flight"')
+    assert (done.returncode, done.stdout.splitlines()) == (0, ["torch>=2.6"]), done.stderr
+    # A wheel that lost the requirement, or put a platform marker on it, is refused: the two-step install cannot hide it.
+    assert listed("dropped.whl", "torch>=2.6").returncode != 0
+    assert listed("marked.whl", "torch>=2.6", 'tensorquill-server<0.1,>=0.0.1; sys_platform == "linux"').returncode != 0
