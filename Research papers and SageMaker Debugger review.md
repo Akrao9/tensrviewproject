@@ -2,9 +2,9 @@
 
 Nov 17, 2026. A review of the 22 papers in `../researchpapers/`, of AWS's `smdebug` library in `../sagemaker-debugger/` and of its rule configurations in `../sagemaker-debugger-rulesconfig/` (cloned and added later the same day), read against TensorQuill as it is on `main` today. Nothing in the repository was changed. This file is new and untracked.
 
-**State on Nov 18, 2026.** The folder now holds 34 papers, and the file has grown in three passes. Sections 1 to 6 are the first pass, of Nov 17: first pages and keyword search over the first 22 papers. Section 7 covers twelve more papers the same way. Sections 8 and 9 are page-by-page reads, of the twelve and of the first 22, and they correct the earlier sections. Where they disagree with sections 1 to 7, sections 8 and 9 are right; the corrected rows are marked in place. Sections 1 to 7 are committed (`1dec431`). Sections 8 and 9 and the marks are not committed. The code was last read at `93e7d77`.
+**State on Nov 18, 2026.** The folder now holds 48 papers and posts (49 files; one paper is there in two versions), and the file has grown in five passes. Sections 1 to 6 are the first pass, of Nov 17: first pages and keyword search over the first 22 papers. Section 7 covers twelve more papers the same way. Sections 8 and 9 are page-by-page reads, of the twelve and of the first 22, and they correct the earlier sections. Section 10 reads eleven more papers and posts added on Nov 18, two of them in part, and corrects section 9 in one place that matters. Where sections disagree, the later one is right; the corrected rows are marked in place. Section 11 reads the three papers section 10 listed as missing and the pages section 10 skipped, and corrects section 10 in eight places. Sections 1 to 9 are committed (`2fe4a91`). Sections 10 and 11, their appendices and their marks are not committed. The code was last read at `b11b2c6`.
 
-**Where to start.** Section 1 for the ten proposals. Section 2 for what TensorQuill claims that the papers do not support, with F1 and F2 from section 8. Then the two corrections tables: C1 to C7 in section 8 and D1 to D9 in section 9. Two of the D rows change plan rows K5 and K7.
+**Where to start.** Section 1 for the ten proposals. Section 2 for what TensorQuill claims that the papers do not support, with F1 and F2 from section 8. Then the two corrections tables: C1 to C7 in section 8 and D1 to D9 in section 9. Two of the D rows change plan rows K5 and K7. **Section 10 takes one of those back in part: hidden expert collapse (K7) now has a source, row E1.** Section 10 also has three gaps in built kinds, H1 to H3, two of them run on CPU. **Section 11 corrects section 10 (rows J1 to J8): the BF16 attention finding H8 has four limits, and Laguna gives a second reported expert collapse, the first said to end in divergence.** It adds a fourth gap, M1.
 
 **How to read it.** Page numbers are PDF pages. "Measured" means the paper reports a number from an experiment. "Claims" means the paper says it without a number, or from one run. What I did not read is listed per paper at the end. TensorQuill facts come from the focused plan, the v3 plan, `sdk/README.md`, the failure list and the code under `sdk/src/tensorquill/`.
 
@@ -16,6 +16,8 @@ Nov 17, 2026. A review of the 22 papers in `../researchpapers/`, of AWS's `smdeb
 - No paper shows a failure that calls for breaking the freeze today. Three candidates for later come out stronger, and two new ones appear.
 - **Added Nov 18, 2026.** Twelve more papers are covered in sections 7 and 8. Section 8 is the one to read: it has a second capture finding (router load is counted from the hooked scores, which is not the real routing where a model adds a balancing bias first; reproduced on CPU, finding F1), a measurement for finding W9 (F2), and seven corrections to section 7.
 - **Added later on Nov 18, 2026.** The first 22 papers have now been read page by page (section 9); one of them, the INT8 inference paper, only in part. Section 9 makes nine corrections to sections 1 to 8. Three overturn a statement, and the plan copied two of those: the one source for hidden expert collapse does not show it, and output-logit growth also happens in stable runs. It finds no new capture defect.
+- **Added last on Nov 18, 2026 (section 10).** Eleven more papers and posts, nine read through their main body and two in part (DeepSeek-V3, Motif 3). One earlier correction is taken back in part: Motif 3 names hidden expert collapse and gives monitors for it, so plan row K7 is not "without a source" (E1); it still has no reported case. The routing finding F1 now has two first-hand sources (E2), and "the rank that reports a timeout is often a victim" is first-hand (E3). Three gaps in built kinds: the attention-logit rule misses a slow rise (H1, reproduced on `main`), the replica check does not say which ranks agree (H2, read), and a fault in Adam's state is seen by neither `update_spike` nor the weights-not-updating check (H3, run on CPU; the second rule's condition emulated). No new capture defect.
+- **Added last of all on Nov 18, 2026 (section 11).** The three missing papers (Laguna, Mamoda2.5, LLMFT) and every page section 10 skipped. Laguna reports an expert collapse that ran to divergence, kind not stated; it is the second reported collapse after Motif 3's, and hidden collapse still has no reported case (J1). Laguna runs a replica hash check and says it mainly catches silent data corruption, with one example and no counts; it also caught four software faults (M2). A weight corrupted in memory is judged by no rule on its norm (M1, run on CPU). LLMFT's detector was never scored on healthy training. No new capture defect.
 
 ---
 
@@ -55,7 +57,7 @@ Proposal 9 belongs between the second and third rows if TensorQuill wants to kee
 
 Ordered by how much they matter. Two more came from the full read of the second batch and are written up in section 8: F1, router counts that are not the real routing (it would stand second in this list, after W1), and F2, a measurement for W9.
 
-**W1. "Silent data corruption on a faulty GPU: same detector as 1" is not supported.**
+**W1. "Silent data corruption on a faulty GPU: same detector as 1" is not supported.** **See section 10, E5 and H2, for where a fault can sit and which of those places the check sees.**
 The failure list (entry 2, and its summary row) says the cross-replica fingerprints cover it. The papers say corruption does not show up there:
 
 - A corrupted gradient is reduced with the others and the same wrong result goes back to every rank. "The corrupted value no longer identifies its source" (SCOUT p. 1; also p. 3). ByteRobust: "a single corrupted gradient from one node can contaminate the global parameter update across all participating workers" (p. 5). Altenbernd et al. say the same and add that they did not test it (p. 9).
@@ -292,6 +294,8 @@ TensorQuill's golden files, parity tests and mutation checks are well ahead of b
 
 ## 5. Benchmarks and public failure sets
 
+*Added Nov 18, 2026: section 10 lists the public material the eleven added papers point to.*
+
 Nothing was downloaded. "Local" means a clone already sits beside this repository.
 
 | What | Where | Use for TensorQuill | Notes |
@@ -312,6 +316,8 @@ Not public as far as the pages I read say: Minder's 150 fault instances, ByteRob
 ---
 
 ## 6. What I did not read or could not verify
+
+*Added Nov 18, 2026: for the eleven added papers and posts, what was and was not read is in the last table of section 10.*
 
 I read the text of each PDF as extracted by `pdftotext`, which was already installed. For most papers I read the first pages in full and then pulled the sentences on method, results and limits by keyword from the remaining main pages. Figures were not viewed, so every number above comes from text or a table. One table (Rotational Equilibrium, Table 1) was checked on the rendered PDF page. **Section 9 replaces this account:** the 22 papers were read page by page later, and its last table says what was seen.
 
@@ -521,7 +527,7 @@ Three things matter most:
 
 | # | The review said | What the paper says | In the plan? |
 | --- | --- | --- | --- |
-| D1 | Hidden expert collapse has one case report behind it: experts that all get tokens and compute the same thing, output cosine above 0.99 (section 1, candidates table; section 3, row 19) | That is the starting state, not something training produced. The two routed experts in each layer are exact copies of one dense network's weights, and they are frozen: "trainable parameters = gating networks + shared experts (routed experts frozen)" (Sha pp. 5–6, 12). Two frozen identical copies give the same output by construction. **No paper in the folder measures experts growing alike in training.** I searched the three MoE papers of the second batch as well; the one that looks at overlap between experts, OLMoE, finds "little redundancy" (p. 20). The other nine of that batch are systems papers | Yes. Row K7 names this as its one source |
+| D1 | Hidden expert collapse has one case report behind it: experts that all get tokens and compute the same thing, output cosine above 0.99 (section 1, candidates table; section 3, row 19) | That is the starting state, not something training produced. The two routed experts in each layer are exact copies of one dense network's weights, and they are frozen: "trainable parameters = gating networks + shared experts (routed experts frozen)" (Sha pp. 5–6, 12). Two frozen identical copies give the same output by construction. **No paper in the folder measures experts growing alike in training.** I searched the three MoE papers of the second batch as well; the one that looks at overlap between experts, OLMoE, finds "little redundancy" (p. 20). The other nine of that batch are systems papers | Yes. Row K7 names this as its one source **Superseded in part by section 10, E1: Motif 3 names hidden collapse and gives monitors for it. The reading of Sha here stands.** |
 | D2 | Proposal 10: output-logit growth in the head as a kind | The logit norm grows in every AdamW run in the paper, the stable ones too: it "grows under every AdamW baseline, including FP32 ... but it destabilizes training only in reduced precision" (Chen et al. p. 2, Fig. 1 caption; p. 8). What separates the failing runs is the gap between BF16 and FP32 logits on the same hidden states. A kind on growth alone would fire on healthy runs. The second number in proposal 8 is the one to judge | Yes. Row K5 is worded as growth |
 | D3 | Section 8, F9 (iv): stacks help with hangs only, and proposal 6 "is limited to hangs" | Too strong; the papers disagree. CCL-D says a slow rank's stacks look like everyone's. ByteRobust uses stacks for slow jobs anyway: it repeats the stack grouping every 10 seconds, flags the group with the most outliers each time, and after 5 rounds takes the group flagged most (p. 8). It names a group of machines, not a rank, and gives no accuracy figure. So: one snapshot cannot name a slow rank; whether repeated snapshots can is contested | No |
 | D4 | Section 5: the loss-spike repository is a from-scratch failure TensorQuill can be run on, to test `attention_logit_growth` among others | The paper's models are written in JAX and Flax and trained mostly on TPUs (p. 3). TensorQuill hooks PyTorch. Every run also uses QK-norm, which removes attention-logit growth on purpose (p. 3), so that kind could not be tested there in any case. The repository itself was not looked at | No |
@@ -539,9 +545,9 @@ Bucket (a) is wording, documentation or a small change. Bucket (b) is design inp
 
 | # | Finding | Source | TensorQuill today | Change | Bucket |
 | --- | --- | --- | --- | --- | --- |
-| G1 | **Three more setups route by something other than the top-k of the router's scores** (finding F1). (i) A 4B MoE trained with "a separate traffic-driven router-bias controller", citing the loss-free balancing paper. (ii) Routing replay: in training, the expert mask is the one recorded at inference, while the gate still uses the training scores; about 10% of routers pick differently between the two. That this breaks a top-k count is my inference. (iii) A 128-expert video model with a sigmoid gate and a loss-free expert bias, as one paper describes another | EnergyCal p. 4; R3 pp. 6–7; Sha p. 3 | Main: unchanged since section 8. The README still does not say how a score-returning router is read | The same change as F1. This raises its weight | (a) |
+| G1 | **Three more setups route by something other than the top-k of the router's scores** (finding F1). (i) A 4B MoE trained with "a separate traffic-driven router-bias controller", citing the loss-free balancing paper. (ii) Routing replay: in training, the expert mask is the one recorded at inference, while the gate still uses the training scores; about 10% of routers pick differently between the two. That this breaks a top-k count is my inference. (iii) A 128-expert video model with a sigmoid gate and a loss-free expert bias, as one paper describes another | EnergyCal p. 4; R3 pp. 6–7; Sha p. 3 | Main: unchanged since section 8. The README still does not say how a score-returning router is read | The same change as F1. This raises its weight | (a) **Section 10, E2: DeepSeek-V3 and Motif 3 confirm the bias design first-hand.** |
 | G2 | **A stall's stacks stop at the rank's own process.** "Root causes may reside in subprocesses spawned by the main training processes for tasks like data fetching or checkpointing; merely analyzing the stacks from the primary training processes is insufficient" | ByteRobust p. 8 | Main: `thread_stacks` reads `sys._current_frames()`, the Python threads of one process (`flight.py`; README, "Where a silent rank is stuck"). Data-loader worker processes are not in it. `data_stalled` and `input_starvation` cover the data path by timing | Say in the README and agent instructions that the stacks do not include worker processes. Reading their stacks would be new code | (a) wording |
-| G3 | **The rank that reports a collective timeout is often not the cause.** SCOUT cites a PyTorch blog post on Flight Recorder: "almost all observed timeouts arise from desynchronization", so the reporting rank and the collective seen at that moment "may both be victims". Second-hand: I did not read the post | SCOUT p. 10 | Main: `collective_hang` and `collective_desync` read Flight Recorder. The agent instructions have no line on this (searched for "victim", "first to report") | One sentence in the agent instructions | (a) wording |
+| G3 | **The rank that reports a collective timeout is often not the cause.** SCOUT cites a PyTorch blog post on Flight Recorder: "almost all observed timeouts arise from desynchronization", so the reporting rank and the collective seen at that moment "may both be victims". Second-hand: I did not read the post | SCOUT p. 10 | Main: `collective_hang` and `collective_desync` read Flight Recorder. The agent instructions have no line on this (searched for "victim", "first to report") | One sentence in the agent instructions | (a) wording **Section 10, E3: now read in the post itself.** |
 | G4 | **For slow ranks (K6): what to measure, and when there is no rank to name.** (i) A collective's time splits in two: waiting for the last peer to start, and the transfer after that. Only the wait points at a rank, and it needs start times on a common clock. (ii) In one production case the lag passed back and forth between ranks: "Rank A may initially lag behind Rank B but might eventually surpass". The cause was code, such as irregular garbage collection. No rank was slow. (iii) A collector pause stalls the forward pass only, because the backward pass is launched from C++. Uneven sequence lengths slow forward and backward together (correlation 0.9 or more in 21.4% of slow jobs). (iv) Slowdown is steady from step to step, so a few sampled steps are enough | Lin et al. pp. 5, 8, 11–12; MegaScale p. 12 | Main: no slow-rank rule. The plan's K6 row already says the rank that waits least is the slow one, which agrees with (i) | Add (ii) and (iii) to the K6 row: the answer may be "no single rank", and forward-only against forward-and-backward tells collector pauses from uneven data | (b) |
 | G5 | **For the update-size kind (K1): a reference value, an outside test, and a public injector.** (i) The paper's steady value, 0.229 × lr at β1 = 0.9, held roughly on a CPU toy while the loss was still high: 0.268 at steps 100 to 200. The first step was 0.985 × lr. By step 3,000, with the loss at 0.02, it had fallen to 0.055 (appendix). So the level is not steady over a run, and the first steps are about four times the settled value. (ii) TrainSDC re-implemented the detector from Altenbernd et al., with replay of flagged steps. It cost 11.2% to 12.1% there, against about 1% in the original. On faults in 10 activation elements it left most of the damage (final loss gap 1.08e-2 against 1.72e-2 unprotected). On 100,000 elements it kept training finite where the unprotected run did not. Their faults are in forward activations, a different fault model, so this is a second data point and not a refutation. (iii) The original authors' injector is public: `github.com/aaltenbernd/llm-sdc-training` (p. 2). It needs a GPU | Rotational Equilibrium p. 4; TrainSDC p. 7 (Table 1, rendered page); Altenbernd et al. p. 2 | The branch: reads only `torch.optim.Adam` and `AdamW`, or a subclass that leaves the step alone; anything else is recorded as `update_not_read` with its reason (`_not_adam` in `capture.py`). The baseline is the mean of the last 100 unflagged changes (the `update_window` option, `evidence.py`). I searched the branch's evidence code for the update over the learning rate and did not find it | Put the update's RMS over the learning rate in the evidence, beside the expected value. Measure the cost on a GPU before quoting 1% | (b) |
 | G6 | **For the cross-rank compare (K2): what the one published version needed.** 100 clean steps to calibrate, a threshold floor for each layer and path, a 64-step history, and an alarm only when the worst rank's score is 1.5 times the next. At the loosest setting it flagged 16.5% of clean steps; at the chosen one, 1 clean step in 1,628. Recall was 41% to 43% for faults in 10 elements and 78% to 86% for 100,000. Most misses were faults in attention weights and attention logits. The test ran one 1,024-token sequence per rank, six ranks, 814 steps | TrainSDC pp. 6, 10–11 | Not built. The plan's K2 row already says different batches per rank force a tolerance | Record these with the K2 design choice | (b) |
@@ -612,6 +618,222 @@ The list stays at ten. No row is added.
 Not done: none of the README or agent-instruction changes above was made, and the plan was not edited. No GPU run, no real model. The two CPU checks are toys. G1 (ii), G10 and the count in D7 are readings, not tests. Nothing in the repository was changed except this file.
 
 ---
+
+## 10. The eleven added papers and posts (Nov 18, 2026, fourth pass)
+
+Thirteen files were added to `../researchpapers/` on Nov 18. Eleven are new: nine papers and two blog posts. Two are fresh downloads of papers already read (TrainSDC and Ma et al., same file names and arXiv versions; their extracted text differs from my first copy by under 0.5% of the words, which I did not trace, and I did not re-read them). **Traced in section 11, row J8: the text is the same.** The folder now holds 45 distinct papers and posts.
+
+**How they were read.** Nine of the eleven: the whole main body, page by page, with no filter on the text. Two in part: DeepSeek-V3 (18 of 53 pages) and Motif 3 (13 of 32). Appendices are mostly unread. **Section 11 reads the rest.** The table at the end of this section gives the pages for each. Every table I quote was re-read with the page layout kept, because plain extraction mixed up rows and columns. The code was read on `main` at `b11b2c6`, where the four lanes are merged, so `update_spike` is now on `main`.
+
+**The one thing to act on first.** Section 9 (row D1) and plan row K7 say hidden expert collapse has no paper behind it. That is no longer true. Motif 3 names it and gives monitors for it (row E1 below). The plan was corrected to "without a source" at `f3524d4` on my word, and that correction should be taken back in part.
+
+### What this pass changes in sections 1 to 9
+
+| # | Earlier statement | What the added papers say | Effect |
+| --- | --- | --- | --- |
+| E1 (a second reported collapse: J1, section 11) | D1 and plan row K7: hidden expert collapse has no paper in the folder | Motif 3, pp. 16-18, "Expert-health monitoring" and Table 3. It names "hidden collapse in which an expert receives tokens but its output projection contributes increasingly little" and "functional collapse in which nominally distinct experts learn similar representations". It gives a monitor for each: the minimum-to-median ratio of the experts' output-projection norms (above 0.8 "typically healthy", a sharp fall below 0.5 means an expert "may be dying"), and the largest cosine between experts' mean outputs (below 0.5 "typically healthy", above 0.8 "severe functional redundancy") | **D1's "no paper" is superseded.** K7 has one source for its design and working values. What stays true: Motif 3 reports no occurrence of either hidden failure, only visible routing collapse in early layers (p. 16). The values are one team's experience from one run, with no detection rate. D1's reading of Sha (frozen identical copies) stands. The focused plan (line 235) cited Motif 3 "from search excerpts only"; it is now read, in part |
+| E2 (Mamoda2.5 is now read: J2, section 11) | G1: three more setups route by something other than the top-k of the hooked scores; one confirmed only by citation, one second-hand | Two first-hand confirmations. DeepSeek-V3, p. 9, eq. 16: a per-expert bias is added to the score to pick the top-k, "the bias term is only used for routing", and the gate value still comes from the score without the bias. Motif 3, p. 16: the same bias design, and Gaussian noise added to the router logits early in training (eq. 28), decayed to a floor | F1 now rests on two of the best-known MoE recipes. Noise is a second way hooked scores differ from the routing; plan row S7 already names it. Mamoda2.5 is not in the folder, so that one setup stays second-hand |
+| E3 | G3: "the rank that reports a collective timeout is often a victim" was second-hand through SCOUT | The post itself, pp. 5 and 8: the rank that first raises the timeout "is rarely the culprit", the collective running at the timeout "may not be the cause", and "almost all" timeouts in Meta's fleet come from ranks falling out of step, not from a slow or hung collective. Causes on the CPU side are above 60% (p. 10); network or hardware is 20 to 30% (p. 15) | G3 is first-hand. Scope: one company's fleet, four training frameworks, three of them recommendation systems and one LLM. The per-cause breakdown is a figure (Fig. 3) I did not read values from |
+| E4 | D3: "stacks help only for hangs" is contested (ByteRobust p. 8) | Two more sources pair collective records with the main thread's Python stack on every rank. The Flight Recorder post, p. 22: Flight Recorder "needs to be coupled with" main-thread stacks to tell the cause, PyTorch provides no tool for it, and py-spy is suggested. Mycroft, pp. 8 and 12: on a trigger it dumps every rank's Python stack, groups identical stacks, and the rank with a different stack is the stuck one (case two: one rank in the data loader, its peers waiting in a broadcast) | TensorQuill's stall stacks plus its Flight Recorder reading is the pairing both describe. Grouping stacks across ranks and naming the odd one is a small step TensorQuill does not take today (I searched `evidence.py`, `flight.py`, `trigger.py` and `server/src` for stacks being grouped or compared and found none) |
+| E5 | W1 and proposal 1: what `replica_drift` can see of silent corruption. I also said the gradient-aggregation paper (PAFT) "bears on W1 directly" | It bears on the case `replica_drift` already sees. PAFT's fault is different noise on each rank's copy of the reduced gradient, so the replicas drift apart (pp. 3-4). It says twice that a corruption shared by all ranks is outside what it handles (pp. 8, 9). Elsen et al. give the cleanest split, in the table below | W1 stands and gets sharper. My "directly" was too strong. `sdk/AGENT_INSTRUCTIONS.md` line 109 on `main` already says a clean drift check does not rule out corruption |
+| E6 | I named "Dai et al." as the paper on expert specialisation and hidden-state geometry | The paper Sha cites is Wang, Hayou and Nalisnick, "The Myth of Expert Specialization in MoEs" (arXiv 2604.09780). That is the file added. It is Sha's reference [11], "the expert specialization myth". Dai is an author of other papers that Li et al. cite, among them DeepSeekMoE | My mistake in the name. The paper does not support K7 either: it is a study of released models at inference, with no training run |
+| E7 (the sign is not fixed: J6, section 11) | D2, K4 and K5: judge the BF16 to FP32 gap, not logit growth | Wortsman et al. are the source of the output-logit instability. Their sign is not the norm: the logits "diverge and become very negative" (p. 4), plotted as the output-logit mean (Fig. G.2, p. 18). It comes late in training, with no weight decay, and a small penalty on log Z removes it | K4 already plans the mean. Add log Z (the log of the softmax's normaliser) beside it. It costs nothing more on the probe's logits |
+| E8 | Plan row K6 quotes "42 of 107 four-node jobs slowed by congestion" | Verified on the page (FALCON, p. 4, Table 1): 43 of 107 slowed, 42 by network congestion and 1 by CPU contention. One node: 6 of 392 (4 CPU contention, 2 GPU). At 512 to 1,024 GPUs: 16 of 27 (13 network, 3 several causes), from one month of traces inspected by hand | The figure holds. More for K6 in row H6 below |
+
+**Where a silent fault can sit, and what TensorQuill sees (Elsen et al., pp. 5, 9-13; PAFT, pp. 8-9).**
+
+| Where the fault is | What the replicas look like | `replica_drift` | Anything else on `main` |
+| --- | --- | --- | --- |
+| One rank's local gradient | All ranks get the same wrong sum and stay equal. "No way to detect this" without repeating the computation (Elsen p. 9) | Cannot see it | `update_spike` fires if the gradient norm rises (CPU check below). A small error is seen by nothing |
+| The reduction, first half (reduce-scatter) | The same: a wrong chunk reaches every rank (Elsen p. 13) | Cannot see it | As above |
+| The reduction, second half (all-gather) | Every rank after the fault in the ring gets the wrong chunk. Elsen saw one third of the ranks agree on one checksum and two thirds on another (p. 10) | Sees a spread. Cannot show the pattern (row H2) | None |
+| One rank's parameter update | One rank differs from all the others | Sees it | None needed |
+
+Elsen's footnote 9 and PAFT's limitations (p. 9) agree on one more limit: under full sharding (FSDP full shard, ZeRO stage 3) no parameter is held twice, so there is nothing to compare. Motif 3 trains with a sharded dimension of 8 inside a replicated dimension (p. 7), so the check applies across the replicated dimension only. The README's note covers tensor parallelism and the docstring names hybrid FSDP; neither says the check has nothing to run on under full sharding alone.
+
+### New findings
+
+| # | Finding | Source | Checked against the code |
+| --- | --- | --- | --- |
+| H1 | **`attention_logit_growth` misses a slow rise.** The rule compares each probe with the median of the last five probes that met no rule. A logit that rises steadily never gets ahead of that moving baseline unless it grows by about 26% or more per probe, which is a doubling within three probes. A rise from 10 to 8,078 at 25% per probe gives no incident. **Probing more often makes the rule blinder**, because the same rise is then spread over more probes. Chen's rise (about 700 times in about 5,500 updates) is about 3.3 times per probe at the default of one probe per 1,000 steps, which would fire, and about 1.13 times per probe at `probe_every=100`, which would not. A run ten times longer with the same total rise is missed at the default too | The kind of failure it matters for: Chen et al. (BF16 FlashAttention-3). Two of 24 layers reach a logit scale in the thousands while the other 22 stay moderate (p. 4). A second run, with the known forward fix, ends within 0.01 to 0.02 nats of the FP32 run with small gradients, yet layers 5 and 11 sit at a logit scale of about 39,000 and 49,000 and a third layer is above 1,000 (p. 9, Table 3; Fig. 3) | **Reproduced on `main`** at `b11b2c6` with the detector unchanged (appendix). Fires at 27% per probe and above, not at 25% and below. The two figures for Chen's run are my arithmetic from its Table 3, not a run. `attention_collapse` uses the same moving baseline (read, not run) |
+| H2 | **`replica_drift` throws away which ranks agree.** Each rank's fingerprint reaches every rank in the `all_gather`, and the code keeps only the largest minus the smallest. The incident names the parameters and the spread, never the ranks | Elsen et al., p. 10: the pattern is the diagnosis. One rank apart points at that rank's update. A run of neighbouring ranks apart points at the network during the gather. They also could not tell which group was right: a majority is not proof | Read: `distributed.py` (`replica_spread`, `spread_from_fingerprints`), `evidence.py` (`detect_replica_drift`). Not run. It also compares parameters only, not optimizer state; a state fault shows as parameter drift one check later, so this matters less |
+| H3 | **A fault in Adam's state is not seen by the two rules that could see it.** With one tensor's second moment wrong by 1e12 and the gradient untouched, that tensor's update falls to about 3e-7 of normal at once and stays there: for the rest of the run at β2 = 0.999, for about 500 steps at β2 = 0.95. `update_spike` does not fire, because it watches the largest update across parameters and needs the gradient norm to rise. The weights-not-updating check needs a norm that is exactly unchanged, and here it never is | He et al. (ISCA '23), pp. 2, 5-9: of 2.9 million injected faults, 9.7% to 17.7% changed the training outcome. For every slow or hidden outcome, large values in the optimizer's history or in a normalisation layer's moving variance were a necessary condition, present within two iterations. For faults in the backward pass the training loss "appears normal throughout" (p. 8). A fault can change the history without changing the gradient (p. 11) | **Run on CPU against `main`** (appendix): `update_spike` fires on a gradient fault and stays silent on the state fault; 0 of 15 norm checks exactly equal. The second rule's condition was emulated, not the detector. A toy MLP, no clipping, 1,500 steps |
+| H4 | **What a stuck collective's record says about the cause.** The post maps Flight Recorder's fields to four causes (p. 19). A missing rank or a state mismatch: a CPU-side stall or code path that differs across ranks (data loading, checkpointing, compilation, an `except` block that swallows or blocks, one rank running out of data early; pp. 10-13), or a hung GPU kernel. A size or dtype mismatch: wrong arguments. A mismatch in the collective's type or call stack: code paths that differ across ranks. All ranks started and none finished: the network | Flight Recorder post, pp. 8-19. Raising the timeout does not fix a desync (p. 8). The watchdog's default is 10 minutes (p. 4) | Read: `collectives.py` already reports `missing_ranks`, `state`, `all_ranks_entered` and the analyzer's mismatch line. It labels a collective with a missing rank `hang`; the post counts a missing rank as desync, its most common case. The plan's 300-second stall is under the 600-second watchdog, so on defaults the stacks are read while the processes are alive (the 300 is the plan's number; I did not find the constant) |
+| H5 | **A monitor table for expert health, from a real 314B-parameter run.** Six signals with working values. TensorQuill can compute two today and part of a third (table below) | Motif 3, pp. 16-18. One reported incident: routing balance in the earliest MoE layers "still collapsed occasionally" despite a stronger balancing loss there; they replaced the layer's router and biases with a neighbour's (p. 16) | Read: router counts give the first two. The 50-step per-parameter norm gives the third only when each expert's output projection is its own parameter; one stacked tensor gives one norm (my reading of the README, not run) |
+| H6 | **Three more things a slow-rank observation (K6) must allow for.** (i) In synchronous training one slow part slows every rank at once, so step time does not name the rank; FALCON separates groups that transfer for longer than 1.1 times the median from groups that sit waiting (p. 7). (ii) Slowdowns are passing: mean 10, 24 and 72 minutes for the three settings (pp. 1, 4-5), so an observation needs a start and an end. (iii) Some slow ranks are the data's doing: under document packing one rank had 3.54 times the mean attention work (Motif 3, p. 13), and rank 0 often carries more by design (Mycroft, p. 13) | FALCON, Motif 3, Mycroft. FALCON's own detector: a change-point test on iteration time, then a check that the mean moved by 10% or more; 99.1% to 100% accurate on its 499 labelled jobs, where a plain 10% sliding window missed 12% to 25% of the slow cases (p. 11, Tables 4-5) | Plan row K6 already limits itself to compute-slow and to "may be no single rank". These add the passing nature and the data cause. Not built, so nothing to run |
+| H7 | **Healthy models that would look like a routing fault.** (i) In gpt-oss-20b, unrelated prompts activate the same experts in the last layers; keeping 12 of 32 experts in the last two layers moves the loss on prompt text by under 10% (pp. 9, 11). (ii) Router confidence drops on shuffled or reversed text (p. 6), so per-token routing entropy moves with the data as well as with the router. (iii) A balancing loss applied on small batches is reported to erase specialisation (p. 5, citing Qiu et al.; second-hand) | Wang, Hayou and Nalisnick. All measured on released models at inference; no training run. The "dead router" case is their hypothesis, which they say they did not test (p. 6, footnote 1) | Bears on `moe_imbalance`, `starved_experts` and plan row K3. It supports G7 and plan row S8 ("a narrow data domain routes unevenly in a healthy MoE"). Not run |
+| H8 (lead time and scope corrected by J4 and J5, section 11) | **A named cause for the agent: BF16 fused attention, backward pass.** Healthy for 25B tokens, then the gradient norm grows about a thousandfold with no NaN and the loss ends 0.2 nats above FP32 attention (pp. 1, 9). The attention statistic leads: at 23.1B tokens the two layers already have a logit scale near 5,400 and 86% of rows at near one-hot attention, at least about 500 updates before the gradient norm starts to grow near 25.2B (Table 3, p. 9; Fig. 3 caption; 4.19M tokens per update, Appendix G; one checkpoint, and the subtraction is mine) | Chen et al., arXiv 2609.34272. One 450M model, FlashAttention-3 on Hopper GPUs, head dimension 64, a preprint. Their test for it: recompute the backward of the suspect layers in FP32 with the forward held fixed; the gradient norm falls by more than 100 times (p. 4) | TensorQuill's probe reads the attention scores from the weights with its own forward, so the kernel's fault does not hide the logits from it. I expect `attention_logit_growth` and `attention_collapse` to fire on the first run: a rise of about 700 times inside the first six of twelve default probes is far above 26% per probe. That is my arithmetic, not a run. TensorQuill cannot do the paper's test: it has no backward recompute |
+| H9 | **Operating facts for the instructions, each from one team.** A faulty node usually shows within 1,000 seconds of a deterministic rerun, rarely after 10,000 (Elsen p. 9). A modern transformer going from fine to NaN in one step "almost never" happens without a hardware problem (Elsen, footnote 1; an opinion). Mycroft's real case: a defective GPU, every rank stuck at once, no error, the job killed by the 10-minute timeout, the fault reproduced only after six hours of offline tests (p. 2) | Elsen et al.; Mycroft | Wording only. The NaN line is an opinion and should be passed on as one |
+
+**Motif 3's expert-health signals (pp. 17-18, Table 3) against what TensorQuill records.**
+
+| Signal | Their working values | Failure it points at | TensorQuill today |
+| --- | --- | --- | --- |
+| Tokens to the least-used expert over the median expert | Above 0.7 healthy, below 0.3 likely starvation | Starved or dead expert | Computable from router counts. `starved_experts` uses another rule (share below 10% of an even share over 50 samples) |
+| Largest token count of any expert | None given | Overload | Recorded |
+| Output-projection norm, least over median | Above 0.8 healthy, sharp fall below 0.5 | Hidden collapse: tokens arrive, the output shrinks | Only with one parameter per expert |
+| Routed output RMS over shared output RMS | Near 0: the shared expert does the work. Above about 0.3: routed experts contribute | Shared-expert dominance | Not recorded |
+| Largest cosine between experts' mean outputs | Below 0.5 healthy, above 0.8 severe | Functional collapse | Not recorded. Needs expert outputs |
+| Largest absolute value over RMS, routed and shared | Above about 10 is an early warning | Outliers | Recorded for watched blocks, not per expert. Do not copy the 10: healthy Granite block outputs reach 740 to 840 times their standard deviation (README) |
+
+Their monitoring runs on the last microbatch of a step only, at the interval of their utilisation heatmap, to keep the cost down (p. 17). They also report that the FFN output RMS kept rising through training after they removed the isolated outliers (p. 17): growth alone is not a failure, the same lesson as D2.
+
+**Reference values for attention logits. The statistics differ, so the columns are not comparable.**
+
+| Source | Statistic | Value | What it marks |
+| --- | --- | --- | --- |
+| Motif 3, p. 11 | Largest pre-softmax logit per head, read every 10 steps from the attention kernel | 100 in main training, 200 at 256K context | The level they clip back to, not a failure line |
+| Wortsman et al., p. 7 | Largest attention logit, block 0, step 2,000 | Above 1e4 | Every such run diverged |
+| Wortsman et al., p. 17 | Logit scale forced to a constant in a 10M model | About 1e3 | Loss gets worse; at 1e4 it is worse than a model with no attention and no MLP layers |
+| Chen et al., p. 9 | Scale × RMS of queries × RMS of keys × √d, per layer (an RMS-type number, not a maximum) | 7 to 8 in the two layers of the healthy runs (26 to 27 at most in any layer); above 1e3 in the failing ones | Healthy against failing, one model |
+| TensorQuill | Largest logit per layer on the probe batch, against a moving baseline | Twice the baseline | `attention_logit_growth` |
+
+Motif 3 had to extend the attention kernel to get the largest logit, because fused attention never builds the score matrix (p. 11). TensorQuill gets it by running its probe through plain attention. That works on a small probe batch and would not on every step.
+
+### What this changes in the findings and proposals
+
+- **W1 and proposal 1.** Partly done on `main` since the lanes merged: a checked `replica_drift` kind now carries a note in `kind_checks`, and the agent instructions say a clean check does not rule out corruption. What is left is the failure list's entry 2 and this: add the table above: `replica_drift` sees two of four places a fault can sit. Add row H2 to the same proposal: report how many distinct fingerprints there were and which ranks held each. The fingerprints are already gathered.
+- **Proposal 6 (stacks) and D3.** Stronger. Two production teams pair collective records with Python stacks. Group the stacks across ranks (E4).
+- **Proposals 8 and 10, plan rows K4 and K5.** Add log Z to the probe numbers (E7).
+- **Plan row K1.** `update_spike` is on `main` and fires on a gradient fault in my check. It does not cover a fault in the optimizer's own state (H3). The per-parameter update is already in the records, so a rule for one parameter's update collapsing could be judged from what is stored; whether it stays quiet on healthy runs is not known. Motif 3 trains its matrices with Muon and only embeddings, the output projection and vectors with AdamW (p. 10), so on a run like it most parameters would be `update_not_read`.
+- **Plan row K7.** Take back "without a source" (E1). The row still needs expert outputs, which nothing captures, and still has no reported case. (Section 11, J1: Laguna reports a second collapse, kind unstated; still no reported hidden case.)
+- **Plan rows S7 and S8.** S7 gains two first-hand sources (E2). S8 gains H4, H8 and H9 as wording.
+- **The attention rule (H1).** The smallest fix with a reproduced gap. Two designs: also compare with a baseline frozen from the first probes, or add an absolute bound. Neither can be given a number from these papers alone: the reference values above use three different statistics.
+- **The list of ten stays ten.** H1 to H3 are defects or gaps in built kinds, not new proposals.
+
+### The eleven, one row each
+
+The "Not read" column is as it stood after this pass. Section 11's table says what has been read since.
+
+| Paper or post | Kind of evidence | Read | Not read |
+| --- | --- | --- | --- |
+| Liu et al., "Flight Recorder: A New Lens for Understanding NCCL Watchdog Timeouts", PyTorch blog, Mar 25, 2026 | A company's fleet experience; no numbers beyond three shares | All 26 printed pages | Figures as images |
+| Elsen, Hawthorne, Somani, "The Adventure of the Errant Hardware", Adept blog, Sep 19, 2023 | One team's incident account; values "illustrative" | All 15 printed pages | Nothing |
+| Tang et al., "Identifying and Mitigating Errors in Gradient Aggregation of Distributed Data Parallel Training", ICML 2026 (PAFT) | Theory plus simulated Gaussian noise on 4 to 32 GPUs; no real fault | pp. 1-9 | Appendices, pp. 12-26, among them Appendix C on real error types. Table 1 would not extract; I quote none of it |
+| Wortsman et al., "Small-scale Proxies for Large-scale Transformer Training Instabilities", ICLR 2024 | Measured, many small runs in JAX on TPUs in bfloat16 | pp. 1-9, appendix text and captions pp. 14-22 | pp. 10-13 (references), pp. 22-26 (more figures) |
+| Chen et al., "Broken Symmetry in BF16 Attention", arXiv 2609.34272 | Measured, one 450M model, matched runs with one seed | pp. 1-10; Tables 1 and 3 re-read; the setup line of Appendix G | Appendices A to I otherwise, pp. 13-28 |
+| Deng et al., "Mycroft", SOSP '25 | Production deployment plus fault injection on 32 GPUs | pp. 1-13 | References |
+| Wu et al., "FALCON", arXiv 2410.12588 | One shared cluster; 499 probe jobs and 27 large jobs inspected by hand | pp. 1-13; Tables 1, 4 and 5 re-read | Appendix, p. 17 |
+| He et al., "Understanding and Mitigating Hardware Failures in Deep Learning Training Accelerator Systems", ISCA '23 | Simulated bit flips in an open accelerator design, not a GPU; mostly CNNs, one Transformer, 8 devices | pp. 1-11; Table 4 re-read | Figures 2 to 5 as images |
+| Wang, Hayou, Nalisnick, "The Myth of Expert Specialization in MoEs", arXiv 2604.09780 | Measured on five released models at inference; two propositions, one informal | pp. 1-11 | Appendices, pp. 14-31 |
+| DeepSeek-AI, "DeepSeek-V3 Technical Report", arXiv 2412.19437v2 | A lab's report; ablations with benchmark tables | **In part.** pp. 8-9, 11-12, 14-18, 22, 26-27, 35, 44-48 | pp. 1-7, 10, 13, 19-21, 23-25, 28-34, 36-43, 49-53. The sentence on load imbalance that starts at the foot of p. 27 runs onto p. 28, which I did not read |
+| Motif Technologies, "Motif 3: Technical Report", arXiv 2608.09119 | A lab's report on one training run; working values, no rates | **In part.** pp. 6-13, 16-19, 26; Table 3 re-read | pp. 1-5, 14-15, 20-25 (post-training and evaluation), 27-32 |
+
+**Public material these papers point to (for section 5).** He et al. publish their fault-injection framework (`github.com/YLab-UChicago/FIdelityTraining`, their reference [1]); it is TensorFlow and models an accelerator that is not a GPU. FALCON says its cluster trace "will be released upon publication" (p. 1, footnote); I did not check whether it was. Motif 3 points to a training example repository with reference implementations of its system optimisations (reference [42]); I did not open it. Chen et al.'s failing run is a seeded, matched recipe (16 GPUs, seed 42, 11,930 updates) and so the closest thing here to a reproducible late-training failure, at a cost no CPU check can meet. None of this was downloaded.
+
+**Not in the folder, so still unchecked.** Mamoda2.5, the Laguna report, LLMFT (Yu et al.) and the Dai et al. paper on DeepSeekMoE that DeepSeek-V3 builds on. (The first three were added later and are read in section 11.)
+
+**Not done in this pass.** No GPU run. No run of TensorQuill on any failure these papers describe. No reading of figure images except through their captions. No edit to the plans, the README or the agent instructions: plan row K7 and its "Decisions" paragraph still say "without a source".
+
+## 11. Three more papers, and the pages section 10 skipped (Nov 18, 2026, fifth pass)
+
+Three files were added after section 10. They are the three papers section 10 listed as missing: the Laguna M.1/XS.2 report (Poolside, arXiv 2605.27605), Mamoda2.5 (ByteDance, arXiv 2605.02641) and the LLMFT paper (Yu et al., SC '25). The folder now holds 49 files and 48 distinct papers and posts, because Ma et al. is there in two versions.
+
+This pass also reads what section 10 left out: the rest of DeepSeek-V3 and Motif 3, and the appendices of five papers. Section 10 read two papers in part and skipped those appendices by my own choice. That was a weak choice, and this section makes up for it.
+
+**How they were read.** The three new papers page by page: LLMFT all 15 pages, Laguna all 37, Mamoda2.5 pp. 1-28 with pp. 29-38 scanned (references, one benchmark table, picture pages). The appendix pages were read through a filter that drops short lines, so equations and table cells were not read as text; the tables I quote were re-read with the page layout kept. The table at the end gives the pages. The code was read on `main` at `b11b2c6`, unchanged since section 10.
+
+**What to act on first.** Three things.
+
+- A third production team checks replicas against each other, with hashes. It says the check "primarily" catches silent data corruption, which sits badly with finding W1. It gives one example and no counts (row M2).
+- The BF16 attention finding H8 was drawn too widely and too narrowly at once. Four limits from the paper's appendices are in row J5.
+- A weight corrupted in memory can pass the gradient rule and the update rule while its tensor's norm jumps by a million times, and no rule reads the weight norms (row M1, run on a CPU toy; only those two rules were tested).
+
+### Corrections to section 10
+
+J rows correct section 10. M rows further down are new findings.
+
+| # | Section 10 said | What the page says | Effect |
+| --- | --- | --- | --- |
+| J1 | E1: Motif 3 reports "only visible routing collapse in early layers"; hidden expert collapse "still has no reported case" | Laguna, p. 9: in "preliminary experiments", Muon with no rescaling of its learning rate and standard weight decay "caused expert collapse beginning at around 450B tokens into training and propagating layer-by-layer through the first three MoE layers until the training diverged". Laguna, p. 17: in M.1, new special tokens with randomly initialised embeddings caused "gradient spikes, dead experts, and broader training instabilities". Motif 3, p. 1, names three failures its balancing guards against: "expert overload, starvation, and specialization collapse" | **A second reported collapse, and the first said to end in divergence.** Motif 3's (p. 16, row E1) was the first. Laguna does not say which kind it was (routing, hidden or functional), how it was seen, or how large the model in that experiment was. One sentence, no numbers beyond the token count. **Hidden collapse still has no reported case, as section 10 said.** Plan row K7 needs nothing beyond what E1 already asked |
+| J2 | E2: Mamoda2.5 "is not in the folder, so that one setup stays second-hand" | Mamoda2.5, p. 7: the bias "is used only for the routing decision"; the gate weight still comes from the score without the bias. Its router uses a sigmoid and top-8 of 128 experts | F1 now has **three** first-hand sources (DeepSeek-V3, Motif 3, Mamoda2.5). Laguna is a fourth design: sigmoid scores normalised after the top-k, routed output multiplied by 2.5, and a balancing loss, not a bias (p. 5). As described, nothing is added to Laguna's scores before the top-k |
+| J3 | The read table: PAFT's Appendix C is "on real error types", unread. Row E5 leaned on PAFT's main body only | Appendix C holds no data of the authors' own. Table 2 is Llama 3's interruption table (from Dubey et al.): 6 of the 419 interruptions listed were silent data corruption, 1.4%, and 7 were NCCL watchdog timeouts, 1.7%. Tables 3 and 4 are GPU error codes from the Fire-Flyer cluster (from An et al.): 12,970 errors in a year, 42.6% of them NVLink errors. Both are **second-hand here**. Two lines are asserted with no data: that many low-level silent errors go unreported (p. 18) and that noise at or above 0.01 "happen less" (p. 19). Appendix E.3: also synchronising the optimizer state helped only a little | E5 stands. PAFT's evidence for gradient-aggregation faults is simulation only. My hint that Appendix C might hold real cases was wrong. The 419 is my sum of the count column. One printed share does not fit it (148 faulty GPUs shown as 30.1%); I did not check the table against the Llama 3 paper |
+| J4 | H8: the attention statistic leads the gradient norm by "at least about 500 updates", with growth starting "near 25.2B" tokens (from the caption of Fig. 3) | A second marker, not a replacement. Table 8, p. 20, gives the logged gradient norm of the failing run: 0.358 at 23.1B tokens, 3.871 at 29.4B, 375.5 at 33.6B. It first passes 10 at **29.9B**. Table 11, p. 23: on eight fixed documents the full-model gradient norm is already 36.7 at 27.3B tokens, and 2.3 to 2.5 once the attention backward is repaired | Two lead times, by two markers. To the start of growth near 25.2B: about 500 updates, as H8 said. To the logged norm passing 10: 6.8B tokens after the 23.1B checkpoint, about 1,600 updates (my division by 4,194,304 tokens per update). The fault is in the gradient at least 600 updates before the logged norm passes 10. The 23.1B and 27.3B points are single checkpoints, not onsets |
+| J5 | H8 named the cause "BF16 fused attention, backward pass", from one 450M model | Four limits from the appendices. (i) The model is not a standard transformer: it is a "Full-AttnRes" design that reads earlier sublayer outputs through a learned softmax (Appendix H, p. 21). (ii) A plain 102M transformer did not show it: the backward differed from FP32 by under 1% at the base learning rate, and its largest query RMS stayed at 42.5 to 44.5 against above 200 in the failing run (Appendix K, p. 27). (iii) The backward error is not special to FlashAttention-3. On the same eight captured inputs the median relative error of the query gradient is 7.7 for FA3 and for FlashAttention-2, about 2.2 for FA3 with the repaired forward and for PyTorch's three fused attention backends, and 0.003 to 0.004 for PyTorch's unfused path (Table 13, p. 27). (iv) Of the five arms that ran the full 50B tokens, two passed a gradient norm of 10: unmodified FA3, and FA3 with key smoothing at 33.2B tokens, ending 0.24 nats above FP32 attention (Table 8) | The cause to name is narrower and wider than H8 said. Narrower: it needs the large-logit regime, which the plain model never reached. Wider: any fused BF16 attention shares the backward error at such inputs. A published fix (key smoothing) did not prevent the failure in this run. The arm with the repaired forward did not fail though it reached the same regime |
+| J6 | E7: Wortsman's output logits go "very negative"; add log Z | Laguna, p. 9: the LM-head logits drifted "strongly positive" in M.1, with no penalty on the logits and a normalisation layer that does not subtract the mean | The sign is not fixed. Record the signed mean and log Z. Nothing on `main` records output logits (searched `evidence.py`, `capture.py`, `probe.py`) |
+| J7 | The read table: the DeepSeek-V3 sentence on load imbalance runs onto p. 28, unread | p. 28: batch-wise balancing leaves two risks, imbalance "within certain sequences or small batches" and imbalance from a change of domain at inference. They answer the first with large batches and the second by serving extra copies of the busy experts, chosen from load statistics about every 10 minutes (p. 19) | Nothing in section 10 changes. It adds to H7: a released, healthy model is expected to route unevenly on one domain. Figure 9 plots per-domain expert load on a scale of 0 to 10 times an even load; I read the scale, not the values |
+| J8 | The opening of section 10: two files are fresh downloads whose text differs "by under 0.5% of the words, which I did not trace" | Traced. TrainSDC: the new file's words are identical to my first extract; the difference was my own page markers. Ma et al.: the folder holds the arXiv preprint and the ACL 2025 version, both extracted in the earlier pass, and both unchanged since. The two versions differ from each other by about 2% of the words (339 and 68 tokens of about 14,000). The differing numbers I saw are page numbers; the list I printed was cut at 150 tokens | Settled. No re-read needed. I did not compare the two Ma versions sentence by sentence |
+
+### New findings
+
+| # | Finding | Source | Checked against the code |
+| --- | --- | --- | --- |
+| M1 | **A weight corrupted in memory is judged only through its effect on the gradient.** `weight_norm_trends` returns numbers "with no threshold and no incident". `update_rms` is read from the optimizer's state, so a change that did not come from an update is not in it. In a toy run, one weight multiplied by 1e8 took its tensor's norm from 5.3 to 21 million, and neither `detect_grad_spikes` nor `detect_update_spikes` fired when the activation was tanh. With ReLU both fired at the next step, from a factor of 100 up. A factor of 10 was missed in both, and did no harm in the toy | LLMFT, pp. 4-7: of 10,000 random single-bit flips per model, 88.6% to 96.7% were masked. Table 2 (p. 7): when the flipped value moved by under 10 times, 0.5% to 8.9% of runs failed; at 10 times or more, 30% to 36%; at 1e8 times or more, 39% to 79% | **Run on CPU against `main`** (appendix). Two rules tested, not all: the toy has no watched block, so `detect_activation_anomalies` was not exercised, and it is the rule most likely to see a fault in the forward path. The fault was put on the largest element of a 64 by 64 tensor |
+| M2 | **A third team runs a replica check, and credits it with catching silent data corruption.** Laguna hashes the weights across data-parallel replicas "periodically" and asserts they are bit-identical. By its account the checks "primarily catch silent data corruption" from defective GPUs, in arithmetic logic that error-correcting memory does not cover. Its one example: a single machine with corrupt arithmetic, "surfacing as anomalous global gradient norms peaking at ∼10^6", which in earlier runs had caused "only subtle symptoms". "Beyond their original purpose" the checks also caught four software faults: data races, collective bugs, non-deterministic kernels in the optimizer, and a checkpoint loader that left rank 0 with 64-bit Adam betas while the other ranks had 32-bit ones | Laguna, pp. 8-9. Nothing is counted: no rate, no interval, no number of catches. One company. **This is in tension with W1**, which says the check sees only some places a fault can sit (Elsen's table in section 10). Laguna does not say where its faults sat. I leave the two side by side: one team's unquantified claim against another team's worked cases | Read: `replica_drift` is the same check with float fingerprints and a tolerance of 1e-6, where Laguna and Megatron compare hashes. **Run on CPU**: two replicas sharing one averaged gradient, one with 32-bit values of the betas. A weight bit differs from step 1. The largest fingerprint spread passes 1e-6 at the first 50-step check at a learning rate of 1e-3, and at the fourth at 1e-4; the largest spread in 20,000 steps was 7e-5. So the tolerance would see this case in the toy, later than a hash would. The script applies the tolerance to the spread itself; `detect_replica_drift` was not called |
+| M3 | **Padding tokens can load one set of experts.** In Laguna M.1 about 5% of training tokens were padding. They were routed and counted in the balancing loss. Every padding token reaches the router with the same vector, so all of them go to the same experts at once, "potentially saturating that expert". XS.2 skips padding in routing and balancing | Laguna, p. 9 | Read: the router hook counts every token the router is called on, and the SDK has no handling of padding (searched). That is correct counting, since those tokens do go there. It is a cause the agent should name, not a bug. With 8 of 256 experts per token (XS.2's router; M.1's is not given), 5% padding puts about 2.6 times an even load on eight experts, far below the 0.35 share at which `moe_imbalance` fires. With 8 experts, one per token, and 30% padding, the share would be about 39%. Both are my arithmetic, not runs |
+| M4 | **A reduction can be wrong on every rank with no hardware fault.** In Laguna M.1 the gradient entering the LM head was all-reduced across tensor-parallel ranks in BF16. As the logits grew, that reduction became "the dominant source of numerical error" and training became unstable. The fix was to do that one all-reduce in FP32 | Laguna, p. 9 | This is the second row of section 10's table of fault locations, reached by precision, not by a broken node. Every rank gets the same sum, so `replica_drift` cannot see it. It is also not a data-parallel reduction, so the check would not be looking there. Read, not run |
+| M5 | **Three outcomes of a fault leave the loss near normal.** LLMFT sorts its failing runs into six kinds. Three end in NaN or no convergence. Three end in a worse model: a slightly changed loss, a higher final loss, and a late convergence. Its Figure 1 shows two loss curves that are hard to tell apart with accuracy at 53.83% and 49.86%. A higher final loss is tied to faults in the optimizer's state (p. 5) | LLMFT, pp. 2, 5. Fine-tuning BERT, GPT-2 and T5-small for a few hundred iterations in FP32 on TensorFlow; single-bit flips in parameters, gradients and optimizer state | A second source for H3: a fault in the optimizer's state can pass without a spike. He et al. was the first. Not run again |
+| M6 | **A corrupted forward kernel can stall a run with a small gradient spike.** In Chen's comparison a second published attention method (Qiu and Yao's dynamic shift) fails in the forward pass. The run falls behind from 2.5B tokens, spikes once at 6.2B to 6.8B with a gradient norm of 6.4, then stalls 0.31 nats behind. By 12.6B tokens the attention output of about half the rows in the later layers is unrelated to exact attention. Swapping exact attention back in later does not help: the weights have adapted | Chen et al., Appendix G, pp. 20-21, Figure 4. One arm, stopped at 13.2B tokens | TensorQuill's probe computes attention with its own plain forward, so it would not see the kernel's wrong output. It would see the logits: the paper reports row maxima near 5,300 at 6.3B tokens, 5 to 100 times the other run's. `max_logit` is the same kind of number, a row maximum. Read, not run |
+| M7 | **Routing can be frozen on purpose.** Motif 3 freezes the router weights and the expert-selection biases through all of its reinforcement-learning and distillation stages (p. 22). DeepSeek-V3 sets its bias update speed to zero for the last 500B of 14.8T tokens (p. 23) | Motif 3; DeepSeek-V3 | In those phases a change in expert load comes from the hidden states alone, and no balancing acts against it. Wording for the agent instructions and plan row S8. Not run |
+
+**The six outcomes of a single bit flip in training (LLMFT, p. 5), and what TensorQuill has for each.** The right-hand column is my reading of the rules, not a run.
+
+| Outcome | What the paper saw | A rule on `main` that could see it |
+| --- | --- | --- |
+| Immediate NaN | Gradients grow without bound in one backward pass | `non_finite` |
+| Delayed NaN | The loss rises and wobbles for some iterations, then NaN | `non_finite` at the end; `grad_spikes` or `update_spike` before it if the norm rises |
+| No convergence | An extreme value in the forward pass; the loss jumps and stays high | `grad_spikes` if the gradient follows. In M1's toy a huge weight behind a tanh left the gradient unmoved, though that run still converged |
+| Slightly changed loss | A small early disturbance; the final accuracy is lower | None |
+| Higher final loss | A fault in the optimizer's state moves the whole path | None (H3) |
+| Late convergence | A loss spike that the optimizer recovers from; accuracy still lower | `grad_spikes` for the spike. Nothing says the model ended worse |
+
+**What a norm-jump rule would have to clear.** In the recorded healthy GPU runs under `~/Downloads/runs` (five files, 8 or 13 weight checks each, 50 steps apart, 218 or 290 tensors), the largest change in any tensor's norm between two checks was a factor of 1.0007. In the toy, a factor-10 fault on one element moved the norm by 1.075 and a factor-100 fault by 4.1. The two sets of numbers are not on the same footing. The toy tensor has 4,096 elements; the real ones have up to millions, and a one-element fault moves a norm less as the tensor grows. So a factor-10 fault in a real tensor would sit well under 1.0007, and only very large faults would stand out. The 1.0007 is an observation from a few dozen intervals in short runs at one stage of training. It is not a threshold. Warm-up and training from scratch are not in it.
+
+### Wrong or unsupported, in the three new papers
+
+| Paper | Claim | Why it does not carry |
+| --- | --- | --- |
+| LLMFT | The detector reaches 97.5% precision and 97.6% F1 (p. 9, Table 3) | The training set is 1,000 injected faults, half masked and half failing; the test set is 1,000 more injected faults (p. 8). No fault-free step is ever scored, so the precision says nothing about false alarms on healthy training. The features include the epoch, batch, stage, layer and component of the injection (p. 6-7). The paper does not say how these are found in live training when no outlier points at a place; that gap is my reading |
+| LLMFT | An outlier flag on the parameters is the key feature (p. 7) | By Table 2, 70% of T5's failing runs had a value that moved by under 10 times (791 of 1,137; my arithmetic), 23% of GPT-2's and 14% of BERT's. An outlier flag cannot see those |
+| LLMFT | Between 3.32% and 11.37% of faults cause a failure (p. 4) | Table 2 gives BERT 3.08% by my sum (44 of 9,262 plus 263 of 738), under the stated range. GPT-2 gives 3.32% and T5 11.37%, as stated |
+| LLMFT | "No delay is introduced" by the detector (p. 10) | The scan takes 63 to 71 ms against a training iteration of 182 to 255 ms, on three small models (BERT-base, GPT-2, T5-small). It reads every parameter each iteration. Nothing is shown at a larger size. The recall formula on p. 8 is printed with the wrong denominator |
+| Laguna | Hash checks are "important to prevent silent and non-silent failures" (p. 8) | Four catches are named and none is counted. No interval, no cost |
+| Laguna | XS.2 "proceeded without encountering further stability issues" (p. 9) | One run, the lab's own account |
+| Mamoda2.5 | Sigmoid routing with a bias beats softmax with a balancing loss (p. 22) | "Preliminary experiments" in one configuration, on training loss, with no number given |
+| DeepSeek-V3 | "We did not experience any irrecoverable loss spikes or perform any rollbacks" (pp. 1, 4) | The lab's own statement about one run. No curve of the loss or gradient norm is shown. Recoverable spikes are not ruled out by the wording |
+
+Mamoda2.5 reports no training failure of any kind, and no expert-load number. For TensorQuill its use is row J2 and one sentence: it trains with fully sharded data parallelism in place of expert parallelism, which it says "avoids computational load imbalance" (p. 13).
+
+### What the rest of the reading confirms
+
+- **Motif 3, pp. 1-5, 14-15, 20-32.** Nothing in section 10's rows E1, E2, H5 or H6 changes. Two values to add to H5's table: the fine-tuning stage keeps a penalty on FFN output magnitude with a threshold of 128, and 1,024 for the last layer (p. 20). The work balancing in H6 (iii) moves whole packed sequences between replicas every step (p. 14), so which rank is slow can change from step to step.
+- **DeepSeek-V3, the other 35 pages.** No token is dropped in training or serving (p. 10). The sequence-wise balance loss has a weight of 0.0001, "just to avoid extreme imbalance within any single sequence" (p. 23). The rest is benchmarks, serving, hardware advice and post-training.
+- **Wang et al., appendices.** Definitions of the measures and more figures. One fact for reference values: the same architecture trained with AdamW has hidden-state norms of 25 to 35, and 12 to 14 with Muon (Figure 11). A healthy scale does not carry from one optimizer to another.
+- **Wortsman et al., pp. 22-26.** Figures. Figure G.19: Adam's update RMS falls when the gradient RMS nears the optimizer's epsilon of 1e-8. That is a second, harmless way for one tensor's update to shrink. A rule for "one parameter's update collapsed" (row H3) would have to tell it from a fault.
+- **FALCON, p. 17.** Formulas for the change-point test and for communication volumes. Nothing new.
+- **Chen et al., Appendices A to F.** Proofs, the kernel's arithmetic and the test suite. The parts that bear on TensorQuill are in rows J4, J5 and M6.
+
+### What this changes in the findings and proposals
+
+- **Plan row K7 and row E1.** Nothing new to change. E1 already asks to take back "without a source". Laguna adds a second reported collapse, of unstated kind, that ended in divergence (J1). Hidden collapse still has no reported case, and the row still needs expert outputs.
+- **W1 and proposal 1.** Three teams now run a replica check (Megatron, Adept, Poolside). Poolside says it mainly catches silent data corruption and also caught four software faults (M2). W1's limits stand on Elsen's cases; Poolside's claim is unquantified and does not say where its faults sat. What M2 does add: the check earns its place on software faults too. Add M4 as an example of the second row of the fault-location table.
+- **Plan row S8 and the agent instructions.** Four causes to name. Padding routed to one set of experts (M3). New tokens with untrained embeddings: gradient spikes and dead experts (J1, Laguna p. 17). Fused BF16 attention in a large-logit regime, with J5's limits. A reduction done in low precision (M4).
+- **Plan row K4.** Record the signed mean of the output logits and log Z (J6).
+- **Plan row K1 and row H3.** A second source says a fault in the optimizer's state can end in a worse model with no spike (M5).
+- **Weight norms.** They are recorded every 50 steps and judged by nothing (M1). A rule on a jump between two checks could be judged from what is stored. The healthy figure above is too thin to set it. This is a gap in a built record, like H1 to H3, not an eleventh proposal.
+- **The list of ten stays ten.**
+
+### What was read in this pass
+
+| Paper | Kind of evidence | Read now | Still not read |
+| --- | --- | --- | --- |
+| Yu et al., "Exploring and Mitigating Failure Behavior of Large Language Model Training Workloads in HPC Systems", SC '25 (LLMFI and LLMFT) | Measured: over 300,000 injected bit flips into three small models being fine-tuned | All 15 pages; Tables 2, 3 and 5 re-read in layout | Figures 4, 6, 7, 8 and 9 as images |
+| Poolside, "Laguna M.1/XS.2 Technical Report", arXiv 2605.27605 | A lab's report on two training runs; incidents told in a sentence or two each, no rates | All 37 pages | Figures as images |
+| Mamoda Team, "Mamoda2.5", arXiv 2605.02641 | A lab's report on a video model; benchmark tables and three ablations | pp. 1-28 | pp. 29-33 (references), p. 34 (one benchmark table), pp. 35-38 (picture pages): scanned only |
+| DeepSeek-V3 | As in section 10 | The 35 pages section 10 skipped. With section 10, all 53 | pp. 37-43 (references) scanned only; pp. 49-53 are heatmaps, read through their captions |
+| Motif 3 | As in section 10 | pp. 1-5, 14-15, 20-24 in full; pp. 25, 27-32 through the filter | pp. 27-30 (references) scanned only |
+| Tang et al. (PAFT) | As in section 10 | pp. 12-26 through the filter; Tables 2 to 4 re-read in layout | The proofs' equations (pp. 19-24); Figures 11 to 18 as images. Table 1 still would not extract. pp. 10-11 are the impact statement and references, scanned only |
+| Chen et al. | As in section 10 | pp. 13-28 through the filter; Tables 8, 11 and 13 re-read in layout | The equations of Appendices A to C; Tables 2, 6, 7, 10, 12, 14 and 15; figures as images. pp. 11-12 are references, scanned only |
+| Wang, Hayou, Nalisnick | As in section 10 | pp. 14-31 through the filter | Equations; Figures 11 to 29 as images. pp. 12-13 are references, scanned only |
+| Wortsman et al. | As in section 10 | pp. 22-26 (captions) | The figures as images; pp. 10-13 (references) |
+| FALCON | As in section 10 | p. 17 | Nothing |
+| TrainSDC; Ma et al. | Read in section 9 | Compared word for word with my first extracts (J8) | Not re-read; no need |
+
+**Public material (for section 5).** LLMFT gives two Zenodo records for its injection tool and its detector (DOIs 10.5281/zenodo.15279193 and 15279226, p. 14); both are TensorFlow 2.8 code for small fine-tuning runs. Laguna XS.2's weights are on Hugging Face under Apache 2.0 (p. 1); a released model, not a failure set. Chen et al. say their kernel errors "can be reproduced from the captures alone" (p. 18); I did not find where the captures are published. None of this was downloaded or opened.
+
+**Not in the folder.** Dai et al., the DeepSeekMoE paper (arXiv 2401.06066). Section 10 lists it; the three other papers on that list are the ones read here.
+
+**Not done in this pass.** No GPU run. No run of TensorQuill on a failure these papers describe. No reading of figure images. No edit to the plans, the README or the agent instructions: plan row K7 still says "without a source", which E1 asks to take back. Nothing is committed.
 
 ## Appendix: the script behind proposal 2
 
@@ -832,3 +1054,219 @@ init std 0.0001: step-0 max |grad| fc1.weight 7.93e-06, fc2.weight 9.97e-06, fc2
 ```
 
 What it shows, and what it does not. Part 1: the update size is near the predicted value while the loss is high, about four times that on the first step, and a quarter of it once the toy has fitted its data. It is a toy MLP, not a transformer, and one seed. Part 2: with both matrices at exact zero, neither ever gets a gradient, at full precision. So a block that starts that way stays stuck without any rounding. It does not show that bf16 rounding never stalls a weight; other papers in the folder show that it can.
+
+## Appendix: the two CPU checks behind section 10 (H1 and H3)
+
+Both import the detectors from `sdk/src` on `main` at `b11b2c6` and change nothing. Run as `python3 <script> /path/to/sdk/src`.
+
+**H1: a slow rise in the largest attention logit.** One attention module, one probe every 1,000 steps, the logit multiplied by a fixed factor at each probe from 10 until it passes 10,000.
+
+```python
+"""Does attention_logit_growth fire on a slow, steady rise? Uses the detector on main, unchanged."""
+import sys
+sys.path.insert(0, sys.argv[1])
+from tensorquill import evidence as ev
+fn = ev.detect_attention_incidents if hasattr(ev, "detect_attention_incidents") else None
+if fn is None:
+    fn = [getattr(ev, n) for n in dir(ev) if "attention" in n.lower() and callable(getattr(ev, n)) and n.startswith(("detect", "_detect", "attention"))]
+    print("candidates", [f.__name__ for f in fn]); fn = fn[0]
+def run(growth, start=10.0, stop=10000.0):
+    recs, v, step = [], start, 999
+    while v < stop:
+        recs.append({"step": step, "probe": {"attention": {"blk5.attn": {"entropy_share": [0.5, 0.5], "max_logit": [v, v * 0.9]}}}})
+        v *= growth; step += 1000
+    out = fn(recs)
+    hits = [i for i in out if i.get("kind") == "attention_logit_growth"]
+    return len(recs), v / growth, hits
+for g in (1.05, 1.10, 1.20, 1.25, 1.27, 1.30, 1.50, 2.0):
+    n, last, hits = run(g)
+    print(f"growth x{g:.2f} per probe | {n:3d} probes | logit 10 -> {last:8.0f} | incidents: {len(hits)}" + (f" first at step {hits[0]['step']} value {hits[0]['modules'][0]['value']:.0f}" if hits else ""))
+```
+
+```text
+growth x1.05 per probe | 142 probes | logit 10 ->     9721 | incidents: 0
+growth x1.10 per probe |  73 probes | logit 10 ->     9556 | incidents: 0
+growth x1.20 per probe |  38 probes | logit 10 ->     8506 | incidents: 0
+growth x1.25 per probe |  31 probes | logit 10 ->     8078 | incidents: 0
+growth x1.27 per probe |  29 probes | logit 10 ->     8063 | incidents: 1 first at step 5999 value 33
+growth x1.30 per probe |  27 probes | logit 10 ->     9173 | incidents: 1 first at step 5999 value 37
+growth x1.50 per probe |  18 probes | logit 10 ->     9853 | incidents: 1 first at step 3999 value 34
+growth x2.00 per probe |  10 probes | logit 10 ->     5120 | incidents: 1 first at step 2999 value 40
+```
+
+The line sits where it should: the baseline is the median of five rising values, which is the value three probes back, and 1.26 cubed is 2.
+
+**H3: one corrupted step under Adam.** A gradient fault (one tensor's gradient times 1e6) and a state fault (the same tensor's second moment times 1e12, gradient untouched), each at step 700 of 1,500, each compared with the same run without the fault.
+
+```python
+"""What Adam's update does after one corrupted step, and what two rules on main say about it.
+CPU, toy MLP, torch.optim.AdamW, no weight decay, no gradient clipping. Each faulted run is
+compared with the same run without the fault (same seed, same data), step for step.
+update_spike: the detector on main, unchanged. Weights-not-updating: only its condition is
+emulated here (the tensor's float64 norm exactly equal at checks 50 steps apart)."""
+import sys, math, torch
+sys.path.insert(0, sys.argv[1])
+from tensorquill.evidence import detect_update_spikes
+AT, STEPS, LR, TARGET = 700, 1500, 1e-3, "2.weight"
+def run(beta2, fault):
+    torch.manual_seed(0)
+    net = torch.nn.Sequential(torch.nn.Linear(32, 64), torch.nn.Tanh(), torch.nn.Linear(64, 64),
+                              torch.nn.Tanh(), torch.nn.Linear(64, 1))
+    opt = torch.optim.AdamW(net.parameters(), lr=LR, betas=(0.9, beta2), weight_decay=0.0)
+    w_true = torch.randn(32, 1)
+    names = [n for n, _ in net.named_parameters()]
+    p = dict(net.named_parameters())[TARGET]
+    recs, series, norms = [], [], []
+    for step in range(STEPS):
+        x = torch.randn(64, 32); y = x @ w_true + 0.1 * torch.randn(64, 1)
+        opt.zero_grad(); loss = ((net(x) - y) ** 2).mean(); loss.backward()
+        if step == AT and fault == "grad":    # one tensor's gradient is wrong by 1e6
+            p.grad.mul_(1e6)
+        gnorm = math.sqrt(sum(float(q.grad.pow(2).sum()) for q in net.parameters()))
+        before = [q.detach().clone() for q in net.parameters()]
+        if step == AT and fault == "state":   # Adam's second moment of one tensor is wrong by 1e12; gradient untouched
+            opt.state[p]["exp_avg_sq"].mul_(1e12)
+        opt.step()
+        rms = {n: float((q.detach() - b).pow(2).mean().sqrt()) for n, q, b in zip(names, net.parameters(), before)}
+        recs.append({"step": step, "grad_norm": gnorm, "update_rms": rms})
+        series.append(rms[TARGET] / LR)
+        if (step + 1) % 50 == 0:
+            norms.append(float(torch.linalg.vector_norm(p.detach().double())))
+    return series, detect_update_spikes(recs), norms, float(loss)
+for b2 in (0.999, 0.95):
+    clean, hit0, _, loss0 = run(b2, "none")
+    print(f"beta2={b2} no fault: update_spike {'step %d' % hit0['step'] if hit0 else 'none'}, final loss {loss0:.4f}")
+    for f in ("grad", "state"):
+        s, hit, norms, loss = run(b2, f)
+        ratio = lambda k: s[AT + k] / clean[AT + k]
+        back = next((k for k in range(1, STEPS - AT) if ratio(k) < 0.5), None)
+        rec = next((k for k in range(back or 1, STEPS - AT) if ratio(k) > 0.5), None) if back else None
+        same = sum(1 for a, b in zip(norms[AT // 50:], norms[AT // 50 + 1:]) if a == b)
+        print(f"  fault={f:5s} update RMS/lr at the fault {s[AT]:.3g} (no fault {clean[AT]:.3g}); faulted/unfaulted at +1 {ratio(1):.2g}, +10 {ratio(10):.2g}, +100 {ratio(100):.2g}, +500 {ratio(500):.2g}"
+              f" | under half from +{back}, over half again at +{rec} | update_spike: {'step %d' % hit['step'] if hit else 'none'}"
+              f" | 50-step norm checks exactly equal after the fault: {same} of {len(norms) - AT // 50 - 1} | final loss {loss:.4f}")
+```
+
+```text
+beta2=0.999 no fault: update_spike none, final loss 0.3619
+  fault=grad  update RMS/lr at the fault 2.25 (no fault 0.13); faulted/unfaulted at +1 14, +10 5.3, +100 0.0021, +500 0.0037 | under half from +34, over half again at +None | update_spike: step 700 | 50-step norm checks exactly equal after the fault: 0 of 15 | final loss 0.3099
+  fault=state update RMS/lr at the fault 3.46e-08 (no fault 0.13); faulted/unfaulted at +1 2.7e-07, +10 3.3e-07, +100 1.6e-07, +500 9.3e-07 | under half from +1, over half again at +None | update_spike: none | 50-step norm checks exactly equal after the fault: 0 of 15 | final loss 0.3498
+beta2=0.95 no fault: update_spike none, final loss 0.1128
+  fault=grad  update RMS/lr at the fault 0.447 (no fault 0.203); faulted/unfaulted at +1 2.1, +10 0.89, +100 0.0066, +500 0.96 | under half from +20, over half again at +391 | update_spike: step 700 | 50-step norm checks exactly equal after the fault: 0 of 15 | final loss 0.1172
+  fault=state update RMS/lr at the fault 6.46e-08 (no fault 0.203); faulted/unfaulted at +1 3.5e-07, +10 4.5e-07, +100 1.6e-05, +500 0.54 | under half from +1, over half again at +498 | update_spike: none | 50-step norm checks exactly equal after the fault: 0 of 15 | final loss 0.1239
+```
+
+What it shows. `update_spike` catches the gradient fault at its step with either β2. After a gradient fault the tensor's update also falls far below normal for a long time (to 0.002 of normal at +100 with β2 = 0.999), because the huge gradient sits in the second moment: this is the slow outcome He et al. describe. The state fault skips the spike and goes straight to the frozen tensor, and neither rule reports it. The update at a gradient fault is bounded by Adam's own arithmetic, (1 − β1)/√(1 − β2) times the learning rate per element: 3.16 at β2 = 0.999 and 0.447 at β2 = 0.95, which is what the run gives.
+
+What it does not show. Anything about a real model, a run with gradient clipping, or a fault smaller than these. The final loss of this toy barely moves, so it says nothing about how much such a fault costs.
+
+## Appendix: the two CPU checks behind section 11 (M1 and M2)
+
+Both import from `sdk/src` on `main` at `b11b2c6` and change nothing. Run as `python3 <script> /path/to/sdk/src`. Both are toy models on CPU.
+
+**M1: one weight corrupted in memory.** After step 700 the largest element of one 64 by 64 tensor is multiplied by a factor. Two rules are asked: `detect_grad_spikes` and `detect_update_spikes`. No other rule is exercised; the toy has no watched block, so the activation rule never runs.
+
+```python
+"""One weight element is multiplied by k after step 700 (a fault in memory, not an update).
+CPU, toy MLP with tanh and then with ReLU, AdamW, no weight decay, no clipping. Compared with the same run without the fault.
+The two detectors are the ones on main, unchanged. Weight norms have no rule on main (trend only)."""
+import sys, math, torch
+sys.path.insert(0, sys.argv[1])
+from tensorquill.evidence import detect_update_spikes, detect_grad_spikes
+AT, STEPS, LR, TARGET = 700, 1500, 1e-3, "2.weight"
+def run(k, act):
+    torch.manual_seed(0)
+    net = torch.nn.Sequential(torch.nn.Linear(32, 64), act(), torch.nn.Linear(64, 64),
+                              act(), torch.nn.Linear(64, 1))
+    opt = torch.optim.AdamW(net.parameters(), lr=LR, betas=(0.9, 0.999), weight_decay=0.0)
+    w_true = torch.randn(32, 1)
+    names = [n for n, _ in net.named_parameters()]
+    p = dict(net.named_parameters())[TARGET]
+    recs, losses, wn = [], [], []
+    for step in range(STEPS):
+        x = torch.randn(64, 32); y = x @ w_true + 0.1 * torch.randn(64, 1)
+        opt.zero_grad(); loss = ((net(x) - y) ** 2).mean(); loss.backward()
+        g = {n: float(q.grad.norm()) for n, q in net.named_parameters()}
+        before = [q.detach().clone() for q in net.parameters()]
+        opt.step()
+        rms = {n: float((q.detach() - b).pow(2).mean().sqrt()) for n, q, b in zip(names, net.parameters(), before)}
+        recs.append({"step": step, "grad_norm": math.sqrt(sum(v * v for v in g.values())), "grad_norms": g, "update_rms": rms})
+        losses.append(float(loss.detach())); wn.append(float(p.detach().double().norm()))
+        if step == AT and k:
+            with torch.no_grad(): p.view(-1)[p.abs().argmax()] *= k   # the largest element of one tensor
+    return recs, losses, wn
+m = lambda xs: sum(xs) / len(xs)
+hit = lambda d: d["step"] if d else "none"
+for act in (torch.nn.Tanh, torch.nn.ReLU):
+    base, l0, w0 = run(0, act)
+    print(f"{act.__name__} no fault: grad_spike {hit(detect_grad_spikes(base))}, update_spike {hit(detect_update_spikes(base))}, mean loss last 100 {m(l0[-100:]):.4f}")
+    for k in (2, 10, 100, 1e8):
+        r, l, w = run(k, act)
+        print(f"  x{k:g}: tensor norm {w[AT-1]:.3g} -> {w[AT+1]:.3g} | loss at +1 {l[AT+1]:.3g} (no fault {l0[AT+1]:.3g}) | grad_spike: {hit(detect_grad_spikes(r))} | update_spike: {hit(detect_update_spikes(r))}"
+              f" | mean loss last 100 {m(l[-100:]):.4g} (no fault {m(l0[-100:]):.4g})")
+```
+
+Output:
+
+```text
+Tanh no fault: grad_spike none, update_spike none, mean loss last 100 0.2947
+  x2: tensor norm 5.33 -> 5.34 | loss at +1 0.339 (no fault 0.338) | grad_spike: none | update_spike: none | mean loss last 100 0.2948 (no fault 0.2947)
+  x10: tensor norm 5.33 -> 5.73 | loss at +1 0.352 (no fault 0.338) | grad_spike: none | update_spike: none | mean loss last 100 0.296 (no fault 0.2947)
+  x100: tensor norm 5.33 -> 21.8 | loss at +1 0.362 (no fault 0.338) | grad_spike: none | update_spike: none | mean loss last 100 0.3016 (no fault 0.2947)
+  x1e+08: tensor norm 5.33 -> 2.12e+07 | loss at +1 0.369 (no fault 0.338) | grad_spike: none | update_spike: none | mean loss last 100 0.3025 (no fault 0.2947)
+ReLU no fault: grad_spike none, update_spike none, mean loss last 100 0.0411
+  x2: tensor norm 6.16 -> 6.18 | loss at +1 0.097 (no fault 0.0962) | grad_spike: none | update_spike: none | mean loss last 100 0.04112 (no fault 0.04114)
+  x10: tensor norm 6.16 -> 6.62 | loss at +1 0.111 (no fault 0.0962) | grad_spike: none | update_spike: none | mean loss last 100 0.04119 (no fault 0.04114)
+  x100: tensor norm 6.16 -> 25 | loss at +1 1.23 (no fault 0.0962) | grad_spike: 701 | update_spike: 701 | mean loss last 100 0.04177 (no fault 0.04114)
+  x1e+08: tensor norm 6.16 -> 2.43e+07 | loss at +1 1.09e+12 (no fault 0.0962) | grad_spike: 701 | update_spike: 701 | mean loss last 100 1.173e+04 (no fault 0.04114)
+```
+
+With tanh neither rule fires at any factor, and the faulted run ends with a loss 2.6% above the unfaulted one at a factor of 1e8. With ReLU both fire one step after the fault at factors of 100 and 1e8, and neither at 2 or 10.
+
+**M2: one replica with 32-bit values of Adam's betas.** Two replicas each compute a gradient on their own batch, the gradients are averaged, and both apply the average, as data-parallel training does. The fingerprints and the tolerance are the ones on `main`.
+
+```python
+"""Two data-parallel 'replicas'. Each computes a gradient on its own batch at its own weights,
+the two gradients are averaged, and both apply the same averaged gradient, as DDP does.
+One differs only in Adam's betas: the float32 value
+of each beta, as a stand-in for the Laguna report's case (rank 0 with FP64 beta factors, the
+other ranks FP32). When does the fingerprint spread on main pass DRIFT_TOLERANCE (1e-6)?
+A hash check fails as soon as any weight bit differs. CPU, toy MLP, float32 weights."""
+import sys, numpy as np, torch
+sys.path.insert(0, sys.argv[1])
+from tensorquill.distributed import parameter_fingerprints, spread_from_fingerprints
+from tensorquill.evidence import DRIFT_TOLERANCE
+def make(betas, lr):
+    torch.manual_seed(0)
+    net = torch.nn.Sequential(torch.nn.Linear(32, 64), torch.nn.ReLU(), torch.nn.Linear(64, 64),
+                              torch.nn.ReLU(), torch.nn.Linear(64, 1))
+    return net, torch.optim.AdamW(net.parameters(), lr=lr, betas=betas, weight_decay=0.0)
+b64 = (0.9, 0.999); b32 = tuple(float(np.float32(b)) for b in b64)
+print("betas", b64, "against", b32, "| tolerance", DRIFT_TOLERANCE)
+for lr in (1e-3, 1e-4):
+    (na, oa), (nb, ob) = make(b64, lr), make(b32, lr)
+    torch.manual_seed(1); w = torch.randn(32, 1)
+    first_bit = first_tol = None; worst = 0.0
+    for step in range(1, 20001):
+        for n, o in ((na, oa), (nb, ob)):
+            x = torch.randn(64, 32); y = x @ w + 0.1 * torch.randn(64, 1)
+            o.zero_grad(); ((n(x) - y) ** 2).mean().backward()
+        for p, q in zip(na.parameters(), nb.parameters()):   # the reduction: one averaged gradient for both
+            g = (p.grad + q.grad) / 2; p.grad.copy_(g); q.grad.copy_(g)
+        oa.step(); ob.step()
+        if first_bit is None and any(not torch.equal(p, q) for p, q in zip(na.parameters(), nb.parameters())):
+            first_bit = step
+        if step % 50 == 0:
+            fp = torch.stack([parameter_fingerprints(list(n.parameters())) for n in (na, nb)])
+            s = float(spread_from_fingerprints(fp).max()); worst = max(worst, s)
+            if first_tol is None and s > DRIFT_TOLERANCE: first_tol = step
+    print(f"lr={lr:g}: first step with any differing weight bit {first_bit} | first 50-step check over the tolerance {first_tol} | largest spread seen in 20,000 steps {worst:.3g}")
+```
+
+Output:
+
+```text
+betas (0.9, 0.999) against (0.8999999761581421, 0.9990000128746033) | tolerance 1e-06
+lr=0.001: first step with any differing weight bit 1 | first 50-step check over the tolerance 50 | largest spread seen in 20,000 steps 4.46e-05
+lr=0.0001: first step with any differing weight bit 1 | first 50-step check over the tolerance 200 | largest spread seen in 20,000 steps 6.94e-05
+```
