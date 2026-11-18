@@ -584,8 +584,8 @@ def test_the_all_ranks_status_says_what_was_checked_for_the_run_and_never_counts
     assert kinds["differs_by_rank"] == {"stalled_weights": {"checked": "0", "not_configured": "1"}}
     assert (kinds["judged_ranks"], kinds["ranks_not_counted"]) == ("0-1", "")
     assert [row["kinds"] for row in status["per_rank"]] == [
-        {"checked": 4, "not_enough_history": 0, "not_configured": 21, "unavailable": 0},
-        {"checked": 3, "not_enough_history": 0, "not_configured": 22, "unavailable": 0},
+        {"checked": 4, "not_enough_history": 0, "not_configured": 22, "unavailable": 0},
+        {"checked": 3, "not_enough_history": 0, "not_configured": 23, "unavailable": 0},
     ]
     assert status["summary"].splitlines()[-1] == (
         "5 of 33 kinds checked on both ranks, 28 not configured, 1 of them checked on some ranks only"

@@ -406,7 +406,7 @@ def test_reports_that_cannot_be_used_and_why(tmp_path):
         report["incidents"] = []
 
     state = with_report(older)
-    assert state["state"] == "unusable" and "does not cover stalled_weights" in state["reason"]
+    assert state["state"] == "unusable" and "does not cover update_spike, stalled_weights" in state["reason"]
     evidence, summary = look(stream, tmp_path)
     assert evidence["detection"]["source"] == "python" and "an older server wrote it" in summary
 

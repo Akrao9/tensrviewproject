@@ -1211,6 +1211,7 @@ class Session:
             return
         try:
             found: list[tuple[int, torch.Tensor]] = []
+            corrections: dict[tuple[float, float, float], tuple[float, float]] = {}
             for group in optimizer.param_groups:
                 lr, (beta1, beta2), eps = group["lr"], group["betas"], group["eps"]
                 second = "max_exp_avg_sq" if group.get("amsgrad") else "exp_avg_sq"
@@ -1229,19 +1230,35 @@ class Session:
                     if first.dtype in _LOW_PRECISION:
                         first, moment = first.float(), moment.float()
                     steps = state["step"]
-                    if not isinstance(steps, torch.Tensor):
-                        steps = torch.tensor(float(steps))
-                    # At least 1: under a loss scaler the fused step takes its count back when it
-                    # skips, and 1 - beta**0 would divide by zero.
-                    steps = steps.clamp(min=1)
-                    if steps.device.type != "mps":  # float64, as PyTorch works these out; MPS has none
-                        steps = steps.double()
                     update = torch.sqrt(moment)  # the one temporary
-                    update.div_(((1 - beta2**steps) ** 0.5).to(update.dtype)).add_(eps)
-                    torch.div(first, update, out=update)
-                    norm = torch.linalg.vector_norm(update)
-                    step_size = torch.as_tensor(lr / (1 - beta1**steps)).to(norm.dtype)
-                    found.append((index, (norm * step_size / math.sqrt(update.numel())).reshape(())))
+                    on_device = any(isinstance(v, torch.Tensor) and v.device.type != "cpu" for v in (steps, beta1, beta2))
+                    if not on_device:
+                        # The usual case off the fused and capturable paths: the step count is on the
+                        # CPU, so the bias corrections are plain numbers, worked out once for each count.
+                        count = max(float(steps), 1.0)
+                        key = (count, float(beta1), float(beta2))
+                        if key not in corrections:
+                            corrections[key] = (math.sqrt(1 - key[2] ** count), 1 / (1 - key[1] ** count))
+                        root, first_correction = corrections[key]
+                        # m / (sqrt(v) / root + eps) is root * m / (sqrt(v) + eps * root): one pass fewer.
+                        update.add_(eps * root)
+                        torch.div(first, update, out=update)
+                        rms = torch.linalg.vector_norm(update) * (lr * (root * first_correction / math.sqrt(update.numel())))
+                    else:
+                        # On the device (fused, capturable): tensor arithmetic, so nothing is synced.
+                        if not isinstance(steps, torch.Tensor):
+                            steps = torch.tensor(float(steps))
+                        # At least 1: under a loss scaler the fused step takes its count back when it
+                        # skips, and 1 - beta**0 would divide by zero.
+                        steps = steps.clamp(min=1)
+                        if steps.device.type != "mps":  # float64, as PyTorch works these out; MPS has none
+                            steps = steps.double()
+                        update.div_(((1 - beta2**steps) ** 0.5).to(update.dtype)).add_(eps)
+                        torch.div(first, update, out=update)
+                        norm = torch.linalg.vector_norm(update)
+                        step_size = torch.as_tensor(lr / (1 - beta1**steps)).to(norm.dtype)
+                        rms = norm * step_size / math.sqrt(update.numel())
+                    found.append((index, rms.reshape(())))
             if not found:
                 return
             by_device: dict[torch.device, list[tuple[int, torch.Tensor]]] = {}

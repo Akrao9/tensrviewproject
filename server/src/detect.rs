@@ -4486,9 +4486,12 @@ mod tests {
         assert!(error.contains("not an Arrow IPC stream"), "{error}");
     }
 
+    /// A step, its total gradient norm and each parameter's update RMS.
+    type UpdateTestRow<'a> = (i64, f64, &'a [(&'a str, f64)]);
+
     /// Rows with a total gradient norm, each parameter's update RMS and, when given, what the
     /// capture said it could not read (`extra_json`).
-    fn update_rows(rows: &[(i64, f64, &[(&str, f64)])], extra: &[Option<&str>]) -> RecordBatch {
+    fn update_rows(rows: &[UpdateTestRow], extra: &[Option<&str>]) -> RecordBatch {
         use arrow::array::{Float64Builder, MapBuilder, StringBuilder};
         use arrow::datatypes::{DataType, Field, Schema};
         let mut sizes = MapBuilder::new(None, StringBuilder::new(), Float64Builder::new());
@@ -4534,7 +4537,7 @@ mod tests {
         let quiet: [(&str, f64); 2] = [("a", 0.010), ("b", 0.002)];
         let other: [(&str, f64); 2] = [("a", 0.011), ("b", 0.002)];
         let jumped: [(&str, f64); 2] = [("a", 0.011), ("b", 0.300)];
-        let mut rows: Vec<(i64, f64, &[(&str, f64)])> = (0..6)
+        let mut rows: Vec<UpdateTestRow> = (0..6)
             .map(|step| (step, 1.0, if step % 2 == 0 { &quiet[..] } else { &other[..] }))
             .collect();
         // The same jump with a gradient norm that fell is not flagged; with one that rose it is.
@@ -4557,7 +4560,12 @@ mod tests {
         assert_eq!(found["parameters"].as_array().unwrap().len(), 2);
         let check = &detectors.kind_checks()["update_spike"];
         assert_eq!(
-            (&check["value"], &check["records"], &check["records_needed"], &check["enough_history"]),
+            (
+                &check["value"],
+                &check["records"],
+                &check["records_needed"],
+                &check["enough_history"]
+            ),
             (&json!("checked"), &json!(9), &json!(6), &json!(true))
         );
         // The first six rows alone report nothing: the one change judged came with no rise.
@@ -4568,7 +4576,7 @@ mod tests {
     #[test]
     fn an_optimizer_that_was_not_read_makes_the_update_kind_unavailable_and_says_why() {
         let none: [(&str, f64); 0] = [];
-        let rows: Vec<(i64, f64, &[(&str, f64)])> = (0..3).map(|step| (step, 1.0, &none[..])).collect();
+        let rows: Vec<UpdateTestRow> = (0..3).map(|step| (step, 1.0, &none[..])).collect();
         let said = r#"{"update_not_read":{"SGD":"SGD is not Adam or AdamW"}}"#;
         let detectors = judge(0, &[update_rows(&rows, &[None, Some(said), None])], &usual()).unwrap();
         let not_checked = detectors.not_checked();
@@ -4583,7 +4591,11 @@ mod tests {
         let check = &detectors.kind_checks()["update_spike"];
         assert_eq!(
             (&check["value"], &check["records"], &check["reason"]),
-            (&json!("unavailable"), &json!(0), &json!("SGD: SGD is not Adam or AdamW"))
+            (
+                &json!("unavailable"),
+                &json!(0),
+                &json!("SGD: SGD is not Adam or AdamW")
+            )
         );
         // A sender from before the column, or a run that never asked: not configured, no entry.
         let plain = judge(0, &[key_rows(&steps("run", 0, 1, 0..3))], &usual()).unwrap();
@@ -4596,8 +4608,14 @@ mod tests {
         let plain = judge(0, &[key_rows(&steps("run", 0, 1, 0..3))], &usual()).unwrap();
         let checks = plain.kind_checks();
         // Only a checked kind carries a note, and only the kinds of `KIND_NOTES`.
-        assert!(checks.as_object().unwrap().values().all(|check| check.get("note").is_none()));
-        assert!(KIND_NOTES[0].1.contains("equal replicas do not rule out silent data corruption"));
+        assert!(checks
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|check| check.get("note").is_none()));
+        assert!(KIND_NOTES[0]
+            .1
+            .contains("equal replicas do not rule out silent data corruption"));
     }
 
     #[test]
