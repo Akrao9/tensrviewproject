@@ -94,3 +94,106 @@ def test_a_resume_from_a_checkpoint_saved_at_a_multiple_of_every_is_compared_wit
     change = incomplete["changes"][0]
     assert (change["step"], change["source"], change["saved_after_step"]) == (50, "save", 49)
     assert {f["component"] for f in change["findings"] if f["finding"] == "missing"} == {"rng", "data"}
+
+
+# --- SDK-03: a step the loss scaler skipped -------------------------------------------------
+
+
+def _scaled_steps(model, optimizer, scaler, n, *, overflow=(), clip=False, other=None):
+    """`n` AMP iterations; on the steps in `overflow` one gradient element of the last layer is
+    made Inf after backward, so the scaler skips that step."""
+    for step in range(n):
+        optimizer.zero_grad()
+        scaler.scale(model(torch.randn(8, 4)).pow(2).mean()).backward()
+        if step in overflow:
+            model[1].weight.grad[0, 0] = float("inf")
+        if clip:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        if other is not None:
+            other(step)
+        scaler.update()
+
+
+def _two_layers() -> nn.Module:
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 1))
+
+
+def test_a_skipped_step_records_its_gradient_norms_and_names_the_parameter_that_overflowed():
+    model = _two_layers()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler("cpu")
+    sink = tensorquill.MemorySink()
+    with tensorquill.init(model, sink=sink, every=2, scaler=scaler, layers=()):
+        _scaled_steps(model, optimizer, scaler, 4, overflow=(0, 2))
+    records = sink.records
+    assert [r["step_skipped"] for r in records] == [True, False, True, False]
+    names = {"0.weight", "0.bias", "1.weight", "1.bias"}
+    assert all(set(r["grad_norms"]) == names for r in records)
+    for r in (records[0], records[2]):
+        assert r["grad_norms"]["1.weight"] == float("inf")
+        assert all(0 < r["grad_norms"][n] < float("inf") for n in names - {"1.weight"})
+    # Inf gradients on a skipped step are the scaler's business: no non-finite incident.
+    assert not [i for i in tensorquill.build_evidence(records)["incidents"] if i["kind"] == "non_finite"]
+
+
+def test_a_skipped_first_step_gives_no_false_reason_for_the_update_size():
+    model = _two_layers()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler("cpu")
+    sink = tensorquill.MemorySink()
+    with tensorquill.init(model, sink=sink, every=1, scaler=scaler, updates=True):
+        _scaled_steps(model, optimizer, scaler, 4, overflow=(0, 2), clip=True)
+    records = sink.records
+    assert [r["step_skipped"] for r in records] == [True, False, True, False]
+    assert not [r for r in records if "update_not_read" in r]
+    assert ["update_rms" in r for r in records] == [False, True, False, True]
+    evidence = tensorquill.build_evidence(records)
+    assert not [e for e in evidence.get("not_checked", []) if e.get("check") == "update_size"]
+
+
+def test_an_optimizer_that_holds_none_of_the_parameters_is_still_named_when_the_first_step_was_skipped():
+    model = _two_layers()
+    copy = nn.Parameter(torch.zeros(5))
+    optimizer = torch.optim.AdamW([copy], lr=0.1)
+    scaler = torch.amp.GradScaler("cpu", init_scale=1024.0)
+    sink = tensorquill.MemorySink()
+    with tensorquill.init(model, sink=sink, every=1, scaler=scaler, updates=True):
+        for step in range(3):
+            scaler.scale(model(torch.randn(2, 4)).sum()).backward()
+            copy.grad = torch.full((5,), float("inf") if step == 0 else 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+    records = sink.records
+    assert [r["step_skipped"] for r in records] == [True, False, False]
+    # Not on the skipped step (no optimizer stepped at all), but on the first that was not.
+    assert [list(r.get("update_not_read", {})) for r in records] == [[], ["no optimizer"], []]
+
+
+def test_a_weight_check_due_on_a_skipped_step_is_made_on_the_next_step_that_was_not_skipped():
+    model = _two_layers()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler("cpu")
+    sink = tensorquill.MemorySink()
+    # A weight check on every second step: steps 1, 3 and 5. Step 1 is skipped.
+    with tensorquill.init(model, sink=sink, every=8, scaler=scaler, weights=2, layers=()):
+        _scaled_steps(model, optimizer, scaler, 6, overflow=(1,))
+    records = sink.records
+    assert [r["step_skipped"] for r in records] == [False, True, False, False, False, False]
+    assert ["weight_norms" in r for r in records] == [False, False, True, True, False, True]
+
+
+def test_scaler_update_with_a_new_scale_and_no_optimizer_seen_is_not_a_step():
+    model = _two_layers()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler("cpu")
+    sink = tensorquill.MemorySink()
+    with tensorquill.init(model, sink=sink, every=4, scaler=scaler):
+        scaler.scale(model(torch.randn(2, 4)).sum())  # makes the scale, as the first forward would
+        scaler.update(2.0**10)  # sets the scale: no optimizer went through the scaler
+        _scaled_steps(model, optimizer, scaler, 2)
+        scaler.update(2.0**12)
+    assert [r["step"] for r in sink.records] == [0, 1]
+    assert [r["step_skipped"] for r in sink.records] == [False, False]

@@ -913,6 +913,16 @@ class Session:
         self._lead: weakref.ref[Any] | None = None
         self._leading = True
         self._grads_after_step = False
+        # Step accounting under a loss scaler (`_commit`, `_watch_scaler`): whether an optimizer
+        # that holds this model's parameters, or one that holds none of them, stepped since the
+        # last step ended (on a step the scaler skipped, neither did); a weight check that fell
+        # on a skipped step, owed to the next step that was not; and for each row of the ring,
+        # whether its step ended with no optimizer of this model seen stepping yet, which
+        # `flush` says as `update_not_read` only for a row the scaler did not skip.
+        self._stepped = False
+        self._foreign_stepped = False
+        self._weight_check_owed = False
+        self._ring_no_optimizer: list[bool] = []
         self._step_depth = 0
         self._outer_frame: Any = None
         self._closed = False
@@ -1009,6 +1019,10 @@ class Session:
     def _should_check_weights(self) -> bool:
         return self._cadence(self.weight_every)
 
+    def _grads_wanted(self) -> bool:
+        # A weight check owed by a step the scaler skipped needs this step's gradient norms too.
+        return self._should_record_grads() or self._weight_check_owed
+
     def _cadence(self, every: int) -> bool:
         # The every-th, 2*every-th, ... step, counting from 1 (as Lightning and wandb do).
         return every > 0 and (self._steps_committed + 1) % every == 0
@@ -1034,6 +1048,7 @@ class Session:
         if self._closed:
             return
         if not self._owns(optimizer):
+            self._foreign_stepped = True
             self._note_foreign_step()
             return
         # PyTorch wraps each optimizer class's own `step` with the global hooks, so an
@@ -1061,7 +1076,7 @@ class Session:
         # gradients are read after it instead (Lightning steps this way).
         closure = kwargs.get("closure", args[1] if len(args) > 1 else None)
         self._grads_after_step = callable(closure)
-        if self._leading and not self._grads_after_step and not self._grads_recorded and self._should_record_grads():
+        if self._leading and not self._grads_after_step and not self._grads_recorded and self._grads_wanted():
             self.record_grads()
 
     def _after_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
@@ -1071,13 +1086,14 @@ class Session:
             self._step_depth -= 1
             return
         self._step_depth, self._outer_frame = 0, None
+        self._stepped = True
         if self.updates:
             # Every optimizer that holds some of this model's parameters, not only the lead: one
             # that steps after the lead has ended the step is read into the next record.
             self._read_updates(optimizer)
         if not self._leading:
             return
-        if self._grads_after_step and not self._grads_recorded and self._should_record_grads():
+        if self._grads_after_step and not self._grads_recorded and self._grads_wanted():
             self.record_grads()
         if self._snapshot_due and self._snapshot_before is not None:
             self._snapshot_due = False
@@ -1094,10 +1110,18 @@ class Session:
         original = scaler.update
 
         def update(*args: Any, **kwargs: Any) -> Any:
+            ends = False
             if not self._closed:
-                self._record_scaler(scaler)
+                # It ends a step only after an optimizer went through the scaler (or one of this
+                # model's stepped): `update(new_scale)` called on its own only sets the scale.
+                ends = self._record_scaler(scaler) or self._stepped
+                if ends and self._commit_on_update and not self._grads_recorded and self._grads_wanted():
+                    # A step the scaler skipped never reaches the optimizer hooks. Its gradients are
+                    # still there, unscaled by `scaler.step`, Inf or NaN where they overflowed:
+                    # read them here, so the record names the parameters that did.
+                    self.record_grads()
             out = original(*args, **kwargs)
-            if self._commit_on_update and not self._closed:
+            if ends and self._commit_on_update and not self._closed:
                 if self._pending_lr is None and self._lead is not None and self._lead() is not None:
                     self._pending_lr = _learning_rates(self._lead())
                 self._commit(None)
@@ -1106,22 +1130,24 @@ class Session:
         scaler.update = update  # an instance attribute; `close()` removes it
         self._scaler_original = original
 
-    def _record_scaler(self, scaler: Any) -> None:
+    def _record_scaler(self, scaler: Any) -> bool:
         # Read before `update()` resets them: whether any optimizer's gradients had an Inf
         # or NaN this iteration (the scaler then skipped its step), and the scale used.
         # Both stay tensors on the device until the next flush, so no sync is added.
+        # Returns whether any optimizer went through the scaler since its last update; with
+        # none, there is nothing to say of a step and nothing is recorded.
         scale = getattr(scaler, "_scale", None)
         if scale is None:
-            return
+            return False
         found = [
             f for state in scaler._per_optimizer_states.values()
             for f in state["found_inf_per_device"].values()
         ]
-        skipped = (
-            torch.stack([f.to(scale.device).reshape(()) for f in found]).sum() > 0
-            if found else torch.ones((), dtype=torch.bool, device=scale.device)
-        )
+        if not found:
+            return False
+        skipped = torch.stack([f.to(scale.device).reshape(()) for f in found]).sum() > 0
         self._pending_amp = {"step_skipped": skipped.float(), "grad_scale": scale.detach().clone()}
+        return True
 
     @torch.no_grad()
     def record_grads(self) -> None:
@@ -1577,9 +1603,20 @@ class Session:
             # rank's own count of recorded steps, which can differ (a rank that started
             # its session later, or skipped a step), and would leave the others waiting.
             self.record_replica_spread(self._replica_group)
-        weights_checked = self._grads_recorded and self._should_check_weights() and bool(self._params)
+        # A step `scaler.update()` ended with no optimizer stepping is one the scaler skipped: its
+        # weights are the previous step's. Told on the host, with no sync. (The record's own
+        # `step_skipped` is the scaler's verdict, read at the flush.)
+        skipped = self._commit_on_update and not self._stepped and not self._foreign_stepped
+        self._stepped = self._foreign_stepped = False
+        # A weight check is not made on a skipped step, so that an unchanged weight always means
+        # an optimizer step that left it alone: one due there is made on the next step instead.
+        check_due = self._should_check_weights() or self._weight_check_owed
+        weights_checked = check_due and self._grads_recorded and bool(self._params) and not skipped
         if weights_checked:
+            self._weight_check_owed = False
             self._record_weights()
+        elif check_due and skipped:
+            self._weight_check_owed = True
         row = len(self._steps)
         has_act = self._act.numel() > 0
         # The buffers the forward hooks write; their versions are kept over the zeroing below.
@@ -1604,6 +1641,7 @@ class Session:
         self._ring_clip_seen.append(self._clip_recorded)
         self._clip_recorded = False
         if self.updates:
+            no_optimizer = False
             if self._update_recorded:
                 self._ring_update[row].copy_(self._update)
                 self._update.zero_()
@@ -1613,12 +1651,11 @@ class Session:
                     "the optimizer hooks are off, so call session.record_updates(optimizer) after each optimizer.step()",
                 )
             elif self._lead is None:
-                # A step ended by `scaler.update()` with no optimizer of this model seen stepping.
-                self._update_why.setdefault(
-                    UPDATES_NO_OPTIMIZER,
-                    "no optimizer that has stepped holds this model's parameters (DeepSpeed ZeRO, Megatron-LM and "
-                    "FSDP1 step flattened or copied parameters), so there is no Adam state to read for them",
-                )
+                # A step ended by `scaler.update()` with no optimizer of this model seen stepping:
+                # one that steps copies of the weights, or a step the scaler skipped, where no
+                # optimizer stepped at all. Which, `flush` tells from the record's `step_skipped`.
+                no_optimizer = True
+            self._ring_no_optimizer.append(no_optimizer)
             self._ring_update_seen.append(self._update_recorded)
             self._update_recorded = False
         if self._spread_recorded and self._spread is not None and self._ring_spread is not None:
@@ -1699,6 +1736,7 @@ class Session:
             self._ring_weight_seen = []
             self._ring_clip_seen = []
             self._ring_update_seen = []
+            self._ring_no_optimizer = []
             self._ring_spread_seen = []
             self._ring_data = []
             self._ring_checkpoint = []
@@ -1737,14 +1775,23 @@ class Session:
         clip_seen = self._ring_clip_seen
         update_seen, self._ring_update_seen = self._ring_update_seen, []
         updates = _cpu_copy(self._ring_update[:n]) if any(update_seen) else None
+        amps = _scalars_to_cpu(self._ring_amp)
+        self._ring_amp = []
+        no_optimizer, self._ring_no_optimizer = self._ring_no_optimizer, []
+        if any(flag and not (amp and amp.get("step_skipped")) for flag, amp in zip(no_optimizer, amps)):
+            # A step that was not skipped, yet no optimizer of this model stepped: the one that
+            # did holds none of its parameters. A skipped step says nothing of that.
+            self._update_why.setdefault(
+                UPDATES_NO_OPTIMIZER,
+                "no optimizer that has stepped holds this model's parameters (DeepSpeed ZeRO, Megatron-LM and "
+                "FSDP1 step flattened or copied parameters), so there is no Adam state to read for them",
+            )
         update_why = {name: why for name, why in self._update_why.items() if name not in self._update_why_written}
         self._update_why_written.update(update_why)
         grad_seen = self._ring_grad_seen
         weight_seen = self._ring_weight_seen
         spread_seen = self._ring_spread_seen
         scalars = _scalars_to_cpu(self._ring_scalars)
-        amps = _scalars_to_cpu(self._ring_amp)
-        self._ring_amp = []
         probes = self._ring_probe
         data_rows, checkpoints = self._ring_data, _checkpoints_to_cpu(self._ring_checkpoint)
         self._ring_data = []
