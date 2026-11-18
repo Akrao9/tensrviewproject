@@ -160,7 +160,9 @@ def test_probe_causes_no_graph_breaks_or_recompiles(backend):
     torch._dynamo.utils.counters.clear()
     model = Toy()
     sink = tensorquill.MemorySink()
-    session = tensorquill.init(model, sink=sink, every=2, probe=torch.zeros(2, 8, dtype=torch.long), probe_every=2)
+    session = tensorquill.init(
+        model, sink=sink, every=2, probe=torch.zeros(2, 8, dtype=torch.long), probe_every=2, probe_head="head"
+    )
     compiled = torch.compile(model, backend=backend, fullgraph=True)
     batch = torch.randint(0, 32, (2, 8))
     with torch._dynamo.config.patch(error_on_recompile=True):
@@ -168,6 +170,8 @@ def test_probe_causes_no_graph_breaks_or_recompiles(backend):
     session.close()
     assert dict(torch._dynamo.utils.counters["graph_break"]) == {}
     assert sum("probe" in r for r in sink.records) == 3
+    # The head's hook, like the blocks', is a no-op in compiled code and reads only in the probe.
+    assert all(r["probe"]["head"]["positions"] == 2 * 8 for r in sink.records if "probe" in r)
 
 
 def test_probe_input_forms():
