@@ -52,15 +52,17 @@ def test_a_full_ring_is_written_when_the_next_step_ends():
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     sink = tensorquill.MemorySink()
     session = tensorquill.init(model, sink=sink, every=4)
-    _steps(model, optimizer, 4)
-    # The fourth step stays in the ring until the fifth ends, so what arrives for it after its
-    # step ended (a checkpoint saved then) is still written on its record.
-    assert session._steps == [0, 1, 2, 3]
-    _steps(model, optimizer, 1)
-    assert session._steps == [4]
-    _written(sink, 4)
-    assert [r["step"] for r in sink.records] == [0, 1, 2, 3]
-    session.close()
+    try:
+        _steps(model, optimizer, 4)
+        # The fourth step stays in the ring until the fifth ends, so what arrives for it after its
+        # step ended (a checkpoint saved then) is still written on its record.
+        assert session._steps == [0, 1, 2, 3]
+        _steps(model, optimizer, 1)
+        assert session._steps == [4]
+        _written(sink, 4)
+        assert [r["step"] for r in sink.records] == [0, 1, 2, 3]
+    finally:
+        session.close()
 
 
 def test_an_explicit_flush_still_writes_every_step():
@@ -68,12 +70,14 @@ def test_an_explicit_flush_still_writes_every_step():
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     sink = tensorquill.MemorySink()
     session = tensorquill.init(model, sink=sink, every=4)
-    _steps(model, optimizer, 4)
-    session.flush()
-    assert session._steps == []
-    _written(sink, 4)
-    assert [r["step"] for r in sink.records] == [0, 1, 2, 3]
-    session.close()
+    try:
+        _steps(model, optimizer, 4)
+        session.flush()
+        assert session._steps == []
+        _written(sink, 4)
+        assert [r["step"] for r in sink.records] == [0, 1, 2, 3]
+    finally:
+        session.close()
 
 
 def test_a_resume_from_a_checkpoint_saved_at_a_multiple_of_every_is_compared_with_that_save():
@@ -144,6 +148,31 @@ def test_a_skipped_step_records_its_gradient_norms_and_names_the_parameter_that_
         assert all(0 < r["grad_norms"][n] < float("inf") for n in names - {"1.weight"})
     # Inf gradients on a skipped step are the scaler's business: no non-finite incident.
     assert not [i for i in tensorquill.build_evidence(records)["incidents"] if i["kind"] == "non_finite"]
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+def test_under_clipping_a_skipped_step_still_has_its_gradient_norms(bad):
+    # Clipping by a total that is not finite multiplies every gradient by 0 (an Inf total) or by
+    # NaN: an Inf still shows where it was (NaN there, 0 elsewhere), a NaN makes every norm NaN.
+    model = _two_layers()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler("cpu")
+    sink = tensorquill.MemorySink()
+    with tensorquill.init(model, sink=sink, every=2, scaler=scaler, layers=()):
+        optimizer.zero_grad()
+        scaler.scale(model(torch.randn(8, 4)).pow(2).mean()).backward()
+        model[1].weight.grad[0, 0] = bad
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+    [record] = sink.records
+    assert record["step_skipped"] is True
+    norms = record["grad_norms"]
+    assert set(norms) == {"0.weight", "0.bias", "1.weight", "1.bias"}
+    assert norms["1.weight"] != norms["1.weight"]  # NaN
+    others = [norms[n] for n in ("0.weight", "0.bias", "1.bias")]
+    assert others == [0.0, 0.0, 0.0] if bad == float("inf") else all(v != v for v in others)
 
 
 def test_a_skipped_first_step_gives_no_false_reason_for_the_update_size():
@@ -359,3 +388,24 @@ def test_lightning_manual_optimization_with_two_optimizers_and_two_backward_pass
     assert all(set(r["update_rms"]) == names for r in records)
     # The loss of the step is everything back-propagated in it, the second optimizer's included.
     assert [r["scalars"]["train/loss"] for r in records] == pytest.approx([a + b for a, b in module.losses], rel=1e-5)
+
+
+def test_an_optimizer_that_steps_before_the_lead_is_taken_for_the_step_before():
+    # The open case: the hooks cannot tell an optimizer that steps after the lead in the same
+    # iteration from one that steps before the lead in the next. Here the first to step (the
+    # lead) is last in the loop from step 2 on, so the other's update lands one step early.
+    model = _mlp()
+    first, other = _optimizers(model, True)
+    sink = tensorquill.MemorySink()
+    with tensorquill.init(model, sink=sink, every=8, updates=True, layers=()):
+        for step in range(4):
+            for opt in (first, other):
+                opt.zero_grad()
+            model(torch.randn(8, 16)).pow(2).mean().backward()
+            if step >= 2:
+                other.step()  # starts later, but sits before the lead in the loop
+            first.step()
+    last = {"4.weight", "4.bias"}
+    # Its updates at steps 2 and 3 are on the records of steps 1 and 2.
+    both = ["4.bias", "4.weight"]
+    assert [sorted(last & set(r["update_rms"])) for r in sink.records] == [[], both, both, []]

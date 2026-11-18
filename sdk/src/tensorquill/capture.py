@@ -931,6 +931,7 @@ class Session:
         self._followers = False
         self._recheck = False
         self._weights_before: torch.Tensor | None = None
+        self._not_exact_before: Any = None
         self._probe_owed = False
         self._step_depth = 0
         self._outer_frame: Any = None
@@ -1155,6 +1156,8 @@ class Session:
             # has stepped holds is judged again, now that this one has (at the first step it had not).
             # One more read of the weights per follower, on weight-check steps only.
             self._prev_weight = None if self._weights_before is None else self._weights_before.clone()
+            if self._not_exact_before is not None:
+                self._weights_not_exact = self._not_exact_before
             self._record_weights()
             self._ring_grad[len(self._steps) - 1, :, 2:].copy_(self._grad[:, 2:])
             self._grad[:, 2:].zero_()
@@ -1716,8 +1719,11 @@ class Session:
         if weights_checked:
             self._weight_check_owed = False
             # What this check compares with, kept for an optimizer that steps after the lead to
-            # read the check again (`_follow`). A copy of one number per parameter.
+            # read the check again (`_follow`). A copy of one number per parameter. Lane R1's
+            # `_record_weights` also keeps which parameters the previous check did not read
+            # exactly (`_weights_not_exact`); that is kept the same way where it exists.
             self._weights_before = None if self._prev_weight is None else self._prev_weight.clone()
+            self._not_exact_before = getattr(self, "_weights_not_exact", None)
             self._record_weights()
         elif check_due and skipped:
             self._weight_check_owed = True
