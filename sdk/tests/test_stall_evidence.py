@@ -354,5 +354,5 @@ def test_the_all_ranks_watcher_rewrites_when_a_stack_arrives_and_not_when_only_i
     def update(evidence, path):
         written.append(evidence["stopped_stacks"]["verdict"])
 
-    ev.watch(folder, rank="all", interval=0.0, polls=6, on_update=update, trigger=Ticks())
+    ev.watch(folder, tmp_path / "all.json", rank="all", interval=0.0, polls=6, on_update=update, trigger=Ticks())
     assert written == ["no_stacks", "odd_group"]
