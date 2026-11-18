@@ -4,6 +4,8 @@ that ended the step (SDK-06)."""
 
 from __future__ import annotations
 
+import time
+
 import pytest
 import torch
 from torch import nn
@@ -19,10 +21,12 @@ def _steps(model: nn.Module, optimizer: torch.optim.Optimizer, n: int) -> None:
         optimizer.step()
 
 
-def _written(session: tensorquill.Session) -> None:
-    """Wait for the writer thread to write everything queued so far (it stops at the None)."""
-    session._queue.put(None)
-    session._worker.join()
+def _written(sink: tensorquill.MemorySink, count: int) -> None:
+    """Wait for the writer thread to have written `count` records."""
+    deadline = time.monotonic() + 10
+    while len(sink.records) < count:
+        assert time.monotonic() < deadline, "the writer thread did not write the records"
+        time.sleep(0.005)
 
 
 # --- SDK-07: a save right after the ring was full -------------------------------------------
@@ -54,8 +58,9 @@ def test_a_full_ring_is_written_when_the_next_step_ends():
     assert session._steps == [0, 1, 2, 3]
     _steps(model, optimizer, 1)
     assert session._steps == [4]
-    _written(session)
+    _written(sink, 4)
     assert [r["step"] for r in sink.records] == [0, 1, 2, 3]
+    session.close()
 
 
 def test_an_explicit_flush_still_writes_every_step():
@@ -65,8 +70,10 @@ def test_an_explicit_flush_still_writes_every_step():
     session = tensorquill.init(model, sink=sink, every=4)
     _steps(model, optimizer, 4)
     session.flush()
-    _written(session)
+    assert session._steps == []
+    _written(sink, 4)
     assert [r["step"] for r in sink.records] == [0, 1, 2, 3]
+    session.close()
 
 
 def test_a_resume_from_a_checkpoint_saved_at_a_multiple_of_every_is_compared_with_that_save():
@@ -197,3 +204,158 @@ def test_scaler_update_with_a_new_scale_and_no_optimizer_seen_is_not_a_step():
         scaler.update(2.0**12)
     assert [r["step"] for r in sink.records] == [0, 1]
     assert [r["step_skipped"] for r in sink.records] == [False, False]
+
+
+# --- SDK-06: an optimizer that steps after the one that ended the step -----------------------
+# Adam works on each parameter alone, so two AdamWs over two halves of a model, stepped one
+# after the other, train it exactly as one AdamW over all of it does: every record of the two
+# runs must be the same.
+
+
+def _mlp() -> nn.Module:
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Linear(16, 32), nn.Tanh(), nn.Linear(32, 32), nn.Tanh(), nn.Linear(32, 1))
+
+
+def _optimizers(model: nn.Module, split: bool) -> list[torch.optim.Optimizer]:
+    if not split:
+        return [torch.optim.AdamW(model.parameters(), lr=1e-3)]
+    last = list(model[4].parameters())
+    rest = [p for p in model.parameters() if all(p is not q for q in last)]
+    return [torch.optim.AdamW(rest, lr=1e-3), torch.optim.AdamW(last, lr=1e-3)]
+
+
+def _split_run(split: bool, steps: int, fault_at: int | None = None, **init):
+    model = _mlp()
+    optimizers = _optimizers(model, split)
+    data = torch.randn(4096, 16)
+    target = data[:, :1].sin()
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, run_id="split", updates=True, **init)
+    seen = []
+    for step in range(steps):
+        i = torch.randint(0, 4096, (64,))
+        loss = (model(data[i]) - target[i]).pow(2).mean()
+        for opt in optimizers:
+            opt.zero_grad()
+        loss.backward()
+        if step == fault_at:
+            model[4].weight.grad.mul_(1e4)  # a gradient fault in the second optimizer's parameters
+        for opt in optimizers:
+            opt.step()
+        seen.append(model[4].weight.detach().clone())
+    session.close()
+    return sink.records, seen, session
+
+
+@pytest.mark.parametrize("every", [1, 3, 50])
+def test_each_optimizers_update_is_in_the_record_of_its_step(every):
+    one, _, _ = _split_run(False, 7, every=every, weights=1)
+    two, _, _ = _split_run(True, 7, every=every, weights=1)
+    assert [r["step"] for r in two] == [r["step"] for r in one] == list(range(7))
+    for a, b in zip(one, two):
+        assert b["update_rms"] == pytest.approx(a["update_rms"], rel=1e-6), a["step"]
+        # The weight check is read after both optimizers stepped, as with one.
+        assert b["weight_norms"] == pytest.approx(a["weight_norms"], rel=1e-9), a["step"]
+        assert b.get("weights_unchanged") == a.get("weights_unchanged")  # none at step 0: nothing before
+    # Both optimizers had stepped when step 0's check judged which parameters one holds.
+    assert all(r["optimizer_ownership"] == {"state": "known", "unheld": [], "unheld_count": 0} for r in two)
+
+
+def test_a_gradient_fault_in_the_second_optimizers_parameters_is_an_update_spike():
+    for split in (False, True):
+        records, _, _ = _split_run(split, 500, fault_at=300)
+        incidents = tensorquill.build_evidence(records)["incidents"]
+        spikes = [i for i in incidents if i["kind"] == "update_spike"]
+        assert spikes and spikes[0]["step"] == 300, (split, spikes)
+        assert spikes[0]["parameters"][0]["name"] == "4.weight"
+
+
+def test_the_probe_runs_after_every_optimizer_of_the_step(monkeypatch):
+    from tensorquill import capture
+
+    probed = []
+
+    def fake_probe(model, fn, state, devices):
+        probed.append(model[4].weight.detach().clone())
+        return {"probed": len(probed) - 1}
+
+    monkeypatch.setattr(capture, "run_probe", fake_probe)
+    records, seen, _ = _split_run(True, 5, every=2, probe=lambda m: None, probe_every=1)
+    # Each step's probe saw the last layer as its own optimizer had just left it. Step 0's ran
+    # twice: when the lead ended it, before the second optimizer was known, and again after it.
+    assert len(probed) == 6
+    assert [r["step"] for r in records if "probe" in r] == [0, 1, 2, 3, 4]
+    assert all(torch.equal(probed[r["probe"]["probed"]], seen[r["step"]]) for r in records)
+
+
+def test_the_usual_amp_loop_with_two_optimizers_ends_the_step_after_both():
+    def run(split):
+        model = _mlp()
+        optimizers = _optimizers(model, split)
+        scaler = torch.amp.GradScaler("cpu", init_scale=2.0**8)
+        sink = tensorquill.MemorySink()
+        with tensorquill.init(model, sink=sink, every=2, scaler=scaler, updates=True):
+            for _ in range(4):
+                for opt in optimizers:
+                    opt.zero_grad()
+                scaler.scale(model(torch.randn(8, 16)).pow(2).mean()).backward()
+                for opt in optimizers:
+                    scaler.step(opt)
+                scaler.update()
+        return sink.records
+
+    one, two = run(False), run(True)
+    assert [r["step"] for r in two] == [0, 1, 2, 3]
+    for a, b in zip(one, two):
+        assert b["update_rms"] == pytest.approx(a["update_rms"], rel=1e-6)
+
+
+def test_lightning_manual_optimization_with_two_optimizers_and_two_backward_passes(tmp_path, monkeypatch):
+    L = pytest.importorskip("lightning.pytorch")
+    from tensorquill.lightning import TensorQuillCallback
+
+    class TwoLosses(L.LightningModule):
+        def __init__(self):
+            super().__init__()
+            torch.manual_seed(0)
+            self.body = nn.Linear(4, 8)
+            self.head = nn.Linear(8, 1)
+            self.automatic_optimization = False
+            self.losses = []
+
+        def training_step(self, batch, batch_idx):
+            first, second = self.optimizers()
+            loss = self.head(torch.tanh(self.body(batch))).pow(2).mean()  # trains the body
+            first.zero_grad()
+            self.manual_backward(loss)
+            first.step()
+            other = (self.head(torch.tanh(self.body(batch)).detach()) - 1).pow(2).mean()  # the head
+            second.zero_grad()
+            self.manual_backward(other)
+            second.step()
+            self.losses.append((loss.item(), other.item()))
+
+        def configure_optimizers(self):
+            return (torch.optim.AdamW(self.body.parameters(), lr=1e-2),
+                    torch.optim.AdamW(self.head.parameters(), lr=1e-2))
+
+        def train_dataloader(self):
+            torch.manual_seed(0)
+            return torch.utils.data.DataLoader(torch.randn(32, 4), batch_size=8)
+
+    monkeypatch.chdir(tmp_path)
+    sink = tensorquill.MemorySink()
+    module = TwoLosses()
+    trainer = L.Trainer(
+        default_root_dir=tmp_path, max_epochs=1, callbacks=[TensorQuillCallback(sink=sink, updates=True)],
+        enable_checkpointing=False, enable_progress_bar=False, enable_model_summary=False, logger=False,
+        accelerator="cpu", devices=1,
+    )
+    trainer.fit(module)
+    records = sink.records
+    assert [r["step"] for r in records] == [0, 1, 2, 3]  # one step per batch, as without Lightning
+    names = {"body.weight", "body.bias", "head.weight", "head.bias"}
+    assert all(set(r["update_rms"]) == names for r in records)
+    # The loss of the step is everything back-propagated in it, the second optimizer's included.
+    assert [r["scalars"]["train/loss"] for r in records] == pytest.approx([a + b for a, b in module.losses], rel=1e-5)
