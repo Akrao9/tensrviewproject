@@ -528,7 +528,10 @@ def test_watch_at_t0_handles_late_ranks_without_latching_or_mixing(tmp_path, mon
     real_watch = ev.watch
     monkeypatch.setattr(ev, "watch", functools.partial(real_watch, polls=3))
     out = tmp_path / "cli.evidence.json"
-    monkeypatch.setattr(sys, "argv", ["tensorquill", str(run), "--watch", "--interval", "0", "-o", str(out)])
+    # `--detectors python`: since Nov 17, 2026 `--watch` needs the Rust detectors unless this is typed,
+    # and this test is of which rank the watcher reads, with parts written here and no server binary.
+    monkeypatch.setattr(sys, "argv", ["tensorquill", str(run), "--watch", "--interval", "0", "-o", str(out),
+                                      "--detectors", "python"])
     ev.main()
     evidence = json.loads(out.read_text())
     assert [s["step"] for s in evidence["samples"]] == list(range(10))

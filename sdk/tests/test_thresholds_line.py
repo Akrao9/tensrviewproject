@@ -205,6 +205,9 @@ def test_the_command_line_prints_the_line_for_every_look_it_reports(tmp_path, st
         process = subprocess.Popen(
             [sys.executable, "-m", "tensorquill", str(folder), "--watch", "--interval", "0.2", "-o", str(out)],
             cwd=tmp_path, stdout=subprocess.PIPE, text=True,
+            # Since Nov 17, 2026 `--watch` needs the Rust detectors' binary before its first look: it is told where
+            # the binary this test's server runs from is, as an installed tensorquill-server would be found.
+            env={**os.environ, "TENSORQUILL_SERVER_BIN": str(store.BINARY)},
             # A process started from a background shell job inherits SIGINT as ignored.
             preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
         )
@@ -339,9 +342,12 @@ def test_one_read_of_a_local_file_prints_the_line_and_at_the_defaults_prints_wha
 @pytest.mark.parametrize("mode", [[], ["--compact"]], ids=["plain", "compact"])
 def test_watching_a_local_file_prints_the_line_and_at_the_defaults_does_not(tmp_path, mode):
     path = capture(tmp_path)
-    loud = watched(path, *mode, *flags(APPLIED), out=tmp_path / "loud.json", cwd=tmp_path)
+    # Since Nov 17, 2026 `--watch` needs the Rust detectors unless `--detectors python` is typed. This
+    # test needs nothing but the package, so it types it; the next test watches through Rust.
+    python = ("--detectors", "python")
+    loud = watched(path, *mode, *python, *flags(APPLIED), out=tmp_path / "loud.json", cwd=tmp_path)
     assert loud.count(HERE_LINE + "\n") == 1 and loud.index(HERE_LINE) < loud.index("Run state:")
-    quiet = watched(path, *mode, *flags(TYPED_DEFAULTS), out=tmp_path / "quiet.json", cwd=tmp_path)
+    quiet = watched(path, *mode, *python, *flags(TYPED_DEFAULTS), out=tmp_path / "quiet.json", cwd=tmp_path)
     assert "Run state:" in quiet and PREFIX not in quiet and "(default" not in quiet
     assert "thresholds" not in json.loads((tmp_path / "quiet.json").read_text(encoding="utf-8"))
 

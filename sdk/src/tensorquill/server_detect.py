@@ -6,8 +6,13 @@ that report out. `build_evidence(..., detectors="rust")` takes its incidents and
 MoE samples from it (`detect --samples`), and passes its own threshold options on as the
 server's one `--thresholds` JSON object.
 
-Needs `pyarrow` (the `flight` extra) and the binary: on `PATH`, or named by
-`TENSORQUILL_SERVER_BIN`.
+Needs `pyarrow` (the `flight` extra) and the binary. `find_binary` says where it is looked
+for: `TENSORQUILL_SERVER_BIN`, then beside the interpreter (where `pip install
+tensorquill-server` puts it), then `PATH`. A binary is run only when `tensorquill-server
+protocol` prints this module's `PROTOCOL`.
+
+`resolve_detectors` turns `detectors="auto"` into `"rust"` or `"python"`: Rust when all of that
+is there, and Python otherwise, with the reason.
 """
 
 from __future__ import annotations
@@ -17,25 +22,129 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import sysconfig
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 BINARY_ENV = "TENSORQUILL_SERVER_BIN"
+BINARY_NAME = "tensorquill-server"
+# The number `tensorquill-server protocol` must print for this module to run the binary. It is
+# `PROTOCOL` in `server/src/main.rs`, and the two go up together whenever what `detect` reads,
+# takes or prints changes in a way the other side would get wrong (a kind added or removed, a
+# threshold or option added, a report key renamed or dropped). Only the same number is taken:
+# a larger one is a newer binary whose reports this module was not written for.
+PROTOCOL = 1
+INSTALL_HINT = "pip install tensorquill-server"
+DETECTOR_CHOICES = ("auto", "python", "rust")
 _BATCH_ROWS = 500
+_PROTOCOL_TIMEOUT = 10.0
+# What each binary answered, by path, modification time and size: one probe per binary and process.
+_protocols: dict[tuple[str, int, int], int | str] = {}
+
+
+def _beside_interpreter() -> str | None:
+    """The binary an installed `tensorquill-server` wheel put with this interpreter's scripts,
+    whether or not that folder is on `PATH` (a virtual environment that was never activated,
+    `uvx`, `pip install --user`)."""
+    name = BINARY_NAME + (".exe" if os.name == "nt" else "")
+    folders: list[str] = []
+    try:
+        folders.append(sysconfig.get_path("scripts"))
+    except (KeyError, OSError):  # an interpreter with no such scheme
+        pass
+    if sys.executable:
+        # Not resolved: a virtual environment's interpreter is a link to the one it was made from.
+        folders.append(os.path.dirname(os.path.abspath(sys.executable)))
+    try:
+        folders.append(sysconfig.get_path("scripts", sysconfig.get_preferred_scheme("user")))
+    except (KeyError, OSError, AttributeError, ValueError):
+        pass
+    for folder in folders:
+        if folder and os.path.isfile(os.path.join(folder, name)):
+            return os.path.join(folder, name)
+    return None
+
+
+def find_binary(binary: str | os.PathLike[str] | None = None) -> str | None:
+    """Where `tensorquill-server` is, or None: `binary`, else `TENSORQUILL_SERVER_BIN`, else
+    the one beside this interpreter (installed with `pip install tensorquill-server`), else
+    the one on `PATH`. The first of these that is named is the answer, whether or not a file
+    is there: a wrong `TENSORQUILL_SERVER_BIN` is said, not passed over."""
+    chosen = binary or os.environ.get(BINARY_ENV) or _beside_interpreter() or shutil.which(BINARY_NAME)
+    return str(chosen) if chosen else None
+
+
+def binary_protocol(binary: str | os.PathLike[str]) -> int:
+    """The protocol number `binary` reports (`tensorquill-server protocol`). Raises
+    `RuntimeError` when it reports none: a binary from before the number, or another program."""
+    path = str(binary)
+    try:
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+    except OSError as error:
+        raise RuntimeError(f"{path} cannot be read: {error}") from error
+    if key not in _protocols:
+        try:
+            done = subprocess.run([path, "protocol"], stdin=subprocess.DEVNULL, capture_output=True,
+                                  timeout=_PROTOCOL_TIMEOUT)
+            printed = done.stdout.decode("ascii", "replace").strip()
+            if done.returncode == 0 and printed.isdigit():
+                _protocols[key] = int(printed)
+            else:
+                _protocols[key] = f"exit status {done.returncode}" if done.returncode else f"it printed {printed[:40]!r}"
+        except subprocess.TimeoutExpired:
+            _protocols[key] = f"no answer in {_PROTOCOL_TIMEOUT:g} s"
+        except OSError as error:
+            _protocols[key] = f"it cannot be run: {error}"
+    answer = _protocols[key]
+    if isinstance(answer, str):
+        raise RuntimeError(
+            f"{path} does not report a protocol number (`tensorquill-server protocol`: {answer}), so it is older "
+            f"than this tensorquill, which needs protocol {PROTOCOL}: {INSTALL_HINT} --upgrade, or rebuild it"
+        )
+    return answer
+
+
+def _only_the_fallback_wheel() -> bool:
+    """Whether `tensorquill-server` is installed as the wheel for platforms without a binary
+    (tagged `py3-none-any`, holding no program). False when the package is not installed."""
+    from importlib import metadata
+
+    try:
+        wheel = metadata.distribution(BINARY_NAME).read_text("WHEEL") or ""
+    except Exception:  # not installed, or metadata that cannot be read: the plain install hint
+        return False
+    return "Tag: py3-none-any" in wheel
 
 
 def server_binary(binary: str | os.PathLike[str] | None = None) -> str:
-    """The `tensorquill-server` to run: `binary`, else `TENSORQUILL_SERVER_BIN`, else the one
-    on `PATH`. Raises `RuntimeError` when there is none."""
-    chosen = binary or os.environ.get(BINARY_ENV) or shutil.which("tensorquill-server")
+    """The `tensorquill-server` to run (`find_binary`), once it has reported this module's
+    `PROTOCOL`. Raises `RuntimeError` when there is none, or it reports another number or none."""
+    chosen = find_binary(binary)
     if not chosen:
+        if _only_the_fallback_wheel():
+            # Installing again would bring the same wheel: say what does bring a binary here.
+            raise RuntimeError(
+                "the Rust detectors need the tensorquill-server binary, and the tensorquill-server package installed "
+                "here has none for this platform (its wheels with the binary are for Linux x86_64, Linux arm64 and "
+                f"macOS arm64): build it from source (cargo build --release in server/) and set {BINARY_ENV} to its path"
+            )
         raise RuntimeError(
-            "the Rust detectors need the tensorquill-server binary: build it (cargo build --release in server/) "
-            f"and put it on PATH, or set {BINARY_ENV} to its path"
+            f"the Rust detectors need the tensorquill-server binary and none was found: {INSTALL_HINT} (wheels for "
+            f"Linux x86_64, Linux arm64 and macOS arm64), or build it (cargo build --release in server/) and set "
+            f"{BINARY_ENV} to its path"
         )
     if not Path(chosen).is_file():
         raise RuntimeError(f"{chosen} is not a file: {BINARY_ENV} or binary= must name the tensorquill-server binary")
-    return str(chosen)
+    spoken = binary_protocol(chosen)
+    if spoken != PROTOCOL:
+        raise RuntimeError(
+            f"{chosen} speaks protocol {spoken} and this tensorquill needs protocol {PROTOCOL}: install a tensorquill "
+            "and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild "
+            "the binary from this source"
+        )
+    return chosen
 
 
 def rust_ready(binary: str | os.PathLike[str] | None = None) -> str:
@@ -47,6 +156,28 @@ def rust_ready(binary: str | os.PathLike[str] | None = None) -> str:
     except ImportError as error:
         raise RuntimeError("the Rust detectors read Arrow: pip install 'tensorquill[flight]'") from error
     return chosen
+
+
+def resolve_detectors(
+    detectors: str, binary: str | os.PathLike[str] | None = None,
+) -> tuple[str, str | None]:
+    """Which detectors `detectors` means here, and why when that is a fallback.
+
+    `"python"` and `"rust"` are themselves, unchecked. `"auto"` is `"rust"` when `rust_ready`
+    passes (a binary that reports this module's `PROTOCOL`, and `pyarrow`), and otherwise
+    `"python"` with the one sentence to show the user: what is missing and what installs it.
+    The choice is made on what is installed, once; a Rust run that then fails is an error, as
+    it is when `"rust"` was asked for.
+    """
+    if detectors not in DETECTOR_CHOICES:
+        raise ValueError(f"detectors must be 'auto', 'python' or 'rust', not {detectors!r}")
+    if detectors != "auto":
+        return str(detectors), None
+    try:
+        rust_ready(binary)
+    except RuntimeError as error:
+        return "python", f"using the Python detectors, not the Rust ones: {error}"
+    return "rust", None
 
 
 def records_stream(records: Iterable[Mapping[str, Any]]) -> bytes:

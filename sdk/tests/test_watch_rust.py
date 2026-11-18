@@ -32,7 +32,7 @@ pytest.importorskip("pyarrow")
 import tensorquill  # noqa: E402
 from tensorquill.compact import compact_evidence  # noqa: E402
 from tensorquill.evidence import watch  # noqa: E402
-from tensorquill.server_detect import BINARY_ENV  # noqa: E402
+from tensorquill.server_detect import BINARY_ENV, PROTOCOL  # noqa: E402
 from tensorquill.trigger import Trigger, state_path_for  # noqa: E402
 
 import test_trigger  # noqa: E402
@@ -329,7 +329,11 @@ def test_a_binary_too_old_for_the_samples_is_said_and_no_evidence_is_written(tmp
     path = tmp_path / "w.jsonl"
     path.write_text(lines(everything()[:20]), encoding="utf-8")
     old = tmp_path / "old-server"
-    old.write_text("#!/bin/sh\necho \"error: unexpected argument '--samples' found\" >&2\nexit 2\n", encoding="utf-8")
+    # It answers `protocol` with this SDK's number (a binary that did not would be refused before
+    # the first look, since Nov 17, 2026: tests/test_auto_detectors.py), so this still reaches
+    # the refusal at the first rebuild, which is what the test is about.
+    old.write_text(f"#!/bin/sh\nif [ \"$1\" = protocol ]; then echo {PROTOCOL}; exit 0; fi\n"
+                   "echo \"error: unexpected argument '--samples' found\" >&2\nexit 2\n", encoding="utf-8")
     old.chmod(0o755)
     monkeypatch.setenv(BINARY_ENV, str(old))
     with pytest.raises(RuntimeError, match="too old to have `detect`, `--thresholds` or `--samples`: rebuild it"):

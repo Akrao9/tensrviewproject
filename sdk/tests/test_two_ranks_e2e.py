@@ -286,7 +286,10 @@ def _cli(cluster: Cluster, *args: str) -> tuple[str, dict]:
     out = cluster.work / "evidence.json"
     out.unlink(missing_ok=True)
     done = subprocess.run(
-        [sys.executable, "-m", "tensorquill", str(cluster.run_dir), *args, "-o", str(out)],
+        # `--detectors python`: these reads are compared with `build_evidence` on each rank's own file,
+        # which is the Python detectors'. Until Nov 17, 2026 they were the default for one read; `auto`
+        # would now take the Rust ones wherever the binary is found and add `"detectors": "rust"`.
+        [sys.executable, "-m", "tensorquill", str(cluster.run_dir), *args, "-o", str(out), "--detectors", "python"],
         cwd=cluster.work, capture_output=True, text=True, timeout=120,
     )
     assert done.returncode == 0, done.stderr

@@ -4,7 +4,8 @@
 #   packaging-smoke.sh <path/to/tensorquill-*.whl> <path/to/examples/toy_moe.py>
 #
 # Optional environment: PYTHON (interpreter that creates the venv, default python3),
-# TORCH_INDEX_URL (for example https://download.pytorch.org/whl/cpu, to install a CPU torch first).
+# TORCH_INDEX_URL (for example https://download.pytorch.org/whl/cpu, to install a CPU torch first),
+# SERVER_WHEEL (a built tensorquill-server wheel to install with it; without one, see below).
 #
 # What it proves: the wheel alone (plus torch) imports, `python -m tensorquill --help` runs, and
 # toy_moe.py runs to completion from a directory with no source tree beside it, with no Python-level
@@ -23,7 +24,18 @@ VPY="$WORK/venv/bin/python"
 if [ -n "${TORCH_INDEX_URL:-}" ]; then
   "$VPY" -m pip install -q --disable-pip-version-check torch --index-url "$TORCH_INDEX_URL"
 fi
-"$VPY" -m pip install -q --disable-pip-version-check "$WHEEL"   # installs torch too if it is not there yet
+if [ -n "${SERVER_WHEEL:-}" ]; then
+  # A built tensorquill-server wheel: pip resolves the wheel's whole requirement list, as a user's install does.
+  "$VPY" -m pip install -q --disable-pip-version-check "$SERVER_WHEEL" "$WHEEL"
+else
+  # tensorquill-server is not on PyPI before the first release, so pip cannot resolve the wheel's own
+  # requirement list. Until it is: every other requirement the wheel declares (torch, if it is not there
+  # yet), then the wheel alone. requirements.py fails if the wheel does not require tensorquill-server.
+  # NOT covered this way: that `pip install tensorquill` resolves, and the binary beside the interpreter.
+  "$PYTHON" "$(dirname "$0")/requirements.py" --wheel "$WHEEL" > "$WORK/requirements.txt"
+  "$VPY" -m pip install -q --disable-pip-version-check -r "$WORK/requirements.txt"
+  "$VPY" -m pip install -q --disable-pip-version-check --no-deps "$WHEEL"
+fi
 
 # The hook goes in after pip has finished, so pip itself is not blocked.
 mkdir "$WORK/hook" "$WORK/proj"
@@ -132,6 +144,7 @@ cd "$WORK/proj"
 "$VPY" -c "import tensorquill; p = tensorquill.__file__; print(p); assert 'site-packages' in p, p"
 "$VPY" -m tensorquill --help > /dev/null
 "$WORK/venv/bin/tensorquill" --help > /dev/null
+"$WORK/venv/bin/tensorquill-mcp" --help > /dev/null
 echo "== 3. toy_moe.py to completion =="
 "$VPY" toy_moe.py
 test -s tensorquill-out/toy-moe.rank0.jsonl

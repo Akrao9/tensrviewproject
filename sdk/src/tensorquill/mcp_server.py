@@ -1471,7 +1471,8 @@ def serve(source: Source, reader: Any, writer: Any) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="python -m tensorquill.mcp_server",
+        # The installed command (`tensorquill-mcp`) names itself; the module run with -m is named here.
+        prog=None if Path(sys.argv[0]).name.startswith("tensorquill-mcp") else "python -m tensorquill.mcp_server",
         description="A read-only MCP server (stdio) over one run's TensorQuill evidence, and the runs kept beside it: "
         "six tools, no write action.",
     )
