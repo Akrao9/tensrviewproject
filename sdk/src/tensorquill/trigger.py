@@ -240,8 +240,9 @@ class Trigger:
     `look(evidence, path)` after every write; neither ever raises. Invariants fire, and a
     stall at `critical` (`STALL_KINDS`), once an episode; `anomalies` adds the anomalies, `kinds` any
     kinds by name, a stall at `warning` among them. `state_path` replaces the state file beside
-    the evidence. `compact_window` writes the compact evidence beside the full file at each look
-    and hands that one over (the command line sets it). `log` gets each line this prints.
+    the evidence, and is read when the trigger is made. `compact_window` writes the compact
+    evidence beside the full file at each look and hands that one over (the command line sets
+    it). `log` gets each line this prints.
     """
 
     def __init__(
@@ -302,6 +303,16 @@ class Trigger:
         self._retry_at: dict[tuple[str, str], float] = {}
         self._unknown: set[str] = set()
         self._save_failed = False
+        if self._state_path is not None:
+            # Read now (DET-01, Nov 18, 2026): both watchers tick before their first look, and a
+            # file read only at that look was first written over with nothing fired.
+            try:
+                self._load()
+            except Exception as error:  # a state file that cannot be read never stops the watcher
+                self._fired.clear()
+                self._episode, self._deliveries = None, []
+                self._log(f"trigger: {self._state_path} could not be read ({type(error).__name__}: {error}):"
+                          " nothing counts as fired")
 
     # --- What the watcher calls ------------------------------------------------------------
 
@@ -736,7 +747,9 @@ class Trigger:
         self._deliveries = deliveries
 
     def _save(self) -> None:
-        if self._state_path is None:
+        # Nothing is written before the first look: until then nothing has fired, been tried or
+        # ended, and the file read at the start (a `state_path` given) is left as it was.
+        if self._state_path is None or self._evidence_path is None:
             return
         document = {"version": STATE_VERSION, "evidence": str(self._evidence_path), "deliveries": self._deliveries,
                     "episode": self._episode}
