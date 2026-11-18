@@ -137,16 +137,79 @@ def _first_tensor(output: Any, *, integer: bool) -> torch.Tensor | None:
     return None
 
 
-def _stats_hook(
-    buf: torch.Tensor, stat_idx: torch.Tensor, row: int, phase: _Evaluating | None = None
-) -> Callable[..., None]:
-    phase = phase or _Evaluating()
+def _output_unread(x: torch.Tensor, device: torch.device) -> str | None:
+    """Why a watched block's output is not read into the layer statistics kept on `device`, from
+    its type, layout and device alone: no data, so no sync, and the same under `torch.compile`,
+    where an op that raises fails the trace before any `except` could see it. None when it is read.
 
-    def hook(module: nn.Module, args: Any, output: Any) -> None:
-        if _recomputing() or _evaluating(module, phase):
-            return
+    Another device is read when the four numbers can be moved to `device` without a wait the hook
+    did not already make: between two GPUs, a device-to-device copy that PyTorch orders with
+    stream events (`copy_device_to_device` in `aten/src/ATen/native/cuda/Copy.cu`, read at v2.6.0,
+    not run here: no GPU), so the host does not wait; from the CPU, one copy to the device, where
+    the hook before this made three (`torch.where` copied each CPU number to the device). An output
+    on a device whose numbers would have to be read back to the host, an MPS or CUDA output with
+    the statistics on the CPU (a model split between CPU and MPS, FSDP's CPU offload), is not read:
+    that copy waits for the device at every forward."""
+    if x.is_nested:
+        return "its output is a nested tensor"
+    if x.layout != torch.strided:
+        return f"its output is a {str(x.layout).removeprefix('torch.')} tensor, not a dense one"
+    if x.device == device or x.device.type == "cpu" or x.device.type == device.type == "cuda":
+        return None
+    if x.device.type == "meta":
+        return "its output is on meta, which holds no values"
+    return (
+        f"its output is on {x.device}, not on {device} where the layer statistics are kept, and moving its "
+        "statistics there would make the host wait for a device at every forward"
+    )
+
+
+def _stats_hook(
+    buf: torch.Tensor,
+    stat_idx: torch.Tensor,
+    row: int,
+    phase: _Evaluating | None = None,
+    problems: list[str] | None = None,
+) -> Callable[..., None]:
+    """The forward hook that writes a watched block's output statistics into row `row` of `buf`.
+    Nothing in it raises into training. An output it cannot read leaves no entry for the block
+    in that step's `layers` and is said once in `problems` (the hook's `problems` attribute when
+    none is given): judged first from type, layout and device alone (`_output_unread`), so the
+    same under `torch.compile`, and in eager mode from any exception left, which is caught.
+
+    A DTensor output (tensor parallelism with `use_local_output=False`) is read on its local
+    tensor: under Replicate that is the output, under Shard it is this rank's part, read as
+    `grad_norms` and `weight_norms` already are for FSDP2's parameters. Under Partial each rank
+    holds an addend of the output, so no statistic of it would be true, and it is not read.
+
+    Not wired to the records yet: saying `problems` in a record needs a field of its own
+    (`layers_not_read`, as `moe_refused` is for routers), which is a schema change left for a
+    decision."""
+    phase = phase or _Evaluating()
+    problems = [] if problems is None else problems
+
+    def refuse(why: Callable[[], str]) -> None:
+        # Built only the first time; the hook still runs on every forward.
+        if not problems:
+            problems.append(why())
+
+    def read(output: Any) -> None:
         x = _first_tensor(output, integer=False)
-        if x is None or x.numel() == 0:
+        if x is None:
+            return
+        if _DTensor is not None and isinstance(x, _DTensor):
+            if any(placement.is_partial() for placement in x.placements):
+                refuse(lambda: (
+                    "its output is a DTensor with a Partial placement: each rank holds an addend of the output, "
+                    "not its values"
+                ))
+                return
+            x = x.detach().to_local()
+        wrong = _output_unread(x, buf.device)
+        if wrong is not None:
+            refuse(lambda: wrong)
+            return
+        if x.numel() == 0:
             return
         x = x.detach()
         xf = x.float()
@@ -158,9 +221,13 @@ def _stats_hook(
         # Retain the largest magnitude across forwards until the optimizer step.
         # maximum propagates NaN, so a later clean microbatch cannot hide it.
         peak = xf.abs().amax()
+        # float8 has no `==` on every device and PyTorch release; its float32 copy holds the same zeros.
+        zfrac = ((xf if x.dtype.itemsize == 1 else x) == 0).float().mean()
+        if x.device != buf.device:
+            # One copy of the four numbers to the buffer's device (see `_output_unread`).
+            mean, std, peak, zfrac = torch.stack((mean, std, peak, zfrac)).to(buf.device).unbind()
         kept = _row_max_compiled(buf, row) if torch.compiler.is_compiling() else buf[row, 2]
         amax = torch.maximum(peak, kept)
-        zfrac = (x == 0).float().mean()
         stats = torch.where(
             stat_idx == 0,
             mean,
@@ -179,6 +246,20 @@ def _stats_hook(
         else:
             buf[row] = stats
 
+    def hook(module: nn.Module, args: Any, output: Any) -> None:
+        if _recomputing() or _evaluating(module, phase):
+            return
+        if torch.compiler.is_compiling():
+            # No `try` in a traced hook: the checks in `read` are what keep it from raising there.
+            read(output)
+            return
+        try:
+            read(output)
+        except Exception as error:  # noqa: BLE001
+            # What the checks do not foresee leaves the block out as they do, and training goes on.
+            refuse(lambda: f"reading its output raised {_short(error)}")
+
+    hook.problems = problems  # type: ignore[attr-defined]
     return hook
 
 
@@ -1175,38 +1256,68 @@ class Session:
     def _record_weights(self) -> None:
         # The norm of each parameter after the optimizer step, on the steps that record
         # gradient norms, and whether it is exactly what it was at the previous record.
-        # One read of the weights, no copy of them.
+        # One read of the weights, no copy of them. A complex parameter is read as its real
+        # pairs (`torch.view_as_real`, a view), whose norm is |z|'s, as `_read_updates` reads
+        # Adam's moments and `distributed.py` its fingerprints. Nothing here raises into training,
+        # and no norm is made up: a parameter with no values (on `meta`), or whose norm raised, gets
+        # NaN and "not known" for unchanged; one read only in float32 where float64 was wanted
+        # (on MPS beside buffers elsewhere) gets its norm and "not known".
         n_params = len(self._params)
         dtype = torch.float64 if self._exact_weights else torch.float32
         current = torch.zeros(n_params, dtype=dtype, device=self._grad.device)
         groups: dict[tuple[torch.device, torch.dtype], list[tuple[int, torch.Tensor]]] = {}
         dtypes: dict[str, int] = {}
+        unread: list[int] = []  # no norm: NaN
+        inexact: list[int] = []  # a norm, but not one to compare exactly
         for index, param in enumerate(self._params):
             data = param.detach()
             if type(data) is not torch.Tensor:
                 data = unwrap_local(data)
             name = str(data.dtype).removeprefix("torch.")
             dtypes[name] = dtypes.get(name, 0) + 1
+            if data.device.type == "meta":
+                unread.append(index)
+                continue
+            if data.layout == torch.sparse_coo:
+                data = data.coalesce().values()
+            elif data.layout != torch.strided and not data.is_nested:
+                data = data.values()  # CSR, CSC, BSR, BSC: the stored values are all of them
             if data.numel() == 0:
                 continue
+            if data.is_complex():
+                data = torch.view_as_real(data.resolve_conj())
             groups.setdefault((data.device, data.dtype), []).append((index, data))
         # How many trainable parameters have each dtype: a weight that never changes means
         # something else in bf16 or fp16, where a small update rounds away, than in float32.
+        # A complex parameter is counted under its own dtype.
         self._weight_dtypes = dtypes
-        for (_, param_dtype), items in groups.items():
-            out = dtype if self._exact_weights else (
-                torch.float32 if param_dtype in _LOW_PRECISION else None
-            )
-            norms = torch.stack(_foreach_norm([data for _, data in items], out)).to(current)
+        for (device, param_dtype), items in groups.items():
+            exact = self._exact_weights and device.type != "mps"  # MPS has no float64
+            out = dtype if exact else (torch.float32 if param_dtype in _LOW_PRECISION else None)
+            indices = tuple(i for i, _ in items)
+            try:
+                norms = torch.stack(_foreach_norm([data for _, data in items], out)).to(current)
+            except Exception:  # noqa: BLE001
+                unread.extend(indices)
+                continue
+            if not exact:
+                inexact.extend(indices)
             if len(items) == n_params:
                 current.copy_(norms)
             else:
-                current.index_copy_(0, self._index(tuple(i for i, _ in items)), norms)
+                current.index_copy_(0, self._index(indices), norms)
+        if unread:
+            current.index_fill_(0, self._index(tuple(sorted(unread))), math.nan)
         self._grad[:, 2].copy_(current)
+        # Not known where this check or the one before did not read a parameter exactly.
+        blind = set(unread) | set(inexact)
+        before, self._weights_not_exact = getattr(self, "_weights_not_exact", frozenset()), frozenset(blind)
         if not self._exact_weights or self._prev_weight is None:
             self._grad[:, 3].fill_(-1.0)
         else:
             self._grad[:, 3].copy_(current == self._prev_weight)
+            if blind or before:
+                self._grad[:, 3].index_fill_(0, self._index(tuple(sorted(blind | before))), -1.0)
         if self._exact_weights:
             if self._prev_weight is None:
                 self._prev_weight = current
@@ -1235,6 +1346,15 @@ class Session:
         # moment). Both moments are the optimizer's own state after the step, so nothing is kept
         # of the weights. One parameter at a time: the only temporary is one tensor of that
         # parameter's size. Every value stays on its device, so no sync is added.
+        #
+        # Under FSDP2 the moments are DTensors and each rank reads its own shard (`unwrap_local`),
+        # as `record_grads` and `_record_weights` do: a rank's `update_rms` for a parameter is the
+        # RMS of the update over the rows that rank holds, not over the whole parameter (weighting
+        # each rank's square by its element count gives the whole one's). The update-size rule
+        # compares a rank's records only with that rank's own, against its total gradient norm,
+        # which `grad_norm` also takes over its shards (what `clip_grad_norm` holds under FSDP2 was
+        # not checked); a rank whose shard of a parameter is empty reads nothing for it.
+        # A complex moment is read as its real pairs, as Adam steps it.
         try:
             known = optimizer in self._update_readable
         except TypeError:  # not hashable or not weakly referenceable: judged each time
@@ -1263,13 +1383,20 @@ class Session:
                     if not state or param.grad is None:
                         continue
                     first, moment = state["exp_avg"], state[second]
+                    if type(first) is not torch.Tensor:
+                        first = unwrap_local(first)
+                    if type(moment) is not torch.Tensor:
+                        moment = unwrap_local(moment)
                     if first.numel() == 0:
                         continue
                     if first.is_complex():
-                        first, moment = torch.view_as_real(first), torch.view_as_real(moment)
+                        first = torch.view_as_real(first.resolve_conj())
+                        moment = torch.view_as_real(moment.resolve_conj())
                     if first.dtype in _LOW_PRECISION:
                         first, moment = first.float(), moment.float()
                     steps = state["step"]
+                    if isinstance(steps, torch.Tensor) and type(steps) is not torch.Tensor:
+                        steps = unwrap_local(steps)
                     update = torch.sqrt(moment)  # the one temporary
                     on_device = any(isinstance(v, torch.Tensor) and v.device.type != "cpu" for v in (steps, beta1, beta2))
                     if not on_device:
