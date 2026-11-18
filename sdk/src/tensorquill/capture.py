@@ -44,7 +44,7 @@ from .data import (
 from . import datawait
 from .distributed import FINGERPRINT_WIDTH, replica_spread, unwrap_local
 from .probe import ProbeState, find_head, install_head_hook, install_probe_hooks, probe_callable, run_probe
-from .sink import JsonlSink, Sink
+from .sink import JsonlSink, Sink, clear_end_marker, write_end_marker
 from .system import SystemPart, SystemReadings
 from . import manifest as _manifest
 from .tracker import RunInfo, _world_size, resolve_run, tracker_labels
@@ -938,6 +938,8 @@ class Session:
         self._warned_backpressure = False
         self._worker = threading.Thread(target=self._drain, name="tensorquill-writer", daemon=True)
         self._worker.start()
+        if getattr(sink, "path", None) is not None:
+            clear_end_marker(sink.path)  # the file is being written again (see `sink.write_end_marker`)
 
         self._clip_watched = clip_norm
         if clip_norm:
@@ -1825,9 +1827,11 @@ class Session:
         finally:
             self.set_phase(previous)
 
-    def close(self) -> None:
+    def close(self, *, _exception: BaseException | None = None) -> None:
         """Flush what is left and stop the writer. Forward hooks stay on the model, because
-        removing a hook from a compiled module triggers a recompile."""
+        removing a hook from a compiled module triggers a recompile. Once the records file is
+        closed and complete, `<name>.end.json` is left beside it (`sink.write_end_marker`), so a
+        reader can tell this run from one that was killed; none when the writer failed."""
         if self._closed:
             return
         self._closed = True
@@ -1844,12 +1848,15 @@ class Session:
             self._worker.join()
             self._sink.close()
         self._raise_worker_error()
+        if getattr(self._sink, "path", None) is not None:
+            write_end_marker(self._sink.path, run_id=self.run.run_id, rank=self.run.rank, attempt=self.attempt,
+                             exception=_exception)
 
     def __enter__(self) -> "Session":
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        self.close()
+        self.close(_exception=exc[1])
 
     # ---- writer thread ------------------------------------------------------------
 

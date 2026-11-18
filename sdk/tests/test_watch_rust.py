@@ -101,7 +101,7 @@ def test_a_growing_file_gives_the_python_watchers_evidence_at_every_look(name, t
     for at, (ours, theirs) in zip(cuts, zip(python, rust)):
         assert same(ours, theirs) == [], f"after {at} of {len(records)} records"
     # The last look is the whole file, as one read of it gives.
-    assert same(tensorquill.build_evidence(records), rust[-1]) == []
+    assert same(tensorquill.build_evidence(records, records_file=tmp_path / "rust.jsonl"), rust[-1]) == []
 
 
 def test_the_record_sets_put_incidents_and_unchecked_things_in_front_of_both_watchers(tmp_path):
@@ -167,7 +167,8 @@ def test_the_compact_file_is_the_same_through_rust(tmp_path):
     small = json.loads(out.read_text(encoding="utf-8"))
     assert small.pop("detectors") == "rust" and small["compact"]["kept_steps"] == [[98, 102]]
     assert small == json.loads((tmp_path / "python.evidence.compact.json").read_text(encoding="utf-8"))
-    assert small == json.loads(json.dumps(compact_evidence(tensorquill.build_evidence(records), window=2)))
+    assert small == json.loads(json.dumps(compact_evidence(tensorquill.build_evidence(records, records_file=rust),
+                                                           window=2)))
 
 
 def test_a_planted_failure_fires_the_same_through_rust_as_through_python(tmp_path, hook):

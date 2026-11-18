@@ -106,12 +106,13 @@ class TensorQuillCallback(L.Callback):
         self._close()
 
     def on_exception(self, trainer: L.Trainer, pl_module: L.LightningModule, exception: BaseException) -> None:
-        self._close()  # write what was captured, and stop the writer thread
+        # Write what was captured and stop the writer thread; the end marker says the fit raised.
+        self._close(exception)
 
-    def _close(self) -> None:
+    def _close(self, exception: BaseException | None = None) -> None:
         if self.session is not None:
             session, self.session = self.session, None
-            session.close()
+            session.close(_exception=exception)
 
 
 def _logger_run_id(trainer: L.Trainer) -> str | None:

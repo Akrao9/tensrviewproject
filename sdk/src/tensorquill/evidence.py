@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import manifest as _manifest
+from .sink import read_end_marker
 from .data_checks import DATA_STALL_STEPS, detect_data_stalled, detect_epoch_order_repeated, detect_resume_state
 from .evidence_system import (
     INPUT_WINDOW,
@@ -703,6 +704,182 @@ def stuck_at(rank: Mapping[str, Any]) -> dict[str, Any] | None:
         if isinstance(stack.get(key), (int, float)) and not isinstance(stack[key], bool):
             place[key] = stack[key]
     return place
+
+
+# Grouping the stopped ranks' stacks (the all-ranks view's `stopped_stacks`).
+#
+# What "the same stack" means: the main thread's frames, every frame the heartbeat kept (at most
+# `flight.STACK_FRAMES`, innermost first), compared frame by frame on
+#   - the function name;
+#   - the file, as the path after the last `site-packages/` or `dist-packages/`, else its base
+#     name: ranks on other hosts may have other install prefixes and checkout folders, and the
+#     heartbeat keeps only a path's last 200 characters;
+#   - the line, for frames of the job's own code and TensorQuill's, and not for a library's or
+#     Python's: in the job's code two lines are two different calls (a `loss.item()` and a
+#     `barrier()`), while a library's line numbers differ between versions, and the hosts of one
+#     job may not all have the same patch release. The cost: two ranks blocked at two lines of
+#     the same library function, reached the same way, are one group. (Measured Nov 18, 2026 on
+#     `thread_stacks` itself, 12 samples each: a main thread in a `queue.get(timeout=...)` loop,
+#     `Event.wait()`, an `Event.wait(timeout)` loop and a `time.sleep` loop each kept one line in
+#     every sample, so the line is not dropped because waits move; they did not.)
+# The whole kept depth, not the innermost few frames: two ranks in the same collective reached
+# from different places in the job (one from the forward, one from the optimizer step) are a
+# mismatch worth seeing, and the outer frames all ranks share never split a group. A stack
+# deeper than the kept depth is compared on what was kept. Other threads are left out: their
+# frames are cut to four and they differ by timing (the NCCL watchdog, pin-memory threads).
+STACK_ODD_SHARE = 0.25  # an odd group: one rank, or at most this share of the ranks with a stack
+STACK_GROUPS_SHOWN = 8
+_STOPPED_STATES = ("silent", "lost", "unresponsive")
+_STACK_CAVEATS = (
+    "an observation of where each stopped rank's main thread was, never the cause: the papers disagree on whether"
+    " the odd rank is the culprit (Mycroft takes it as the stuck one; ByteRobust treats ranks outside the largest"
+    " group as suspects to check)",
+    "only each rank's main process: a rank stuck in a data-loader worker or another child process shows the main"
+    " process waiting for it",
+    "each rank's last heartbeat stack, not one snapshot taken at once; and one snapshot cannot name a slow rank,"
+    " whose stack looks like everyone's",
+)
+
+
+def _frame_key(frame: Mapping[str, Any]) -> tuple[Any, ...]:
+    name = str(frame.get("file", "")).replace("\\", "/")
+    for marker in ("site-packages/", "dist-packages/"):
+        if marker in name:
+            name = name.rsplit(marker, 1)[1]
+            break
+    else:
+        name = name.rsplit("/", 1)[-1]
+    library = _library_file(str(frame.get("file", ""))) and frame.get("own") is not True
+    return (frame.get("function"), name, None if library else frame.get("line"))
+
+
+def _main_frames(rank: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
+    stack = rank.get("stack")
+    threads = stack.get("threads") if isinstance(stack, Mapping) else None
+    if not isinstance(threads, list):
+        return None
+    frames = next((t.get("frames") for t in threads if isinstance(t, Mapping) and t.get("main") is True), None)
+    if not isinstance(frames, list):
+        return None
+    frames = [f for f in frames if isinstance(f, Mapping) and isinstance(f.get("file"), str)]
+    return frames or None
+
+
+def stack_signature(rank: Mapping[str, Any]) -> tuple[Any, ...] | None:
+    """What two stopped ranks must share to be in one group (see above), or None with no stack."""
+    frames = _main_frames(rank)
+    return tuple(_frame_key(f) for f in frames) if frames else None
+
+
+def group_stopped_stacks(status: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The stopped ranks of the server's status (silent, lost, unresponsive) grouped by where
+    their main thread was, and the odd group named when one is clearly apart. None when no rank
+    is stopped.
+
+    `verdict` is one of `no_stacks` (no stopped rank sent one: an unresponsive rank never does),
+    `one_stack`, `two_stacks_differ` (two ranks that differ: nothing says which is odd),
+    `all_alike`, `odd_group` (exactly two groups and the smaller is one rank, or at most a quarter
+    of the ranks with a stack: `odd_group` indexes `groups`) or `no_clear_odd_group` (an even
+    split, or more than two places). The ranks that sent no stack are always listed: one of them
+    may be the rank that matters. `caveats` say what this is not."""
+    if not status:
+        return None
+    stopped = [r for r in status.get("ranks", ()) if isinstance(r, Mapping) and r.get("state") in _STOPPED_STATES]
+    if not stopped:
+        return None
+    by_place: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
+    without: list[Any] = []
+    for rank in sorted(stopped, key=lambda r: (not isinstance(r.get("rank"), int), r.get("rank"))):
+        signature = stack_signature(rank)
+        if signature is None:
+            without.append(rank.get("rank"))
+        else:
+            by_place.setdefault(signature, []).append(rank)
+    with_stack = [r.get("rank") for members in by_place.values() for r in members]
+    ordered = sorted(by_place.values(), key=lambda members: (-len(members), members[0].get("rank")))
+    groups = []
+    for members in ordered:
+        place = stuck_at(members[0]) or {}
+        ranks = [m.get("rank") for m in members]
+        groups.append({
+            "ranks": ranks, "rank_ranges": _rank_ranges(ranks),
+            "where": {k: place[k] for k in ("function", "file", "line") if k in place},
+            **({"caller": place["caller"]} if "caller" in place else {}),
+            **({"in_tensorquill": place["in_tensorquill"]} if "in_tensorquill" in place else {}),
+            "frames": len(_main_frames(members[0]) or ()),
+        })
+    count = len(with_stack)
+    odd = None
+    if count == 0:
+        verdict = "no_stacks"
+    elif count == 1:
+        verdict = "one_stack"
+    elif len(groups) == 1:
+        verdict = "all_alike"
+    elif count == 2:
+        verdict = "two_stacks_differ"
+    elif len(groups) == 2 and len(groups[1]["ranks"]) < len(groups[0]["ranks"]) and (
+            len(groups[1]["ranks"]) == 1 or len(groups[1]["ranks"]) <= STACK_ODD_SHARE * count):
+        verdict, odd = "odd_group", 1
+    else:
+        verdict = "no_clear_odd_group"
+    return {
+        "stopped_ranks": sorted((r.get("rank") for r in stopped), key=lambda n: (not isinstance(n, int), n)),
+        "ranks_with_stack": sorted(with_stack),
+        "ranks_without_stack": without,
+        "verdict": verdict,
+        "odd_group": odd,
+        "groups": groups,
+        "same_stack": "the main thread's kept frames (innermost first), each compared on function, file (after"
+                      " site-packages, else the base name) and line (the job's and TensorQuill's own code only)",
+        "caveats": list(_STACK_CAVEATS),
+    }
+
+
+def stopped_stacks_line(found: Mapping[str, Any] | None) -> str | None:
+    """The stack grouping in a sentence or two, for the summary text, or None."""
+    if not isinstance(found, Mapping):
+        return None
+    groups = found.get("groups") or []
+    without = found.get("ranks_without_stack") or []
+    tail = ""
+    if without:
+        tail = (f" Rank{'s' if len(without) != 1 else ''} {_rank_ranges(without, 8)} sent no stack"
+                " (no heartbeat, stopped for less than `stack_seconds`, or unresponsive), so"
+                f" {'they are' if len(without) != 1 else 'it is'} not compared.")
+
+    def place(group: Mapping[str, Any]) -> str:
+        text = _where(group.get("where") or {})
+        if group.get("caller"):
+            text += f", called from {_where(group['caller'])}"
+        return text
+
+    verdict = found.get("verdict")
+    if verdict == "no_stacks":
+        return "Stacks: no stopped rank sent its stack, so nothing is said about where they are." + tail
+    if verdict == "one_stack":
+        return (f"Stacks: only rank {groups[0]['rank_ranges']} sent a stack ({place(groups[0])}), so there is nothing to"
+                " compare it with and no rank is named." + tail)
+    if verdict == "all_alike":
+        return (f"Stacks: all {len(groups[0]['ranks'])} stopped ranks that sent one are at the same place"
+                f" ({place(groups[0])}); no rank stands apart." + tail)
+    if verdict == "two_stacks_differ":
+        return ("Stacks: the two stopped ranks that sent one are at different places"
+                f" (rank {groups[0]['rank_ranges']}: {place(groups[0])}; rank {groups[1]['rank_ranges']}: {place(groups[1])});"
+                " with two there is no telling which is the odd one, so none is named." + tail)
+    if verdict == "odd_group":
+        main, odd = groups[0], groups[found.get("odd_group", 1)]
+        many = len(odd["ranks"]) != 1
+        return (f"Stacks: rank{'s' if many else ''} {odd['rank_ranges']} {'are' if many else 'is'} somewhere else than the"
+                f" other {len(main['ranks'])} stopped rank{'s' if len(main['ranks']) != 1 else ''}: {place(odd)}, where"
+                f" ranks {main['rank_ranges']} are in {place(main)}. An observation, not the cause: the papers disagree"
+                " on whether the odd rank is the culprit, a rank stuck in a data-loader worker shows only its main"
+                " process's stack, and one snapshot cannot name a slow rank." + tail)
+    shown = "; ".join(f"rank{'s' if len(g['ranks']) != 1 else ''} {g['rank_ranges']}: {place(g)}"
+                      for g in groups[:3])
+    more = len(groups) - 3
+    return (f"Stacks: the stopped ranks are at {len(groups)} places ({shown}"
+            + (f"; and {more} more" if more > 0 else "") + "); no one group stands clearly apart, so none is named." + tail)
 
 
 def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]]:
@@ -2578,6 +2755,8 @@ def _status_stamp(status: Mapping[str, Any] | None, status_age: float | None) ->
             for r in status["ranks"]
         ),
         status_age is not None,
+        # Where each stopped rank is, not for how long: a stack that arrives, or moves, is news.
+        tuple((r.get("rank"), stack_signature(r)) for r in status["ranks"] if isinstance(r, Mapping) and r.get("stack")),
     )
 
 
@@ -2849,12 +3028,14 @@ def watch(
                         emitted_grace = None
                         waiting_since, was_current, last_current_report = None, False, None
                         adopted = {}
-                seen = ("python", look and look["state"], stamp, other_stamp)
+                # The end marker appears after the last record: its arrival alone is news.
+                ended = read_end_marker(source) if source.suffix == ".jsonl" else None
+                seen = ("python", look and look["state"], stamp, other_stamp, ended and ended["state"])
                 if not tail.records or (not grown and seen == emitted):
                     continue
                 here = {**adopted, **thresholds}
                 evidence = build_evidence(
-                    tail.records, **{"run_manifest": source, **build_options, **here,
+                    tail.records, **{"run_manifest": source, "records_file": source, **build_options, **here,
                                      **({"watchdog": status_file} if status_file else {})}
                 )
                 if look is not None:
@@ -3365,6 +3546,7 @@ def combine_rank_evidence(
         "last_step": {"min": min(steps), "max": max(steps)} if steps else None,
         "incident_groups": groups,
         "run_incidents": run_incidents,
+        **({"stopped_stacks": stacks} if (stacks := group_stopped_stacks(status)) else {}),
     }
     stated = {n: found for n in judged if (found := stated_kind_checks(per_rank[n])) is not None}
     silent = [n for n in judged if n not in stated]
@@ -3639,6 +3821,8 @@ def _all_ranks_evidence(
         **({"thresholds_by_rank": by_thresholds} if len(by_thresholds) > 1 else {}),
         "incident_groups": groups,
         "run_incidents": run_incidents,
+        # The stopped ranks' stacks from the status, grouped: present only while a rank is stopped.
+        **({"stopped_stacks": stacks} if (stacks := group_stopped_stacks(status)) else {}),
         "ranks": entries,
         **({"not_checked": not_checked} if not_checked else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
@@ -4168,8 +4352,14 @@ def build_evidence(
     server_binary: str | os.PathLike[str] | None = None,
     run_manifest: str | Path | Mapping[str, Any] | None = None,
     update_window: int = UPDATE_WINDOW,
+    records_file: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build viewer-neutral detector evidence from captured step records.
+
+    `run_end` says whether the session that wrote a local `.jsonl` file closed it
+    (`sink.read_end_marker`): read from `source` when that is the file, or from `records_file`
+    for a caller that hands over records it has already read. Any state but `closed` means the
+    run is not known to have finished. A server's store or a list of records has none.
 
     The evidence's `run` block (project, name, run ID) is read from the run manifest
     (`manifest.py`): the one beside `source` when that is a path, or `run_manifest`, which is
@@ -4402,6 +4592,7 @@ def build_evidence(
         "incidents": incidents,
         "samples": samples,
         **({"detectors": "rust"} if from_rust is not None else {}),
+        **({"run_end": read_end_marker(ended)} if (ended := _records_file(source, records_file)) else {}),
         **({"not_checked": not_checked} if not_checked else {}),
         **({"weight_trends": trends} if trends else {}),
         **({"head_trends": head_trends} if head_trends else {}),
@@ -4421,6 +4612,29 @@ def build_evidence(
     evidence["kind_checks"] = {kind: {**rank_checks, **others}[kind] for kind in INCIDENT_CLASSES}
     evidence["run_state"] = _per_rank_run_state(evidence, status, _status_age(status), steps_judged=bool(records))
     return evidence
+
+
+def _records_file(source: Any, records_file: Any) -> Path | None:
+    """The local `.jsonl` file whose end marker the evidence reports, if there is one."""
+    for candidate in (records_file, source):
+        if isinstance(candidate, (str, Path)) and Path(candidate).suffix == ".jsonl":
+            return Path(candidate)
+    return None
+
+
+def run_end_line(evidence: Mapping[str, Any]) -> str | None:
+    """One line on whether the session that wrote the local file closed it, or None."""
+    end = evidence.get("run_end")
+    if not isinstance(end, Mapping):
+        return None
+    if end.get("state") == "closed":
+        when = end.get("closed_at")
+        at = (" at " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(when))
+              if isinstance(when, (int, float)) and not isinstance(when, bool) else "")
+        if end.get("outcome") == "raised":
+            return f"Run end: the session was closed{at} by an exception ({end.get('exception', 'unknown')})."
+        return f"Run end: the session closed the file{at}."
+    return f"Run end: not known to have finished: {end.get('detail', end.get('state'))}."
 
 
 def first_incident(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -4976,6 +5190,9 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
     applied = thresholds_line(evidence)  # only when a threshold applied is not the default
     if applied:
         notes.append(applied)
+    ended = run_end_line(evidence)
+    if ended:
+        notes.append(ended)
     if not lines:
         return "\n".join(["No incidents detected.", *notes])
     if evidence.get("layer_count"):
@@ -5101,6 +5318,9 @@ def _all_ranks_summary(evidence: Mapping[str, Any]) -> str:
     for incident in evidence.get("run_incidents", ()):
         text = _describe(incident)
         lines.append(text or f"Incident at step {incident.get('step')}: {incident['kind']}")
+    stacks = stopped_stacks_line(evidence.get("stopped_stacks"))
+    if stacks:
+        lines.append(stacks)
     classes = _class_line([*groups, *evidence.get("run_incidents", ())])
     if classes:
         lines.append(classes)
@@ -5729,7 +5949,7 @@ def main() -> None:
         evidence = build_evidence(
             records, **args.thresholds, watchdog=_watchdog_beside(args.input),
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
-            traincheck=args.traincheck, detectors=detectors, run_manifest=args.input,
+            traincheck=args.traincheck, detectors=detectors, run_manifest=args.input, records_file=args.input,
         )
     except (RuntimeError, ValueError) as error:
         if detectors != "rust":

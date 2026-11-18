@@ -306,7 +306,8 @@ def test_watch_keeps_the_compact_file_current_and_hands_on_the_full_evidence(tmp
     # No incident yet, so no sample; then the collapse and its window. `on_update` gets everything.
     assert seen == [(90, False, []), (200, False, [[98, 102]])]
     small = json.loads(out.read_text())
-    assert small == json.loads(json.dumps(compact_evidence(tensorquill.build_evidence(records), window=2)))
+    assert small == json.loads(json.dumps(compact_evidence(tensorquill.build_evidence(records, records_file=source),
+                                                           window=2)))
     # A named output is used as it is.
     named = watch(source, tmp_path / "named.json", interval=0.0, polls=1, compact_window=2)
     assert named == tmp_path / "named.json" and json.loads(named.read_text()) == small
