@@ -418,25 +418,26 @@ def test_the_seeded_gradient_is_found_as_a_jump_in_the_update_size_at_its_step_o
     records = update_case["records"]
     # Every step carries every parameter's update size, read from AdamW's state.
     assert len(records) == 350 and all(SEEDED in r["update_rms"] and len(r["update_rms"]) == len(r["grad_norms"]) for r in records)
-    evidence = tensorquill.build_evidence(records, update_warmup=200)
+    evidence = tensorquill.build_evidence(records)  # the detector's own defaults
     found = incident(evidence, "update_spike")
     assert (found["step"], found["parameters"][0]["name"], found["spike_steps"][0]) == (250, SEEDED, 250)
-    # With the detector's own default the run is too short to judge, and says so.
-    usual = tensorquill.build_evidence(records)
-    assert not [i for i in usual["incidents"] if i["kind"] == "update_spike"]
-    assert usual["kind_checks"]["update_spike"]["enough_history"] is False
+    assert evidence["kind_checks"]["update_spike"]["enough_history"] is True and "thresholds" not in evidence
+    # Cut before the baseline is full, the run is too short to judge, and says so.
+    short = tensorquill.build_evidence(records[:80])
+    assert not [i for i in short["incidents"] if i["kind"] == "update_spike"]
+    assert short["kind_checks"]["update_spike"]["enough_history"] is False
 
 
 def test_the_update_judge_fails_for_another_step_or_another_parameter(update_case):
-    evidence = tensorquill.build_evidence(update_case["records"], update_warmup=200)
+    evidence = tensorquill.build_evidence(update_case["records"])
     assert sf.judge_update_spike(evidence, SEEDED, 250, 1e4).passed
     assert not sf.judge_update_spike(evidence, SEEDED, 249, 1e4).passed
     assert not sf.judge_update_spike(evidence, "model.layers.0.self_attn.k_proj.weight", 250, 1e4).passed
-    none = tensorquill.build_evidence(update_case["records"][:240], update_warmup=200)
+    none = tensorquill.build_evidence(update_case["records"][:240])
     verdict = sf.judge_update_spike(none, SEEDED, 250, 1e4)
     assert not verdict.passed and "no update_spike incident" in verdict.summary
 
 
 def test_a_seed_step_inside_the_baseline_is_refused_before_any_training(tmp_path):
-    code, _ = run_main(tmp_path / "out", "--case", "update_spike", "--seed-step", "150")
+    code, _ = run_main(tmp_path / "out", "--case", "update_spike", "--seed-step", "50")
     assert code == 2 and not (tmp_path / "out").exists()

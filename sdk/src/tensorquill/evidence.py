@@ -69,13 +69,15 @@ SPIKE_SUSTAIN = 3
 # A jump in the size of the optimizer's update (`update_spike`), by the rule of Altenbernd et
 # al. (arXiv 2604.00726, eqs. 8 to 13). R is the largest RMS update over the parameters on a
 # step (`update_rms`, with `init(..., updates=True)`). A step is flagged when R changed from
-# the step before by more than `baseline / (UPDATE_ALPHA * sqrt(rise))`: `baseline` is the mean
-# of that change over the first UPDATE_WARMUP steps that could be compared, and `rise` is how
-# far the total gradient norm before clipping rose from the step before (a norm that did not
-# rise flags nothing). The paper takes the mean over the run's learning-rate warm-up, which a
-# reader of the records does not know; the `update_warmup` option stands in for its length.
+# the step before by more than `baseline / (UPDATE_ALPHA * sqrt(rise))`: `rise` is how far the
+# total gradient norm before clipping rose from the step before (a norm that did not rise
+# flags nothing), and `baseline` is the mean of that change over the last UPDATE_WINDOW steps
+# that could be compared and were not flagged (the `update_window` option). The paper takes
+# the mean once, over the run's learning-rate warm-up, which a reader of the records does not
+# know. A mean frozen after a fixed number of steps flagged a clean toy run whose warm-up was
+# longer than it; the mean of the last steps did not (Decisions: "update_spike").
 UPDATE_ALPHA = 0.05
-UPDATE_WARMUP = 1000
+UPDATE_WINDOW = 100
 # Activation detectors compare each watched module with its own history, because trained
 # LLMs carry large outliers by design: on healthy Granite the largest value in middle
 # blocks was 740-840 times the standard deviation. Healthy Granite (650 steps, 24 blocks)
@@ -417,7 +419,7 @@ def detect_grad_spikes(
 
 
 def detect_update_spikes(
-    records: list[dict[str, Any]], *, warmup: int = UPDATE_WARMUP, alpha: float = UPDATE_ALPHA
+    records: list[dict[str, Any]], *, window: int = UPDATE_WINDOW, alpha: float = UPDATE_ALPHA
 ) -> dict[str, Any] | None:
     """Return the first jump in the size of the optimizer's update and the parameters whose
     own update moved most, or None.
@@ -425,9 +427,12 @@ def detect_update_spikes(
     Each record's `update_rms` gives the RMS of Adam's update to each parameter; `R` is the
     largest of them. A record is compared with the last one before it that could be judged, in
     the same attempt: `change` is how far `R` moved (either way) and `rise` how far the total
-    gradient norm rose (0 when it fell). The first `warmup` changes make the baseline, their
-    mean, and are not judged. After that a record is flagged when `rise > 0` and
-    `change > baseline / (alpha * sqrt(rise))` (Altenbernd et al., arXiv 2604.00726, eq. 13).
+    gradient norm rose (0 when it fell). The first `window` changes are not judged. After that
+    `baseline` is the mean of the last `window` changes that were not flagged, and a record is
+    flagged when `rise > 0` and `change > baseline / (alpha * sqrt(rise))` (Altenbernd et al.,
+    arXiv 2604.00726, eq. 13). A flagged change stays out of the baseline, so a fault that lasts
+    is still measured against what came before it; every other change joins it, whether or not
+    the gradient norm rose. The paper's mean is taken once, over the learning-rate warm-up.
 
     The total is the pre-clipping `clip_grad_norm` whenever the run clips and `grad_norm`
     otherwise, as for `grad_spike`. Left out, and never used as the record before: a step the
@@ -440,8 +445,7 @@ def detect_update_spikes(
     """
     key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
     before: tuple[Any, float, float, dict[str, float]] | None = None  # attempt, R, total, each parameter's
-    seen = 0
-    summed = 0.0
+    recent: deque[float] = deque(maxlen=window)  # the last `window` changes that were not flagged
     first: dict[str, Any] | None = None
     spikes: list[int] = []
     for record in sorted(records, key=lambda r: r["step"]):
@@ -458,13 +462,14 @@ def detect_update_spikes(
         attempt = record.get("attempt", 0)
         if before is not None and before[0] == attempt:
             change, rise = abs(largest - before[1]), max(0.0, total - before[2])
-            if seen < warmup:
-                summed += change
-                seen += 1
+            if len(recent) < window:
+                recent.append(change)
             else:
-                baseline = summed / warmup
+                baseline = math.fsum(recent) / window
                 threshold = baseline / (alpha * math.sqrt(rise)) if rise > 0 and baseline > 0 else None
-                if threshold is not None and change > threshold:
+                if threshold is None or change <= threshold:
+                    recent.append(change)
+                else:
                     step = int(record["step"])
                     spikes.append(step)
                     if first is None:
@@ -1600,8 +1605,8 @@ KIND_INPUTS: dict[str, str] = {
 #   grad_spike            the total: SPIKE_MIN_HISTORY earlier norms and the one judged, 11;
 #                         one parameter: SPIKE_MIN_HISTORY earlier norms, then SPIKE_SUSTAIN in
 #                         a row
-#   update_spike          one record to compare the first with, the `update_warmup` option
-#                         (UPDATE_WARMUP) changes that make the baseline, and the one judged
+#   update_spike          one record to compare the first with, the `update_window` option
+#                         (UPDATE_WINDOW) changes that make the first baseline, and the one judged
 #   stalled_weights       STALL_STEPS weight checks in a row
 #   loss_scale_trouble    a scale below the floor 1; SCALE_SKIP_RUN skips in a row
 #   data_stalled          no batch: DATA_STALL_STEPS steps in a row, 3; the same batch: the
@@ -1635,7 +1640,7 @@ RECORDS_NEEDED: dict[str, int] = {
     "moe_imbalance": OVERLOAD_MIN_HISTORY + 1,
     "starved_experts": STARVE_WINDOW,
     "grad_spike": SPIKE_MIN_HISTORY + SPIKE_SUSTAIN,
-    "update_spike": UPDATE_WARMUP + 2,
+    "update_spike": UPDATE_WINDOW + 2,
     "stalled_weights": STALL_STEPS,
     "repeated_steps": 1,
     "loss_scale_trouble": SCALE_SKIP_RUN,
@@ -1737,11 +1742,11 @@ def _unavailable(entry: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
     return {"value": "unavailable", **extra, "check": entry.get("check"), "reason": entry.get("reason")}
 
 
-def records_needed(starve_window: int = STARVE_WINDOW, update_warmup: int = UPDATE_WARMUP) -> dict[str, int]:
+def records_needed(starve_window: int = STARVE_WINDOW, update_window: int = UPDATE_WINDOW) -> dict[str, int]:
     """`RECORDS_NEEDED` as a run applies it: `starved_experts` needs the window the run was
     judged with (the `starve_window` option) and `update_spike` the baseline it was judged with
-    (the `update_warmup` option, and two records more); every other kind its constant."""
-    return {**RECORDS_NEEDED, "starved_experts": int(starve_window), "update_spike": int(update_warmup) + 2}
+    (the `update_window` option, and two records more); every other kind its constant."""
+    return {**RECORDS_NEEDED, "starved_experts": int(starve_window), "update_spike": int(update_window) + 2}
 
 
 # What a kind's clean check does not show, said in its `kind_checks` entry as `note` when the
@@ -1761,7 +1766,7 @@ def _noted(kind: str, value: Any) -> dict[str, str]:
 
 def kind_checks(
     counts: Mapping[str, int], not_checked: Iterable[Mapping[str, Any]], *, starve_window: int = STARVE_WINDOW,
-    update_warmup: int = UPDATE_WARMUP,
+    update_window: int = UPDATE_WINDOW,
 ) -> dict[str, dict[str, Any]]:
     """The value of each of the server's kinds (`KIND_INPUTS`), from how many records carried
     its input (`input_counts`) and the checks that could not be made.
@@ -1772,14 +1777,14 @@ def kind_checks(
     record carried the input and `not_configured` when none did.
 
     Every entry also has `records`, `records_needed` (`RECORDS_NEEDED`, with the
-    `starve_window` and the `update_warmup` the run was judged with) and `enough_history`,
+    `starve_window` and the `update_window` the run was judged with) and `enough_history`,
     which is `records >= records_needed` whatever the value. A kind is `checked` from its first
     record, so it is `enough_history` that says whether "nothing found" is a verdict yet. A
     checked kind whose clean check leaves something open says so under `note` (`KIND_NOTES`).
     `tensorquill-server` gives the same object in its report (`kind_checks`).
     """
     named = _kinds_not_checked(not_checked)
-    needed = records_needed(starve_window, update_warmup)
+    needed = records_needed(starve_window, update_window)
     checks: dict[str, dict[str, Any]] = {}
     for kind, counter in KIND_INPUTS.items():
         records = int(counts.get(counter, 0))
@@ -2026,11 +2031,11 @@ def _top_k_option(top_k: int | Mapping[str, int] | None) -> int | dict[str, int]
 
 
 # The six detector options: `build_evidence`'s, and the keys of the server's `--thresholds`.
-THRESHOLD_NAMES = ("overload_threshold", "drift_tolerance", "starve_window", "starve_ratio", "top_k", "update_warmup")
+THRESHOLD_NAMES = ("overload_threshold", "drift_tolerance", "starve_window", "starve_ratio", "top_k", "update_window")
 THRESHOLD_DEFAULTS: dict[str, Any] = {
     "overload_threshold": OVERLOAD_THRESHOLD, "drift_tolerance": DRIFT_TOLERANCE,
     "starve_window": STARVE_WINDOW, "starve_ratio": STARVE_RATIO, "top_k": None,
-    "update_warmup": UPDATE_WARMUP,
+    "update_window": UPDATE_WINDOW,
 }
 
 
@@ -2058,7 +2063,7 @@ def applied_thresholds(report: Mapping[str, Any] | None) -> dict[str, Any]:
         value = listed.get(name)
         if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
             out[name] = value
-    for name in ("starve_window", "update_warmup"):
+    for name in ("starve_window", "update_window"):
         if _count(listed.get(name)):
             out[name] = listed[name]
     top_k = listed.get("top_k")
@@ -2141,7 +2146,7 @@ def read_server_report(
     starve_window: int | None = None,
     starve_ratio: float | None = None,
     top_k: int | Mapping[str, int] | None = None,
-    update_warmup: int | None = None,
+    update_window: int | None = None,
 ) -> dict[str, Any]:
     """Read a rank's `incidents.json` from a server's store and say whether it can be used.
 
@@ -2212,7 +2217,7 @@ def read_server_report(
     asked = _given_thresholds({
         "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
         "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": top_k,
-        "update_warmup": update_warmup,
+        "update_window": update_window,
     })
     # A server started with `--thresholds` lists what it applied, `top_k` among them (null: what
     # the run recorded). A server from before that option has no `top_k` there, which reads the same.
@@ -3684,7 +3689,7 @@ def all_ranks_evidence(
     starve_window: int | None = None,
     starve_ratio: float | None = None,
     top_k: int | Mapping[str, int] | None = None,
-    update_warmup: int | None = None,
+    update_window: int | None = None,
 ) -> dict[str, Any]:
     """One look at every rank of a run: the evidence `watch(source, rank="all")` writes on its
     first look, returned and not written.
@@ -3709,7 +3714,7 @@ def all_ranks_evidence(
     thresholds = _given_thresholds({
         "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
         "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": top_k,
-        "update_warmup": update_warmup,
+        "update_window": update_window,
     })
     folders, looks, _, _ = _look_at_ranks(source, status, {}, thresholds, REPORT_GRACE_SECONDS)
     other_sources = {"traincheck": traincheck, "flight_recorder": flight_recorder,
@@ -4104,7 +4109,7 @@ def build_evidence(
     detectors: str = "python",
     server_binary: str | os.PathLike[str] | None = None,
     run_manifest: str | Path | Mapping[str, Any] | None = None,
-    update_warmup: int = UPDATE_WARMUP,
+    update_window: int = UPDATE_WINDOW,
 ) -> dict[str, Any]:
     """Build viewer-neutral detector evidence from captured step records.
 
@@ -4133,9 +4138,9 @@ def build_evidence(
     before it was recorded: one value for every router, or a value per router name.
     `overload_threshold` is the base assignment-share threshold for top-1 and top-2.
     Top-3 and higher use a per-router baseline once ten unflagged samples are available.
-    `update_warmup` is how many step-to-step changes of the update size make the baseline of
-    `update_spike` (`detect_update_spikes`): it stands in for the length of the run's
-    learning-rate warm-up, which the rule's paper averages over.
+    `update_window` is how many of the last step-to-step changes of the update size make the
+    baseline of `update_spike` (`detect_update_spikes`), where the rule's paper averages once
+    over the run's learning-rate warm-up.
 
     `detectors="rust"` takes the incidents of the server's kinds (`SERVER_KINDS`) from the
     Rust detectors, run here on the same records through `tensorquill-server detect`
@@ -4152,8 +4157,8 @@ def build_evidence(
     """
     if detectors not in ("python", "rust"):
         raise ValueError(f"detectors must be 'python' or 'rust', not {detectors!r}")
-    if isinstance(update_warmup, bool) or not isinstance(update_warmup, int) or update_warmup < 1:
-        raise ValueError(f"update_warmup must be a whole number of at least 1, not {update_warmup!r}")
+    if isinstance(update_window, bool) or not isinstance(update_window, int) or update_window < 1:
+        raise ValueError(f"update_window must be a whole number of at least 1, not {update_window!r}")
     every_attempt = load_records(source, rank=rank, all_attempts=True)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
@@ -4174,7 +4179,7 @@ def build_evidence(
         asked = {
             "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
             "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": _top_k_option(top_k),
-            "update_warmup": update_warmup,
+            "update_window": update_window,
         }
         report = server_report(every_attempt, thresholds=asked, binary=server_binary, samples=True)
         absent = [kind for kind in SERVER_KINDS if kind not in (report.get("checked") or ())]
@@ -4244,7 +4249,7 @@ def build_evidence(
         if starved_hit is not None:
             incidents.append(starved_hit)
         for detector in (
-            detect_grad_spikes, lambda found: detect_update_spikes(found, warmup=update_warmup), detect_stalled_weights,
+            detect_grad_spikes, lambda found: detect_update_spikes(found, window=update_window), detect_stalled_weights,
             detect_repeated_steps, detect_loss_scale_trouble,
         ):
             # Only this detector looks at what a later attempt replaced.
@@ -4274,7 +4279,7 @@ def build_evidence(
         if not_read is not None:
             not_checked.append(not_read)
         rank_checks = kind_checks(
-            input_counts(records), not_checked, starve_window=starve_window, update_warmup=update_warmup)
+            input_counts(records), not_checked, starve_window=starve_window, update_window=update_window)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
     # A status is expected where a server stores the run (a directory of its parts, or one
     # part) or when one was named. A local file or a list of records has no server to miss.
@@ -4329,7 +4334,7 @@ def build_evidence(
         **({"thresholds": ran_with} if _off_default(ran_with := {
             "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
             "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": _top_k_option(top_k),
-            "update_warmup": update_warmup,
+            "update_window": update_window,
         }) else {}),
         "incidents": incidents,
         "samples": samples,
@@ -5567,9 +5572,9 @@ def main() -> None:
         help="experts chosen per token, for captures made before moe_top_k was recorded",
     )
     parser.add_argument(
-        "--update-warmup",
+        "--update-window",
         type=int,
-        help="step-to-step changes of the update size that make the baseline of update_spike (default: 1000)",
+        help="how many of the last step-to-step changes of the update size make the baseline of update_spike (default: 100)",
     )
     parser.add_argument(
         "--detectors",

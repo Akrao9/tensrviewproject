@@ -40,7 +40,7 @@ MOE_NEEDS, STATUS_NEEDS = "moe: a router's expert counts", "the server's progres
 # What each of the server's kinds needs, by hand from its rules (`RECORDS_NEEDED` in evidence.py
 # lists them). The Rust unit test `what_each_kind_needs_is_these_numbers_...` has the same list.
 BY_HAND = {
-    "moe_imbalance": 11, "starved_experts": 50, "grad_spike": 13, "update_spike": 1002, "stalled_weights": 3,
+    "moe_imbalance": 11, "starved_experts": 50, "grad_spike": 13, "update_spike": 102, "stalled_weights": 3,
     "repeated_steps": 1,
     "loss_scale_trouble": 10, "resume_lr_change": 1, "resume_data_mismatch": 1, "resume_incomplete": 1,
     "data_stalled": 4, "epoch_order_repeated": 4, "activation_spike": 11, "activation_drift": 60,
@@ -129,7 +129,7 @@ def test_what_each_kind_needs_is_the_same_numbers_here_by_hand_and_in_rust():
     # The window a run is judged with, not the default one.
     assert ev.records_needed(7) == {**BY_HAND, "starved_experts": 7}
     # And the baseline it is judged with: one record to compare the first with, and the one judged.
-    assert ev.records_needed(update_warmup=30) == {**BY_HAND, "update_spike": 32}
+    assert ev.records_needed(update_window=30) == {**BY_HAND, "update_spike": 32}
     source = DETECT_RS.read_text(encoding="utf-8")
     # The table names the kinds in order; its numbers are expressions over the rules' constants,
     # which a Rust unit test holds to the list it has by hand. That list is read here.
@@ -550,11 +550,11 @@ def boundary() -> dict[str, tuple[str, list[dict], dict]]:
                   + [{"grad_norm": 1001.25, "grad_norms": {"big": 1000.0, "small": 50.0}}] * 3),
             {"trigger": "parameter", "sustained": 3},
         ),
-        # The largest update moves 0.001 a step for the 1,000 changes of the baseline; then the gradient norm
+        # The largest update moves 0.001 a step for the 100 changes of the first baseline; then the gradient norm
         # rises by 1 and the small parameter's update jumps past 0.001 / (0.05 * sqrt(1)) = 0.02.
         "update_spike": (
             "update_spike",
-            _each([{"grad_norm": 1.0, "update_rms": {"big": 0.010 + 0.001 * (step % 2), "small": 0.002}} for step in range(1001)]
+            _each([{"grad_norm": 1.0, "update_rms": {"big": 0.010 + 0.001 * (step % 2), "small": 0.002}} for step in range(101)]
                   + [{"grad_norm": 2.0, "update_rms": {"big": 0.010, "small": 0.3}}]),
             {"spike_count": 1, "grad_rise": 1.0},
         ),

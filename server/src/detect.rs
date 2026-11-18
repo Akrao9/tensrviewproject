@@ -88,9 +88,10 @@ pub const SPIKE_MIN_HISTORY: usize = 10;
 /// reported on its own; a single such step is ordinary (see `SPIKE_SUSTAIN` in `evidence.py`).
 pub const SPIKE_SUSTAIN: u32 = 3;
 /// `update_spike` (Altenbernd et al., arXiv 2604.00726, eq. 13): the sensitivity, and how many
-/// step-to-step changes of the largest RMS update make the baseline (the `update_warmup` option).
+/// of the last unflagged step-to-step changes of the largest RMS update make the baseline (the
+/// `update_window` option).
 pub const UPDATE_ALPHA: f64 = 0.05;
-pub const UPDATE_WARMUP: usize = 1000;
+pub const UPDATE_WINDOW: usize = 100;
 pub const ACT_SPIKE_FACTOR: f64 = 5.0;
 pub const ACT_WINDOW: usize = 50;
 pub const ACT_MIN_HISTORY: usize = 10;
@@ -270,8 +271,8 @@ pub const RECORDS_NEEDED: [(&str, u64); 26] = [
     ("starved_experts", STARVE_WINDOW as u64),
     // One parameter: its earlier norms, then `SPIKE_SUSTAIN` in a row (the total needs 11).
     ("grad_spike", SPIKE_MIN_HISTORY as u64 + SPIKE_SUSTAIN as u64),
-    // One row to compare the first with, the changes that make the baseline, and the one judged.
-    ("update_spike", UPDATE_WARMUP as u64 + 2),
+    // One row to compare the first with, the changes that make the first baseline, and the one judged.
+    ("update_spike", UPDATE_WINDOW as u64 + 2),
     ("stalled_weights", STALL_STEPS as u64),
     ("repeated_steps", 1),
     // Skips in a row (a scale below the floor needs 1).
@@ -302,14 +303,14 @@ pub const RECORDS_NEEDED: [(&str, u64); 26] = [
 ];
 
 /// [`RECORDS_NEEDED`] for one kind as a run applies it: `starved_experts` needs the
-/// `starve_window` the run is judged with, `update_spike` its `update_warmup` and two rows
+/// `starve_window` the run is judged with, `update_spike` its `update_window` and two rows
 /// more, every other kind its constant.
 pub fn records_needed(kind: &str, thresholds: &Thresholds) -> u64 {
     if kind == "starved_experts" {
         return thresholds.starve_window as u64;
     }
     if kind == "update_spike" {
-        return thresholds.update_warmup as u64 + 2;
+        return thresholds.update_window as u64 + 2;
     }
     RECORDS_NEEDED
         .iter()
@@ -342,7 +343,7 @@ pub enum TopK {
 }
 
 /// The detector options a run can set: `build_evidence`'s `overload_threshold`,
-/// `drift_tolerance`, `starve_window`, `starve_ratio`, `top_k` and `update_warmup`. The default is the value
+/// `drift_tolerance`, `starve_window`, `starve_ratio`, `top_k` and `update_window`. The default is the value
 /// each rule has always applied. They arrive as one JSON object, on `tensorquill-server
 /// --thresholds` for the server's detectors and on `tensorquill-server detect --thresholds`.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -358,9 +359,9 @@ pub struct Thresholds {
     pub starve_ratio: f64,
     /// Experts chosen per token, in place of the recorded `moe_top_k`.
     pub top_k: Option<TopK>,
-    /// How many step-to-step changes of the update size make the baseline of `update_spike`:
-    /// it stands in for the length of the run's learning-rate warm-up.
-    pub update_warmup: usize,
+    /// How many of the last unflagged step-to-step changes of the update size make the baseline
+    /// of `update_spike`.
+    pub update_window: usize,
 }
 
 impl Default for Thresholds {
@@ -371,7 +372,7 @@ impl Default for Thresholds {
             starve_window: STARVE_WINDOW,
             starve_ratio: STARVE_RATIO,
             top_k: None,
-            update_warmup: UPDATE_WARMUP,
+            update_window: UPDATE_WINDOW,
         }
     }
 }
@@ -380,7 +381,7 @@ impl Thresholds {
     /// Reads the JSON object given on the command line. A key left out keeps its default
     /// and `"top_k": null` means the recorded value. Refused: anything but an object, a key
     /// that is not one of the six, a value of the wrong type, a number that is negative or
-    /// not finite, a window or warm-up below 1 and a `top_k` below 1.
+    /// not finite, a window below 1 and a `top_k` below 1.
     pub fn parse(text: &str) -> Result<Self, String> {
         let value: Value = serde_json::from_str(text).map_err(|error| format!("not JSON: {error}"))?;
         if !value.is_object() {
@@ -402,8 +403,8 @@ impl Thresholds {
         if thresholds.starve_window < 1 {
             return Err("starve_window must be at least 1".to_string());
         }
-        if thresholds.update_warmup < 1 {
-            return Err("update_warmup must be at least 1".to_string());
+        if thresholds.update_window < 1 {
+            return Err("update_window must be at least 1".to_string());
         }
         let chosen: Vec<i64> = match &thresholds.top_k {
             None => Vec::new(),
@@ -442,7 +443,7 @@ impl Thresholds {
             "spike_factor": SPIKE_FACTOR,
             "spike_window": SPIKE_WINDOW,
             "spike_sustain": SPIKE_SUSTAIN,
-            "update_warmup": self.update_warmup,
+            "update_window": self.update_window,
             "update_alpha": UPDATE_ALPHA,
             "activation_spike_factor": ACT_SPIKE_FACTOR,
             "activation_drift_factor": ACT_DRIFT_FACTOR,
@@ -1785,9 +1786,8 @@ struct Updates {
     /// Whether any record so far had `clip_grad_norm`; the total is read from it from then on.
     clips: bool,
     before: Option<UpdateRow>,
-    /// How many changes the baseline holds so far, and their sum.
-    seen: usize,
-    summed: f64,
+    /// The last `update_window` changes that were not flagged.
+    recent: VecDeque<f64>,
     first: Option<Value>,
     spikes: u64,
     spike_steps: Vec<i64>,
@@ -1799,7 +1799,7 @@ struct Updates {
 }
 
 impl Updates {
-    fn row(&mut self, attempt: i64, step: i64, columns: &Columns, row: usize, warmup: usize) {
+    fn row(&mut self, attempt: i64, step: i64, columns: &Columns, row: usize, window: usize) {
         // `update_not_read` travels in `extra_json`, which is parsed only on a row that names it.
         if let Some(extra) = text(columns.extra, row).filter(|extra| extra.contains("\"update_not_read\"")) {
             let extra: Option<Value> = serde_json::from_str(extra).ok();
@@ -1819,8 +1819,7 @@ impl Updates {
             // any record has it, and the records before clipping began have none.
             self.clips = true;
             self.before = None;
-            self.seen = 0;
-            self.summed = 0.0;
+            self.recent.clear();
             self.first = None;
             self.spikes = 0;
             self.spike_steps.clear();
@@ -1853,11 +1852,11 @@ impl Updates {
         let largest = own.iter().map(|(_, size)| *size).fold(f64::NEG_INFINITY, f64::max);
         if let Some(before) = self.before.as_ref().filter(|before| before.attempt == attempt) {
             let (change, rise) = ((largest - before.largest).abs(), (total - before.total).max(0.0));
-            if self.seen < warmup {
-                self.summed += change;
-                self.seen += 1;
+            if self.recent.len() < window {
+                self.recent.push_back(change);
             } else {
-                let baseline = self.summed / warmup as f64;
+                // The mean of the last `window` unflagged changes, summed as Python's `fsum` sums.
+                let baseline = fsum(self.recent.iter().copied()) / window as f64;
                 let threshold = (rise > 0.0 && baseline > 0.0).then(|| baseline / (UPDATE_ALPHA * rise.sqrt()));
                 if let Some(threshold) = threshold.filter(|threshold| change > *threshold) {
                     self.spikes += 1;
@@ -1898,6 +1897,11 @@ impl Updates {
                             "parameters": parameters,
                         }));
                     }
+                } else {
+                    // Every change that is not flagged joins the baseline, whether or not the
+                    // gradient norm rose; a flagged one never does.
+                    self.recent.pop_front();
+                    self.recent.push_back(change);
                 }
             }
         }
@@ -3264,7 +3268,7 @@ impl RankDetectors {
             self.moe.row(step, &columns, row, &self.thresholds);
             self.gradients.row(step, &columns, row, &mut self.scalars);
             self.updates
-                .row(self.attempt, step, &columns, row, self.thresholds.update_warmup);
+                .row(self.attempt, step, &columns, row, self.thresholds.update_window);
             self.stalled.row(step, &columns, row);
             self.loss_scale.row(step, &columns, row);
             self.activations.row(step, layers);
@@ -3813,7 +3817,7 @@ mod tests {
             (0.35, 1e-6, 50, 0.1)
         );
         assert_eq!(usual.top_k, None);
-        assert_eq!(usual.update_warmup, 1000);
+        assert_eq!(usual.update_window, 100);
         let applied = usual.applied();
         assert_eq!(applied["overload_threshold"], 0.35);
         assert_eq!(applied["drift_tolerance"], 1e-6);
@@ -3828,8 +3832,8 @@ mod tests {
             (&json!(3), &json!(20))
         );
         assert_eq!(
-            (&applied["update_warmup"], &applied["update_alpha"]),
-            (&json!(1000), &json!(0.05))
+            (&applied["update_window"], &applied["update_alpha"]),
+            (&json!(100), &json!(0.05))
         );
         // One key changes only itself, and a null top_k is the recorded value.
         let one = Thresholds::parse(r#"{"starve_window": 10, "top_k": null}"#).unwrap();
@@ -3843,7 +3847,7 @@ mod tests {
     #[test]
     fn thresholds_take_each_of_the_six_keys_and_list_what_was_applied() {
         let text = r#"{"overload_threshold": 1, "drift_tolerance": 0.001, "starve_window": 20,
-                       "starve_ratio": 0.25, "top_k": 2, "update_warmup": 30}"#;
+                       "starve_ratio": 0.25, "top_k": 2, "update_window": 30}"#;
         let all = Thresholds::parse(text).unwrap();
         assert_eq!(all.overload_threshold, 1.0); // a whole number is a number
         assert_eq!((all.top_k_for("any"), all.top_k_for("other")), (Some(2), Some(2)));
@@ -3854,7 +3858,7 @@ mod tests {
             ("starve_window", json!(20)),
             ("starve_ratio", json!(0.25)),
             ("top_k", json!(2)),
-            ("update_warmup", json!(30)),
+            ("update_window", json!(30)),
         ] {
             assert_eq!(applied[name], value, "{name}");
         }
@@ -3888,8 +3892,8 @@ mod tests {
             (r#"{"starve_window": 0}"#, "starve_window must be at least 1"),
             (r#"{"starve_window": 2.5}"#, "invalid type"),
             (r#"{"starve_window": -1}"#, "invalid value"),
-            (r#"{"update_warmup": 0}"#, "update_warmup must be at least 1"),
-            (r#"{"update_warmup": 2.5}"#, "invalid type"),
+            (r#"{"update_window": 0}"#, "update_window must be at least 1"),
+            (r#"{"update_window": 2.5}"#, "invalid type"),
             (r#"{"update_alpha": 0.1}"#, "unknown field `update_alpha`"), // listed in a report, but not an option
             (r#"{"top_k": 0}"#, "top_k must be at least 1, got 0"),
             (r#"{"top_k": {"a": 2, "b": -1}}"#, "top_k must be at least 1, got -1"),
@@ -4250,7 +4254,7 @@ mod tests {
         assert_eq!(kinds, PORTED);
         // By hand from the rules, not from the constants: evidence.py lists each kind's rules.
         let by_hand: [u64; 26] = [
-            11, 50, 13, 1002, 3, 1, 10, 1, 1, 1, 4, 4, 11, 60, 60, 4, 4, 4, 1, 1, 6, 1, 1, 2, 1, 21,
+            11, 50, 13, 102, 3, 1, 10, 1, 1, 1, 4, 4, 11, 60, 60, 4, 4, 4, 1, 1, 6, 1, 1, 2, 1, 21,
         ];
         for ((kind, needed), expected) in RECORDS_NEEDED.iter().zip(by_hand) {
             assert_eq!(*needed, expected, "{kind}");
@@ -4259,7 +4263,7 @@ mod tests {
         let narrow = Arc::new(Thresholds::parse(r#"{"starve_window": 7}"#).unwrap());
         assert_eq!(records_needed("starved_experts", &narrow), 7);
         assert_eq!(records_needed("moe_imbalance", &narrow), 11);
-        let short = Arc::new(Thresholds::parse(r#"{"update_warmup": 30}"#).unwrap());
+        let short = Arc::new(Thresholds::parse(r#"{"update_window": 30}"#).unwrap());
         assert_eq!(records_needed("update_spike", &short), 32);
         assert_eq!(records_needed("starved_experts", &short), 50);
         let rows: Vec<MoeRow> = (0..7).map(|step| (1, step, vec![("a", vec![40, 40])])).collect();
@@ -4532,30 +4536,47 @@ mod tests {
 
     #[test]
     fn an_update_spike_is_a_jump_past_the_baseline_on_a_step_whose_gradient_norm_rose() {
-        let short = Arc::new(Thresholds::parse(r#"{"update_warmup": 4}"#).unwrap());
-        // Six rows make the baseline: one to compare the first with, then four changes of 0.001.
+        let short = Arc::new(Thresholds::parse(r#"{"update_window": 4}"#).unwrap());
+        // Six rows: one to compare the first with, four changes of 0.001 that make the first
+        // baseline, and a fifth that is judged, not flagged, and takes the oldest one's place.
         let quiet: [(&str, f64); 2] = [("a", 0.010), ("b", 0.002)];
         let other: [(&str, f64); 2] = [("a", 0.011), ("b", 0.002)];
         let jumped: [(&str, f64); 2] = [("a", 0.011), ("b", 0.300)];
-        let mut rows: Vec<UpdateTestRow> = (0..6)
+        let rows: Vec<UpdateTestRow> = (0..6)
             .map(|step| (step, 1.0, if step % 2 == 0 { &quiet[..] } else { &other[..] }))
             .collect();
-        // The same jump with a gradient norm that fell is not flagged; with one that rose it is.
-        rows.push((6, 0.5, &jumped[..]));
-        rows.push((7, 0.5, &quiet[..]));
-        rows.push((8, 4.5, &jumped[..]));
-        let detectors = judge(0, &[update_rows(&rows, &[])], &short).unwrap();
+        assert!(judge(0, &[update_rows(&rows, &[])], &short)
+            .unwrap()
+            .incidents()
+            .is_empty());
+        // The jump with a gradient norm that fell is not flagged; with one that rose it is.
+        let mut fell = rows.clone();
+        fell.push((6, 0.5, &jumped[..]));
+        assert!(judge(0, &[update_rows(&fell, &[])], &short)
+            .unwrap()
+            .incidents()
+            .is_empty());
+        let mut rose = rows.clone();
+        rose.push((6, 5.0, &jumped[..]));
+        // The fall back at step 7, with no rise in the norm, is not flagged and joins the baseline:
+        // it raises it, and the same jump at step 8 is then under the limit.
+        rose.push((7, 1.0, &quiet[..]));
+        rose.push((8, 5.0, &jumped[..]));
+        let detectors = judge(0, &[update_rows(&rose, &[])], &short).unwrap();
         let incidents = detectors.incidents();
         assert_eq!(incidents.len(), 1, "{incidents:?}");
         let found = &incidents[0];
         assert_eq!(
             (&found["kind"], &found["class"], &found["step"]),
-            (&json!("update_spike"), &json!("anomaly"), &json!(8))
+            (&json!("update_spike"), &json!("anomaly"), &json!(6))
         );
         // The limit is baseline / (alpha * sqrt(rise)) = 0.001 / (0.05 * 2) = 0.01.
         assert!((found["baseline"].as_f64().unwrap() - 0.001).abs() < 1e-12);
         assert!((found["threshold"].as_f64().unwrap() - 0.01).abs() < 1e-12);
-        assert_eq!((&found["grad_rise"], &found["spike_steps"]), (&json!(4.0), &json!([8])));
+        assert_eq!(
+            (&found["grad_rise"], &found["spike_steps"], &found["spike_count"]),
+            (&json!(4.0), &json!([6]), &json!(1))
+        );
         assert_eq!(found["parameters"][0]["name"], "b");
         assert_eq!(found["parameters"].as_array().unwrap().len(), 2);
         let check = &detectors.kind_checks()["update_spike"];
@@ -4568,9 +4589,6 @@ mod tests {
             ),
             (&json!("checked"), &json!(9), &json!(6), &json!(true))
         );
-        // The first six rows alone report nothing: the one change judged came with no rise.
-        let detectors = judge(0, &[update_rows(&rows[..6], &[])], &short).unwrap();
-        assert!(detectors.incidents().is_empty());
     }
 
     #[test]

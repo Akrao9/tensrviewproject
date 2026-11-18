@@ -3,8 +3,8 @@
 The capture reads Adam's update to each parameter from the optimizer's own state after the step.
 The rule is Altenbernd et al.'s (arXiv 2604.00726, eq. 13): the largest RMS update moved from
 the step before by more than `baseline / (0.05 * sqrt(rise))`, where `baseline` is the mean of
-that change over the first `update_warmup` steps and `rise` is how far the total gradient norm
-rose. Here: the number recorded is the step PyTorch applied, on every path Adam takes; the
+that change over the last `update_window` steps that were not flagged and `rise` is how far the
+total gradient norm rose. Here: the number recorded is the step PyTorch applied, on every path Adam takes; the
 optimizer patterns the capture already handles; an optimizer that cannot be read is said, never
 silent; the rule's edges; a seeded fault on a CPU toy; and the same answers from the server.
 """
@@ -117,7 +117,7 @@ def test_nothing_is_read_unless_asked_for(toy_moe):
     assert all("update_rms" not in r and "update_not_read" not in r for r in sink.records)
     evidence = tensorquill.build_evidence(sink.records)
     assert evidence["kind_checks"]["update_spike"] == {
-        "value": "not_configured", "records": 0, "records_needed": 1002, "enough_history": False, "needs": NEEDS,
+        "value": "not_configured", "records": 0, "records_needed": 102, "enough_history": False, "needs": NEEDS,
     }
     assert entry(evidence) is None
 
@@ -289,7 +289,7 @@ def test_a_fused_step_the_scaler_skipped_reads_an_unchanged_state_and_the_rule_l
     kept = [r for r in records if not r["step_skipped"]]
     wild = [{**r, "update_rms": {name: 9.0 for name in r.get("update_rms") or {"weight": 0}}} if r["step_skipped"] else r
             for r in records]
-    assert ev.detect_update_spikes(wild, warmup=1) == ev.detect_update_spikes(kept, warmup=1)
+    assert ev.detect_update_spikes(wild, window=1) == ev.detect_update_spikes(kept, window=1)
 
 
 def test_an_optimizer_that_holds_none_of_the_models_parameters_is_said_once_the_user_steps_by_hand():
@@ -376,7 +376,7 @@ def test_any_other_optimizer_is_not_checked_with_its_reason_never_silence(make, 
     assert found["kinds"] == ["update_spike"] and found["optimizers"] == [name] and found["step"] == 0
     assert found["reason"].startswith(f"{name}: {starts}")
     check = evidence["kind_checks"]["update_spike"]
-    assert check == {"value": "unavailable", "records": 0, "records_needed": 1002, "enough_history": False,
+    assert check == {"value": "unavailable", "records": 0, "records_needed": 102, "enough_history": False,
                      "needs": NEEDS, "check": "update_size", "reason": found["reason"]}
     assert evidence["run_state"]["state"] == "degraded"
     assert "update_spike" in ev.checked_line(evidence) and "update_spike" in ev.kinds_by_value(evidence)["unavailable"]
@@ -454,25 +454,46 @@ def quiet(count: int, start: int = 0, **more) -> list[dict]:
 
 
 def test_a_jump_past_the_baseline_is_flagged_only_when_the_gradient_norm_rose():
-    records = quiet(6)  # five changes: four make the baseline, the fifth is judged with no rise
-    assert ev.detect_update_spikes(records, warmup=4) is None
+    records = quiet(6)  # five changes: four make the first baseline, the fifth is judged with no rise
+    assert ev.detect_update_spikes(records, window=4) is None
     # The baseline is 0.001, so the limit for a rise of 4 is 0.001 / (0.05 * 2) = 0.01.
-    fell = records + [step(6, small=0.3, total=0.5), step(7, total=0.5)]
-    assert ev.detect_update_spikes(fell, warmup=4) is None
-    rose = fell + [step(8, small=0.3, total=4.5)]
-    hit = ev.detect_update_spikes(rose, warmup=4)
-    assert (hit["kind"], hit["step"], hit["spike_count"], hit["spike_steps"]) == ("update_spike", 8, 1, [8])
+    assert ev.detect_update_spikes(records + [step(6, small=0.3, total=0.5)], window=4) is None  # the norm fell
+    hit = ev.detect_update_spikes(records + [step(6, small=0.3, total=5.0)], window=4)
+    assert (hit["kind"], hit["step"], hit["spike_count"], hit["spike_steps"]) == ("update_spike", 6, 1, [6])
     assert hit["baseline"] == pytest.approx(0.001) and hit["threshold"] == pytest.approx(0.01)
-    assert (hit["grad_norm"], hit["grad_norm_before"], hit["grad_rise"]) == (4.5, 0.5, 4.0)
-    assert (hit["update_rms"], hit["previous"]) == (0.3, 0.010) and hit["change"] == pytest.approx(0.29)
+    assert (hit["grad_norm"], hit["grad_norm_before"], hit["grad_rise"]) == (5.0, 1.0, 4.0)
+    assert (hit["update_rms"], hit["previous"]) == (0.3, 0.011) and hit["change"] == pytest.approx(0.289)
     # The parameter whose own update moved most is first.
     assert [p["name"] for p in hit["parameters"]] == ["small", "big"]
     assert hit["parameters"][0] == {"name": "small", "update_rms": 0.3, "previous": 0.002, "change": pytest.approx(0.298)}
     # Under the limit: a change of 0.009 with the same rise.
-    under = fell + [step(8, big=0.019, total=4.5)]
-    assert ev.detect_update_spikes(under, warmup=4) is None
+    assert ev.detect_update_spikes(records + [step(6, big=0.020, total=5.0)], window=4) is None
     # A smaller rise raises the limit: 0.001 / (0.05 * sqrt(0.0001)) = 2.
-    assert ev.detect_update_spikes(fell + [step(8, small=0.3, total=0.5001)], warmup=4) is None
+    assert ev.detect_update_spikes(records + [step(6, small=0.3, total=1.0001)], window=4) is None
+
+
+def test_the_baseline_is_the_last_changes_that_were_not_flagged():
+    jump = dict(small=0.3, total=5.0)
+    # A jump that lasts: its first step is flagged and stays out of the baseline, so the steps
+    # after it are judged against what came before. They do not move, and are not flagged.
+    lasting = quiet(6) + [step(at, big=0.011, small=0.3, total=5.0 + at) for at in range(6, 12)]
+    hit = ev.detect_update_spikes(lasting, window=4)
+    assert (hit["step"], hit["spike_steps"]) == (6, [6])
+    # A second jump right after the first is judged by the same baseline: flagged too.
+    twice = quiet(6) + [step(6, **jump), step(7, small=0.9, total=9.0)]
+    assert ev.detect_update_spikes(twice, window=4)["spike_steps"] == [6, 7]
+    # The fall back, with no rise in the norm, is not flagged and joins the baseline. It raises
+    # it for the next `window` steps: the same jump two steps later is under the limit then.
+    back = quiet(6) + [step(6, **jump), step(7), step(8, **jump)]
+    assert ev.detect_update_spikes(back, window=4)["spike_steps"] == [6]
+    # Once the window has moved past it, the same jump is flagged again.
+    later = quiet(6) + [step(6, **jump), step(7)] + quiet(5, start=8) + [step(13, **jump)]
+    assert ev.detect_update_spikes(later, window=4)["spike_steps"] == [6, 13]
+    # A baseline that follows the run: changes ten times larger for a window, and a jump that
+    # was far over the old limit is under the new one.
+    grown = quiet(6) + [step(at, big=0.010 + 0.010 * (at % 2)) for at in range(6, 12)] + [step(12, big=0.010, small=0.08, total=5.0)]
+    assert ev.detect_update_spikes(grown, window=4) is None
+    assert ev.detect_update_spikes(quiet(12) + [step(12, big=0.010, small=0.08, total=5.0)], window=4)["step"] == 12
 
 
 def test_what_cannot_be_judged_is_left_out_and_is_never_the_step_before():
@@ -487,55 +508,55 @@ def test_what_cannot_be_judged_is_left_out_and_is_never_the_step_before():
         step(6, small=5.0, total=nan), step(6, small=5.0, total="inf"),
         step(6, big=nan, small="nan", total=9.0),
     ):
-        hit = ev.detect_update_spikes(base + [odd, step(7, **jump)], warmup=4)
+        hit = ev.detect_update_spikes(base + [odd, step(7, **jump)], window=4)
         assert (hit["step"], hit["previous"], hit["grad_norm_before"]) == (7, 0.011, 1.0), odd
-        assert ev.detect_update_spikes(base + [odd], warmup=4) is None, odd
+        assert ev.detect_update_spikes(base + [odd], window=4) is None, odd
     # One parameter that is not finite is left out; the others are judged.
-    hit = ev.detect_update_spikes(base + [step(6, big=nan, **jump)], warmup=4)
+    hit = ev.detect_update_spikes(base + [step(6, big=nan, **jump)], window=4)
     assert hit["step"] == 6 and [p["name"] for p in hit["parameters"]] == ["small"]
     # A non-finite total is `non_finite`'s to report.
-    evidence = tensorquill.build_evidence(base + [step(6, small=5.0, total=nan)], update_warmup=4)
+    evidence = tensorquill.build_evidence(base + [step(6, small=5.0, total=nan)], update_window=4)
     assert [i["kind"] for i in evidence["incidents"]] == ["non_finite"]
 
 
 def test_a_new_attempt_is_not_compared_with_the_one_it_replaced():
     resumed = quiet(6) + [step(6, small=0.3, total=4.5, attempt=2), step(7, small=0.3, total=4.5, attempt=2)]
-    assert ev.detect_update_spikes(resumed, warmup=4) is None
+    assert ev.detect_update_spikes(resumed, window=4) is None
     later = resumed + [step(8, small=0.9, total=8.5, attempt=2)]
-    assert ev.detect_update_spikes(later, warmup=4)["step"] == 8
+    assert ev.detect_update_spikes(later, window=4)["step"] == 8
 
 
 def test_a_run_that_clips_is_judged_by_the_norm_before_clipping():
     # `grad_norm` is read after clipping and stays flat; the jump is in `clip_grad_norm`.
     clipped = [{**r, "clip_grad_norm": 2.0} for r in quiet(6)] + [step(6, small=0.3, total=1.0, clip_grad_norm=6.0)]
-    hit = ev.detect_update_spikes(clipped, warmup=4)
+    hit = ev.detect_update_spikes(clipped, window=4)
     assert (hit["step"], hit["grad_norm"], hit["grad_rise"]) == (6, 6.0, 4.0)
     # Once any record has it, a record without it has no total: the steps before clipping began are not judged.
     late = quiet(6) + [{**r, "clip_grad_norm": 2.0} for r in quiet(3, start=6)] + [step(9, small=0.3, total=1.0, clip_grad_norm=6.0)]
-    assert ev.detect_update_spikes(late, warmup=4) is None  # two changes since clipping began: no baseline yet
-    assert ev.detect_update_spikes(late, warmup=2)["step"] == 9
+    assert ev.detect_update_spikes(late, window=4) is None  # two changes since clipping began: no baseline yet
+    assert ev.detect_update_spikes(late, window=2)["step"] == 9
 
 
 def test_the_baseline_is_the_option_and_the_kind_needs_two_records_more():
     records = quiet(12) + [step(12, small=0.3, total=4.5)]
-    for warmup, found in ((4, True), (11, True), (12, False)):
-        evidence = tensorquill.build_evidence(records, update_warmup=warmup)
+    for window, found in ((4, True), (11, True), (12, False)):
+        evidence = tensorquill.build_evidence(records, update_window=window)
         check = evidence["kind_checks"]["update_spike"]
-        assert bool(spikes(evidence)) is found, warmup
-        assert (check["records"], check["records_needed"], check["enough_history"]) == (13, warmup + 2, found)
+        assert bool(spikes(evidence)) is found, window
+        assert (check["records"], check["records_needed"], check["enough_history"]) == (13, window + 2, found)
         # Off its default, the option is listed with the others and named in the summary.
-        assert evidence["thresholds"]["update_warmup"] == warmup
-        assert f"update_warmup {warmup} (default: 1000)" in ev.thresholds_line(evidence)
+        assert evidence["thresholds"]["update_window"] == window
+        assert f"update_window {window} (default: 100)" in ev.thresholds_line(evidence)
     usual = tensorquill.build_evidence(records)
     assert "thresholds" not in usual and not spikes(usual) and ev.thresholds_line(usual) is None
-    assert "update_spike 13 of 1002" in ev.checked_line(usual)
+    assert "update_spike 13 of 102" in ev.checked_line(usual)
     for bad in (0, -1, 2.5, True, None):
-        with pytest.raises(ValueError, match="update_warmup"):
-            tensorquill.build_evidence(records, update_warmup=bad)
+        with pytest.raises(ValueError, match="update_window"):
+            tensorquill.build_evidence(records, update_window=bad)
 
 
 def test_the_summary_names_the_step_the_sizes_and_the_parameter():
-    evidence = tensorquill.build_evidence(quiet(6) + [step(6, small=0.3, total=4.5)], update_warmup=4)
+    evidence = tensorquill.build_evidence(quiet(6) + [step(6, small=0.3, total=4.5)], update_window=4)
     (found,) = spikes(evidence)
     assert found["class"] == "anomaly" and evidence["run_state"]["state"] == "unhealthy"
     line = next(text for text in ev.incident_summary(evidence).splitlines() if "Update-size jump" in text)
@@ -615,7 +636,7 @@ class Toy(nn.Module):
 
 
 SEEDED = "blocks.1.linear1.weight"
-WARMUP, FAULT_STEP, TOY_STEPS = 100, 180, 260
+WINDOW, FAULT_STEP, TOY_STEPS = ev.UPDATE_WINDOW, 180, 260
 
 
 def toy_run(seed: int, *, clip: float | None = None, fault: float | None = None, make=None) -> list[dict]:
@@ -641,18 +662,22 @@ def toy_run(seed: int, *, clip: float | None = None, fault: float | None = None,
     return sink.records
 
 
-def margin(records: list[dict], warmup: int = WARMUP) -> float:
-    """The largest change over its limit on any judged step: a step is flagged above 1."""
+def margin(records: list[dict], window: int = WINDOW) -> float:
+    """The largest change over its limit on any judged step, by the rule as `detect_update_spikes`
+    applies it: a step is flagged above 1, and a flagged change stays out of the baseline."""
     key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
-    worst, summed, seen, before = 0.0, 0.0, 0, None
+    worst, recent, before = 0.0, [], None
     for record in records:
         largest, total = max(record["update_rms"].values()), record[key]
         if before is not None:
             change, rise = abs(largest - before[0]), max(0.0, total - before[1])
-            if seen < warmup:
-                summed, seen = summed + change, seen + 1
+            if len(recent) < window:
+                recent.append(change)
             else:
-                worst = max(worst, change * ev.UPDATE_ALPHA * math.sqrt(rise) / (summed / warmup))
+                over = change * ev.UPDATE_ALPHA * math.sqrt(rise) / (math.fsum(recent[-window:]) / window)
+                worst = max(worst, over)
+                if over <= 1:
+                    recent.append(change)
         before = (largest, total)
     return worst
 
@@ -661,7 +686,7 @@ def margin(records: list[dict], warmup: int = WARMUP) -> float:
 def test_clean_toy_runs_stay_silent_over_several_seeds(clip):
     for seed in range(4):
         records = toy_run(seed, clip=clip)
-        evidence = tensorquill.build_evidence(records, update_warmup=WARMUP)
+        evidence = tensorquill.build_evidence(records, update_window=WINDOW)
         check = evidence["kind_checks"]["update_spike"]
         assert (check["value"], check["records"], check["enough_history"]) == ("checked", TOY_STEPS, True)
         assert spikes(evidence) == [] and entry(evidence) is None, (seed, clip)
@@ -672,7 +697,7 @@ def test_clean_toy_runs_stay_silent_over_several_seeds(clip):
 @pytest.mark.parametrize("clip", [None, 1.0], ids=["no clipping", "clipping at 1"])
 def test_a_seeded_gradient_fault_fires_at_its_step_and_names_the_parameter(clip):
     records = toy_run(0, clip=clip, fault=1e4)
-    evidence = tensorquill.build_evidence(records, update_warmup=WARMUP)
+    evidence = tensorquill.build_evidence(records, update_window=WINDOW)
     (found,) = spikes(evidence)
     assert found["step"] == FAULT_STEP and found["spike_steps"][0] == FAULT_STEP
     assert found["parameters"][0]["name"] == SEEDED
@@ -687,7 +712,7 @@ def test_a_seeded_gradient_fault_fires_at_its_step_and_names_the_parameter(clip)
 
 def test_the_toy_with_sgd_reads_not_checked_with_its_reason():
     records = toy_run(0, fault=1e4, make=lambda p: torch.optim.SGD(p, lr=0.05))[:60]
-    evidence = tensorquill.build_evidence(records, update_warmup=WARMUP)
+    evidence = tensorquill.build_evidence(records, update_window=WINDOW)
     assert spikes(evidence) == [] and evidence["kind_checks"]["update_spike"]["value"] == "unavailable"
     assert entry(evidence)["reason"].startswith("SGD: SGD is not Adam or AdamW: the update size is worked out from the two moments")
 
@@ -716,42 +741,42 @@ def _run(name: str, count: int, change=lambda at, record: None, attempt: int = 1
 
 
 def update_cases() -> dict[str, list[dict]]:
-    """Record sets that reach each branch of the rule at the default baseline of 1,000 changes."""
+    """Record sets that reach each branch of the rule at the default baseline of the last 100 changes."""
     nan = float("nan")
 
     def spiked(at, record):
-        if at in (1005, 1020):  # flagged: the gradient norm rose and one parameter's update jumped
+        if at in (105, 120):  # flagged: the gradient norm rose and one parameter's update jumped
             record.update(grad_norm=40.0, update_rms=_sizes(at, **{"blocks.0.weight": 0.05}))
-        if at == 1010:  # the same jump with a gradient norm that fell is not flagged. The step after it is: the
+        if at == 110:  # the same jump with a gradient norm that fell is not flagged. The step after it is: the
             # rule reads the change either way, the size fell back and the norm rose to its usual value
             record.update(grad_norm=0.5, update_rms=_sizes(at, **{"blocks.0.weight": 0.05}))
 
     def late_clipping(at, record):
         if at >= 20:
             record["clip_grad_norm"] = 2.0 * _wobble(at, 4)
-        if at == 1030:
+        if at == 130:
             record.update(clip_grad_norm=30.0, update_rms=_sizes(at, **{"embed.weight": 0.04}))
 
     def odd(at, record):
-        if at in (300, 301, 1004):  # the scaler skipped: sizes repeat or are wild, and are not read
+        if at in (30, 31, 104):  # the scaler skipped: sizes repeat or are wild, and are not read
             record.update(step_skipped=True, grad_scale=1024.0, grad_norm=float("inf"), update_rms=_sizes(at, **{"blocks.0.bias": 9.0}))
         else:
             record.update(step_skipped=False, grad_scale=1024.0)
-        if at == 400:
+        if at == 40:
             del record["update_rms"]
-        if at == 401:
+        if at == 41:
             record["update_rms"] = {}
-        if at == 402:
+        if at == 42:
             record["update_rms"] = _sizes(at, **{"embed.weight": nan})
-        if at == 403:
+        if at == 43:
             record["update_rms"] = {name: nan for name in _sizes(at)}
-        if at == 404:
+        if at == 44:
             record["grad_norm"] = None
-        if at == 1012:
+        if at == 112:
             record.update(grad_norm=25.0, update_rms=_sizes(at, **{"blocks.0.bias": 0.06, "embed.weight": 0.03}))
 
     def resumed(at, record):  # the second attempt: its first record is not compared, the next jump is
-        if at == 1015:
+        if at == 115:
             record.update(grad_norm=30.0, update_rms=_sizes(at, **{"blocks.0.weight": 0.07}))
 
     def unread(at, record):
@@ -770,13 +795,13 @@ def update_cases() -> dict[str, list[dict]]:
         record["grad_norm"] = None
         del record["grad_norms"]
 
-    first = _run("update-resumed", 1008)
-    first[1006].update(grad_norm=30.0, update_rms=_sizes(1006, **{"blocks.0.weight": 0.07}))  # rolled back by the resume
+    first = _run("update-resumed", 108)
+    first[106].update(grad_norm=30.0, update_rms=_sizes(106, **{"blocks.0.weight": 0.07}))  # rolled back by the resume
     return {
-        "update size, a jump": _run("update-jump", 1030, spiked),
-        "update size, clipping starts late": _run("update-clip", 1040, late_clipping),
-        "update size, what is left out": _run("update-odd", 1020, odd),
-        "update size, a resume": first + _run("update-resumed", 20, resumed, attempt=2, start=1005),
+        "update size, a jump": _run("update-jump", 130, spiked),
+        "update size, clipping starts late": _run("update-clip", 140, late_clipping),
+        "update size, what is left out": _run("update-odd", 120, odd),
+        "update size, a resume": first + _run("update-resumed", 20, resumed, attempt=2, start=105),
         "update size, not read": _run("update-unread", 12, unread),
         "update size, read for some": _run("update-partly", 12, partly),
         "update size, no gradient norm": _run("update-no-total", 12, no_total),
@@ -791,10 +816,10 @@ def test_the_record_sets_reach_each_branch_of_the_rule():
     found = {name: tensorquill.build_evidence(records) for name, records in UPDATE_CASES.items()}
     def of(name):
         return [(i["step"], i["spike_steps"], [p["name"] for p in i["parameters"]][:1]) for i in spikes(found[name])]
-    assert of("update size, a jump") == [(1005, [1005, 1011, 1020], ["blocks.0.weight"])]
-    assert of("update size, clipping starts late") == [(1030, [1030], ["embed.weight"])]
-    assert of("update size, what is left out") == [(1012, [1012], ["blocks.0.bias"])]
-    assert of("update size, a resume") == [(1015, [1015], ["blocks.0.weight"])]
+    assert of("update size, a jump") == [(105, [105, 111, 120], ["blocks.0.weight"])]
+    assert of("update size, clipping starts late") == [(130, [130], ["embed.weight"])]
+    assert of("update size, what is left out") == [(112, [112], ["blocks.0.bias"])]
+    assert of("update size, a resume") == [(115, [115], ["blocks.0.weight"])]
     values = {name: evidence["kind_checks"]["update_spike"] for name, evidence in found.items()}
     assert (values["update size, not read"]["value"], values["update size, not read"]["records"]) == ("unavailable", 0)
     assert (values["update size, read for some"]["value"], values["update size, read for some"]["records"]) == ("unavailable", 12)
@@ -804,7 +829,7 @@ def test_the_record_sets_reach_each_branch_of_the_rule():
         "step": 2,
     }
     assert values["update size, no gradient norm"] == {
-        "value": "not_configured", "records": 0, "records_needed": 1002, "enough_history": False, "needs": NEEDS}
+        "value": "not_configured", "records": 0, "records_needed": 102, "enough_history": False, "needs": NEEDS}
     assert (values["update size, still warming up"]["value"], values["update size, still warming up"]["enough_history"]) == ("checked", False)
     # The scalars logged on the step come with the incident, as for every kind.
-    assert spikes(found["update size, a jump"])[0]["scalars"]["train/loss"]["value"] == 2.0 - 1005 / 2000
+    assert spikes(found["update size, a jump"])[0]["scalars"]["train/loss"]["value"] == 2.0 - 105 / 2000

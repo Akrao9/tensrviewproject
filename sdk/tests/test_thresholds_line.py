@@ -28,14 +28,14 @@ from tensorquill.evidence import THRESHOLD_DEFAULTS, THRESHOLD_NAMES, incident_s
 
 # Every one differs from its default (the values of `test_reader_thresholds.APPLIED`).
 APPLIED = {"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": 2,
-           "update_warmup": 30}
+           "update_window": 30}
 NAMED = {
     "overload_threshold": "overload_threshold 0.5 (default: 0.35)",
     "drift_tolerance": "drift_tolerance 0.001 (default: 1e-06)",
     "starve_window": "starve_window 20 (default: 50)",
     "starve_ratio": "starve_ratio 0.5 (default: 0.1)",
     "top_k": "top_k 2 (default: what the run recorded)",
-    "update_warmup": "update_warmup 30 (default: 1000)",
+    "update_window": "update_window 30 (default: 100)",
 }
 PREFIX = "Thresholds that are not the defaults: "
 SERVER_LINE = PREFIX + "the server applied " + ", ".join(NAMED[name] for name in THRESHOLD_NAMES) + "."
@@ -255,7 +255,7 @@ def test_the_command_line_prints_the_line_for_every_look_it_reports(tmp_path, st
 
 FLAGS = {"overload_threshold": "--overload-threshold", "drift_tolerance": "--drift-tolerance",
          "starve_window": "--starve-window", "starve_ratio": "--starve-ratio", "top_k": "--top-k",
-         "update_warmup": "--update-warmup"}
+         "update_window": "--update-window"}
 # Each typed at its default value (`top_k`'s default, what the run recorded, has no value to type).
 TYPED_DEFAULTS = {name: value for name, value in THRESHOLD_DEFAULTS.items() if value is not None}
 ONE_READ_MODES = {"plain": [], "rank": ["--rank", "0"], "compact": ["--compact"]}

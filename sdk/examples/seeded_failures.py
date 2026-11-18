@@ -24,8 +24,8 @@ and fails unless the real capture and `build_evidence` report it in time, on tha
   times `--factor` (10,000 unless given) from `--seed-step`, with `init(..., updates=True)`, which
   records the size of AdamW's update to each parameter from the optimizer's own state. PASS when
   the `update_spike` incident is at the seeded step and the parameter whose update moved most is
-  the seeded one. The rule's baseline is the first `--update-warmup` step-to-step changes (200
-  here, so that it ends before the default seed step of 250; the detector's own default is 1,000).
+  the seeded one. The rule's baseline is the mean of the last `--update-window` step-to-step
+  changes that were not flagged (the detector's default, 100), so the seed step must come after them.
   Adam divides by the gradient's own size, so one bad gradient moves a parameter only a few
   learning rates: x100 on one parameter is often under the rule's limit, and x10,000 is not.
 
@@ -66,7 +66,7 @@ import torch
 
 import tensorquill
 from tensorquill.capture import WEIGHT_EVERY
-from tensorquill.evidence import SPIKE_FACTOR, SPIKE_MIN_HISTORY, SPIKE_SUSTAIN, SPIKE_WINDOW, STALL_STEPS
+from tensorquill.evidence import SPIKE_FACTOR, SPIKE_MIN_HISTORY, SPIKE_SUSTAIN, SPIKE_WINDOW, STALL_STEPS, UPDATE_WINDOW
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dense_outlier_check import FLUSH_EVERY, MODEL, build_models, load_batches, train_step  # noqa: E402
@@ -427,7 +427,7 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
             scale.remove()
 
     records = tensorquill.load_records(jsonl)
-    evidence = tensorquill.build_evidence(records, **({"update_warmup": args.update_warmup} if case == UPDATE else {}))
+    evidence = tensorquill.build_evidence(records, **({"update_window": args.update_window} if case == UPDATE else {}))
     print(f"\n--- Detection ({case}) ---")
     print(tensorquill.incident_summary(evidence))
     if case == "grad_spike":
@@ -453,9 +453,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--case", choices=[*CASES, UPDATE, "both", HEALTHY, "all"], default="both",
                         help="both: grad_spike and stalled_weights; healthy: nothing planted; all: healthy, then both; "
                              "update_spike: the seeded gradient read as the size of the optimizer's update")
-    parser.add_argument("--update-warmup", type=int, default=200,
-                        help="update_spike: step-to-step changes that make the rule's baseline; the seed step must come "
-                             "at least two steps after them (default: 200; the detector's default is 1000)")
+    parser.add_argument("--update-window", type=int, default=UPDATE_WINDOW,
+                        help="update_spike: how many of the last step-to-step changes make the rule's baseline; the seed "
+                             f"step must come after the first of them (default: the detector's, {UPDATE_WINDOW})")
     parser.add_argument("--out", type=Path, required=True, help="new directory; each case writes a folder in it")
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -488,9 +488,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         # A spike in one parameter is known once it has lasted SPIKE_SUSTAIN recorded steps.
         if case == UPDATE:
-            if args.update_warmup < 1 or args.seed_step < args.update_warmup + 1:
+            if args.update_window < 1 or args.seed_step < args.update_window + 1:
                 parser.error(f"--seed-step {args.seed_step} is inside the baseline: update_spike is first judged at step "
-                             f"{args.update_warmup + 1} with --update-warmup {args.update_warmup}")
+                             f"{args.update_window + 1} with --update-window {args.update_window}")
             need = args.seed_step + 1
         else:
             need = args.seed_step + SPIKE_SUSTAIN if case == "grad_spike" else first_visible_stall(args.freeze_step) + 1

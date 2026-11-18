@@ -536,16 +536,16 @@ def test_an_option_reaches_the_rust_rules_and_gives_pythons_result(option):
 
 
 @pytest.mark.parametrize("warmup", [1, 4, 11, 12, 500])
-def test_the_update_baseline_reaches_the_rust_rules_and_gives_pythons_result(warmup):
+def test_the_update_window_reaches_the_rust_rules_and_gives_pythons_result(warmup):
     # Thirteen records with a jump on the last: found with a baseline of up to eleven changes.
     records = quiet(12) + [update_step(12, small=0.3, total=4.5)]
-    assert both(records, update_warmup=warmup) == []
-    rust = tensorquill.build_evidence(records, detectors="rust", update_warmup=warmup)
+    assert both(records, update_window=warmup) == []
+    rust = tensorquill.build_evidence(records, detectors="rust", update_window=warmup)
     assert bool([i for i in rust["incidents"] if i["kind"] == "update_spike"]) is (warmup <= 11)
     assert rust["kind_checks"]["update_spike"]["records_needed"] == warmup + 2
     # And on the long sets, where a shorter baseline moves the incident.
     for name in ("update size, a jump", "update size, what is left out", "update size, a resume"):
-        assert both(UPDATE_CASES[name], update_warmup=warmup) == [], name
+        assert both(UPDATE_CASES[name], update_window=warmup) == [], name
 
 
 # One router of a record set, and a value for it other than the one recorded on every row,
@@ -581,10 +581,10 @@ def test_a_top_k_for_one_router_stands_against_the_value_recorded_on_every_row(n
 def test_the_report_lists_the_thresholds_it_applied():
     usual = server_report(everything())["thresholds"]
     assert (usual["overload_threshold"], usual["drift_tolerance"], usual["starve_window"], usual["starve_ratio"]) == (0.35, 1e-6, 50, 0.1)
-    assert usual["top_k"] is None and (usual["update_warmup"], usual["update_alpha"]) == (1000, 0.05)
+    assert usual["top_k"] is None and (usual["update_window"], usual["update_alpha"]) == (100, 0.05)
     assert server_report(everything(), thresholds={})["thresholds"] == usual  # every key left out
     asked = {"overload_threshold": 0.5, "drift_tolerance": 1e-3, "starve_window": 20, "starve_ratio": 0.5, "top_k": {"r1": 2},
-             "update_warmup": 30}
+             "update_window": 30}
     applied = server_report(everything(), thresholds=asked)["thresholds"]
     assert {name: applied[name] for name in asked} == asked
     assert {name: value for name, value in applied.items() if name not in asked} == {
@@ -597,7 +597,7 @@ def test_the_report_lists_the_thresholds_it_applied():
 
 @pytest.mark.parametrize("option, reason", [
     ({"starve_window": 0}, "starve_window must be at least 1"),
-    ({"update_warmup": 0}, "update_warmup must be"),
+    ({"update_window": 0}, "update_window must be"),
     ({"top_k": 0}, "top_k must be at least 1"),
     ({"top_k": {"r1": 0}}, "top_k must be at least 1"),
     ({"overload_threshold": -0.1}, "overload_threshold must be a finite number of at least 0"),
