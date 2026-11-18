@@ -148,8 +148,9 @@ def _output_unread(x: torch.Tensor, device: torch.device) -> str | None:
     not run here: no GPU), so the host does not wait; from the CPU, one copy to the device, where
     the hook before this made three (`torch.where` copied each CPU number to the device). An output
     on a device whose numbers would have to be read back to the host, an MPS or CUDA output with
-    the statistics on the CPU (a model split between CPU and MPS, FSDP's CPU offload), is not read:
-    that copy waits for the device at every forward."""
+    the statistics on the CPU (a model split between CPU and MPS; by reading, not run, also FSDP's
+    CPU offload, whose first parameter is on the CPU), is not read: that copy waits for the device
+    at every forward."""
     if x.is_nested:
         return "its output is a nested tensor"
     if x.layout != torch.strided:
@@ -1296,7 +1297,11 @@ class Session:
             out = dtype if exact else (torch.float32 if param_dtype in _LOW_PRECISION else None)
             indices = tuple(i for i, _ in items)
             try:
-                norms = torch.stack(_foreach_norm([data for _, data in items], out)).to(current)
+                norms = torch.stack(_foreach_norm([data for _, data in items], out))
+                if norms.device != current.device:
+                    # Move, then widen: MPS cannot hold the float64 `current` may be.
+                    norms = norms.to(current.device)
+                norms = norms.to(current)
             except Exception:  # noqa: BLE001
                 unread.extend(indices)
                 continue

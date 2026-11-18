@@ -24,7 +24,7 @@ from torch import nn
 
 import tensorquill
 from tensorquill import distributed as D
-from tensorquill.capture import STATS, _stats_hook
+from tensorquill.capture import STATS
 
 MPS = torch.backends.mps.is_available()
 needs_mps = pytest.mark.skipif(not MPS, reason="needs Apple MPS")
@@ -140,11 +140,16 @@ def test_blocks_on_cpu_and_mps_train_and_only_a_read_back_is_left_out(tmp_path, 
     else:
         assert all(set(r["layers"]) == {"blocks.0", "blocks.1"} for r in records)
         assert problems["blocks.1"] == []
-    assert all(set(r["weight_norms"]) == {"blocks.0.lin.weight", "blocks.0.lin.bias", "blocks.1.lin.weight",
-                                           "blocks.1.lin.bias"} for r in records)
-    first_norm = records[-1]["weight_norms"]["blocks.0.lin.weight"]
-    assert first_norm == pytest.approx(torch.linalg.vector_norm(model.blocks[0].lin.weight.detach().cpu()).item(),
-                                       rel=1e-6)
+    # Every parameter's norm, on both devices, is read and true. Where the buffers are on the CPU
+    # (float64 compared exactly), MPS's float32 norms cannot be compared exactly, so its two
+    # parameters are never listed as unchanged; on an MPS session no parameter is.
+    last = records[-1]
+    for block in model.blocks:
+        for name, param in (("weight", block.lin.weight), ("bias", block.lin.bias)):
+            key = f"blocks.{list(model.blocks).index(block)}.lin.{name}"
+            real = torch.linalg.vector_norm(param.detach().cpu().double()).item()
+            assert last["weight_norms"][key] == pytest.approx(real, rel=1e-6), key
+    assert not {"blocks.1.lin.weight", "blocks.1.lin.bias"} & set(last.get("weights_unchanged", []))
 
 
 def test_between_two_gpus_and_from_the_cpu_the_four_numbers_are_moved_not_left_out():
