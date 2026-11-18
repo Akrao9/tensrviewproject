@@ -87,7 +87,8 @@ struct Args {
     #[arg(long, global = true, value_name = "JSON", value_parser = Thresholds::parse)]
     thresholds: Option<Thresholds>,
     /// How long a failing request to S3 or GCS is retried before the stream is told the store is unavailable
-    /// (the sender keeps its rows and tries again). Also bounds how long SIGTERM waits for a failing store.
+    /// (the sender keeps its rows and tries again). Also bounds each wait for a failing store at SIGTERM:
+    /// a write in progress, then the last parts, then the stopped status.
     #[arg(long, default_value_t = 30.0)]
     store_retry_seconds: f64,
     /// A run with no stream open, whose ranks have all been disconnected or finished for this many hours,

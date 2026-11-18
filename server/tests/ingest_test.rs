@@ -384,7 +384,7 @@ async fn a_resumed_attempt_keeps_the_steps_it_writes_again() {
 
 /// `(attempt, last_step, gaps)` of rank 0 in the status, once its last step is `step`.
 async fn progress_at(server: &TestServer, step: i64) -> (i64, i64, usize) {
-    until(&format!("last_step {step}"), || {
+    until_within(&format!("last_step {step}"), SLOW_BOUND, || {
         server
             .ingest
             .watchdog_statuses()

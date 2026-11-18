@@ -1645,6 +1645,62 @@ State as of Nov 16, 2026.
     - The trigger does not read `stopped_stacks`, and a local run of several ranks has no status, so no stacks are grouped there.
     - Nothing here ran on a GPU, a real model or PyTorch 2.6. Nothing is pushed.
   - *CI on the merged tree (`78f8f7e`, run 44377712206).* 11 of 13 jobs passed, both PyTorch 2.6 jobs among them, so 2.6 stays supported with no version-specific code. Two PyTorch 2.15 jobs failed on one test that no lane touched, `test_ranks_that_issued_different_collectives_are_a_desync`. PyTorch's Flight Recorder loader lists the dumps in the file system's order (`os.walk`), and its analyzer takes the first rank it reads as the reference, so where two ranks issued different collectives the rank it calls the culprit, and the collective it names, followed the runner's disk. Reproduced here by listing the dumps in reverse. Fixed at the author's word: `analyze_flight_recorder` puts the dumps in rank order before the analyzer reads them, and a new test runs the same dumps listed both ways (it fails without the fix). This makes the answer the same on every machine, not more right: with two ranks that disagree nothing says which is at fault, and the summary still quotes PyTorch's "Culprit rank N". Whether to soften that wording for two ranks is the author's.
+- [x] **R6: three server findings of the outside review (Nov 18, 2026, lane R6, branch `claude/lane-r6-server-920397`; not merged).** These are RUST-01, RUST-03 and RUST-04 of the review written at `78f8f7e`, as the top session checked them on `3124fd2`. Only `server/` changed: `src/ingest.rs`, `src/main.rs`, `src/watchdog.rs` and `tests/ingest_test.rs`. The Parquet schema, the detectors, `detect`'s output, the golden files and the protocol number (2) are unchanged. RUST-02 and RUST-05 were judged not to hold, or to be narrow, and are not touched.
+  - *RUST-01, the test half: reproduced and fixed.*
+    - The fault. `exceeding_the_128_mib_quota_returns_resource_exhausted` waited 2 × 300 ms, then asserted that 100 MiB was buffered.
+    - Reproduced. At background priority (`taskpolicy -b`, six runs at once) it failed 12 of 12 at `tests/ingest_test.rs:436`, the line lane B saw fail. At normal priority, 12 single runs and 6 runs of the whole file passed.
+    - The fix. The test now polls `buffered_bytes()` through a new `until_within` (up to 120 s; `until` keeps its 5 s). It then checks that the third rank is refused while the first two still have no acknowledgement. It passed 12 of 12 under the same throttling.
+    - Two other fixed waits asserted a state the server reaches in its own time, and now poll:
+      - `buffered_ranks` waited for the first buffered byte, then 100 ms, before 32 parts were asserted. It now waits until the status names all 32 ranks' batches, then sleeps the 100 ms that ages the buffers past their 50 ms interval.
+      - `sigterm_flushes_buffered_rows_before_exit` sent SIGTERM 500 ms after the batch. It now waits until the binary's `watchdog.json` names step 49.
+    - Left as they are. The other `no_ack_within` calls assert that nothing arrived, which slowness cannot make fail. The remaining sleeps are the test's input: pacing ranks, outages, refresh and abandon times, file-time resolution. Under the same throttling, `ranks_are_written_concurrently_so_a_slow_store_does_not_serialise_them` misses its 1.5 s bound (47 s). That is a timing claim, not a wait, and is not changed.
+  - *RUST-01, the h2 half: does not reproduce, and the code is left as it was.*
+    - The test. The new test `a_refused_stream_is_told_its_status_while_more_batches_are_in_flight` sends 200 streams through a tonic client on a four-thread runtime, eight at a time. Each stream is refused, half for the quota and half as a bad batch, with eight 1 MiB batches queued behind the refused one. So DATA is still in flight when the server stops reading.
+    - The result. Every client read `ResourceExhausted: ingest buffer full` or its `InvalidArgument`. Over 24 runs (debug and release, normal and background priority), that is 4,800 streams with none `Unknown`. With the error send removed as a check, the test fails, reading `not a status: None` on all 200.
+    - Why, read in the sources:
+      - Dropping the request body sends no reset while the response is open (h2 0.4.20, `RecvStream::drop`).
+      - The reset that follows the trailers is `NO_ERROR` (`maybe_cancel`). hyper 1.12 reads that as the end of a body.
+      - h2 keeps a received end of stream after a reset (`ErrorAfterEndStream`).
+  - *Lane E's h2 errors: not explained by the drop order.*
+    - What `Unknown` means. tonic reports `Unknown: h2 protocol error: …` only for an h2 error whose reason it does not map. Examples are an error with no reason at all (an I/O error on the connection, or one of h2's own user errors) or a `STREAM_CLOSED` reset. The reset a dropped stream would cause is `NO_ERROR` or `CANCEL`, which tonic does map.
+    - The experiment. A tonic client whose server process is killed under a waiting stream reads exactly `Unknown: h2 protocol error: error reading a body from connection`, caused by "stream closed because of a broken pipe". This was a throwaway experiment and is not kept.
+    - The conclusion. Those ranks most likely lost their connection. A refusal would have reached them with its own code, as 139 quota refusals did in lane E's first 1,024-rank run. What broke the connections is not known.
+    - Follow-ups. Make `live_streams.rs` print a status's source chain, and have the server log a refused stream (it logs none now).
+  - *RUST-04: reproduced and fixed.*
+    - The fault. `main.rs` aborted the flusher and the status writer, wrote the stopped status, and only then flushed.
+    - The fix. `main.rs` now calls a new `Ingest::stop`, which does this in order:
+      1. It refuses batches.
+      2. It signals both tasks through a `watch` channel, which they check between rounds. A round already started skips the ranks it has not begun.
+      3. It waits for the two tasks to end.
+      4. It flushes and judges what is buffered (`shutdown`).
+      5. It writes the stopped status, even when the flush failed, and returns that error afterwards.
+    - Tests:
+      - `sigterm_flushes_buffered_rows_before_exit` runs the binary with rows buffered at SIGTERM. It now also checks that `incidents.json` reaches step 49, and that the last `watchdog.json` says `server_stopped` with rank 0 judged. On the old binary it failed: `no_steps` and `ranks_unknown: [0]`.
+      - New: `a_stop_lets_a_flush_in_progress_finish_and_writes_the_stopped_status_last`. It runs in process with every store request taking 300 ms, and stops as soon as the timed flush's part is acknowledged. With the old order moved into the library first, `incidents.json` was never written.
+    - The cost. A SIGTERM that arrives during a write to a failing store waits for that write's retry time before the shutdown flush starts. A status write in progress is also waited for, so no live status can land after the stopped one. The `--store-retry-seconds` help now says it bounds each of these waits, not the whole stop.
+  - *RUST-03: reproduced and fixed.*
+    - The fix. `Watchdog::batch` now makes a new attempt's step the rank's `last_step` at that attempt's first stored batch. A new attempt is one other than the rank's, or one seen in heartbeats that has stored nothing yet. Within an attempt, `last_step` is the running maximum, as before. `accept` now reports the last attempt that kept rows, with that attempt's own last step; it used to take the maximum across the attempts in one batch.
+    - Unchanged:
+      - Rows of an earlier attempt sent late, while the new attempt has stored nothing, raise `last_step` without counting as progress.
+      - There is one `batch` call per batch, so the gaps, states and severities are as they were. A new unit test checks this on the stall clock: silent at 60 s, critical at 180 s, gaps `[10, 10, 10, 10]`.
+      - A lower attempt, once the newer one has stored rows, is still taken as a job started again (a host whose clock is behind). Its step is now the rank's too.
+    - Tests changed. Two existing unit tests changed only their `last_step` expectations: 99 → 29, and 120 → 29 then 59.
+    - New tests, all failing before the fix:
+      - `last_step_is_the_newest_attempts_once_it_stores_rows_and_stall_timing_is_unchanged`, a unit test.
+      - `the_status_follows_the_newest_attempts_step_once_it_stores_rows`, on a real stream. It sees 149, then 109 for the resumed attempt, then 59 for one batch that ends attempt 200 and starts attempt 300.
+    - The trigger. Its stall episodes compare a rank's attempt and step, and a new attempt already ends an episode, so a lower step after it changes nothing there. That was read in `trigger.py`, and the real-server test bears it out: `test_a_new_attempt_that_hangs_before_it_passes_the_old_step_fires_again` still fires once for each stall, twice in all.
+    - **An SDK test pins the old value: open, for the author.** That same test fails on its last line, `rank["last_step"] == 99  # the highest stored step, of the old attempt`, where the status now says 29, the step the new attempt stored. It fails on every run. The test is in `sdk/tests/test_trigger.py`, outside this lane, and is not changed here. The expectation becomes 29 if this change is kept.
+  - *Run.* macOS, offline, with lanes R1 to R5 building on the same machine (load averages 20 to 50).
+    - Rust:
+      - `cargo build --release`.
+      - `cargo test` and `cargo test --release`: 98 unit tests, 34 integration tests and 1 ignored, and 1 protocol test.
+      - `cargo clippy --all-targets -- -D warnings`, with and without default features.
+      - `cargo fmt --check`.
+      - At background priority, six runs at a time: the three new stop and attempt tests passed 12 of 12.
+    - Python: the 27 files of the CI server job, with this branch's debug binary: 1,098 passed and 2 failed, in 16.5 minutes at load averages of 30 to 50.
+      - `test_a_new_attempt_that_hangs_before_it_passes_the_old_step_fires_again` fails on every run, on the pinned value above.
+      - `test_a_job_started_again_that_hangs_before_its_first_stored_step_fires_after_its_start_window[all]` failed once. Its message was not kept. Its new attempt stores no step, so `last_step` does not reach it, and it asserts timings (the new attempt seen within 4 s, nothing fired inside the window). It then passed 5 of 5 alone, both variants. In a run of `test_trigger.py` alone at load 11 to 24 it passed again: 41 passed, and the only failure was the pinned test. So it was load; the same test on the old binary under the same load was not run.
+  - *Not run.* Linux. S3 or GCS: the stop order is the same code, but a store's retry time at SIGTERM was not exercised. No test covers a timed-flush round skipping the ranks it has not started once the stop is set. Lane E's 64- and 1,024-rank runs, again. The SDK trigger against a resumed run.
 
 ## Sources
 
