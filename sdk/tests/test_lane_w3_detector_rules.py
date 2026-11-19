@@ -365,3 +365,126 @@ def test_rust12_skipped_steps_do_not_count_toward_update_history(engine: str, sk
     records = [row(step, update_rms={"w": 0.001}, step_skipped=skipped, grad_scale=1024.0) for step in range(4)]
     check = _evidence(records, engine, update_window=2)["kind_checks"]["update_spike"]
     assert (check["records"], check["enough_history"]) == (counted, counted >= 4)
+
+
+# --- contract 1, Python side: attempts in order of first appearance -------------------------
+#
+# The fixture's attempt numbers go down: A = 900 writes first, B = 2 resumes at step 30. In a
+# local file, an attempt's place is its first appearance; numbers are identities, not order.
+
+
+def _a_then_b(bad_b_step: int | None = None, bad_a_step: int | None = None) -> list[dict[str, Any]]:
+    def fault(step: int, attempt: int, bad: int | None) -> dict[str, Any]:
+        if step == bad:
+            return row(step, attempt, grad_norm=math.nan, grad_norms={"w": math.nan})
+        return row(step, attempt)
+
+    a = [fault(step, 900, bad_a_step) for step in range(102)]  # A's steps 0 to 100, then its late 101
+    b = [fault(step, 2, bad_b_step) for step in range(30, 36)]
+    return a + b
+
+
+def test_contract1_resolve_attempts_orders_attempts_by_first_appearance() -> None:
+    from tensorquill.evidence import resolve_attempts
+
+    kept = resolve_attempts(_a_then_b())
+    assert [(r["attempt"], r["step"]) for r in kept] == [(900, s) for s in range(30)] + [(2, s) for s in range(30, 36)]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_contract1_the_later_attempt_is_judged_whatever_its_number(engine: str) -> None:
+    # A fault in B's rows is the run's; one in A's rolled-back steps (50) is not.
+    found = [i["step"] for i in _evidence(_a_then_b(bad_b_step=32, bad_a_step=50), engine)["incidents"]
+             if i["kind"] == "non_finite"]
+    assert found == [32]
+
+
+def _store(tmp_path: Any, order: list[int] | None) -> Any:
+    import json
+
+    rank = tmp_path / "runs" / "r" / "rank=0"
+    for attempt, first, last in ((900, 0, 101), (2, 30, 35)):
+        folder = rank / f"attempt={attempt}"
+        folder.mkdir(parents=True)
+        (folder / f"part-{first}-{last}.parquet").write_bytes(b"")
+    if order is not None:
+        (rank / "attempts.json").write_text(json.dumps({
+            "schema_version": 1, "run_id": "r", "rank": 0,
+            "attempts": [{"attempt": a, "by": "rows", "first_seen_ms": 0} for a in order],
+        }))
+    return rank
+
+
+def test_contract1_newest_part_follows_the_stored_attempt_order(tmp_path: Any) -> None:
+    from tensorquill.evidence import _newest_part
+
+    newest, path, unknown = _newest_part(_store(tmp_path, [900, 2]))
+    assert newest == (2, 35) and path is not None and path.name == "part-30-35.parquet" and unknown == 0
+
+
+def test_contract1_a_store_without_the_order_falls_back_to_numeric(tmp_path: Any) -> None:
+    from tensorquill.evidence import _newest_part
+
+    newest, _, _ = _newest_part(_store(tmp_path, None))
+    assert newest == (900, 101)
+
+
+# --- contract 3, Python side: capture stopped ----------------------------------------------
+
+
+def _status(rank_state: str, summary: str, **rank: Any) -> dict[str, Any]:
+    return {"summary": summary, "ranks": [{"rank": 0, "state": rank_state, "attempt": 1, "last_step": 40, **rank}]}
+
+
+def _judge(status: dict[str, Any]) -> dict[str, Any]:
+    from tensorquill.evidence import run_state
+
+    return run_state(incidents=[], steps_judged=True, status=status)
+
+
+STOPPED = {"capture_stopped": {"reason": "sink_error", "seconds": 3.0}}
+
+
+@pytest.mark.parametrize(
+    ("rank_state", "summary"),
+    [("capture_stopped", "capture_stopped"), ("unresponsive", "stalled"), ("lost", "stalled"),
+     ("capture_stopped", "active")],
+    ids=["stopped", "unresponsive", "lost", "summary-says-active"],
+)
+def test_contract3_a_rank_whose_capture_stopped_is_unknown_with_its_reason(rank_state: str, summary: str) -> None:
+    judged = _judge(_status(rank_state, summary, **STOPPED))
+    assert judged["state"] == "unknown"
+    stopped = [r for r in judged["reasons"] if r["code"] == "capture_stopped"]
+    assert stopped and stopped[0]["ranks"] == [0] and stopped[0]["state"] == "unknown"
+
+
+def test_contract3_a_rank_state_this_reader_does_not_know_is_never_healthy() -> None:
+    judged = _judge(_status("some_future_state", "active"))
+    assert judged["state"] != "healthy"
+    assert any("some_future_state" in r["detail"] for r in judged["reasons"])
+
+
+def test_contract3_a_summary_word_this_reader_does_not_know_is_never_healthy() -> None:
+    judged = _judge(_status("active", "some_future_summary"))
+    assert judged["state"] != "healthy"
+    assert any("some_future_summary" in r["detail"] for r in judged["reasons"])
+
+
+def test_contract1_a_rank_whose_new_owner_has_no_rows_yet_reads_no_step() -> None:
+    from tensorquill.evidence import detect_watchdog_incidents
+
+    status = _status("silent", "stalled", last_step=None, attempt_without_steps=True, severity="critical")
+    for incident in detect_watchdog_incidents(status):
+        assert all(r.get("last_step") is None for r in incident.get("ranks", ())), incident
+
+
+def test_contract3_a_capture_stopped_rank_raises_no_progress_incident() -> None:
+    # Summary rule 5: one rank stopped capture, another is active, so the run reads `degraded`.
+    # `main`'s reader turns that into `rank_silent` ("ranks_never_connected") with no rank in it.
+    from tensorquill.evidence import detect_watchdog_incidents
+
+    status = {"summary": "degraded", "ranks": [
+        {"rank": 0, "state": "capture_stopped", "attempt": 1, "last_step": 40, "severity": None, **STOPPED},
+        {"rank": 1, "state": "active", "attempt": 1, "last_step": 41, "severity": None},
+    ]}
+    assert [i["kind"] for i in detect_watchdog_incidents(status) if i["kind"] in ("rank_silent", "job_stalled")] == []
