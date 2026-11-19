@@ -489,3 +489,29 @@ def test_contract3_a_capture_stopped_rank_raises_no_progress_incident() -> None:
         {"rank": 1, "state": "active", "attempt": 1, "last_step": 41, "severity": None},
     ]}
     assert [i["kind"] for i in detect_watchdog_incidents(status) if i["kind"] in ("rank_silent", "job_stalled")] == []
+
+
+# --- E3, the count half: a resume judged from the loss scale counts as checked ---------------
+
+
+def _scaled_resume(scale: bool) -> list[dict[str, Any]]:
+    """Attempt 1 halves its loss scale at step 5; attempt 2 resumes at 8 with the halved scale,
+    as it should. No checkpoint manifest anywhere: the loss scale is the only resume-state input."""
+    def scaled(step: int, attempt: int, value: float) -> dict[str, Any]:
+        return row(step, attempt, **({"grad_scale": value, "step_skipped": False} if scale else {}))
+
+    earlier = [scaled(step, 1, 64.0 if step < 5 else 32.0) for step in range(10)]
+    return earlier + [scaled(step, 2, 32.0) for step in range(8, 12)]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_e3_a_resume_judged_from_the_loss_scale_that_finds_nothing_is_checked(engine: str) -> None:
+    evidence = _evidence(_scaled_resume(scale=True), engine)
+    assert not [i for i in evidence["incidents"] if i["kind"] == "resume_incomplete"]
+    check = evidence["kind_checks"]["resume_incomplete"]
+    assert check["value"] == "checked" and check["records"] > 0 and check["enough_history"]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_e3_a_run_with_neither_checkpoint_nor_loss_scale_stays_not_configured(engine: str) -> None:
+    assert _evidence(_scaled_resume(scale=False), engine)["kind_checks"]["resume_incomplete"]["value"] == "not_configured"
