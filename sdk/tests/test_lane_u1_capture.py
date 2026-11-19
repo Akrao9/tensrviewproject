@@ -1,0 +1,581 @@
+"""Lane U1: ways the capture session could still raise into, block or change a training run.
+
+Each test fails on `main` at 1767a4a and passes with the lane's change in `capture.py`:
+C01 (an unreadable gradient raised out of `optimizer.step()`), C04 (a closed session's step and
+flush blocked for good), B8 (`init` traced by `torch.compile`), C10 (a rejected `init` left hooks
+and files), C19 (closing a session removed someone else's `GradScaler.update`), the probe's
+warning under `-W error`, and `init`'s docstring on the drift check's gather. No server binary.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+import warnings
+from pathlib import Path
+
+import pytest
+import torch
+from torch import nn
+from torch.optim.optimizer import _global_optimizer_post_hooks, _global_optimizer_pre_hooks
+
+import tensorquill
+from tensorquill import capture, datawait
+from tensorquill.distributed import FINGERPRINT_WIDTH
+from tensorquill.flight import record_to_row, row_to_record
+
+DEADLINE = 20.0  # seconds; a blocked call never returns, so a deadline is the only way to see it
+
+
+# --- C01: a gradient that cannot be read ---------------------------------------------------------
+
+
+class WithMeta(nn.Module):
+    """A linear layer, and one trainable parameter on `meta`, as an unmaterialized layer leaves it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lin = nn.Linear(3, 2)
+        self.extra = nn.Parameter(torch.ones(4, device="meta"))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.lin(x)
+
+
+def _train_with_meta(observe: bool, steps: int = 3, every: int = 2) -> tuple[torch.Tensor, list[dict]]:
+    torch.manual_seed(0)
+    model = WithMeta()
+    opt = torch.optim.SGD(model.parameters(), lr=0.5, foreach=False)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=every, weights=1) if observe else None
+    try:
+        for _ in range(steps):
+            opt.zero_grad()
+            model(torch.ones(2, 3)).sum().backward()
+            model.extra.grad = torch.ones_like(model.extra)
+            opt.step()
+    finally:
+        if session is not None:
+            session.close()
+    return model.lin.weight.detach().clone(), sink.records
+
+
+def test_a_gradient_on_meta_is_left_out_on_its_own_and_the_step_runs_as_without_tensorquill():
+    without, _ = _train_with_meta(observe=False)
+    with_tq, records = _train_with_meta(observe=True)
+    assert torch.equal(without, with_tq)
+    assert [r["step"] for r in records] == [0, 1, 2]
+    for record in records:
+        assert set(record["grad_norms"]) == {"lin.weight", "lin.bias"}
+        assert record["grad_norm"] == pytest.approx((2 * 3 * 4 + 2 * 4) ** 0.5)  # |2| x 6 and |2| x 2
+        assert record["grad_norms"]["lin.bias"] == pytest.approx(8 ** 0.5)
+    # Said once, on the first record written after it was found, across blocks and held steps.
+    said = [r.get("grads_not_read") for r in records]
+    assert said == [{"extra": "its gradient is on meta, which holds no values"}, None, None]
+    # The weight check leaves the same parameter out, as lane T2 made it.
+    assert records[0]["weight_norms"]["extra"] != records[0]["weight_norms"]["extra"]  # NaN
+    # The new field reaches the evidence and the stream's rows like any other key.
+    tensorquill.build_evidence(records)
+    assert row_to_record(record_to_row(records[0]))["grads_not_read"] == said[0]
+
+
+def _one(make: callable) -> dict:
+    """One step of a model whose second trainable parameter has the gradient `make()` returns."""
+    special = make()
+    param = nn.Parameter(special.detach().clone())
+    model = nn.ParameterList([nn.Parameter(torch.ones(2, 2)), param])
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, layers=(), weights=False, auto_step=False, every=1)
+    model[0].grad = torch.full((2, 2), 3.0)
+    param.grad = make()
+    session.step()
+    session.close()
+    return sink.records[0]
+
+
+SPARSE = {
+    "coo": lambda: torch.full((2, 2), 2.0).to_sparse(),
+    "csr": lambda: torch.full((2, 2), 2.0).to_sparse_csr(),
+    "csc": lambda: torch.full((2, 2), 2.0).to_sparse_csc(),
+    "bsr": lambda: torch.full((2, 2), 2.0).to_sparse_bsr((1, 1)),
+    "bsc": lambda: torch.full((2, 2), 2.0).to_sparse_bsc((1, 1)),
+}
+
+
+@pytest.mark.parametrize("layout", sorted(SPARSE))
+def test_a_sparse_gradient_is_read_from_its_stored_values(layout):
+    record = _one(SPARSE[layout])
+    assert record["grad_norms"] == {"0": pytest.approx(6.0), "1": pytest.approx(4.0)}
+    assert "grads_not_read" not in record
+
+
+UNREADABLE = {
+    "meta": (lambda: torch.ones(2, 2, device="meta"), "its gradient is on meta, which holds no values"),
+    "coo-on-meta": (lambda: torch.ones(2, 2).to_sparse().to("meta"), "its gradient is on meta, which holds no values"),
+    # The CPU has no norm for float8: found by reading the rest of its group one at a time.
+    "float8": (lambda: torch.full((2, 2), 2.0).to(torch.float8_e4m3fn), "reading it raised"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(UNREADABLE))
+def test_an_unreadable_gradient_is_named_and_the_others_keep_their_norms(kind):
+    make, why = UNREADABLE[kind]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)  # PyTorch's own note on the float8 copy, if any
+        record = _one(make)
+    assert record["grad_norms"] == {"0": pytest.approx(6.0)}
+    assert record["grad_norm"] == pytest.approx(6.0)
+    assert list(record["grads_not_read"]) == ["1"] and record["grads_not_read"]["1"].startswith(why)
+
+
+def test_a_sparse_embedding_steps_as_before():
+    torch.manual_seed(0)
+    model = nn.Embedding(10, 3, sparse=True)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    with tensorquill.init(model, sink=sink, every=1):
+        model(torch.tensor([1, 2, 2])).sum().backward()
+        opt.step()
+    assert set(sink.records[0]["grad_norms"]) == {"weight"} and "grads_not_read" not in sink.records[0]
+
+
+# --- C04: a closed session ------------------------------------------------------------------------
+
+
+class Loader:
+    """A minimal loader: iterating it yields two batches."""
+
+    def __iter__(self):
+        return iter([torch.ones(1), torch.ones(1)])
+
+
+def _every_public_call(session: capture.Session, model: nn.Module, tmp_path: Path) -> None:
+    model(torch.randn(2, 4)).sum().backward()
+    session.record_grads()
+    session.record_grad_norm(torch.tensor(1.0))
+    session.record_updates(torch.optim.SGD(model.parameters(), lr=0.1))
+    session.record_replica_spread(torch.zeros(2, 3, dtype=torch.float64))
+    session.log({"loss": 1.0})
+    session.data([1, 2])
+    session.checkpoint({"model": {}}, event="save")
+    session.checkpoint_files(tmp_path)
+    session.set_phase("eval")
+    session.tick()
+    with session.phase("eval"):
+        pass
+    session.watch_loaders()
+    assert list(session.watch_loader(Loader())) == [torch.ones(1)] * 2
+    assert list(session.time_data([1, 2])) == [1, 2]
+    session.step()
+    session.flush()
+    session.close()
+
+
+def test_every_public_call_on_a_closed_session_returns_at_once_and_queues_nothing(tmp_path):
+    model = nn.Linear(4, 4)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=1, auto_step=False, updates=True,
+                               heartbeat_seconds=None, stack_seconds=None)
+    model(torch.randn(2, 4)).sum().backward()
+    session.step()
+    session.close()
+    written = list(sink.records)
+    assert [r["step"] for r in written] == [0]
+    failed: list[BaseException] = []
+
+    def calls() -> None:
+        try:
+            for _ in range(capture.WRITER_QUEUE * 3):  # past the writer queue's capacity
+                _every_public_call(session, model, tmp_path)
+        except BaseException as error:  # noqa: BLE001
+            failed.append(error)
+
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        worker = threading.Thread(target=calls, daemon=True)
+        worker.start()
+        worker.join(DEADLINE)
+    assert not worker.is_alive(), "a call on a closed session blocked"
+    assert failed == []
+    assert session._queue.qsize() == 0 and sink.records == written
+    closed = [w for w in said if "after session.close()" in str(w.message)]
+    assert len(closed) == 1 and len(said) == 1
+
+
+def test_a_closed_session_does_not_raise_under_warnings_as_errors(caplog):
+    model = nn.Linear(4, 4)
+    session = tensorquill.init(model, sink=tensorquill.MemorySink(), every=1)  # auto_step: step() raised before
+    session.close()
+    with warnings.catch_warnings(), caplog.at_level(logging.WARNING, logger="tensorquill"):
+        warnings.simplefilter("error")
+        session.step()
+        session.log({"loss": 1.0})
+        session.data([1])
+    assert sum("after session.close()" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_close_still_writes_the_steps_left_in_the_ring():
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=50)
+    for _ in range(3):
+        model(torch.randn(2, 4)).sum().backward()
+        opt.step()
+    session.close()
+    assert [r["step"] for r in sink.records] == [0, 1, 2]
+
+
+# --- B8: init traced by torch.compile -------------------------------------------------------------
+
+
+def test_init_inside_a_compiled_function_runs_and_captures():
+    """TrainCheck's PT-115607 loop (B8 in the plan), with TensorQuill started inside the function
+    Dynamo traces, as `experiments/traincheck-bugs/b08_pt115607.py` starts it."""
+    sink = tensorquill.MemorySink()
+    counts: list[float] = []
+
+    def loop() -> capture.Session:
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(2, 3), nn.Sigmoid(), nn.Linear(3, 1), nn.Sigmoid())
+        params = list(model.parameters())
+        opt = torch.optim.Adam(params)
+        session = tensorquill.init(model, sink=sink, every=1)
+        for i in range(6):
+            opt.zero_grad()
+            if i != 3:
+                loss = model(torch.ones(3, 2)).sum()
+                loss.backward()
+                session.log({"loss": loss})
+            opt.step()
+            counts.append(float(opt.state[params[0]]["step"]))
+        return session
+
+    torch._dynamo.reset()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)  # Dynamo's notes on what it does not trace
+        session = torch.compile(loop, backend="eager")()
+    session.close()
+    torch._dynamo.reset()
+    assert counts == [1.0, 2.0, 3.0, 3.0, 4.0, 5.0]
+    assert [r["step"] for r in sink.records] == list(range(6))
+    for i, record in enumerate(sink.records):
+        trained = i != 3
+        assert bool(record["layers"]) == trained and bool(record["grad_norms"]) == trained
+        assert ("scalars" in record) == trained
+
+
+def test_init_then_compile_the_model_still_captures():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(2, 3), nn.ReLU(), nn.Linear(3, 1))
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    torch._dynamo.reset()
+    with tensorquill.init(model, sink=sink, every=1, layers="all"):
+        compiled = torch.compile(model, backend="eager")
+        for _ in range(2):
+            opt.zero_grad()
+            compiled(torch.ones(3, 2)).sum().backward()
+            opt.step()
+    torch._dynamo.reset()
+    assert [sorted(r["layers"]) for r in sink.records] == [["0", "2"], ["0", "2"]]
+
+
+def test_the_optimizer_hooks_do_not_raise_when_optimizer_step_is_traced_under_warnings_as_errors():
+    """`optimizer.step()` inside a compiled function: traced, the session's optimizer hooks made
+    Dynamo warn on `sys._getframe`, which `-W error` raised out of the step."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(2, 3), nn.Sigmoid(), nn.Linear(3, 1))
+    opt = torch.optim.Adam(model.parameters())
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=1)
+    compiled_model = torch.compile(model, backend="eager")
+
+    def train() -> None:
+        opt.zero_grad()
+        compiled_model(torch.ones(3, 2)).sum().backward()
+        opt.step()
+
+    torch._dynamo.reset()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        step = torch.compile(train, backend="eager")
+        for _ in range(3):
+            step()
+    session.close()
+    torch._dynamo.reset()
+    assert [r["step"] for r in sink.records] == [0, 1, 2]
+    assert all(r["grad_norms"] and r["layers"] for r in sink.records)
+
+
+# --- C10: a rejected init changes nothing ---------------------------------------------------------
+
+
+def _state(model: nn.Module, scaler: torch.amp.GradScaler, root: Path) -> dict:
+    import torch.nn.utils as nn_utils
+
+    return {
+        "hooks": [(len(m._forward_hooks), len(m._forward_pre_hooks)) for m in model.modules()],
+        # TensorQuill's own threads (writer, stream sender, heartbeat): others' come and go.
+        "threads": sorted(t.name for t in threading.enumerate() if "tensorquill" in t.name.lower()),
+        "optimizer_hooks": (len(_global_optimizer_pre_hooks), len(_global_optimizer_post_hooks)),
+        "clip": nn_utils.clip_grad_norm_,
+        "scaler": dict(vars(scaler)).get("update"),
+        "loader_next": datawait._BaseDataLoaderIter.__dict__.get("__next__"),
+        "watching": list(datawait._watching),
+        "files": sorted(str(p.relative_to(root)) for p in root.rglob("*")),
+    }
+
+
+class Head(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList([nn.Sequential(nn.Linear(4, 4), nn.ReLU()) for _ in range(2)])
+        self.router = nn.Linear(4, 4)
+        self.lm_head = nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return self.lm_head(self.router(x))
+
+
+REJECTED = {
+    "absent probe head": {"probe": torch.ones(1, 4), "probe_head": "nope"},
+    "probe head not a Linear": {"probe": torch.ones(1, 4), "probe_head": "blocks.0"},
+    "unknown router": {"routers": {"nope": 4}, "capture": "full"},
+    "unknown layer": {"layers": ["nope"]},
+    "bad replica_params": {"replica_params": ["nope"]},
+    "bad probe": {"probe": 3},
+    "bad every": {"every": 0},
+}
+
+
+@pytest.mark.parametrize("case", sorted(REJECTED))
+def test_a_rejected_init_leaves_hooks_threads_globals_and_files_as_they_were(case, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    model = Head()
+    scaler = torch.amp.GradScaler("cpu")
+    before = _state(model, scaler, tmp_path)
+    with pytest.raises((ValueError, TypeError)):
+        tensorquill.init(model, run_id="rejected", scaler=scaler, data_wait=True, **REJECTED[case])
+    assert _state(model, scaler, tmp_path) == before
+    assert not (tmp_path / "tensorquill-out").exists()
+
+
+def test_a_later_failure_undoes_every_effect_made_before_it(tmp_path, monkeypatch):
+    """The last effect `init` makes (the data-loader timer) fails: everything made before it is
+    undone, with the default sink's file and folder and the run manifest."""
+    monkeypatch.chdir(tmp_path)
+    model = Head()
+    scaler = torch.amp.GradScaler("cpu")
+    before = _state(model, scaler, tmp_path)
+
+    def late(session: object) -> None:
+        raise RuntimeError("late")
+
+    monkeypatch.setattr(datawait, "watch", late)
+    with pytest.raises(RuntimeError, match="late"):
+        tensorquill.init(model, run_id="late", scaler=scaler, data_wait=True, probe=torch.ones(1, 4),
+                         probe_head="lm_head", routers={"router": 4}, capture="full")
+    monkeypatch.undo()
+    assert _state(model, scaler, tmp_path) == before
+    assert not (tmp_path / "tensorquill-out").exists()
+
+
+def test_a_later_failure_puts_an_earlier_runs_manifest_and_end_marker_back(tmp_path, monkeypatch):
+    """A run started again under its run ID: its manifest and the finished run's end marker are
+    left as they were when the new start fails."""
+    monkeypatch.chdir(tmp_path)
+    model = nn.Linear(4, 4)
+    session = tensorquill.init(model, run_id="again")
+    session.close()
+    folder = tmp_path / "tensorquill-out"
+    before = {p.name: p.read_bytes() for p in folder.iterdir()}
+    assert any(name.endswith(".end.json") for name in before) and any(name.endswith(".run.json") for name in before)
+
+    def late(session: object) -> None:
+        raise RuntimeError("late")
+
+    monkeypatch.setattr(datawait, "watch", late)
+    with pytest.raises(RuntimeError, match="late"):
+        tensorquill.init(model, run_id="again", data_wait=True, tags=["changed"])
+    assert {p.name: p.read_bytes() for p in folder.iterdir()} == before
+
+
+def test_a_rejected_init_does_not_remove_a_finished_runs_end_marker(tmp_path):
+    model = nn.Linear(4, 4)
+    path = tmp_path / "run.rank0.jsonl"
+    session = tensorquill.init(model, sink=tensorquill.JsonlSink(path), run_id="run")
+    session.close()
+    marker = tmp_path / "run.rank0.end.json"
+    assert marker.exists()
+    with pytest.raises(ValueError):
+        tensorquill.init(model, sink=tensorquill.JsonlSink(path), run_id="run", layers=["nope"])
+    assert marker.exists()
+
+
+# --- C19: the scaler's update ---------------------------------------------------------------------
+
+
+def _scaled_steps(model: nn.Module, opt: torch.optim.Optimizer, scaler: torch.amp.GradScaler, n: int = 1) -> None:
+    for _ in range(n):
+        opt.zero_grad()
+        scaler.scale(model(torch.ones(2, 4)).sum()).backward()
+        scaler.step(opt)
+        scaler.update()
+
+
+def test_closing_puts_back_an_update_someone_installed_before_init():
+    scaler = torch.amp.GradScaler("cpu")
+    original = scaler.update
+    calls: list[int] = []
+
+    def theirs(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    scaler.update = theirs
+    model = nn.Linear(4, 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    with tensorquill.init(model, sink=sink, scaler=scaler, every=1):
+        _scaled_steps(model, opt, scaler, 2)
+    assert vars(scaler)["update"] is theirs and len(calls) == 2
+    assert [r["step"] for r in sink.records] == [0, 1]
+
+
+def test_closing_leaves_a_scaler_with_its_class_method():
+    scaler = torch.amp.GradScaler("cpu")
+    session = tensorquill.init(nn.Linear(4, 1), sink=tensorquill.MemorySink(), scaler=scaler)
+    assert "update" in vars(scaler)
+    session.close()
+    assert "update" not in vars(scaler) and scaler.update.__func__ is torch.amp.GradScaler.update
+
+
+@pytest.mark.parametrize("first", ["a", "b"])
+def test_two_sessions_on_one_scaler_keep_counting_whichever_closes_first(first):
+    scaler = torch.amp.GradScaler("cpu")
+    models = {"a": nn.Linear(4, 1), "b": nn.Linear(4, 1)}
+    opts = {k: torch.optim.SGD(m.parameters(), lr=0.1) for k, m in models.items()}
+    sinks = {k: tensorquill.MemorySink() for k in models}
+    sessions = {k: tensorquill.init(models[k], sink=sinks[k], scaler=scaler, every=1) for k in models}
+    other = "b" if first == "a" else "a"
+    sessions[first].close()
+    _scaled_steps(models[other], opts[other], scaler, 2)
+    sessions[other].close()
+    assert [r["step"] for r in sinks[other].records] == [0, 1]
+    assert sinks[first].records == []
+    assert "update" not in vars(scaler)
+
+
+def test_a_wrapper_installed_on_top_after_init_is_left_in_place():
+    scaler = torch.amp.GradScaler("cpu")
+    model = nn.Linear(4, 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, scaler=scaler, every=1)
+    ours = scaler.update
+
+    def later(*args, **kwargs):
+        return ours(*args, **kwargs)
+
+    scaler.update = later
+    _scaled_steps(model, opt, scaler)
+    session.close()
+    assert vars(scaler)["update"] is later
+    _scaled_steps(model, opt, scaler)  # what is left under it passes the call through
+    assert [r["step"] for r in sink.records] == [0]
+
+
+# --- The probe's warning, and the other warnings training reaches --------------------------------
+
+
+def test_a_failed_probe_does_not_raise_out_of_the_step_under_warnings_as_errors(caplog):
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+
+    def probe(model: nn.Module) -> None:
+        raise ValueError("probe boom")
+
+    session = tensorquill.init(model, sink=sink, probe=probe, probe_every=1, every=1)
+    with warnings.catch_warnings(), caplog.at_level(logging.WARNING, logger="tensorquill"):
+        warnings.simplefilter("error")
+        model(torch.randn(2, 4)).sum().backward()
+        opt.step()
+    session.close()
+    assert sink.records[0]["probe"] == {"error": "ValueError: probe boom"}
+    assert any("probe failed" in r.getMessage() for r in caplog.records)
+
+
+def test_a_failed_probe_still_warns_where_warnings_are_not_errors():
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    def probe(model: nn.Module) -> None:
+        raise ValueError("probe boom")
+
+    with tensorquill.init(model, sink=tensorquill.MemorySink(), probe=probe, probe_every=1, every=1):
+        with pytest.warns(RuntimeWarning, match="probe failed"):
+            model(torch.randn(2, 4)).sum().backward()
+            opt.step()
+
+
+class NoTensor(nn.Module):
+    def forward(self, x: torch.Tensor) -> str:
+        return "no tensor"
+
+
+class WithRouter(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lin = nn.Linear(4, 4)
+        self.router = NoTensor()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.router(x)
+        return self.lin(x)
+
+
+def test_a_refused_router_and_steps_of_another_model_do_not_raise_under_warnings_as_errors(caplog):
+    model = WithRouter()
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    foreign = torch.optim.SGD([nn.Parameter(torch.zeros(2))], lr=0.1)
+    session = tensorquill.init(nn.Linear(2, 2), sink=tensorquill.MemorySink(), every=1)  # steps none of these
+    routed = tensorquill.init(model, sink=tensorquill.MemorySink(), routers={"router": 4}, every=1)
+    with warnings.catch_warnings(), caplog.at_level(logging.WARNING, logger="tensorquill"):
+        warnings.simplefilter("error")
+        for _ in range(capture.FOREIGN_STEPS_WARNING + 1):
+            model(torch.randn(2, 4)).sum().backward()
+            opt.step()
+            foreign.param_groups[0]["params"][0].grad = torch.ones(2)
+            foreign.step()
+    session.close()
+    routed.close()
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("not counting the router 'router'" in m for m in messages)
+    assert any("has recorded no steps" in m for m in messages)
+
+
+# --- The drift check's gather, in init's docstring ------------------------------------------------
+
+
+def test_init_says_how_many_bytes_the_drift_check_gathers():
+    gathered = (FINGERPRINT_WIDTH + 1) * 8  # float64 fingerprints and the flag column (`_fingerprint_table`)
+    assert gathered == 32
+    doc = " ".join(tensorquill.init.__doc__.split())
+    assert f"gathers {gathered} bytes per parameter tensor" in doc
+    assert "24 bytes with the flag" in doc and "24 bytes per parameter tensor" not in doc
+
+
+def test_the_writer_thread_is_named_once_per_open_session():
+    """Guards the C10 thread check: a session's writer thread exists only while it is open."""
+    names = lambda: [t.name for t in threading.enumerate()].count("tensorquill-writer")  # noqa: E731
+    start = names()
+    session = tensorquill.init(nn.Linear(2, 2), sink=tensorquill.MemorySink())
+    assert names() == start + 1
+    session.close()
+    assert names() == start
+    assert os.environ.get("TENSORQUILL_ENDPOINT") is None

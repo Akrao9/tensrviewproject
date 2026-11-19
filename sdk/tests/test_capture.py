@@ -606,8 +606,9 @@ def test_log_records_scalars_for_the_step_in_progress():
     assert [s["peak"] for s in scalars] == [1.0, 0.0, 0.0]
     assert [s["train/loss"] for s in scalars] == pytest.approx(losses)
     assert all("after_last_step" not in s for s in scalars)
-    with pytest.raises(RuntimeError, match="closed"):
-        session.log(x=1.0)
+    with pytest.warns(RuntimeWarning, match="after session.close"):
+        session.log(x=1.0)  # a closed session does nothing (lane U1, C04): no raise, nothing written
+    assert len(sink.records) == 3
 
 
 def test_log_rejects_non_scalars():
