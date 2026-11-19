@@ -532,9 +532,15 @@ class Trigger:
 
     @staticmethod
     def _open_episode(incident: Mapping[str, Any], delivery_id: str | None) -> dict[str, Any]:
-        """The episode a stall that fires opens: what it was stopped at, to tell progress from."""
-        return {"kind": incident.get("kind"), "delivery": delivery_id, "run_step": _run_step(incident),
-                "ranks": _stopped(incident)}
+        """The episode a stall that fires opens: what it was stopped at, to tell progress from.
+        A `job_stalled` also keeps its own `step` (`stall_step`), the highest step any rank had
+        stored, finished ranks included: those are not in its `ranks`, so a rank that steps on
+        and then finishes is seen only there (DET-07, lane V5, Nov 19, 2026)."""
+        episode = {"kind": incident.get("kind"), "delivery": delivery_id, "run_step": _run_step(incident),
+                   "ranks": _stopped(incident)}
+        if incident.get("kind") == "job_stalled":
+            episode["stall_step"] = _number(incident.get("step"))
+        return episode
 
     def _follow_episode(self, stall: Mapping[str, Any]) -> None:
         """End the open episode if `stall` shows progress or a new attempt since it opened, or
@@ -566,8 +572,13 @@ class Trigger:
                 return
         if episode.get("kind") == "job_stalled":
             # The run's step: the stall is over once any rank has stored a step beyond the
-            # highest one stored when it fired.
-            if _beyond(_run_step(stall), episode.get("run_step")):
+            # highest one stored when it fired. Of the ranks the stall lists, or, read from the
+            # stall's own step, of a rank that has since finished and is no longer listed. An
+            # episode from a state file written before `stall_step` was kept has only the first.
+            opened_at = _number(episode.get("stall_step"))
+            if _beyond(_run_step(stall), episode.get("run_step")) or (
+                    stall.get("kind") == "job_stalled" and opened_at is not None
+                    and _beyond(_number(stall.get("step")), opened_at)):
                 self._episode = None
                 return
         else:

@@ -639,7 +639,8 @@ def test_the_all_ranks_status_of_a_two_rank_run_folder(start, store):
     assert found["ranks"] == {"on_ranks": "0-1", "rank_count": 2, "on_all_judged_ranks": True, "numbers_differ": True, "numbers_are_from_rank": 0}
     assert "rank 0's, not rank 1's" in client.call("get_incident", id="grad_spike@40", rank=1)["ranks"]["note"]
     assert "rank 0 is not among the ranks" in client.call("get_incident", id="non_finite@55", rank=0)["ranks"]["note"]
-    assert found["incident"]["grad_norm"] == 9.0 and found["look_next"][0]["arguments"] == {"name": "blocks.1.weight", "kind": "parameter"}
+    # The follow-up call names the rank the numbers are from (CLI-15, lane V5, Nov 19, 2026).
+    assert found["incident"]["grad_norm"] == 9.0 and found["look_next"][0]["arguments"] == {"name": "blocks.1.weight", "kind": "parameter", "rank": 0}
     # The parts made by hand are empty: the error says the parts or pyarrow, and the server goes on.
     assert re.search("stored parts|pyarrow", client.error("get_series", name="blocks.1.weight", rank=1))
     assert client.request("ping")["result"] == {}

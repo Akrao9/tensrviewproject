@@ -43,7 +43,12 @@ counted as clean. A run of one rank is read as before.
 
 Part 4 compares rank r of one run with rank r of the other, for each rank, and gives the
 earliest divergence with its rank. Runs whose ranks differ are not compared there
-(`ranks_differ`); nothing is ever made across ranks.
+(`ranks_differ`); nothing is ever made across ranks. A rank whose step records cannot be read
+is named (`ranks_not_read`) and the other ranks are still compared.
+
+A run's `last_step` is where it stands after any resume: the highest step of the records the
+detectors judge (`evidence.resolve_attempts`), not of every attempt. A rank whose records are
+in several local files is read from all of them, the attempts resolved across them.
 
 `compare_runs` returns the result and writes nothing. The command line writes `compare.json`.
 """
@@ -95,6 +100,31 @@ def _rank_of(record: Mapping[str, Any]) -> int:
     return int(record.get("rank", 0))
 
 
+def _record_key(record: Mapping[str, Any]) -> str:
+    return json.dumps(record, sort_keys=True, default=str)
+
+
+def _not_read_yet(found: list[dict[str, Any]], seen: set[str]) -> list[dict[str, Any]]:
+    """Of the records of one of a rank's several files, those not already read, whole and
+    identical, from another of its files; `seen` then holds this file's too. A copy of a file
+    (`x.rank0.bak.jsonl`) is read once, not as a second attempt: twice gave `repeated_steps`.
+    A step written twice within one file is kept, as one file is read (lane V4, CLI-13)."""
+    new = [record for record in found if _record_key(record) not in seen]
+    seen.update(_record_key(record) for record in found)
+    return new
+
+
+def _last_step(records: list[dict[str, Any]]) -> int | None:
+    """The last step of one rank's records as the run stands: the highest step of the records
+    `resolve_attempts` keeps, the same records the detectors judge. After a resume from an
+    earlier checkpoint, the steps the later attempt rolled back are not the run's (lane V4, E2:
+    the highest step of every attempt was taken, and a run that ended at 199 read as 299)."""
+    from .evidence import resolve_attempts
+
+    steps = [r["step"] for r in resolve_attempts([r for r in records if _is_step(r.get("step"))])]
+    return max(steps) if steps else None
+
+
 def _world_size(manifest: Mapping[str, Any] | None) -> int:
     """The run manifest's `world_size`, or 0 when it does not say one that can be counted."""
     from .evidence import MAX_EXPECTED_RANKS
@@ -109,16 +139,26 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
     files: Mapping[int, Path] = run.get("files") or {}
     if not files:
         raise _runs.RunLookupError(f"run {run['run_id']} has a manifest and no records yet: nothing to compare")
-    path = files.get(rank) if rank is not None and rank in files else files[min(files)]
+    key = rank if rank is not None and rank in files else min(files)
+    path = files[key]
     records, unfinished = _read_local(path)
     if rank is None and len(files) > 1:
         # Every rank's file is read, whether or not the lowest rank's holds a whole record yet:
         # a rank whose process has written none is unknown there, never a reason to compare
         # nothing while the other ranks have records.
         return _open_local_all_ranks(run, files, path, records, unfinished)
-    if not records:
+    # The rank's other files (`runs.discover_runs`' `more_files`): read with it, and the attempts
+    # across them resolved as within one file (`build_evidence`, `_last_step`) (lane V4, CLI-13).
+    extra = [Path(more) for more in ((run.get("more_files") or {}).get(key) or ())]
+    own, torn = list(records), unfinished
+    seen = {_record_key(record) for record in records} if extra else set()
+    for more in extra:
+        found, cut = _read_local(more)
+        own += _not_read_yet(found, seen)
+        torn = torn or cut
+    if not own:
         raise _runs.RunLookupError(f"run {run['run_id']} has no whole record in {path} yet: nothing to compare")
-    held = sorted({_rank_of(r) for r in records})
+    held = sorted({_rank_of(r) for r in own})
     ranks = sorted(set(files) | set(held))
     # A rank the manifest's world size counts that no file holds is unknown, as a store's rank its
     # status expects that stored nothing: the run is read whole, never as the ranks it has.
@@ -129,15 +169,16 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
     if picked is None:
         raise _runs.RunLookupError(f"run {run['run_id']} has no rank {rank} here: it has rank{'s' if len(ranks) != 1 else ''} "
                                    f"{', '.join(map(str, ranks))}")
-    records = [r for r in records if _rank_of(r) == picked]
+    records = [r for r in own if _rank_of(r) == picked]
     evidence = build_evidence(records, run_manifest=run.get("manifest") or {})
-    steps = [r["step"] for r in records if _is_step(r.get("step"))]
+    every = [str(path), *map(str, extra)] if extra else None
     return {
-        "evidence": evidence, "last_step": max(steps) if steps else None,
+        "evidence": evidence, "last_step": _last_step(records),
         "read_from": {"path": str(path), "kind": "local records", "rank": picked, "ranks": ranks,
+                      **({"paths": every} if every else {}),
                       "judged_by": "the Python detectors, here, with the default thresholds",
-                      **({"unfinished_lines_left_out": True} if unfinished else {})},
-        "records": {"path": str(path), "rank": picked},
+                      **({"unfinished_lines_left_out": True} if torn else {})},
+        "records": {"path": str(path), "rank": picked, **({"paths": every} if every else {})},
     }
 
 
@@ -163,15 +204,33 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
     paths: dict[int, str] = {}
     held_in: dict[str, set[int]] = {}
     unfinished_in: list[str] = [str(first)] if unfinished else []
-    for path in [first, *(files[n] for n in sorted(files) if files[n] != first)]:
+    # A rank's other files (`more_files`): its records there are read with it (lane V4, CLI-13).
+    more_of = {str(path): number for number, more in (run.get("more_files") or {}).items() for path in more}
+    extra_read: dict[int, list[str]] = {}
+    seen: dict[int, set[str]] = {}  # of a rank with other files: the records read so far, from the files before
+    for path in [first, *(files[n] for n in sorted(files) if files[n] != first),
+                 *(Path(p) for p in more_of if Path(p) not in files.values())]:
         found, torn = (records, unfinished) if path == first else _read_local(path)
         if torn and str(path) not in unfinished_in:
             unfinished_in.append(str(path))
+        added: dict[int, set[str]] = {}
         for record in found:
             number = _rank_of(record)
             held_in.setdefault(str(path), set()).add(number)
             if paths.setdefault(number, str(path)) == str(path):  # a rank is read from the first file that holds it
                 by_rank.setdefault(number, []).append(record)
+            elif more_of.get(str(path)) == number:  # and from its other files, a record already read there once
+                if _record_key(record) in seen.get(number, ()):
+                    continue
+                by_rank.setdefault(number, []).append(record)
+                if str(path) not in extra_read.setdefault(number, []):
+                    extra_read[number].append(str(path))
+            else:
+                continue
+            if number in (run.get("more_files") or {}):
+                added.setdefault(number, set()).add(_record_key(record))
+        for number, keys in added.items():
+            seen.setdefault(number, set()).update(keys)
     if not by_rank:
         names = ", ".join(sorted({p.name for p in files.values()}))
         raise _runs.RunLookupError(f"run {run['run_id']} has no whole record in any of its files ({names}) yet: nothing to compare")
@@ -190,9 +249,7 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
     unknown.update((n, why) for n in range(world) if n not in by_rank and n not in unknown)
     per_rank = {}
     for number, own in sorted(by_rank.items()):
-        steps = [r["step"] for r in own if _is_step(r.get("step"))]
-        per_rank[number] = {**build_evidence(own, run_manifest=run.get("manifest") or {}),
-                            "last_step": max(steps) if steps else None}
+        per_rank[number] = {**build_evidence(own, run_manifest=run.get("manifest") or {}), "last_step": _last_step(own)}
     combined = combine_rank_evidence(per_rank, unknown_ranks=unknown)
     last = combined.get("last_step")
     ranks = sorted(set(per_rank) | set(unknown))
@@ -205,7 +262,8 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
                       "judged_by": "the Python detectors, here, with the default thresholds, on each rank; the ranks put "
                                    "together by the all-ranks view's rules",
                       **({"unfinished_lines_left_out": True, "unfinished_in": unfinished_in} if unfinished_in else {})},
-        "records": {"path": str(first), "rank": None, "ranks": {n: paths[n] for n in sorted(per_rank)}},
+        "records": {"path": str(first), "rank": None,
+                    "ranks": {n: [paths[n], *extra_read[n]] if extra_read.get(n) else paths[n] for n in sorted(per_rank)}},
     }
 
 
@@ -248,10 +306,12 @@ def _open_store(run: Mapping[str, Any], rank: int | None, read_parts: bool) -> d
         except (OSError, ValueError, ImportError) as error:  # ImportError: the parts need pyarrow
             return _unread_store_rank(run, folder, folders, picked,
                                       f"{look['state']}: {look['reason']}; its parts could not be read here ({error})")
+        if not records:  # nothing to judge: unknown, never clean (lane V4, CLI-08)
+            return _unread_store_rank(run, folder, folders, picked,
+                                      f"{look['state']}: {look['reason']}; its parts hold no record")
         evidence = build_evidence(records, watchdog=folder / "watchdog.json", run_manifest=run.get("manifest") or {},
                                   **applied)
-        steps = [r["step"] for r in records if _is_step(r.get("step"))]
-        last = max(steps) if steps else None
+        last = _last_step(records)
         judged = ("the Python detectors, here, on the stored parts, with "
                   + ("the thresholds the server's last report applied" if applied else "the default thresholds")
                   + f": the server's report is {look['state']} ({look['reason']})")
@@ -306,6 +366,7 @@ def _open_store_all_ranks(run: Mapping[str, Any], folder: Path, folders: Mapping
             + "). Nothing current to compare without reading its parts and judging them here, which "
               "`python -m tensorquill compare` does")
     judged_here: list[int] = []
+    not_read: dict[int, str] = {}  # ranks whose parts were tried here and give no record: part 4 does not read them again
     if read_parts and stale:
         status = read_watchdog(folder / "watchdog.json")
         per_rank: dict[int, dict[str, Any]] = {}
@@ -322,12 +383,15 @@ def _open_store_all_ranks(run: Mapping[str, Any], folder: Path, folders: Mapping
             try:
                 records = load_records(folder, rank=number, all_attempts=True)
             except (OSError, ValueError, ImportError) as error:  # ImportError: the parts need pyarrow
-                unknown[number] = f"{look['state']}: {look['reason']}; its parts could not be read here ({error})"
+                unknown[number] = not_read[number] = (f"{look['state']}: {look['reason']}; its parts could not be read "
+                                                      f"here ({error})")
                 continue
-            steps = [r["step"] for r in records if _is_step(r.get("step"))]
+            if not records:  # nothing to judge: unknown, never clean (lane V4, CLI-08)
+                unknown[number] = not_read[number] = f"{look['state']}: {look['reason']}; its parts hold no record"
+                continue
             per_rank[number] = {**build_evidence(records, watchdog=folder / "watchdog.json",
                                                  run_manifest=run.get("manifest") or {}, **applied),
-                                "last_step": max(steps) if steps else None}
+                                "last_step": _last_step(records)}
             judged_here.append(number)
         combined = combine_rank_evidence(per_rank, status=status, status_expected=True, unknown_ranks=unknown,
                                          memory=memory)
@@ -349,7 +413,8 @@ def _open_store_all_ranks(run: Mapping[str, Any], folder: Path, folders: Mapping
                       **({"judged_here": judged_here} if judged_here else {}),
                       **({"unknown_why": {n: unknown.get(n) for n in unknown_now}} if unknown_now else {}),
                       "judged_by": judged},
-        "records": {"path": str(folder), "rank": None, "ranks": {n: str(folder) for n in sorted(folders)}},
+        "records": {"path": str(folder), "rank": None, "ranks": {n: str(folder) for n in sorted(folders) if n not in not_read},
+                    **({"not_read": not_read} if not_read else {})},
     }
 
 
@@ -791,7 +856,7 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_
     from .divergence import divergence_summary, first_divergence
 
     try:
-        read = [_step_records(run["records"]["path"], run["records"]["rank"]) for run in opened]
+        read = [_step_records(run["records"].get("paths") or run["records"]["path"], run["records"]["rank"]) for run in opened]
     except (OSError, ValueError, ImportError) as error:  # ImportError: a store's parts need pyarrow
         return {"state": "no_records", "detail": f"the step records could not be read for where the runs part ({error})"}
     left_out = {label: [rank] for label, rank, (_, torn) in zip(labels, ranks, read) if torn}
@@ -808,13 +873,31 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_
     }
 
 
-def _step_records(path: str | Path, rank: int) -> tuple[list[dict[str, Any]], bool]:
+def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[str, Any]], bool]:
     """One rank's step records for part 4, as `load_records(path, rank=rank)` reads them, and
     whether a line that is not whole was left out: a `.jsonl` file the job is still writing (or
     one with a line torn by a killed process) is read on its whole lines, as `_open_local` reads
-    it, with the attempts resolved as `load_records` resolves them."""
+    it, with the attempts resolved as `load_records` resolves them. A list is a rank's several
+    files: every attempt of each, in that order, then resolved together (lane V4, CLI-13)."""
     from .evidence import _Tail, load_records, resolve_attempts
 
+    if isinstance(path, (list, tuple)):
+        every: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        torn = False
+        for one in path:
+            try:
+                found = load_records(one, rank=rank, all_attempts=True)
+            except ValueError:
+                source = Path(one)
+                if source.is_dir() or source.suffix == ".parquet":
+                    raise
+                tail = _Tail(source, rank)
+                tail.poll()
+                found = tail.records
+                torn = True
+            every += _not_read_yet(found, seen)
+        return resolve_attempts(every), torn
     try:
         return load_records(path, rank=rank), False
     except ValueError:
@@ -844,13 +927,23 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
     keys one rank's answer has, read from that rank; `no_divergence` only when every rank
     says so; else `no_answer`, naming the ranks without one. `by_rank` has each rank's answer
     in brief: a rank without an answer carries its reason when it is not the chosen rank's.
+
+    A rank whose step records cannot be read, in either run, is left out with why
+    (`ranks_not_read`, and `detail` names it) and the other ranks are still compared: one torn
+    part never ends part 4 for every rank (lane V4, CLI-08). A rank whose parts were already
+    found unreadable or empty when the run was opened (`records["not_read"]`) is not read again.
+    `no_records` only when no rank could be read in both runs.
     """
     from .divergence import divergence_summary, first_divergence
 
     # Each run's step records by rank, and its ranks: all of them, whether or not a rank has
     # records yet, so that a run of two ranks is never taken for a run of one.
-    paths: list[dict[int, str]] = []
+    paths: list[dict[int, Any]] = []
     sets: list[list[int]] = []
+    not_read: dict[int, list[str]] = {}
+    for label, run in zip(labels, opened):
+        for rank, why in sorted((run["records"].get("not_read") or {}).items()):
+            not_read.setdefault(rank, []).append(f"{label}: {why}")
     for run in opened:
         records = run["records"]
         own = dict(records["ranks"]) if records.get("rank") is None else {records["rank"]: records["path"]}
@@ -862,21 +955,23 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
                 "detail": f"where the two runs part compares each rank with the same rank of the other run, and {labels[0]} "
                           f"has {_rank_text(sets[0])} where {labels[1]} has {_rank_text(sets[1])}: with other ranks a rank reads another share of the data, so no rank is "
                           "compared"}
-    without = {rank: [label for label, own in zip(labels, paths) if rank not in own] for rank in sets[0]}
+    without = {rank: [label for label, own in zip(labels, paths) if rank not in own] for rank in sets[0]
+               if rank not in not_read}
     without = {rank: missing for rank, missing in without.items() if missing}
-    compared = [rank for rank in sets[0] if rank not in without]
-    if not compared:
-        return {"state": "no_records", "ranks_without_records": without,
-                "detail": "where the two runs part needs both runs' step records of a rank, and no rank has them in both"}
+    compared = [rank for rank in sets[0] if rank not in without and rank not in not_read]
     answers: dict[int, dict[str, Any]] = {}
     summaries: dict[int, str] = {}
     torn_in: dict[str, list[int]] = {}
     for rank in compared:
-        try:
-            read = [_step_records(own[rank], rank) for own in paths]
-        except (OSError, ValueError, ImportError) as error:  # ImportError: a store's parts need pyarrow
-            return {"state": "no_records", "detail": f"the step records of rank {rank} could not be read for where the runs "
-                                                     f"part ({error})"}
+        read = []
+        for label, own in zip(labels, paths):
+            try:
+                read.append(_step_records(own[rank], rank))
+            except (OSError, ValueError, ImportError) as error:  # ImportError: a store's parts need pyarrow
+                not_read.setdefault(rank, []).append(f"{label}: its step records could not be read ({error})")
+        if rank in not_read:
+            del read
+            continue
         for label, (_, torn) in zip(labels, read):
             if torn:
                 torn_in.setdefault(label, []).append(rank)
@@ -888,6 +983,17 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
         answers[rank] = {**found, "series": {name: e for name, e in series.items() if e.get("status") != "agrees"},
                          "series_agreeing": sum(1 for e in series.values() if e.get("status") == "agrees")}
         del pair
+    unread = {rank: "; ".join(why) for rank, why in sorted(not_read.items())}
+    unread_text = ("" if not unread else f" Not read: {_rank_text(sorted(unread))} ("
+                   + "; ".join(f"rank {rank}: {why}" for rank, why in list(unread.items())[:8]) + ").")
+    if not answers:
+        found = {"state": "no_records", **({"ranks_without_records": without} if without else {}),
+                 **({"ranks_not_read": unread} if unread else {})}
+        if unread:
+            return {**found, "detail": "where the two runs part needs both runs' step records of a rank, and no rank's "
+                                       "could be read in both" + unread_text}
+        return {**found, "detail": "where the two runs part needs both runs' step records of a rank, and no rank has "
+                                   "them in both"}
     diverged = [r for r, found in answers.items() if found["answer"] == "diverged"]
     unanswered = [r for r, found in answers.items() if found["answer"] == "no_answer"]
 
@@ -913,6 +1019,7 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
     if without:
         detail += (f" Not compared: {_rank_text(sorted(without))}, with no step records yet in "
                    + "; ".join(f"rank {rank}: {' and '.join(missing)}" for rank, missing in sorted(without.items())[:8]) + ".")
+    detail += unread_text
     left_out = {label: torn_in[label] for label in labels if label in torn_in}
     detail += _left_out_text(left_out, of_ranks=True)
     chosen = answers[picked]
@@ -931,6 +1038,7 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
         **{key: value for key, value in chosen.items() if key not in ("answer", "reason")},
         "ranks_compared": sorted(answers),
         **({"ranks_without_records": without} if without else {}),
+        **({"ranks_not_read": unread} if unread else {}),
         "by_rank": brief,
         **({"unfinished_lines_left_out": left_out} if left_out else {}),
     }

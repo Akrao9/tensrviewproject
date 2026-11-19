@@ -198,6 +198,35 @@ def histogram_figure(before: dict, after: dict, labels: tuple[str, str], path: P
     return True
 
 
+def finite(values) -> list[float]:
+    """The finite numbers among `values`: a non-finite one is the string the sink writes for it."""
+    return [float(v) for v in values or ()
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)]
+
+
+def split_probes(records, seed_step: int):
+    """The probe passes in `records`: the failed ones as (step, error), kept for the summary, and
+    the others before and after `seed_step` as (step, probe)."""
+    failed, before, after = [], [], []
+    for r in records:
+        if "probe" not in r:
+            continue
+        step, probe = r["step"], r["probe"]
+        if "error" in probe:
+            failed.append((step, probe["error"]))
+        else:
+            (before if step < seed_step else after).append((step, probe))
+    return failed, before, after
+
+
+def attention_text(a) -> str:
+    """One block's attention summary, over the finite values only, with `n/a` where none is."""
+    logits, share = finite(a.get("max_logit")), finite(a.get("entropy_share"))
+    largest = f"{max(logits):.2f}" if logits else "n/a"
+    mean = f"{sum(share) / len(share):.2f}" if share else "n/a"
+    return f"attention largest logit {largest}, entropy share {mean}, {a.get('invalid_rows', '?')} invalid rows"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", type=Path, required=True, help="new directory for the run")
@@ -331,13 +360,10 @@ def main() -> None:
         print(f"  First spike: step {spike['step']}, modules {[m['module'] for m in spike['modules'][:5]]}")
 
     # ---- probe before and after ----------------------------------------------------
-    probes = [(r["step"], r["probe"]) for r in records if "probe" in r and "error" not in r["probe"]]
-    before = [(s, p) for s, p in probes if s < args.seed_step]
-    after = [(s, p) for s, p in probes if s >= args.seed_step]
-    print(f"\n--- Probe ({len(probes)} passes) ---")
-    for s, p in probes:
-        if "error" in p:
-            print(f"Probe at step {s} failed: {p['error']}")
+    failed, before, after = split_probes(records, args.seed_step)
+    print(f"\n--- Probe ({len(before) + len(after) + len(failed)} passes, {len(failed)} failed) ---")
+    for s, error in failed:
+        print(f"Probe at step {s} failed: {error}")
     # The seeded block's own attention runs before its output is scaled; the next block's
     # attention is the first to read the outlier.
     reader = blocks[layer + 1] if layer + 1 < len(blocks) else seeded_block
@@ -351,10 +377,7 @@ def main() -> None:
             if h:
                 line += f"histogram [{h['lo']:.2f}, {h['hi']:.2f}], largest |x| {max(abs(h['lo']), abs(h['hi'])):.2f}"
             if a:
-                share = [v for v in a["entropy_share"] if isinstance(v, float) and math.isfinite(v)]
-                line += (f"; attention largest logit {max(a['max_logit']):.2f}, entropy share "
-                         f"{(sum(share) / len(share)) if share else float('nan'):.2f}, "
-                         f"{a['invalid_rows']} invalid rows")
+                line += f"; {attention_text(a)}"
             print(line)
         h0, h1 = p0["histograms"].get(seeded_block), p1["histograms"].get(seeded_block)
         if h0 and h1:

@@ -232,6 +232,32 @@ def run_comparison(
     return t0, t1, routers, expected_steps, expected_assignments, collapse_step, top_k
 
 
+def _finite(values) -> list[float]:
+    """The finite numbers among `values`: a non-finite one is the string the sink writes for it."""
+    return [float(v) for v in values or ()
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)]
+
+
+def probe_lines(probes: list[dict]) -> list[str]:
+    """What the probe passes say: how many failed and why, then the last pass that did not fail,
+    with each attention summary over its finite values only (`n/a` where there is none)."""
+    failed = [p for p in probes if "error" in p]
+    lines = [f"  {len(failed)} failed; the last: {failed[-1]['error']}"] if failed else []
+    good = [p for p in probes if "error" not in p]
+    if not good:
+        return lines + ["  no probe pass succeeded"] if probes else lines
+    last = good[-1].get("attention") or {}
+    lines.append(f"Last probe that ran: {len(good[-1].get('histograms') or {})} histograms, "
+                 f"attention in {len(last)} layers")
+    for name, att in list(last.items())[:: max(1, len(last) // 4)]:
+        logits, share = _finite(att.get("max_logit")), _finite(att.get("entropy_share"))
+        largest = f"{max(logits):.2f}" if logits else "n/a"
+        entropy = f"{sum(share) / len(share):.2f}" if share else "n/a"
+        lines.append(f"  {name}: largest logit {largest}, entropy {entropy} of maximum, "
+                     f"{att.get('masked_rows', '?')} masked and {att.get('invalid_rows', '?')} invalid rows")
+    return lines
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True, help="new directory for the run")
@@ -388,15 +414,8 @@ def main() -> None:
     if args.probe_every:
         probes = [r["probe"] for r in tensorquill.load_records(full_path) if "probe" in r]
         print(f"Probe passes in {full_path.name}: {len(probes)} (every {args.probe_every} steps)")
-        if probes:
-            last = probes[-1]["attention"]
-            print(f"Last probe: {len(probes[-1]['histograms'])} histograms, attention in {len(last)} layers")
-            for name, att in list(last.items())[:: max(1, len(last) // 4)]:
-                share = sum(att["entropy_share"]) / len(att["entropy_share"])
-                print(
-                    f"  {name}: largest logit {max(att['max_logit']):.2f}, entropy {share:.2f} of maximum, "
-                    f"{att['masked_rows']} masked and {att['invalid_rows']} invalid rows"
-                )
+        for line in probe_lines(probes):
+            print(line)
     if args.cuda_graphs:
         skips = counters["inductor"]["cudagraph_skips"]
         if skips:

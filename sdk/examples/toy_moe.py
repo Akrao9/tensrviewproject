@@ -2,13 +2,16 @@
 
     python examples/toy_moe.py            # writes tensorquill-out/toy-moe.rank0.jsonl
 
+and its evidence beside it, as `python -m tensorquill <capture>` names it
+(`toy-moe.rank0.evidence.json`), so `python -m tensorquill runs tensorquill-out` and the MCP
+server (`tensorquill-mcp tensorquill-out/toy-moe.rank0.evidence.json`) pair the two.
+
 At step 200 the router's bias is pushed towards expert 0, so the expert load collapses
 while the loss keeps looking ordinary. The script then reads the capture back and prints
 the first step where one expert took more than half the tokens.
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -17,6 +20,7 @@ from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import tensorquill  # noqa: E402
+from tensorquill.evidence import default_evidence_path, write_evidence  # noqa: E402
 
 N_EXPERTS, DIM, BATCH, STEPS, BREAK_AT = 8, 32, 256, 300, 200
 
@@ -75,8 +79,8 @@ def main() -> None:
 
     records = tensorquill.load_records(out)
     evidence = tensorquill.build_evidence(records)
-    evidence_path = Path("tensorquill-out") / "toy-moe.evidence.json"
-    evidence_path.write_text(json.dumps(evidence, separators=(",", ":")) + "\n", encoding="utf-8")
+    # The name the command line, `tensorquill runs` and the MCP server read beside a capture.
+    evidence_path = write_evidence(evidence, default_evidence_path(out, records))
 
     first = tensorquill.first_incident(evidence)["step"]
     print(f"captured {len(records)} steps, {len(records[0]['layers'])} layers -> {out}")

@@ -632,7 +632,7 @@ def toy(tmp_path_factory):
             "other_seed": healthy_run(sf, root / "other-seed.jsonl", 350, seed=1),
         }
     for case in sf.CASES:
-        runs[case] = tensorquill.load_records(root / "seeded" / case / f"{case}.jsonl")
+        runs[case] = tensorquill.load_records(root / "seeded" / f"{case}.jsonl")
     return runs
 
 
@@ -697,7 +697,7 @@ def frozen_early(toy, tmp_path_factory):
                          "--steps", "300"])
             except SystemExit:
                 pass  # its own verdict on the stall detector, not what is tested here
-        runs[freeze] = tensorquill.load_records(root / str(freeze) / "stalled_weights" / "stalled_weights.jsonl")
+        runs[freeze] = tensorquill.load_records(root / str(freeze) / "stalled_weights.jsonl")
     return runs
 
 
