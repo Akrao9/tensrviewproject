@@ -2428,13 +2428,15 @@ def _threshold_problem(name: str, value: Any) -> str | None:
     return None
 
 
-def check_thresholds(**given: Any) -> None:
+def check_thresholds(*, none_given: bool = False, **given: Any) -> None:
     """Raise `ValueError` for a detector option the Rust detectors refuse (`_threshold_problem`),
     so the Python detectors refuse the same ones (E6 / DET-15, Nov 19, 2026: they took a negative
     tolerance, `top_k=0` or `starve_window=0` and judged with it). `given` is any of the six
-    `THRESHOLD_NAMES`; one left out or None (`top_k` aside) is not checked."""
+    `THRESHOLD_NAMES`; one left out is not checked, nor one that is None (`top_k` aside), which
+    `watch` and the command line read as "not given". `none_given=True` checks None too, for
+    `build_evidence`, whose options have no "not given"."""
     for name in THRESHOLD_NAMES:
-        if name not in given or (given[name] is None and name != "top_k"):
+        if name not in given or (given[name] is None and name != "top_k" and not none_given):
             continue
         problem = _threshold_problem(name, given[name])
         if problem is not None:
@@ -4709,7 +4711,7 @@ def build_evidence(
     # Both detectors judge by one contract, the Rust one's: refused here before anything is read.
     check_thresholds(overload_threshold=overload_threshold, drift_tolerance=drift_tolerance,
                      starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,
-                     update_window=update_window)
+                     update_window=update_window, none_given=True)
     every_attempt, left_out = _load_counted(source, rank)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
