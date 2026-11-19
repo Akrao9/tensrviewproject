@@ -134,7 +134,7 @@ IDLE_COLOR = (150, 158, 170)
 def _is_non_finite(value: Any) -> bool:
     if isinstance(value, str):
         return value in ("nan", "inf", "-inf")
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
         return not math.isfinite(value)
     return False
 
@@ -267,7 +267,11 @@ def _jump_overloaded(
 
 
 def _finite(value: Any) -> float | None:
-    return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else None
+    """A finite number, else None. A bool is not a number (DET-16): an imported `true` is not a
+    measurement of 1. Flags such as `step_skipped` are read as flags, not through here."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
 
 
 def _median(values: list[float]) -> float:
@@ -280,12 +284,16 @@ def scalar_context(
     records: list[dict[str, Any]], step: int, *, window: int = SPIKE_WINDOW
 ) -> dict[str, dict[str, Any]]:
     """Values logged with `session.log` at `step`, each with the median of its finite
-    values over the previous `window` records, so an incident shows what the loss did."""
+    values over the previous `window` records, so an incident shows what the loss did.
+    A bool logged as a scalar is left out (DET-16): it is not a measurement, and the row sent
+    to the Rust detectors, whose scalars are numbers, cannot carry it either."""
     index = next((i for i, record in enumerate(records) if record.get("step") == step), None)
     if index is None:
         return {}
     context = {}
     for name, value in (records[index].get("scalars") or {}).items():
+        if isinstance(value, bool):
+            continue
         before = [
             v for v in (_finite((r.get("scalars") or {}).get(name)) for r in records[max(0, index - window) : index])
             if v is not None
@@ -922,6 +930,11 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
     if not status or status.get("summary") not in ("stalled", "degraded"):
         return []
     full = list(status.get("ranks", ()))
+    if not status.get("missing_ranks") and not any(r.get("state") in ("silent", "lost", "unresponsive") for r in full):
+        # No rank stopped and none is missing: the summary's cause is not progress, as when a rank
+        # whose capture stopped is beside an active one (contract 3). As `progress_incidents` in
+        # watchdog.rs (lane W2).
+        return []
     places = [place for place in map(stuck_at, (r for r in full if r.get("state") in ("silent", "lost", "unresponsive")))
               if place is not None]
     ranks = [{k: v for k, v in r.items() if k != "stack"} for r in full]
@@ -992,30 +1005,45 @@ def detect_stalled_weights(
     Uses `weights_unchanged`, which the capture sets when a parameter's float64 norm is
     exactly what it was at the previous weight check. Equal norms are strong evidence
     but not proof that the weights are equal, so this is a warning: a parameter is reported
-    once that holds on `steps` checks in a row while its gradient is finite and non-zero.
+    once that holds on `steps` checks in a row while its gradient is finite and non-zero
+    (contract 2, signed off Nov 19, 2026). At a weight check (a row with the list):
+
+    - listed, with a finite gradient above zero: the streak grows;
+    - listed, with no gradient entry: the streak holds (it was not asked to move then);
+    - listed, with a zero or non-finite gradient: the streak starts again;
+    - not listed, a parameter seen before with a gradient: the streak starts again, with or
+      without a gradient there. The list leaves out a parameter the check found changed and
+      one it could not compare, and either breaks the streak; neither ends the parameter's
+      history, so a later streak can still fire.
+
+    A row whose total gradient norm is not finite adds nothing to a streak (mixed-precision
+    loss scaling skips those optimizer steps on purpose) but its resets apply. A row
+    without the list is no weight check, and every streak holds.
 
     There is one incident, dated at the first step any parameter stalled; `step`,
     `parameters`, `stalled` and `optimizer` describe that first onset. Every parameter is
     judged on its own history, so one that stalls later is named too: `onsets` lists each
-    step at which parameters first stalled, with the parameters (those that had changed at
-    an earlier check first), how many had (`trained_before`), and the optimizer evidence for
-    them; `stalled_total` counts every parameter that stalled at any step. A parameter that has never changed since the first check and one that trained and
-    then stopped are different findings: with bf16 or fp16 weights and no float32 master
-    copy, an update smaller than the weight's spacing rounds away from the first step (norm
-    weights near 1.0 at a small learning rate), while a parameter that trained and then
-    stopped was frozen during the run. `weight_dtypes` (how many trainable parameters have
-    each dtype, when the capture recorded it) says which precision that is.
+    step at which parameters first stalled, with the parameters (those not shown unchanged at
+    an earlier check first), how many were (`trained_before`), and the optimizer evidence for
+    them; `stalled_total` counts every parameter that stalled at any step. `trained_before`
+    counts a parameter that was missing from the list at an earlier check: it changed there,
+    or the check could not compare it, and the record does not say which. A parameter never
+    seen changing and one seen changing or not compared are different findings: with bf16 or
+    fp16 weights and no float32 master copy, an update smaller than the weight's spacing
+    rounds away from the first step (norm weights near 1.0 at a small learning rate), while a
+    parameter that trained and then stopped was frozen during the run. `weight_dtypes` (how
+    many trainable parameters have each dtype, when the capture recorded it) says which
+    precision that is.
 
     `optimizer` says whether an optimizer that stepped holds the parameters: `known` with
     the stalled parameters no optimizer holds, or `unknown` with the reason, for DeepSpeed,
     Megatron, FSDP1, `auto_step=False` or captures that did not record it. A stalled
-    parameter that no optimizer holds is the likely cause. Steps with a non-finite gradient
-    norm are skipped, because mixed-precision loss scaling skips those optimizer steps on
-    purpose. Captures without `weights_unchanged` (older files, or Apple MPS) are not
-    checked: a float32 norm stays the same while bf16 weights change by a few elements.
+    parameter that no optimizer holds is the likely cause. Captures without
+    `weights_unchanged` (older files, or Apple MPS) are not checked: a float32 norm stays the
+    same while bf16 weights change by a few elements.
     """
     streak: dict[str, int] = {}
-    changed: set[str] = set()  # seen changing at some weight check
+    changed: set[str] = set()  # not shown unchanged at some weight check: changed, or not compared
     reported: set[str] = set()
     onsets: list[dict[str, Any]] = []
     first: dict[str, Any] | None = None
@@ -1025,17 +1053,24 @@ def detect_stalled_weights(
         unchanged = record.get("weights_unchanged")
         if unchanged is None:
             continue
-        if _finite(record.get("grad_norm")) is None and record.get("grad_norm") is not None:
-            continue
+        evidence = _finite(record.get("grad_norm")) is not None or record.get("grad_norm") is None
         grads = record.get("grad_norms", {})
         unchanged_set = set(unchanged)
+        for name in streak:
+            if name not in unchanged_set:
+                streak[name] = 0
         for name, value in grads.items():
             grad = _finite(value)
-            if grad is not None and grad > 0 and name in unchanged_set:
+            if grad is None or grad <= 0 or name not in unchanged_set:
+                streak[name] = 0
+            elif evidence:
                 streak[name] = streak.get(name, 0) + 1
             else:
-                streak[name] = 0
-        stalled = [name for name, count in streak.items() if count >= steps]
+                streak.setdefault(name, 0)
+        changed.update(name for name in streak if name not in unchanged_set)
+        if not evidence:
+            continue
+        stalled =[name for name, count in streak.items() if count >= steps]
         if stalled:
             stalled_steps += 1
             new = [name for name in stalled if name not in reported]
@@ -1065,7 +1100,6 @@ def detect_stalled_weights(
                 dtypes = record.get("weight_dtypes")
                 if isinstance(dtypes, dict) and dtypes:
                     first["weight_dtypes"] = dtypes
-        changed.update(name for name in grads if name not in unchanged_set)
     if first is not None:
         first["stalled_steps"] = stalled_steps
         first["stalled_total"] = len(reported)
@@ -1362,7 +1396,7 @@ def detect_repeated_steps(records: list[dict[str, Any]]) -> dict[str, Any] | Non
         for r, attempt, step in seen:
             if r == rank:
                 steps.setdefault(attempt, set()).add(step)
-        attempts = sorted(steps)
+        attempts = list(steps)  # in the order they first appear (contract 1)
         start = min(steps[attempts[0]])
         earlier = set(steps[attempts[0]])
         for attempt in attempts[1:]:
@@ -1422,7 +1456,7 @@ def detect_resume_lr_changes(
             not_checked.append({"check": "resume_lr", "step": step, "rank": rank, "reason": reason, **numbers})
 
     for rank, attempts in sorted(by_rank.items(), key=lambda kv: str(kv[0])):
-        order = sorted(attempts)
+        order = list(attempts)  # in the order they first appear (contract 1)
         run_start = min(attempts[order[0]])
         first_lr = attempts[order[0]][run_start]
         history: dict[int, tuple[list[float], int]] = {}  # step -> (learning rate, attempt)
@@ -1585,7 +1619,9 @@ def lines_left_out_line(evidence: Mapping[str, Any]) -> str | None:
             " written) and were skipped; the steps after them are read.")
 
 
-def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def resolve_attempts(
+    records: list[dict[str, Any]], *, order: Mapping[tuple[str, Any], list[Any]] | None = None
+) -> list[dict[str, Any]]:
     """Leave out the records a later attempt replaced.
 
     Each `tensorquill.init` stamps its records with `attempt`, its start time. A job that
@@ -1594,6 +1630,15 @@ def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     is history that training rolled back, including steps the new attempt has not reached
     yet. Records without `attempt` (written before it existed) count as attempt 0. The
     order of the remaining records is unchanged.
+
+    "Later" is the order in which a rank's attempts first appear in `records`, not their
+    numbers (contract 1, signed off Nov 19, 2026): an attempt number is an identity, and a
+    replacement on a host whose clock is behind has a lower one. A local file is appended
+    across attempts, so its order is arrival order; a store's parts are read in the rank's
+    stored attempt order (`attempts.json`, else by number: `_parquet_parts`). `order` gives a
+    rank's attempts oldest first by `(run_id, rank)` where the records alone cannot, as for a
+    rank's several files (`resolve_attempts_across`); an attempt it does not list keeps its
+    place of first appearance after those it does.
 
     An attempt is of one run: a later attempt of another run ID never rolls back this one's
     records (lane U7, Nov 19, 2026). A record with no `run_id` is of no named run (`_run_of`).
@@ -1609,13 +1654,155 @@ def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     cutoff: dict[tuple[str, Any, int], float] = {}
     for run, rank in {(run, rank) for run, rank, _ in first_step}:
         cut = math.inf
-        for attempt in sorted((a for n, r, a in first_step if (n, r) == (run, rank)), reverse=True):
+        # `first_step` holds a rank's attempts in the order they first appear.
+        appeared = [a for n, r, a in first_step if (n, r) == (run, rank)]
+        given = [a for a in (order or {}).get((run, rank), ()) if a in appeared]
+        for attempt in reversed(given + [a for a in appeared if a not in given]):
             cutoff[(run, rank, attempt)] = cut
             cut = min(cut, first_step[(run, rank, attempt)])
     return [
         record for record in records
         if int(record["step"]) < cutoff[(_run_of(record), record.get("rank", 0), record.get("attempt", 0))]
     ]
+
+
+def superseded_rows(records: Iterable[Mapping[str, Any]]) -> int:
+    """How many records belong to an attempt that is not the newest seen so far, in the order
+    given: a late row of a superseded attempt (contract 1, a reader with only the local file).
+    They are kept and judged by the rollback as before, and do not move the run's last step."""
+    newest: dict[tuple[str, Any], int] = {}
+    places: dict[tuple[str, Any], dict[Any, int]] = {}
+    late = 0
+    for record in records:
+        key = (_run_of(record), record.get("rank", 0))
+        known = places.setdefault(key, {})
+        place = known.setdefault(record.get("attempt", 0), len(known))
+        if place < newest.get(key, -1):
+            late += 1
+        newest[key] = max(newest.get(key, -1), place)
+    return late
+
+
+def attempt_order_report(
+    files: Iterable[Iterable[Mapping[str, Any]]], names: Iterable[str] | None = None
+) -> dict[tuple[str, Any], dict[str, Any]]:
+    """How the attempts of each rank are ordered when its records are in several local files
+    (contract 1, "One run and rank in more than one local file", as the author amended it,
+    Nov 19, 2026), by `(run_id, rank)`: `order` (oldest first), `attempt_order` and, when it
+    applies, `reason` and `by_number`.
+
+    1. In each file an attempt's place is its first appearance there, and any two attempts in
+       one file keep that file's order.
+    2. An attempt is placed once every attempt any file puts before it is placed.
+    3. Among attempts ready at once, the earliest first-record `ts` goes first (an attempt held
+       by several files counts its earliest finite first `ts`); the lower attempt number decides
+       when a candidate has no finite `ts`, or two share the earliest. Those pairs are named in
+       `by_number`, each with why (`"no ts"` or `"same ts"`).
+    4. Files that disagree (one puts A before B, another B before A, directly or through other
+       attempts) give numeric order, `attempt_order: "numeric"`, and a `reason` naming the
+       attempts and the files (`names`, else "file 1", "file 2", ...).
+    5. Otherwise `attempt_order: "first_seen"`. The order the files are given in never decides.
+    """
+    listed = [list(records) for records in files]
+    labels = list(names) if names is not None else [f"file {n}" for n in range(1, len(listed) + 1)]
+    firsts: dict[tuple[str, Any], dict[Any, float | None]] = {}
+    edges: dict[tuple[str, Any], dict[Any, dict[Any, set[str]]]] = {}  # earlier -> later -> files
+    for label, records in zip(labels, listed):
+        places: dict[tuple[str, Any], list[Any]] = {}
+        for record in records:
+            key, attempt = (_run_of(record), record.get("rank", 0)), record.get("attempt", 0)
+            here = places.setdefault(key, [])
+            if attempt in here:
+                continue
+            here.append(attempt)  # its first record in this file
+            ts, stamps = _finite(record.get("ts")), firsts.setdefault(key, {})
+            if attempt not in stamps:
+                stamps[attempt] = ts
+            elif ts is not None and (stamps[attempt] is None or ts < stamps[attempt]):  # type: ignore[operator]
+                stamps[attempt] = ts  # the earliest finite first `ts` among the files
+        for key, here in places.items():
+            later_of = edges.setdefault(key, {})
+            for at, earlier in enumerate(here):
+                for later in here[at + 1:]:
+                    later_of.setdefault(earlier, {}).setdefault(later, set()).add(label)
+
+    def number(attempt: Any) -> int:
+        return _whole_attempt(attempt) or 0
+
+    out: dict[tuple[str, Any], dict[str, Any]] = {}
+    for key, stamps in firsts.items():
+        later_of = edges.get(key, {})
+        clash = sorted(
+            ((a, b) for a, laters in later_of.items() for b in laters if a in later_of.get(b, {})), key=str
+        )
+        waiting = {a: sum(a in laters for laters in later_of.values()) for a in stamps}
+        order: list[Any] = []
+        by_number: list[dict[str, Any]] = []
+        while waiting and not clash:
+            ready = [a for a, n in waiting.items() if n == 0]
+            if not ready:  # a disagreement through other attempts
+                clash = sorted(((a, b) for a in waiting for b in later_of.get(a, {}) if b in waiting), key=str)
+                break
+            if len(ready) == 1:
+                pick = ready[0]
+            elif any(stamps[a] is None for a in ready):
+                pick = min(ready, key=number)
+                by_number += [{"attempts": [pick, other], "why": "no ts"} for other in ready if other != pick]
+            else:
+                earliest = min(stamps[a] for a in ready)  # type: ignore[type-var]
+                tied = [a for a in ready if stamps[a] == earliest]
+                pick = min(tied, key=number)
+                by_number += [{"attempts": [pick, other], "why": "same ts"} for other in tied if other != pick]
+            order.append(pick)
+            del waiting[pick]
+            for later in later_of.get(pick, {}):
+                if later in waiting:
+                    waiting[later] -= 1
+        if clash:
+            attempts = sorted({a for pair in clash for a in pair}, key=number)
+            named = sorted({f for a, b in clash for f in later_of[a][b]} | {f for a, b in clash for f in later_of.get(b, {}).get(a, ())})
+            out[key] = {
+                "order": sorted(stamps, key=number), "attempt_order": "numeric",
+                "reason": f"the files disagree on the order of attempts {', '.join(map(str, attempts))}"
+                          f" ({', '.join(named)}): ordered by number",
+            }
+        else:
+            out[key] = {"order": order, "attempt_order": "first_seen", **({"by_number": by_number} if by_number else {})}
+    return out
+
+
+def attempt_order_across(
+    files: Iterable[Iterable[Mapping[str, Any]]], names: Iterable[str] | None = None
+) -> dict[tuple[str, Any], list[Any]]:
+    """Each rank's attempts oldest first when its records are in several local files: the
+    `order` of `attempt_order_report`."""
+    return {key: info["order"] for key, info in attempt_order_report(files, names).items()}
+
+
+def in_attempt_order(
+    records: Iterable[Mapping[str, Any]], order: Mapping[tuple[str, Any], list[Any]]
+) -> list[dict[str, Any]]:
+    """`records` with each rank's attempts in `order` (oldest first, by `(run_id, rank)`): a
+    stable sort, so the records of one attempt keep their order. An attempt `order` does not
+    list keeps its place of first appearance after those it lists. Every reader that takes
+    first appearance as the order (`resolve_attempts`, the detectors, the stream to the Rust
+    detectors) then reads `order`."""
+    listed = list(records)
+    places: dict[tuple[str, Any], dict[Any, int]] = {}
+    for key, attempts in order.items():
+        places[key] = {attempt: at for at, attempt in enumerate(attempts)}
+    for record in listed:
+        known = places.setdefault((_run_of(record), record.get("rank", 0)), {})
+        known.setdefault(record.get("attempt", 0), len(known))
+    return sorted(listed, key=lambda r: places[(_run_of(r), r.get("rank", 0))][r.get("attempt", 0)])  # type: ignore[return-value]
+
+
+def resolve_attempts_across(files: Iterable[Iterable[Mapping[str, Any]]]) -> list[dict[str, Any]]:
+    """`resolve_attempts` over a rank's several files, with the attempts in `attempt_order_across`
+    order: the records of every file, in the order given, with those a later attempt replaced
+    left out."""
+    listed = [list(records) for records in files]
+    return resolve_attempts([r for records in listed for r in records], order=attempt_order_across(listed))  # type: ignore[misc]
 
 
 def check_one_run(records: Iterable[Mapping[str, Any]]) -> None:
@@ -1641,6 +1828,39 @@ def _run_of(record: Mapping[str, Any]) -> str:
 
 
 _PART_NAME = re.compile(r"part-(-?\d+)-(-?\d+)\.parquet$")
+_WHOLE = re.compile(r"-?[0-9]+")  # ASCII digits only: `int("²")` raises (lane V3's note)
+ATTEMPT_ORDER_FILE = "attempts.json"
+
+
+def _attempt_number(value: str) -> int | None:
+    return int(value) if _WHOLE.fullmatch(value) else None
+
+
+def stored_attempt_order(rank_folder: Path) -> tuple[list[int] | None, str]:
+    """The rank's attempts oldest first, as the server wrote them to `attempts.json`
+    (contract 1), and how the order was set: `"first_seen"`, `"numeric_then_first_seen"` (the
+    file lists attempts that were in the store before it, `by: "store"`) or `"numeric"` (no
+    readable file: the attempts go by number, as stores written before the file existed do)."""
+    try:
+        document = json.loads((rank_folder / ATTEMPT_ORDER_FILE).read_text(encoding="utf-8"))
+        entries = document["attempts"]
+        order = [entry["attempt"] for entry in entries]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, "numeric"
+    if not all(isinstance(a, int) and not isinstance(a, bool) for a in order) or len(set(order)) != len(order):
+        return None, "numeric"
+    by_store = any(isinstance(entry, Mapping) and entry.get("by") == "store" for entry in entries)
+    return order, "numeric_then_first_seen" if by_store else "first_seen"
+
+
+def _attempt_place(order: list[int] | None, attempt: int) -> tuple[int, int]:
+    """A sort key for `attempt` in a rank's stored order: by number without one; an attempt the
+    file does not list goes just before the newest (contract 1, rule 3), by number among such."""
+    if order is None:
+        return (attempt, 0)
+    if attempt in order:
+        return (2 * order.index(attempt), 0)
+    return (2 * len(order) - 3, attempt)
 
 
 _RANK_FOLDER = re.compile(r"rank=([0-9]+)")
@@ -1664,22 +1884,33 @@ def _other_rank_folder(entry: os.DirEntry[str], rank: int) -> bool:
 def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
     """The server's part files under `directory`, ordered by rank, attempt and first step.
 
-    With `rank`, the `rank=<n>` folders of other ranks directly under `directory` are not
+    Attempts go in the rank's stored order (`attempts.json`, contract 1), or by number in a
+    store written before that file. With `rank`, the `rank=<n>` folders of other ranks directly under `directory` are not
     entered: the server writes a rank's records only into its own folder, so reading and
     discarding them would cost every other rank's share of the run on each look. Parts
     anywhere else are listed as before and their records filtered by the caller.
     """
 
-    def order(path: Path) -> tuple[int, int, int, str]:
+    orders: dict[Path, list[int] | None] = {}
+
+    def order(path: Path) -> tuple[int, tuple[int, int], int, str]:
         numbers = {"rank": 0, "attempt": 0}
-        for parent in path.relative_to(directory.parent).parts[:-1]:
+        rank_folder: Path | None = None
+        relative = path.relative_to(directory.parent).parts[:-1]
+        for depth, parent in enumerate(relative):
             name, _, value = parent.partition("=")
             if name == "rank" and _rank_number(parent) is not None:
                 numbers[name] = int(value)
-            elif name == "attempt" and value.lstrip("-").isdigit():
-                numbers[name] = int(value)
+                rank_folder = directory.parent.joinpath(*relative[: depth + 1])
+            elif name == "attempt" and (number := _attempt_number(value)) is not None:
+                numbers[name] = number
+        if rank_folder is None:
+            rank_folder = path.parent.parent if path.parent.name.startswith("attempt=") else path.parent
+        if rank_folder not in orders:
+            orders[rank_folder] = stored_attempt_order(rank_folder)[0]
         match = _PART_NAME.search(path.name)
-        return numbers["rank"], numbers["attempt"], int(match.group(1)) if match else 0, path.name
+        place = _attempt_place(orders[rank_folder], numbers["attempt"])
+        return numbers["rank"], place, int(match.group(1)) if match else 0, path.name
 
     if rank is None:
         found = list(directory.rglob("part-*.parquet"))
@@ -1904,7 +2135,7 @@ INPUT_NEEDS: dict[str, str] = {
     "loss_scale": "step_skipped (scaler=)",
     "lr": "lr",
     "data": "data (session.watch_loader)",
-    "checkpoint": "checkpoint",
+    "checkpoint": "checkpoint, or grad_scale (scaler=)",
     "layers": "layers (full capture)",
     "attention": "probe with attention (probe=)",
     "numbers": "layers, grad_norm, clip_grad_norm or grad_norms",
@@ -2034,12 +2265,18 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
         total = record.get("grad_norm") is not None or record.get("clip_grad_norm") is not None
         norms, layers = bool(record.get("grad_norms")), bool(record.get("layers"))
         counts["grad_total"] += total
-        counts["update"] += total and isinstance(record.get("update_rms"), Mapping) and bool(record["update_rms"])
+        # A step the loss scaler skipped is no update history (RUST-12): the update rule skips it.
+        counts["update"] += (
+            total and isinstance(record.get("update_rms"), Mapping) and bool(record["update_rms"])
+            and not record.get("step_skipped")
+        )
         counts["weight_check"] += record.get("weights_unchanged") is not None and norms
         counts["loss_scale"] += record.get("step_skipped") is not None
         counts["lr"] += _lr_values(record) is not None
         counts["data"] += isinstance(record.get("data"), Mapping)
-        counts["checkpoint"] += isinstance(record.get("checkpoint"), Mapping)
+        # `resume_incomplete` judges a resume from a checkpoint manifest or from the loss scale
+        # (E3): either is its input.
+        counts["checkpoint"] += isinstance(record.get("checkpoint"), Mapping) or _finite(record.get("grad_scale")) is not None
         counts["layers"] += layers
         probe = record.get("probe")
         counts["attention"] += (
@@ -2057,7 +2294,7 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
 
 
 def _finite_number(value: Any) -> float | None:
-    return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else None
+    return _finite(value)
 
 
 def _kinds_not_checked(not_checked: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
@@ -2361,13 +2598,17 @@ def _rank_folder(source: Path, rank: int | None, dirs: list[Path] | None = None)
 
 def _newest_part(folder: Path) -> tuple[tuple[int, int] | None, Path | None, int]:
     """The newest attempt stored in a rank's folder and its last step, read from the part
-    names alone, with that part's path and how many parts have a name the server did not give."""
+    names alone, with that part's path and how many parts have a name the server did not give.
+    The newest attempt is the last in the rank's stored order (`attempts.json`, contract 1), or
+    the highest number in a store written before that file."""
     # A walk of names with `os.scandir`, which builds no `Path` per part: with 200 parts a rank
     # (10,000 steps) that was 94% of a look at 64 ranks, and it grows with the run. The parts
     # counted, and the ones left out, are those `folder.rglob("part-*.parquet")` gives.
     newest: tuple[int, int] | None = None
+    newest_key: tuple[tuple[int, int], int] | None = None
     newest_path: str | None = None
     unknown = 0
+    order = stored_attempt_order(folder)[0]  # the rank's attempts in their stored order (contract 1)
     pending = [(str(folder), 0, "")]
     while pending:
         directory, depth, directory_name = pending.pop()
@@ -2381,12 +2622,14 @@ def _newest_part(folder: Path) -> tuple[tuple[int, int] | None, Path | None, int
                 if name.startswith("part-") and name.endswith(".parquet"):
                     match = _PART_NAME.search(name)
                     key, _, attempt = directory_name.partition("=")
-                    if match is None or depth != 1 or key != "attempt" or not attempt.lstrip("-").isdigit():
+                    number = _attempt_number(attempt)
+                    if match is None or depth != 1 or key != "attempt" or number is None:
                         unknown += 1
                     else:
-                        at = (int(attempt), int(match.group(2)))
-                        if newest is None or at > newest:
-                            newest, newest_path = at, entry.path
+                        at = (number, int(match.group(2)))
+                        ranked = (_attempt_place(order, number), at[1])
+                        if newest_key is None or ranked > newest_key:
+                            newest, newest_key, newest_path = at, ranked, entry.path
                 if entry.is_dir(follow_symlinks=False):
                     pending.append((entry.path, depth + 1, name))
     return newest, Path(newest_path) if newest_path is not None else None, unknown
@@ -2586,9 +2829,10 @@ def read_server_report(
     """
     folder = Path(folder)
     stored, _, unknown = _newest_part(folder)
+    order, attempt_order = stored_attempt_order(folder)
 
     def result(state: str, reason: str, report: dict[str, Any] | None = None) -> dict[str, Any]:
-        return {"state": state, "reason": reason, "stored": stored, "report": report}
+        return {"state": state, "reason": reason, "stored": stored, "report": report, "attempt_order": attempt_order}
 
     try:
         text = (folder / "incidents.json").read_text(encoding="utf-8")
@@ -2638,7 +2882,8 @@ def read_server_report(
     where = f"step {last_step} of attempt {report['attempt']}"
     if reported == stored:
         return result("current", f"the server's report is current through {where}", report)
-    if reported < stored:
+    # Attempts compared by their place in the rank's stored order (contract 1), not by number.
+    if (_attempt_place(order, reported[0]), reported[1]) < (_attempt_place(order, stored[0]), stored[1]):
         return result("behind", f"the server's report stops at {where} and the store holds step {stored[1]} of"
                       f" attempt {stored[0]}", report)
     return result("unusable", f"the server's report reaches {where}, past the stored step {stored[1]} of"
@@ -2655,6 +2900,9 @@ def _detection(look: Mapping[str, Any], source: str, rank: int | None) -> dict[s
         "rank": report.get("rank", rank),
         **({"stored_attempt": stored[0], "stored_last_step": stored[1]} if stored else {}),
         **({f"report_{key}": report[key] for key in ("attempt", "last_step", "steps", "rebuilds") if key in report}),
+        # How the store's attempts were ordered (contract 1): `first_seen`, `numeric_then_first_seen`
+        # or `numeric` for a store written before the order was kept.
+        **({"attempt_order": look["attempt_order"]} if look.get("attempt_order") else {}),
     }
 
 
@@ -2762,6 +3010,10 @@ def _report_evidence(
 # against it, and every status summary or report state not named here reads `unknown`.
 RUN_STATES = ("healthy", "degraded", "unknown", "unhealthy")
 _STATUS_HEALTHY = ("active", "finished")
+# The rank states a server's `watchdog.json` writes (`RankState` in watchdog.rs, and contract 3's
+# `capture_stopped`). A reader meeting another one says so and never calls the run healthy.
+RANK_STATES = ("active", "starting", "paused", "silent", "unresponsive", "reconnecting", "lost", "finished",
+               "capture_stopped")
 
 
 def _reason(state: str, code: str, detail: str, **extra: Any) -> dict[str, Any]:
@@ -2773,8 +3025,10 @@ def _whole_attempt(value: Any) -> int | None:
 
 
 def newest_attempt(records: Iterable[Mapping[str, Any]]) -> int | None:
-    """The newest attempt among `records` (a record that names none is attempt 0), or None for none."""
-    return max((_whole_attempt(r.get("attempt", 0)) or 0 for r in records), default=None)
+    """The newest attempt among `records` (a record that names none is attempt 0), or None for
+    none: the one that first appears last (contract 1), not the highest number."""
+    places = dict.fromkeys(_whole_attempt(r.get("attempt", 0)) or 0 for r in records)
+    return next(reversed(places), None)
 
 
 def _not_current_by_status(status: Mapping[str, Any], judged: Mapping[int, int | None]) -> dict[int, str]:
@@ -2833,7 +3087,14 @@ def run_state(
     `observations` reason, whose state is `healthy`, and every other incident, a kind this
     version does not know among them, to `incidents`. Codes are stable: `incidents`;
     `no_steps`, `report_not_current`, `ranks_unknown`, `status_old`, `server_stopped`,
-    `status_summary`; `no_status`, `not_checked`; `observations`.
+    `status_summary`, `capture_stopped`, `rank_state_unknown`; `no_status`, `not_checked`;
+    `observations`.
+
+    `capture_stopped` (contract 3, Nov 19, 2026): a rank whose attempt stopped capture while
+    training went on is not judged, whatever state it reads (`capture_stopped`, or
+    `unresponsive`, `reconnecting` or `lost` beside the kept stop): unknown, with its ranks and
+    each one's reason. `rank_state_unknown`: a rank state this version does not know (a newer
+    server's) is unknown too, never healthy.
     """
     reasons: list[dict[str, Any]] = []
     listed = list(incidents)
@@ -2865,6 +3126,26 @@ def run_state(
         reasons.append(_reason("unknown", "ranks_unknown", f"{len(ranks)} rank{'s' if len(ranks) != 1 else ''} without"
                                f" a current report ({_rank_ranges(ranks, 8)}): nothing is said about incidents on"
                                " them", ranks=ranks))
+    if status is not None:
+        entries = [r for r in status.get("ranks") or () if isinstance(r, Mapping)]
+        stopped = {r.get("rank"): r["capture_stopped"] for r in entries if r.get("capture_stopped") is not None}
+        if stopped:
+            ranks = sorted(stopped, key=str)
+            why = {rank: (stop.get("reason") if isinstance(stop, Mapping) else None) or "unknown" for rank, stop in stopped.items()}
+            reasons.append(_reason(
+                "unknown", "capture_stopped",
+                f"capture stopped on {len(ranks)} rank{'s' if len(ranks) != 1 else ''} while training went on"
+                f" ({', '.join(f'rank {rank}: {why[rank]}' for rank in ranks)}): nothing is judged there since",
+                ranks=ranks, reasons={str(rank): why[rank] for rank in ranks}))
+        strange = {r.get("rank"): r.get("state") for r in entries if r.get("state") not in RANK_STATES}
+        if strange:
+            ranks = sorted(strange, key=str)
+            words = list(dict.fromkeys(str(strange[rank]) for rank in ranks))
+            reasons.append(_reason(
+                "unknown", "rank_state_unknown",
+                f"the server's status gives a rank state this reader does not know ({', '.join(map(repr, words))},"
+                f" {len(ranks)} rank{'s' if len(ranks) != 1 else ''}): a newer server's, so nothing is said about them",
+                ranks=ranks, states=words))
     if status is None:
         if status_expected:
             reasons.append(_reason("degraded", "no_status", _NO_STATUS))
@@ -4607,6 +4888,11 @@ def _moe_samples(
                     mean_share = 1.0 / n_experts
                     se_share = math.sqrt(mean_share * (1.0 - mean_share) / tokens)
                     collapse_threshold = max(2.0 * mean_share, mean_share + 3.0 * se_share)
+                    if collapse_threshold >= 1.0 / k:
+                        # A top-k expert's share cannot pass 1/k (each token picks it once at
+                        # most), so with n_experts <= 2k that bound names nothing (DET-11): use
+                        # the midpoint between an even share and the largest one there is.
+                        collapse_threshold = (mean_share + 1.0 / k) / 2.0
                     overloaded = [
                         i for i, share in enumerate(shares, 1) if share > collapse_threshold
                     ]
@@ -4653,8 +4939,14 @@ def build_evidence(
     run_manifest: str | Path | Mapping[str, Any] | None = None,
     update_window: int = UPDATE_WINDOW,
     records_file: str | Path | None = None,
+    attempt_order: Mapping[tuple[str, Any], list[Any]] | None = None,
 ) -> dict[str, Any]:
     """Build viewer-neutral detector evidence from captured step records.
+
+    `attempt_order` gives each rank's attempts oldest first by `(run_id, rank)` where the
+    records' own order cannot, as for a rank's several local files (`attempt_order_across`,
+    contract 1). The records are put in that order first (`in_attempt_order`), so the Python
+    detectors and the stream sent to the Rust ones judge the same order.
 
     `run_end` says whether the session that wrote a local `.jsonl` file closed it
     (`sink.read_end_marker`): read from `source` when that is the file, or from `records_file`
@@ -4716,11 +5008,16 @@ def build_evidence(
                      starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,
                      update_window=update_window, none_given=True)
     every_attempt, left_out = _load_counted(source, rank)
+    if attempt_order:
+        every_attempt = in_attempt_order(every_attempt, attempt_order)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
         raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
     check_one_run(every_attempt)
-    records = resolve_attempts(every_attempt)
+    # Lane W3's step-order rule: the effective run is judged in step order, rows of one step in
+    # the order they arrived (a stable sort). Arrival order stays in `every_attempt`, for the
+    # analyses that are about arrival (which attempt came first, repeats, resumes).
+    records = sorted(resolve_attempts(every_attempt), key=lambda r: int(r["step"]))
     router_sizes = _router_sizes(records)
     routers = list(router_sizes)
     expert_count = max(router_sizes.values(), default=0)
@@ -4903,6 +5200,8 @@ def build_evidence(
         **({"run_end": read_end_marker(ended)} if (ended := _records_file(source, records_file)) else {}),
         **({"not_checked": not_checked} if not_checked else {}),
         **({"lines_left_out": left_out} if left_out else {}),
+        # Rows of an attempt after a later attempt's first row (contract 1): kept, not progress.
+        **({"superseded_rows": late} if (late := superseded_rows(every_attempt)) else {}),
         **({"weight_trends": trends} if trends else {}),
         **({"head_trends": head_trends} if head_trends else {}),
         **({"memory": memory} if memory else {}),
@@ -5273,8 +5572,8 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         if onsets:
             trained = onsets[0].get("trained_before", 0)
             since = (
-                "; none of them has changed since the first weight check" if trained == 0
-                else f"; {trained} of them had changed at an earlier check"
+                "; none of them was seen changing at an earlier weight check" if trained == 0
+                else f"; {trained} of them changed, or could not be compared, at an earlier weight check"
             )
         later = ""
         if len(onsets) > 1:
@@ -5283,9 +5582,9 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
                 shown = ", ".join(onset["parameters"][:2])
                 rest = onset["stalled"] - min(2, onset["stalled"])
                 was = (
-                    "after changing at earlier checks" if onset["trained_before"] == onset["stalled"]
+                    "changed or not compared at an earlier check" if onset["trained_before"] == onset["stalled"]
                     else "never seen changing" if onset["trained_before"] == 0
-                    else f"{onset['trained_before']} after changing at earlier checks"
+                    else f"{onset['trained_before']} changed or not compared at an earlier check"
                 )
                 parts.append(f"step {onset['step']}: {shown}{f', and {rest} more' if rest > 0 else ''} ({was})")
             more_onsets = len(onsets) - 4 + int(incident.get("onsets_omitted") or 0)

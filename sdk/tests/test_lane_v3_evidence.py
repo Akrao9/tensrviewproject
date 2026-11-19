@@ -197,14 +197,18 @@ def test_e3_a_kind_without_its_input_and_without_an_incident_stays_not_configure
     assert checks["resume_incomplete"]["value"] == "not_configured"
 
 
-def test_e3_the_lifted_entry_keeps_its_count_and_says_why():
-    evidence = tensorquill.build_evidence(scaler_reset(), detectors="python")
+def test_e3_the_loss_scale_is_counted_so_nothing_needs_lifting():
+    # E3's count half (lane W3): the loss scale is resume_incomplete's input as well as a checkpoint,
+    # so the entry is counted from the records that carry it and is not lifted. Until then it read
+    # 0 of 1 records, lifted to checked by the incident with a note saying why.
+    records = scaler_reset()
+    evidence = tensorquill.build_evidence(records, detectors="python")
     check = evidence["kind_checks"]["resume_incomplete"]
-    assert (check["records"], check["records_needed"], check["enough_history"]) == (0, 1, False)
-    assert "loss scale" in check["note"]
-    assert ev.kinds_by_value(evidence)["not_enough_history"]["resume_incomplete"] == {
-        "records": 0, "records_needed": 1, "reported": True}
-    assert "resume_incomplete 0 of 1 records but reported by a faster rule" in ev.checked_line(evidence)
+    scaled = sum(1 for r in ev.resolve_attempts(records) if isinstance(r.get("grad_scale"), float))
+    assert (check["value"], check["records"], check["records_needed"], check["enough_history"]) == (
+        "checked", scaled, 1, True)
+    assert "note" not in check
+    assert "resume_incomplete" not in ev.kinds_by_value(evidence).get("not_enough_history", {})
 
 
 def test_e3_a_cross_rank_kind_on_one_ranks_evidence_is_left_as_it_was():

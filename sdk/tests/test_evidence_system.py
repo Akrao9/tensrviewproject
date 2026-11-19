@@ -276,7 +276,8 @@ def test_unavailable_readings_are_listed_once_per_check():
 def test_odd_values_are_skipped_not_misread():
     found = by_kind(edges()["odd"])
     assert sorted(found) == ["allocator_retries", "gpu_throttled", "hardware_errors"]
-    assert found["gpu_throttled"]["step"] == 11 and found["gpu_throttled"]["temperature_c"] == 1.0
+    # A bool temperature is no reading (lane W3, DET-16); it read as 1.0 before.
+    assert found["gpu_throttled"]["step"] == 11 and found["gpu_throttled"]["temperature_c"] is None
     assert found["hardware_errors"]["step"] == 12  # 0 at step 5 is the baseline; 2.0 and False are not counts
     assert found["allocator_retries"]["step"] == 13
 
