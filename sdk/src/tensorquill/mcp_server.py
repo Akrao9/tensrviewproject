@@ -51,7 +51,9 @@ from . import runs as _runs
 from .sink import read_end_marker
 from .evidence import (
     ALL_RANKS_VIEW,
+    SERVER_KINDS,
     _discover_rank_folders,
+    _parquet_parts,
     all_ranks_evidence,
     all_ranks_kinds,
     build_evidence,
@@ -59,8 +61,8 @@ from .evidence import (
     incident_summary,
     kinds_by_value,
     load_records,
-    read_server_report,
     read_watchdog,
+    resolve_attempts,
 )
 
 SERVER_NAME = "tensorquill"
@@ -122,6 +124,21 @@ def _stamp(path: Path) -> tuple[int, int]:
     return found.st_mtime_ns, found.st_size
 
 
+def _parts_stamp(folder: Path, rank: int) -> tuple[tuple[str, int | None, int | None], ...]:
+    """Every part `load_records(folder, rank=rank)` reads, with its time of change and size.
+    Not the newest part's `(attempt, last step)` alone: a late part of an older attempt, or a
+    part written again, leaves that the same (CLI-22, lane V5, Nov 19, 2026)."""
+    found = []
+    for part in _parquet_parts(folder, rank):
+        try:
+            stat = part.stat()
+        except OSError:  # removed since it was listed: the listing itself has changed
+            found.append((str(part), None, None))
+        else:
+            found.append((str(part), stat.st_mtime_ns, stat.st_size))
+    return tuple(found)
+
+
 def _rank_number(name: str) -> int | None:
     key, _, value = name.partition("=")
     return int(value) if key == "rank" and value.isdecimal() else None
@@ -130,6 +147,16 @@ def _rank_number(name: str) -> int | None:
 def _rank_of(record: Mapping[str, Any]) -> int:
     rank = record.get("rank", 0)
     return rank if isinstance(rank, int) and not isinstance(rank, bool) else 0
+
+
+def _step_of(record: Mapping[str, Any]) -> int | None:
+    step = record.get("step")
+    return step if isinstance(step, int) and not isinstance(step, bool) else None
+
+
+def _step_range(records: list[dict[str, Any]]) -> dict[str, int]:
+    steps = [record["step"] for record in records]
+    return {"first": min(steps), "last": max(steps), "records": len(steps)}
 
 
 def _ranges(ranks: Iterable[Any]) -> str:
@@ -269,8 +296,20 @@ class Source:
 
         return self._keep(("capture", path), _stamp(path), read)
 
+    def _capture_stamp(self, path: Path) -> Any:
+        """The stamp the capture's records now held were read under. What is built from them is
+        kept under it, not under a stamp taken later: a line appended between the read and that
+        stamp would have kept the shorter file's evidence as the longer one's (CLI-22, lane V5,
+        Nov 19, 2026)."""
+        return self._kept[("capture", path)][0]
+
     def capture_evidence(self, path: Path, rank: int) -> dict[str, Any]:
         records, _ = self.capture(path)
+        return self._capture_evidence(path, rank, records)
+
+    def _capture_evidence(self, path: Path, rank: int, records: list[dict[str, Any]]) -> dict[str, Any]:
+        """One rank's evidence from `records`, the capture's records as last read: an answer that
+        also says something of the records themselves reads them once and builds from those."""
 
         def build() -> dict[str, Any]:
             try:
@@ -278,7 +317,7 @@ class Source:
             except (KeyError, TypeError, ValueError) as error:
                 raise ToolError(f"the detectors could not read the records in {path} ({error!r}).") from None
 
-        evidence = self._keep(("evidence", path, rank), _stamp(path), build)
+        evidence = self._keep(("evidence", path, rank), self._capture_stamp(path), build)
         # Read at every call, not kept: the marker is written after the last record, so the file's
         # stamp does not move when it appears.
         return {**evidence, "run_end": read_end_marker(path)} if path.suffix == ".jsonl" else evidence
@@ -304,7 +343,7 @@ class Source:
             every, _ = self.capture(where)
             ranks = sorted({_rank_of(r) for r in every})
             picked = _pick_rank(rank, default_rank, ranks, f"the capture {where}")
-            stamp: Any = _stamp(where)
+            stamp: Any = self._capture_stamp(where)
 
             def read() -> list[dict[str, Any]]:
                 return load_records(every, rank=picked)
@@ -313,7 +352,7 @@ class Source:
             if not ranks:
                 raise ToolError(f"{where} holds no rank=<n> folder yet, so there are no step records to read.")
             picked = _pick_rank(rank, default_rank, ranks, f"the run folder {where}")
-            stamp = read_server_report(where / f"rank={picked}")["stored"]
+            stamp = _parts_stamp(where, picked)
 
             def read() -> list[dict[str, Any]]:
                 try:
@@ -370,11 +409,21 @@ class Source:
             records, skipped = self.capture(where)
             ranks = sorted({_rank_of(r) for r in records})
             picked = _pick_rank(rank, None, ranks, f"the capture {where}")
-            evidence = self.capture_evidence(where, picked)
+            evidence = self._capture_evidence(where, picked, records)
             source["rank"] = picked
-            steps = [r["step"] for r in records if _rank_of(r) == picked and isinstance(r.get("step"), int)]
-            if steps:
-                source["steps"] = {"first": min(steps), "last": max(steps), "records": len(steps)}
+            # The run as it stands: what a resume rolled back is left out, as the detectors
+            # leave it out (`resolve_attempts`; E2, lane V5, Nov 19, 2026: the last step was the
+            # highest of every attempt). Every record written is counted apart, when that differs.
+            written = [r for r in records if _rank_of(r) == picked and _step_of(r) is not None]
+            current = resolve_attempts(written)
+            if current:
+                source["steps"] = _step_range(current)
+            if len(current) != len(written):
+                source["steps_all_attempts"] = _step_range(written)
+                source["steps_note"] = (
+                    "a later attempt resumed from an earlier step, so what earlier attempts wrote from that step on is"
+                    " rolled back: `steps` is the run as it stands, `steps_all_attempts` every record written"
+                )
             if len(ranks) > 1:
                 source["ranks_here"] = _ranges(ranks)
                 source["note"] = f"this file holds ranks {_ranges(ranks)}; this answer is rank {picked} (pass rank= for another)"
@@ -627,7 +676,12 @@ def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, An
 
 
 def _sample_context(evidence: Mapping[str, Any], incident: Mapping[str, Any]) -> dict[str, Any] | None:
-    """The MoE sample an incident points at: the largest shares, and the sample before it."""
+    """The MoE sample an incident points at: the largest shares, and the sample before it.
+
+    In compact evidence that left steps out, the last earlier sample it keeps is the sample
+    before only when both are in one window of steps kept one after another. Otherwise it is
+    `previous_kept_sample`, with a note: the steps between were left out, and it may be another
+    incident's window (CLI-22, lane V5, Nov 19, 2026)."""
     step, layer = incident.get("step"), incident.get("layer")
     own = [s for s in evidence.get("samples") or () if isinstance(s, dict) and s.get("layer") == layer]
     sample = next((s for s in own if s.get("step") == step), None)
@@ -646,18 +700,36 @@ def _sample_context(evidence: Mapping[str, Any], incident: Mapping[str, Any]) ->
     before = [s for s in own if isinstance(s.get("step"), int) and s["step"] < step and s.get("routed_tokens")]
     if before:
         previous = max(before, key=lambda s: s["step"])
-        out["previous_sample"] = {
+        found = {
             "step": previous["step"], "diversity": previous.get("diversity"),
             "largest_share": _strict_number(max(previous.get("counts") or [0]) / previous["routed_tokens"]),
         }
+        marker = _compact._omits(evidence)
+        windows = marker.get("kept_steps") if marker is not None else None
+        same = marker is None or any(
+            isinstance(w, list) and len(w) == 2 and w[0] <= previous["step"] and step <= w[1] for w in windows or ()
+        )
+        if same:
+            out["previous_sample"] = found
+        else:
+            found["note"] = (
+                f"the last sample before step {step} that this compact evidence keeps: the steps between were left out,"
+                " so it is not known to be the sample before (start the server on the .jsonl capture or the run folder"
+                " for every step)"
+            )
+            out["previous_kept_sample"] = found
     return out
 
 
-def _look_next(incident: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """The `get_series` calls that show the data behind an incident."""
+def _look_next(incident: Mapping[str, Any], rank: int | None = None) -> list[dict[str, Any]]:
+    """The `get_series` calls that show the data behind an incident, on `rank` when it is known:
+    without it, a run of several ranks answers with the default rank's series (CLI-15, lane V5,
+    Nov 19, 2026)."""
     calls: list[dict[str, Any]] = []
 
     def add(**arguments: Any) -> None:
+        if rank is not None:
+            arguments["rank"] = rank
         if len(calls) < 4 and arguments not in [c["arguments"] for c in calls]:
             calls.append({"tool": "get_series", "arguments": arguments})
 
@@ -688,6 +760,8 @@ def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
         raise ToolError("`id` is required: the id of an incident, as list_incidents gives it (for example grad_spike@310).")
     rank = _integer(arguments, "rank", minimum=0)
     opened = source.open(rank)
+    if opened["shape"] == "all_ranks" and rank is None:
+        rank = opened["default_rank"]  # the server was started on a rank=<n> folder, as list_incidents reads it
     entries = _entries(opened)
     entry = next((e for e in entries if e["id"] == wanted), None)
     if entry is None:
@@ -705,8 +779,15 @@ def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
         "where": _where(incident),
     }
     group = entry.get("group")
+    # The rank whose series show the data: the one asked for where it shows the incident, else
+    # the one the numbers are from; one rank's evidence is of its own rank. None for an incident
+    # of the run as a whole, or a file that does not say its rank.
+    series_rank: int | None = opened["source"].get("rank") if opened["shape"] == "rank" else None
     if group is not None:
         ranks = group.get("ranks") or []
+        numbers_from = group.get("incident_rank")
+        series_rank = rank if rank is not None and rank in ranks else (
+            numbers_from if isinstance(numbers_from, int) and not isinstance(numbers_from, bool) else None)
         answer["ranks"] = {
             "on_ranks": _ranges(ranks), "rank_count": len(ranks), "on_all_judged_ranks": group.get("on_all_judged_ranks"),
             "numbers_differ": group.get("numbers_differ"), "numbers_are_from_rank": group.get("incident_rank"),
@@ -725,7 +806,7 @@ def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
         sample = _sample_context(opened["evidence"], incident)
         if sample is not None:
             answer["sample"] = sample
-    calls = _look_next(incident)
+    calls = _look_next(incident, series_rank)
     if calls:
         answer["look_next"] = calls
     return answer
@@ -1075,7 +1156,7 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
              "last_step": (entry.get("detection") or {}).get("report_last_step"),
              **({"incidents": [i.get("kind") for i in entry["incidents"] if isinstance(i, dict)]}
                 if isinstance(entry.get("incidents"), list) else {}),
-             # Of the 25 kinds this rank's own report judges: where a rank differs from the others.
+             # Of the kinds this rank's own report judges (`SERVER_KINDS`): where a rank differs from the others.
              **({"kinds": {key: entry["kind_counts"].get(key) for key in (
                  "checked", "not_enough_history", "not_configured", "unavailable")}}
                 if isinstance(entry.get("kind_counts"), dict) else {}),
@@ -1199,8 +1280,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "description": (
             "One incident in full, by the id list_incidents gave (for example grad_spike@310): every number the"
             " detector recorded, what its class means, the ranks that show it, for an MoE incident the sample it"
-            " points at (largest expert shares, and the sample before), and the get_series calls that show the data"
-            " behind it."
+            " points at (largest expert shares, and the sample before; from compact evidence that left the steps"
+            " between out, the last earlier one it keeps is `previous_kept_sample` instead), and the get_series"
+            " calls that show the data behind it, with the rank to read."
         ),
         "inputSchema": {
             "type": "object",
@@ -1264,7 +1346,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " verdict either), and an incident of that kind stands for the ranks that show it. `kinds.not_enough_history` gives the fewest"
             " `records` any judged rank has and the ranks still warming up. When a judged rank's report does not"
             " say what was checked, or no rank is judged, there is no `kinds`: `kinds_not_stated` gives the reason,"
-            " and nothing is to be inferred. `per_rank[].kinds` counts each rank's own 25 kinds. While ranks are"
+            f" and nothing is to be inferred. `per_rank[].kinds` counts each rank's own {len(SERVER_KINDS)} kinds. While ranks are"
             " stopped, `stopped_stacks` groups those that sent a stack by where their main thread was and names an odd"
             " group only when one is clearly apart (`verdict`); it is an observation, never the cause (see its"
             " `caveats`), and the ranks with no stack are listed, not compared. `rank`"

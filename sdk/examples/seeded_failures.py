@@ -37,9 +37,12 @@ fails.
 `--case healthy` trains the same model on the same batches with nothing planted, and passes when
 `build_evidence` lists no incident; `--case all` runs it and then the two seeded cases. It is the
 other half of a pair for `python -m tensorquill compare`: each case is a run of the project
-`seeded-failures`, named after its case, with what was planted in its `config`:
+`seeded-failures`, named after its case, with what was planted in its `config`. Every case writes
+`<case>.jsonl` and its evidence (`<case>.evidence.json`) into the `--out` folder itself, so one
+listing shows them all:
 
-    python -m tensorquill compare runs/seeded/healthy/healthy.jsonl runs/seeded/grad_spike/grad_spike.jsonl
+    python -m tensorquill runs runs/seeded
+    python -m tensorquill compare runs/seeded/healthy.jsonl runs/seeded/grad_spike.jsonl
 
 With bfloat16 weights the healthy run is not clean (see below), so use `--dtype float32` for the pair.
 
@@ -66,6 +69,7 @@ import torch
 
 import tensorquill
 from tensorquill.capture import WEIGHT_EVERY
+from tensorquill.evidence import default_evidence_path, write_evidence
 from tensorquill.evidence import SPIKE_FACTOR, SPIKE_MIN_HISTORY, SPIKE_SUSTAIN, SPIKE_WINDOW, STALL_STEPS, UPDATE_WINDOW
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -379,7 +383,8 @@ def make_batches(args, device, total: int) -> torch.Tensor:
 
 
 def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdict:
-    """Train with full capture, plant the failure, and judge what `build_evidence` reports."""
+    """Train with full capture, plant the failure, and judge what `build_evidence` reports.
+    Writes `<case>.jsonl` and its evidence file into the folder `out`, beside the other cases."""
     steps = args.steps or steps_for(case, args)
     models, optimizers = build_models(args, device)  # two identical models and their optimizers; one is enough
     model = models[0]
@@ -400,7 +405,7 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
         factor = UPDATE_FACTOR
     scale = GradientScale(seeded, factor) if case in ("grad_spike", UPDATE) else None
     jsonl = out / f"{case}.jsonl"
-    out.mkdir(parents=True)
+    out.mkdir(parents=True, exist_ok=True)
     planted: dict[str, Any] = {"case": case, "parameter": name, "dtype": str(dtype), "lr": args.lr, "steps": steps}
     if case in ("grad_spike", UPDATE):
         planted.update(seed_step=args.seed_step, factor=factor)
@@ -428,6 +433,7 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
 
     records = tensorquill.load_records(jsonl)
     evidence = tensorquill.build_evidence(records, **({"update_window": args.update_window} if case == UPDATE else {}))
+    write_evidence(evidence, default_evidence_path(jsonl, records))  # what `tensorquill runs` reads beside it
     print(f"\n--- Detection ({case}) ---")
     print(tensorquill.incident_summary(evidence))
     if case == "grad_spike":
@@ -456,7 +462,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--update-window", type=int, default=UPDATE_WINDOW,
                         help="update_spike: how many of the last step-to-step changes make the rule's baseline; the seed "
                              f"step must come after the first of them (default: the detector's, {UPDATE_WINDOW})")
-    parser.add_argument("--out", type=Path, required=True, help="new directory; each case writes a folder in it")
+    parser.add_argument("--out", type=Path, required=True, help="new directory; each case writes its capture and evidence in it")
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=512)
@@ -503,7 +509,8 @@ def main(argv: list[str] | None = None) -> None:
     name = torch.cuda.get_device_name() if device.type == "cuda" else "CPU"
     print(f"{torch.__version__} on {name} | {'toy Llama' if args.toy else args.model} | eager\n", flush=True)
 
-    verdicts = [run_case(case, args, device, batches, args.out / case) for case in cases]
+    verdicts = [run_case(case, args, device, batches, args.out) for case in cases]
+    print(f"List them: python -m tensorquill runs {args.out}")
     failed = [v.case for v in verdicts if not v.passed]
     if failed:
         print(f"{len(failed)} case(s) failed: {', '.join(failed)}")

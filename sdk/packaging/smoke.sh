@@ -8,7 +8,8 @@
 # SERVER_WHEEL (a built tensorquill-server wheel to install with it; without one, see below).
 #
 # What it proves: the wheel alone (plus torch) imports, `python -m tensorquill --help` runs, and
-# toy_moe.py runs to completion from a directory with no source tree beside it, with no Python-level
+# toy_moe.py runs to completion from a directory with no source tree beside it, the evidence file it
+# prints is the one `tensorquill runs` and `tensorquill-mcp` pair with its capture, with no Python-level
 # socket connect or name lookup to anything but loopback. The hook is shown to fire first, so a
 # clean result is not vacuous. It does not see native-code networking or child processes.
 set -euo pipefail
@@ -146,9 +147,37 @@ cd "$WORK/proj"
 "$WORK/venv/bin/tensorquill" --help > /dev/null
 "$WORK/venv/bin/tensorquill-mcp" --help > /dev/null
 echo "== 3. toy_moe.py to completion =="
-"$VPY" toy_moe.py
+"$VPY" toy_moe.py | tee "$WORK/toy_moe.out"
 test -s tensorquill-out/toy-moe.rank0.jsonl
-test -s tensorquill-out/toy-moe.evidence.json
+EVIDENCE="tensorquill-out/toy-moe.rank0.evidence.json"   # the name the readers pair with the capture
+grep -qxF "evidence -> $EVIDENCE" "$WORK/toy_moe.out"
+test -s "$EVIDENCE"
+
+echo "== 3b. the evidence it printed, read back through the installed CLI and MCP server =="
+# `runs` must find the evidence beside the capture: a missing one is listed with its state unknown.
+"$WORK/venv/bin/tensorquill" runs tensorquill-out --json > "$WORK/runs.json"
+# The MCP server on the printed path must read the capture beside it for a router's series.
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_series","arguments":{"name":"router"}}}' \
+  | "$WORK/venv/bin/tensorquill-mcp" "$EVIDENCE" > "$WORK/mcp.out"
+"$VPY" - "$WORK/runs.json" "$WORK/mcp.out" "$EVIDENCE" <<'PYREAD'
+import json, sys
+from pathlib import Path
+runs, mcp, evidence = sys.argv[1:]
+(row,) = json.loads(Path(runs).read_text())
+assert row["run_id"] == "toy-moe", row
+assert row["evidence"]["state"] != "missing", row["evidence"]
+assert row["incidents"], row
+replies = {r.get("id"): r for r in map(json.loads, Path(mcp).read_text().splitlines())}
+result = replies[2]["result"]
+assert result["isError"] is False, result
+series = json.loads(result["content"][0]["text"])
+capture = str(Path(evidence).resolve().with_name("toy-moe.rank0.jsonl"))
+assert series["records"] is not None and Path(series["records"]).resolve() == Path(capture), series["records"]
+print("runs:", row["run_id"], row["evidence"]["state"], "| MCP get_series read", series["records"])
+PYREAD
 
 echo "== 4. audit log =="
 cat "$NETAUDIT_LOG"

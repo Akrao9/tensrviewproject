@@ -174,10 +174,12 @@ def test_a_servers_store_is_listed_from_its_small_files_without_opening_a_part(t
         assert (fixed["run_state"], fixed["last_step"], fixed["incidents"], fixed["first_incident"], fixed["ranks"]) == (
             "unhealthy", 59, {"anomaly": 1, "invariant": 1}, {"kind": "grad_spike", "step": 40}, [0])
     assert [r["run_id"] for r in tensorquill.list_runs(store / "runs" / "run-2")] == ["run-2"]
-    # A folder may hold local files and a store both; a run in both is two rows.
+    # A folder may hold local files and a store both; a run in both is one row, read from its
+    # local files, which says where its store copy is (lane V4, CLI-21: it was two rows).
     local_run(store, "run-1", project="granite", name="baseline")
-    assert [(r["run_id"], r["source"]) for r in tensorquill.list_runs(store, project="granite")] == [
-        ("run-1", "local"), ("run-1", "store"), ("run-2", "store")]
+    rows = tensorquill.list_runs(store, project="granite")
+    assert [(r["run_id"], r["source"]) for r in rows] == [("run-1", "local"), ("run-2", "store")]
+    assert rows[0]["also_in_store"] == str(store / "runs" / "run-1")
 
 
 def test_the_printed_listing_groups_by_project_and_the_json_option_gives_the_rows(out):
@@ -438,7 +440,7 @@ def seeded(tmp_path_factory) -> Path:
 
 @pytest.mark.parametrize("case, step", [("grad_spike", 250), ("stalled_weights", 249)])
 def test_a_healthy_run_and_a_seeded_run_compare_as_one_incident_in_the_second_only_on_the_seeded_parameter(seeded, case, step):
-    healthy, planted = seeded / "healthy" / "healthy.jsonl", seeded / case / f"{case}.jsonl"
+    healthy, planted = seeded / "healthy.jsonl", seeded / f"{case}.jsonl"
     result = tensorquill.compare_runs(healthy, planted)
     assert [(run["name"], run["run_id"], run["project"], run["incidents"]) for run in result["runs"]] == [
         ("healthy", "seeded-healthy", "seeded-failures", 0), (case, f"seeded-{case}", "seeded-failures", 1)]
@@ -461,8 +463,8 @@ def test_the_seeded_runs_are_found_by_name_in_one_folder_and_the_command_writes_
     folder = tmp_path / "together"
     folder.mkdir()
     for case in ("healthy", "grad_spike", "stalled_weights"):
-        (folder / f"seeded-{case}.rank0.jsonl").write_bytes((seeded / case / f"{case}.jsonl").read_bytes())
-        (folder / f"seeded-{case}.run.json").write_bytes((seeded / case / f"seeded-{case}.run.json").read_bytes())
+        (folder / f"seeded-{case}.rank0.jsonl").write_bytes((seeded / f"{case}.jsonl").read_bytes())
+        (folder / f"seeded-{case}.run.json").write_bytes((seeded / f"seeded-{case}.run.json").read_bytes())
     rows = tensorquill.list_runs(folder, project="seeded-failures")
     assert [row["name"] for row in rows] == ["healthy", "grad_spike", "stalled_weights"]
     done = cli("compare", "healthy", "grad_spike", "stalled_weights", "--source", str(folder), "--project",
