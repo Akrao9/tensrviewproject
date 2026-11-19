@@ -247,6 +247,51 @@ def test_c08_real_servers_with_two_stores_each_get_the_whole_file(tmp_path):
         assert [r["step"] for r in stored_records(store_root, "two")] == list(range(30))
 
 
+def idle_sender(path: Path, monkeypatch, endpoint: str = "grpc://127.0.0.1:9") -> FlightSender:
+    """A sender whose thread does nothing, to drive its methods from the test."""
+    with monkeypatch.context() as patched:
+        patched.setattr(FlightSender, "_run", lambda self: None)
+        return FlightSender(path, endpoint, "run-a", 0)
+
+
+def test_c08_ack_of_an_offset_not_sent_after_a_replay_is_not_taken(tmp_path, monkeypatch):
+    # The server keeps the highest offset of a stream that ended before it stored it
+    # (`ingest.rs`, `detach` clears only the ack channel) and acks it on the next stream.
+    path = tmp_path / "run-a.rank0.jsonl"
+    append(path, [record(step, ts=1.5) for step in range(5)])
+    old_end = path.stat().st_size
+    sender = idle_sender(path, monkeypatch)
+    assert sender._resume() == 0
+    sender._sent(path.read_bytes(), old_end)
+    sender._ack(old_end)  # the old file's offset, bound to the old file
+    path.unlink()  # replaced by a file with fewer, longer lines
+    append(path, [record(step, ts=2.5, note="x" * 200) for step in range(5, 7)])
+    first = len(lines(path)[0]) + 1
+    sender = idle_sender(path, monkeypatch)
+    assert sender._resume() == 0 and sender.replayed is not None
+    sender._sent(path.read_bytes()[:first], first)
+    sender._ack(old_end)  # max(this stream's batch end, the old stream's held offset)
+    assert sender.acked_offset == 0  # not taken: it names the old file's bytes
+    assert read_offset(offset_path(path)) == old_end and sender.unacked_bytes() == path.stat().st_size
+    sender._ack(first)
+    assert sender.acked_offset == first
+    assert read_binding(offset_path(path))["head"] == flight.file_identity(path, first)["head"]
+
+
+def test_c08_ack_beyond_the_end_of_the_file_is_not_taken(tmp_path, monkeypatch):
+    path = tmp_path / "run-a.rank0.jsonl"
+    append(path, [record(step) for step in range(3)])
+    sender = idle_sender(path, monkeypatch)
+    assert sender._resume() == 0 and sender.replayed is None
+    sender._ack(path.stat().st_size + 100)  # an offset no stream of this file sent
+    assert sender.acked_offset == 0 and not offset_path(path).exists()
+    middle = len(lines(path)[0]) + 1
+    sender._ack(middle)  # one this stream did not send but the file has: bound to its bytes
+    assert read_binding(offset_path(path)) == {
+        "version": 2, "offset": middle, "endpoint": "grpc://127.0.0.1:9", "run_id": "run-a", "rank": 0,
+        **flight.file_identity(path, middle)}
+
+
 # --- C09: the retry loop after a long outage ---------------------------------------------
 
 

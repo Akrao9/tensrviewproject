@@ -614,11 +614,13 @@ class FlightSender:
                 # Say once per outage that nothing is arriving: a wrong token or address
                 # would otherwise stay silent until close(). close() reports on its own.
                 self._reported = True
-                print(
-                    f"tensorquill: streaming to {self.endpoint} is failing ({self.last_error}). Training "
-                    f"continues and {self.path} stays complete; the sender keeps retrying.",
-                    file=sys.stderr,
-                )
+                if isinstance(self.last_error, LocalFileUnreadable):
+                    message = (f"tensorquill: {self.last_error}, so nothing more of it can be streamed to "
+                               f"{self.endpoint}. Training continues; the sender tries the file again later.")
+                else:
+                    message = (f"tensorquill: streaming to {self.endpoint} is failing ({self.last_error}). Training "
+                               f"continues and {self.path} stays complete; the sender keeps retrying.")
+                print(message, file=sys.stderr)
             if self._closing.is_set():
                 if time.monotonic() >= self._deadline or isinstance(self.last_error, LocalFileUnreadable):
                     return  # close() says the file cannot be read; waiting would not change that
@@ -689,16 +691,22 @@ class FlightSender:
         if offset > self._acked:
             with self._pending_lock:
                 identity = self._pending.get(offset)
-                for end in [end for end in self._pending if end <= offset]:
-                    del self._pending[end]
             if identity is None:
-                # An offset this stream did not send (the server held it from an earlier stream).
+                # An offset this stream did not send: the server keeps the highest offset of a
+                # stream that ended before it stored it, and acks it on the next stream. When this
+                # stream started again at byte 0 because the file was replaced, that offset is the
+                # old file's, so it is not taken. Otherwise it is this file's, if the file reaches it.
+                if self.replayed is not None:
+                    return
                 try:
                     identity = file_identity(self.path, offset)
                 except (OSError, ValueError):
-                    identity = None  # saved unbound: the next stream starts again at byte 0
-            write_offset(self.offset_path, offset, {**self._destination, **identity} if identity else None)
+                    return  # later acks name the batches this stream sends
+            write_offset(self.offset_path, offset, {**self._destination, **identity})
             self._acked = offset
+            with self._pending_lock:
+                for end in [end for end in self._pending if end <= offset]:
+                    del self._pending[end]
             self._progress = True
             self.last_error = None
 
