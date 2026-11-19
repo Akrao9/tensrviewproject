@@ -14,9 +14,17 @@ found by its files:
 
 - local files, as `tensorquill.init` writes them: `<run_id>.rank<N>.jsonl`, with the manifest
   `<run_id>.run.json` beside them and, once `python -m tensorquill <file>` has run, the
-  evidence file `<file>.evidence.json`;
+  evidence file `<file>.evidence.json` (or `<file>.evidence.compact.json`, which `--compact`
+  writes; when both are there, the one written later is read, and the full one on a tie);
 - a server's store: `runs/<run_id>/` with `run.json`, `watchdog.json` and a `rank=<n>` folder
   for each rank. `<folder or store>` is the folder that holds `runs/`, or `runs/` itself.
+
+A run kept both as local files and in a store under one folder is one row, read from its local
+files, and the row says where its store copy is (`also_in_store`). A rank whose records are in
+several files (a restart that wrote a file of a name of its own) keeps them all: its last step
+is read from each file's ends with the attempts resolved, its files are named, and it is not
+judged by the listing (an evidence file is of one file); `compare` reads every file of it.
+A store run with no judged rank lists its incidents as not known (`?`), never as none.
 
 The listing reads the manifest and the small evidence or report files only. It never opens a
 Parquet part and never runs a detector, so a local run whose evidence file was never written
@@ -194,7 +202,9 @@ def _local_runs(folder: Path, files: Iterable[Path] | None = None) -> list[dict[
             first = _first_record(path)
             run_id = str(first["run_id"]) if first and first.get("run_id") else path.name[: -len(".jsonl")]
         found = entry(run_id)
-        found["files"].setdefault(_rank_of_file(path, first), path)
+        rank = _rank_of_file(path, first)
+        if found["files"].setdefault(rank, path) != path:  # another file of this rank: kept, never left out
+            found.setdefault("more_files", {}).setdefault(rank, []).append(path)
     if files is None:
         for path in sorted(folder.glob(f"*{_manifest.MANIFEST_SUFFIX}")):
             # A manifest whose rank 0 has not written a record yet is still a run that started.
@@ -206,11 +216,36 @@ def _local_runs(folder: Path, files: Iterable[Path] | None = None) -> list[dict[
     return [by_id[run_id] for run_id in sorted(by_id)]
 
 
+def _once(local: list[dict[str, Any]], stored: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The runs of one folder that holds local files and a store, each run once (lane V4,
+    CLI-21: a run kept both ways was listed twice). The run ID is the identity. A run with
+    local records is read from them, as `find_run` always read it, since they hold every record;
+    the entry says where its store copy is (`also_in_store`). A run whose local side is only
+    its manifest is read from the store, with the local manifest when the store has none."""
+    kept = list(local)
+    by_id = {run["run_id"]: index for index, run in enumerate(kept)}
+    for run in stored:
+        index = by_id.get(run["run_id"])
+        if index is None:
+            kept.append(run)
+        elif kept[index]["files"]:
+            kept[index]["also_in_store"] = run["path"]
+        else:
+            mine = kept[index]
+            kept[index] = {**run, "manifest": run["manifest"] or mine["manifest"], "also_local": mine["path"]}
+    return kept
+
+
 def discover_runs(source: str | Path) -> list[dict[str, Any]]:
     """Every run at `source`, each as `{"run_id", "source", "path", "manifest"}` (and `files`,
     a `.jsonl` file per rank, for local files). `source` is a folder of local files, a
     server's store (the folder that holds `runs/`, or `runs/` itself), one run folder of a
-    store, or one `.jsonl` file. A folder may hold local files and a store both."""
+    store, or one `.jsonl` file. A folder may hold local files and a store both; a run kept both
+    ways is one entry (`_once`).
+
+    `files` keeps one file a rank. A rank whose records are in several files (a restart that
+    wrote a file of a name of its own) has the others in `more_files`, by rank, so no file is
+    left out (lane V4, CLI-13)."""
     source = Path(source)
     if not source.exists():
         raise FileNotFoundError(f"{source} does not exist: nothing to list")
@@ -219,12 +254,12 @@ def discover_runs(source: str | Path) -> list[dict[str, Any]]:
             raise ValueError(f"{source} is not a folder of runs or a .jsonl capture")
         return _local_runs(source.parent, [source])
     if (source / "runs").is_dir() and not _is_run_folder(source):
-        return _local_runs(source) + _store_runs(source / "runs")
+        return _once(_local_runs(source), _store_runs(source / "runs"))
     if _is_run_folder(source):  # one run of a store
         folder = source.resolve()
         return [{"run_id": folder.name, "source": "store", "path": source,
                  "manifest": _manifest.find_manifest(source, folder.name)}]
-    return _local_runs(source) + _store_runs(source)
+    return _once(_local_runs(source), _store_runs(source))
 
 
 def find_run(source: str | Path, wanted: str, project: str | None = None,
@@ -311,7 +346,8 @@ def _record_rank(record: Mapping[str, Any] | None) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, given: bool = False) -> dict[str, Any]:
+def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, given: bool = False,
+                 more: Mapping[int, list[Path]] | None = None) -> dict[str, Any]:
     """The ranks of a local run, from what the listing reads anyway: the file names, the first
     line and the last megabyte of each file, and the manifest's `world_size`. No file is read
     whole.
@@ -332,6 +368,8 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     `held` gives each file of its own name (or misnamed) the ranks it is seen to hold, and
     `several` the files among them that hold several; `last_steps` the ranks' last steps
     (`_steps_by_rank`) of each file that holds or may hold several, where the row uses them.
+
+    `more` are a rank's other files (`discover_runs`' `more_files`): read as the others are.
     """
     from .evidence import MAX_EXPECTED_RANKS
 
@@ -342,7 +380,8 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     held: dict[Path, list[int]] = {}
     tails: dict[Path, list[bytes]] = {}
     read: dict[Path, tuple[dict[str, Any] | None, dict[str, Any] | None]] = {}
-    for number, path in files.items():
+    pairs = [*files.items(), *((number, path) for number, paths in (more or {}).items() for path in paths)]
+    for number, path in pairs:
         lines = _tail_lines(path)
         read[path] = first, last = _first_record(path), _last_of(lines)  # kept: the row reads them too
         ends = {r for r in (_record_rank(first), _record_rank(last)) if r is not None}
@@ -366,13 +405,13 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     unsettled = bool(own_name or misnamed)
     reason = f"the run manifest says world size {world}"
     if given:
-        reason = (f"only {', '.join(sorted(p.name for p in files.values()))} {'was' if len(files) == 1 else 'were'} "
+        reason = (f"only {', '.join(sorted(p.name for _, p in pairs))} {'was' if len(pairs) == 1 else 'were'} "
                   f"given, and {reason}")
     missing = {n: reason for n in range(world) if n not in seen} if (
         not unsettled and world is not None and world <= MAX_EXPECTED_RANKS) else {}
     # `shared`: a lone file read as one run of several ranks, for its ends or for the world size.
     # Not on which rank wrote the last line alone, which changes from one listing to the next.
-    shared = len(files) == 1 and unsettled and (bool(several) or (world or 1) > 1)
+    shared = len(pairs) == 1 and unsettled and (bool(several) or (world or 1) > 1)
     # Each rank's last step is read only where the row uses it: a file of several ranks in a run
     # of several files, or a lone file read as several ranks.
     last_steps = {path: _steps_by_rank(lines) for path, lines in tails.items() if path in several or shared}
@@ -391,7 +430,7 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
         said = (f"the run manifest says world size {world}" if world is not None
                 else "no run manifest says the world size" if manifest is None
                 else "the run manifest does not say the world size")
-        by = "the file names and the first and last records" if len(own_name) < len(files) else "the first and last records"
+        by = "the file names and the first and last records" if len(own_name) < len(pairs) else "the first and last records"
         found["why"] = (f"{'; '.join(clauses)}; {by} name {_rank_list(sorted(seen))}, and {said}. How many ranks the run "
                         "has is not known without reading every record (python -m tensorquill compare reads them)")
     return found
@@ -425,8 +464,9 @@ def _local_row(run: Mapping[str, Any], known: Mapping[str, Any] | None) -> dict[
     row["ranks"] = known["ranks"]
     if "why" in known:
         row["rank_count_not_known"] = known["why"]
-    if len(files) > 1 or known["missing"]:
-        return _local_all_ranks_row(files, row, known)
+    more = run.get("more_files") or {}
+    if len(files) > 1 or known["missing"] or more:
+        return _local_all_ranks_row(files, row, known, more)
     rank = min(files)
     records = files[rank]
     if known["shared"]:
@@ -435,26 +475,17 @@ def _local_row(run: Mapping[str, Any], known: Mapping[str, Any] | None) -> dict[
     if isinstance((last or {}).get("step"), int):
         row["last_step"] = last["step"]
     row["started_from_records"] = _iso((first or {}).get("ts"))
-    path = records.with_suffix(".evidence.json")
-    try:
-        evidence = json.loads(path.read_text(encoding="utf-8"))
-        written = path.stat().st_mtime
-    except FileNotFoundError:
-        row["evidence"] = {
-            "state": "missing", "rank": rank,
-            "detail": f"no evidence file beside {records.name}: write it with python -m tensorquill {records}",
-        }
+    evidence, look = _read_evidence_file(records)
+    if evidence is None:
+        row["evidence"] = {**look, "rank": rank}
+        if look["state"] == "missing":
+            row["evidence"]["detail"] = f"{look['detail']}: write it with python -m tensorquill {records}"
         return row
-    except (OSError, ValueError) as error:
-        row["evidence"] = {"state": "unreadable", "rank": rank, "path": str(path), "detail": str(error)}
-        return row
-    if not isinstance(evidence, dict):
-        row["evidence"] = {"state": "unreadable", "rank": rank, "path": str(path), "detail": "not a JSON object"}
-        return row
-    stale = written < records.stat().st_mtime
+    stale = look["state"] == "older_than_records"
     row["evidence"] = {
-        "state": "older_than_records" if stale else "current", "rank": rank, "path": str(path),
-        **({"detail": f"{records.name} has grown since {path.name} was written; the row is as of that file"} if stale else {}),
+        "state": look["state"], "rank": rank, "path": look["path"],
+        **({"detail": f"{records.name} has grown since {Path(look['path']).name} was written; the row is as of that file"}
+           if stale else {}),
         **({"compact": True} if isinstance(evidence.get("compact"), Mapping) else {}),
     }
     incidents = evidence.get("incidents") or []
@@ -506,9 +537,32 @@ def _local_shared_file_row(records: Path, known: Mapping[str, Any], row: dict[st
     return row
 
 
+EVIDENCE_ENDINGS = (".evidence.json", ".evidence.compact.json")  # the full file, and the one `--compact` writes
+
+
+def _evidence_path(records: Path) -> Path | None:
+    """The evidence file beside a `.jsonl` file: `<name>.evidence.json` or the compact
+    `<name>.evidence.compact.json` that `--compact` writes by default. When both are there, the
+    one written later is read, as the nearer to the records; on the same time, the full one.
+    The compact file keeps every key a row reads (only per-step `samples` are cut), so either
+    gives the same row when both were written from the same records. None when neither is
+    there (lane V4, E7: the compact file alone was listed as `missing`)."""
+    found: list[tuple[float, int, Path]] = []
+    for order, ending in enumerate(EVIDENCE_ENDINGS):
+        path = records.with_suffix(ending)
+        try:
+            found.append((path.stat().st_mtime, -order, path))
+        except OSError:
+            continue
+    return max(found)[2] if found else None
+
+
 def _read_evidence_file(records: Path) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    """A rank's evidence file beside its `.jsonl` file, and what the row says of it."""
-    path = records.with_suffix(".evidence.json")
+    """A rank's evidence file beside its `.jsonl` file (`_evidence_path`), and what the row says
+    of it."""
+    path = _evidence_path(records)
+    if path is None:
+        return None, {"state": "missing", "detail": f"no evidence file beside {records.name}"}
     try:
         evidence = json.loads(path.read_text(encoding="utf-8"))
         written = path.stat().st_mtime
@@ -525,7 +579,8 @@ def _read_evidence_file(records: Path) -> tuple[dict[str, Any] | None, dict[str,
     return evidence, {"state": "older_than_records" if stale else "current", "path": str(path)}
 
 
-def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: Mapping[str, Any]) -> dict[str, Any]:
+def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: Mapping[str, Any],
+                         more: Mapping[int, list[Path]] | None = None) -> dict[str, Any]:
     """A local run of several ranks: every rank's evidence file, put together by the
     all-ranks view's rules (`combine_rank_evidence`). No record is judged here: a rank without
     an evidence file is unknown, never clean, and so is a rank the manifest's world size counts
@@ -535,9 +590,15 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
     does not say which, as for a lone such file (`_local_shared_file_row`): it is given to no
     rank. Its ranks are unknown unless a file of their own judges them; its incidents are
     listed with no rank (one that is the same, by the view's identity, as a judged rank's is
-    counted once), and the run is `unhealthy` if it shows any. Its ranks' last steps count
-    toward the run's, each rank's own (`_steps_by_rank`)."""
-    from .evidence import _incident_identity, _rank_ranges, combine_rank_evidence
+    counted once), and the run is `unhealthy` by its incidents as the run-state classifier reads
+    them (an observation is not a failure). Its ranks' last steps count toward the run's, each
+    rank's own (`_steps_by_rank`).
+
+    A rank whose records are in several files (`more`) is unknown: an evidence file is of one
+    file, and the listing reads no file whole. Its last step is the furthest of the files'
+    first and last records that `resolve_attempts` keeps, so an attempt that a later one
+    replaced does not count (lane V4, CLI-13). The files are named."""
+    from .evidence import RUN_STATES, _incident_identity, _rank_ranges, combine_rank_evidence, resolve_attempts, run_state
 
     def ranks(numbers: list[int]) -> str:
         return f"rank{'s' if len(numbers) != 1 else ''} {_rank_ranges(numbers, 8)}"
@@ -547,8 +608,20 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
     looks: dict[int, dict[str, Any]] = {}
     steps: list[int] = []
     shared: list[tuple[Path, dict[str, Any] | None, dict[str, Any]]] = []
+    split: dict[int, str] = {}
     for number in sorted(files):
         records = files[number]
+        if number in (more or {}):
+            paths = [records, *more[number]]
+            ends = [end for path in paths for end in known["ends"][path]
+                    if end is not None and _record_rank(end) == number and isinstance(end.get("step"), int)
+                    and not isinstance(end.get("step"), bool)]
+            kept = resolve_attempts(ends)
+            if kept:
+                steps.append(max(r["step"] for r in kept))
+            split[number] = (f"its records are in {len(paths)} files ({', '.join(p.name for p in paths)}), and an evidence "
+                             "file is of one file: compare it (python -m tensorquill compare reads them all)")
+            continue
         _, last = known["ends"][records]
         step = (last or {}).get("step")
         step = step if isinstance(step, int) and not isinstance(step, bool) else None
@@ -575,7 +648,7 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
                      + (f", and {ranks(new)} {'are' if len(new) != 1 else 'is'} not judged" if new else ""))
     one, many = known["missing_verb"]
     missing = {n: f"this rank {one}: {why}" for n, why in known["missing"].items()}
-    unknown = {**no_evidence, **in_shared, **missing}
+    unknown = {**no_evidence, **split, **in_shared, **missing}
     if steps:
         row["last_step"] = max(steps)
     first, _ = known["ends"][files[min(files)]]
@@ -584,6 +657,8 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
     if no_evidence:
         notes.insert(0, f"{ranks(sorted(no_evidence))} {'have' if len(no_evidence) != 1 else 'has'} no evidence file (write "
                         f"it with python -m tensorquill <the rank's .jsonl file>), so nothing is said about incidents there")
+    for number, why in split.items():
+        notes.append(f"rank {number}: {why}, so nothing is said about incidents there")
     if missing:
         notes.append(f"{ranks(sorted(missing))} {many if len(missing) != 1 else one}: "
                      f"{next(iter(known['missing'].values()))}, so nothing is said about incidents there")
@@ -592,6 +667,10 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
                      "of those files")
     shared_evidence = [evidence for _, evidence, _ in shared if evidence is not None]
     if not per_rank and not shared_evidence:
+        if split and not no_evidence:  # every rank without one is in several files: no evidence file is missing
+            row["evidence"] = {"state": "ranks_unknown", "judged_ranks": 0, "unknown_ranks": len(row["ranks"]),
+                               "detail": "; ".join(notes)}
+            return row
         detail = (f"no evidence file beside any of its {len(files)} ranks' .jsonl files: write each with python -m "
                   f"tensorquill <the rank's .jsonl file>, as for {files[min(files)].name}")
         row["evidence"] = {"state": "missing", "judged_ranks": 0, "unknown_ranks": len(row["ranks"]),
@@ -616,18 +695,39 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
             incidents = groups + [i for i in combined.get("run_incidents") or () if isinstance(i, Mapping)] + extra
             row["incidents"] = _by_class(incidents)
             row["first_incident"] = _first(incidents)
-            row["run_state"] = "unhealthy"
+            # The shared file's incidents by the run-state classifier, as every other incident:
+            # an observation is never a failure, and the worse of the two states stands (lane V4,
+            # E4: any incident here made the run `unhealthy`, an observation among them).
+            theirs = run_state(incidents=extra, steps_judged=True, status=None, status_expected=False)["state"]
+            row["run_state"] = max((row.get("run_state") or "healthy", theirs), key=RUN_STATES.index)
+            if not per_rank:
+                row["rank_incidents_not_known"] = True
     return row
+
+
+def _incident_cells(row: dict[str, Any], view: Mapping[str, Any]) -> None:
+    """The incidents and the first incident, from the all-ranks view or `combine_rank_evidence`.
+
+    With no judged rank nothing is said about the ranks' incidents, so the count is not known
+    (None, printed `?`), never "none". The run's own incidents (the server's status) are still
+    counted when there are any, and `rank_incidents_not_known` says the ranks' are not (lane V4,
+    CLI-09: an empty count was printed `none` for a store run with no judged rank)."""
+    incidents = [group["incident"] for group in view.get("incident_groups") or () if isinstance(group.get("incident"), Mapping)]
+    incidents += [i for i in view.get("run_incidents") or () if isinstance(i, Mapping)]
+    if not view.get("judged_ranks"):
+        if not incidents:
+            row["incidents"] = row["first_incident"] = None
+            return
+        row["rank_incidents_not_known"] = True
+    row["incidents"] = _by_class(incidents)
+    row["first_incident"] = _first(incidents)
 
 
 def _all_ranks_cells(row: dict[str, Any], view: Mapping[str, Any]) -> None:
     """The run state, incidents and kinds checked of a run of several ranks, from the
     all-ranks view or `combine_rank_evidence`: the whole run's, with no rank named."""
     row["run_state"] = (view.get("run_state") or {}).get("state")
-    incidents = [group["incident"] for group in view.get("incident_groups") or () if isinstance(group.get("incident"), Mapping)]
-    incidents += [i for i in view.get("run_incidents") or () if isinstance(i, Mapping)]
-    row["incidents"] = _by_class(incidents)
-    row["first_incident"] = _first(incidents)
+    _incident_cells(row, view)
     row["ranks_with_incidents"] = list(view.get("ranks_with_incidents") or ())
     row["kinds_checked"] = _kinds_checked(view.get("kind_checks"))
     if row["kinds_checked"] is None and isinstance(view.get("kind_checks_not_stated"), Mapping):
@@ -659,10 +759,7 @@ def _store_row(run: Mapping[str, Any]) -> dict[str, Any]:
         _all_ranks_cells(row, view)
         return row
     row["run_state"] = (view.get("run_state") or {}).get("state")
-    incidents = [group["incident"] for group in view.get("incident_groups") or () if isinstance(group.get("incident"), Mapping)]
-    incidents += [i for i in view.get("run_incidents") or () if isinstance(i, Mapping)]
-    row["incidents"] = _by_class(incidents)
-    row["first_incident"] = _first(incidents)
+    _incident_cells(row, view)
     # One rank: the count is that rank's own evidence, as before the all-ranks view said what
     # was checked, and the row names the rank.
     if judged:
@@ -694,9 +791,11 @@ def run_row(run: Mapping[str, Any]) -> dict[str, Any]:
         "first_incident": None,
         "kinds_checked": None,
     }
+    if run.get("also_in_store") is not None:
+        row["also_in_store"] = str(run["also_in_store"])
     if run["source"] == "local":
         files = run.get("files") or {}
-        known = _local_ranks(files, manifest, bool(run.get("files_given"))) if files else None
+        known = _local_ranks(files, manifest, bool(run.get("files_given")), run.get("more_files")) if files else None
         row.update(_local_row(run, known))
         if known is not None:
             row["end"] = _local_end(files, known["missing"], known["missing_verb"][0])
@@ -751,7 +850,8 @@ def _incidents_text(row: Mapping[str, Any]) -> str:
         return "none"
     order = ["invariant", "anomaly", "observation"]
     names = [name for name in order if name in counts] + sorted(name for name in counts if name not in order)
-    return ", ".join(f"{counts[name]} {name}" for name in names)
+    text = ", ".join(f"{counts[name]} {name}" for name in names)
+    return text + " (ranks not judged)" if row.get("rank_incidents_not_known") else text
 
 
 def _cells(row: Mapping[str, Any]) -> list[str]:
@@ -804,6 +904,9 @@ def listing_text(rows: list[Mapping[str, Any]], source: str | Path, project: str
             elif evidence.get("state") == "ranks_unknown":
                 notes.append(f"{row['run_id']}: {evidence.get('unknown_ranks')} of its ranks have no current report "
                              f"({evidence.get('judged_ranks')} judged)")
+            if row.get("also_in_store"):
+                notes.append(f"{row['run_id']}: also in the store at {row['also_in_store']}; listed once, from its local "
+                             "files, which hold every record")
             if row.get("rank_count_not_known"):
                 notes.append(f"{row['run_id']}: ranks not counted: {row['rank_count_not_known']}")
             if not row["has_manifest"]:

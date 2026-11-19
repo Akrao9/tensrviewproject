@@ -174,10 +174,12 @@ def test_a_servers_store_is_listed_from_its_small_files_without_opening_a_part(t
         assert (fixed["run_state"], fixed["last_step"], fixed["incidents"], fixed["first_incident"], fixed["ranks"]) == (
             "unhealthy", 59, {"anomaly": 1, "invariant": 1}, {"kind": "grad_spike", "step": 40}, [0])
     assert [r["run_id"] for r in tensorquill.list_runs(store / "runs" / "run-2")] == ["run-2"]
-    # A folder may hold local files and a store both; a run in both is two rows.
+    # A folder may hold local files and a store both; a run in both is one row, read from its
+    # local files, which says where its store copy is (lane V4, CLI-21: it was two rows).
     local_run(store, "run-1", project="granite", name="baseline")
-    assert [(r["run_id"], r["source"]) for r in tensorquill.list_runs(store, project="granite")] == [
-        ("run-1", "local"), ("run-1", "store"), ("run-2", "store")]
+    rows = tensorquill.list_runs(store, project="granite")
+    assert [(r["run_id"], r["source"]) for r in rows] == [("run-1", "local"), ("run-2", "store")]
+    assert rows[0]["also_in_store"] == str(store / "runs" / "run-1")
 
 
 def test_the_printed_listing_groups_by_project_and_the_json_option_gives_the_rows(out):

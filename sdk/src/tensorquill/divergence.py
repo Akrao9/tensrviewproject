@@ -84,6 +84,17 @@ _NOTE_KEYS = ("moe_refused", "update_not_read")
 # output changes before the loss computed from it and the gradients computed from that, and the
 # size of the optimizer's update and the weight check come after the optimizer's step.
 _KIND_ORDER = {"layers": 0, "moe": 0, "scalars": 1, "grad_norms": 2, "grad_norm": 3, "update_rms": 4, "weight_norms": 5}
+# After the step, the kind and the capture order, series that left at once are ordered by how
+# far they left, in three groups (lane V4, CLI-20):
+#   0. a departure to a value that is not finite (NaN or an infinity) first;
+#   1. then a series that moves of itself, by its departure measured in its own early movement
+#      (`in_own_movement`, larger first);
+#   2. then a series that did not move at all early (a constant), by the size of its departure
+#      (larger first). It has no movement to measure the departure in, and before Nov 19, 2026
+#      its measure was taken as infinite: a constant scalar moving by 1e-9 was named before
+#      a loss leaving by fifty times its line at the same step.
+# The series' name breaks a tie that remains.
+_RANK_NON_FINITE, _RANK_MOVING, _RANK_CONSTANT = 0, 1, 2
 _NON_FINITE = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}
 
 
@@ -340,7 +351,12 @@ def _judge(a: Mapping[int, float], b: Mapping[int, float], early_last: int, iden
         sustained=length,
         out_share=out_after[run_start] / (len(later) - run_start),
     )
-    out["_rank_size"] = math.inf if non_finite or movement == 0 else size / movement
+    if non_finite:
+        out["_rank_group"], out["_rank_size"] = _RANK_NON_FINITE, math.inf
+    elif movement > 0:
+        out["_rank_group"], out["_rank_size"] = _RANK_MOVING, size / movement
+    else:
+        out["_rank_group"], out["_rank_size"] = _RANK_CONSTANT, size
     return out
 
 
@@ -488,7 +504,8 @@ def first_divergence(
     def order(item: tuple[str, dict[str, Any]]) -> tuple[Any, ...]:
         series_id, entry = item
         capture = a.layer_order.get(entry["name"], 0) if entry["kind"] == "layers" else 0
-        return (entry["step"], _KIND_ORDER.get(entry["kind"], 9), capture, -entry["_rank_size"], series_id)
+        return (entry["step"], _KIND_ORDER.get(entry["kind"], 9), capture, entry["_rank_group"], -entry["_rank_size"],
+                series_id)
 
     left.sort(key=order)
     result["diverged_series"] = [
