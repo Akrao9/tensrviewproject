@@ -1285,7 +1285,9 @@ from torch import nn
 model = nn.Linear(8, 1)
 # `every=10`: steps leave the device ten at a time; the flush after the loop puts every step in
 # the file before the stop (a full ring's newest step otherwise waits for the next one).
-session = tensorquill.init(model, run_id=os.environ["TQ_RUN_ID"], every=10, heartbeat_seconds=0.5, stack_seconds=1.0)
+# A rank that stops stepping, not layer statistics: layers=(), since C24 observes a bare nn.Linear.
+session = tensorquill.init(model, run_id=os.environ["TQ_RUN_ID"], every=10, heartbeat_seconds=0.5, stack_seconds=1.0,
+                           layers=())
 session._sink.sender._batch_seconds, session._sink.sender._backoff_cap = 0.25, 0.5
 optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
 for _ in range(int(os.environ["TQ_STEPS"])):
