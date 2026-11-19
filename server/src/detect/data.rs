@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, Int64Array, StringArray};
+use arrow::array::{Int32Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Map, Value};
 
@@ -38,6 +38,17 @@ fn number(value: &Value) -> Option<f64> {
         Value::Number(number) => number.as_f64().filter(|value| value.is_finite()),
         _ => None,
     }
+}
+
+/// A batch hash's kind: the text before its first `:` (`v2` for `v2:cd09ce7a08834a9e`), and
+/// `""` for a hash with none, which the writer before C16 made (lane V2, Nov 19, 2026). Two
+/// hashes are compared only when their kinds are equal. `data_stalled`,
+/// `epoch_order_repeated` and `duplicate_batches` need nothing more: they look for equal
+/// hashes, and two of different kinds are never equal, so a pair across the change ends a
+/// stretch, breaks an order or makes no duplicate. A resume compares hashes for a difference
+/// too, so [`ResumePass::compare_data`] keeps to the resumed hash's kind.
+fn hash_kind(hash: &str) -> &str {
+    hash.split_once(':').map_or("", |(kind, _)| kind)
 }
 
 /// One row's `data`, as `data_checks.py` reads it.
@@ -358,15 +369,13 @@ pub fn detect_run(batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Resu
         if batch.num_rows() == 0 {
             continue;
         }
+        super::check_keys(batch)?;
         let (Some(run_ids), Some(ranks)) = (
             column::<StringArray>(batch, "run_id"),
             column::<Int32Array>(batch, "rank"),
         ) else {
-            return Err("the rows need a run_id (string) and a rank (int32) column".to_string());
+            unreachable!("check_keys found both columns");
         };
-        if column::<Int64Array>(batch, "step").is_none() {
-            return Err("the rows need a step (int64) column".to_string());
-        }
         // The batch cut where the rank changes, so every piece belongs to one rank.
         let mut start = 0;
         while start < batch.num_rows() {
@@ -435,16 +444,23 @@ pub(super) struct ResumeRow {
 impl ResumeRow {
     pub(super) fn read(columns: &Columns, row: usize, data: Option<DataRow>) -> Self {
         let scale = super::value(columns.grad_scale, row).filter(|scale| scale.is_finite());
-        let checkpoint = text(columns.checkpoint, row)
-            .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            .filter(Value::is_object);
         Self {
             data,
             scale,
             lr: columns.lr(row),
-            checkpoint,
+            checkpoint: checkpoint(columns, row),
         }
     }
+}
+
+/// A row's checkpoint manifest: its `checkpoint_json` when that is a JSON object, as Python's
+/// `isinstance(record["checkpoint"], Mapping)`. What the resume check reads and what
+/// `kind_checks` counts (RS11, lane V7, Nov 19, 2026: text that does not parse counted).
+pub(super) fn checkpoint(columns: &Columns, row: usize) -> Option<Value> {
+    text(columns.checkpoint, row)
+        .filter(|text| text.trim_start().starts_with('{')) // an object, if anything, and no parse for the rest
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .filter(Value::is_object)
 }
 
 /// What the resume checks found: kept with the rank, like `Attempts`.
@@ -590,7 +606,7 @@ impl ResumePass {
     }
 
     fn compare_data(&self, new: Option<&str>, resumed_at: i64) -> Result<Option<Value>, &'static str> {
-        let known: BTreeMap<i64, (Option<String>, i64)> = self
+        let mut known: BTreeMap<i64, (Option<String>, i64)> = self
             .hashes
             .iter()
             .filter(|(_, (hash, _))| hash.is_some())
@@ -605,6 +621,13 @@ impl ResumePass {
         };
         if known.is_empty() {
             return Err("no batch hash recorded in the earlier attempts");
+        }
+        // Only hashes of the resumed one's kind are compared with it (C16): the same batch
+        // hashed by two writers gives two hashes, which say neither "same" nor "different".
+        let kind = hash_kind(new);
+        known.retain(|_, (hash, _)| hash.as_deref().map(hash_kind) == Some(kind));
+        if known.is_empty() {
+            return Err("the batch hashes before and after the resume are of different kinds");
         }
         let expected = known.get(&resumed_at);
         if expected.is_some_and(|(hash, _)| hash.as_deref() == Some(new)) {
@@ -760,6 +783,7 @@ impl ResumePass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Int64Array;
 
     /// Rows as (rank, attempt, step, data), `data` the row's `data_json` or nothing.
     fn rows(run: &str, rows: &[(i32, i64, i64, Option<String>)]) -> RecordBatch {

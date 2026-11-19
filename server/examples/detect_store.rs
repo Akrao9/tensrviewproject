@@ -8,21 +8,47 @@
 //! it was written in (one part per rank and flush): for each flush it reads that part of
 //! every rank, then times the detectors over those batches on one thread, apart from the
 //! reading. It also times writing the same batches as Parquet parts to a scratch store, the
-//! JSON decoding alone, and rebuilding the ranks from the store.
+//! JSON decoding alone, and rebuilding the ranks from the store. A run with no rank, or a
+//! rank with no part, has nothing to time and says so.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
+use clap::Parser;
 use serde::de::IgnoredAny;
-use tensorquill_server::detect::{replay, RankDetectors, Thresholds, PORTED};
+use tensorquill_server::detect::{replay, report, RankDetectors, Thresholds};
 use tensorquill_server::storage::{Error, Storage};
+
+/// The server's detectors over a store on local disk.
+#[derive(Parser)]
+struct Args {
+    /// The store: a directory or file:// location.
+    store: String,
+    run_id: String,
+    #[command(flatten)]
+    mode: Mode,
+}
+
+/// One of the two modes; any other flag is refused (RS19, lane V7, Nov 19, 2026: until then
+/// anything but `--rank`, `--bogus` too, ran the benchmark).
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct Mode {
+    /// Rebuild this rank's detectors from its parts and print its report.
+    #[arg(long)]
+    rank: Option<i32>,
+    /// Play the store back flush by flush and time the detectors.
+    #[arg(long)]
+    bench: bool,
+}
 
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e3
 }
 
+/// The median of a measurement taken at least once.
 fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
@@ -67,24 +93,16 @@ fn decode_json(batch: &RecordBatch) -> usize {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let [store, run_id, mode, rest @ ..] = args.as_slice() else {
-        return Err("usage: detect_store <store> <run_id> (--rank <n> | --bench)".into());
-    };
+    let Args { store, run_id, mode } = Args::parse();
+    let (store, run_id) = (store.as_str(), &run_id);
     let storage = Storage::from_url(store)?;
     // The benchmark measures the rules at their usual values.
     let thresholds = std::sync::Arc::new(Thresholds::default());
-    if mode == "--rank" {
-        let rank: i32 = rest.first().ok_or("--rank needs a number")?.parse()?;
+    if let Some(rank) = mode.rank {
         let detectors = replay(&storage, run_id, rank, &thresholds).await?;
-        let document = serde_json::json!({
-            "run_id": run_id,
-            "rank": rank,
-            "last_step": detectors.last_step(),
-            "steps": detectors.rows(),
-            "checked": PORTED,
-            "incidents": detectors.incidents(),
-        });
+        // The report the server writes and `tensorquill-server detect` prints, so `checked`,
+        // `not_checked` and `kind_checks` say what was checked for this rank.
+        let document = report(run_id, rank, &detectors, 0);
         println!("{}", serde_json::to_string_pretty(&document)?);
         return Ok(());
     }
@@ -96,6 +114,11 @@ async fn main() -> Result<(), Error> {
     }
     let flushes = parts.iter().map(Vec::len).min().unwrap_or(0);
     println!("{} ranks, {flushes} flushes each", ranks.len());
+    if flushes == 0 {
+        // No rank, or a rank with no part: no flush to time and no rank to rebuild.
+        println!("no samples: the run has no rank with a stored part, or a rank without one");
+        return Ok(());
+    }
     let scratch_dir = tempfile::tempdir()?;
     let scratch = Storage::from_url(scratch_dir.path().to_str().ok_or("bad scratch path")?)?;
 

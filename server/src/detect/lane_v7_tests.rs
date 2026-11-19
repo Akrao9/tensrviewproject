@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Builder, Int32Array, Int64Array, MapBuilder, StringArray, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Value};
 
@@ -34,7 +34,10 @@ fn keys(steps: &[i64]) -> Vec<(&'static str, ArrayRef)> {
             Arc::new(StringArray::from_iter_values(steps.iter().map(|_| "run"))) as ArrayRef,
         ),
         ("rank", Arc::new(Int32Array::from_iter_values(steps.iter().map(|_| 0)))),
-        ("attempt", Arc::new(Int64Array::from_iter_values(steps.iter().map(|_| 1)))),
+        (
+            "attempt",
+            Arc::new(Int64Array::from_iter_values(steps.iter().map(|_| 1))),
+        ),
         ("step", Arc::new(Int64Array::from_iter_values(steps.iter().copied()))),
     ]
 }
@@ -166,7 +169,11 @@ fn rs11_only_a_checkpoint_that_parses_to_an_object_counts() {
     ));
     let detectors = judge(0, &[batch(columns)], &usual()).unwrap();
     let checks = detectors.kind_checks();
-    assert_eq!(checks["resume_incomplete"]["records"], 1, "{}", checks["resume_incomplete"]);
+    assert_eq!(
+        checks["resume_incomplete"]["records"], 1,
+        "{}",
+        checks["resume_incomplete"]
+    );
 }
 
 // --- RS16 / RUST-14 ------------------------------------------------------------------------
@@ -233,4 +240,112 @@ fn rs10_the_offline_modes_refuse_null_or_mistyped_keys() {
     assert_eq!((&report["attempt"], &report["steps"]), (&json!(0), &json!(2)));
     let run = detect_run(&[rows], &usual()).unwrap();
     assert_eq!(run["reports"][0]["attempt"], 0);
+}
+
+// --- C16, the Rust reader --------------------------------------------------------------------
+
+/// The shared fixture of lane V2 (`sdk/tests/fixtures/c16-batch-hash-versions.json`, a
+/// byte-identical copy of the one at V2's commit 59222b0).
+const C16_FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../sdk/tests/fixtures/c16-batch-hash-versions.json"
+));
+
+/// The reason both engines give when a resume's batch hash has no earlier hash of its kind.
+const C16_REASON: &str = "the batch hashes before and after the resume are of different kinds";
+
+/// A fixture case's records as one batch per rank, in the order given (grouped by attempt).
+fn c16_batches(records: &[Value]) -> std::collections::BTreeMap<i64, RecordBatch> {
+    let mut by_rank: std::collections::BTreeMap<i64, Vec<&Value>> = Default::default();
+    for record in records {
+        by_rank
+            .entry(record["rank"].as_i64().unwrap())
+            .or_default()
+            .push(record);
+    }
+    by_rank
+        .into_iter()
+        .map(|(rank, rows)| {
+            let columns: Vec<(&str, ArrayRef)> = vec![
+                (
+                    "run_id",
+                    Arc::new(StringArray::from_iter_values(
+                        rows.iter().map(|row| row["run_id"].as_str().unwrap()),
+                    )),
+                ),
+                (
+                    "rank",
+                    Arc::new(Int32Array::from_iter_values(
+                        rows.iter().map(|row| row["rank"].as_i64().unwrap() as i32),
+                    )),
+                ),
+                (
+                    "attempt",
+                    Arc::new(Int64Array::from_iter_values(
+                        rows.iter().map(|row| row["attempt"].as_i64().unwrap()),
+                    )),
+                ),
+                (
+                    "step",
+                    Arc::new(Int64Array::from_iter_values(
+                        rows.iter().map(|row| row["step"].as_i64().unwrap()),
+                    )),
+                ),
+                (
+                    "data_json",
+                    Arc::new(StringArray::from_iter_values(
+                        rows.iter().map(|row| row["data"].to_string()),
+                    )),
+                ),
+            ];
+            (rank, batch(columns))
+        })
+        .collect()
+}
+
+/// C16: every case of the shared fixture gets its verdict. Hashes of two kinds are never a
+/// match and never a difference; a resume between them is "not compared", in `not_checked`.
+#[test]
+fn c16_hashes_of_two_kinds_are_not_compared() {
+    let fixture: Value = serde_json::from_str(C16_FIXTURE).unwrap();
+    for case in fixture["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let detector = case["detector"].as_str().unwrap();
+        let batches = c16_batches(case["records"].as_array().unwrap());
+        let (incidents, not_checked): (Vec<Value>, Vec<Value>) = if detector == "duplicate_batches" {
+            let all: Vec<RecordBatch> = batches.values().cloned().collect();
+            let run = detect_run(&all, &usual()).unwrap();
+            (run["incidents"].as_array().unwrap().clone(), Vec::new())
+        } else {
+            assert_eq!(batches.len(), 1, "{name}");
+            let (rank, rows) = batches.iter().next().unwrap();
+            let detectors = judge(*rank as i32, std::slice::from_ref(rows), &usual()).unwrap();
+            (detectors.incidents(), detectors.not_checked())
+        };
+        let found: Vec<&Value> = incidents.iter().filter(|i| i["kind"] == detector).collect();
+        match case["incident"].as_object() {
+            None => assert!(found.is_empty(), "{name}: {found:?}"),
+            Some(expected) => {
+                assert_eq!(found.len(), 1, "{name}: {incidents:?}");
+                for (key, value) in expected {
+                    let got = if key == "finding" {
+                        &found[0]["changes"][0]["finding"]
+                    } else {
+                        &found[0][key]
+                    };
+                    assert_eq!(got, value, "{name}: {key} in {}", found[0]);
+                }
+            }
+        }
+        if detector == "resume_data_mismatch" {
+            let skipped: Vec<&Value> = not_checked.iter().filter(|i| i["check"] == "resume_data").collect();
+            if case["compared"] == false {
+                assert_eq!(skipped.len(), 1, "{name}: {not_checked:?}");
+                assert_eq!(skipped[0]["reason"], C16_REASON, "{name}");
+                assert_eq!(skipped[0]["step"], 3, "{name}");
+            } else {
+                assert!(skipped.is_empty(), "{name}: {skipped:?}");
+            }
+        }
+    }
 }

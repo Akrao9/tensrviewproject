@@ -253,10 +253,7 @@ impl Storage {
         let objects: Vec<_> = self.store.list(Some(&dir)).try_collect().await?;
         let mut parts: Vec<StoredPart> = objects
             .into_iter()
-            .filter(|object| {
-                object.location.extension() == Some("parquet")
-                    && object.location.filename().is_some_and(|name| name.starts_with("part-"))
-            })
+            .filter(|object| is_part(&object.location))
             .map(|object| StoredPart {
                 // The partition directly under the rank's folder, read relative to it: a folder
                 // above it (in the store's root) that looks like a partition says nothing about
@@ -329,13 +326,18 @@ impl Storage {
 
     /// The highest step already stored for this attempt of this rank, from the `step` column statistics in
     /// the Parquet footers. Only the parts whose file name claims the highest last step are
-    /// opened; a part with a name this server did not write is always opened.
+    /// opened; a part whose name gives no step range is always opened.
+    ///
+    /// The parts are those [`rank_parts`](Self::rank_parts) lists and replay reads (`part-*.parquet`),
+    /// and no other file: a row that only some other file holds would be below the watermark,
+    /// dropped by ingest, and never read (RS09, lane V7, Nov 19, 2026). A part whose footer has
+    /// no statistics for the step column is read for its step column.
     pub async fn max_step(&self, run_id: &str, rank: i32, attempt: i64) -> Result<Option<i64>, Error> {
         let dir = self.attempt_dir(run_id, rank, attempt);
         let objects: Vec<_> = self.store.list(Some(&dir)).try_collect().await?;
         let mut named: Vec<(Option<i64>, Path, u64)> = objects
             .into_iter()
-            .filter(|object| object.location.extension() == Some("parquet"))
+            .filter(|object| is_part(&object.location))
             .map(|object| (name_max_step(&object.location), object.location, object.size))
             .collect();
         let newest = named.iter().filter_map(|(step, _, _)| *step).max();
@@ -361,12 +363,36 @@ impl Storage {
                 .iter()
                 .position(|column| column.path().string() == "step");
             let Some(column) = column else { continue };
+            let mut complete = true;
             for row_group in metadata.row_groups() {
-                if let Some(Statistics::Int64(stats)) = row_group.column(column).statistics() {
-                    if let Some(step) = stats.max_opt() {
-                        max = max.max(Some(*step));
+                match row_group.column(column).statistics() {
+                    Some(Statistics::Int64(stats)) if stats.max_opt().is_some() => {
+                        max = max.max(stats.max_opt().copied());
                     }
+                    // No statistics, or none for this row group (all its steps null, which no
+                    // writer makes, gives none too): its steps are read.
+                    _ => complete = complete && row_group.num_rows() == 0,
                 }
+            }
+            if !complete {
+                max = max.max(self.highest_step(&path, column).await?);
+            }
+        }
+        Ok(max)
+    }
+
+    /// The highest step in a part, read from its step column (leaf `column`) alone.
+    async fn highest_step(&self, path: &Path, column: usize) -> Result<Option<i64>, Error> {
+        use arrow::array::{Array, Int64Array};
+        use parquet::arrow::ProjectionMask;
+        let bytes = self.store.get(path).await?.bytes().await?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+        let mask = ProjectionMask::leaves(builder.parquet_schema(), [column]);
+        let mut max = None;
+        for batch in builder.with_projection(mask).build()? {
+            let batch = batch?;
+            if let Some(steps) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
+                max = max.max(steps.iter().flatten().max());
             }
         }
         Ok(max)
@@ -412,17 +438,29 @@ impl MetadataSuffixFetch for FooterSuffixFetch<'_> {
     }
 }
 
+/// Whether `path` is a part: a `part-*.parquet` file, the only files `rank_parts`, `max_step`
+/// and Python's `_parquet_parts` read.
+fn is_part(path: &Path) -> bool {
+    path.extension() == Some("parquet") && path.filename().is_some_and(|name| name.starts_with("part-"))
+}
+
+/// A part's step range as its name gives it: `part-00000000-00000049.parquet` -> `(0, 49)`,
+/// and `part--0000010--0000001.parquet` -> `(-10, -1)`. The `-` between the two numbers is
+/// the first one after the first number's own digits; each number may start with a sign.
+fn name_steps(path: &Path) -> Option<(i64, i64)> {
+    let name = path.filename()?.strip_prefix("part-")?.strip_suffix(".parquet")?;
+    let at = name.get(1..)?.find('-')? + 1;
+    Some((name[..at].parse().ok()?, name[at + 1..].parse().ok()?))
+}
+
 /// `part-00000000-00000049.parquet` -> `49`.
 fn name_max_step(path: &Path) -> Option<i64> {
-    let name = path.filename()?.strip_prefix("part-")?.strip_suffix(".parquet")?;
-    // Steps are not negative in practice, so the last `-` separates the two numbers.
-    name.rsplit_once('-')?.1.parse().ok()
+    name_steps(path).map(|(_, last)| last)
 }
 
 /// `part-00000000-00000049.parquet` -> `0`.
 fn name_min_step(path: &Path) -> Option<i64> {
-    let name = path.filename()?.strip_prefix("part-")?.strip_suffix(".parquet")?;
-    name.rsplit_once('-')?.0.parse().ok()
+    name_steps(path).map(|(first, _)| first)
 }
 
 #[cfg(test)]
@@ -628,8 +666,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Also place a file whose name does not follow `part-<min>-<max>.parquet`.
-        let custom_path = storage.attempt_dir("run-1", 0, 1).join("legacy.parquet");
+        // Also place a part whose name gives no step range. (Until lane V7, Nov 19, 2026, this
+        // was `legacy.parquet`, which replay never reads: RS09.)
+        let custom_path = storage.attempt_dir("run-1", 0, 1).join("part-legacy.parquet");
         let custom_batch = make_batch(20..30, 8);
         let mut buf = Vec::new();
         let mut writer = ArrowWriter::try_new(&mut buf, custom_batch.schema(), None).unwrap();
