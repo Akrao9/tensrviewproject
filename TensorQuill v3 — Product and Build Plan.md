@@ -2256,6 +2256,37 @@ State as of Nov 16, 2026.
   - The two tests skip when `torch.cpu.Stream` has no `record_event` (`_cpu_fsdp2_supported`, a capability check, not a version string). They still run on 2.10, 2.14 and 2.15.
   - New: `test_dtensor_optimizer_state_is_read_without_fully_shard`. Two linear layers whose parameters are one-rank `Shard(0)` DTensors, made without `fully_shard`, stepped by AdamW with `updates=True`: AdamW's state is DTensors, no `update_not_read` is written, and `update_rms` equals a plain model's. Before R1's fix (`6326603`) it fails on `update_not_read`, SDK-05's symptom.
   - Run here on 2.15: the file's 30 tests pass. Not yet run on 2.6; CI is the check. FSDP2 itself under 2.6 is now tested nowhere until a GPU run.
+- [ ] **Wave U: an audit of the code checked on `main`, and seven fix lanes started (Nov 19, 2026, at the author's word: "start them with opus 5.5 effort high"; none merged).** `CODEBASE_AUDIT.md` and `CORRECTNESS_AUDIT.md` are untracked files in the main checkout, not written by this session and not committed. The audit reviewed `c965e01` and lists 70 groups of findings: 24 in the training SDK (C01 to C24), 16 in the evidence readers, 19 in the Rust server (RS01 to RS19) and 11 in the experiments and release checks (X01 to X11). Between `c965e01` and `d509b38` only `sdk/tests/test_capture_tensors.py` and this plan changed, so its findings and line numbers apply to `main`.
+  - *Run on `main`* (macOS, CPU, PyTorch 2.15; the scripts are in the session notes, `codebase-audit-checks/`).
+    - C01, new: a trainable parameter on `meta` with a gradient. `optimizer.step()` gives 0.5 with capture off and raises `NotImplementedError` with it on. T2 fixed the weights and the drift check on `meta`, not the gradient read.
+    - C03, new: a sink whose `write` raises `OSError` makes `optimizer.step()` raise `RuntimeError: the TensorQuill writer thread failed` at the next flush (`_after_optimizer_step` > `_commit` > `_flush` > `_raise_worker_error`), with no error of the user's involved.
+    - C04, new: after `close()`, a manual `step()` and `flush()` loop commits 8 steps, the queue's size, and then blocks.
+    - C02: while one thread's probe is open, another thread's valid 5-D `scaled_dot_product_attention` call raises `ValueError`. It is SDK-18's raise, reached from a thread the session's catch does not cover.
+    - C05: `mlflow.active_run()` raising makes `init` raise on a single process. Already R3's and T1's open point.
+    - C06 is F1: 36 of 36 full maps matched and 0 of 85 with fewer assignments. Also, integer output `[-1, 8]` for 4 experts is recorded as `[0, 0, 0, 0]` with no refusal.
+    - C07: appending after a torn last line joins the first new step to the torn line, and neither can be read. The torn-line rule in the specification covers the sender, which waits for the newline; the writer is not covered, and `test_flight.py`'s torn-line test accepts the loss.
+  - *Confirmed by reading only.* The `KeyError: 'assessment'` when a `duplicate_batches` status meets a complete collective-hang dump (`evidence.py:912`, `:4279`); `write_evidence` without `allow_nan=False`; the upper-middle median (`evidence.py:593`); the trigger's key without a run ID (`trigger.py:189`); Gate 1 printing PASSES after its partial-coverage line (`harness.py:545`, `:588`).
+  - *Not checked here.* The 19 Rust findings, the rest of C08 to C24, the other evidence findings and X02 to X11: the audit's claims until a lane reproduces them.
+  - *Already in this plan under another name.* C17 is SDK-19, C18 is SDK-16 and SDK-18, C20 is SDK-12, C21 is SDK-20, C22 is SDK-11 and SDK-17. RS06 to RS10 are RUST-07 to RUST-11, RS12 is RUST-06, RS16 and RS17 are RUST-14 and RUST-15. CLI-07, CLI-12, DET-08, DET-15 and DET-19 are T6's. `init` traced by Dynamo (B8), T2's item 3 and SDK-22's gather are restated.
+  - *Two checks of what this plan says.*
+    - X03 says the TrainCheck scorer can credit a catch whose healthy control failed. The catches recorded above hold: in `results.json` the healthy controls of B9, B10, B3 and B2 completed with no `replica_drift`, and B1's with no `stalled_weights`. The scorer still needs the fix.
+    - Activation drift: the audit counts 11 of the 17 healthy entries, on 8 of 10 workloads (recounted here). That is this plan's 6 of 7 distinct trainings long enough to judge (11 of their 12 runs) under another denominator.
+  - *The lanes*, one writer per set of files, each in its own worktree cut from this commit, each to reproduce a finding before fixing it and to add a test that fails before the fix.
+    - U1, `capture.py`: C01; C04; `init` traced by Dynamo (B8); hooks left attached by a rejected `init` (C10); another owner's `GradScaler.update` hook removed at close (C19); the probe's warning raised under `-W error` (SDK-18's half in `capture.py`); `init`'s docstring, which still says 24 bytes for the gather.
+    - U2, `capture.py` again, held for the three decisions below: C03, T2's item 3 and F1.
+    - U3, `probe.py`, `data.py`, `datawait.py`: C02; the loader wrapper (C17); the composite model's attention setting and the loader's warning (C18).
+    - U4, `sink.py`, `flight.py`: the writer's half of C07; offsets tied to one local filename (C08); the retry loop's overflow and its use of the global RNG (C09); a JSON null that stops the sender at one offset (SDK-21); the offset's shared scratch name.
+    - U5, `tracker.py`, `distributed.py`, `lightning.py`: C05; a drift-check gather that fails (SDK-22); a logger property that fails on rank 0.
+    - U6, `server/`: RS01 to RS05.
+    - U7, `evidence.py`, `evidence_system.py`, `mcp_server.py`, `trigger.py`: five of the six evidence P1s; the reader's half of C07; the shared temporary file; the median; the division by zero on a repeated step.
+    - U8, `experiments/`, packaging and CI: X01, X03, X04, X05 and the wheel checker (RS18).
+  - *Held out of this wave.* The sixth evidence P1, a parameter that changes without a gradient and is still called stalled: it spans `capture.py`, `evidence.py` and `detect.rs`, three lanes' files. The audit's P2 and P3 rows not named above.
+  - *Wording that no longer matches `main` (listed, not edited).* `sdk/README.md`, "Nothing raises once training runs": true of the stream sender, not of the local sink (C03). The Focused Plan's row on TensorQuill stopping a run, which lists neither C01 to C04 nor that CI has run on Linux. CI's `package` job has passed twice (`3124fd2`, `e693e2f`), so its `continue-on-error` can come off; U8 does that.
+  - *Open, for the author.*
+    - C03: when the sink fails or falls behind, either capture stops with one warning and training goes on, or today's raise and wait stay. The writer's backpressure was deliberate; the rule that nothing raises into training points to the first, with blocking as an option.
+    - T2's item 3: option (a), (b) or (c) in its entry.
+    - F1: read the routing map, or refuse such a router until that is built.
+  - *Not run.* A GPU, NCCL, Linux, PyTorch 2.6. Nothing is pushed: `main` is ahead of `origin/main` (`e693e2f`), whose CI is red on the two PyTorch 2.6 jobs until the fix above is pushed.
 
 ## Sources
 
