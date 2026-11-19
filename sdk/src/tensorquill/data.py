@@ -12,9 +12,19 @@ identities of each (counts, an optimizer's step, a scheduler's `last_epoch`, a l
 - `session.checkpoint(state, event="save" | "load")` records the manifest of the state dict
   that was saved or loaded.
 
-The hash is BLAKE2b (8 bytes, unkeyed) over the indices as little-endian int64, or over
-their text when they are not integers, so every process, rank and attempt that draws the
-same samples in the same order gets the same hash. It is written as 16 hex digits.
+The hash is BLAKE2b (8 bytes, unkeyed) over each batch's length and bytes, in order, so
+every process, rank and attempt that draws the same samples in the same order gets the same
+hash. A batch of integers that fit int64 is its indices as little-endian int64 after a tag
+byte (one C loop: the common case); any other batch is a tag byte, then each item's type,
+byte length and bytes (text as UTF-8, bytes as they are), so no two different batches share
+their bytes. It is written as `v2:` and 16 hex digits.
+
+The prefix is the encoding's version. A writer before it wrote the 16 hex digits alone,
+from int64 indices or from the items' text joined by NUL bytes, in which different batches
+could share their bytes (`["a\\x00b", "c"]` and `["a", "b\\x00c"]`; byte ids decoded with
+replacement). Hashes of two versions are of different encodings: equal batches give
+different hashes, so a reader compares only hashes of one version (the text before the first
+`:`, none for the old writer's) and leaves a pair of two versions not compared.
 """
 
 from __future__ import annotations
@@ -39,6 +49,10 @@ _COUNTER_KEYS = ("step", "global_step", "epoch", "iteration", "steps", "global_s
 _MAX_OTHER = 20
 
 
+HASH_PREFIX = "v2:"  # the version of the encoding below; the old writer's hashes have none
+_INTS, _ITEMS = b"i", b"t"  # a batch's first byte: int64 indices, or typed items
+
+
 def _int_bytes(values: Any) -> bytes | None:
     """Little-endian int64, in one C loop (a Python loop over 1,024 indices took 0.6 ms)."""
     try:
@@ -47,7 +61,25 @@ def _int_bytes(values: Any) -> bytes | None:
         return None
     if sys.byteorder == "big":
         packed.byteswap()
-    return packed.tobytes()
+    return _INTS + packed.tobytes()
+
+
+def _item_bytes(value: Any) -> bytes:
+    """One id of a batch that is not all int64: its type, its byte length, its bytes."""
+    if isinstance(value, str):
+        kind, raw = b"s", value.encode("utf-8", "surrogatepass")
+    elif isinstance(value, (bytes, bytearray, memoryview)):
+        kind, raw = b"b", bytes(value)
+    elif isinstance(value, bool):
+        kind, raw = b"?", b"1" if value else b"0"
+    elif isinstance(value, numbers.Integral):
+        kind, raw = b"n", str(int(value)).encode()
+    elif isinstance(value, numbers.Real):
+        kind, raw = b"f", repr(float(value)).encode()
+    else:
+        cls = type(value)
+        kind, raw = b"o", f"{cls.__module__}.{cls.__qualname__}\x00{value}".encode("utf-8", "surrogatepass")
+    return kind + len(raw).to_bytes(8, "little") + raw
 
 
 def identity_bytes(values: Any) -> bytes | None:
@@ -60,15 +92,17 @@ def identity_bytes(values: Any) -> bytes | None:
             return fast
     if isinstance(values, torch.Tensor):
         values = values.detach().reshape(-1).tolist()
-    elif isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
+    elif isinstance(values, (str, bytes, bytearray, memoryview)) or not isinstance(values, Iterable):
         values = [values]
     else:
         values = [v.item() if isinstance(v, torch.Tensor) and v.numel() == 1 else v for v in values]
     if not values or any(v is None for v in values):
         return None  # an IterableDataset's sampler yields None for every sample
     if all(isinstance(v, numbers.Integral) and not isinstance(v, bool) for v in values):
-        return _int_bytes(values)
-    return "\x00".join(v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v) for v in values).encode()
+        fast = _int_bytes(values)
+        if fast is not None:
+            return fast  # else an index beyond int64: typed items below
+    return _ITEMS + b"".join(_item_bytes(v) for v in values)
 
 
 class DataStep:
@@ -94,7 +128,7 @@ class DataStep:
     def record(self) -> dict[str, Any]:
         out: dict[str, Any] = {"batches": self.batches}
         if self.batches and self._known:
-            out["batch_hash"] = self._hash.hexdigest()
+            out["batch_hash"] = HASH_PREFIX + self._hash.hexdigest()
         out.update(self.fields)
         return out
 
