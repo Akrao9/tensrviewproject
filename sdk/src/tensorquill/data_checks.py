@@ -51,6 +51,18 @@ def _hash(data: Mapping[str, Any]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def hash_kind(digest: str) -> str:
+    """The encoding a batch hash was made with: the text before its first `:` (`"v2"`), or `""`
+    for a hash with none, which the writer before that prefix wrote (`data.py`). Equal batches
+    hashed by two encodings give two different hashes, so only hashes of one kind are compared
+    (C16, Nov 19, 2026). A pair of two kinds is not compared: never a match and never a
+    difference. Every detector here asks one of two things of two hashes: whether they are
+    equal (a stall, an epoch's order, a duplicate), which a pair of two kinds never is, so it
+    is no match; or whether they differ (a resume), which `_compare_data` asks only of one kind."""
+    kind, colon, _ = digest.partition(":")
+    return kind if colon else ""
+
+
 def _bool(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
@@ -232,6 +244,16 @@ def _compare_data(
         return "no batch hash recorded at the first step of the resumed attempt" if known else None
     if not known:
         return "no batch hash recorded in the earlier attempts"
+    # Only hashes of the resumed batch's encoding are compared with it (`hash_kind`).
+    kind = hash_kind(new)
+    other = known.get(resumed_at)
+    if other is not None and hash_kind(other[0]) != kind:  # type: ignore[arg-type]
+        return ("not compared: the batch the earlier attempts drew at the resume step was hashed by another encoding"
+                " (a tensorquill from before or after the change of batch hash) than the resumed one")
+    known = {s: v for s, v in known.items() if hash_kind(v[0]) == kind}  # type: ignore[arg-type]
+    if not known:
+        return ("not compared: the earlier attempts' batch hashes are of another encoding (a tensorquill from before"
+                " or after the change of batch hash) than the resumed one")
     expected = known.get(resumed_at)
     if expected is not None and expected[0] == new:
         return None

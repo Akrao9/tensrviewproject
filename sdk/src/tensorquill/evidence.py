@@ -645,8 +645,7 @@ def _watchdog_beside(source: Any) -> Path | None:
         return None
     directory = Path(source).resolve()
     status = directory / "watchdog.json"
-    key, _, rank = directory.name.partition("=")
-    if key == "rank" and rank.isdecimal() and not status.is_file():
+    if _rank_number(directory.name) is not None and not status.is_file():
         return directory.parent / status.name
     return status
 
@@ -1644,9 +1643,22 @@ def _run_of(record: Mapping[str, Any]) -> str:
 _PART_NAME = re.compile(r"part-(-?\d+)-(-?\d+)\.parquet$")
 
 
+_RANK_FOLDER = re.compile(r"rank=([0-9]+)")
+
+
+def _rank_number(name: str) -> int | None:
+    """The rank a folder named `rank=<n>` holds, or None for any other name. `<n>` is what the
+    server writes (`server/src/storage.rs`): ASCII digits, a rank of at least 0. Every reader of
+    the name asks this one (DET-17, Nov 19, 2026: some took `isdecimal()`, which lets in other
+    scripts' digits, and some `lstrip("-").isdigit()`, which lets in `--1` and `²` and then
+    raised in `int()`)."""
+    found = _RANK_FOLDER.fullmatch(name)
+    return int(found.group(1)) if found else None
+
+
 def _other_rank_folder(entry: os.DirEntry[str], rank: int) -> bool:
-    name, _, value = entry.name.partition("=")
-    return name == "rank" and value.lstrip("-").isdigit() and int(value) != rank
+    number = _rank_number(entry.name)
+    return number is not None and number != rank
 
 
 def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
@@ -1662,7 +1674,9 @@ def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
         numbers = {"rank": 0, "attempt": 0}
         for parent in path.relative_to(directory.parent).parts[:-1]:
             name, _, value = parent.partition("=")
-            if name in numbers and value.lstrip("-").isdigit():
+            if name == "rank" and _rank_number(parent) is not None:
+                numbers[name] = int(value)
+            elif name == "attempt" and value.lstrip("-").isdigit():
                 numbers[name] = int(value)
         match = _PART_NAME.search(path.name)
         return numbers["rank"], numbers["attempt"], int(match.group(1)) if match else 0, path.name
@@ -2120,6 +2134,37 @@ def kind_checks(
     return checks
 
 
+# Said as `note` on a kind's entry that would read `not_configured` beside an incident of that
+# kind (`checked_where_reported`): where the incident came from.
+REPORTED_NOTES: dict[str, str] = {
+    "resume_incomplete": (
+        "reported from the loss scale (grad_scale), which this kind's records count leaves out: it counts"
+        " checkpoint records only"
+    ),
+    "duplicate_batches": "reported by the server, which compares every rank's batches (its status lists it)",
+}
+REPORTED_NOTE = "reported from input this entry does not count"
+
+
+def checked_where_reported(
+    checks: Mapping[str, Any], incidents: Iterable[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """`checks` (a `kind_checks` object) with every kind among `incidents` that it calls
+    `not_configured` made `checked`, with a `note` on where the incident came from
+    (`REPORTED_NOTES`): a kind that reported an incident was checked. `resume_incomplete` is judged from a checkpoint record and also from the loss scale
+    alone, and its count is of checkpoint records only, so a resume that reset the loss scale was
+    reported beside "never configured" (E3, Nov 19, 2026; both detectors). `records` and
+    `enough_history` stay as counted, the same in both detectors; counting the loss scale for
+    the kind needs `KIND_INPUTS` changed in both, which is left open."""
+    reported = {i.get("kind") for i in incidents if isinstance(i, Mapping)}
+    out = dict(checks)
+    for kind in reported:
+        check = out.get(kind)
+        if isinstance(check, Mapping) and check.get("value") == "not_configured":
+            out[kind] = {**check, "value": "checked", "note": REPORTED_NOTES.get(str(kind), REPORTED_NOTE)}
+    return out
+
+
 def other_kind_checks(
     *,
     status: Mapping[str, Any] | None,
@@ -2287,8 +2332,7 @@ STATUS_STALE_FACTOR = 2.0
 def _own_rank(source: Path) -> int | None:
     if not source.is_dir():
         return None
-    key, _, value = source.resolve().name.partition("=")
-    return int(value) if key == "rank" and value.isdecimal() else None
+    return _rank_number(source.resolve().name)
 
 
 def _rank_dirs(source: Path) -> list[Path]:
@@ -2359,6 +2403,42 @@ THRESHOLD_DEFAULTS: dict[str, Any] = {
     "starve_window": STARVE_WINDOW, "starve_ratio": STARVE_RATIO, "top_k": None,
     "update_window": UPDATE_WINDOW,
 }
+
+
+def _threshold_problem(name: str, value: Any) -> str | None:
+    """Why the Rust detectors would refuse `value` for the option `name`, or None. The contract
+    is `Thresholds::parse` in server/src/detect.rs, and so are the words: the three shares and
+    tolerances finite and at least 0 (a whole number is one), the two windows whole and at
+    least 1, `top_k` None, a whole number of at least 1, or one per router name. A bool is
+    none of these (JSON's `true` is not a number)."""
+    if name in ("overload_threshold", "drift_tolerance", "starve_ratio"):
+        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if not number or not math.isfinite(value) or value < 0:
+            return f"{name} must be a finite number of at least 0, got {value!r}"
+    elif name in ("starve_window", "update_window"):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            return f"{name} must be at least 1 and a whole number, got {value!r}"
+    elif name == "top_k" and value is not None:
+        each = list(value.values()) if isinstance(value, Mapping) else [value]
+        for k in each:
+            if isinstance(k, bool) or not isinstance(k, int):
+                return f"top_k must be a whole number or one per router name, got {k!r}"
+            if k < 1:
+                return f"top_k must be at least 1, got {k}"
+    return None
+
+
+def check_thresholds(**given: Any) -> None:
+    """Raise `ValueError` for a detector option the Rust detectors refuse (`_threshold_problem`),
+    so the Python detectors refuse the same ones (E6 / DET-15, Nov 19, 2026: they took a negative
+    tolerance, `top_k=0` or `starve_window=0` and judged with it). `given` is any of the six
+    `THRESHOLD_NAMES`; one left out or None (`top_k` aside) is not checked."""
+    for name in THRESHOLD_NAMES:
+        if name not in given or (given[name] is None and name != "top_k"):
+            continue
+        problem = _threshold_problem(name, given[name])
+        if problem is not None:
+            raise ValueError(f"the detectors refuse these thresholds: {problem}")
 
 
 def _given_thresholds(options: Mapping[str, Any]) -> dict[str, Any]:
@@ -2649,10 +2729,11 @@ def _report_evidence(
             status=status, status_expected=True, not_checked=not_checked,
             flight_recorder=flight_recorder is not None, traincheck=traincheck is not None,
         )
-        evidence["kind_checks"] = {
+        evidence["kind_checks"] = checked_where_reported({
             kind: dict({**rank_checks, **others}[kind]) for kind in INCIDENT_CLASSES
-        }
-    evidence["run_state"] = _per_rank_run_state(evidence, status, _status_age(status), steps_judged=bool(report.get("steps")))
+        }, incidents)
+    evidence["run_state"] = _per_rank_run_state(evidence, status, _status_age(status), steps_judged=bool(report.get("steps")),
+                                                attempt=_whole_attempt(report.get("attempt")))
     return evidence
 
 
@@ -2682,6 +2763,38 @@ def _reason(state: str, code: str, detail: str, **extra: Any) -> dict[str, Any]:
     return {"state": state, "code": code, **extra, "detail": detail}
 
 
+def _whole_attempt(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def newest_attempt(records: Iterable[Mapping[str, Any]]) -> int | None:
+    """The newest attempt among `records` (a record that names none is attempt 0), or None for none."""
+    return max((_whole_attempt(r.get("attempt", 0)) or 0 for r in records), default=None)
+
+
+def _not_current_by_status(status: Mapping[str, Any], judged: Mapping[int, int | None]) -> dict[int, str]:
+    """The judged ranks that the server's status says were judged by an earlier attempt, with why:
+    the status marks the rank `attempt_without_steps` (the job was started again and the new
+    attempt has stored nothing), or names another attempt than the one judged. The rule of
+    `run_state` in server/src/watchdog.rs (lane U6), applied here (L6, Nov 19, 2026). A status
+    entry that names no attempt (a server from before attempts) and an attempt not known here
+    (None) are not compared."""
+    found: dict[int, str] = {}
+    for entry in status.get("ranks") or ():
+        if not isinstance(entry, Mapping):
+            continue
+        rank = entry.get("rank")
+        if not isinstance(rank, int) or isinstance(rank, bool) or rank not in judged:
+            continue
+        shown, was = _whole_attempt(entry.get("attempt")), judged[rank]
+        if entry.get("attempt_without_steps") is True:
+            found[rank] = (f"started again{f' as attempt {shown}' if shown is not None else ''}, which has stored no"
+                           " step yet: what was judged is an earlier attempt's")
+        elif shown is not None and was is not None and shown != was:
+            found[rank] = f"attempt {was} was judged, and the server's status shows attempt {shown}"
+    return found
+
+
 def run_state(
     *,
     incidents: Iterable[Mapping[str, Any]],
@@ -2693,6 +2806,7 @@ def run_state(
     unknown_ranks: Mapping[int, str] | None = None,
     judged_ranks: Iterable[int] = (),
     status_expected: bool = True,
+    judged_attempts: Mapping[int, int | None] | None = None,
 ) -> dict[str, Any]:
     """The run's state from what the evidence holds: `{"state", "reasons"}`.
 
@@ -2706,6 +2820,10 @@ def run_state(
     A rank the status expects (`missing_ranks`, or below `world_size`) that is neither listed in
     it nor judged is unknown too: the status calls a rank missing only after its silence floor,
     and until then a run of one connected rank out of four would otherwise read healthy.
+    `judged_attempts` is the attempt each judged rank's incidents come from (None when not
+    known): a rank the status marks `attempt_without_steps`, or shows at another attempt, is
+    unknown too, as the server judges it (`_not_current_by_status`). Its incidents stay listed:
+    they were found in what it stored.
     An incident's class is looked up from its kind (`incident_class`): observations go to the
     `observations` reason, whose state is `healthy`, and every other incident, a kind this
     version does not know among them, to `incidents`. Codes are stable: `incidents`;
@@ -2735,6 +2853,8 @@ def run_state(
             expected |= set(range(world_size)) - listed
         for rank in sorted(expected - judged):
             unknown.setdefault(rank, "the server's status expects it and it has not connected")
+        for rank, why in _not_current_by_status(status, judged_attempts or {}).items():
+            unknown.setdefault(rank, why)
     if unknown:
         ranks = sorted(unknown)
         reasons.append(_reason("unknown", "ranks_unknown", f"{len(ranks)} rank{'s' if len(ranks) != 1 else ''} without"
@@ -2777,7 +2897,9 @@ def run_state_line(evidence: Mapping[str, Any]) -> str | None:
 
 
 def _per_rank_run_state(evidence: Mapping[str, Any], status: Mapping[str, Any] | None,
-                        status_age: float | None, steps_judged: bool) -> dict[str, Any]:
+                        status_age: float | None, steps_judged: bool, attempt: int | None = None) -> dict[str, Any]:
+    """`run_state` of one rank's evidence. `attempt` is the attempt its incidents were judged
+    from: the report's, or the newest of the records the detectors read here."""
     # Evidence that says what was checked says whether a status was expected at all; without
     # the key (the server's report read by a watcher) one is, as before.
     checks = evidence.get("kind_checks")
@@ -2786,6 +2908,7 @@ def _per_rank_run_state(evidence: Mapping[str, Any], status: Mapping[str, Any] |
         incidents=evidence.get("incidents", ()), steps_judged=steps_judged, status=status, status_age=status_age,
         not_checked=evidence.get("not_checked", ()), detection=evidence.get("detection"),
         status_expected=not (isinstance(stall, Mapping) and stall.get("value") == "not_configured"),
+        judged_attempts={rank: attempt} if isinstance(rank := evidence.get("rank"), int) and steps_judged else None,
     )
 
 
@@ -2856,7 +2979,8 @@ def _status_stamp(status: Mapping[str, Any] | None, status_age: float | None) ->
         json.dumps(status.get("pauses", {}), sort_keys=True),
         status.get("recommended_silent_seconds"),
         tuple(
-            (r.get("rank"), r.get("state"), r.get("last_step"), r.get("severity"), r.get("phase"))
+            (r.get("rank"), r.get("state"), r.get("last_step"), r.get("severity"), r.get("phase"),
+             r.get("attempt"), r.get("attempt_without_steps"))  # a job started again is news (L6)
             for r in status["ranks"]
         ),
         status_age is not None,
@@ -3003,6 +3127,8 @@ def watch(
     `trigger` (a `trigger.Trigger`) fires once for each new incident: it is told of every look
     and handed each evidence written, and never raises into the watcher.
     """
+    # Said before the first look, not at the first rebuild hours into a run.
+    check_thresholds(**{name: build_options[name] for name in THRESHOLD_NAMES if name in build_options})
     if isinstance(rank, str):
         if rank != ALL_RANKS:
             raise ValueError(f"rank must be a rank number or {ALL_RANKS!r}, not {rank!r}")
@@ -3045,6 +3171,8 @@ def watch(
     emitted: Any = None
     emitted_grace: Any = None
     status_clock = _StatusAgeTracker()
+    others_seen: set[int] = set()  # the ranks seen when the watcher locked onto `default_rank`
+    told_absent: list[int] | None = None
     try:
         while polls is None or done < polls:
             if done:
@@ -3064,6 +3192,8 @@ def watch(
                 world_size = status.get("world_size") if status else None
                 if len(dirs) > 1 or (dirs and isinstance(world_size, int) and world_size > 1):
                     picked_rank = default_rank
+                    others_seen = {n for d in dirs if (n := _rank_number(d.name)) is not None}
+                    others_seen |= {int(r.get("rank", 0)) for r in tail.records}
                     if any(r.get("rank", 0) != picked_rank for r in tail.records):
                         emitted = None
                         emitted_grace = None
@@ -3129,6 +3259,7 @@ def watch(
                     ranks_seen = {int(r.get("rank", 0)) for r in tail.records}
                     if len(ranks_seen) > 1:
                         picked_rank = default_rank
+                        others_seen |= ranks_seen
                         tail = _Tail(source, picked_rank)
                         grown = tail.poll()
                         folder = _rank_folder(source, picked_rank) if server_reports else None
@@ -3139,7 +3270,21 @@ def watch(
                 # The end marker appears after the last record: its arrival alone is news.
                 ended = read_end_marker(source) if source.suffix == ".jsonl" else None
                 seen = ("python", look and look["state"], stamp, other_stamp, ended and ended["state"])
-                if not tail.records or (not grown and seen == emitted):
+                if not tail.records:
+                    # The rank this watcher locked onto has no record yet while others do: said
+                    # once for each set of ranks seen, since nothing is written for it until it
+                    # has one (DET-12, Nov 19, 2026: it wrote nothing and said nothing).
+                    present = sorted(others_seen - {picked_rank})
+                    if rank is None and picked_rank is not None and present and present != told_absent:
+                        told_absent = present
+                        warnings.warn(
+                            f"rank {picked_rank} has no records here yet, and ranks {_rank_ranges(present, 8)} do: no"
+                            f" evidence is written until rank {picked_rank} has a step. Choose another with rank=N"
+                            f" (--rank N), or every rank with rank='all' (--rank all)",
+                            RuntimeWarning, stacklevel=2,
+                        )
+                    continue
+                if not grown and seen == emitted:
                     continue
                 here = {**adopted, **thresholds}
                 evidence = build_evidence(
@@ -3155,7 +3300,9 @@ def watch(
             if status_age is not None and "watchdog" in evidence:
                 evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
             judged = bool(report_look["report"].get("steps")) if report_look is not None else bool(tail.records)
-            evidence["run_state"] = _per_rank_run_state(evidence, status, status_age, steps_judged=judged)
+            attempt = (_whole_attempt(report_look["report"].get("attempt")) if report_look is not None
+                       else newest_attempt(tail.records))
+            evidence["run_state"] = _per_rank_run_state(evidence, status, status_age, steps_judged=judged, attempt=attempt)
             emitted = seen
             emitted_grace = grace_key
             written = _write_output(evidence, path, output is not None, compact_window)
@@ -3186,11 +3333,6 @@ ALL_RANKS_VIEW_VERSION = 1
 MAX_EXPECTED_RANKS = 100_000
 # Lines of the text summary given to incidents on only some ranks before the rest are counted.
 SUMMARY_PARTIAL_LINES = 8
-
-
-def _rank_number(name: str) -> int | None:
-    key, _, value = name.partition("=")
-    return int(value) if key == "rank" and value.isdecimal() else None
 
 
 def _discover_rank_folders(source: Path) -> dict[int, Path]:
@@ -3453,12 +3595,14 @@ CHECKED_LINE_KINDS = 6
 def stated_kind_checks(report: Any) -> Mapping[str, Any] | None:
     """A server report's `kind_checks` when it gives every one of the server's kinds one of
     the three values, else None (a server older than the key wrote the report). The test
-    `_report_evidence` applies before it takes them."""
+    `_report_evidence` applies before it takes them. A kind among the report's incidents is
+    never `not_configured` (`checked_where_reported`)."""
     checks = report.get("kind_checks") if isinstance(report, Mapping) else None
     if isinstance(checks, Mapping) and all(
         isinstance(checks.get(kind), Mapping) and checks[kind].get("value") in KIND_CHECK_VALUES for kind in SERVER_KINDS
     ):
-        return checks
+        incidents = report.get("incidents")
+        return checked_where_reported(checks, incidents if isinstance(incidents, (list, tuple)) else ())
     return None
 
 
@@ -3712,6 +3856,8 @@ def combine_rank_evidence(
         incidents=incidents, steps_judged=bool(steps),
         status=status, status_age=_status_age(status), not_checked=not_checked, unknown_ranks=unknown,
         judged_ranks=judged, status_expected=status_expected,
+        # The attempt a rank's evidence was judged from, when it says (a server report's).
+        judged_attempts={n: _whole_attempt((per_rank[n].get("detection") or {}).get("report_attempt")) for n in judged},
     )
     return combined
 
@@ -3987,8 +4133,9 @@ def _all_ranks_run_state(evidence: Mapping[str, Any], looks: Mapping[int, Mappin
                                                         for item in entry.get("not_checked", ()))]
     unknown = {n: f"{look['state']}: {look['reason']}" for n, look in looks.items() if n not in judged}
     steps = any((looks[n].get("report") or {}).get("steps") for n in judged)
+    attempts = {n: _whole_attempt((looks[n].get("report") or {}).get("attempt")) for n in judged}
     return run_state(incidents=incidents, steps_judged=steps, status=status, status_age=status_age,
-                     not_checked=not_checked, unknown_ranks=unknown, judged_ranks=judged)
+                     not_checked=not_checked, unknown_ranks=unknown, judged_ranks=judged, judged_attempts=attempts)
 
 
 def _all_ranks_source(source: str | Path) -> Path:
@@ -4541,8 +4688,10 @@ def build_evidence(
     `detectors="rust"` takes the incidents of the server's kinds (`SERVER_KINDS`) from the
     Rust detectors, run here on the same records through `tensorquill-server detect`
     (`server_binary`, else where `server_detect.find_binary` looks; needs `pyarrow`).
-    The six options above go to it as one JSON object (`--thresholds`), and a value the
-    Rust rules refuse (a negative number, a window or `top_k` below 1) raises `ValueError`.
+    The six options above go to it as one JSON object (`--thresholds`). A value the Rust
+    rules refuse (a negative or non-finite number, a window or `top_k` below 1 or not whole,
+    a bool) raises `ValueError` under either detectors, before anything is read
+    (`check_thresholds`): the Python ones judge by the same contract.
     The per-step `samples` come from that run too (`detect --samples`), so no MoE rule runs
     here. The weight trends, the router names and sizes and the kinds read from other files
     are still made here. The evidence then carries `"detectors": "rust"`.
@@ -4557,8 +4706,10 @@ def build_evidence(
     the defaults there is no such key, so that evidence is what it was before the key.
     """
     detectors = _detectors_option(detectors, server_binary)  # "auto" becomes one of the two here
-    if isinstance(update_window, bool) or not isinstance(update_window, int) or update_window < 1:
-        raise ValueError(f"update_window must be a whole number of at least 1, not {update_window!r}")
+    # Both detectors judge by one contract, the Rust one's: refused here before anything is read.
+    check_thresholds(overload_threshold=overload_threshold, drift_tolerance=drift_tolerance,
+                     starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,
+                     update_window=update_window)
     every_attempt, left_out = _load_counted(source, rank)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
@@ -4761,9 +4912,11 @@ def build_evidence(
         status=status, status_expected=status_expected, not_checked=not_checked,
         flight_recorder=flight_recorder is not None, traincheck=traincheck is not None,
     )
-    # Every kind, in the order `INCIDENT_CLASSES` lists them.
-    evidence["kind_checks"] = {kind: {**rank_checks, **others}[kind] for kind in INCIDENT_CLASSES}
-    evidence["run_state"] = _per_rank_run_state(evidence, status, _status_age(status), steps_judged=bool(records))
+    # Every kind, in the order `INCIDENT_CLASSES` lists them, none called not configured beside its incident.
+    evidence["kind_checks"] = checked_where_reported(
+        {kind: {**rank_checks, **others}[kind] for kind in INCIDENT_CLASSES}, incidents)
+    evidence["run_state"] = _per_rank_run_state(evidence, status, _status_age(status), steps_judged=bool(records),
+                                                attempt=newest_attempt(records))
     return evidence
 
 
@@ -5635,178 +5788,183 @@ def export_rerun(
     run_id = str(evidence.get("run_id") or "tensorquill-run")
 
     rr.init("tensorquill", recording_id=run_id)
-    rr.save(out_path)
-    rr.log("/incident/summary", rr.TextDocument(incident_summary(evidence)), static=True)
+    # Let go of the recording however this ends: a failure part way must not leave the
+    # process's recording open on a half-written file (DET-14, Nov 19, 2026).
+    try:
+        rr.save(out_path)
+        rr.log("/incident/summary", rr.TextDocument(incident_summary(evidence)), static=True)
 
-    all_samples = list(evidence.get("samples", ()))
-    steps = sorted({int(sample["step"]) for sample in all_samples})
-    layer_count = int(evidence.get("layer_count") or max((int(s["layer"]) for s in all_samples), default=0))
-    expert_count = int(
-        evidence.get("expert_count")
-        or max((len(s.get("counts", ())) for s in all_samples), default=0)
-    )
-    by_key = {(int(sample["step"]), int(sample["layer"])): sample for sample in all_samples}
-
-    tabs = []
-    if steps and layer_count > 0 and expert_count > 0:
-        tabs.append(
-            rrb.Horizontal(
-                rrb.Tabs(
-                    rrb.Spatial2DView(origin="/routing/status", name="Routing status by layer and expert"),
-                    rrb.TensorView(origin="/routing/share", name="Raw routing share"),
-                ),
-                rrb.Vertical(
-                    rrb.TextDocumentView(
-                        origin="/incident/expert_load", name=f"Layer {incident_layer:02} expert load"
-                    ),
-                    rrb.TimeSeriesView(origin="/routing/layers", name="Router diversity by layer"),
-                    row_shares=[3, 2],
-                ),
-                name="MoE routing",
-            )
+        all_samples = list(evidence.get("samples", ()))
+        steps = sorted({int(sample["step"]) for sample in all_samples})
+        layer_count = int(evidence.get("layer_count") or max((int(s["layer"]) for s in all_samples), default=0))
+        expert_count = int(
+            evidence.get("expert_count")
+            or max((len(s.get("counts", ())) for s in all_samples), default=0)
         )
-        for step in steps[1:]:
-            rr.set_time("training_step", sequence=step)
-            rr.log(
-                "/incident/expert_load",
-                rr.TextDocument(
-                    expert_load_table(evidence, step, incident_layer),
-                    media_type=rr.MediaType.MARKDOWN,
-                ),
+        by_key = {(int(sample["step"]), int(sample["layer"])): sample for sample in all_samples}
+
+        tabs = []
+        if steps and layer_count > 0 and expert_count > 0:
+            tabs.append(
+                rrb.Horizontal(
+                    rrb.Tabs(
+                        rrb.Spatial2DView(origin="/routing/status", name="Routing status by layer and expert"),
+                        rrb.TensorView(origin="/routing/share", name="Raw routing share"),
+                    ),
+                    rrb.Vertical(
+                        rrb.TextDocumentView(
+                            origin="/incident/expert_load", name=f"Layer {incident_layer:02} expert load"
+                        ),
+                        rrb.TimeSeriesView(origin="/routing/layers", name="Router diversity by layer"),
+                        row_shares=[3, 2],
+                    ),
+                    name="MoE routing",
+                )
             )
-        for layer in range(1, layer_count + 1):
-            rr.log(
-                f"/routing/layers/layer-{layer:02}",
-                rr.SeriesPoints(names=[f"Layer {layer:02}"]),
-                static=True,
-            )
-        for step in steps:
-            rr.set_time("training_step", sequence=step)
-            step_samples = [
-                by_key.get((step, layer)) or _missing_sample(step, layer, expert_count)
-                for layer in range(1, layer_count + 1)
+            # Every step, the first among them: a one-step recording has its table too (DET-14).
+            for step in steps:
+                rr.set_time("training_step", sequence=step)
+                rr.log(
+                    "/incident/expert_load",
+                    rr.TextDocument(
+                        expert_load_table(evidence, step, incident_layer),
+                        media_type=rr.MediaType.MARKDOWN,
+                    ),
+                )
+            for layer in range(1, layer_count + 1):
+                rr.log(
+                    f"/routing/layers/layer-{layer:02}",
+                    rr.SeriesPoints(names=[f"Layer {layer:02}"]),
+                    static=True,
+                )
+            for step in steps:
+                rr.set_time("training_step", sequence=step)
+                step_samples = [
+                    by_key.get((step, layer)) or _missing_sample(step, layer, expert_count)
+                    for layer in range(1, layer_count + 1)
+                ]
+                shares = np.full((layer_count, expert_count), np.nan, dtype=np.float32)
+                for row_idx, sample in enumerate(step_samples):
+                    tokens = int(sample.get("routed_tokens") or 0)
+                    if not sample.get("missing") and tokens > 0:
+                        counts = np.asarray(sample["counts"], dtype=np.float64)
+                        n = min(len(counts), expert_count)
+                        shares[row_idx, :n] = (counts[:n] / tokens).astype(np.float32)
+                rr.log(
+                    "/routing/share",
+                    rr.Tensor(shares, dim_names=("layer", "expert"), value_range=(0.0, 0.36)),
+                )
+                colors = np.array(
+                    [list(routing_colors(sample, expert_count)) for sample in step_samples],
+                    dtype=np.uint8,
+                )
+                rr.log(
+                    "/routing/status",
+                    rr.Image(
+                        bytes=colors.tobytes(),
+                        width=expert_count,
+                        height=layer_count,
+                        color_model="RGB",
+                        datatype=np.uint8,
+                        magnification_filter="Nearest",
+                    ),
+                )
+                for sample in step_samples:
+                    diversity = sample.get("diversity")
+                    if not sample.get("missing") and sample.get("routed_tokens", 0) > 0 and diversity is not None:
+                        rr.log(
+                            f"/routing/layers/layer-{sample['layer']:02}",
+                            rr.Scalars(float(diversity)),
+                        )
+
+        activation_paths: dict[str, set[str]] = {}
+        training_paths: dict[str, str] = {}
+        logged_paths: dict[str, str] = {}
+        probe_hist: dict[str, str] = {}
+        probe_maps: dict[str, str] = {}
+        probe_series = False
+        probe_invalid = [False]
+        if records is not None:
+            for record in records:
+                rr.set_time("training_step", sequence=int(record["step"]))
+                grad_norm = record.get("grad_norm")
+                if isinstance(grad_norm, (int, float)) and math.isfinite(grad_norm):
+                    rr.log("/training/grad_norm", rr.Scalars(float(grad_norm)))
+                    training_paths["/training/grad_norm"] = "Gradient norm"
+                clip_norm = _finite(record.get("clip_grad_norm"))
+                if clip_norm is not None:
+                    rr.log("/training/clip_grad_norm", rr.Scalars(clip_norm))
+                    training_paths["/training/clip_grad_norm"] = "Pre-clipping gradient norm"
+                weights = [v for v in record.get("weight_norms", {}).values() if _finite(v) is not None]
+                if weights:
+                    rr.log("/training/weight_norm", rr.Scalars(math.sqrt(sum(v * v for v in weights))))
+                    training_paths["/training/weight_norm"] = "Weight norm"
+                if record.get("lr"):
+                    rr.log("/training/lr", rr.Scalars(float(record["lr"][0])))
+                    training_paths["/training/lr"] = "Learning rate"
+                scale = _finite(record.get("grad_scale"))
+                if scale is not None:
+                    rr.log("/training/grad_scale", rr.Scalars(scale))
+                    training_paths["/training/grad_scale"] = "Loss scale"
+                if "step_skipped" in record:
+                    rr.log("/training/step_skipped", rr.Scalars(float(bool(record["step_skipped"]))))
+                    training_paths["/training/step_skipped"] = "Step skipped by the loss scaler"
+                for name, val in (record.get("scalars") or {}).items():
+                    value = _finite(val)
+                    if value is not None:
+                        parts = "/".join(rr.escape_entity_path_part(p) for p in name.split("/") if p)
+                        entity = f"/logged/{parts}"
+                        rr.log(entity, rr.Scalars(value))
+                        logged_paths[entity] = name
+                probe = record.get("probe")
+                if probe:
+                    probe_series |= _log_probe(rr, probe, probe_hist, probe_maps, probe_invalid)
+                for layer_name, stats in record.get("layers", {}).items():
+                    for key, val in stats.items():
+                        if isinstance(val, (int, float)) and math.isfinite(val):
+                            entity = (f"/layers/{rr.escape_entity_path_part(str(layer_name))}"
+                                      f"/{rr.escape_entity_path_part(str(key))}")
+                            rr.log(entity, rr.Scalars(float(val)))
+                            activation_paths.setdefault(key, set()).add(entity)
+
+        if activation_paths:
+            labels = {
+                "abs_max": "Peak magnitude", "mean": "Mean", "std": "Standard deviation",
+                "zero_frac": "Zero fraction",
+            }
+            activation_views = [
+                rrb.TimeSeriesView(origin="/layers", contents=sorted(paths), name=labels.get(key, key))
+                for key, paths in sorted(activation_paths.items(), key=lambda item: item[0] != "abs_max")
             ]
-            shares = np.full((layer_count, expert_count), np.nan, dtype=np.float32)
-            for row_idx, sample in enumerate(step_samples):
-                tokens = int(sample.get("routed_tokens") or 0)
-                if not sample.get("missing") and tokens > 0:
-                    counts = np.asarray(sample["counts"], dtype=np.float64)
-                    n = min(len(counts), expert_count)
-                    shares[row_idx, :n] = (counts[:n] / tokens).astype(np.float32)
-            rr.log(
-                "/routing/share",
-                rr.Tensor(shares, dim_names=("layer", "expert"), value_range=(0.0, 0.36)),
-            )
-            colors = np.array(
-                [list(routing_colors(sample, expert_count)) for sample in step_samples],
-                dtype=np.uint8,
-            )
-            rr.log(
-                "/routing/status",
-                rr.Image(
-                    bytes=colors.tobytes(),
-                    width=expert_count,
-                    height=layer_count,
-                    color_model="RGB",
-                    datatype=np.uint8,
-                    magnification_filter="Nearest",
-                ),
-            )
-            for sample in step_samples:
-                diversity = sample.get("diversity")
-                if not sample.get("missing") and sample.get("routed_tokens", 0) > 0 and diversity is not None:
-                    rr.log(
-                        f"/routing/layers/layer-{sample['layer']:02}",
-                        rr.Scalars(float(diversity)),
-                    )
+            tabs.append(rrb.Tabs(*activation_views, name="Activations"))
+        if training_paths:
+            tabs.append(rrb.Tabs(*(
+                rrb.TimeSeriesView(origin=entity, name=name)
+                for entity, name in sorted(training_paths.items())
+            ), name="Optimizer"))
+        if probe_series or probe_hist or probe_maps:
+            probe_views = []
+            if probe_series:
+                probe_views += [
+                    rrb.TimeSeriesView(origin="/probe/max_logit", name="Largest attention logit"),
+                    rrb.TimeSeriesView(origin="/probe/entropy", name="Attention entropy (share of maximum)"),
+                ]
+            if probe_invalid[0]:
+                probe_views.append(rrb.TimeSeriesView(origin="/probe/invalid_rows", name="Attention rows with NaN or Inf"))
+            probe_views += [rrb.BarChartView(origin=e, name=f"Histogram {n}") for e, n in probe_hist.items()]
+            probe_views += [rrb.TensorView(origin=e, name=f"Attention {n}") for e, n in probe_maps.items()]
+            tabs.append(rrb.Tabs(*probe_views, name="Probe"))
+        if logged_paths:
+            tabs.append(rrb.Tabs(*(
+                rrb.TimeSeriesView(origin=entity, name=name)
+                for entity, name in sorted(logged_paths.items(), key=lambda item: item[1])
+            ), name="Logged"))
 
-    activation_paths: dict[str, set[str]] = {}
-    training_paths: dict[str, str] = {}
-    logged_paths: dict[str, str] = {}
-    probe_hist: dict[str, str] = {}
-    probe_maps: dict[str, str] = {}
-    probe_series = False
-    probe_invalid = [False]
-    if records is not None:
-        for record in records:
-            rr.set_time("training_step", sequence=int(record["step"]))
-            grad_norm = record.get("grad_norm")
-            if isinstance(grad_norm, (int, float)) and math.isfinite(grad_norm):
-                rr.log("/training/grad_norm", rr.Scalars(float(grad_norm)))
-                training_paths["/training/grad_norm"] = "Gradient norm"
-            clip_norm = _finite(record.get("clip_grad_norm"))
-            if clip_norm is not None:
-                rr.log("/training/clip_grad_norm", rr.Scalars(clip_norm))
-                training_paths["/training/clip_grad_norm"] = "Pre-clipping gradient norm"
-            weights = [v for v in record.get("weight_norms", {}).values() if _finite(v) is not None]
-            if weights:
-                rr.log("/training/weight_norm", rr.Scalars(math.sqrt(sum(v * v for v in weights))))
-                training_paths["/training/weight_norm"] = "Weight norm"
-            if record.get("lr"):
-                rr.log("/training/lr", rr.Scalars(float(record["lr"][0])))
-                training_paths["/training/lr"] = "Learning rate"
-            scale = _finite(record.get("grad_scale"))
-            if scale is not None:
-                rr.log("/training/grad_scale", rr.Scalars(scale))
-                training_paths["/training/grad_scale"] = "Loss scale"
-            if "step_skipped" in record:
-                rr.log("/training/step_skipped", rr.Scalars(float(bool(record["step_skipped"]))))
-                training_paths["/training/step_skipped"] = "Step skipped by the loss scaler"
-            for name, val in (record.get("scalars") or {}).items():
-                value = _finite(val)
-                if value is not None:
-                    parts = "/".join(rr.escape_entity_path_part(p) for p in name.split("/") if p)
-                    entity = f"/logged/{parts}"
-                    rr.log(entity, rr.Scalars(value))
-                    logged_paths[entity] = name
-            probe = record.get("probe")
-            if probe:
-                probe_series |= _log_probe(rr, probe, probe_hist, probe_maps, probe_invalid)
-            for layer_name, stats in record.get("layers", {}).items():
-                for key, val in stats.items():
-                    if isinstance(val, (int, float)) and math.isfinite(val):
-                        entity = f"/layers/{layer_name}/{key}"
-                        rr.log(entity, rr.Scalars(float(val)))
-                        activation_paths.setdefault(key, set()).add(entity)
-
-    if activation_paths:
-        labels = {
-            "abs_max": "Peak magnitude", "mean": "Mean", "std": "Standard deviation",
-            "zero_frac": "Zero fraction",
-        }
-        activation_views = [
-            rrb.TimeSeriesView(origin="/layers", contents=sorted(paths), name=labels.get(key, key))
-            for key, paths in sorted(activation_paths.items(), key=lambda item: item[0] != "abs_max")
-        ]
-        tabs.append(rrb.Tabs(*activation_views, name="Activations"))
-    if training_paths:
-        tabs.append(rrb.Tabs(*(
-            rrb.TimeSeriesView(origin=entity, name=name)
-            for entity, name in sorted(training_paths.items())
-        ), name="Optimizer"))
-    if probe_series or probe_hist or probe_maps:
-        probe_views = []
-        if probe_series:
-            probe_views += [
-                rrb.TimeSeriesView(origin="/probe/max_logit", name="Largest attention logit"),
-                rrb.TimeSeriesView(origin="/probe/entropy", name="Attention entropy (share of maximum)"),
-            ]
-        if probe_invalid[0]:
-            probe_views.append(rrb.TimeSeriesView(origin="/probe/invalid_rows", name="Attention rows with NaN or Inf"))
-        probe_views += [rrb.BarChartView(origin=e, name=f"Histogram {n}") for e, n in probe_hist.items()]
-        probe_views += [rrb.TensorView(origin=e, name=f"Attention {n}") for e, n in probe_maps.items()]
-        tabs.append(rrb.Tabs(*probe_views, name="Probe"))
-    if logged_paths:
-        tabs.append(rrb.Tabs(*(
-            rrb.TimeSeriesView(origin=entity, name=name)
-            for entity, name in sorted(logged_paths.items(), key=lambda item: item[1])
-        ), name="Logged"))
-
-    summary = rrb.TextDocumentView(origin="/incident/summary", name="Training incidents")
-    layout = rrb.Vertical(summary, rrb.Tabs(*tabs), row_shares=[1, 4]) if tabs else summary
-    rr.send_blueprint(rrb.Blueprint(layout, collapse_panels=True))
-
-    rr.disconnect()
+        summary = rrb.TextDocumentView(origin="/incident/summary", name="Training incidents")
+        layout = rrb.Vertical(summary, rrb.Tabs(*tabs), row_shares=[1, 4]) if tabs else summary
+        rr.send_blueprint(rrb.Blueprint(layout, collapse_panels=True))
+    finally:
+        rr.disconnect()
     return out_path
 
 
@@ -6037,6 +6195,10 @@ def main() -> None:
     args.compact_window = _compact.window_from_args(args)  # None: the full file
     args.trigger = _trigger.from_args(args, parser)  # None without --on-incident or --webhook
     args.thresholds = _given_thresholds(vars(args))  # only the ones typed
+    try:
+        check_thresholds(**args.thresholds)  # a usage error with either detectors, never a traceback
+    except ValueError as error:
+        parser.error(str(error))
 
     if args.rank == ALL_RANKS:
         _main_all_ranks(args, parser)
