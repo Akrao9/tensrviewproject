@@ -113,6 +113,16 @@ def _projection_f64(p: torch.Tensor, seed: int) -> torch.Tensor:
     return torch.stack(parts).sum()
 
 
+def _rows(items: list[tuple[int, torch.Tensor]], projection: bool) -> torch.Tensor:
+    """The fingerprints of `(position, tensor)` pairs, one row each; a tensor's position in the
+    checked list seeds its projection."""
+    tensors = [p for _, p in items]
+    columns = [_norms_f64(tensors), torch.stack([_sum_f64(p) for p in tensors])]
+    if projection:
+        columns.append(torch.stack([_projection_f64(p, i) for i, p in items]))
+    return torch.stack(columns, dim=1)
+
+
 @torch.no_grad()
 def parameter_fingerprints(params: Iterable[torch.Tensor], *, projection: bool = True) -> torch.Tensor:
     """Compute float64 fingerprints for `params`: `[n_params, 3]` `(norm, sum, projection)`,
@@ -127,10 +137,106 @@ def parameter_fingerprints(params: Iterable[torch.Tensor], *, projection: bool =
     local = [unwrap_local(p) for p in params]
     if not local:
         raise ValueError("no replicated parameters to check")
-    columns = [_norms_f64(local), torch.stack([_sum_f64(p) for p in local])]
-    if projection:
-        columns.append(torch.stack([_projection_f64(p, i) for i, p in enumerate(local)]))
-    return torch.stack(columns, dim=1)
+    return _rows(list(enumerate(local)), projection)
+
+
+# Why a parameter's fingerprints are not read, by the code `_fingerprint_table` puts in its last
+# column (0: read; code `i` is `_UNREAD[i - 1]`). All but the last are judged from the tensor's
+# device, layout and type alone, which hold no values, so no rank reads data to decide them.
+_SPARSE = ("sparse_coo", "sparse_csr", "sparse_csc", "sparse_bsr", "sparse_bsc")
+_UNREAD = (
+    "it is on meta, which holds no values",
+    "it is a nested tensor",
+    *(f"it is a {layout} tensor, not a dense one" for layout in _SPARSE),
+    "it is not a dense tensor",
+    "reading it raised an error",
+)
+_RAISED = len(_UNREAD)
+
+
+def _unread_code(p: torch.Tensor) -> int:
+    if p.device.type == "meta":
+        return 1
+    if p.is_nested:
+        return 2
+    if p.layout != torch.strided:
+        name = str(p.layout).removeprefix("torch.")
+        return 3 + _SPARSE.index(name) if name in _SPARSE else 3 + len(_SPARSE)
+    return 0
+
+
+def _unread_reason(code: float) -> str:
+    """The reason a code in the last column of `_fingerprint_table` stands for."""
+    index = int(code) - 1
+    return _UNREAD[index] if 0 <= index < len(_UNREAD) else _UNREAD[-1]
+
+
+@torch.no_grad()
+def _fingerprint_table(
+    params: Iterable[torch.Tensor], *, projection: bool, device: torch.device | None = None
+) -> tuple[torch.Tensor, list[str | None]]:
+    """What `_spread_and_unread` gathers: `[n_params, width + 1]` float64 on `device`, each
+    parameter's fingerprints (`parameter_fingerprints`, the same values, `width` 3 or 2) and then
+    0.0 where they were read, or the code of why not (`_UNREAD`) with zeros for its values. Also
+    each parameter's reason on this rank, or None.
+
+    It never raises for a parameter, so a rank never leaves a collective the others enter: one
+    on `meta`, nested or sparse is not read, and one whose reading raises is flagged instead.
+    The shape depends only on how many parameters there are, never on which were read. A
+    parameter's values are not looked at to decide, so a NaN weight is read, as before.
+
+    `device`: where the table is built (the session's, which is never `meta`); by default
+    where the first parameter that is read leaves its fingerprints, else the CPU."""
+    local = [unwrap_local(p) for p in params]
+    width = FINGERPRINT_WIDTH if projection else 2
+    codes = [_unread_code(p) for p in local]
+    reasons: list[str | None] = [_UNREAD[code - 1] if code else None for code in codes]
+    if device is None:
+        device = next(
+            (torch.device("cpu") if p.device.type == "mps" else p.device for p, code in zip(local, codes) if not code),
+            torch.device("cpu"),
+        )
+    table = torch.zeros(len(local), width + 1, dtype=F64, device=device)
+    # One pass over every parameter, as `parameter_fingerprints` makes, with an empty tensor in
+    # place of one not read (its row stays zero); only if that raises, one parameter at a time.
+    empty = torch.zeros(0, dtype=F64, device=device)
+    try:
+        items = [(i, empty if code else p) for i, (p, code) in enumerate(zip(local, codes))]
+        table[:, :width].copy_(_rows(items, projection))
+    except Exception:  # noqa: BLE001
+        for i, p in enumerate(local):
+            if codes[i]:
+                continue
+            try:
+                table[i, :width].copy_(_rows([(i, p)], projection)[0])
+            except Exception as error:  # noqa: BLE001
+                table[i, :width].zero_()
+                codes[i] = _RAISED
+                text = " ".join(f"{type(error).__name__}: {error}".split())
+                reasons[i] = f"reading it raised {text if len(text) <= 200 else text[:199] + '…'}"
+    for i, code in enumerate(codes):
+        if code:
+            table[i, width].fill_(float(code))  # a fill with a number: no copy from the host
+    return table, reasons
+
+
+@torch.no_grad()
+def _spread_and_unread(
+    params: Iterable[torch.Tensor], group: dist.ProcessGroup, *, projection: bool, device: torch.device | None = None
+) -> tuple[torch.Tensor, torch.Tensor, list[str | None]]:
+    """The session's cross-GPU check: one `all_gather` of `_fingerprint_table`, which every rank
+    enters with the same shape whatever it could read. Returns the `[n_params, width]` spread
+    (`spread_from_fingerprints`), for each parameter 0.0 where every rank read it or else the
+    largest code any rank gave (the same on every rank, since all see every rank's codes, so all
+    leave out the same rows), and this rank's own reasons. The spread of a row not read on some
+    rank means nothing: it is left out by its code, never by its value, so a NaN still reads
+    as drift and a zero as agreement only where the weights were read. Both stay on the device."""
+    table, reasons = _fingerprint_table(params, projection=projection, device=device)
+    out = [torch.empty_like(table) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(out, table, group=group)  # 32 bytes per tensor per rank (24 without the projection)
+    gathered = torch.stack(out)
+    width = table.shape[1] - 1
+    return spread_from_fingerprints(gathered[..., :width]), gathered[..., width].amax(0), reasons
 
 
 @torch.no_grad()

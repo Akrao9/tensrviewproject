@@ -54,9 +54,12 @@ def test_replica_params_compares_only_replicated_weights(monkeypatch):
     monkeypatch.setattr(dist, "get_world_size", lambda g=None: 2)
 
     def gather(out, fp, group=None):
+        # The session gathers each parameter's fingerprints and whether it was read (`_fingerprint_table`).
+        from tensorquill.distributed import _fingerprint_table
+
         out[0].copy_(fp)
         names = [n for n, _ in rank0.named_parameters() if n.startswith("norm")]
-        out[1].copy_(tensorquill.parameter_fingerprints(p for n, p in rank1.named_parameters() if n in names))
+        out[1].copy_(_fingerprint_table((p for n, p in rank1.named_parameters() if n in names), projection=True)[0])
 
     monkeypatch.setattr(dist, "all_gather", gather)
     sink = tensorquill.MemorySink()
@@ -143,8 +146,11 @@ def test_session_records_the_projection_unless_switched_off(monkeypatch, project
     other.load_state_dict(model.state_dict())
 
     def gather(out, fp, group=None):
+        from tensorquill.distributed import _fingerprint_table
+
         out[0].copy_(fp)
-        out[1].copy_(tensorquill.parameter_fingerprints(other.parameters(), projection=fp.shape[-1] == 3))
+        out[1].copy_(_fingerprint_table(other.parameters(), projection=projection)[0])
+        assert fp.shape[-1] == width + 1  # the fingerprints, then whether each was read
 
     monkeypatch.setattr(dist, "get_world_size", lambda g=None: 2)
     monkeypatch.setattr(dist, "all_gather", gather)

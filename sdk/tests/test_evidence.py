@@ -66,8 +66,11 @@ def test_non_finite_and_replica_drift_detectors_from_capture_session(tmp_path, m
     monkeypatch.setattr(dist, "get_world_size", lambda g=None: 2)
 
     def fake_all_gather(out_list, tensor, group=None):
+        # The session gathers each parameter's fingerprints and whether it was read.
+        from tensorquill.distributed import _fingerprint_table
+
         out_list[0].copy_(tensor)
-        out_list[1].copy_(tensorquill.parameter_fingerprints(model_b.parameters()))
+        out_list[1].copy_(_fingerprint_table(model_b.parameters(), projection=True)[0])
 
     monkeypatch.setattr(dist, "all_gather", fake_all_gather)
 

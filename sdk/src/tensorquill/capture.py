@@ -42,7 +42,7 @@ from .data import (
     optimizer_step_value,
 )
 from . import datawait
-from .distributed import FINGERPRINT_WIDTH, replica_spread, unwrap_local
+from .distributed import FINGERPRINT_WIDTH, _spread_and_unread, _unread_reason, unwrap_local
 from .probe import ProbeState, find_head, install_head_hook, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink, clear_end_marker, write_end_marker
 from .system import SystemPart, SystemReadings
@@ -889,7 +889,7 @@ class Session:
         replicas = _select_replica_params(params, replica_params)
         self._replica_params = [p for _, p in replicas]
         self.replica_names = [name for name, _ in replicas]
-        self.device = self._params[0].device if self._params else torch.device("cpu")
+        self.device = _buffers_device(self._params)
 
         selected = _select_layers(model, layers)
         self.layer_names = [name for name, _ in selected]
@@ -926,6 +926,10 @@ class Session:
         self._prev_weight: torch.Tensor | None = None
         self._weight_dtypes: dict[str, int] = {}
         self._spread: torch.Tensor | None = None
+        # Replicated parameters the cross-GPU check could not read on this rank, with why
+        # (`record_replica_spread`), and those already named in a warning (`_say_replica_unread`).
+        self._replica_unread_here: dict[str, str] = {}
+        self._replica_unread_said: set[str] = set()
         self._counts = {
             name: torch.zeros(_count_width(spec), dtype=torch.int64, device=self.device)
             for name, spec in self._routers.items()
@@ -1770,9 +1774,11 @@ class Session:
             # Apple MPS rejects float64 allocations; keep float64 replica buffers on CPU there.
             spread_device = torch.device("cpu") if self.device.type == "mps" else self.device
             n_params = len(self._replica_params)
-            self._spread = torch.zeros(n_params, FINGERPRINT_WIDTH, dtype=torch.float64, device=spread_device)
+            # Each parameter's spread, then 0.0 where every replica read it, or the code of why
+            # one did not (`distributed._UNREAD`), which leaves it out of the record (`_decode`).
+            self._spread = torch.zeros(n_params, FINGERPRINT_WIDTH + 1, dtype=torch.float64, device=spread_device)
             self._ring_spread = torch.zeros(
-                self.every, n_params, FINGERPRINT_WIDTH, dtype=torch.float64, device=spread_device
+                self.every, n_params, FINGERPRINT_WIDTH + 1, dtype=torch.float64, device=spread_device
             )
         return self._spread, self._ring_spread
 
@@ -1783,6 +1789,12 @@ class Session:
         Pass a replication `ProcessGroup` (or rely on `replica_group` passed to `init`), or
         pass a precomputed `[n_params, 3]` (or older `[n_params, 2]`) tensor from
         `spread_from_fingerprints`.
+
+        With a group, a replicated parameter that some replica cannot read (on `meta`, nested or
+        sparse, or one whose reading raised) is still gathered, so every rank enters the same
+        collective, and is then left out of `replica_spread` on every rank, never written as a
+        spread: a warning names it once, at the next flush. A NaN weight that was read still
+        reads as drift.
         """
         if not self._replica_params:
             return
@@ -1790,16 +1802,42 @@ class Session:
         if target is None:
             raise ValueError("pass a replication process group or precomputed spread tensor")
         spread_buf, _ = self._ensure_spread_buffers()
+        unread: torch.Tensor | None = None
         if isinstance(target, torch.Tensor):
             spread = target.to(spread_buf)
         else:
-            spread = replica_spread(
-                self._replica_params, target, projection=self._replica_projection
-            ).to(spread_buf)
+            spread, unread, reasons = _spread_and_unread(
+                self._replica_params, target, projection=self._replica_projection, device=spread_buf.device
+            )
+            for name, why in zip(self.replica_names, reasons):
+                if why is not None:
+                    self._replica_unread_here.setdefault(name, why)
         width = spread.shape[-1]
         spread_buf.zero_()
         spread_buf[:, :width].copy_(spread)
+        if unread is not None:
+            spread_buf[:, -1].copy_(unread)
         self._spread_recorded = width
+
+    def _say_replica_unread(self, spreads: torch.Tensor, seen: Sequence[int]) -> None:
+        """Name once each replicated parameter left out of the cross-GPU check, from the block's
+        spreads, already on the CPU: no transfer and no sync is added. The same on every rank,
+        since every rank leaves out the same rows; the reason is this rank's own when it could
+        not read the parameter, else what another replica said."""
+        codes = spreads[..., -1]
+        for row, width in enumerate(seen):
+            if not width or not bool(codes[row].any()):
+                continue
+            for name, code in zip(self.replica_names, codes[row].tolist()):
+                if not code or name in self._replica_unread_said:
+                    continue
+                self._replica_unread_said.add(name)
+                why = self._replica_unread_here.get(name) or f"on another replica in the group, {_unread_reason(code)}"
+                warnings.warn(
+                    f"TensorQuill is not comparing the parameter {name!r} across replicas: {why}. It is left out "
+                    "of replica_spread, so the cross-GPU drift check does not cover it.",
+                    RuntimeWarning, stacklevel=4,
+                )
 
     def step(self, step: int | None = None, lr: float | Sequence[float] | None = None) -> None:
         """Mark the end of one optimizer step. Only for `auto_step=False`.
@@ -2076,6 +2114,8 @@ class Session:
             if self._ring_spread is not None and any(self._ring_spread_seen)
             else None
         )
+        if spreads is not None:
+            self._say_replica_unread(spreads, self._ring_spread_seen)
         clips = _cpu_copy(self._ring_clip[:n]) if any(self._ring_clip_seen) else None
         clip_seen = self._ring_clip_seen
         update_seen, self._ring_update_seen = self._ring_update_seen, []
@@ -2385,7 +2425,7 @@ class Session:
             else None
         )
         spread_rows = (
-            spreads.reshape(n, len(self.replica_names), FINGERPRINT_WIDTH).tolist() if spreads is not None else None
+            spreads.reshape(n, len(self.replica_names), FINGERPRINT_WIDTH + 1).tolist() if spreads is not None else None
         )
         update_rows = updates.reshape(n, n_params, 2).tolist() if updates is not None and n_params > 0 else None
         moe: dict[str, list[list[int]]] = {}
@@ -2430,7 +2470,9 @@ class Session:
                 if isinstance(weight_seen[i], dict):
                     record["optimizer_ownership"] = weight_seen[i]["ownership"]
                     record["weight_dtypes"] = weight_seen[i]["dtypes"]
-                if self.param_names and grad[i][0][3] >= 0:
+                # Written when the check knew any parameter (1 or 0, not -1); one it did not read
+                # (`_record_weights`), the first included, is left out of the list, never the list.
+                if any(row[3] >= 0 for row in grad[i]):
                     record["weights_unchanged"] = [
                         name for name, row in zip(self.param_names, grad[i]) if row[3] > 0
                     ]
@@ -2459,10 +2501,17 @@ class Session:
                 record["checkpoint"] = checkpoints[i]
             if spread_rows is not None and spread_seen[i]:
                 width = spread_seen[i]
-                record["replica_spread"] = {
+                # A parameter some replica could not read (a code in the last column) is left out,
+                # whatever its spread holds; with none left the record has no `replica_spread`, so
+                # the readers count no comparison in it (`replica_drift` is then `not_configured`
+                # where no other record compared any, never `checked`).
+                compared = {
                     name: [float(v) for v in row[:width]]
                     for name, row in zip(self.replica_names, spread_rows[i])
+                    if not row[-1]
                 }
+                if compared:
+                    record["replica_spread"] = compared
             if moe:
                 step_moe = {name: rows[i] for name, rows in moe.items()}
                 record["moe"] = step_moe
@@ -2516,6 +2565,19 @@ def _scalars_to_cpu(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for (i, name, _), value in zip(entries, values):
             out[i][name] = value
     return out
+
+
+def _buffers_device(params: Sequence[torch.Tensor]) -> torch.device:
+    """Where a session keeps its buffers: the device of the first trainable parameter that holds
+    values, never `meta` (a parameter registered on the root module comes first in
+    `named_parameters`, and one left on `meta` there would put every buffer on `meta`, which no
+    flush can read). The CPU when none does: no trainable parameter, or all on `meta`. A model
+    without a parameter on `meta` gets its first parameter's device, as before.
+
+    Not covered (by reading, not run: no GPU): under FSDP's CPU offload the parameters are on the
+    CPU while the blocks run on the GPU, so the buffers are on the CPU and every block's output is
+    left out (`_output_unread`)."""
+    return next((p.device for p in params if p.device.type != "meta"), torch.device("cpu"))
 
 
 def _select_replica_params(
