@@ -930,11 +930,10 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
     if not status or status.get("summary") not in ("stalled", "degraded"):
         return []
     full = list(status.get("ranks", ()))
-    stopped_capture = [r for r in full if r.get("state") == "capture_stopped"]
-    if (stopped_capture and not status.get("missing_ranks")
-            and not any(r.get("state") in ("silent", "lost", "unresponsive") for r in full)):
-        # Contract 3: a rank whose capture stopped is not a hang and raises no progress incident;
-        # the server's `degraded` here is that rank beside an active one, not a missing rank.
+    if not status.get("missing_ranks") and not any(r.get("state") in ("silent", "lost", "unresponsive") for r in full):
+        # No rank stopped and none is missing: the summary's cause is not progress, as when a rank
+        # whose capture stopped is beside an active one (contract 3). As `progress_incidents` in
+        # watchdog.rs (lane W2).
         return []
     places = [place for place in map(stuck_at, (r for r in full if r.get("state") in ("silent", "lost", "unresponsive")))
               if place is not None]
@@ -1620,7 +1619,9 @@ def lines_left_out_line(evidence: Mapping[str, Any]) -> str | None:
             " written) and were skipped; the steps after them are read.")
 
 
-def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def resolve_attempts(
+    records: list[dict[str, Any]], *, order: Mapping[tuple[str, Any], list[Any]] | None = None
+) -> list[dict[str, Any]]:
     """Leave out the records a later attempt replaced.
 
     Each `tensorquill.init` stamps its records with `attempt`, its start time. A job that
@@ -1634,7 +1635,10 @@ def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     numbers (contract 1, signed off Nov 19, 2026): an attempt number is an identity, and a
     replacement on a host whose clock is behind has a lower one. A local file is appended
     across attempts, so its order is arrival order; a store's parts are read in the rank's
-    stored attempt order (`attempts.json`, else by number: `_parquet_parts`).
+    stored attempt order (`attempts.json`, else by number: `_parquet_parts`). `order` gives a
+    rank's attempts oldest first by `(run_id, rank)` where the records alone cannot, as for a
+    rank's several files (`resolve_attempts_across`); an attempt it does not list keeps its
+    place of first appearance after those it does.
 
     An attempt is of one run: a later attempt of another run ID never rolls back this one's
     records (lane U7, Nov 19, 2026). A record with no `run_id` is of no named run (`_run_of`).
@@ -1651,13 +1655,76 @@ def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for run, rank in {(run, rank) for run, rank, _ in first_step}:
         cut = math.inf
         # `first_step` holds a rank's attempts in the order they first appear.
-        for attempt in reversed([a for n, r, a in first_step if (n, r) == (run, rank)]):
+        appeared = [a for n, r, a in first_step if (n, r) == (run, rank)]
+        given = [a for a in (order or {}).get((run, rank), ()) if a in appeared]
+        for attempt in reversed(given + [a for a in appeared if a not in given]):
             cutoff[(run, rank, attempt)] = cut
             cut = min(cut, first_step[(run, rank, attempt)])
     return [
         record for record in records
         if int(record["step"]) < cutoff[(_run_of(record), record.get("rank", 0), record.get("attempt", 0))]
     ]
+
+
+def attempt_order_across(files: Iterable[Iterable[Mapping[str, Any]]]) -> dict[tuple[str, Any], list[Any]]:
+    """Each rank's attempts oldest first, for a rank whose records are in several files (contract 1
+    as amended by the author, Nov 19, 2026). Within a file the order is first appearance, the
+    file being appended across attempts; that order is kept first. Only between attempts no
+    single file orders does the attempt's earliest `ts` decide, then its number. The order the
+    files are given in (a path order) never decides. Files that disagree (one has A before B,
+    another B before A) are a contradiction no rule settles: the same tie rule picks then."""
+    import functools
+
+    seen: dict[tuple[str, Any], dict[Any, float | None]] = {}
+    after: dict[tuple[str, Any], dict[Any, set[Any]]] = {}
+    for records in files:
+        places: dict[tuple[str, Any], list[Any]] = {}
+        for record in records:
+            key, attempt = (_run_of(record), record.get("rank", 0)), record.get("attempt", 0)
+            ts = _finite(record.get("ts"))
+            stamps = seen.setdefault(key, {})
+            if attempt not in stamps:
+                stamps[attempt] = ts
+            elif ts is not None and (stamps[attempt] is None or ts < stamps[attempt]):  # type: ignore[operator]
+                stamps[attempt] = ts
+            listed = places.setdefault(key, [])
+            if attempt not in listed:
+                listed.append(attempt)
+        for key, listed in places.items():
+            edges = after.setdefault(key, {})
+            for earlier, later in zip(listed, listed[1:]):
+                edges.setdefault(earlier, set()).add(later)
+
+    orders: dict[tuple[str, Any], list[Any]] = {}
+    for key, stamps in seen.items():
+        def before(a: Any, b: Any) -> int:
+            ta, tb = stamps[a], stamps[b]
+            if ta is not None and tb is not None and ta != tb:
+                return -1 if ta < tb else 1
+            na, nb = _whole_attempt(a) or 0, _whole_attempt(b) or 0
+            return (na > nb) - (na < nb)
+
+        edges = after.get(key, {})
+        waiting = {a: sum(a in later for later in edges.values()) for a in stamps}
+        order: list[Any] = []
+        while waiting:
+            ready = [a for a, n in waiting.items() if n == 0] or list(waiting)  # a contradiction: pick anyway
+            pick = min(ready, key=functools.cmp_to_key(before))
+            order.append(pick)
+            del waiting[pick]
+            for later in edges.get(pick, ()):
+                if later in waiting:
+                    waiting[later] -= 1
+        orders[key] = order
+    return orders
+
+
+def resolve_attempts_across(files: Iterable[Iterable[Mapping[str, Any]]]) -> list[dict[str, Any]]:
+    """`resolve_attempts` over a rank's several files, with the attempts in `attempt_order_across`
+    order: the records of every file, in the order given, with those a later attempt replaced
+    left out."""
+    listed = [list(records) for records in files]
+    return resolve_attempts([r for records in listed for r in records], order=attempt_order_across(listed))  # type: ignore[misc]
 
 
 def check_one_run(records: Iterable[Mapping[str, Any]]) -> None:

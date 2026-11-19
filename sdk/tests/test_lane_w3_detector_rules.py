@@ -540,3 +540,54 @@ def test_contract1_a_report_of_the_older_attempt_is_behind_not_past_the_store(tm
     assert (report["attempt"], report["last_step"]) == (900, 101)
     assert look["state"] == "behind", look["reason"]
     assert look["attempt_order"] == "first_seen"
+
+
+# --- contract 1 across files (the author's amendment, Nov 19, 2026) ---------------------------
+#
+# File 1 holds A then C, file 2 holds B then C. C's first `ts` (30) is before B's (50), so an
+# order by timestamp alone, or by first appearance in path order, puts B last. Each file's own
+# order says C came after A and after B: C is the newest, and A and B are ordered by `ts`.
+
+def _overlapping_files() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def at(attempt: int, step: int, ts: float) -> dict[str, Any]:
+        return {**row(step, attempt), "ts": ts}
+
+    first = [at(1, step, float(step)) for step in range(20)] + [at(3, step, 30.0 + step - 15) for step in range(15, 18)]
+    second = [at(2, step, 50.0 + step - 10) for step in range(10, 15)] + [at(3, step, 33.0 + step - 18) for step in range(18, 21)]
+    return first, second
+
+
+EXPECTED_ACROSS = [(1, s) for s in range(10)] + [(2, s) for s in range(10, 15)] + [(3, s) for s in range(15, 21)]
+
+
+def test_contract1_across_files_each_files_own_order_comes_first() -> None:
+    from tensorquill.evidence import attempt_order_across, resolve_attempts, resolve_attempts_across
+
+    first, second = _overlapping_files()
+    assert attempt_order_across([first, second]) == {("lane-w3-order", 0): [1, 2, 3]}
+    # The order the files are given in never decides.
+    assert attempt_order_across([second, first]) == {("lane-w3-order", 0): [1, 2, 3]}
+    for files in ([first, second], [second, first]):
+        kept = resolve_attempts_across(files)
+        assert sorted((r["attempt"], r["step"]) for r in kept) == EXPECTED_ACROSS
+    order = attempt_order_across([first, second])
+    kept = resolve_attempts(first + second, order=order)
+    assert sorted((r["attempt"], r["step"]) for r in kept) == EXPECTED_ACROSS
+
+
+def test_contract1_across_files_compare_keeps_each_files_own_order(tmp_path: Any) -> None:
+    # `compare` reads a rank's several files (`_step_records`, lane V4's file): it must resolve
+    # them with `resolve_attempts_across`, not by concatenating them in path order.
+    import json
+
+    from tensorquill.compare import _step_records
+
+    first, second = _overlapping_files()
+    paths = []
+    for name, records in (("a.jsonl", first), ("b.jsonl", second)):
+        path = tmp_path / name
+        path.write_text("".join(json.dumps(r) + "\n" for r in records))
+        paths.append(str(path))
+    for given in (paths, paths[::-1]):
+        kept, _ = _step_records(given, 0)
+        assert sorted((r["attempt"], r["step"]) for r in kept) == EXPECTED_ACROSS
