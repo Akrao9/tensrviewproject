@@ -52,11 +52,23 @@ from torch import nn
 rank, world, store_path, out = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
 plan = json.loads(sys.argv[5])
 timeout = datetime.timedelta(seconds=15)
-dist.init_process_group(plan.get("backend", "gloo"), store=dist.FileStore(store_path, world), rank=rank,
-                        world_size=world, timeout=timeout)
+if plan.get("port"):  # a TCPStore, the store `env://` and torchrun give real jobs
+    dist.init_process_group(plan.get("backend", "gloo"), init_method=f"tcp://127.0.0.1:{plan['port']}", rank=rank,
+                            world_size=world, timeout=timeout)
+else:
+    dist.init_process_group(plan.get("backend", "gloo"), store=dist.FileStore(store_path, world), rank=rank,
+                            world_size=world, timeout=timeout)
 found = {"rank": rank}
 from tensorquill import distributed as D
 """
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 _FOOTER = """
 with open(out, "w") as file:
@@ -130,10 +142,12 @@ except BaseException as error:
 
 
 @needs_dist
-def test_l5_ranks_on_different_device_types_all_skip_the_gather(tmp_path):
+@pytest.mark.parametrize("store", ["file", "tcp"])
+def test_l5_ranks_on_different_device_types_all_skip_the_gather(tmp_path, store):
     # Before: rank 1 skipped (no gloo backend for its table's device type), rank 0 entered the
     # gather alone and failed after the group's timeout, or the next all_reduce did.
-    found = _ranks(tmp_path, 2, _DEVICES_BODY, {"devices": ["cpu", "meta"]})
+    plan = {"devices": ["cpu", "meta"], **({"port": _free_port()} if store == "tcp" else {})}
+    found = _ranks(tmp_path, 2, _DEVICES_BODY, plan)
     for f in found:
         assert f["raised"] is None, f
         assert f["steps"] == 4

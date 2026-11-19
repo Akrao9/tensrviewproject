@@ -512,7 +512,10 @@ def replica_spread(
     why. Where the gather cannot run at all (as the session's check judges it: no backend for the
     tensors' device, no process group, a rank outside `group`, or a session's agreement at
     `init` that turned the check off on `group`), no collective is issued and every row is NaN,
-    with the reason. A NaN weight that was read gives NaN too, with no warning. A gather that
+    with the reason. A NaN weight that was read gives NaN too, with no warning. NaN compares
+    false with any tolerance, so `spread > tol` reads such a row as no drift: test
+    `spread.isnan()` first, and treat a NaN row as not compared (or, for a NaN weight, drift).
+    A gather that
     fails once issued still raises here. It gathers 32 bytes per parameter per rank (24 without
     the projection), the session's table, so every rank must run a TensorQuill that gathers alike.
     """
