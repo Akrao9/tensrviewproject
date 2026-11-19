@@ -79,9 +79,15 @@ class FakeNvml(types.ModuleType):
         self.shutdowns = 0
         self.threads: set[int] = set()
         self.delay = 0.0
+        self.hang: set[str] = set()  # calls that block, as on a hung driver, until `release` is set
+        self.release = threading.Event()
+        self.calls: list[str] = []
 
     def _call(self, name):
         self.threads.add(threading.get_ident())
+        self.calls.append(name)
+        if name in self.hang:
+            self.release.wait()
         if name in self.fail:
             raise self.fail[name]
 
@@ -89,6 +95,7 @@ class FakeNvml(types.ModuleType):
         self._call("init")
 
     def nvmlShutdown(self):
+        self._call("shutdown")
         self.shutdowns += 1
 
     def nvmlDeviceGetHandleByUUID(self, uuid):
@@ -144,7 +151,8 @@ class FakeNvml(types.ModuleType):
 def nvml(monkeypatch):
     fake = FakeNvml()
     monkeypatch.setitem(sys.modules, "pynvml", fake)
-    return fake
+    yield fake
+    fake.release.set()  # no call stays hung past its test
 
 
 # --- CUDA memory ---------------------------------------------------------------------------
@@ -335,6 +343,161 @@ def test_readings_that_fail_mid_run_never_stop_training(cuda, nvml, monkeypatch)
     assert notes[1] == {"cuda": {"unavailable": "RuntimeError: allocator gone"},
                         "nvml": {"unavailable": "Exception: driver fell off the bus"}}
     assert len(notes) == 2  # each note once, then nothing
+
+
+def _train_on_a_thread(session, model, steps):
+    """Train on a thread of its own, so a test can see training stall instead of hanging."""
+    done = threading.Event()
+
+    def run():
+        _train(session, model, steps)
+        done.set()
+
+    threading.Thread(target=run, name="trainer", daemon=True).start()
+    return done
+
+
+def _closes_within(session, seconds):
+    """Close the session on a thread of its own; True when it closed within `seconds`, so a
+    close that waits for a hung call fails the test instead of hanging the run."""
+    errors: list[BaseException] = []
+
+    def run():
+        try:
+            session.close()
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    closer = threading.Thread(target=run, name="closer", daemon=True)
+    closer.start()
+    closer.join(seconds)
+    assert not errors, errors
+    return not closer.is_alive()
+
+
+def _exits_within(thread, seconds):
+    thread.join(seconds)
+    return not thread.is_alive()
+
+
+SLOW = 0.5  # the bounds in these tests: short, but far above a fake reading on a busy machine
+OPEN = 1.0
+
+
+@pytest.fixture
+def bounds(monkeypatch):
+    monkeypatch.setattr(system_module, "NVML_SLOW_SECONDS", SLOW)
+    monkeypatch.setattr(system_module, "NVML_OPEN_SECONDS", OPEN)
+
+
+def test_a_hung_nvml_call_never_holds_training(cuda, nvml, bounds):
+    session, model, sink = _session(every=1, system=True)  # a queue of 8 blocks, one reading each
+    session._system = SystemReadings(CUDA0)
+    _train(session, model, 3)
+    _written(sink, 2)  # each step is written when the next one ends
+    asked = len(nvml.calls)
+    nvml.hang.add("temperature")  # the driver stops answering, and never does again in this run
+    done = _train_on_a_thread(session, model, 40)
+    finished = done.wait(10)
+    if not finished:  # on a writer that waits for NVML: let it go, so the session can close
+        nvml.release.set()
+        done.wait(10)
+    closed = _closes_within(session, 5)
+    assert finished, "training waited for a hung NVML call"
+    assert closed, "closing the session waited for a hung NVML call"
+    stuck = session._system._thread
+    assert stuck.is_alive()  # still in the hung call: never joined
+    assert nvml.calls[asked:] == ["temperature"]  # nothing asked of NVML after it hung, not even a shutdown
+
+    assert [r["step"] for r in sink.records] == list(range(43))
+    systems = [r["system"] for r in sink.records if "system" in r]
+    assert len(systems) == 43 and all("cuda" in s for s in systems)  # memory goes on at every flush
+    nvml_parts = [s["nvml"] for s in systems if "nvml" in s]
+    assert nvml_parts[0]["temperature_c"] == 71 and nvml_parts[1]["temperature_c"] == 71
+    assert nvml_parts[2:] == [{"unavailable": f"an NVML reading took over {SLOW:g} s; NVML is off for this session"}]
+
+    nvml.release.set()  # the driver answers after all: the late reading is dropped, NVML shut down
+    assert _exits_within(stuck, 5)
+    assert nvml.shutdowns == 1
+    assert [r["step"] for r in sink.records] == list(range(43))
+
+
+def test_a_hung_nvml_open_never_holds_training(cuda, nvml, bounds):
+    nvml.hang.add("init")
+    session, model, sink = _session(every=1, system=True)
+    session._system = SystemReadings(CUDA0)
+    done = _train_on_a_thread(session, model, 30)
+    finished = done.wait(10)
+    if not finished:
+        nvml.release.set()
+        done.wait(10)
+    closed = _closes_within(session, 5)
+    assert finished and closed
+    assert nvml.calls == ["init"]
+    nvml_parts = [r["system"]["nvml"] for r in sink.records if "nvml" in r.get("system", {})]
+    assert nvml_parts == [{"unavailable": f"the first NVML reading, which opens NVML, took over {OPEN:g} s; "
+                                          "NVML is off for this session"}]
+    assert sink.records[0]["system"]["nvml"] == nvml_parts[0]  # on the first flush, which waited for it
+    stuck = session._system._thread
+    nvml.release.set()
+    assert _exits_within(stuck, 5) and nvml.shutdowns == 1  # it opened late, and was shut down
+
+
+def test_a_hung_nvml_shutdown_never_holds_the_close(cuda, nvml, bounds):
+    session, model, sink = _session(every=5, system=True)
+    session._system = SystemReadings(CUDA0)
+    _train(session, model, 10)
+    nvml.hang.add("shutdown")
+    started = time.monotonic()
+    assert _closes_within(session, 5)
+    assert time.monotonic() - started < SLOW + 2  # one bounded wait for the shutdown
+    assert [r["step"] for r in sink.records] == list(range(10))
+    assert [r["system"]["nvml"]["temperature_c"] for r in sink.records if "system" in r] == [71, 71]
+    assert session._system._thread.is_alive() and nvml.calls[-1] == "shutdown"
+
+
+def test_a_reading_that_comes_back_too_late_is_noted_once_and_dropped(cuda, nvml, bounds):
+    readings = SystemReadings(CUDA0)
+    assert readings.write({})["nvml"]["temperature_c"] == 71  # the first reading opens NVML
+    nvml.delay = SLOW + 0.3  # slower than the bound, but it does come back
+    note = {"unavailable": f"an NVML reading took over {SLOW:g} s; NVML is off for this session"}
+    started = time.monotonic()
+    assert readings.write({"cuda": {"allocated": 1}}) == {"cuda": {"allocated": 1}, "nvml": note}
+    assert time.monotonic() - started < SLOW + 0.25  # the writer did not wait for it
+    assert _exits_within(readings._thread, 5)  # it came back: NVML shut down, the thread gone
+    assert nvml.shutdowns == 1 and nvml.calls[-1] == "shutdown"
+    asked = len(nvml.calls)
+    assert readings.write({}) is None and readings.write({"cuda": {}}) == {"cuda": {}}  # never asked again
+    readings.close()
+    assert len(nvml.calls) == asked
+
+
+def test_nvml_is_read_on_its_own_thread_and_the_thread_ends_with_nvml(cuda, nvml):
+    readings = SystemReadings(CUDA0)
+    assert readings.write({})["nvml"]["temperature_c"] == 71
+    assert readings.write({})["nvml"]["temperature_c"] == 71
+    thread = readings._thread
+    assert thread.daemon and thread.name == "tensorquill-nvml"
+    assert nvml.threads == {thread.ident} and threading.get_ident() not in nvml.threads
+    readings.close()
+    assert not thread.is_alive() and nvml.shutdowns == 1
+    readings.close()  # once only
+    assert nvml.shutdowns == 1
+
+
+def test_unavailable_nvml_ends_its_thread_after_the_note(cuda, monkeypatch):
+    monkeypatch.setitem(sys.modules, "pynvml", None)
+    readings = SystemReadings(CUDA0)
+    assert readings.write({})["nvml"]["unavailable"].startswith("pynvml is not installed")
+    assert _exits_within(readings._thread, 5)
+    assert readings.write({}) is None
+    readings.close()
+
+
+def test_a_session_that_never_flushes_never_starts_the_nvml_thread(cuda, nvml):
+    readings = SystemReadings(CUDA0)
+    readings.close()
+    assert readings._thread is None and nvml.calls == []
 
 
 def test_readings_survive_the_flight_columns():
