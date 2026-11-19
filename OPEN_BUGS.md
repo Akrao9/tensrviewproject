@@ -1,6 +1,6 @@
 # TensorQuill: open bugs, consolidated
 
-One list of the open bugs known from the two code reviews and the fix lanes, as of `main` at `351ad85`, after merge group M1 of wave V (Nov 19, 2026). It joins three sources that were tracked apart:
+One list of the open bugs known from the two code reviews and the fix lanes, as of `main` at `4b0be90`, after both merge groups of wave V (Nov 19, 2026). It joins three sources that were tracked apart:
 
 - `CODEBASE_AUDIT.md`, the second audit: 70 finding groups with IDs C, RS and X. Its evidence-reader rows have no IDs, so they are numbered E1 to E8 here.
 - `codebase_review_findings.md`, the first outside review: 87 findings with IDs SDK, DET, CLI and RUST.
@@ -24,12 +24,12 @@ Only the rows marked *Run on main* were run again when this file was written. Ro
 |---|---:|---:|---:|---:|
 | Can raise into training, or stop it | 1 | 0 | 0 | 1 |
 | Training SDK | 2 | 7 | 1 | 10 |
-| Evidence readers, detectors, command line, MCP | 1 | 17 | 5 | 23 |
+| Evidence readers, detectors, command line, MCP | 1 | 10 | 1 | 12 |
 | Rust server | 1 | 1 | 1 | 3 |
-| Experiments, examples, CI, docs | 0 | 8 | 2 | 10 |
-| **All** | **5** | **33** | **9** | **47** |
+| Experiments, examples, CI, docs | 0 | 3 | 0 | 3 |
+| **All** | **5** | **21** | **3** | **29** |
 
-There were 72 when this file was written. Merge group M1 of wave V closed 25 of them (and, outside the 72, the lanes' items L4 and L7 and the never-shown RUST-17); 47 remain, 12 of which are fixed in part and say what is still open. Section 6 holds five more that are parts of closed findings or that the two reviews disagree on, section 7 the items the lanes raised, section 8 the audit's notes on cost and narrow cases, and section 9 the wrong behaviour the plan records from measurement. None of those is counted here.
+There were 72 when this file was written. Wave V closed 43 of them in its two merge groups (and, outside the 72, the lanes' items L4, L7 and L8 and the never-shown RUST-17); 29 remain, 14 of which are fixed in part and say what is still open. All five P1 rows are still open: they are wave W's. Section 6 holds five more that are parts of closed findings or that the two reviews disagree on, section 7 the items the lanes raised, section 8 the audit's notes on cost and narrow cases, and section 9 the wrong behaviour the plan records from measurement. None of those is counted here.
 
 ## 1. Can raise into training, or stop it
 
@@ -64,13 +64,8 @@ There were 72 when this file was written. Merge group M1 of wave V closed 25 of 
 | ID | Also known as | Priority | Issue | Checked |
 |---|---|---|---|---|
 | E1 | | P1 | A parameter that changes without a gradient is still called a stalled-weight invariant. Held out of wave U because it changes a detector rule | Audit |
-| E2 | CLI-07 | P2 | Rollback is applied to the detectors' input and not to `compare` or MCP progress: after a resume, `last_step` is the highest step of every attempt | Run (T6) |
 | E3 | | P2 | **Open part after M1:** a scaler-only resume that finds nothing still reads `not_configured`; counting the loss scale needs both engines changed together (lane W3). Fixed (lane V3): a kind that reports an incident is counted as checked | Run (V3) |
-| E4 | | P2 | A benign observation marks a run `unhealthy` in `list_runs` | Audit |
 | E5 | | P2 | The physical order of steps in the file changes which fault is named first | Audit |
-| E7 | CLI-12 | P2 | A run with only the compact evidence file reads as `missing` in the catalog | Run on main |
-| E8 | DET-19 | P3 | The TrainCheck import merges violations whose names share their first 200 characters, and can change the first step | Run (T6) |
-| DET-07 | | Medium | A `job_stalled` episode stays open when the rank later reads `finished` | Run (T6) |
 | DET-09 | | Medium | Learning rates seen only in rolled-back steps can make `scheduler` an expected component, so a resume can be called incomplete (Python and Rust) | Read |
 | DET-10 | | Medium | Records out of order within an attempt give the Rust detectors different incidents than Python. The capture writes steps in order | Run (T6) |
 | DET-11 | | Medium | In a top-k router's warm-up with `n_experts <= 2k`, `overloaded` is always empty (Python and Rust). Dead experts are still flagged | Read |
@@ -78,14 +73,8 @@ There were 72 when this file was written. Merge group M1 of wave V closed 25 of 
 | DET-14 | | Medium | **Open part after M1:** at a run's first step the expert-load table compares the step with itself. Fixed (lane V3): the table is shown at the first step and layer names are escaped | Run (V3) |
 | DET-16 | | Medium | A bool is read as the number 1.0 (Python and Rust) | Run (T6) |
 | DET-17 | | Low | **Open part after M1:** `attempt=<n>` folders are still parsed with the looser rule (lane W3's code), and four other modules parse `rank=` on their own. Fixed (lane V3): the evidence readers share one `rank=` parser | Run (V3) |
-| CLI-08 | | Medium | One unreadable rank folder in a store ends the divergence for every rank | Read |
-| CLI-09 | | Medium | A run with no judged rank lists its incidents as none | Read |
-| CLI-13 | | Medium | Of two files of one run and rank only the first is kept, with no word | Run on main |
+| CLI-13 | | Medium | **Open part after M2:** when a run and rank has two files, their order is path order and the `end` cell reads only the first file; both wait for contract 1's rule across files (wave W). Fixed (lane V4): the second file is no longer dropped | Run (V4) |
 | CLI-14 | | Medium | MCP serves no head or attention probe series | Read |
-| CLI-15 | | Medium | `get_incident`'s follow-up calls carry no rank. Not read again after lane U7 changed how MCP picks a rank | Read |
-| CLI-20 | | Low | A constant series ranks first among series leaving at the same step | Read |
-| CLI-21 | | Low | A run kept as files and in a store is listed twice | Run on main |
-| CLI-22 | | Low | A compact file's previous kept sample is called the previous sample; a store rank's cache can miss a late part of an older attempt | Read |
 
 ## 4. Rust server
 
@@ -102,15 +91,8 @@ RUST-17 (Low) was shown by lane V6 and fixed: rebuilds from the stream path had 
 | ID | Also known as | Priority | Issue | Checked |
 |---|---|---|---|---|
 | X02 | | P2 | Gate 1's older speed gate reads zero tool calls as an infinite speedup. Needs the author's amendment to the preregistration | Audit |
-| X06 | | P2 | `trainer_check.py` counts string norms as recorded and then skips every comparison | Audit |
-| X07 | CLI-18, CLI-23 | P2 | `dense_outlier_check.py` drops failed probes before the loop that prints their errors; `moe_dogfood.py` raises on a failed probe's record | Read |
-| X08 | CLI-16 | P2 | `toy_moe.py` writes an evidence name the reader does not pair with a rank file; `smoke.sh` tests that name | Read |
-| X09 | | P2 | The Megatron example does not record `update_successful`. The guide says so; the example is unchanged | Audit |
-| X10 | | P3 | `capture_rerun.py` ignores an explicit step 0 | Audit |
-| X11 | | P2 | CI does not run Python 3.10 or PyTorch 2.9, both of which the package declares | Audit |
-| CLI-17 | | Medium | CI runs clippy with `--no-default-features` only, so the S3 and GCS code is built and tested but not linted. The `package` job now blocks (lane U8) | Read |
-| CLI-19 | | Medium | `tensorquill runs` finds nothing in the folders `seeded_failures.py` writes | Read |
-| CLI-24 | | Low | **Open part after M1:** the MCP tool text that names a kind count (lane V5, next merge group). Fixed (lane V6): the `main.rs` comment | Read |
+| X09 | | P2 | **Open part after M2:** the detectors still judge a step Megatron skipped as one that updated the weights. Treating it as skipped needs a public `skipped=` on `session.step()`, the author's decision, parked. Fixed (lane V8): the guide's example records `megatron/update_successful` as a scalar | Run (V8) |
+| X11 | | P2 | **Open part after M2:** the two new CI jobs (Python 3.10 with PyTorch 2.6, Python 3.12 with PyTorch 2.9) have never run; this machine has neither. They run first after a push | Read |
 
 ## 6. Parts of closed findings, and where the two reviews disagree
 
@@ -135,7 +117,6 @@ These are not in either audit.
 | L3 | U4 | The server's ack carries no store ID |
 | L5 | U5 | The drift check does not handle ranks on different device types |
 | L6 | U6 | **Open part after M1:** in the all-ranks evidence a rank with `attempt_without_steps` is still counted among judged ranks; only `run_state` calls it unknown. Fixed (lane V3): the readers look at the flag |
-| L8 | U7 | The MCP path that reads another rank from a store has no test |
 
 ## 8. The second audit's notes on cost and narrow cases
 
@@ -184,3 +165,4 @@ Not from either review. Not counted in the 72.
 | The sweep after the first review | All six ways to stop or hang training are fixed |
 | Second audit (70 groups) | 30 fixed: C01, C02, C04, C05, C07 to C10, C17 to C19; C03 and C06 in part; RS01 to RS04, RS18; X01, X03, X04, X05; and eight evidence rows (five P1 and three small ones) |
 | Wave V, merge group M1 (`main` at `351ad85`, Nov 19, 2026; lanes V1, V2, V3, V6, V7) | Fixed, each with a test that failed on `66b52d7`: C13, C15, C21, C23, DET-12, DET-18, E6, L4, L7, RS06, RS07, RS08, RS09, RS11, RS12, RS13, RS14, RS15, RS16, RS19, RUST-13, RUST-16, RUST-18, SDK-15, SDK-25, SDK-26. C24: V1: the capture half is fixed (a model that is one leaf module is observed under its class name); the sink half did not reproduce on `66b52d7`. RUST-17: V6: shown for concurrency (40 rebuilds at once after a restart) and fixed with a bound of 16. Fixed in part, still listed above with what is open: C12, C14, C16, C20, C22, SDK-16, E3, DET-14, DET-17, RS10, L6, CLI-24. Checked and left as they are: C11, SDK-23, RS17, L3 (options written, nothing changed). Verified on the trial merge, macOS and CPU only; not on Linux, PyTorch 2.6 or a GPU |
+| Wave V, merge group M2 (`main` at `4b0be90`, Nov 19, 2026; lanes V4, V5, V8) | Fixed, each with a test that failed on `66b52d7` (X06, X07 and X10 by reading, since the code had no seam to test before): CLI-08, CLI-09, CLI-15, CLI-17, CLI-19, CLI-20, CLI-21, CLI-22, CLI-24, DET-07, E2, E4, E7, E8, L8, X06, X07, X08, X10. DET-07's "paused" half does not hold, as T6 said. Fixed in part, still listed above: CLI-13, X09, X11. Checked and left as they are: CLI-10, DET-13, CLI-14. `seeded_failures.py` now writes every case flat into `--out`. Verified on the trial merge, macOS and CPU only |

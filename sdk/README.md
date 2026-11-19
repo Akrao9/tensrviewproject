@@ -221,6 +221,8 @@ python examples/seeded_failures.py --case grad_spike --factor 100 --out runs/see
 python examples/seeded_failures.py --case stalled_weights --dtype float32 --out runs/seeded-fp32
 ```
 
+Each case writes straight into `--out`: `runs/seeded/grad_spike.jsonl` and `runs/seeded/stalled_weights.jsonl`, each with its `<case>.evidence.json` and `seeded-<case>.run.json` beside it (there is no per-case folder). `python -m tensorquill runs runs/seeded` lists them. Copy the whole `--out` folder out of Colab before the session ends.
+
 **Status.** Built Nov 15, 2026; the two detector findings it recorded were closed on Nov 16, 2026 by judging each parameter on its own history. On the CPU toy all of these pass: `--case both`, `--case grad_spike --factor 100` (reported at step 250, known at step 252) and `--case stalled_weights --dtype bfloat16` (the seeded parameter named at step 249 beside the norm weights from step 199); the first two are in CI. None has run on a GPU: the script's CUDA path, SmolLM2 and fused AdamW with a zero-lr group are untried, so expect to read the first run's output closely.
 
 ## Dense model with a seeded activation outlier

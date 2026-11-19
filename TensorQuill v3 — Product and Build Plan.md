@@ -2924,6 +2924,14 @@ State as of Nov 16, 2026.
   - *Two things V1 built beyond its rows, both kept by the author (decided the same day).* An unmarked evaluation's fetches are left out of `data_wait` (lane T6 had called that half of SDK-12 documented), and `time_data` called from a thread other than the session's no longer counts. Both conditions are now in the README's Data wait paragraph, since they say how to read the metric and where to put `time_data` in a custom loop.
   - *Exceptions to file ownership that M1 carries,* each recorded in `wave-vw/changes-after-launch.md`: V1 one line in `test_trigger.py`, V3 one test in `test_mcp_server.py`, V7 one test in `test_server_detect.py`.
   - *Unblocked the same hour.* W1, W2 and W3 merge `main` into their branches and implement; W4 adds its one call in `capture.py`. The trial for M2 (V4, V5, V8) is cut from this commit.
+- [x] **Wave V, merge group M2: lanes V4, V5 and V8 are in `main` (Nov 19, 2026, at the author's word: "Merge M2").** `main` was fast-forwarded to the trial merge's commit, `4b0be90`, which also holds `main`'s README commit of the same afternoon. Not pushed. Wave V is now all in `main`.
+  - *Run on the trial merge* (macOS, CPU, Python 3.12, PyTorch 2.15), before the merge. Rust: build, `fmt --check`, clippy with all features, with the default features and with none, and `cargo test`, all clean. Python with the server binary: 2,291 passed, none skipped. The experiment tests: 112 passed. Without the binary, moved aside: 1,629 passed, 662 skipped. Without pyarrow: 1,480 passed, 120 skipped. Without NumPy and pyarrow: 1,401 passed, 188 skipped. Then `main`'s README commit was merged into the trial and the 197 tests that read the docs passed.
+  - *Fixed.* V4: E2's `compare` half, E4, E7, CLI-08, CLI-09, CLI-20, CLI-21. V5: E2's MCP half, E8, DET-07's "finished" half (the "paused" half does not hold), CLI-15, CLI-22, the MCP tool text of CLI-24, and the test L8 asked for. V8: X06, X07, X08, X10, CLI-17, CLI-19.
+  - *Fixed in part, still open in `OPEN_BUGS.md`.* CLI-13 (two files of one run and rank are both read; their order and the `end` cell wait for contract 1's rule across files). X09 (the example records `megatron/update_successful`; the detectors do not read it, pending a public `skipped=` the author has parked). X11 (the CI jobs for Python 3.10 and PyTorch 2.9 are added and have never run).
+  - *Checked and left as they are.* CLI-10, DET-13, CLI-14.
+  - *A change the author's GPU runs meet.* `seeded_failures.py` writes every case straight into `--out`, with no per-case folder, so `tensorquill runs` lists them. The README's commands are unchanged; it now says where the output lands.
+  - *The register.* 29 of the 72 rows remain, 14 of them fixed in part; the five P1 rows are wave W's.
+  - *Kept by the author the same day:* both of lane V1's additions to the data-wait rule, now stated in the README.
 
 ## Sources
 
