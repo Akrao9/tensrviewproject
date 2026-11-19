@@ -516,6 +516,9 @@ def test_c03_a_close_that_runs_out_of_time_is_told_as_close_timeout(tmp_path, mo
             session.step()
             session.close()
         release.set()
+        # close() leaves a sink the writer is still in open, by design: once released, the test closes it.
+        session._worker.join(DEADLINE)
+        session._sink._sink.close()
         assert session._stopped
         assert [b[STOPPED] for b in server.beats if STOPPED in b][:1] == ["close_timeout"]
     finally:
@@ -646,6 +649,34 @@ def test_contract1_a_refused_batch_is_retried_and_every_row_arrives(tmp_path, ca
         assert capfd.readouterr().err.count("is failing") == 1
     finally:
         server.shutdown()
+
+
+# --- Lane W3's finding: one bool in `scalars` drops the whole map from the Arrow column ------------
+
+
+def test_a_bool_scalar_leaves_out_only_itself_from_the_scalars_column():
+    """`record_to_row` converts `scalars` as one map; one bool value (a bool is not a number, `_float`) sent
+    the whole map to `extra_json`, so the Rust detectors, which read the `scalars` column, lost the record's
+    loss while the Python path kept it. Wanted: the bool alone is left out of the column and the numbers stay.
+    Where the bool itself goes is lane W3's (DET-16) and is not asserted here. Fail-before."""
+    from tensorquill.flight import record_to_row
+
+    record = {"schema_version": 1, "run_id": "r", "rank": 0, "attempt": 1, "step": 3, "ts": 1.0, "grad_norm": None,
+              "scalars": {"loss": 1.5, "warmup_done": True, "tokens": 3, "acc": "nan"}}
+    row = record_to_row(record)
+    kept = dict(row["scalars"] or [])
+    assert set(kept) == {"loss", "tokens", "acc"}, row
+    assert kept["loss"] == 1.5 and kept["tokens"] == 3.0 and kept["acc"] != kept["acc"]  # "nan" is NaN
+
+
+def test_scalars_with_only_numbers_fill_the_column_as_before():
+    """Guard."""
+    from tensorquill.flight import record_to_row
+
+    row = record_to_row({"schema_version": 1, "run_id": "r", "rank": 0, "step": 0, "ts": None, "grad_norm": None,
+                         "scalars": {"loss": 2.0, "tokens": 7}})
+    assert row["scalars"] == [("loss", 2.0), ("tokens", 7.0)]
+    assert row["extra_json"] is None
 
 
 # --- L2: the writer never waits for an NVML reading ----------------------------------------------
