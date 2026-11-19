@@ -149,10 +149,35 @@ def test_overlapping_probes_leave_the_original_function(order):
         release.set()
         thread.join(TIMEOUT)
     assert F.scaled_dot_product_attention is original
+    assert torch._dynamo.eval_frame._stance.stance == "default"  # not left on force_eager
     assert list(out_a["result"]["attention"]) == ["attention"]
     assert out_b["result"]["attention"] == {}
     q = torch.randn(1, 1, 3, 4)
     assert torch.equal(F.scaled_dot_product_attention(q, q, q), original(q, q, q))
+
+
+def test_a_wrapper_put_over_the_probes_during_a_probe_does_not_make_a_later_probe_recurse():
+    original = F.scaled_dot_product_attention
+    model = Blocks(Attn())
+    try:
+        def wrap_over(m):
+            inner = F.scaled_dot_product_attention  # another tool wraps whatever is there
+
+            def other_tool(*args, **kwargs):
+                return inner(*args, **kwargs)
+
+            F.scaled_dot_product_attention = other_tool
+
+        tq_probe.run_probe(model, wrap_over, tq_probe.ProbeState(), CPU)
+        other_tool = F.scaled_dot_product_attention
+        assert other_tool is not original  # the other tool's wrapper stays
+        result = tq_probe.run_probe(model, lambda m: m(torch.randn(1, 48)), tq_probe.ProbeState(), CPU)
+        assert list(result["attention"]) == ["attention"]  # read once, not twice, no RecursionError
+        assert F.scaled_dot_product_attention is other_tool
+        q = torch.randn(1, 1, 3, 4)
+        assert torch.equal(F.scaled_dot_product_attention(q, q, q), original(q, q, q))
+    finally:
+        F.scaled_dot_product_attention = original
 
 
 def test_the_probe_leaves_the_deterministic_setting_alone():
@@ -276,6 +301,22 @@ def test_a_watched_loader_pickles_before_during_and_after_and_keeps_its_sampler(
     assert _pickles(loader) and _pickles(sampler)
 
 
+def test_while_a_pass_is_being_opened_the_sampler_pickles_and_copies_as_its_own_class():
+    sampler = _loader(shuffle=True).batch_sampler
+    assert tq_data._swap_in(sampler)
+    try:
+        assert type(sampler) is not BatchSampler and isinstance(sampler, BatchSampler)
+        for clone in (pickle.loads(pickle.dumps(sampler)), copy.deepcopy(sampler), copy.copy(sampler)):
+            assert type(clone) is BatchSampler and clone.batch_size == 2 and len(list(clone)) == 20
+        buffer = io.BytesIO()
+        torch.save(sampler, buffer)
+        buffer.seek(0)
+        assert type(torch.load(buffer, weights_only=False)) is BatchSampler
+    finally:
+        tq_data._swap_out(sampler)
+    assert type(sampler) is BatchSampler
+
+
 def test_iterating_the_unwrapped_loader_keeps_nothing_and_does_not_shift_the_wrapper():
     session = FakeSession()
     loader = _loader(shuffle=True)
@@ -294,9 +335,10 @@ def test_iterating_the_unwrapped_loader_keeps_nothing_and_does_not_shift_the_wra
     assert session.noted == drawn
 
 
-def test_two_iterators_of_one_watched_loader_each_note_their_own_batches():
+@pytest.mark.parametrize("workers", [0, 2])
+def test_two_iterators_of_one_watched_loader_each_note_their_own_batches(workers):
     session = FakeSession()
-    watched = WatchedLoader(session, _loader(shuffle=True))
+    watched = WatchedLoader(session, _loader(shuffle=True, num_workers=workers))
     a, b = iter(watched), iter(watched)
     drawn = []
     for _ in range(5):

@@ -211,7 +211,13 @@ def _recording_class(base: type) -> type:
         return _recorded(iter(inner), _claim.fifo)
 
     def __reduce_ex__(self: Any, protocol: Any) -> Any:
-        return _plain_copy(self, base).__reduce_ex__(protocol)
+        reduced = _plain_copy(self, base).__reduce_ex__(protocol)
+        # Pickle refuses `copyreg.__newobj__` whose class is not the pickled object's own;
+        # `copyreg._reconstructor` makes the same `object.__new__(base)` without that check.
+        if isinstance(reduced, tuple) and len(reduced) >= 2 and reduced[0] is copyreg.__newobj__ \
+                and len(reduced[1]) == 1:
+            reduced = (copyreg._reconstructor, (reduced[1][0], object, None), *reduced[2:])  # type: ignore[attr-defined]
+        return reduced
 
     cls = type(base.__name__, (base,), {
         "__slots__": (), "__iter__": __iter__, "__reduce_ex__": __reduce_ex__, "__qualname__": base.__qualname__,

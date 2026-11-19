@@ -440,26 +440,37 @@ def _attention_stats_fp32(
 
 
 # The probe reads attention by replacing `F.scaled_dot_product_attention`, which is one
-# attribute for the whole process. One wrapper serves every probe: it is put in place when the
-# first probe opens and taken out when the last one closes (`_interpose_sdpa`), and it reads a
-# call only on a thread with a probe open, the newest one there. Any other call goes straight
-# to the function it replaced, with the arguments it was given.
+# attribute for the whole process. While any probe is open one wrapper is installed: it is made,
+# around the function then in place, when the first probe opens, and taken out when the last one
+# closes (`_open_probe`). It reads a call only on a thread with a probe open, the newest one
+# there, and only while it is the installed wrapper; any other call goes straight to the function
+# it wraps, with the arguments it was given. A wrapper that something else wrapped in turn is
+# left in place when its probes close and from then on only passes calls through, so a later
+# probe's wrapper, made around that chain, never calls itself.
+# The compiler's stance is also the process's (`torch._dynamo.eval_frame._stance`, a module
+# global in PyTorch 2.6 and later), so it too is set by the first probe to open and put back by
+# the last to close: two probes that closed in the order they opened used to leave the process
+# on `force_eager`.
 _sdpa_lock = threading.Lock()
-_sdpa_original: Any = None  # what the wrapper calls; kept, since a caller may hold the wrapper
+_sdpa_installed: tuple[Any, Any] | None = None  # (wrapper, the function it wraps) while open
 _sdpa_open = 0
+_open_stack: contextlib.ExitStack | None = None  # undoes the first probe's process-wide changes
 _sdpa_probes: dict[int, list[ProbeState]] = {}  # thread id -> its open probes, newest last
 
 
-def _probe_sdpa(*args: Any, **kwargs: Any) -> Any:
-    original = _sdpa_original
-    if torch.compiler.is_compiling():
-        return original(*args, **kwargs)
-    probes = _sdpa_probes.get(threading.get_ident())
-    if not probes:
-        return original(*args, **kwargs)
-    out = original(*args, **kwargs)
-    _note_attention(probes[-1], args, kwargs)
-    return out
+def _make_probe_sdpa(original: Any) -> Any:
+    def probe_sdpa(*args: Any, **kwargs: Any) -> Any:
+        if torch.compiler.is_compiling():
+            return original(*args, **kwargs)
+        installed = _sdpa_installed
+        probes = _sdpa_probes.get(threading.get_ident())
+        if not probes or installed is None or installed[0] is not probe_sdpa:
+            return original(*args, **kwargs)
+        out = original(*args, **kwargs)
+        _note_attention(probes[-1], args, kwargs)
+        return out
+
+    return probe_sdpa
 
 
 def _sdpa_arguments(query: Any, key: Any, value: Any, attn_mask: Any = None, dropout_p: float = 0.0,
@@ -485,15 +496,39 @@ def _note_attention(state: ProbeState, args: tuple, kwargs: dict) -> None:
         state.attention[label] = {"error": f"{type(error).__name__}: {error}"}
 
 
+def _uninstall_sdpa() -> None:
+    global _sdpa_installed
+    if _sdpa_installed is None:
+        return
+    wrapper, original = _sdpa_installed
+    _sdpa_installed = None
+    # Something that replaced the wrapper since stays; the wrapper it may call now passes
+    # every call through.
+    if F.scaled_dot_product_attention is wrapper:
+        F.scaled_dot_product_attention = original
+
+
 @contextlib.contextmanager
-def _interpose_sdpa(state: ProbeState) -> Iterator[None]:
-    """Read the SDPA calls this thread makes while open (see `_probe_sdpa`)."""
-    global _sdpa_original, _sdpa_open
+def _open_probe(state: ProbeState) -> Iterator[None]:
+    """What a probe changes for the whole process, counted across open probes: the eager
+    stance (`_eager_stance`) and the SDPA wrapper (`_make_probe_sdpa`), which reads the calls
+    this thread makes while this probe is its newest."""
+    global _sdpa_installed, _sdpa_open, _open_stack
     thread = threading.get_ident()
     with _sdpa_lock:
-        if _sdpa_open == 0 and F.scaled_dot_product_attention is not _probe_sdpa:
-            _sdpa_original = F.scaled_dot_product_attention
-            F.scaled_dot_product_attention = _probe_sdpa
+        if _sdpa_open == 0:
+            stack = contextlib.ExitStack()
+            try:
+                stack.enter_context(_eager_stance())
+                original = F.scaled_dot_product_attention
+                wrapper = _make_probe_sdpa(original)
+                F.scaled_dot_product_attention = wrapper
+                _sdpa_installed = (wrapper, original)
+                stack.callback(_uninstall_sdpa)
+            except BaseException:
+                stack.close()
+                raise
+            _open_stack = stack
         _sdpa_open += 1
         _sdpa_probes.setdefault(thread, []).append(state)
     try:
@@ -507,10 +542,9 @@ def _interpose_sdpa(state: ProbeState) -> Iterator[None]:
             if not probes:
                 _sdpa_probes.pop(thread, None)
             _sdpa_open -= 1
-            # Something that replaced the wrapper since stays: it may call the wrapper, which
-            # with no probe open is a plain call to the original.
-            if _sdpa_open == 0 and F.scaled_dot_product_attention is _probe_sdpa:
-                F.scaled_dot_product_attention = _sdpa_original
+            if _sdpa_open == 0 and _open_stack is not None:
+                stack, _open_stack = _open_stack, None
+                stack.close()
 
 
 def _configs(config: Any) -> list[tuple[Any, Any]]:
@@ -615,9 +649,8 @@ def run_probe(
             stack.enter_context(torch.random.fork_rng(devices=cuda))
             stack.enter_context(_fork_host_rng())
             stack.enter_context(torch.no_grad())
-            stack.enter_context(_eager_stance())
             switched = stack.enter_context(_sdpa_instead_of_flash(model))
-            stack.enter_context(_interpose_sdpa(state))
+            stack.enter_context(_open_probe(state))
             state.active = True
             try:
                 fn(model)
