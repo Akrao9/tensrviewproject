@@ -16,8 +16,10 @@ The hash is BLAKE2b (8 bytes, unkeyed) over each batch's length and bytes, in or
 every process, rank and attempt that draws the same samples in the same order gets the same
 hash. A batch of integers that fit int64 is its indices as little-endian int64 after a tag
 byte (one C loop: the common case); any other batch is a tag byte, then each item's type,
-byte length and bytes (text as UTF-8, bytes as they are), so no two different batches share
-their bytes. It is written as `v2:` and 16 hex digits.
+byte length and bytes (text as UTF-8, bytes as they are), so batches of different ids do
+not share their bytes. One exception keeps the fast path one C loop: a list that starts with
+an int and holds a bool hashes as its integers (`[1, True]` as `[1, 1]`). It is written as
+`v2:` and 16 hex digits.
 
 The prefix is the encoding's version. A writer before it wrote the 16 hex digits alone,
 from int64 indices or from the items' text joined by NUL bytes, in which different batches

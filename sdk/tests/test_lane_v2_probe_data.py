@@ -157,6 +157,12 @@ def test_c22_logits_beyond_the_sums_range_are_not_said_to_hold_nan_or_inf():
     assert "NaN" not in numbers["not_read"] and "overflow" in numbers["not_read"]
 
 
+def test_c22_a_bf16_pass_that_overflows_leaves_the_position_out_as_overflow():
+    # 3.4e38 is finite in FP32 and past BF16's largest finite value: the BF16 logit is Inf.
+    numbers = _numbers(torch.ones(1, 1), torch.tensor([[3.4e38], [0.0]]))
+    assert numbers["nonfinite_positions"] == 0 and numbers["overflow_positions"] == 1
+
+
 def test_c22_no_positions_is_not_said_to_hold_nan_or_inf():
     numbers = _numbers(torch.zeros(1, 0, 4), torch.randn(10, 4))
     assert numbers["positions"] == 0 and numbers["nonfinite_positions"] == 0
@@ -301,6 +307,43 @@ def test_sdk16_flash_attention_of_a_wrapped_model_is_switched_for_the_probe_and_
     assert wrapper.teacher.config._attn_implementation == "eager"
 
 
+def test_sdk16_a_wrapper_with_a_config_of_its_own_still_switches_the_model_inside():
+    from tensorquill import probe as P
+
+    wrapper = _Wrapper(_HFInner())
+    wrapper.config = {"lr": 1e-3}  # a LightningModule's hyperparameters
+    with P._sdpa_instead_of_flash(wrapper) as switched:
+        assert switched and wrapper.model.config._attn_implementation == "sdpa"
+    assert wrapper.model.config._attn_implementation == "flash_attention_2" and wrapper.config == {"lr": 1e-3}
+
+
+def test_sdk16_a_wrapped_model_s_record_carries_its_head_numbers():
+    import tensorquill
+    from test_probe import Toy
+
+    class Inner(Toy):
+        def get_output_embeddings(self):
+            return self.head
+
+    class Wrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner = Inner()
+
+        def forward(self, ids):
+            return self.inner(ids)
+
+    torch.manual_seed(0)
+    ids = torch.randint(0, 32, (1, 6))
+    session = tensorquill.init(Wrapper(), sink=tensorquill.MemorySink(), probe=ids)
+    try:
+        head = session._probe()["head"]
+    finally:
+        session.close()
+    assert head["module"] == "inner.head" and head["found_by"] == "get_output_embeddings"
+    assert head["positions"] == 6 and "not_read" not in head and head["norm"] > 0
+
+
 def test_sdk16_a_config_inside_a_layer_is_not_taken_for_the_model_s():
     from types import SimpleNamespace
 
@@ -329,7 +372,6 @@ def test_sdk26_a_folder_given_as_a_path_is_the_checkpoint_folder(tmp_path):
 
 
 def test_sdk26_nvml_with_every_metric_failed_adds_nothing_after_its_note(monkeypatch):
-    sys.path.insert(0, str(Path(__file__).parent))
     from test_system import CUDA0, FakeNvml
 
     from tensorquill.system import Nvml

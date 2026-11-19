@@ -670,22 +670,33 @@ def _set_attention(configs: list[tuple[Any, Any]], values: list[Any]) -> None:
             pass
 
 
+def _attention_config(config: Any) -> bool:
+    """Whether `config` is a model's, with an attention setting: a LightningModule's own
+    `config` of hyperparameters (a dict, a namespace) is not, so the model inside is asked."""
+    if config is None:
+        return False
+    try:
+        return hasattr(config, "_attn_implementation")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @contextlib.contextmanager
 def _sdpa_instead_of_flash(model: nn.Module) -> Iterator[bool]:
     """Hugging Face models loaded with FlashAttention never call SDPA; switch them to
     SDPA for the probe. Each config set to FlashAttention, the model's own or a sub-config's,
     is switched and the others are left; afterwards every one has its own setting back.
-    A model with no `config` of its own (a LightningModule or a DDP around a Hugging Face
-    model) has the configs of the outermost modules inside it that have one (`_inner_models`).
+    A model with no attention `config` of its own (a LightningModule or a DDP around a Hugging
+    Face model) has those of the outermost modules inside it that have one (`_inner_models`).
     Yields whether a switch happened."""
     try:
         own = getattr(model, "config", None)
-        if own is not None:
+        if _attention_config(own):
             configs = _configs(own)
         else:
             configs = []
             ids: set[int] = set()
-            for _, inner in _inner_models(model, lambda m: getattr(m, "config", None) is not None):
+            for _, inner in _inner_models(model, lambda m: _attention_config(getattr(m, "config", None))):
                 for entry in _configs(getattr(inner, "config", None)):
                     if id(entry[0]) not in ids:
                         ids.add(id(entry[0]))
