@@ -6,8 +6,11 @@
 <platform> is one of: manylinux_2_17_x86_64, manylinux_2_17_aarch64, macosx_arm64, any.
 
 `wheel` checks the file: its tags, that it holds the program (or, for `any`, that it holds none),
-both license files, the license expression, and that the version is the crate's. For a Linux
-wheel it also reads the program's own GLIBC symbol versions with `objdump`, when that is on PATH.
+both license files, the license expression, and that the version is the crate's. Every field of
+the file name (distribution, version, interpreter, ABI and platform tags) must say what METADATA
+and WHEEL say, since the name is what pip and PyPI read; a build tag is refused, as the release
+builds none. For a Linux wheel it also reads the program's own GLIBC symbol versions with
+`objdump`, when that is on PATH.
 
 `installed` checks the environment it is run in: the tag in the installed WHEEL file says which
 wheel pip chose, and the program is, or for `any` is not, in the scripts directory. It is how a
@@ -33,6 +36,10 @@ ALLOWED = {
     "any": {"py3-none-any"},
 }
 MAC = re.compile(r"py3-none-macosx_1[1-9]_\d+_arm64")
+# PEP 427: {distribution}-{version}(-{build tag})?-{python tag}-{abi tag}-{platform tag}.whl, where
+# a tag may be a dot-separated set ("compressed tag set") and a build tag starts with a digit.
+WHEEL_NAME = re.compile(r"(?P<name>[^-]+)-(?P<version>[^-]+)(?:-(?P<build>\d[^-]*))?"
+                        r"-(?P<python>[^-]+)-(?P<abi>[^-]+)-(?P<platform>[^-]+)\.whl")
 GLIBC_FLOOR = (2, 17)
 
 
@@ -48,6 +55,39 @@ def check_tags(tags: set, platform: str, where: str) -> None:
         ok = required in tags and tags <= ALLOWED[platform]
     if not ok:
         fail(f"{where}: tags {sorted(tags)} are not those of a {platform} wheel")
+
+
+def normalize(name: str) -> str:
+    """A distribution name as PEP 503 compares names (`tensorquill_server` is `tensorquill-server`)."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def check_file_name(path: Path, dist_info: str, name: list, version: list, tags: set) -> None:
+    """Every field of the file name against the dist-info directory, METADATA and WHEEL."""
+    match = WHEEL_NAME.fullmatch(path.name)
+    if not match:
+        fail(f"{path.name}: not a wheel file name (distribution-version-python-abi-platform.whl)")
+    field = match.groupdict()
+    if field["build"] is not None:
+        fail(f"{path.name}: file name has the build tag {field['build']}; the release builds none")
+    if len(name) != 1 or normalize(field["name"]) != normalize(name[0]):
+        fail(f"{path.name}: file name distribution {field['name']!r} is not METADATA's Name {name}")
+    if len(version) != 1 or field["version"] != version[0]:
+        fail(f"{path.name}: file name version {field['version']!r} is not METADATA's Version {version}")
+    folder = dist_info[: -len(".dist-info")].rsplit("-", 1)
+    if len(folder) != 2 or normalize(folder[0]) != normalize(field["name"]) or folder[1] != field["version"]:
+        fail(f"{path.name}: dist-info directory {dist_info} does not match the file name's "
+             f"{field['name']}-{field['version']}")
+    triples = [tuple(tag.split("-")) for tag in tags]
+    for index, part in enumerate(("python", "abi", "platform")):
+        named, inside = set(field[part].split(".")), {t[index] for t in triples if len(t) == 3}
+        if named != inside:
+            label = {"python": "interpreter", "abi": "ABI", "platform": "platform"}[part]
+            fail(f"{path.name}: file name {label} tags {sorted(named)} disagree with WHEEL's {sorted(inside)}")
+    product = {f"{p}-{a}-{t}" for p in field["python"].split(".") for a in field["abi"].split(".")
+               for t in field["platform"].split(".")}
+    if product != tags:
+        fail(f"{path.name}: file name tags {sorted(product)} disagree with WHEEL tags {sorted(tags)}")
 
 
 def wheel_tags(text: str) -> set:
@@ -71,18 +111,23 @@ def newest_glibc(program: Path):
 def check_wheel(path: Path, platform: str) -> None:
     with zipfile.ZipFile(path) as wheel:
         names = wheel.namelist()
-        dist_info = next(n.split("/")[0] for n in names if n.endswith(".dist-info/METADATA"))
+        folders = {n.split("/")[0] for n in names if n.split("/")[0].endswith(".dist-info")}
+        if len(folders) != 1:
+            fail(f"{path.name}: expected one dist-info directory, found {sorted(folders)}")
+        dist_info = folders.pop()
+        for record in ("METADATA", "WHEEL"):
+            count = names.count(f"{dist_info}/{record}")
+            if count != 1:
+                fail(f"{path.name}: expected exactly one {dist_info}/{record}, found {count}")
         metadata = wheel.read(f"{dist_info}/METADATA").decode()
         tags = wheel_tags(wheel.read(f"{dist_info}/WHEEL").decode())
         check_tags(tags, platform, path.name)
-        # The file name is what pip and PyPI read; it must say the same as WHEEL.
-        name_tags = path.name[: -len(".whl")].split("-")[-1].split(".")
-        if {f"py3-none-{p}" for p in name_tags} != tags:
-            fail(f"{path.name}: file name platforms {name_tags} disagree with WHEEL tags {sorted(tags)}")
 
         head = metadata.split("\n\n", 1)[0]
         fields = [tuple(part.strip() for part in line.split(":", 1)) for line in head.splitlines() if ":" in line]
         get = lambda key: [v for k, v in fields if k == key]
+        # The file name is what pip and PyPI read; every field of it must say what the wheel says.
+        check_file_name(path, dist_info, get("Name"), get("Version"), tags)
         if get("Name") != [PROGRAM]:
             fail(f"{path.name}: Name is {get('Name')}")
         if get("Version") != [crate_version()]:

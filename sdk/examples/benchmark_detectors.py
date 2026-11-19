@@ -335,13 +335,25 @@ def write_store(
 def prepare_store(
     store: Path, shape: dict[str, int], ranks: int, steps: int, workers: int
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Reuse `store` if it holds this shape and at least these ranks and steps."""
+    """Reuse `store` if it holds this shape and at least these ranks and steps, and build it if it
+    is missing or empty. Anything else is refused, never deleted: `--store` is the caller's
+    directory, and may hold more than an earlier store."""
     manifest_path = store / "manifest.json"
     if manifest_path.exists() and (store / "template.json").exists():
-        manifest = json.loads(manifest_path.read_text())
-        if manifest["shape"] == shape and manifest["ranks"] >= ranks and manifest["steps"] >= steps:
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            fits = manifest["shape"] == shape and manifest["ranks"] >= ranks and manifest["steps"] >= steps
+        except (ValueError, KeyError, TypeError):
+            manifest, fits = None, False
+        if fits:
             return json.loads((store / "template.json").read_text()), manifest
-        shutil.rmtree(store)
+        held = (f"a store of shape {manifest.get('shape')}, {manifest.get('ranks')} ranks x {manifest.get('steps')} steps"
+                if isinstance(manifest, dict) else "an unreadable manifest.json")
+        raise SystemExit(f"--store {store} holds {held}; this run needs shape {shape}, {ranks} ranks x {steps} steps. "
+                         "Nothing was deleted: give a new or empty --store, or remove that one yourself.")
+    if store.exists() and (not store.is_dir() or any(store.iterdir())):
+        raise SystemExit(f"--store {store} is not empty and holds no benchmark store. Nothing was deleted: "
+                         "give a new or empty --store.")
     template = capture_template(**shape)
     return template, write_store(store, template, ranks, steps, workers)
 

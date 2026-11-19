@@ -17,6 +17,11 @@
 # rank's incidents.json covers a batch; the client then reads those files, which costs it CPU),
 # KEEP=1 (keep the server's store). Run from the `server` directory. Nothing here changes a
 # system setting: the open-file limit is whatever the calling shell has.
+#
+# Results go to $OUT/<label>, which must be new or empty: one that holds anything, such as an
+# earlier run with the same label, is refused, never deleted. If a step fails (the server does
+# not start, the load client or the summary exits nonzero), the server and the sampler started
+# here are stopped, the logs and the store are kept, and the script exits with that step's status.
 set -u
 label=${1:?label}; src=${2:?source store}; ranks=${3:?ranks}; shift 3
 bin=${BIN_DIR:-target/release}
@@ -25,17 +30,46 @@ port=${PORT:-50071}; restarts=${RESTARTS:-0}
 for built in tensorquill-server examples/live_streams; do
   [ -x "$bin/$built" ] || { echo "$bin/$built is not built: cargo build --release && cargo build --release --examples" >&2; exit 1; }
 done
-rm -rf "$out"; mkdir -p "$store"
+if [ -e "$out" ] && { [ ! -d "$out" ] || [ -n "$(ls -A "$out")" ]; }; then
+  echo "$out is not empty (an earlier run with the label $label?); nothing was deleted. Choose another label or OUT." >&2
+  exit 2
+fi
+mkdir -p "$store" || exit
+
+server=; timer=; sampler=
+cleanup() { # on every exit: stop what this script started and is still running
+  local status=$? pid i
+  trap - EXIT INT TERM
+  for pid in $sampler $server $timer; do kill -TERM "$pid" 2>/dev/null; done
+  for ((i = 0; i < 50; i++)); do
+    alive=; for pid in $sampler $server $timer; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [ -z "$alive" ] && break; sleep 0.1
+  done
+  for pid in $sampler $server $timer; do kill -KILL "$pid" 2>/dev/null; done
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+fail() { # $1 = exit status, $2 = what failed
+  echo "simulated_ranks.sh: $2 (status $1); logs kept in $out" >&2
+  exit "$1"
+}
+
+if nc -z 127.0.0.1 "$port" 2>/dev/null; then
+  fail 1 "something already listens on port $port; set PORT to a free one"
+fi
 
 start_server() { # $1 = tag
   /usr/bin/time -l "$bin/tensorquill-server" --listen 127.0.0.1:"$port" --store "$store" --flush-steps 50 \
     ${SERVER_ARGS:-} > "$out/server-$1.log" 2> "$out/server-$1.time" &
   timer=$!
   until nc -z 127.0.0.1 "$port" 2>/dev/null; do
-    kill -0 $timer 2>/dev/null || { echo "the server did not start: $(cat "$out/server-$1.time")" >&2; exit 1; }
+    kill -0 $timer 2>/dev/null || fail 1 "the server did not start: $(cat "$out/server-$1.time")"
     sleep 0.1
   done
   server=$(pgrep -P $timer)
+  [ -n "$server" ] || fail 1 "the server's process was not found under $timer"
   ( n=0
     while kill -0 "$server" 2>/dev/null; do
       echo "$(date +%s) $(ps -o rss=,time= -p "$server")" >> "$out/samples-$1.txt"
@@ -45,32 +79,37 @@ start_server() { # $1 = tag
   sampler=$!
 }
 stop_server() {
+  local i
   kill -TERM "$server"; wait $timer 2>/dev/null; wait $sampler 2>/dev/null
-  while nc -z 127.0.0.1 "$port" 2>/dev/null; do sleep 0.1; done
+  server=; timer=; sampler=
+  for ((i = 0; i < 300; i++)); do nc -z 127.0.0.1 "$port" 2>/dev/null || return 0; sleep 0.1; done
+  fail 1 "port $port is still open 30 s after the server was stopped"
 }
-drive() { # $1 = tag, then live_streams options
-  local tag=$1; shift
+drive() { # $1 = tag, then live_streams options; returns the client's exit status
+  local tag=$1 status; shift
   { echo "before: $(uptime | sed 's/.*load/load/'); $(sysctl -n vm.swapusage)"
     echo "start $(date +%s)"
     /usr/bin/time -l "$bin/examples/live_streams" "$src" bench http://127.0.0.1:"$port" "$@" 2> "$out/client-$tag.time"
+    status=$?
     echo "end $(date +%s)"
     echo "after: $(uptime | sed 's/.*load/load/'); $(sysctl -n vm.swapusage)"; } > "$out/client-$tag.txt" 2>&1
+  return $status
 }
 
 reports=(); [ "${REPORTS:-0}" = 1 ] && reports=(--store "$store")
 echo "open-file limit of this shell: $(ulimit -n); server options: --flush-steps 50 ${SERVER_ARGS:-}" > "$out/setup.txt"
 start_server first
-drive first --ranks "$ranks" ${reports[@]+"${reports[@]}"} "$@"
+drive first --ranks "$ranks" ${reports[@]+"${reports[@]}"} "$@" || fail $? "the load client (first) failed"
 stop_server
 steps=$(( $(ls "$src"/runs/bench/rank=0/attempt=*/ | wc -l) * 50 ))
 for ((i = 1; i <= restarts; i++)); do
   start_server restart$i
-  drive restart$i --ranks "$ranks" --first-step $steps --batches 3
+  drive restart$i --ranks "$ranks" --first-step $steps --batches 3 || fail $? "the load client (restart$i) failed"
   stop_server
   steps=$((steps + 150))
 done
 
-python3 - "$out" "$ranks" <<'PY'
+python3 - "$out" "$ranks" <<'PY' || fail $? "the summary failed"
 import collections, glob, json, os, statistics, sys
 out, ranks = sys.argv[1], int(sys.argv[2])
 store = f"{out}/store"
