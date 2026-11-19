@@ -1070,7 +1070,9 @@ class Session:
         # Bounded, as TensorBoard's SummaryWriter is (`max_queue=10`): if the sink falls
         # behind, for example on a stalled network filesystem, training waits for it
         # instead of holding every unwritten step in memory. No step is dropped.
-        self._queue: queue.Queue[Any] = queue.Queue(maxsize=WRITER_QUEUE)
+        # A full ring is queued as two items, all but its newest step and then that step
+        # (`_hold_newest`), one when it is one step: the bound stays WRITER_QUEUE rings.
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=WRITER_QUEUE * (1 if every == 1 else 2))
         self._warned_backpressure = False
         self._worker = threading.Thread(target=self._drain, name="tensorquill-writer", daemon=True)
         self._worker.start()

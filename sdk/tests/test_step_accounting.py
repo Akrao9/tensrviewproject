@@ -63,6 +63,9 @@ def test_a_full_ring_is_written_at_once_but_for_its_newest_step_until_the_next_s
         assert session._steps == [3]  # kept back: a save made now is still written on its record
         _written(sink, 3)
         session.checkpoint({"model": model.state_dict()}, event="save")
+        # One optimizer: nothing on the device changed for the held step, so writing it reads nothing
+        # off the device again; it is queued from the copy the ring was read into.
+        assert session._held is not None and session._held["dirty"] == set()
         _steps(model, optimizer, 1)
         assert session._steps == [4]
         _written(sink, 4)
