@@ -62,8 +62,14 @@ WEIGHT_EVERY = 50
 SCHEMA_VERSION = 1
 # Probe passes are rare, like wandb.watch's histograms (every 1,000 batches by default).
 PROBE_EVERY = 1000
-# Blocks of `every` steps waiting for the writer thread before training waits for it.
+# Rings of `every` steps the writer thread may fall behind before capture stops for the session
+# (`Session._put`, `_queue_blocks`): training never waits for the sink. At every=1 that is 8 steps.
 WRITER_QUEUE = 8
+# How long `close()` waits for the writer to take and write what is left, at most, in seconds; then
+# capture is taken as stopped (no end marker) and `close()` returns. After a stop it waits
+# `STOPPED_CLOSE_SECONDS` at most for a writer that may be stuck in the sink.
+CLOSE_SECONDS = 60.0
+STOPPED_CLOSE_SECONDS = 1.0
 FOREIGN_STEPS_WARNING = 10  # optimizer steps on other parameters before warning that none was counted
 # Why the update size was not read (`updates=True`), by what it is said about: an optimizer's
 # class name, or one of these two.
@@ -693,6 +699,17 @@ _clip_original: Callable[..., Any] | None = None
 _DYNAMO_DIR = str(Path(torch._dynamo.__file__).parent)
 
 
+def _queue_blocks(every: int) -> int:
+    """The writer queue's size in blocks: `WRITER_QUEUE` rings. A full ring is queued as two blocks,
+    all but its newest step and then that step (`_hold_newest`), one when it is one step."""
+    return WRITER_QUEUE * (1 if every == 1 else 2)
+
+
+def _noop_hook(*args: Any, **kwargs: Any) -> None:
+    """What a stopped session's optimizer hooks become until `close()` removes them (`_stop`)."""
+    return None
+
+
 def _caller_frame(depth: int) -> Any:
     """The frame `depth` levels above the caller, not counting `torch.compiler.disable`'s own."""
     frame = sys._getframe(depth + 1)
@@ -1201,13 +1218,15 @@ class Session:
         self._pending_data_wait = 0.0
         self._last_step_clock: float | None = None
         self._ring_wait: list[tuple[float, float | None] | None] = []
-        # Bounded, as TensorBoard's SummaryWriter is (`max_queue=10`): if the sink falls
-        # behind, for example on a stalled network filesystem, training waits for it
-        # instead of holding every unwritten step in memory. No step is dropped.
-        # A full ring is queued as two items, all but its newest step and then that step
-        # (`_hold_newest`), one when it is one step: the bound stays WRITER_QUEUE rings.
-        self._queue: queue.Queue[Any] = queue.Queue(maxsize=WRITER_QUEUE * (1 if every == 1 else 2))
-        self._warned_backpressure = False
+        # Bounded, as TensorBoard's SummaryWriter is (`max_queue=10`): if the sink falls a full
+        # queue behind, for example on a stalled network filesystem, capture stops for the
+        # session (`_stop`) instead of holding every unwritten step in memory or making training
+        # wait (the author's decision on C03).
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=_queue_blocks(every))
+        # Capture stopped for the rest of the session (`_stop`), and why: the sink's exception, or
+        # the writer falling a full queue behind. Training goes on either way.
+        self._stopped = False
+        self.writer_error: BaseException | None = None
         self._worker = threading.Thread(target=self._drain, name="tensorquill-writer", daemon=True)
         self._clip_watched = clip_norm
         self._scaler = plan.scaler
@@ -1368,7 +1387,8 @@ class Session:
             return
         if not self._owns(optimizer):
             self._foreign_stepped = True
-            self._note_foreign_step()
+            if not self._stopped:
+                self._note_foreign_step()
             return
         # PyTorch wraps each optimizer class's own `step` with the global hooks, so an
         # optimizer that subclasses another and calls `super().step()` fires them again,
@@ -1390,6 +1410,8 @@ class Session:
         if lead is None:
             self._lead, lead = weakref.ref(optimizer), optimizer
         self._leading = optimizer is lead
+        if self._stopped:
+            return  # only the step count goes on, for the drift check's schedule (`_count_stopped`)
         if self._leading and self._probe_owed:
             # Every optimizer of the previous iteration has stepped: its probe runs now.
             self._run_owed_probe()
@@ -1410,6 +1432,10 @@ class Session:
             return
         self._step_depth, self._outer_frame = 0, None
         self._stepped = True
+        if self._stopped:
+            if self._leading and not self._commit_on_update:
+                self._count_stopped(None)
+            return
         # An optimizer that steps after the lead ended the step (two optimizers on one model,
         # `opt1.step(); opt2.step()`: Muon and AdamW, a GAN's two halves in one module) belongs to
         # that step, which is still the newest in the ring (when it filled the ring, `_commit` kept
@@ -1504,7 +1530,7 @@ class Session:
         lead = self._lead() if self._lead is not None else None
         return (
             lead is not None and optimizer is not lead and self.auto_step and not self._commit_on_update
-            and bool(self._steps) and not self._closed and self._owns(optimizer)
+            and bool(self._steps) and not self._closed and not self._stopped and self._owns(optimizer)
         )
 
     def _add_to_newest(self, name: str, value: Any) -> None:
@@ -1555,6 +1581,8 @@ class Session:
         """Before the scaler's own `update()`: whether it ends this session's step."""
         if self._closed:
             return False
+        if self._stopped:
+            return self._stepped
         # It ends a step only after an optimizer went through the scaler (or one of this
         # model's stepped): `update(new_scale)` called on its own only sets the scale.
         ends = self._record_scaler(scaler) or self._stepped
@@ -1566,6 +1594,9 @@ class Session:
         return ends
 
     def _scaler_after_update(self, ends: bool) -> None:
+        if ends and self._commit_on_update and not self._closed and self._stopped:
+            self._count_stopped(None)
+            return
         if ends and self._commit_on_update and not self._closed:
             if self._pending_lr is None and self._lead is not None and self._lead() is not None:
                 self._pending_lr = _learning_rates(self._lead())
@@ -2058,11 +2089,16 @@ class Session:
         spread: a warning names it once, at the next flush. A NaN weight that was read still
         reads as drift.
         """
-        if self._closed_call("record_replica_spread()") or not self._replica_params:
+        if self._closed or not self._replica_params:
             return
         target = self._replica_group if group_or_spread is None else group_or_spread
         if target is None:
             raise ValueError("pass a replication process group or precomputed spread tensor")
+        if self._stopped:
+            if not isinstance(target, torch.Tensor):
+                self._gather_and_drop(target)  # the other ranks are entering it too
+                self._spread_recorded = 1
+            return
         spread_buf, _ = self._ensure_spread_buffers()
         unread: torch.Tensor | None = None
         if isinstance(target, torch.Tensor):
@@ -2109,6 +2145,8 @@ class Session:
         value per parameter group, or a single value) to record the learning rate.
         """
         if self._closed_call("step()"):
+            if self._stopped and not self._closed and not self.auto_step:
+                self._count_stopped(step)  # the drift check's schedule goes on (`_count_stopped`)
             return
         if self.auto_step:
             raise RuntimeError("step() is called automatically; pass auto_step=False to call it yourself")
@@ -2158,11 +2196,19 @@ class Session:
 
     @torch.no_grad()
     def _commit(self, step: int | None) -> None:
+        if self._error is not None and not self._stopped:
+            self._stop(self._error)  # the sink failed on the writer thread: said here, on this one
+        if self._stopped:
+            self._count_stopped(step)
+            return
         current = self._next_step if step is None else step
         if self._probe_owed:
             self._run_owed_probe()  # the previous step's, before this one becomes the newest
         if self._held is not None:
             self._release_held()  # the step kept back when the ring last filled: this one ends it
+            if self._stopped:  # the writer was a full queue behind (`_put`)
+                self._count_stopped(step)
+                return
         self._say_router_problems(stacklevel=4)
         if (
             not self._spread_recorded
@@ -2342,11 +2388,10 @@ class Session:
         self._ring_wait = []
 
     def _flush(self, *, hold_newest: bool) -> None:
-        if self._error is not None:
-            self._clear_ring_lists()
-            self._probe_owed = False
-            self._held = None
-            self._raise_worker_error()
+        if self._error is not None and not self._stopped:
+            self._stop(self._error)
+        if self._stopped:
+            return
         if self._probe_owed and not hold_newest:
             self._run_owed_probe()  # the newest step's, before it leaves the ring (a held one stays)
         if self._held is not None:
@@ -2528,27 +2573,102 @@ class Session:
             self._held["dirty"].add(part)
 
     def _put(self, block: tuple[Any, ...]) -> None:
+        """Hand a block to the writer thread, never waiting for it. A writer a full queue behind
+        stops capture for the session (`_stop`) and this block is dropped: the steps already
+        queued are still written, so the records stay one unbroken run of steps."""
+        if self._stopped:
+            return
         try:
             self._queue.put_nowait(block)
         except queue.Full:
-            if not self._warned_backpressure:
-                self._warned_backpressure = True
-                cause = ("The sink is slower than training, for example a stalled network filesystem; "
-                         "pass sink=tensorquill.JsonlSink(path) on local disk.")
-                if self._system is not None:
-                    # With system readings on, the writer may instead be in its bounded wait for an
-                    # NVML reading (system.py), after which NVML is off for the session.
-                    cause = ("The sink is slower than training, for example a stalled network filesystem "
-                             "(pass sink=tensorquill.JsonlSink(path) on local disk), or the writer is waiting "
-                             "for an NVML reading that is slow to come back; it waits a bounded time, then "
-                             "turns NVML off for the session.")
-                warnings.warn(
-                    f"TensorQuill's writer is {WRITER_QUEUE * self.every} steps behind; training "
-                    f"now waits for it. {cause}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            self._queue.put(block)
+            blocks = self._queue.maxsize
+            cause = ("for example on a stalled network filesystem (pass sink=tensorquill.JsonlSink(path) on "
+                     "local disk)")
+            if self._system is not None:
+                # With system readings on, the writer may instead be in its bounded wait for an NVML
+                # reading (system.py), after which NVML is off for the session.
+                cause += ", or while the writer waited for an NVML reading that was slow to come back"
+            self._stop(RuntimeError(
+                f"the writer fell {blocks} blocks ({WRITER_QUEUE * self.every} steps) behind training, {cause}"
+            ))
+
+    def _stop(self, cause: BaseException) -> None:
+        """Stop capture for the rest of the session, on the training thread, and say so once.
+
+        The author's decision on C03: a sink that fails, or a writer a full queue behind, stops
+        capture; nothing is raised into training and nothing waits. The cause is kept as
+        `writer_error`. Every public entry point then returns at once (`_closed_call`), except
+        what the heartbeat reads (`set_phase`, `tick`, `phase`). The forward hooks stay: a flag
+        they read under `torch.compile` would be guarded, and flipping it would recompile; their
+        buffers are never read again. The clipping and loader hooks come off. The optimizer hooks
+        become no-ops (taking them out now could be inside PyTorch's loop over them, which would
+        raise) and `close()` removes them; with a `replica_group` they instead keep counting steps,
+        so this rank keeps entering the drift check's gather on the same steps as the others
+        (`_count_stopped`). `close()` then writes no end marker, so the file reads as cut off."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self.writer_error = cause
+        self._clear_ring_lists()
+        self._held = None
+        self._probe_owed = False
+        try:  # an idle writer ends now; a busy one ends once the queue is empty (`_drain`)
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        for undo in (lambda: _unwatch_clipping(self), lambda: datawait.unwatch(self)):
+            try:
+                undo()
+            except Exception:  # noqa: BLE001
+                pass
+        if not self._keeps_schedule():
+            for handle in self._optimizer_handles:
+                try:
+                    hooks = handle.hooks_dict_ref()
+                    if hooks is not None and handle.id in hooks:
+                        hooks[handle.id] = _noop_hook  # same key: safe while PyTorch iterates them
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                self._unwatch_scaler()
+            except Exception:  # noqa: BLE001
+                pass
+        if cause is self._error:
+            what = f"its sink raised {_short(cause)}"
+        else:
+            what = str(cause)
+        _warn(
+            f"TensorQuill stopped capturing for this session: {what}. Training goes on and does not wait; "
+            "the steps already handed to the writer are written, no later step is, and the records file gets "
+            "no end marker, so it reads as cut off. The cause is session.writer_error.",
+            stacklevel=4,
+        )
+
+    def _keeps_schedule(self) -> bool:
+        """Whether a stopped session must keep counting steps: it takes part in the drift check's
+        `all_gather`, which every rank of the group must enter on the same steps."""
+        return (
+            self._replica_group is not None and not isinstance(self._replica_group, torch.Tensor)
+            and bool(self._replica_params)
+        )
+
+    def _count_stopped(self, step: int | None) -> None:
+        """A step ended on a stopped session: only the drift check's gather goes on, on the steps it
+        was due (as `_commit` schedules it), and its result is dropped."""
+        current = self._next_step if step is None else step
+        self._stepped = self._foreign_stepped = False
+        if self._keeps_schedule() and not self._spread_recorded and (current + 1) % self.replica_every == 0:
+            self._gather_and_drop(self._replica_group)
+        self._spread_recorded = 0
+        self._next_step = current + 1
+
+    def _gather_and_drop(self, group: Any) -> None:
+        try:
+            spread_buf, _ = self._ensure_spread_buffers()
+            _spread_and_unread(self._replica_params, group, projection=self._replica_projection,
+                               device=spread_buf.device)
+        except Exception:  # noqa: BLE001
+            pass  # nothing is recorded any more; a failed gather is as it would be without TensorQuill
 
     def set_phase(self, phase: str = "train") -> None:
         """Say what the process is doing: `"train"` (the default), `"eval"`, `"checkpoint"`, or
@@ -2556,7 +2676,7 @@ class Session:
         not call the missing steps a hang. Under `"eval"`, a forward in eval mode or without
         gradients is also left out of the records (`_evaluating`); without it, only one with
         both. Otherwise a no-op unless streaming with `endpoint=`."""
-        if self._closed_call("set_phase()"):
+        if self._closed:  # live after a stop: the heartbeat still says what the process is doing
             return
         self._phase = phase
         self._evaluating.on = phase == "eval"
@@ -2569,7 +2689,7 @@ class Session:
         evaluation batch. A pause whose work stops moving is reported as a suspected hang;
         one that keeps ticking is not limited. The Lightning and Hugging Face callbacks tick
         for you. Cheap: it only adds one to a counter."""
-        if self._closed_call("tick()"):
+        if self._closed:  # live after a stop, as `set_phase`
             return
         self._ticks += 1
 
@@ -2603,7 +2723,7 @@ class Session:
         """`with session.phase("eval"): ...` marks a stretch with no training steps, and goes
         back to the phase it interrupted afterwards, even if the block raises. On a closed
         session, or one closed inside the block, it marks nothing."""
-        if self._closed_call("phase()"):
+        if self._closed:  # live after a stop, as `set_phase`
             yield
             return
         previous = self._phase
@@ -2620,32 +2740,69 @@ class Session:
         bounded queue and then wait for good (`_put`). So every public entry point returns at once
         on a closed session: no raise, nothing queued, and no warning, since a warning on the
         caller's thread is an exception under `python -W error`. `what` names the call for a
-        reader of this code; nothing is said."""
-        return self._closed
+        reader of this code; nothing is said. A session whose capture stopped (`_stop`) is the same
+        state for these calls: its one warning was given when it stopped."""
+        return self._closed or self._stopped
 
     def close(self, *, _exception: BaseException | None = None) -> None:
         """Flush what is left and stop the writer. Forward hooks stay on the model, because
         removing a hook from a compiled module triggers a recompile. Once the records file is
         closed and complete, `<name>.end.json` is left beside it (`sink.write_end_marker`), so a
-        reader can tell this run from one that was killed; none when the writer failed."""
+        reader can tell this run from one that was killed.
+
+        It never raises and never waits without bound. A sink that fails here, or a writer that
+        has not finished within `CLOSE_SECONDS`, stops capture (`_stop`), as during training: one
+        warning, `writer_error` set, and no end marker, so the file reads as cut off. After a stop
+        the writer, which may be stuck in the sink, is waited for `STOPPED_CLOSE_SECONDS` at most;
+        a sink still in a write is not closed under it (only a stream's heartbeat and sender are
+        stopped), and the writer, a daemon thread, does not hold the process. Inside `with
+        session:` the training's own exception comes out unchanged."""
         if self._closed:
             return
         self._closed = True
-        datawait.unwatch(self)
-        for handle in self._optimizer_handles:
-            handle.remove()
-        _unwatch_clipping(self)
-        self._unwatch_scaler()
+        for undo in (
+            lambda: datawait.unwatch(self),
+            lambda: [handle.remove() for handle in self._optimizer_handles],
+            lambda: _unwatch_clipping(self),
+            self._unwatch_scaler,
+        ):
+            try:
+                undo()
+            except Exception:  # noqa: BLE001
+                pass
+        deadline = time.monotonic() + CLOSE_SECONDS
+        if not self._stopped:
+            try:
+                self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
+            except Exception as error:  # noqa: BLE001
+                self._stop(error)
+        if not self._stopped:
+            try:
+                self._queue.put(None, timeout=max(deadline - time.monotonic(), 0.0))
+            except queue.Full:
+                self._stop(RuntimeError(f"the writer had not taken what was left within {CLOSE_SECONDS:g} s at close"))
+        wait = STOPPED_CLOSE_SECONDS if self._stopped else max(deadline - time.monotonic(), 0.0)
+        self._worker.join(wait)
+        if self._worker.is_alive():
+            self._stop(RuntimeError(f"the writer had not finished within {wait:g} s at close"))
+            try:
+                _close_stream(self._sink)  # the stream's threads, not the sink the writer is still in
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            if self._error is not None:
+                self._stop(self._error)  # the last write failed
+            try:
+                self._sink.close()
+            except Exception as error:  # noqa: BLE001
+                self._stop(error)
+        if self._stopped or getattr(self._sink, "path", None) is None:
+            return
         try:
-            self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
-        finally:
-            self._queue.put(None)
-            self._worker.join()
-            self._sink.close()
-        self._raise_worker_error()
-        if getattr(self._sink, "path", None) is not None:
             write_end_marker(self._sink.path, run_id=self.run.run_id, rank=self.run.rank, attempt=self.attempt,
                              exception=_exception)
+        except Exception:  # noqa: BLE001
+            pass  # no marker: the file reads as cut off, which is less than it is, never more
 
     def __enter__(self) -> "Session":
         return self
@@ -2655,32 +2812,32 @@ class Session:
 
     # ---- writer thread ------------------------------------------------------------
 
-    def _raise_worker_error(self) -> None:
-        if self._error is not None:
-            error, self._error = self._error, None
-            raise RuntimeError("the TensorQuill writer thread failed") from error
-
     def _drain(self) -> None:
+        """The writer thread. It never raises and never stops training: a sink that raises is kept
+        as `_error`, which the training thread turns into a stop at its next step (`_commit`); the
+        blocks after it are passed over. Once capture has stopped it writes what was queued before
+        the stop and ends when the queue is empty, or at the `None` that `_stop` or `close` put."""
         try:
             while True:
                 item = self._queue.get()
                 if item is None:
                     return
-                if self._error is not None:
-                    continue
-                if self._system is not None:
-                    # NVML is asked for here, on the writer thread, and read on a thread of its own,
-                    # waited for a bounded time (system.py). A failure is written as a note in the
-                    # record and never stops the writer, which would stop training.
-                    # Found by its type, not its place, so other parts of the block can come after it.
+                if self._error is None:
+                    if self._system is not None:
+                        # NVML is asked for here, on the writer thread, and read on a thread of its own,
+                        # waited for a bounded time (system.py). A failure is written as a note in the
+                        # record and never stops the writer.
+                        # Found by its type, not its place, so other parts of the block can come after it.
+                        try:
+                            item = tuple(self._system.write(x) if isinstance(x, SystemPart) else x for x in item)
+                        except Exception:  # noqa: BLE001
+                            pass
                     try:
-                        item = tuple(self._system.write(x) if isinstance(x, SystemPart) else x for x in item)
-                    except Exception:  # noqa: BLE001
-                        pass
-                try:
-                    self._sink.write(self._decode(*item))
-                except BaseException as error:  # noqa: BLE001
-                    self._error = error
+                        self._sink.write(self._decode(*item))
+                    except BaseException as error:  # noqa: BLE001
+                        self._error = error
+                if self._stopped and self._queue.empty():
+                    return
         finally:
             if self._system is not None:
                 self._system.close()

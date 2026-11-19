@@ -9,9 +9,12 @@ warning under `-W error`, and `init`'s docstring on the drift check's gather. No
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
+import time
 import warnings
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -612,3 +615,276 @@ def test_the_writer_thread_is_named_once_per_open_session():
     assert names() == start + 1
     session.close()
     assert names() == start
+
+
+# --- C03, decided by the author: a failing or lagging sink stops capture, training goes on --------
+
+
+class FailingSink(tensorquill.MemorySink):
+    """Writes the first `good` blocks, then raises on every write, as a disk that fills up."""
+
+    def __init__(self, good: int = 0) -> None:
+        super().__init__()
+        self.good = good
+
+    def write(self, records):
+        if self.good <= 0:
+            raise OSError("disk gone")
+        self.good -= 1
+        super().write(records)
+
+
+class FailingJsonl(tensorquill.JsonlSink):
+    def __init__(self, path: Path, good: int) -> None:
+        super().__init__(path)
+        self.good = good
+
+    def write(self, records):
+        if self.good <= 0:
+            raise OSError("disk gone")
+        self.good -= 1
+        super().write(records)
+
+
+class StuckSink(tensorquill.MemorySink):
+    """A sink whose `write` never returns until the test lets it go, as a hung network filesystem."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+
+    def write(self, records):
+        self.release.wait()
+        super().write(records)
+
+
+def _stopped_by_a_failing_sink(model: nn.Module, opt: torch.optim.Optimizer, **init) -> capture.Session:
+    """A session whose sink fails at its first write, stepped until capture has stopped: the writer
+    keeps the error and the next step on the training thread turns it into the stop (`_commit`)."""
+    session = tensorquill.init(model, sink=FailingSink(), every=1, **init)
+    deadline = time.monotonic() + DEADLINE
+    while not session._stopped and time.monotonic() < deadline:
+        opt.zero_grad()
+        model(torch.ones(2, 4)).sum().backward()
+        opt.step()
+        if session._error is None:
+            time.sleep(0.01)  # give the writer thread its turn
+    assert session._stopped
+    return session
+
+
+def _train_plain(sink: object | None, steps: int = 30, every: int = 1) -> tuple[torch.Tensor, object]:
+    torch.manual_seed(0)
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    session = tensorquill.init(model, sink=sink, every=every) if sink is not None else None
+    for _ in range(steps):
+        opt.zero_grad()
+        model(torch.ones(2, 4)).sum().backward()
+        opt.step()
+    if session is not None:
+        session.close()
+    return model.weight.detach().clone(), session
+
+
+@pytest.mark.parametrize("errors", [False, True], ids=["plain", "warnings-as-errors"])
+@pytest.mark.parametrize("every", [1, 4])
+def test_a_failing_sink_stops_capture_and_every_step_runs_as_without_tensorquill(errors, every, caplog):
+    without, _ = _train_plain(None)
+    with warnings.catch_warnings(record=not errors) as said, caplog.at_level(logging.WARNING, logger="tensorquill"):
+        warnings.simplefilter("error" if errors else "always")
+        with_tq, session = _train_plain(FailingSink(good=2), every=every)
+    assert torch.equal(without, with_tq)
+    assert isinstance(session.writer_error, OSError) and str(session.writer_error) == "disk gone"
+    told = [str(w.message) for w in said if "TensorQuill" in str(w.message)] if not errors else [
+        r.getMessage() for r in caplog.records]
+    assert len(told) == 1 and "stopped capturing" in told[0] and "OSError: disk gone" in told[0]
+
+
+def test_the_users_own_exception_comes_out_unchanged_after_the_sink_failed():
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    mine = LookupError("the user's own training error")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(LookupError) as raised:
+            with tensorquill.init(model, sink=FailingSink(), every=1) as session:
+                for _ in range(3):
+                    opt.zero_grad()
+                    model(torch.ones(2, 4)).sum().backward()
+                    opt.step()
+                raise mine
+    assert raised.value is mine and raised.value.__context__ is None
+    assert isinstance(session.writer_error, OSError)
+
+
+def test_a_sink_that_never_returns_holds_neither_training_nor_close():
+    sink = StuckSink()
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    done: list[str] = []
+
+    def run() -> None:
+        session = tensorquill.init(model, sink=sink, every=1)
+        for _ in range(capture.WRITER_QUEUE * 4):
+            opt.zero_grad()
+            model(torch.ones(2, 4)).sum().backward()
+            opt.step()
+        done.append("trained")
+        session.close()
+        done.append(str(session.writer_error))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(DEADLINE)
+    sink.release.set()  # let the writer thread go, so it ends with the test
+    assert not worker.is_alive(), f"held: {done}"
+    assert done[0] == "trained" and "behind training" in done[1]
+
+
+def test_after_a_stop_no_end_marker_the_cause_kept_and_exactly_one_warning(tmp_path):
+    path = tmp_path / "run.rank0.jsonl"
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        session = tensorquill.init(model, sink=FailingJsonl(path, good=3), run_id="run", every=1)
+        for _ in range(10):
+            opt.zero_grad()
+            model(torch.ones(2, 4)).sum().backward()
+            opt.step()
+        session.log({"loss": 1.0})
+        session.flush()
+        session.close()
+    assert not (tmp_path / "run.rank0.end.json").exists()
+    assert isinstance(session.writer_error, OSError)
+    assert len([w for w in said if "TensorQuill" in str(w.message)]) == 1
+    steps = [json.loads(line)["step"] for line in path.read_text().splitlines()]
+    assert steps == [0, 1, 2]  # an unbroken run of steps, then nothing
+
+
+def test_after_a_stop_the_optimizer_hooks_do_nothing_and_close_takes_them_off():
+    before = (len(_global_optimizer_pre_hooks), len(_global_optimizer_post_hooks))
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        session = _stopped_by_a_failing_sink(model, opt)
+    hooks = [_global_optimizer_pre_hooks.get(h.id) for h in session._optimizer_handles]
+    hooks += [_global_optimizer_post_hooks.get(h.id) for h in session._optimizer_handles]
+    assert capture._noop_hook in hooks
+    session.close()
+    assert (len(_global_optimizer_pre_hooks), len(_global_optimizer_post_hooks)) == before
+
+
+def test_what_the_heartbeat_reads_stays_live_after_a_stop():
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        session = _stopped_by_a_failing_sink(model, opt)
+    session.set_phase("eval")
+    session.tick()
+    assert session._phase == "eval" and session._ticks == 1
+    with session.phase("checkpoint"):
+        assert session._phase == "checkpoint"
+    assert session._phase == "eval"
+    session.close()
+
+
+def test_close_returns_within_its_bound_when_the_last_write_is_slow(monkeypatch, tmp_path):
+    monkeypatch.setattr(capture, "CLOSE_SECONDS", 0.3)
+    path = tmp_path / "slow.rank0.jsonl"
+    release = threading.Event()
+
+    class Slow(tensorquill.JsonlSink):
+        def write(self, records):
+            release.wait()
+            super().write(records)
+
+    session = tensorquill.init(nn.Linear(2, 2), sink=Slow(path), run_id="slow", every=50, auto_step=False)
+    session.step()
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        started = time.monotonic()
+        session.close()
+        took = time.monotonic() - started
+    release.set()
+    assert took < 0.3 + capture.STOPPED_CLOSE_SECONDS + 1.0
+    assert "had not finished" in str(session.writer_error)
+    assert not (tmp_path / "slow.rank0.end.json").exists()
+    assert len([w for w in said if "TensorQuill" in str(w.message)]) == 1
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_a_stop_causes_no_graph_break_and_no_recompile(toy_moe, backend):
+    """The forward hooks stay as they are after a stop: nothing they read under `torch.compile`
+    changes, so the compiled model is neither traced again nor broken."""
+    sink = FailingSink(good=2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        session = tensorquill.init(toy_moe, sink=sink, every=1, capture="full", routers={"router": 4})
+        compiled = torch.compile(toy_moe, backend=backend)
+        opt = torch.optim.SGD(toy_moe.parameters(), lr=0.01)
+        torch._dynamo.utils.counters.clear()
+        with torch._dynamo.config.patch(error_on_recompile=True):
+            for _ in range(8):
+                opt.zero_grad()
+                compiled(torch.randn(16, 8)).sum().backward()
+                opt.step()
+        session.close()
+    assert session._stopped and isinstance(session.writer_error, OSError)
+    assert dict(torch._dynamo.utils.counters["graph_break"]) == {}
+    assert torch._dynamo.utils.counters["frames"]["ok"] >= 1
+    assert [r["step"] for r in sink.records] == [0, 1]
+
+
+def _stopped_rank_worker(rank, store_path, out_dir):
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", rank=rank, world_size=2, store=dist.FileStore(store_path, 2),
+                            timeout=timedelta(seconds=60))
+    try:
+        torch.manual_seed(0)
+        model = nn.Linear(4, 2)
+        path = Path(out_dir) / f"rank{rank}.jsonl"
+        sink = FailingJsonl(path, good=1) if rank == 0 else tensorquill.JsonlSink(path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            session = tensorquill.init(model, run_id="r1", sink=sink, every=1, replica_group=dist.group.WORLD,
+                                       replica_every=2)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            for _ in range(8):
+                model(torch.ones(2, 4)).sum().backward()
+                optimizer.step()
+                optimizer.zero_grad()
+            session.close()
+        (Path(out_dir) / f"done{rank}").write_text(str(session.writer_error))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_a_stopped_rank_keeps_entering_the_drift_checks_gather(tmp_path):
+    """Rank 0's sink fails at its second block, so its capture stops; rank 1's goes on. The drift
+    check's `all_gather` is due every second step on both: a stopped rank that left it would leave
+    rank 1 waiting there."""
+    dist = pytest.importorskip("torch.distributed")
+    if not dist.is_available():
+        pytest.skip("needs torch.distributed")
+    import torch.multiprocessing as mp
+
+    context = mp.start_processes(_stopped_rank_worker, args=(str(tmp_path / "store"), str(tmp_path)), nprocs=2,
+                                 join=False, start_method="spawn")
+    for _ in range(240):
+        if context.join(timeout=0.5):
+            break
+    else:
+        for process in context.processes:
+            process.terminate()
+        pytest.fail("a rank did not finish: it was left waiting in the all_gather")
+    assert "disk gone" in (tmp_path / "done0").read_text() and (tmp_path / "done1").read_text() == "None"
+    records = [json.loads(line) for line in (tmp_path / "rank1.jsonl").read_text().splitlines()]
+    assert [r["step"] for r in records] == list(range(8))
+    assert [r["step"] for r in records if "replica_spread" in r] == [1, 3, 5, 7]
