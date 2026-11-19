@@ -4275,8 +4275,11 @@ def _check_other_sources(
                         # A stuck collective in PyTorch's own dump is a second source for a hang the
                         # stream only suggested, if the dump is complete and was written after the last
                         # step TensorQuill recorded. An old or partial dump proves nothing about now.
+                        # Only a stall is corroborated: the status also lists `duplicate_batches`,
+                        # which has no assessment (lane U7, Nov 19, 2026: it raised KeyError here).
                         for incident in stream_incidents:
-                            if incident["assessment"] == "suspected_hang":
+                            if incident.get("kind") in ("job_stalled", "rank_silent") \
+                                    and incident.get("assessment") == "suspected_hang":
                                 incident["assessment"] = "confirmed_hang"
                                 incident["corroborated_by"] = "collective_hang"
     return traincheck_summary, recorder_summary
