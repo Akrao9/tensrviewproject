@@ -375,8 +375,8 @@ def test_with_bfloat16_weights_the_incident_names_the_seeded_parameter(bfloat16_
     assert own["optimizer"] == {"state": "known", "not_held": [], "not_held_count": 0, "held_count": 1}
     assert stalled["stalled_total"] == sum(o["stalled"] for o in stalled["onsets"]) and stalled["onsets_omitted"] == 0
     summary = tensorquill.incident_summary(bfloat16_stall["evidence"])
-    assert f"step 249: {SEEDED} (after changing at earlier checks)" in summary
-    assert "none of them has changed since the first weight check" in summary and "the weights are bfloat16" in summary
+    assert f"step 249: {SEEDED} (changed or not compared at an earlier check)" in summary
+    assert "none of them was seen changing at an earlier weight check" in summary and "the weights are bfloat16" in summary
 
 
 @pytest.fixture(scope="module")
