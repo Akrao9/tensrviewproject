@@ -44,14 +44,42 @@ def _finite(value: Any) -> Any:
     return value
 
 
+def _ends_torn(path: Path) -> bool:
+    """Whether `path` is a non-empty file whose last byte is not a newline: a line that a killed
+    process left half written. Never raises: a file that cannot be read is opened as before."""
+    try:
+        with path.open("rb") as file:
+            file.seek(0, os.SEEK_END)
+            if file.tell() == 0:
+                return False
+            file.seek(-1, os.SEEK_END)
+            return file.read(1) != b"\n"
+    except OSError:
+        return False
+
+
 class JsonlSink:
     """One JSON object per captured step. Non-finite numbers are written as the strings
-    "nan", "inf" and "-inf" so the file stays standard JSON."""
+    "nan", "inf" and "-inf" so the file stays standard JSON.
+
+    A file whose last line was left half written (the process that wrote it was killed in the
+    middle of a step) is first given the newline that line lacks, so the first new step starts a
+    line of its own and is read, by the stream sender and by a plain line-by-line reader. The
+    fragment stays where it was, as a line that is not a whole JSON object: incomplete history
+    that a reader skips. Nothing is removed or moved, so the file is only ever appended to and
+    the stream sender's saved offset stays valid. A fragment that happens to be a whole object
+    (the process died just before the newline) becomes a whole line again. If another process
+    is still writing that line, the newline cuts it in two and its step is lost: two writers
+    appending to one file interleave their lines anyway, and the sink takes no lock."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        torn = _ends_torn(self.path)
         self._file = self.path.open("a", encoding="utf-8")
+        if torn:
+            self._file.write("\n")
+            self._file.flush()
 
     def write(self, records: list[dict[str, Any]]) -> None:
         for record in records:
@@ -129,7 +157,8 @@ def read_end_marker(records_file: str | Path) -> dict[str, Any]:
       `close()`, or wrote the file before markers existed: this cannot tell which;
     - `written_after_close`: a marker is there and the file is larger than when it was written,
       so something wrote to it after the close (a process that did not remove the marker);
-    - `unreadable`: a marker that is not one, read as no marker.
+    - `unreadable`: a marker that is not one, read as no marker; or a marker whose records file
+      cannot be read (it was deleted or moved), so nothing says the file is the one that closed.
     Every state but `closed` means "not known to have finished"."""
     records = Path(records_file)
     path = end_marker_path(records)
@@ -149,9 +178,10 @@ def read_end_marker(records_file: str | Path) -> dict[str, Any]:
                 "detail": "the end marker is not one TensorQuill wrote, so the run is not known to have closed"}
     try:
         now = records.stat().st_size
-    except OSError:
-        now = None
-    if now is not None and now != size:
+    except OSError as error:
+        return {"state": "unreadable", "path": str(records), "detail": f"an end marker is there but {records.name}"
+                f" cannot be read ({error}), so the run is not known to have closed"}
+    if now != size:
         return {"state": "written_after_close", "path": str(path), "records_bytes": size, "now_bytes": now,
                 "detail": f"{records.name} was closed at {size:,} bytes and is {now:,} now: written after the close,"
                           " so the run is not known to have finished"}

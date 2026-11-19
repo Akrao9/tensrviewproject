@@ -12,6 +12,7 @@ sender keeps no backlog in memory and re-reads the file from the saved offset.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -266,18 +267,87 @@ def offset_path(jsonl_path: str | Path) -> Path:
     return Path(jsonl_path).with_suffix(".offset")
 
 
-def read_offset(path: Path) -> int:
+# The offset file says how many bytes of the local file the server stored, and also which
+# server (its address, the run and the rank) and which file: a digest of the file's first bytes
+# and of the bytes just before the offset. An append-only file never changes those bytes, so a
+# sender resumes at the offset only when the address, the run, the rank and both digests match;
+# anything else (another server, a file deleted and written again, a file rewritten in place,
+# a file shorter than the offset, an offset file from before the binding) sends the file again
+# from its start, which is safe because the server drops the steps it already has. The file's
+# inode is not part of it: a copy of the same bytes resumes, which is right, and a new file under
+# the same inode is told apart by its bytes. A server that lost its store behind the same address
+# cannot be told apart here: the server sends nothing that names its store.
+OFFSET_VERSION = 2
+HEAD_BYTES = 64 * 1024
+TAIL_BYTES = 4 * 1024
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _windows(path: Path, offset: int) -> tuple[bytes, bytes]:
+    """`path`'s first `min(offset, HEAD_BYTES)` bytes and the `TAIL_BYTES` before `offset`.
+    Raises OSError, or ValueError when the file is shorter than `offset`."""
+    with open(path, "rb") as file:
+        head = file.read(min(offset, HEAD_BYTES))
+        start = max(0, offset - TAIL_BYTES)
+        file.seek(start)
+        tail = file.read(offset - start)
+    if len(tail) != offset - start or len(head) != min(offset, HEAD_BYTES):
+        raise ValueError(f"{path.name} is shorter than {offset} bytes")
+    return head, tail
+
+
+def file_identity(path: Path, offset: int) -> dict[str, str]:
+    """What the offset file keeps of `path` at `offset`: the digests of its first bytes and of
+    the bytes just before the offset."""
+    head, tail = _windows(path, offset)
+    return {"head": _digest(head), "tail": _digest(tail)}
+
+
+def read_binding(path: Path) -> dict[str, Any]:
+    """The offset file as written by `write_offset`: `{"offset": int, ...}`, with the
+    destination and file identity when it has them. `{"offset": 0}` when there is none."""
     try:
-        return max(0, int(path.read_text(encoding="ascii").strip() or 0))
+        text = path.read_text(encoding="ascii").strip()
     except (OSError, ValueError):
-        return 0
+        return {"offset": 0}
+    try:
+        document = json.loads(text) if text else 0
+    except ValueError:
+        return {"offset": 0}
+    if isinstance(document, dict):
+        offset = document.get("offset")
+        if isinstance(offset, int) and not isinstance(offset, bool) and offset >= 0:
+            return document
+        return {"offset": 0}
+    if isinstance(document, int) and not isinstance(document, bool):
+        return {"offset": max(0, document)}  # an offset file from before the binding
+    return {"offset": 0}
 
 
-def write_offset(path: Path, offset: int) -> None:
-    """Write and rename, so a crash leaves either the old offset or the new one."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(f"{offset}\n", encoding="ascii")
-    os.replace(tmp, path)
+def read_offset(path: Path) -> int:
+    return read_binding(path)["offset"]
+
+
+def write_offset(path: Path, offset: int, binding: Mapping[str, Any] | None = None) -> None:
+    """Write and rename, so a crash leaves either the old offset or the new one. The scratch
+    file is named for this process and thread, so two writers in one directory (a live sender
+    and a `send_file` of the same file, say) never write into each other's scratch file.
+    Without `binding` the offset names no server and no file, and a sender reading it starts
+    again from the start of the file."""
+    text = json.dumps({"version": OFFSET_VERSION, "offset": offset, **binding}) if binding else f"{offset}"
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(text + "\n", encoding="ascii")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def read_lines(path: Path, offset: int, max_lines: int, max_bytes: int) -> tuple[list[bytes], int]:
@@ -330,6 +400,42 @@ def parse_lines(lines: Iterable[bytes], run_id: str) -> tuple[list[dict[str, Any
         else:
             skipped += 1
     return records, skipped
+
+
+def rows_to_send(records: Iterable[Mapping[str, Any]], schema: Any) -> tuple[Any, list[int], int]:
+    """`records` as one record batch of `schema`, the steps it holds, and how many records were
+    left out because a value cannot be stored: a null or a string where a key column needs an
+    integer (`"attempt": null`), an integer too large for its column, a NaN inside a nested
+    object. Such a line is skipped and counted like a line that is not JSON; were it kept, every
+    retry would start again at it and the sender would never get past it."""
+    import pyarrow as pa
+
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    for record in records:
+        try:
+            rows.append(record_to_row(record))
+        except Exception:  # noqa: BLE001  any value that cannot be converted is the line's, not the stream's
+            skipped += 1
+    try:
+        batch = pa.RecordBatch.from_pylist(rows, schema=schema)
+    except Exception:  # noqa: BLE001  find the rows Arrow refuses, one at a time
+        kept = []
+        for row in rows:
+            try:
+                pa.RecordBatch.from_pylist([row], schema=schema)
+            except Exception:  # noqa: BLE001
+                skipped += 1
+                continue
+            kept.append(row)
+        rows = kept
+        batch = pa.RecordBatch.from_pylist(rows, schema=schema)
+    return batch, [row["step"] for row in rows], skipped
+
+
+class LocalFileUnreadable(OSError):
+    """The local `.jsonl` file cannot be read: it was deleted or moved, or is not readable.
+    This is not "nothing left to send": `close()` returns False and says so."""
 
 
 # --- The sender ------------------------------------------------------------------------
@@ -417,7 +523,17 @@ class FlightSender:
         self._poll_seconds = poll_seconds
         self._backoff_base = backoff_base
         self._backoff_cap = backoff_cap
-        self._acked = read_offset(self.offset_path)
+        # The jitter's own generator: drawing from the global `random` during an outage would
+        # change what a training script's seeded sampler draws next.
+        self._random = random.Random()
+        # Where the offset file binds its offset: this server, run and rank (see `write_offset`).
+        self._destination = {"endpoint": self._location, "run_id": run_id, "rank": rank}
+        self.replayed: str | None = None  # why the last stream started again at byte 0, if it did
+        self._acked = 0  # set from the offset file as each stream starts (`_resume`)
+        self._head = b""  # the file's first bytes and the bytes just before `sent`, to bind acks
+        self._tail = b""
+        self._pending: dict[int, dict[str, str]] = {}  # batch end offset -> the file's identity there
+        self._pending_lock = threading.Lock()
         self._progress = False
         self._reported = False
         self._pid = os.getpid()
@@ -434,11 +550,13 @@ class FlightSender:
         """Bytes of the local file that the server has stored."""
         return self._acked
 
-    def unacked_bytes(self) -> int:
+    def unacked_bytes(self) -> int | None:
+        """Bytes of the local file the server has not confirmed; None when the file cannot be
+        read, which is not "nothing left to send"."""
         try:
             return max(0, self.path.stat().st_size - self._acked)
         except OSError:
-            return 0
+            return None
 
     def close(self, timeout: float = CLOSE_TIMEOUT) -> bool:
         """Send the complete lines that are left and wait up to `timeout` seconds for the
@@ -454,6 +572,13 @@ class FlightSender:
         self._closing.set()
         self._thread.join(timeout)
         left = self.unacked_bytes()
+        if left is None:
+            print(
+                f"tensorquill: {self.path} cannot be read, so whether {self.endpoint} has all of it is not "
+                f"known ({self.last_error or 'the file is missing'}).",
+                file=sys.stderr,
+            )
+            return False
         if left:
             reason = f" ({self.last_error})" if self.last_error is not None else ""
             print(
@@ -472,7 +597,7 @@ class FlightSender:
             deadline = time.monotonic() + FIRST_BEAT_HOLD_SECONDS + 1.0
             while not self._hold.is_set() and not self._closing.is_set() and time.monotonic() < deadline:
                 self._hold.wait(0.05)
-        attempt = 0
+        ceiling = self._backoff_base  # the next delay's upper bound, doubled after each failure up to the cap
         retried_on_close = False
         while True:
             was_closing = self._closing.is_set()
@@ -483,26 +608,27 @@ class FlightSender:
                 self.last_error = _without_traceback(error)
             if self._progress:
                 self._progress = False
-                attempt = 0
+                ceiling = self._backoff_base
                 self._reported = False
             elif not self._reported and not self._closing.is_set():
                 # Say once per outage that nothing is arriving: a wrong token or address
                 # would otherwise stay silent until close(). close() reports on its own.
                 self._reported = True
-                print(
-                    f"tensorquill: streaming to {self.endpoint} is failing ({self.last_error}). Training "
-                    f"continues and {self.path} stays complete; the sender keeps retrying.",
-                    file=sys.stderr,
-                )
+                if isinstance(self.last_error, LocalFileUnreadable):
+                    message = (f"tensorquill: {self.last_error}, so nothing more of it can be streamed to "
+                               f"{self.endpoint}. Training continues; the sender tries the file again later.")
+                else:
+                    message = (f"tensorquill: streaming to {self.endpoint} is failing ({self.last_error}). Training "
+                               f"continues and {self.path} stays complete; the sender keeps retrying.")
+                print(message, file=sys.stderr)
             if self._closing.is_set():
-                if time.monotonic() >= self._deadline:
-                    return
+                if time.monotonic() >= self._deadline or isinstance(self.last_error, LocalFileUnreadable):
+                    return  # close() says the file cannot be read; waiting would not change that
                 if not was_closing and not retried_on_close:
                     retried_on_close = True
-                    attempt = 0
+                    ceiling = self._backoff_base
                     continue
-                delay = random.uniform(0.0, min(self._backoff_cap, self._backoff_base * 2**attempt))
-                attempt += 1
+                delay, ceiling = self._backoff(ceiling)
                 remaining = self._deadline - time.monotonic()
                 if remaining <= 0:
                     return
@@ -510,18 +636,77 @@ class FlightSender:
                 if time.monotonic() >= self._deadline:
                     return
                 continue
-            delay = random.uniform(0.0, min(self._backoff_cap, self._backoff_base * 2**attempt))
-            attempt += 1
+            delay, ceiling = self._backoff(ceiling)
             if self._closing.wait(delay):
                 if time.monotonic() >= self._deadline:
                     return
                 retried_on_close = True
-                attempt = 0
+                ceiling = self._backoff_base
+
+    def _backoff(self, ceiling: float) -> tuple[float, float]:
+        """Full jitter: a delay drawn below `ceiling`, and the next ceiling, doubled and held at
+        the cap, so a long outage keeps retrying every `backoff_cap` seconds at most."""
+        ceiling = min(self._backoff_cap, max(0.0, ceiling))
+        return self._random.uniform(0.0, ceiling), min(self._backoff_cap, ceiling * 2.0)
+
+    def _resume(self) -> int:
+        """Where this stream starts: the saved offset when the offset file names this server,
+        run and rank and the file's bytes match its digests, else 0 (the server drops what it
+        already has). Raises `LocalFileUnreadable` when the file cannot be read."""
+        binding = read_binding(self.offset_path)
+        offset = binding["offset"]
+        try:
+            head, tail = _windows(self.path, 0)
+            reason = None
+            if offset and any(binding.get(key) != value for key, value in self._destination.items()):
+                reason = "the offset file names another server, run or rank" if "endpoint" in binding else (
+                    "the offset file names no server or file")
+            elif offset:
+                try:
+                    found_head, found_tail = _windows(self.path, offset)
+                except ValueError:
+                    reason = f"the file is shorter than its saved offset {offset}"
+                else:
+                    if (_digest(found_head), _digest(found_tail)) != (binding.get("head"), binding.get("tail")):
+                        reason = "the file's bytes are not the ones the offset was saved for"
+                    else:
+                        head, tail = found_head, found_tail
+        except OSError as error:
+            raise LocalFileUnreadable(f"{self.path} cannot be read ({error})") from None
+        self.replayed = reason
+        self._head, self._tail = head, tail
+        with self._pending_lock:
+            self._pending.clear()
+        return 0 if reason else offset
+
+    def _sent(self, data: bytes, end: int) -> None:
+        """Move the identity windows past `data`, the bytes just sent, which end at `end`."""
+        if len(self._head) < HEAD_BYTES:
+            self._head += data[: HEAD_BYTES - len(self._head)]
+        self._tail = (self._tail + data[-TAIL_BYTES:])[-TAIL_BYTES:]
+        with self._pending_lock:
+            self._pending[end] = {"head": _digest(self._head), "tail": _digest(self._tail)}
 
     def _ack(self, offset: int) -> None:
         if offset > self._acked:
-            write_offset(self.offset_path, offset)
+            with self._pending_lock:
+                identity = self._pending.get(offset)
+            if identity is None:
+                # An offset this stream did not send: the server keeps the highest offset of a
+                # stream that ended before it stored it, and acks it on the next stream. When this
+                # stream started again at byte 0 because the file was replaced, that offset is the
+                # old file's, so it is not taken. Otherwise it is this file's, if the file reaches it.
+                if self.replayed is not None:
+                    return
+                try:
+                    identity = file_identity(self.path, offset)
+                except (OSError, ValueError):
+                    return  # later acks name the batches this stream sends
+            write_offset(self.offset_path, offset, {**self._destination, **identity})
             self._acked = offset
+            with self._pending_lock:
+                for end in [end for end in self._pending if end <= offset]:
+                    del self._pending[end]
             self._progress = True
             self.last_error = None
 
@@ -529,12 +714,7 @@ class FlightSender:
         import pyarrow as pa
         import pyarrow.flight as flight
 
-        try:
-            size = self.path.stat().st_size
-        except OSError:
-            size = 0
-        if self._acked > size:  # the file was replaced; the server's step filter covers a resend
-            self._acked = 0
+        self._acked = self._resume()  # 0 when the file is not the one the offset was saved for
         sent = self._acked
         schema = flight_schema()
         headers = [(b"authorization", f"Bearer {self._token}".encode())] if self._token else []
@@ -578,8 +758,8 @@ class FlightSender:
                     full = len(lines) >= self._batch_steps or end - sent >= self._batch_bytes
                     if lines and (full or closing or now - waiting_since >= self._batch_seconds):
                         records, skipped = parse_lines(lines, self.run_id)
-                        self.skipped_lines += skipped
-                        steps = [r["step"] for r in records]
+                        batch, steps, unstorable = rows_to_send(records, schema)
+                        self.skipped_lines += skipped + unstorable
                         metadata = {
                             "schema_version": SCHEMA_VERSION,
                             "run_id": self.run_id,
@@ -592,9 +772,7 @@ class FlightSender:
                             **({MANIFEST_KEY: self.manifest} if first_batch and self.manifest else {}),
                         }
                         first_batch = False
-                        batch = pa.RecordBatch.from_pylist(
-                            [record_to_row(r) for r in records], schema=schema
-                        )
+                        self._sent(b"".join(line + b"\n" for line in lines), end)
                         writer.write_with_metadata(batch, pa.py_buffer(json.dumps(metadata).encode()))
                         sent = end
                         waiting_since = None
@@ -632,6 +810,15 @@ def _without_traceback(error: BaseException) -> BaseException:
         item.__traceback__ = None
         item = item.__cause__ or item.__context__
     return error
+
+
+def _close_quietly(client: Any) -> None:
+    if client is None:
+        return
+    try:
+        client.close()
+    except BaseException:  # noqa: BLE001  a client that cannot close is dropped as before
+        pass
 
 
 def send_file(
@@ -817,9 +1004,11 @@ class Heartbeat:
                     pass
                 self.sent += 1
             except BaseException:  # noqa: BLE001  a missed beat is the server's to notice
+                _close_quietly(client)  # its channel is closed now, not when the collector gets to it
                 client = None
             self.first_sent.set()
             self._changed.wait(self.interval)
+        _close_quietly(client)
 
 
     def _stalled_stack(self, work: int) -> dict[str, Any] | None:

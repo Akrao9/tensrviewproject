@@ -160,11 +160,15 @@ def test_line_torn_by_a_crash_is_skipped_and_other_runs_lines_are_not_sent(tmp_p
     append(path, [record(0)])
     with path.open("a", encoding="utf-8") as file:
         file.write('{"schema_version":1,"run_id":"run-a","ra')  # the process died here
-    append(path, [record(1), record(7, run_id="someone-else"), record(2)])
+    # The next process opens the file with JsonlSink, which ends the torn line first: the
+    # fragment stays a line of its own and step 1, the first step after the restart, is kept.
+    sink = tensorquill.JsonlSink(path)
+    sink.write([record(1), record(7, run_id="someone-else"), record(2)])
+    sink.close()
     sender = fast_sender(path, server.endpoint)
     assert sender.close() is True
-    assert store.steps() == [0, 2]  # the torn line swallowed step 1's line; both are skipped
-    assert sender.skipped_lines == 2
+    assert store.steps() == [0, 1, 2]
+    assert sender.skipped_lines == 2  # the fragment and the other run's line
     assert read_offset(offset_path(path)) == path.stat().st_size
 
 
@@ -417,7 +421,8 @@ def test_tls_ca_is_loaded_at_init_and_ignored_for_plaintext(tmp_path, monkeypatc
     monkeypatch.setenv("TENSORQUILL_TLS_CA", str(missing))
     plain = FlightSender(path, "grpc://127.0.0.1:9", "run-a", 0)
     assert plain._tls_root_certs is None
-    assert plain.close(timeout=0.05) is True  # empty missing file has 0 unacked bytes
+    # The file was never written: that is not "all of it confirmed" (audit C08, lane U4).
+    assert plain.close(timeout=0.05) is False
 
 
 def test_thread_stacks_name_where_each_thread_is_without_the_caller_or_tensorquill_s_own():
