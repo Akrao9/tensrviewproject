@@ -598,7 +598,10 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
     file, and the listing reads no file whole. Its last step is the furthest of the files'
     first and last records that `resolve_attempts` keeps, so an attempt that a later one
     replaced does not count (lane V4, CLI-13). The files are named."""
-    from .evidence import RUN_STATES, _incident_identity, _rank_ranges, combine_rank_evidence, resolve_attempts, run_state
+    from .evidence import (
+        RUN_STATES, _incident_identity, _rank_ranges, attempt_order_report, combine_rank_evidence,
+        resolve_attempts_across, run_state,
+    )
 
     def ranks(numbers: list[int]) -> str:
         return f"rank{'s' if len(numbers) != 1 else ''} {_rank_ranges(numbers, 8)}"
@@ -613,14 +616,19 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
         records = files[number]
         if number in (more or {}):
             paths = [records, *more[number]]
-            ends = [end for path in paths for end in known["ends"][path]
-                    if end is not None and _record_rank(end) == number and isinstance(end.get("step"), int)
-                    and not isinstance(end.get("step"), bool)]
-            kept = resolve_attempts(ends)
+            # Each file's ends kept apart: the attempts are ordered across the files by contract 1
+            # (each file's own order first, then `ts`, then number; never path order; lane W3).
+            ends = [[end for end in known["ends"][path]
+                     if end is not None and _record_rank(end) == number and isinstance(end.get("step"), int)
+                     and not isinstance(end.get("step"), bool)] for path in paths]
+            kept = resolve_attempts_across(ends)
             if kept:
                 steps.append(max(r["step"] for r in kept))
+            order = [info for info in attempt_order_report(ends, [p.name for p in paths]).values()
+                     if info["attempt_order"] == "numeric"]
             split[number] = (f"its records are in {len(paths)} files ({', '.join(p.name for p in paths)}), and an evidence "
-                             "file is of one file: compare it (python -m tensorquill compare reads them all)")
+                             "file is of one file: compare it (python -m tensorquill compare reads them all)"
+                             + "".join(f"; {info['reason']}" for info in order))
             continue
         _, last = known["ends"][records]
         step = (last or {}).get("step")

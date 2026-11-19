@@ -879,10 +879,10 @@ def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[st
     one with a line torn by a killed process) is read on its whole lines, as `_open_local` reads
     it, with the attempts resolved as `load_records` resolves them. A list is a rank's several
     files: every attempt of each, in that order, then resolved together (lane V4, CLI-13)."""
-    from .evidence import _Tail, load_records, resolve_attempts
+    from .evidence import _Tail, load_records, resolve_attempts, resolve_attempts_across
 
     if isinstance(path, (list, tuple)):
-        every: list[dict[str, Any]] = []
+        per_file: list[list[dict[str, Any]]] = []  # each file's own order kept (contract 1, lane W3)
         seen: set[str] = set()
         torn = False
         for one in path:
@@ -896,8 +896,8 @@ def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[st
                 tail.poll()
                 found = tail.records
                 torn = True
-            every += _not_read_yet(found, seen)
-        return resolve_attempts(every), torn
+            per_file.append(_not_read_yet(found, seen))
+        return resolve_attempts_across(per_file), torn
     try:
         return load_records(path, rank=rank), False
     except ValueError:

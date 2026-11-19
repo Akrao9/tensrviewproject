@@ -621,9 +621,23 @@ def _write_case(folder: Any, case: dict[str, Any]) -> None:
 
 
 @pytest.mark.parametrize("name", CASES_ACROSS)
-def test_contract1_across_files_compare(name: str, tmp_path: Any) -> None:
-    # `compare` reads every file of a rank (lane V4's compare.py): it must resolve them with
-    # `resolve_attempts_across`, not by concatenating them in path order.
+def test_contract1_across_files_compare_step_records(name: str, tmp_path: Any) -> None:
+    # `compare` reads every file of a rank for its step records (`_step_records`, the divergence
+    # part): resolved with `resolve_attempts_across`, not concatenated in path order.
+    from tensorquill.compare import _step_records
+
+    case = _case(name)
+    _write_case(tmp_path / "runs", case)
+    paths = sorted(str(tmp_path / "runs" / name) for name in case["files"])
+    for given in (paths, paths[::-1]):
+        kept, _ = _step_records(given, 0)
+        assert sorted((r["attempt"], r["step"]) for r in kept) == sorted(case["kept"])
+
+
+@pytest.mark.xfail(strict=True, reason="compare's open_run (`_open_local`, `_open_local_all_ranks`) still concatenates a "
+                   "rank's files in path order: not in the two edits granted to lane W3; asked of the top session")
+@pytest.mark.parametrize("name", [n for n in CASES_ACROSS if n != "null-ts"])
+def test_contract1_across_files_compare_open_run(name: str, tmp_path: Any) -> None:
     from tensorquill import compare
 
     case = _case(name)
@@ -638,6 +652,11 @@ def test_contract1_across_files_runs(name: str, tmp_path: Any) -> None:
     _write_case(tmp_path / "runs", case)
     (row,) = [r for r in tensorquill.list_runs(tmp_path / "runs") if r["run_id"] == ACROSS_RUN]
     assert row["last_step"] == case["last"]
+    if case["attempt_order"] == "numeric":  # the reader says the files disagree, naming them
+        import json
+
+        said = json.dumps(row)
+        assert "disagree" in said and all(name in said for name in case["files"]), said
 
 
 def test_contract1_late_rows_of_a_superseded_attempt_are_counted_in_a_local_file() -> None:
