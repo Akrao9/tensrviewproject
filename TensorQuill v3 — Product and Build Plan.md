@@ -2445,6 +2445,39 @@ State as of Nov 16, 2026.
       - `test_a_strict_subclass_is_refused_under_compile_not_raised` (default and `indices=` routers, with and without `fullgraph`) and `test_a_subclass_that_raises_on_eq_is_refused_under_fullgraph`: these 5 fail on `112ea01`.
       - `test_eager_mode_still_reads_subclasses_through_its_try` (2 cases) and `test_a_module_that_returns_a_parameter_is_still_read_under_compile` (`eager` and `aot_eager`; router counts `[3, 3, 0, 0]` and the block's mean 0.5) pass before and after. They guard the eager behaviour and the `nn.Parameter` allowance; option (a) would have failed the second.
     - *Open, for the author.* A refused block is visible in the records only as a block missing from `layers`. The layer statistics have no field that says why. Proposed: `layers_not_read: {block: why}`, said once, as `moe_refused` is. It would be a schema change, with readers in the evidence and the server; it is not built here.
+  - *Item 10, F1, decided by the author (logged on `main` at `543f2cc`): "read the bool routing map [..., n_experts], filtering probs != 0 when paired with a same-shape float tensor. option a".* Done in commits of its own, after item 9. With it, nothing in `capture.py` is held back.
+    - *Reproduced first, on this branch.*
+      - `f1-megatron-capacity-drop.py` counted `[2, 2, 0, 0]` where the map routes `[1, 1, 0, 0]`, and the other misreads as the F1 entry lists them.
+      - `router121.py`, the script from `CORRECTNESS_AUDIT.md`: 36 of 36 full maps matched, 0 of 85 with fewer assignments.
+    - *Built* (`_routing_map`, `_router_hook`). The order of sources: an `indices=` function, then an integer tensor, as before; then a bool routing map; then the top-`top_k` of a float tensor.
+      - A map is the first bool tensor whose last dimension is `n_experts` and whose other dimensions multiply to the tokens the hook was called on. The token check is skipped where that count is symbolic.
+      - A map is read only when the output also holds a floating-point tensor, so only an output of a float tensor and a bool map is counted differently. A bool tensor alone is refused as before; `test_router_guard.py`'s bool case holds that.
+      - The count, per expert, is the true entries of the map. Entries whose paired float is exactly zero are left out. The paired float is the first floating-point tensor of exactly the map's shape; with none of that shape, every true entry counts.
+      - `_unusable` (device, layout and dtype, and item 9's subclass check) applies to the map and to its paired float.
+      - There is no branch on the data, so it traces the same under `torch.compile`. `Router`'s docstring states the order and the pairing rule.
+    - *Run after the change.*
+      - `f1-megatron-capacity-drop.py`: two tokens `[1, 1, 0, 0]`; the partial drop `[1, 1, 1, 1]`; 64 tokens `[24, 32, 32, 32]` ("probs" policy) and `[32, 32, 28, 32]` ("position"); no capacity limit `[34, 31, 33, 30]`, as before; padded to capacity `[29, 32, 32, 31]` and `[32, 32, 24, 30]`, the entries with a nonzero probability.
+      - `router121.py`: 121 of 121 maps match. Tokens with fewer than `top_k` assignments, and with none, are counted as the map says.
+    - *Tests* (13 new; 11 fail on `ee0166e`, and the 2 that pass there guard what must not change).
+      - `test_a_megatron_style_router_is_counted_as_its_routing_map_routes` (7 cases): each checks the router's own map or nonzero probabilities, and the two cases that use no random numbers check the plan's numbers too.
+      - `test_every_one_of_the_121_two_token_maps_is_counted_as_it_routes`
+      - `test_a_mask_over_the_experts_alone_is_not_taken_for_a_routing_map` (guard)
+      - `test_with_logits_before_the_probabilities_the_logits_are_paired_and_padding_is_counted`, which pins the limit below.
+      - `test_a_routing_map_on_another_device_is_refused_as_any_output_there_is`
+      - `test_a_compiled_megatron_style_router_counts_as_in_eager_mode` (`eager` and `aot_eager`, each with a control that compiles without TensorQuill).
+      - `test_compile.py`: 0 graph breaks and 0 recompiles. The full `sdk/tests` with this worktree on `PYTHONPATH`: 1300 passed, 619 skipped, none failed.
+    - *Limits, stated.*
+      - The pairing takes the first float tensor of the map's shape. An output of logits, probabilities and a map pairs the logits, which are never zero, so with `pad_to_capacity` the padding is counted.
+      - A real assignment whose weight is exactly zero, after an underflow in half precision for example, is left out together with the padding.
+    - *Downstream* (script `lane-u1-f1-downstream.py`): a capture of 120 steps whose router keeps 80 of 128 assignments a step (capacity factor 0.6), run through `build_evidence` with the Python detectors and with the read-only server binary's `detect`.
+      - Both ran and agreed: no incident, with `moe_imbalance` and `starved_experts` checked. The same with no capacity limit.
+      - No MoE rule needs tokens × `top_k` assignments: shares are taken over each step's own total.
+      - One soft assumption: the top-k ≥ 3 jump rule estimates tokens as the total divided by k (`evidence.py` `_jump_overloaded`, `detect.rs:1006`). With drops that estimate falls with the kept assignments.
+      - `moe_stats.routed_tokens` is the number of assignments, not tokens. It already was with `top_k` above 1, and is now the assignments kept.
+    - *Open, for the author.*
+      - Nothing in the record or the manifest shows which source a router was counted from. A router that returns `(probs, routing_map)` now counts differently from before, with nothing in the record saying so. Proposed: `moe_source: {router: "indices=" | "integer" | "routing_map" | "top_k"}`, said once, as `moe_refused` is. Not built: a schema change with readers in the evidence and the server.
+      - The audit's C06 integer case, `[-1, 8]` for 4 experts recorded as `[0, 0, 0, 0]`, is still open and undecided; not touched here.
+    - *Not run.* Megatron itself is not installed; the stand-in follows the reference clone. Also not run: a GPU, inductor, PyTorch 2.6.
 
 ## Sources
 
