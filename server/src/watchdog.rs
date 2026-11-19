@@ -98,10 +98,11 @@
 //! A higher attempt on a rank whose stream had finished is the job started again after a clean
 //! end: the rank is no longer finished, but a stream not open yet, `reconnecting` for the start
 //! window from that beat and then `lost`, until the new attempt opens its stream (decided Nov 19,
-//! 2026; until then the rank read finished for good, the new attempt shown beside it). So is a
-//! rank whose stream, opened before the new attempt's first beat, then ends cleanly: that is the
-//! earlier attempt's process closing. A stream the new attempt opened itself and closed cleanly
-//! is finished, whether or not it stored anything.
+//! 2026; until then the rank read finished for good, the new attempt shown beside it). A stream
+//! the new attempt opens and closes cleanly finishes the rank again, whether or not it stored
+//! anything. A clean end of a stream that was open before the new attempt's first beat finishes it
+//! too: the server cannot tell the earlier attempt's process closing from the new attempt's
+//! (a sender that waited longer than its hold opens its stream before its first beat).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
@@ -708,26 +709,12 @@ impl Watchdog {
         });
     }
 
-    /// `clean` is true when the sender ended the stream itself, as `close()` does. A clean end of
-    /// a stream that opened before a new attempt was seen in the beats is the earlier attempt's
-    /// process closing: the new attempt has not connected, so the rank is not finished. It is a
-    /// stream not open yet, `reconnecting` for the start window from the new attempt's first beat
-    /// (decided Nov 19, 2026; until then the rank read finished for good).
+    /// `clean` is true when the sender ended the stream itself, as `close()` does.
     pub fn stream_ended(&self, key: &Key, clean: bool, now: Instant) {
-        let window = self.config.start_limit;
         self.with(key, now, |p| {
             p.open_streams = p.open_streams.saturating_sub(1);
             if p.open_streams == 0 {
-                let earlier_attempts = p.attempt_since.is_some_and(|since| p.last_change < since);
-                p.stream = if clean && !earlier_attempts {
-                    Stream::Finished
-                } else {
-                    Stream::Dropped
-                };
-                if clean && earlier_attempts {
-                    let since = p.attempt_since.unwrap_or(now);
-                    p.fresh = Some((since.checked_add(window).unwrap_or(since), RankState::Lost));
-                }
+                p.stream = if clean { Stream::Finished } else { Stream::Dropped };
                 p.last_change = now;
             }
         });
@@ -1047,14 +1034,18 @@ pub fn run_status(
 /// What this server's detectors last reported for one rank: the incident kinds in order and
 /// the checks it could not make (Flight Recorder and TrainCheck left out: they are never
 /// expected here), and the attempt and last step they had read, the report's own `attempt` and
-/// `last_step`. Present only while the rank's detectors are on; [`run_state`] counts it only
-/// while its attempt is the one the status shows for the rank.
+/// `last_step`. Present only while the rank's detectors are on. [`run_state`] lists its incidents
+/// whatever rows it read, and judges the rank by it only while it is current: of the attempt the
+/// status shows for the rank, and not `behind`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RankReport {
     pub kinds: Vec<String>,
     pub not_checked: Vec<String>,
     pub attempt: i64,
     pub last_step: Option<i64>,
+    /// Set by the caller: the report stops before the newest part stored for the rank, and has
+    /// for longer than a moment (see `Ingest::write_statuses`).
+    pub behind: bool,
 }
 
 const RUN_STATES: [&str; 4] = ["healthy", "degraded", "unknown", "unhealthy"];
@@ -1065,9 +1056,9 @@ const RUN_STATES: [&str; 4] = ["healthy", "degraded", "unknown", "unhealthy"];
 /// A rank this server has not judged since it started (it has not sent a part, its detectors
 /// failed, or `--no-detect`) is unknown; so is a rank whose report is of another attempt than
 /// the status shows for it, or that the status marks `attempt_without_steps` (the job was started
-/// again and the new attempt has stored nothing: decided Nov 19, 2026, until then any report the
-/// rank had counted). The caller passes only the reports that cover the last part it stored
-/// (see `Ingest::write_statuses`). So is a missing rank, a stopped server and any summary
+/// again and the new attempt has stored nothing), or that is `behind` the store (decided Nov 19,
+/// 2026; until then any report the rank had judged it). Such a report's incidents are still
+/// listed: they were found in stored rows. So is a missing rank, a stopped server and any summary
 /// other than `active` or `finished` (a stall among them: the stream cannot tell a hang from a
 /// pause). A reader of a `watchdog.json` that is no longer being rewritten must not trust it:
 /// Python calls such a status old, and the run state unknown. Each incident's class comes from
@@ -1082,22 +1073,25 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
         .iter()
         .filter_map(|rank| rank["rank"].as_i64().and_then(|rank| i32::try_from(rank).ok()))
         .collect();
-    // The reports about what the status shows: of the attempt the status names for the rank (a
-    // status entry without one is attempt 0, as a sender that names none), and not of a rank whose
-    // new attempt has stored nothing yet. Another rank's report says nothing here.
+    // The reports that judge their rank: not behind the store, of the attempt the status names for
+    // the rank (a status entry without one is attempt 0, as a sender that names none), and not of a
+    // rank whose new attempt has stored nothing yet.
     let entries = status["ranks"].as_array().map_or(&[][..], Vec::as_slice);
-    let current = |rank: &i32| -> Option<&RankReport> {
-        let report = reports.get(rank)?;
-        let entry = entries
+    let current = |rank: &i32| -> bool {
+        let Some(report) = reports.get(rank).filter(|report| !report.behind) else {
+            return false;
+        };
+        entries
             .iter()
-            .find(|entry| entry["rank"].as_i64() == Some(i64::from(*rank)))?;
-        let same_attempt = entry["attempt"].as_i64().unwrap_or(0) == report.attempt;
-        (same_attempt && entry["attempt_without_steps"] != true).then_some(report)
+            .find(|entry| entry["rank"].as_i64() == Some(i64::from(*rank)))
+            .is_some_and(|entry| {
+                entry["attempt"].as_i64().unwrap_or(0) == report.attempt && entry["attempt_without_steps"] != true
+            })
     };
     let stream = status["incidents"].as_array().map_or(&[][..], Vec::as_slice);
     let mut listed: Vec<String> = Vec::new();
     for rank in &ranks {
-        if let Some(report) = current(rank) {
+        if let Some(report) = reports.get(rank) {
             listed.extend(report.kinds.iter().cloned());
         }
     }
@@ -1123,11 +1117,7 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
             "detail": format!("{count} incident{} listed: {}", if count == 1 { "" } else { "s" }, kinds.join(", ")),
         }));
     }
-    let judged: Vec<i32> = ranks
-        .iter()
-        .copied()
-        .filter(|rank| detect && current(rank).is_some())
-        .collect();
+    let judged: Vec<i32> = ranks.iter().copied().filter(|rank| detect && current(rank)).collect();
     if judged.is_empty() {
         reasons.push(json!({"state": "unknown", "code": "no_steps", "detail": "no step has been judged yet"}));
     }
@@ -3026,24 +3016,16 @@ mod tests {
     }
 
     #[test]
-    fn a_new_attempt_seen_before_the_earlier_attempts_stream_closes_is_not_finished_by_that_close() {
-        // RS01, the other order: the new attempt's first beat comes while the earlier attempt's
-        // stream is still open, and that stream then ends cleanly.
+    fn a_new_attempt_that_opens_its_own_stream_and_closes_it_cleanly_is_finished() {
+        // RS01's reopening does not keep a rank from finishing: the new attempt opens its stream,
+        // stores nothing and closes it cleanly.
         let t0 = Instant::now();
-        let dog = Watchdog::new(config(60));
-        dog.stream_opened(&key(0), t0);
-        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 5));
-        assert!(dog.attempt_seen(&key(0), 2, at(t0, 100)));
-        dog.stream_ended(&key(0), true, at(t0, 110));
-        assert_eq!(states(&dog, at(t0, 111)), ["reconnecting"]);
-        assert_eq!(summary(&dog, at(t0, 111)), "active");
-        assert_eq!(states(&dog, at(t0, 701)), ["lost"]);
-        // A new attempt that opens its own stream, stores nothing and closes it cleanly finished.
         let dog = Watchdog::new(config(60));
         dog.stream_opened(&key(0), t0);
         dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 5));
         dog.stream_ended(&key(0), true, at(t0, 6));
         assert!(dog.attempt_seen(&key(0), 2, at(t0, 100)));
+        assert_eq!(summary(&dog, at(t0, 100)), "active");
         dog.stream_opened(&key(0), at(t0, 101));
         dog.stream_ended(&key(0), true, at(t0, 102));
         assert_eq!(summary(&dog, at(t0, 103)), "finished");
@@ -3124,5 +3106,42 @@ mod tests {
         assert_eq!(found["reasons"][1]["ranks"], json!([0]), "{found}");
         let found = run_state(&status, &ours, true);
         assert_eq!(found["state"], "unknown", "{found}");
+        // The incidents it found are still listed: they were found in stored rows.
+        let found_one = BTreeMap::from([(
+            0,
+            RankReport {
+                kinds: vec!["non_finite".into()],
+                attempt: 1,
+                ..Default::default()
+            },
+        )]);
+        let found = run_state(&status, &found_one, true);
+        assert_eq!(found["state"], "unhealthy", "{found}");
+        let codes: Vec<&str> = found["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|reason| reason["code"].as_str().unwrap())
+            .collect();
+        assert_eq!(codes, ["incidents", "no_steps", "ranks_unknown"]);
+        // A report behind the store judges nothing either, and its incidents are listed.
+        let mut behind = found_one.clone();
+        behind.get_mut(&0).unwrap().behind = true;
+        let mut same = status.clone();
+        same["ranks"][0]["attempt"] = json!(1);
+        same["ranks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("attempt_without_steps");
+        assert_eq!(
+            run_state(&same, &found_one, true)["reasons"].as_array().unwrap().len(),
+            1
+        );
+        let found = run_state(&same, &behind, true);
+        assert_eq!(
+            (&found["state"], &found["reasons"][2]["ranks"]),
+            (&json!("unhealthy"), &json!([0])),
+            "{found}"
+        );
     }
 }

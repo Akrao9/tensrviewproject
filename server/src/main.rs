@@ -218,6 +218,7 @@ async fn run(args: Args) -> Result<(), Error> {
         detect: !args.no_detect,
         thresholds: Arc::new(args.thresholds.unwrap_or_default()),
         abandon_after: Duration::from_secs_f64(args.abandon_hours * 3600.0),
+        ..IngestConfig::default()
     };
     let options = StoreOptions {
         retry_timeout: Duration::from_secs_f64(args.store_retry_seconds),

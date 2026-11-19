@@ -2297,16 +2297,20 @@ async fn status_until(
     }
 }
 
-/// RS04. A rank's cached report counts only while it covers what the status shows: the attempt
-/// the status names (not one seen in the beats alone) and the last part this server stored. Two
-/// flushes with the second report's write held back and the attempt changed, then a third with
-/// the attempt the same: while the report is held the rank is not judged. Rows waiting in the
-/// buffer, not stored yet, do not make a current report stale.
+/// RS04. A rank's cached report judges it only while it covers what the status shows: the
+/// attempt the status names (not one seen in the beats alone) and the last part this server
+/// stored (here with no grace). Two flushes with the second report's write held back and the
+/// attempt changed, then a third with the attempt the same: while the report is held the rank is
+/// not judged. Rows waiting in the buffer, not stored yet, do not make a current report stale.
 #[tokio::test]
 async fn a_cached_report_of_other_rows_than_the_status_shows_does_not_judge_the_rank() {
     use std::sync::atomic::Ordering;
     let store = TestStore::new();
-    let server = start_on(store.clone(), every_50(), None).await;
+    let config = IngestConfig {
+        report_grace: Duration::ZERO,
+        ..every_50()
+    };
+    let server = start_on(store.clone(), config, None).await;
     let mut put = open_attempts(&server).await;
     put.send(attempt_batch(&rows(1, 0..50)), 100).await;
     assert_eq!(put.ack().await, Ok(100));
@@ -2353,6 +2357,50 @@ async fn a_cached_report_of_other_rows_than_the_status_shows_does_not_judge_the_
     let status = written_status(&server, &store).await;
     assert!(judged(&status), "{}", status["run_state"]);
     assert_eq!(put.finish().await, vec![400]);
+}
+
+/// RS04, with the usual grace: a report a moment behind the part just stored still judges its
+/// rank, so a run that streams normally does not read unknown after each part; a report of an
+/// earlier attempt than the status shows never does.
+#[tokio::test]
+async fn a_report_a_moment_behind_the_store_judges_its_rank_for_the_grace_and_one_of_another_attempt_never() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let server = start_on(store.clone(), every_50(), None).await; // the usual 30 s grace
+    let mut put = open_attempts(&server).await;
+    put.send(attempt_batch(&rows(1, 0..50)), 100).await;
+    assert_eq!(put.ack().await, Ok(100));
+    status_until(&server, &store, "attempt 1 judged", judged).await;
+    store.knobs.hold_incidents.store(true, Ordering::SeqCst);
+    put.send(attempt_batch(&rows(1, 50..100)), 200).await;
+    assert_eq!(put.ack().await, Ok(200));
+    until_within("the second report held", SLOW_BOUND, || {
+        store.knobs.held_incidents.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let status = written_status(&server, &store).await;
+    assert_eq!(status["ranks"][0]["last_step"], 99);
+    assert!(judged(&status), "{}", status["run_state"]);
+    store.knobs.hold_incidents.store(false, Ordering::SeqCst);
+    // The held report is written (the rank reads judged throughout, so wait for the file).
+    let deadline = tokio::time::Instant::now() + SLOW_BOUND;
+    while json_in(&store, &format!("runs/{RUN}/rank=0/incidents.json")).await["last_step"] != 99 {
+        assert!(tokio::time::Instant::now() < deadline, "the second report written");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    store.knobs.hold_incidents.store(true, Ordering::SeqCst);
+    put.send(attempt_batch(&rows(2, 0..50)), 300).await;
+    assert_eq!(put.ack().await, Ok(300));
+    until_within("the third report held", SLOW_BOUND, || {
+        store.knobs.held_incidents.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    let status = written_status(&server, &store).await;
+    assert_eq!(status["ranks"][0]["attempt"], 2);
+    assert!(!judged(&status), "{}", status["run_state"]);
+    store.knobs.hold_incidents.store(false, Ordering::SeqCst);
+    status_until(&server, &store, "attempt 2 judged", judged).await;
+    put.finish().await;
 }
 
 fn data_attempt_schema() -> Arc<Schema> {
