@@ -18,7 +18,6 @@ import random
 import threading
 import warnings
 
-import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -489,21 +488,29 @@ def test_a_composite_configs_parts_are_as_they_were_after_a_probe(before):
 
 
 def test_a_probe_leaves_pythons_and_numpys_random_state_as_it_found_them():
+    try:  # the core SDK does not need NumPy, and CI's CPU jobs do not install it
+        import numpy as np
+    except ImportError:
+        np = None
+
     def draws():
-        return random.random(), float(np.random.rand()), float(torch.rand(()))
+        return random.random(), float(np.random.rand()) if np else None, float(torch.rand(()))
 
     def fn(m):
         random.random()
-        np.random.rand(3)
+        if np:
+            np.random.rand(3)
         torch.rand(5)
         m(torch.randn(1, 48))
 
-    random.seed(123)
-    np.random.seed(123)
-    torch.manual_seed(123)
+    def seed():
+        random.seed(123)
+        if np:
+            np.random.seed(123)
+        torch.manual_seed(123)
+
+    seed()
     expected = draws()
-    random.seed(123)
-    np.random.seed(123)
-    torch.manual_seed(123)
+    seed()
     tq_probe.run_probe(Blocks(Attn()), fn, tq_probe.ProbeState(), CPU)
     assert draws() == expected
