@@ -49,6 +49,9 @@ pub const SCHEMA_VERSION: i64 = 1;
 pub const DEFAULT_QUOTA_BYTES: usize = 128 * 1024 * 1024;
 pub const DEFAULT_FLUSH_STEPS: usize = 500;
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a rank's report may stay behind the parts stored for it and still judge the rank:
+/// Python's `REPORT_GRACE_SECONDS` (see `IngestConfig::report_grace`).
+pub const DEFAULT_REPORT_GRACE: Duration = Duration::from_secs(30);
 /// Parts written at once by the timed flush and at shutdown.
 const FLUSH_CONCURRENCY: usize = 16;
 /// Runs whose status is read at startup at once (see `restore_watchdog`).
@@ -85,6 +88,11 @@ pub struct IngestConfig {
     /// status stops being refreshed and a restarted server does not take it up again. Zero never
     /// gives a run up.
     pub abandon_after: Duration,
+    /// A part is stored first and judged a moment later, so a rank's report is behind the store
+    /// for a moment after each part. For this long from when it fell behind it still judges its
+    /// rank in the run state; after it, the rank is unknown until the report catches up. As
+    /// Python's watchers wait `report_grace` (decided Nov 19, 2026).
+    pub report_grace: Duration,
 }
 
 impl Default for IngestConfig {
@@ -103,6 +111,7 @@ impl Default for IngestConfig {
             detect: true,
             thresholds: Arc::default(),
             abandon_after: crate::watchdog::DEFAULT_ABANDON,
+            report_grace: DEFAULT_REPORT_GRACE,
         }
     }
 }
@@ -197,6 +206,20 @@ struct RankBuffer {
     sealed: bool,
 }
 
+/// The newest part stored for a rank and since when its report has been behind it.
+#[derive(Clone, Copy)]
+struct Stored {
+    /// `(attempt, last step)` of the newest part stored, by attempt and then step.
+    newest: (i64, i64),
+    /// When the report last fell behind the store; none while it covers `newest`.
+    behind_since: Option<Instant>,
+}
+
+/// Where a report stops: its attempt and last step, before every step when it read none.
+fn reported(report: &RankReport) -> (i64, i64) {
+    (report.attempt, report.last_step.unwrap_or(i64::MIN))
+}
+
 pub struct Ingest {
     storage: Storage,
     config: IngestConfig,
@@ -215,6 +238,10 @@ pub struct Ingest {
     /// What each rank's detectors last reported, for the run state in `watchdog.json`. Kept
     /// apart from the rank buffers so the watchdog never waits for a flush or a rebuild.
     reports: Mutex<HashMap<Key, RankReport>>,
+    /// Per rank, what this server stored, set as soon as a part is written and before it is
+    /// judged: a report that stops before it is behind the store (as `read_server_report` in
+    /// `evidence.py` reads it), and judges the rank only for `report_grace`.
+    stored: Mutex<HashMap<Key, Stored>>,
     /// The manifest last written per run, as JSON text, so the same one is written once.
     manifests: Mutex<HashMap<String, String>>,
 }
@@ -236,6 +263,7 @@ impl Ingest {
             written: Mutex::new(HashMap::new()),
             data_windows: Mutex::new(HashMap::new()),
             reports: Mutex::new(HashMap::new()),
+            stored: Mutex::new(HashMap::new()),
             manifests: Mutex::new(HashMap::new()),
             used: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -384,6 +412,19 @@ impl Ingest {
                 return Err(Status::unavailable(format!("cannot write to the store: {error}")));
             }
             buffer.sealed = false;
+            {
+                let part = (buffer.attempt, buffer.max_step);
+                let report = self.reports.lock().unwrap().get(key).map(reported);
+                let mut stored = self.stored.lock().unwrap();
+                let entry = stored.entry(key.clone()).or_insert(Stored {
+                    newest: part,
+                    behind_since: None,
+                });
+                entry.newest = entry.newest.max(part);
+                if entry.behind_since.is_none() && report.is_none_or(|report| report < entry.newest) {
+                    entry.behind_since = Some(Instant::now());
+                }
+            }
             self.used.fetch_sub(buffer.bytes, Ordering::SeqCst);
             stored = std::mem::take(&mut buffer.batches);
             buffer.rows = 0;
@@ -409,7 +450,7 @@ impl Ingest {
     /// a rebuild turns this rank's detectors off.
     async fn detect(&self, key: &Key, buffer: &mut RankBuffer, stored: &[RecordBatch]) {
         if buffer.detect_off {
-            self.reports.lock().unwrap().remove(key);
+            self.forget_report(key);
             return;
         }
         let (attempt, first_step) = (buffer.attempt, buffer.min_step);
@@ -454,7 +495,7 @@ impl Ingest {
             };
         }
         let Some(detectors) = &buffer.detectors else {
-            self.reports.lock().unwrap().remove(key);
+            self.forget_report(key);
             return;
         };
         {
@@ -477,6 +518,9 @@ impl Ingest {
                 .collect()
         };
         let report = RankReport {
+            attempt: detectors.attempt(),
+            last_step: detectors.last_step(),
+            behind: false,
             kinds: names(&document["incidents"], "kind"),
             not_checked: names(&document["not_checked"], "check")
                 .into_iter()
@@ -485,7 +529,13 @@ impl Ingest {
         };
         match self.storage.write_incidents(&key.0, key.1, &document).await {
             Ok(()) => {
+                let at = reported(&report);
                 self.reports.lock().unwrap().insert(key.clone(), report);
+                if let Some(stored) = self.stored.lock().unwrap().get_mut(key) {
+                    if at >= stored.newest {
+                        stored.behind_since = None;
+                    }
+                }
             }
             Err(error) => {
                 // What the store holds is now behind what was judged: a reader finds the report
@@ -496,6 +546,16 @@ impl Ingest {
                     key.0, key.1
                 );
             }
+        }
+    }
+
+    /// The rank has no detectors (a rebuild failed or panicked): its report and its batch hashes
+    /// are dropped, since both came from rows before the ones just stored. (Until Nov 19, 2026 the
+    /// hashes stayed, and the status still said the rank's batches were compared.)
+    fn forget_report(&self, key: &Key) {
+        self.reports.lock().unwrap().remove(key);
+        if let Some(run) = self.data_windows.lock().unwrap().get_mut(&key.0) {
+            run.remove(&key.1);
         }
     }
 
@@ -790,15 +850,34 @@ impl Ingest {
 
     async fn write_statuses(&self, statuses: std::collections::BTreeMap<String, serde_json::Value>) {
         let now = Instant::now();
+        // The reports first and the parts stored after: a part stored in between can only make a
+        // report read behind, never current.
+        let all_reports = self.reports.lock().unwrap().clone();
+        let stored = self.stored.lock().unwrap().clone();
         for (run_id, mut status) in statuses {
             status["refresh_seconds"] = serde_json::json!(self.config.status_refresh.as_secs_f64());
-            let reports: std::collections::BTreeMap<i32, RankReport> = self
-                .reports
-                .lock()
-                .unwrap()
+            // A report that stops before the newest part stored for its rank, and has for longer
+            // than `report_grace`, is behind: its rank is not judged until it catches up, and its
+            // incidents are still listed. Rows still in the buffer are not stored, and do not make a
+            // report behind.
+            let reports: std::collections::BTreeMap<i32, RankReport> = all_reports
                 .iter()
                 .filter(|((run, _), _)| *run == run_id)
-                .map(|((_, rank), report)| (*rank, report.clone()))
+                .map(|(key, report)| {
+                    let behind = stored.get(key).is_some_and(|stored| {
+                        reported(report) < stored.newest
+                            && stored
+                                .behind_since
+                                .is_none_or(|since| now.saturating_duration_since(since) >= self.config.report_grace)
+                    });
+                    (
+                        key.1,
+                        RankReport {
+                            behind,
+                            ..report.clone()
+                        },
+                    )
+                })
                 .collect();
             status["run_state"] = crate::watchdog::run_state(&status, &reports, self.config.detect);
             let signature = serde_json::json!({

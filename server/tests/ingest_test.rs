@@ -1110,6 +1110,12 @@ mod store {
         pub range_gets: AtomicUsize,
         pub in_flight: AtomicUsize,
         pub max_in_flight: AtomicUsize,
+        /// While set, a write of an `incidents.json` waits (the detectors' report is held back).
+        pub hold_incidents: AtomicBool,
+        /// How many writes of an `incidents.json` have waited on `hold_incidents`.
+        pub held_incidents: AtomicUsize,
+        /// While set, every read of an object fails.
+        pub fail_gets: AtomicBool,
     }
 
     #[derive(Debug)]
@@ -1163,6 +1169,12 @@ mod store {
                 let now = self.knobs.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.knobs.max_in_flight.fetch_max(now, Ordering::SeqCst);
                 self.wait().await;
+                if location.as_ref().ends_with("incidents.json") && self.knobs.hold_incidents.load(Ordering::SeqCst) {
+                    self.knobs.held_incidents.fetch_add(1, Ordering::SeqCst);
+                    while self.knobs.hold_incidents.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
                 let fail = self
                     .knobs
                     .fail_puts
@@ -1215,6 +1227,12 @@ mod store {
                     self.knobs.gets.fetch_add(1, Ordering::SeqCst);
                 }
                 self.wait().await;
+                if self.knobs.fail_gets.load(Ordering::SeqCst) {
+                    return Err(object_store::Error::Generic {
+                        store: "TestStore",
+                        source: "injected read failure".into(),
+                    });
+                }
                 self.inner.get_opts(location, options).await
             }
             .boxed()
@@ -2245,4 +2263,209 @@ async fn a_manifest_that_cannot_be_stored_never_refuses_the_batch() {
     let stored = store.inner.get(&manifest_path).await.unwrap().bytes().await.unwrap();
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&stored).unwrap(), good);
     assert_eq!(steps_in(&store).await, (0..10).collect::<Vec<_>>());
+}
+
+// --- Lane U6 (Nov 19, 2026): a run read as healthy on a report of other rows -------------------
+
+/// Writes the status and reads it back from `store`.
+async fn written_status(server: &TestServer, store: &TestStore) -> serde_json::Value {
+    server.ingest.write_watchdog().await;
+    json_in(store, &format!("runs/{RUN}/watchdog.json")).await
+}
+
+/// Whether the status's run state counts rank 0 as judged by a current report.
+fn judged(status: &serde_json::Value) -> bool {
+    let codes = run_state_codes(status);
+    !codes.iter().any(|code| code == "ranks_unknown" || code == "no_steps")
+}
+
+/// Writes the status until `ready` holds for it, for at most `SLOW_BOUND`.
+async fn status_until(
+    server: &TestServer,
+    store: &TestStore,
+    what: &str,
+    ready: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + SLOW_BOUND;
+    loop {
+        let status = written_status(server, store).await;
+        if ready(&status) {
+            return status;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{what}: {status}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// RS04. A rank's cached report judges it only while it covers what the status shows: the
+/// attempt the status names (not one seen in the beats alone) and the last part this server
+/// stored (here with no grace). Two flushes with the second report's write held back and the
+/// attempt changed, then a third with the attempt the same: while the report is held the rank is
+/// not judged. Rows waiting in the buffer, not stored yet, do not make a current report stale.
+#[tokio::test]
+async fn a_cached_report_of_other_rows_than_the_status_shows_does_not_judge_the_rank() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let config = IngestConfig {
+        report_grace: Duration::ZERO,
+        ..every_50()
+    };
+    let server = start_on(store.clone(), config, None).await;
+    let mut put = open_attempts(&server).await;
+    put.send(attempt_batch(&rows(1, 0..50)), 100).await;
+    assert_eq!(put.ack().await, Ok(100));
+    status_until(&server, &store, "attempt 1 judged", judged).await;
+
+    // Attempt 2 resumes at step 30; its report's write is held back.
+    store.knobs.hold_incidents.store(true, Ordering::SeqCst);
+    put.send(attempt_batch(&rows(2, 30..80)), 200).await;
+    assert_eq!(put.ack().await, Ok(200)); // acknowledged once stored, before it is judged
+    until_within("the second report held", SLOW_BOUND, || {
+        store.knobs.held_incidents.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let status = written_status(&server, &store).await;
+    assert_eq!(
+        (&status["ranks"][0]["attempt"], &status["ranks"][0]["last_step"]),
+        (&serde_json::json!(2), &serde_json::json!(79))
+    );
+    assert!(!judged(&status), "{}", status["run_state"]);
+    assert_eq!(status["run_state"]["state"], "unknown");
+    store.knobs.hold_incidents.store(false, Ordering::SeqCst);
+    status_until(&server, &store, "attempt 2 judged", judged).await;
+
+    // The same attempt goes on; the report of its next part is held back.
+    store.knobs.hold_incidents.store(true, Ordering::SeqCst);
+    put.send(attempt_batch(&rows(2, 80..130)), 300).await;
+    assert_eq!(put.ack().await, Ok(300));
+    until_within("the third report held", SLOW_BOUND, || {
+        store.knobs.held_incidents.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    let status = written_status(&server, &store).await;
+    assert_eq!(status["ranks"][0]["last_step"], 129);
+    assert!(!judged(&status), "{}", status["run_state"]);
+    store.knobs.hold_incidents.store(false, Ordering::SeqCst);
+    status_until(&server, &store, "the third part judged", judged).await;
+
+    // Rows in the buffer, not yet stored: the report is still current for what is stored.
+    put.send(attempt_batch(&rows(2, 130..140)), 400).await;
+    until_within("the buffered rows seen", SLOW_BOUND, || {
+        server.ingest.watchdog_statuses()[RUN]["ranks"][0]["last_step"] == 139
+    })
+    .await;
+    let status = written_status(&server, &store).await;
+    assert!(judged(&status), "{}", status["run_state"]);
+    assert_eq!(put.finish().await, vec![400]);
+}
+
+/// RS04, with the usual grace: a report a moment behind the part just stored still judges its
+/// rank, so a run that streams normally does not read unknown after each part; a report of an
+/// earlier attempt than the status shows never does.
+#[tokio::test]
+async fn a_report_a_moment_behind_the_store_judges_its_rank_for_the_grace_and_one_of_another_attempt_never() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let server = start_on(store.clone(), every_50(), None).await; // the usual 30 s grace
+    let mut put = open_attempts(&server).await;
+    put.send(attempt_batch(&rows(1, 0..50)), 100).await;
+    assert_eq!(put.ack().await, Ok(100));
+    status_until(&server, &store, "attempt 1 judged", judged).await;
+    store.knobs.hold_incidents.store(true, Ordering::SeqCst);
+    put.send(attempt_batch(&rows(1, 50..100)), 200).await;
+    assert_eq!(put.ack().await, Ok(200));
+    until_within("the second report held", SLOW_BOUND, || {
+        store.knobs.held_incidents.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let status = written_status(&server, &store).await;
+    assert_eq!(status["ranks"][0]["last_step"], 99);
+    assert!(judged(&status), "{}", status["run_state"]);
+    store.knobs.hold_incidents.store(false, Ordering::SeqCst);
+    // The held report is written (the rank reads judged throughout, so wait for the file).
+    let deadline = tokio::time::Instant::now() + SLOW_BOUND;
+    while json_in(&store, &format!("runs/{RUN}/rank=0/incidents.json")).await["last_step"] != 99 {
+        assert!(tokio::time::Instant::now() < deadline, "the second report written");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    store.knobs.hold_incidents.store(true, Ordering::SeqCst);
+    put.send(attempt_batch(&rows(2, 0..50)), 300).await;
+    assert_eq!(put.ack().await, Ok(300));
+    until_within("the third report held", SLOW_BOUND, || {
+        store.knobs.held_incidents.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    let status = written_status(&server, &store).await;
+    assert_eq!(status["ranks"][0]["attempt"], 2);
+    assert!(!judged(&status), "{}", status["run_state"]);
+    store.knobs.hold_incidents.store(false, Ordering::SeqCst);
+    status_until(&server, &store, "attempt 2 judged", judged).await;
+    put.finish().await;
+}
+
+fn data_attempt_schema() -> Arc<Schema> {
+    let mut fields = attempt_schema().fields().to_vec();
+    fields.push(Arc::new(Field::new("data_json", DataType::Utf8, true)));
+    Arc::new(Schema::new(fields))
+}
+
+/// Rows of rank 0 in `data_attempt_schema()` that drew one batch per step, hashed by step.
+fn data_attempt_batch(attempt: i64, steps: std::ops::Range<i64>) -> RecordBatch {
+    let steps: Vec<i64> = steps.collect();
+    let n = steps.len();
+    RecordBatch::try_new(
+        data_attempt_schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1; n])),
+            Arc::new(StringArray::from(vec![RUN; n])),
+            Arc::new(Int32Array::from(vec![0; n])),
+            Arc::new(Int64Array::from(vec![attempt; n])),
+            Arc::new(Int64Array::from(steps.clone())),
+            Arc::new(Float64Array::from(vec![0.5; n])),
+            Arc::new(StringArray::from(vec!["{}"; n])),
+            Arc::new(StringArray::from(
+                steps
+                    .iter()
+                    .map(|step| Some(format!(r#"{{"batches":1,"batch_hash":"a{attempt}-{step}"}}"#)))
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// RS04. A rebuild of a rank's detectors that fails drops the rank's report and its batch hashes:
+/// the status no longer says its batches were compared, from hashes of rows before the rebuild.
+#[tokio::test]
+async fn a_failed_rebuild_drops_the_ranks_batch_hashes_from_the_comparison() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let config = IngestConfig {
+        flush_steps: 10,
+        ..manual()
+    };
+    let server = start_on(store.clone(), config, None).await;
+    let compared = |server: &TestServer| server.ingest.watchdog_statuses()[RUN]["ranks_compared"].clone();
+    let mut put = open_with(&server.address, RUN, 0, None, data_attempt_schema()).await;
+    put.send(data_attempt_batch(1, 0..10), 1).await;
+    assert_eq!(put.ack().await, Ok(1));
+    until_within("rank 0 compared", SLOW_BOUND, || {
+        compared(&server) == serde_json::json!([0])
+    })
+    .await;
+    status_until(&server, &store, "rank 0 judged", judged).await;
+    // A new attempt needs a rebuild from the store, which cannot be read.
+    let failed = store.knobs.gets.load(Ordering::SeqCst);
+    store.knobs.fail_gets.store(true, Ordering::SeqCst);
+    put.send(data_attempt_batch(2, 0..10), 2).await;
+    assert_eq!(put.ack().await, Ok(2));
+    until_within("the rebuild tried and failed", SLOW_BOUND, || {
+        store.knobs.gets.load(Ordering::SeqCst) > failed && compared(&server) == serde_json::json!([])
+    })
+    .await;
+    let status = written_status(&server, &store).await;
+    assert_eq!(status["ranks_compared"], serde_json::json!([]), "{status}");
+    assert!(!judged(&status), "{}", status["run_state"]);
+    store.knobs.fail_gets.store(false, Ordering::SeqCst);
+    put.finish().await;
 }

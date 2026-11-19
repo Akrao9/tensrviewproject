@@ -4873,4 +4873,34 @@ mod tests {
             attention_hit("attention_logit_growth", 20.0, 10.0) && !attention_hit("attention_logit_growth", 19.9, 10.0)
         );
     }
+
+    #[tokio::test]
+    async fn replay_reads_each_parts_attempt_from_under_its_rank_whatever_the_store_root_holds() {
+        // RS03 (lane U6, Nov 19, 2026). A store rooted at `.../attempt=7`: attempt 1 reaches step
+        // 99 and attempt 2 resumes at step 50. The resume cuts attempt 1 at 50, so 60 rows count,
+        // and the newest attempt read is 2.
+        use object_store::memory::InMemory;
+        let storage = crate::storage::Storage::new(Arc::new(InMemory::new()), "store/attempt=7".into());
+        storage
+            .write_part("prefix", 0, 1, &[key_rows(&steps("prefix", 0, 1, 0..100))], 0, 99)
+            .await
+            .unwrap();
+        storage
+            .write_part("prefix", 0, 2, &[key_rows(&steps("prefix", 0, 2, 50..60))], 50, 59)
+            .await
+            .unwrap();
+        let detectors = replay(&storage, "prefix", 0, &usual()).await.unwrap();
+        assert_eq!(
+            (detectors.attempt(), detectors.last_step(), detectors.rows()),
+            (2, Some(59), 60)
+        );
+        assert!(
+            !detectors
+                .incidents()
+                .iter()
+                .any(|incident| incident["kind"] == "repeated_steps"),
+            "{:?}",
+            detectors.incidents()
+        );
+    }
 }
