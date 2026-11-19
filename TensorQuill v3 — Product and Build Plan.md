@@ -1843,6 +1843,74 @@ State as of Nov 16, 2026.
   - *Read.* The copy off the device is a blocking `.cpu()`, so the held step's slice of it is complete. The owed probe now runs between the next backward and the lead's step; `run_probe` runs under `no_grad` and `fork_rng`, restores each module's training flag, and `_run_owed_probe` puts the hook buffers back. `_decode` finds the gradient rows from the layer count, so the split block lines up with it; `refused` lays out the router counts, and the refusals are written once, from `announce`, on the first part. The optimizer hooks were registered with no guard against raising before R2, and R2's new paths are no less guarded. The six edited tests change timing only, and the two-optimizer update-size test asserts more than before.
   - *Run on the trial merge* (macOS, Python 3.12, PyTorch 2.15). With the server binary 1,799 passed; without it 1,180 passed and 619 skipped; without `pyarrow` 1,056 passed and 80 skipped (R2 had not run this setup); `experiments/` 92 passed. Each is `main`'s count plus R2's 28 new tests. The six more warnings in each setup are Lightning's own, from R2's two Lightning tests. Under load from a parallel suite run, the stall test and the flush test passed 5 out of 5 and the ten trigger tests that run the two edited worker scripts 3 out of 3. No Rust check was run: R2 changes nothing under `server/`.
   - *Open, for the author.* An optimizer that sits before the lead in the loop but starts stepping later has its update, re-check and probe one step early, where before R2 its update was on the right record (pinned by a test; the fix needs an iteration-end signal). R2's other choices to revisit are listed in its hand-over note (`lane-r2-capture-steps.md` in the session notes): a weight check due on a skipped step moves to the next step, Lightning's loss with several optimizers is a sum, and the first step a follower followed is probed twice. Nothing ran on a GPU, Linux or PyTorch 2.6. Nothing is pushed.
+- [x] **Lane T4: RUST-05, RUST-01's h2 half, and which ranks the server compared for duplicate batches (Nov 18, 2026, lane T4, branch `claude/lane-t4-server-2a4bc3`; not merged).** Three server items left open by the outside review of `78f8f7e` and by the entry "What was checked in the all-ranks view". Each was first checked on `main` at `3f93636`. Under `server/`, `src/detect.rs`, `src/detect/data.rs`, `src/ingest.rs` and `tests/ingest_test.rs` changed. Outside it, only the all-ranks `duplicate_batches` entry in `sdk/src/tensorquill/evidence.py` (`run_kind_checks`, a new `_ranks_compared`, and item 5 of the rule comment), its tests in `sdk/tests/test_kind_checks.py`, and two assertions in `sdk/tests/test_data_server.py`. The Parquet schema, the shape of `detect`'s output, the golden files and the protocol number (2) are unchanged. No golden file needed a change: `test_golden.py` passes unchanged with this branch's binary. Hand-over note: `lane-t4-server.md` in the session notes, with every function touched.
+  - *RUST-05: reproduced, and the history lookup fixed.*
+    - Found. Five hand-made `.jsonl` files whose steps go back within one attempt were each read with `load_records(..., all_attempts=True)` and judged by both paths. The script is `lane-t4-rust05-repro.py` in the session notes. On `main` all five differed from Python. A to D were run through the binary; E was run through `judge` on `main`'s `detect.rs`.
+    - The cause, cases C, D and E. `AttemptPass.history` was a `Vec` in the order the rows came, binary-searched with `partition_point`.
+      - C. Steps 3 to 5 were written again inside attempt 0, and attempt 1 resumes past the history's end. Rust's "last ten steps" were no longer in step order, so it extrapolated from steps 4 and 5: an expected learning rate of 0.00024, against Python's 0.00088.
+      - D. The resume lands on a step written twice. Rust compared it with the first writing (0.00093); Python compares it with the last (0.00072).
+      - E. A step written again with no learning rate. Python's history drops the step and extrapolates; Rust kept the first writing and compared at the same step.
+    - The fix. The history is a `BTreeMap` from step to (attempt, learning rate), so the last writing of a step wins, as in Python's dict. A rollback is `split_off`, and a writing without a learning rate removes the step. `compare_resume` takes `same_step` from `get` and the last ten steps from `range(..resumed_at)`. A `BTreeMap` rather than a sorted insert into the `Vec`, because a reversed attempt would make that quadratic. Rows in step order, which is all a store holds, are read as before.
+    - The test. `a_resume_is_compared_with_the_last_writing_of_each_step_when_an_attempt_went_back` (in `detect.rs`, through `judge`) holds Python's numbers for D, C and E, and the in-order case. On `main` it fails at D (0.00093 against 0.00072). On this branch C, D and E match Python through `build_evidence(detectors="rust")`.
+    - **Not fixed, for the author: an attempt whose first row is not its lowest step (cases A and B).** `AttemptPass` judges the resume on an attempt's first row; Python judges it on the attempt's lowest step. `ResumePass` (`resume_data_mismatch`, `resume_incomplete`) makes the same assumption.
+      - A. A resumed attempt written 15, 16, 17, then 12, 13, 14. Python reports `resume_lr_change` at 12; Rust reports nothing.
+      - B. A later attempt written 5, 6, then 0, 1, 2. Python reads a restart of the numbering and reports `repeated_steps` on 0, 1, 2, 5 and 6; Rust reads a resume at 5 and reports nothing.
+      - The options, with their costs:
+        1. Leave it. `judge`'s doc already asks for each attempt's rows in recorded order, and only hand-made or concatenated files go backwards; the store never does. Cost: offline `detect` differs from Python on such files.
+        2. Read each attempt's rows in step order in `judge_with`, with a stable sort so a step written twice keeps its writings' order. As an experiment, the records were sorted before they were sent (`lane-t4-rust05-sorted.py`). Then A to E, and a run with a stretch of steps moved earlier, match Python exactly. A run with a stretch written again, and a reversed run, differ only in the scalar context's `median_before`, which Python takes over the records in file order. Cost: a sort, and a second copy of each attempt's rows, in offline `detect`. It also changes what every detector reads on such input, and whether Python's file-order medians are right is a question of its own.
+        3. Refuse such input in `judge_with`, as it already refuses attempts out of order. Cost: the Rust path fails where Python answers.
+        4. Use the attempt's lowest step (`first_steps`, already computed) for the resume and restart checks only. Fixes A and B for `AttemptPass` and `ResumePass`, and no other detector.
+    - **The other detectors differ on such input too, on `main` and here alike.** One attempt of the repository's `everything()` run (`lane-t4-rust05-wide.py`): a stretch of steps moved earlier gives 28 differences, a stretch written again 8, the whole attempt reversed 3. Python sorts by step in most detectors; Rust reads the rows in the order they come. This is the same choice as option 2, and nothing was changed for it.
+  - *RUST-01, the h2 half: does not reproduce, and nothing changed.* The probes are in the session notes, not in the repository.
+    - Read in the sources. h2 0.4.20's `RecvStream::drop` clears the buffer, sets `is_recv = false`, and sends no reset. Once the response is sent while the request is still streaming, `maybe_cancel` sends `RST_STREAM(NO_ERROR)`.
+    - Probe A (`lane-t4-h2-probes.rs`). Lane R6 opened one connection per stream; this probe put 300 refused streams on one tonic connection, 30 at a time, each with 4 MiB queued behind its refused 1 MiB batch.
+      - All 300 read their own status: 150 `ResourceExhausted` and 150 `InvalidArgument`, median 35 ms, at most 163 ms.
+      - No stuck stream. Every client's request side was let go within 10 ms of its status.
+      - No leak. A healthy stream on the same connection afterwards was acknowledged, and the buffered bytes went back to the holder's row, then to 0.
+    - The real client (`lane-t4-h2-pyarrow-probe.py`). The binary with `--quota-mib 1`, through pyarrow's Flight client, the one the SDK's sender uses. No SDK test sends a refused stream to the real server.
+      - 160 refused streams on their own clients and 160 on one shared client, each writing 4 MiB more: all 320 read `RESOURCE_EXHAUSTED: ingest buffer full`, and none hung (at most 0.15 s).
+      - A healthy stream on the shared client and the holder's stream were acknowledged, and the server exited 0.
+    - **The one wait found (probe B).** A refused stream of rank 0 sent while rank 0's end-of-stream flush was writing to a store that takes 3 s a request. Its status came 9.0 s later: the part, the replay's reads and `incidents.json`. The wait is `accept` taking the rank's buffer lock before it reads a row, not the drop-then-`detach` order; the review's reordering would not change it. It is bounded by the store, and it needs a second stream of a rank while its first is still flushing.
+  - *Duplicate batches: the status always carries `ranks_compared`, and the all-ranks entry reads it.*
+    - Found on `main`. `with_data` wrote the comparison into the status only when it found a duplicate. The new ingest test fails there at its first assertion: the key is absent (`Null`) where `[]` is expected.
+    - The server.
+      - Every run's status now has a top-level `ranks_compared`: the ranks with a hashed batch in their window, an empty list when there are none. It is made by a new `detect::ranks_compared`, which `duplicate_batches` and `detect --run` now share, so the list means the same in all three. The finding keeps its own copy, which `evidence.py` and `test_data_server.py` read there.
+      - The list is in the signature that decides whether a status is written again, so a status where only it changed is written, a finished run's too. A restarted server's status says `[]` until a rank's store is read again.
+      - The test `the_status_names_the_ranks_whose_batches_were_compared_found_or_not` walks through `[]`, `[0]`, `[0, 1]` with no finding, the file, a new `Ingest` over the same store (`[]`, then `[1]`), and a duplicate whose top-level list equals the finding's.
+    - The SDK rule, with a status that carries the list:
+      - A judged rank the list names is `checked`, when the list has at least two ranks; one rank alone compared with nothing.
+      - A judged rank it does not name is `not_configured`, unless its own report says its data could not be read, which stays `unavailable`.
+      - The run's value is the worst judged rank's, as for every cross-rank kind.
+      - The judged ranks that recorded `data` but are not named are listed under `not_compared_ranks`, with a `note` naming both causes: the server has not read their store since it started (none right after a restart), or their batches have no hash.
+      - A status without the key, or with it in another shape, is read as one from an older server: what the ranks recorded, with the old note, unchanged. Finished runs keep the file an older server wrote.
+    - **Why `not_configured` and not `unavailable` for a rank the list leaves out (the author may overrule).**
+      - `unavailable` must be named by a `not_checked` entry (or `no_status`), and it makes the run `degraded`.
+      - Making it so would degrade every watched run after each server restart, until each rank flushes again.
+      - It would degrade a rank whose `data` has no `batch_hash` for good: an `IterableDataset`, which no report can show.
+      - The rule already gives `unavailable` only when a rank's own report says its input could not be read.
+      - The cost of `not_configured`: right after a restart the entry reads like a run with no data capture, except for `not_compared_ranks` and the note.
+    - The tests.
+      - New: `test_duplicate_batches_is_checked_on_the_ranks_the_servers_status_says_it_compared`. It covers both ranks listed, a restart (`[]`: `not_configured`, both named, run state `healthy`, one kind fewer on the count line), one rank of three not yet compared, a rank without data, one rank listed, and three malformed lists. On `main`'s `evidence.py` it fails at its first assertion: the old note is there.
+      - The existing test for `duplicate_batches` is unchanged, and now covers the status without the key.
+      - `test_ranks_drawing_the_same_batch_show_in_the_runs_status` (real binary) now also checks the top-level list and that the entry is `checked` with no note.
+    - This closes the open item of "What was checked in the all-ranks view" on `duplicate_batches`.
+  - *Run.* macOS, offline, with six other lanes running suites on the same machine (load averages 13 to 20).
+    - Rust:
+      - `cargo build`, and `cargo fmt --check`.
+      - `cargo clippy --all-targets -- -D warnings`, with and without default features.
+      - `cargo test`: 135 passed and 1 ignored (`main`: 133 and 1).
+      - `cargo test --no-default-features --lib`: 98 passed (`main`: 97).
+    - Python, from `sdk/`:
+      - With this branch's binary: 1,800 passed, none skipped (`main`: 1,799). The one more is the new test in `test_kind_checks.py`.
+      - Without it (the variable unset and the binary moved aside): 1,181 passed, 619 skipped (`main`: 1,180 and 619).
+      - Without `pyarrow` or the binary: 1,057 passed, 80 skipped (`main`: 1,056 and 80). Runs 2 and 3 ran at the same time; no run had a failure to rerun.
+      - `experiments/`: 92 passed (`main`: 92).
+  - *Not run.* Linux, a GPU, S3 or GCS. A restart through the SDK's sender with live ranks; the ingest test restarts in process. Lane E's 64- and 1,024-rank runs, whose h2 errors R6 traced to lost connections.
+  - *Open.*
+    - For the author: RUST-05's cases A and B, and the reading order of offline `detect` (options 1 to 4 above). The `not_configured` rule for a rank the status does not list.
+    - Docs outside this lane's files still describe the old note: `sdk/AGENT_INSTRUCTIONS.md` (the "A run folder" section) and `sdk/README.md` ("What was checked, limits"). The README's `watchdog.json` text does not mention `ranks_compared`.
+    - A rank's report does not say whether its batches have a hash, so "no hash" and "not read since the restart" share one note.
+    - R6's follow-ups stand: the server logs nothing when it refuses a stream.
 
 ## Sources
 
