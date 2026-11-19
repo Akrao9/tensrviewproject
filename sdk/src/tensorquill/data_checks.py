@@ -57,10 +57,18 @@ def hash_kind(digest: str) -> str:
     hashed by two encodings give two different hashes, so only hashes of one kind are compared
     (C16, Nov 19, 2026). A pair of two kinds is not compared: never a match and never a
     difference. Every detector here asks one of two things of two hashes: whether they are
-    equal (a stall, an epoch's order, a duplicate), which a pair of two kinds never is, so it
-    is no match; or whether they differ (a resume), which `_compare_data` asks only of one kind."""
+    equal (a stall, an epoch's order, a duplicate), which a pair of two kinds never is: it is
+    treated as a step without a hash is (a stall's stretch and an epoch's comparison end there),
+    and a rank is among a duplicate's `ranks_compared` only when another rank wrote a hash of a
+    kind it wrote too; or whether they differ (a resume), which `_compare_data` asks only of
+    one kind, and a resume of two kinds is listed under `not_checked` (`KINDS_DIFFER`)."""
     kind, colon, _ = digest.partition(":")
     return kind if colon else ""
+
+
+# A resume whose two sides hold hashes of different kinds, as `not_checked` gives it: the same
+# words in the Rust reader (server/src/detect/data.rs).
+KINDS_DIFFER = "the batch hashes before and after the resume are of different kinds"
 
 
 def _bool(value: Any) -> bool | None:
@@ -91,6 +99,8 @@ def detect_data_stalled(records: list[dict[str, Any]]) -> dict[str, Any] | None:
             run, previous = 0, None
             continue
         batches, digest = _int(data.get("batches")), _hash(data)
+        if digest is not None and previous is not None and hash_kind(digest) != hash_kind(previous):
+            digest = None  # two kinds: as a step without a hash (C16)
         if batches == 0:
             why = "no_batch"
         elif batches is not None and batches > 0 and digest is not None and digest == previous:
@@ -156,6 +166,7 @@ def detect_epoch_order_repeated(records: list[dict[str, Any]]) -> dict[str, Any]
             current.append(digest)
         if previous is None or not equal or shuffle is False or position >= ORDER_COMPARE:
             continue
+        # A position of another kind ends the comparison, as one without a hash does (C16).
         if digest is None or position >= len(previous) or previous[position] != digest:
             equal = False
             continue
@@ -175,14 +186,8 @@ def detect_epoch_order_repeated(records: list[dict[str, Any]]) -> dict[str, Any]
     return None
 
 
-def detect_duplicate_batches(records: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Steps at which ranks reading different shares of the data drew the same batch.
-
-    `records` are several ranks' (after `resolve_attempts`). Each rank's last
-    `DUPLICATE_WINDOW` steps with a `batch_hash` are compared; ranks with the same
-    `data_rank` (a tensor-parallel group reading one share) are meant to match and are not a
-    duplicate. The rank's own number stands in when `data_rank` is not recorded.
-    """
+def _hashed_steps(records: list[dict[str, Any]]) -> dict[int, list[tuple[int, int, str]]]:
+    """Each rank's steps that drew a hashed batch: `(step, data share, hash)`, in step order."""
     by_rank: dict[int, list[tuple[int, int, str]]] = {}
     for record in _by_step(records):
         data = _data(record)
@@ -192,7 +197,31 @@ def detect_duplicate_batches(records: list[dict[str, Any]]) -> dict[str, Any] | 
         rank = int(record.get("rank", 0))
         share = _int(data.get("data_rank"))
         by_rank.setdefault(rank, []).append((int(record["step"]), rank if share is None else share, digest))
+    return by_rank
+
+
+def _ranks_compared(by_rank: Mapping[int, list[tuple[int, int, str]]]) -> list[int]:
+    """The ranks a comparison is made for: each that wrote, among its last `DUPLICATE_WINDOW`
+    hashed steps, a hash of a kind another rank wrote there too. Hashes of two kinds are never
+    compared (C16, Nov 19, 2026: every rank with a hash was listed, which claimed comparisons
+    across an encoding change that were never made)."""
+    kinds = {rank: {hash_kind(digest) for _, _, digest in rows[-DUPLICATE_WINDOW:]} for rank, rows in by_rank.items()}
+    return sorted(rank for rank in by_rank if any(kinds[rank] & kinds[other] for other in by_rank if other != rank))
+
+
+def detect_duplicate_batches(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Steps at which ranks reading different shares of the data drew the same batch.
+
+    `records` are several ranks' (after `resolve_attempts`). Each rank's last
+    `DUPLICATE_WINDOW` steps with a `batch_hash` are compared; ranks with the same
+    `data_rank` (a tensor-parallel group reading one share) are meant to match and are not a
+    duplicate. The rank's own number stands in when `data_rank` is not recorded.
+    """
+    by_rank = _hashed_steps(records)
     if len(by_rank) < 2:
+        return None
+    compared = _ranks_compared(by_rank)
+    if not compared:
         return None
     at: dict[int, list[tuple[int, int, str]]] = {}
     for rank, rows in by_rank.items():
@@ -218,7 +247,7 @@ def detect_duplicate_batches(records: list[dict[str, Any]]) -> dict[str, Any] | 
         "step": first[0],
         "ranks": first[1],
         "duplicated_steps": duplicated,
-        "ranks_compared": sorted(by_rank),
+        "ranks_compared": compared,
     }
 
 
@@ -248,12 +277,10 @@ def _compare_data(
     kind = hash_kind(new)
     other = known.get(resumed_at)
     if other is not None and hash_kind(other[0]) != kind:  # type: ignore[arg-type]
-        return ("not compared: the batch the earlier attempts drew at the resume step was hashed by another encoding"
-                " (a tensorquill from before or after the change of batch hash) than the resumed one")
+        return KINDS_DIFFER
     known = {s: v for s, v in known.items() if hash_kind(v[0]) == kind}  # type: ignore[arg-type]
     if not known:
-        return ("not compared: the earlier attempts' batch hashes are of another encoding (a tensorquill from before"
-                " or after the change of batch hash) than the resumed one")
+        return KINDS_DIFFER
     expected = known.get(resumed_at)
     if expected is not None and expected[0] == new:
         return None

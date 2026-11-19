@@ -415,7 +415,7 @@ def test_c16_a_resume_across_the_encoding_change_is_not_compared():
     mismatch, _ = dc.detect_resume_state(records, not_checked=not_checked)
     assert mismatch is None  # never a difference
     assert [(i["check"], i["step"]) for i in not_checked] == [("resume_data", 3)]
-    assert "encoding" in not_checked[0]["reason"]
+    assert not_checked[0]["reason"] == "the batch hashes before and after the resume are of different kinds"
 
 
 def test_c16_a_resume_compares_the_hashes_of_its_own_kind_when_both_are_there():
@@ -445,28 +445,73 @@ def test_c16_hash_kinds():
     assert dc.hash_kind("v3:x:y") == "v3"
 
 
+def test_c16_ranks_compared_lists_only_ranks_that_share_a_kind_with_another():
+    def rank_rows(rank, hashes):
+        return [{**r, "rank": rank} for r in _drawn(0, range(len(hashes)), hashes)]
+    # Ranks 0 and 1 by the new writer draw the same batches; rank 2, by the old one, is compared with no one.
+    records = rank_rows(0, NEW[:3]) + rank_rows(1, NEW[:3]) + rank_rows(2, OLD[:3])
+    found = dc.detect_duplicate_batches(records)
+    assert found is not None and found["ranks"] == [0, 1] and found["ranks_compared"] == [0, 1]
+    # No two ranks share a kind: nothing is compared, as when no rank has a hash.
+    assert dc.detect_duplicate_batches(rank_rows(0, NEW[:3]) + rank_rows(1, OLD[:3])) is None
+
+
+def test_c16_a_stall_across_kinds_is_a_step_without_a_hash():
+    # Three old-writer steps of I0, then the new writer's I0 three times from step 3: the step of
+    # the change reads as a step without a hash, so the new writer's stretch starts at step 4.
+    records = _drawn(0, range(3), [OLD[0]] * 3) + _drawn(1, range(3, 7), [NEW[0]] * 4)
+    found = dc.detect_data_stalled(ev.resolve_attempts(records))
+    assert found is None or found["step"] >= 4
+    missing = [dict(r, data={"batches": 1}) if r["step"] == 3 else r for r in records]
+    assert found == dc.detect_data_stalled(ev.resolve_attempts(missing))
+
+
 FIXTURE = Path(__file__).parent / "fixtures" / "c16-batch-hash-versions.json"
+KINDS_DIFFER = "the batch hashes before and after the resume are of different kinds"
 
 
-@pytest.mark.skipif(not FIXTURE.is_file(), reason="lane V2's shared fixture is not in this tree yet")
+def _without_other_kinds(records: list[dict]) -> list[dict]:
+    """`records` with every hash of a kind other than the first hash's taken out: what a reader
+    that compares only one kind may see."""
+    first = next(r["data"]["batch_hash"] for r in records if (r.get("data") or {}).get("batch_hash"))
+    kind = dc.hash_kind(first)
+    return [r if dc.hash_kind((r.get("data") or {}).get("batch_hash") or first) == kind
+            else {**r, "data": {k: v for k, v in r["data"].items() if k != "batch_hash"}} for r in records]
+
+
+@pytest.mark.skipif(not FIXTURE.is_file(), reason="lane V2's shared fixture is not in this tree")
 def test_c16_the_shared_fixture():
-    """Lane V2's fixture, the one both readers are held to: each case's detector gives its verdict."""
+    """Lane V2's fixture, the one both readers are held to: each case's incident, and whether its
+    hashes were compared, through `build_evidence(..., detectors="python")` and the rule itself."""
     fixture = json.loads(FIXTURE.read_text())
+    assert len(fixture["cases"]) == 11
     for case in fixture["cases"]:
-        records = case["records"]
-        detector = case["detector"]
-        if detector == "resume_data_mismatch":
-            found = dc.detect_resume_state(records, not_checked=[])[0]
-        elif detector == "duplicate_batches":
+        name, records, detector, want = case["name"], case["records"], case["detector"], case["incident"]
+        if detector == "duplicate_batches":
             found = dc.detect_duplicate_batches(ev.resolve_attempts(records))
-        elif detector == "data_stalled":
-            found = dc.detect_data_stalled(ev.resolve_attempts(records))
+            compared = bool(dc._ranks_compared(dc._hashed_steps(ev.resolve_attempts(records))))
         else:
-            found = dc.detect_epoch_order_repeated(ev.resolve_attempts(records))
-        if case["incident"] is None:
-            assert found is None, case["name"]
-        else:
-            assert found is not None, case["name"]
+            evidence = tensorquill.build_evidence(records, detectors="python")
+            hits = [i for i in evidence["incidents"] if i["kind"] == detector]
+            assert len(hits) <= 1, name
+            found = hits[0] if hits else None
             if detector == "resume_data_mismatch":
-                found = {**found, **found["changes"][0]}
-            assert {k: found.get(k) for k in case["incident"]} == case["incident"], case["name"]
+                skipped = [i for i in evidence.get("not_checked", ()) if i.get("check") == "resume_data"]
+                compared = not any(i.get("reason") == KINDS_DIFFER for i in skipped)
+                if not compared:
+                    assert skipped == [{"check": "resume_data", "step": skipped[0]["step"], "rank": 0,
+                                        "reason": KINDS_DIFFER}], name
+                if found is not None:
+                    found = {**found, **found["changes"][0]}
+            else:
+                # Hashes of two kinds are read as missing ones: the verdict is the one-kind reader's.
+                one_kind = [i for i in tensorquill.build_evidence(_without_other_kinds(records), detectors="python")
+                            ["incidents"] if i["kind"] == detector]
+                assert hits == one_kind, name
+                compared = all(dc.hash_kind(r["data"]["batch_hash"]) == dc.hash_kind(records[0]["data"]["batch_hash"])
+                               for r in records if (r.get("data") or {}).get("batch_hash"))
+        assert compared == case["compared"], name
+        if want is None:
+            assert found is None, name
+        else:
+            assert found is not None and {k: found.get(k) for k in want} == want, name
