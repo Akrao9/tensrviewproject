@@ -146,6 +146,19 @@ def _first_tensor(output: Any, *, integer: bool) -> torch.Tensor | None:
     return None
 
 
+# The tensor types a hook reads under `torch.compile` (the author's decision on lane T2's item 3,
+# option (b)): a plain tensor, or a parameter a module returns as it is. Any other subclass is
+# refused there by its type alone: under tracing an op it refuses fails the trace before any
+# `except` could see it, and its type does not tell such a subclass from one that would be read.
+# In eager mode the hooks' `try` still catches what raises, so nothing is refused for its type.
+_PLAIN_TYPES = (torch.Tensor, nn.Parameter)
+
+
+def _compiled_subclass(t: torch.Tensor) -> bool:
+    """Whether `t` is a tensor subclass the hooks do not read, which only matters under `torch.compile`."""
+    return torch.compiler.is_compiling() and type(t) not in _PLAIN_TYPES
+
+
 def _output_unread(x: torch.Tensor, device: torch.device) -> str | None:
     """Why a watched block's output is not read into the layer statistics kept on `device`, from
     its type, layout and device alone: no data, so no sync, and the same under `torch.compile`,
@@ -185,7 +198,9 @@ def _stats_hook(
     Nothing in it raises into training. An output it cannot read leaves no entry for the block
     in that step's `layers` and is said once in `problems` (the hook's `problems` attribute when
     none is given): judged first from type, layout and device alone (`_output_unread`), so the
-    same under `torch.compile`, and in eager mode from any exception left, which is caught.
+    same under `torch.compile`, and in eager mode from any exception left, which is caught. Under
+    `torch.compile` an output that is a tensor subclass other than `nn.Parameter` is not read
+    (`_compiled_subclass`); a DTensor is unwrapped to its local tensor first.
 
     A DTensor output (tensor parallelism with `use_local_output=False`) is read on its local
     tensor: under Replicate that is the output, under Shard it is this rank's part, read as
@@ -215,6 +230,12 @@ def _stats_hook(
                 ))
                 return
             x = x.detach().to_local()
+        if _compiled_subclass(x):
+            refuse(lambda: (
+                f"its output is a {type(x).__name__}, a tensor subclass, which TensorQuill does not read under "
+                "torch.compile"
+            ))
+            return
         wrong = _output_unread(x, buf.device)
         if wrong is not None:
             refuse(lambda: wrong)
@@ -300,6 +321,11 @@ def _refusal(name: str, spec: Router, why: str, fix: str | None = None, device: 
             f"pass routers={{{name!r}: tensorquill.Router({spec.n_experts}, {spec.top_k}, indices=...)}} with a "
             f"function that returns the chosen expert indices from its output on {device}, where the counts are"
         )
+    elif fix == "subclass":
+        fix = (
+            f"pass routers={{{name!r}: tensorquill.Router({spec.n_experts}, {spec.top_k}, indices=...)}} with a "
+            f"function that returns the chosen expert indices as a plain torch.Tensor, or {inner}"
+        )
     elif fix == "top_k":
         fix = (
             f"pass routers={{{name!r}: tensorquill.Router(n_experts, top_k)}} with its number of experts and a "
@@ -369,9 +395,14 @@ def _unusable(t: torch.Tensor, device: torch.device, what: str) -> tuple[str, st
     its type, layout, device and dtype alone: no data, so no sync, and the same under
     `torch.compile`, where an op that raises fails the trace before any `except` could see
     it. The reason, and the fix `_refusal` names for it; None when the counting can read the
-    tensor. Only what raises today is refused: nothing counted before is."""
+    tensor. In eager mode only what raises is refused (and the hook's `try` catches the rest).
+    Under `torch.compile` a tensor subclass other than `nn.Parameter` is refused by its type alone
+    (`_compiled_subclass`), the well-behaved ones that AOTAutograd would have counted included:
+    the author's decision on lane T2's item 3, since a raising op fails the trace there."""
     if _DTensor is not None and isinstance(t, _DTensor):
         return f"{what} is a DTensor, not a plain tensor", None
+    if _compiled_subclass(t):
+        return f"{what} is a {type(t).__name__}, a tensor subclass, which TensorQuill does not count under torch.compile", "subclass"
     if t.is_nested:
         return f"{what} is a nested tensor", None
     if t.layout != torch.strided:

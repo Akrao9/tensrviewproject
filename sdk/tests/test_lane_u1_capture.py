@@ -1008,3 +1008,215 @@ def test_an_exception_part_way_through_a_flush_stops_capture_and_later_steps_run
     assert len(told) == 1 and "moving a block of steps off the device raised" in told[0]
     steps = [r["step"] for r in sink.records]
     assert steps and steps == list(range(len(steps))) and len(steps) < 12  # an unbroken run, then nothing
+
+
+# --- Lane T2's item 3, decided by the author: option (b), subclasses refused under torch.compile ---
+
+
+class Strict(torch.Tensor):
+    """A traceable wrapper subclass that refuses a plain tensor beside it, as DTensor does (lane
+    T2's `lane-t2-router-strict-subclasses.py`)."""
+
+    @staticmethod
+    def __new__(cls, elem):
+        return torch.Tensor._make_wrapper_subclass(cls, elem.shape, dtype=elem.dtype, device=elem.device)
+
+    def __init__(self, elem):
+        self.elem = elem
+
+    def __tensor_flatten__(self):
+        return ["elem"], None
+
+    @staticmethod
+    def __tensor_unflatten__(inner, meta, outer_size, outer_stride):
+        return Strict(inner["elem"])
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        from torch.utils._pytree import tree_flatten, tree_map_only
+
+        flat, _ = tree_flatten((args, kwargs or {}))
+        if any(type(a) is torch.Tensor for a in flat):
+            raise RuntimeError(f"{func} got mixed torch.Tensor and Strict")
+        unwrap = lambda x: tree_map_only(Strict, lambda t: t.elem, x)  # noqa: E731
+        out = func(*unwrap(args), **unwrap(kwargs or {}))
+        return tree_map_only(torch.Tensor, lambda t: Strict(t) if not isinstance(t, Strict) else t, out)
+
+
+class NoEq(torch.Tensor):
+    """A `__torch_function__` subclass that raises on `eq`."""
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        if func in (torch.Tensor.__eq__, torch.eq, torch.Tensor.eq):
+            raise RuntimeError("NoEq refuses eq")
+        return super().__torch_function__(func, types, args, kwargs or {})
+
+
+WRAPS = {"strict": lambda t: Strict(t), "no_eq": lambda t: t.as_subclass(NoEq)}
+
+
+class SubRouter(nn.Module):
+    def __init__(self, wrap):
+        super().__init__()
+        self.proj = nn.Linear(8, 4)
+        self.wrap = wrap
+
+    def forward(self, x):
+        return self.wrap(self.proj(x).detach())  # beside the computation: the model never mixes them
+
+
+class SubBlock(nn.Module):
+    def __init__(self, wrap):
+        super().__init__()
+        self.lin = nn.Linear(8, 8)
+        self.wrap = wrap
+
+    def forward(self, x):
+        y = self.lin(x)
+        return self.wrap(y.detach()), y
+
+
+class SubModel(nn.Module):
+    def __init__(self, wrap):
+        super().__init__()
+        self.router = SubRouter(wrap)
+        self.blocks = nn.ModuleList([SubBlock(wrap)])
+        self.out = nn.Linear(8, 1)
+
+    def forward(self, x):
+        self.router(x)
+        _, y = self.blocks[0](x)
+        return self.out(y).sum()
+
+
+def _sub_run(wrap: str, *, backend: str | None, fullgraph: bool = False, hooked: bool = True,
+             indices: bool = False) -> list[dict]:
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    model = SubModel(WRAPS[wrap])
+    sink = tensorquill.MemorySink()
+    session = None
+    if hooked:
+        spec = (tensorquill.Router(4, 2, indices=lambda out: out.topk(2, dim=-1).indices) if indices
+                else tensorquill.Router(4, 2))
+        session = tensorquill.init(model, sink=sink, every=1, routers={"router": spec}, layers=["blocks.0"])
+    forward = model if backend is None else torch.compile(model, backend=backend, fullgraph=fullgraph)
+    opt = torch.optim.SGD(model.parameters(), lr=0.01)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for _ in range(3):
+                forward(torch.randn(3, 8)).backward()
+                opt.step()
+                opt.zero_grad()
+            if session is not None:
+                session.close()
+    finally:
+        torch._dynamo.reset()
+    return sink.records
+
+
+def _sub_control(wrap: str, backend: str, fullgraph: bool) -> None:
+    """The same model compiled without TensorQuill: where this PyTorch cannot trace the subclass (it
+    has never run on PyTorch 2.6), there is nothing to test, and the test is skipped by that capability."""
+    try:
+        _sub_run(wrap, backend=backend, fullgraph=fullgraph, hooked=False)
+    except Exception as error:  # noqa: BLE001
+        pytest.skip(f"this PyTorch cannot compile the model without TensorQuill: {type(error).__name__}")
+
+
+@pytest.mark.parametrize("fullgraph", [False, True], ids=["graph-breaks", "fullgraph"])
+@pytest.mark.parametrize("indices", [False, True], ids=["default", "indices="])
+def test_a_strict_subclass_is_refused_under_compile_not_raised(fullgraph, indices):
+    """Lane T2: the strict wrapper as a router's output raised "aten.eq.Tensor got mixed torch.Tensor
+    and Strict", and as a watched block's output "aten.maximum.default got mixed", out of training
+    under backend="eager". Now both are refused: the router in `moe_refused`, the block left out."""
+    _sub_control("strict", "eager", fullgraph)
+    records = _sub_run("strict", backend="eager", fullgraph=fullgraph, indices=indices)
+    assert [r["step"] for r in records] == [0, 1, 2]
+    assert all("moe" not in r and r["layers"] == {} for r in records)
+    reason = records[0]["moe_refused"]["router"]
+    assert "is a Strict, a tensor subclass, which TensorQuill does not count under torch.compile" in reason
+
+
+def test_a_subclass_that_raises_on_eq_is_refused_under_fullgraph():
+    """Lane T2: under fullgraph=True Dynamo raised "Observed exception" from the hook's `eq`."""
+    _sub_control("no_eq", "eager", True)
+    records = _sub_run("no_eq", backend="eager", fullgraph=True)
+    assert "is a NoEq, a tensor subclass" in records[0]["moe_refused"]["router"]
+    assert all(r["layers"] == {} for r in records)
+
+
+@pytest.mark.parametrize("wrap", sorted(WRAPS))
+def test_eager_mode_still_reads_subclasses_through_its_try(wrap):
+    """Eager mode is as before: nothing is refused for its type; what raises is caught."""
+    records = _sub_run(wrap, backend=None)
+    assert "counting its output raised RuntimeError" in records[0]["moe_refused"]["router"]
+    assert all("blocks.0" not in r["layers"] for r in records)  # its reading raised, and was caught
+
+
+class ParamRouter(nn.Module):
+    """A router that returns a parameter as it is, as the author's rule keeps allowed."""
+
+    def __init__(self):
+        super().__init__()
+        self.table = nn.Parameter(torch.tensor([[2.0, 1.0, 0.0, -1.0]] * 3))
+
+    def forward(self, x):
+        return self.table
+
+
+class ParamBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.full((3, 8), 0.5))
+
+    def forward(self, x):
+        return self.weight
+
+
+class ParamModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.router = ParamRouter()
+        self.blocks = nn.ModuleList([ParamBlock()])
+        self.out = nn.Linear(8, 1)
+
+    def forward(self, x):
+        logits = self.router(x)
+        y = self.blocks[0](x)
+        return self.out(x + y).sum() + logits.sum() * 0
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_a_module_that_returns_a_parameter_is_still_read_under_compile(backend):
+    def run(hooked: bool) -> list[dict]:
+        torch._dynamo.reset()
+        model = ParamModel()
+        sink = tensorquill.MemorySink()
+        session = tensorquill.init(model, sink=sink, every=1, routers={"router": tensorquill.Router(4, 2)},
+                                   layers=["blocks.0"]) if hooked else None
+        compiled = torch.compile(model, backend=backend)
+        opt = torch.optim.SGD(model.parameters(), lr=0.0)
+        try:
+            for _ in range(2):
+                compiled(torch.ones(3, 8)).backward()
+                opt.step()
+                opt.zero_grad()
+            if session is not None:
+                session.close()
+        finally:
+            torch._dynamo.reset()
+        return sink.records
+
+    try:
+        run(hooked=False)
+    except Exception as error:  # noqa: BLE001
+        pytest.skip(f"this PyTorch cannot compile the model without TensorQuill: {type(error).__name__}")
+    records = run(hooked=True)
+    assert [r["moe"]["router"] for r in records] == [[3, 3, 0, 0]] * 2  # top-2 of each of 3 tokens
+    assert all("moe_refused" not in r for r in records)
+    assert [r["layers"]["blocks.0"]["mean"] for r in records] == [pytest.approx(0.5)] * 2
