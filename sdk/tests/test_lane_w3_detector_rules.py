@@ -338,14 +338,15 @@ def test_det16_a_bool_layer_statistic_is_not_an_activation_spike(engine: str) ->
                 if k[0] == "activation_spike"]
 
 
-def test_det16_a_logged_bool_has_no_median() -> None:
-    # Python only: the Arrow path (`flight.record_to_row`) drops a record's whole `scalars` map
-    # when one value is a bool, so the Rust detectors never see it (reported, not this lane's file).
+def test_det16_a_logged_bool_is_left_out_of_the_scalar_context() -> None:
+    # A bool scalar is left out, the rest kept: what the row sent to Rust can carry too (a float
+    # map). Python only here: `flight.record_to_row` still drops the whole map on a bool, which
+    # lane W1 changes to dropping the one value; then this can run on both engines.
     records = [row(step, scalars={"loss": 2.0, "is_best": True}) for step in range(5)]
     records.append(row(5, grad_norm=math.nan, grad_norms={"w": math.nan}, scalars={"loss": 2.0, "is_best": True}))
     found = [i for i in tensorquill.build_evidence(records)["incidents"] if i["kind"] == "non_finite"]
     assert found[0]["scalars"]["loss"]["median_before"] == 2.0
-    assert found[0]["scalars"]["is_best"]["median_before"] is None
+    assert "is_best" not in found[0]["scalars"]
 
 
 def test_det16_system_readings_do_not_read_a_bool_as_a_number() -> None:
