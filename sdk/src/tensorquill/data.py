@@ -431,9 +431,29 @@ def _optimizer_step(state: Mapping[Any, Any]) -> float | int | None:
     return None
 
 
+def _extra_state_key(key: Any) -> bool:
+    """A module's `get_extra_state` entry in its state dict (`<prefix>_extra_state`), any value."""
+    return isinstance(key, str) and (key == "_extra_state" or key.endswith("._extra_state"))
+
+
+def _model_tensors(value: Mapping[Any, Any]) -> int:
+    """How many tensors a model state dict holds; 0 when `value` is not one: every entry a
+    tensor or a module's extra state, at least one tensor."""
+    tensors = 0
+    for k, v in value.items():
+        if isinstance(v, torch.Tensor):
+            tensors += 1
+        elif not _extra_state_key(k):
+            return 0
+    return tensors
+
+
 def _classify(key: str, value: Any) -> tuple[str, dict[str, Any]] | None:
-    """The component a state-dict entry holds, with its identities; None when not known."""
-    name = key.lower()
+    """The component a state-dict entry holds, with its identities; None when not known.
+
+    A name is matched by its last dotted part, so a parameter path inside a model's state
+    dict (`model.resampler.weight`) is never taken for a sampler or an RNG state."""
+    name = key.rsplit(".", 1)[-1].lower()
     if isinstance(value, (list, tuple)) and value and all(isinstance(v, Mapping) for v in value):
         found = [_classify(key, v) for v in value]
         kinds = {f[0] for f in found if f is not None}
@@ -465,8 +485,9 @@ def _classify(key: str, value: Any) -> tuple[str, dict[str, Any]] | None:
             k in value for k in ("_num_yielded", "_sampler_iter_yielded", "samples_seen")
         ):
             return "data", {}
-        if value and all(isinstance(v, torch.Tensor) for v in value.values()):
-            return "model", {"tensors": len(value), "keys_hash": _keys_hash(value.keys())}
+        tensors = _model_tensors(value)
+        if tensors:
+            return "model", {"tensors": tensors, "keys_hash": _keys_hash(value.keys())}
         return None
     if "rng" in name or "random" in name:
         return "rng", {}
@@ -480,7 +501,8 @@ def checkpoint_manifest(state: Mapping[str, Any]) -> dict[str, Any]:
 
     Each top-level entry is recognised by its shape: an optimizer's `state` and
     `param_groups`, a scheduler's `last_epoch`, a GradScaler's `scale`, a model's mapping
-    of tensors; RNG states and a data position by their names (`rng`, `random`;
+    of tensors (with any module's `_extra_state` entries); RNG states and a data position by
+    the last dotted part of their names (`rng`, `random`;
     `dataloader`, `sampler`, `loops`, ...) or a StatefulDataLoader's keys. A mapping that is
     none of these is looked into once, so `{"training": {"optimizer": ...}}` is found too.
     Integer counters such as `step`, `global_step` and `epoch` are listed as `counters`.

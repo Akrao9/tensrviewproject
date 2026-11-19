@@ -79,7 +79,14 @@ def install_probe_hooks(blocks: list[tuple[str, nn.Module]], state: ProbeState) 
 
 
 def _first_float(output: Any) -> torch.Tensor | None:
-    items = output if isinstance(output, (tuple, list)) else (output,)
+    """The first floating-point tensor of a block's output: the output itself, or one of a
+    tuple's, list's or dict's (a Hugging Face `ModelOutput` too) items, as `capture` reads them."""
+    if isinstance(output, (tuple, list)):
+        items: Any = output
+    elif isinstance(output, dict):
+        items = output.values()
+    else:
+        items = (output,)
     for item in items:
         if isinstance(item, torch.Tensor) and item.is_floating_point():
             return item
@@ -98,11 +105,22 @@ def _histogram(tensor: torch.Tensor, bins: int) -> dict[str, Any]:
     lo, hi = (float(v) for v in torch.aminmax(values))
     if lo == hi:
         lo, hi = lo - 0.5, hi + 0.5
+    # The bin index is `(v - lo) * bins / (hi - lo)` in float32, which overflows once
+    # `(hi - lo) * bins` passes float32's range: histc then counts nothing or misses values.
+    # Values that large are scaled down by a power of two first, which is exact (values that
+    # become subnormal or zero are within a bin of zero), so every bin edge stays where it was.
+    span_lo, span_hi, scaled = lo, hi, values
+    if max(abs(lo), abs(hi)) * bins > _HIST_SCALE_ABOVE:
+        span_lo, span_hi, scaled = lo * _HIST_SCALE, hi * _HIST_SCALE, values * _HIST_SCALE
     if torch.are_deterministic_algorithms_enabled():
-        counts = _histc_counts(values, bins, lo, hi)
+        counts = _histc_counts(scaled, bins, span_lo, span_hi)
     else:
-        counts = [int(c) for c in torch.histc(values, bins=bins, min=lo, max=hi).tolist()]
+        counts = [int(c) for c in torch.histc(scaled, bins=bins, min=span_lo, max=span_hi).tolist()]
     return {"lo": lo, "hi": hi, "counts": counts, "nonfinite": nonfinite}
+
+
+_HIST_SCALE_ABOVE = 2.0**120  # about 1.3e36: below it the bin arithmetic stays within float32
+_HIST_SCALE = 2.0**-64
 
 
 def _histc_counts(values: torch.Tensor, bins: int, lo: float, hi: float) -> list[int]:
@@ -116,9 +134,10 @@ def _histc_counts(values: torch.Tensor, bins: int, lo: float, hi: float) -> list
     last are lo and hi) and on CUDA (`getBin`). `hi - lo` stays a tensor on the values'
     device, because CUDA divides by a CPU scalar as a product with its reciprocal. Two
     differences: counts are int64, where histc adds in float32 and stops counting a bin at
-    2^24, and where `(v - lo) * bins` overflows float32 (a span above about 5e36) histc's
-    index is undefined, while here the value goes to the last bin. The bin index is made a
-    chunk at a time, CHUNK_ELEMENTS int64 values at most.
+    2^24, and where `(v - lo) * bins` overflows float32 histc's index is undefined, while
+    here the value goes to the last bin (`_histogram` scales values that large down first, so
+    neither meets it). The bin index is made a chunk at a time, CHUNK_ELEMENTS int64 values
+    at most.
     """
     left = torch.tensor(lo, dtype=torch.float32, device=values.device)
     span = torch.tensor(hi, dtype=torch.float32, device=values.device) - left
@@ -152,6 +171,10 @@ def find_head(model: nn.Module, head: str | bool | None) -> tuple[str | None, st
     its output embeddings (`model.get_output_embeddings()`). Either must be a plain
     `nn.Linear`. A name the user gives that is missing or not a plain `nn.Linear` is an
     error at `init`, as an unknown router is. `head=False` turns the reading off.
+
+    A model that does not report one itself, such as a LightningModule or a DDP around a Hugging
+    Face model, is asked through the outermost modules inside it that do (`_inner_models`):
+    one head among them is read, under its name in the whole model; two different ones are not.
     """
     if head is False:
         return None, None, None
@@ -166,14 +189,33 @@ def find_head(model: nn.Module, head: str | bool | None) -> tuple[str | None, st
     if head is not None and head is not True:
         raise TypeError("probe_head must be a module name, True, False or None")
     getter = getattr(model, "get_output_embeddings", None)
-    if not callable(getter):
-        return None, None, "the model names no output head; pass probe_head=<module name> to read one"
-    try:
-        module = getter()
-    except Exception as error:  # noqa: BLE001
-        return None, None, f"get_output_embeddings() raised {type(error).__name__}; pass probe_head=<module name>"
-    if module is None:
-        return None, None, "get_output_embeddings() returned None: the model has no language-model head"
+    if callable(getter):
+        try:
+            module = getter()
+        except Exception as error:  # noqa: BLE001
+            return None, None, f"get_output_embeddings() raised {type(error).__name__}; pass probe_head=<module name>"
+        if module is None:
+            return None, None, "get_output_embeddings() returned None: the model has no language-model head"
+    else:
+        inner = _inner_models(model, lambda m: callable(getattr(m, "get_output_embeddings", None)))
+        if not inner:
+            return None, None, "the model names no output head; pass probe_head=<module name> to read one"
+        heads: dict[int, tuple[nn.Module, list[str]]] = {}
+        for prefix, wrapped in inner:
+            try:
+                found = wrapped.get_output_embeddings()
+            except Exception as error:  # noqa: BLE001
+                return None, None, (f"{prefix!r}.get_output_embeddings() raised {type(error).__name__}; "
+                                    "pass probe_head=<module name>")
+            if found is not None:
+                heads.setdefault(id(found), (found, []))[1].append(prefix)
+        if not heads:
+            return None, None, "get_output_embeddings() returned None: the model has no language-model head"
+        if len(heads) > 1:
+            names = ", ".join(repr(p) for _, prefixes in heads.values() for p in prefixes)
+            return None, None, (f"the modules {names} inside the model each report a different output head; "
+                                "pass probe_head=<module name> to read one")
+        module = next(iter(heads.values()))[0]
     name = next((n for n, m in modules.items() if m is module), None)
     if name is None:
         return None, None, "get_output_embeddings() returned a module outside the model"
@@ -181,6 +223,19 @@ def find_head(model: nn.Module, head: str | bool | None) -> tuple[str | None, st
     if reason:
         return None, None, f"{name!r} from get_output_embeddings() {reason}; the probe reads only a plain nn.Linear head"
     return name, "get_output_embeddings", None
+
+
+def _inner_models(model: nn.Module, test: Callable[[nn.Module], bool]) -> list[tuple[str, nn.Module]]:
+    """The outermost modules inside `model` that pass `test`, with their names: those with no
+    ancestor below `model` that passes it too. One wrapped Hugging Face model gives itself, not
+    its decoder or its attention layers, which carry the same `config`."""
+    found: list[tuple[str, nn.Module]] = []
+    for name, module in model.named_modules():
+        if not name or any(name.startswith(f"{outer}.") for outer, _ in found):
+            continue
+        if test(module):
+            found.append((name, module))
+    return found
 
 
 def install_head_hook(head: nn.Module, state: ProbeState) -> list[Any]:
@@ -233,7 +288,8 @@ def _head_logit_sums(hidden: torch.Tensor, weight: torch.Tensor, bias: torch.Ten
     of at most CHUNK_ELEMENTS logits. Each chunk is reduced in float32 and the chunks are
     added in float64 (float32 on MPS, which has none). The spread is summed about each
     position's mean over the first chunk, so a large common shift of the logits does not
-    cancel it away.
+    cancel it away. `logits_finite` says which positions' FP32 logits are all finite, read
+    from the logits themselves, so a sum that overflows is not taken for a NaN or an Inf.
     """
     x = hidden.detach().reshape(-1, hidden.shape[-1])
     positions, vocab = x.shape[0], weight.shape[0]
@@ -244,21 +300,23 @@ def _head_logit_sums(hidden: torch.Tensor, weight: torch.Tensor, bias: torch.Ten
     zero = torch.zeros(positions, dtype=acc, device=x.device)
     sq, dsum, dsq, gap = zero.clone(), zero.clone(), zero.clone(), zero.clone()
     lse = torch.full((positions,), -math.inf, dtype=acc, device=x.device)
+    logits_finite = torch.ones(positions, dtype=torch.bool, device=x.device)
     for v0 in range(0, vocab, rows):
         w = weight[v0 : v0 + rows].detach()
         b = bias[v0 : v0 + rows].detach() if bias is not None else None
         zf = F.linear(xf, w.float(), None if b is None else b.float())
         zb = F.linear(xb, w.to(torch.bfloat16), None if b is None else b.to(torch.bfloat16)).float()
+        logits_finite &= zf.isfinite().all(-1)
         if shift is None:
             shift = zf.mean(-1, keepdim=True)
         # One pass each, reduced in float32 within the chunk and added up across chunks
         # in `acc`: per-element float64 sums cost as much as the two GEMMs on CPU.
         lse = torch.logaddexp(lse, torch.logsumexp(zf, -1).to(acc))
-        sq += torch.linalg.vector_norm(zf, dim=-1).to(acc).square()
-        gap += torch.linalg.vector_norm(zb.sub_(zf), dim=-1).to(acc).square()
+        sq += _square_norm(zf, acc)
+        gap += _square_norm(zb.sub_(zf), acc)
         d = zf.sub_(shift)  # zf is not used again in this chunk
         dsum += d.sum(-1).to(acc)
-        dsq += torch.linalg.vector_norm(d, dim=-1).to(acc).square()
+        dsq += _square_norm(d, acc)
     assert shift is not None
     mean_d = dsum / vocab
     return {
@@ -268,14 +326,30 @@ def _head_logit_sums(hidden: torch.Tensor, weight: torch.Tensor, bias: torch.Ten
         "log_z": lse,
         "gap_sq": gap,
         "vocab": torch.tensor(vocab),
+        "logits_finite": logits_finite,
     }
+
+
+def _square_norm(t: torch.Tensor, acc: torch.dtype) -> torch.Tensor:
+    """Each row's squared L2 norm, in `acc`. `vector_norm` in float32 overflows once a row's
+    sum of squares passes float32's range (finite logits of about 1e19 over a large
+    vocabulary); then each row is divided by its largest magnitude first, and its norm
+    multiplied back in `acc`. A row holding a NaN or an Inf stays non-finite."""
+    norm = torch.linalg.vector_norm(t, dim=-1)
+    if not bool(norm.isinf().any()):  # a sync, as the probe's histograms make: it is rare
+        return norm.to(acc).square()
+    top = t.abs().amax(-1, keepdim=True)
+    top = torch.where(top.isfinite() & (top > 0), top, torch.ones_like(top))
+    return (torch.linalg.vector_norm(t / top, dim=-1).to(acc) * top.squeeze(-1).to(acc)).square()
 
 
 def _head_numbers(calls: list[dict[str, Any]]) -> dict[str, Any]:
     """The four head numbers over every position the head saw in the probe (padding
     included: the probe has no mask for the head). Positions whose FP32 logits hold a NaN
-    or an Inf are left out and counted. Over positions t and vocabulary entries v of the
-    FP32 logits z:
+    or an Inf are left out and counted (`nonfinite_positions`); so are positions whose logits
+    are finite but whose sums below overflow, in `acc` or in the BF16 pass's float32 logits
+    (`overflow_positions`, listed only when there are some). Over positions t and vocabulary
+    entries v of the FP32 logits z:
 
     - `norm`: the mean over t of the L2 norm of z_t over the vocabulary.
     - `mean`: the signed mean of z over every t and v.
@@ -288,15 +362,33 @@ def _head_numbers(calls: list[dict[str, Any]]) -> dict[str, Any]:
     if any(int(c["vocab"]) != vocab for c in calls):
         return {"not_read": "the head was called with different output sizes in one probe"}
     joined = {key: torch.cat([c[key] for c in calls]) for key in ("norm", "mean", "var", "log_z", "gap_sq")}
-    finite = torch.stack([v.isfinite() for k, v in joined.items() if k != "gap_sq"]).all(0)
+    sums_finite = torch.stack([v.isfinite() for v in joined.values()]).all(0)
+    if all("logits_finite" in c for c in calls):
+        logits_finite = torch.cat([c["logits_finite"] for c in calls])
+    else:
+        logits_finite = sums_finite
+    finite = logits_finite & sums_finite
     n = int(finite.sum())
+    nonfinite = int((~logits_finite).sum())
+    overflow = int(finite.numel()) - n - nonfinite
     out: dict[str, Any] = {
-        "positions": n, "nonfinite_positions": int(finite.numel() - n), "vocab": vocab, "calls": len(calls),
+        "positions": n, "nonfinite_positions": nonfinite, "vocab": vocab, "calls": len(calls),
         "input_dtype": calls[0]["input_dtype"].removeprefix("torch."),
         "weight_dtype": calls[0]["weight_dtype"].removeprefix("torch."),
     }
+    if overflow:
+        out["overflow_positions"] = overflow
     if n == 0:
-        return {**out, "not_read": "every position's FP32 logits hold a NaN or an Inf"}
+        if finite.numel() == 0:
+            reason = "the head saw no positions"
+        elif not overflow:
+            reason = "every position's FP32 logits hold a NaN or an Inf"
+        elif not nonfinite:
+            reason = "every position's FP32 logits are finite but too large: their sums overflow"
+        else:
+            reason = (f"no position read: {nonfinite} with a NaN or an Inf in their FP32 logits, {overflow} with "
+                      "finite logits whose sums overflow")
+        return {**out, "not_read": reason}
     pick = {key: value[finite] for key, value in joined.items()}
     gap = math.sqrt(float(pick["gap_sq"].sum()) / (n * vocab))
     spread = math.sqrt(float(pick["var"].mean()))
@@ -583,9 +675,21 @@ def _sdpa_instead_of_flash(model: nn.Module) -> Iterator[bool]:
     """Hugging Face models loaded with FlashAttention never call SDPA; switch them to
     SDPA for the probe. Each config set to FlashAttention, the model's own or a sub-config's,
     is switched and the others are left; afterwards every one has its own setting back.
+    A model with no `config` of its own (a LightningModule or a DDP around a Hugging Face
+    model) has the configs of the outermost modules inside it that have one (`_inner_models`).
     Yields whether a switch happened."""
     try:
-        configs = _configs(getattr(model, "config", None))
+        own = getattr(model, "config", None)
+        if own is not None:
+            configs = _configs(own)
+        else:
+            configs = []
+            ids: set[int] = set()
+            for _, inner in _inner_models(model, lambda m: getattr(m, "config", None) is not None):
+                for entry in _configs(getattr(inner, "config", None)):
+                    if id(entry[0]) not in ids:
+                        ids.add(id(entry[0]))
+                        configs.append(entry)
     except Exception:  # noqa: BLE001
         configs = []
     before = [impl for _, impl in configs]
