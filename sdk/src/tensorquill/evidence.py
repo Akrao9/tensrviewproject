@@ -930,6 +930,12 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
     if not status or status.get("summary") not in ("stalled", "degraded"):
         return []
     full = list(status.get("ranks", ()))
+    stopped_capture = [r for r in full if r.get("state") == "capture_stopped"]
+    if (stopped_capture and not status.get("missing_ranks")
+            and not any(r.get("state") in ("silent", "lost", "unresponsive") for r in full)):
+        # Contract 3: a rank whose capture stopped is not a hang and raises no progress incident;
+        # the server's `degraded` here is that rank beside an active one, not a missing rank.
+        return []
     places = [place for place in map(stuck_at, (r for r in full if r.get("state") in ("silent", "lost", "unresponsive")))
               if place is not None]
     ranks = [{k: v for k, v in r.items() if k != "stack"} for r in full]
@@ -1612,6 +1618,18 @@ def lines_left_out_line(evidence: Mapping[str, Any]) -> str | None:
     return (f"Lines left out: {left_out} line{'s' if left_out != 1 else ''} of the capture"
             f" {'are' if left_out != 1 else 'is'} not a whole JSON record (torn by a killed process, or still being"
             " written) and were skipped; the steps after them are read.")
+
+
+def _store_attempt_order(source: Any, rank: int | None) -> str | None:
+    """For evidence read from a server's store, how its attempts were ordered
+    (`stored_attempt_order`: `first_seen`, `numeric_then_first_seen` or `numeric`); None for
+    any other source, whose order is the order its records were written in (contract 1)."""
+    if not isinstance(source, (str, Path)) or not Path(source).is_dir():
+        return None
+    folder = Path(source)
+    if rank is not None and folder.name != f"rank={rank}":
+        folder = folder / f"rank={rank}"
+    return stored_attempt_order(folder)[1] if folder.is_dir() else None
 
 
 def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2854,6 +2872,10 @@ def _report_evidence(
 # against it, and every status summary or report state not named here reads `unknown`.
 RUN_STATES = ("healthy", "degraded", "unknown", "unhealthy")
 _STATUS_HEALTHY = ("active", "finished")
+# The rank states a server's `watchdog.json` writes (`RankState` in watchdog.rs, and contract 3's
+# `capture_stopped`). A reader meeting another one says so and never calls the run healthy.
+RANK_STATES = ("active", "starting", "paused", "silent", "unresponsive", "reconnecting", "lost", "finished",
+               "capture_stopped")
 
 
 def _reason(state: str, code: str, detail: str, **extra: Any) -> dict[str, Any]:
@@ -2927,7 +2949,14 @@ def run_state(
     `observations` reason, whose state is `healthy`, and every other incident, a kind this
     version does not know among them, to `incidents`. Codes are stable: `incidents`;
     `no_steps`, `report_not_current`, `ranks_unknown`, `status_old`, `server_stopped`,
-    `status_summary`; `no_status`, `not_checked`; `observations`.
+    `status_summary`, `capture_stopped`, `rank_state_unknown`; `no_status`, `not_checked`;
+    `observations`.
+
+    `capture_stopped` (contract 3, Nov 19, 2026): a rank whose attempt stopped capture while
+    training went on is not judged, whatever state it reads (`capture_stopped`, or
+    `unresponsive`, `reconnecting` or `lost` beside the kept stop): unknown, with its ranks and
+    each one's reason. `rank_state_unknown`: a rank state this version does not know (a newer
+    server's) is unknown too, never healthy.
     """
     reasons: list[dict[str, Any]] = []
     listed = list(incidents)
@@ -2959,6 +2988,26 @@ def run_state(
         reasons.append(_reason("unknown", "ranks_unknown", f"{len(ranks)} rank{'s' if len(ranks) != 1 else ''} without"
                                f" a current report ({_rank_ranges(ranks, 8)}): nothing is said about incidents on"
                                " them", ranks=ranks))
+    if status is not None:
+        entries = [r for r in status.get("ranks") or () if isinstance(r, Mapping)]
+        stopped = {r.get("rank"): r["capture_stopped"] for r in entries if r.get("capture_stopped") is not None}
+        if stopped:
+            ranks = sorted(stopped, key=str)
+            why = {rank: (stop.get("reason") if isinstance(stop, Mapping) else None) or "unknown" for rank, stop in stopped.items()}
+            reasons.append(_reason(
+                "unknown", "capture_stopped",
+                f"capture stopped on {len(ranks)} rank{'s' if len(ranks) != 1 else ''} while training went on"
+                f" ({', '.join(f'rank {rank}: {why[rank]}' for rank in ranks)}): nothing is judged there since",
+                ranks=ranks, reasons={str(rank): why[rank] for rank in ranks}))
+        strange = {r.get("rank"): r.get("state") for r in entries if r.get("state") not in RANK_STATES}
+        if strange:
+            ranks = sorted(strange, key=str)
+            words = list(dict.fromkeys(str(strange[rank]) for rank in ranks))
+            reasons.append(_reason(
+                "unknown", "rank_state_unknown",
+                f"the server's status gives a rank state this reader does not know ({', '.join(map(repr, words))},"
+                f" {len(ranks)} rank{'s' if len(ranks) != 1 else ''}): a newer server's, so nothing is said about them",
+                ranks=ranks, states=words))
     if status is None:
         if status_expected:
             reasons.append(_reason("degraded", "no_status", _NO_STATUS))
@@ -5005,6 +5054,7 @@ def build_evidence(
         **({"run_end": read_end_marker(ended)} if (ended := _records_file(source, records_file)) else {}),
         **({"not_checked": not_checked} if not_checked else {}),
         **({"lines_left_out": left_out} if left_out else {}),
+        **({"attempt_order": order} if (order := _store_attempt_order(source, ranks[0] if ranks else rank)) else {}),
         **({"weight_trends": trends} if trends else {}),
         **({"head_trends": head_trends} if head_trends else {}),
         **({"memory": memory} if memory else {}),
