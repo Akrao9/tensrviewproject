@@ -13,6 +13,12 @@ table is written from.
 A kind counts as catching the bug in a configuration when it fires on the buggy run and not
 on the healthy run of the same configuration. A kind that fires on both is listed as also on
 the healthy run, and every incident of a healthy run is a false incident.
+
+A pair is judged only when both runs completed and gave valid observations (`problem`): exit
+status 0, a `RESULT` line naming a readable `result.json`, one summary per rank, and the bug's
+symptom measured as true or false, with the healthy control's false. Otherwise the table says
+why it was not judged. A run that fails, exits nonzero or passes `TIMEOUT` is recorded for its
+own case, with its output in the log, and the sweep goes on.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +39,7 @@ SDK = HERE.parent.parent / "sdk" / "src"
 OUT = HERE / "out"
 RESULTS = HERE / "results.json"
 TABLE = HERE / "RESULTS.md"
+TIMEOUT = 1800  # seconds a run may take before it and every process it started are killed
 VARIANTS = ("buggy", "healthy")
 LEVELS = {
     "shipped": "TrainCheck's script",
@@ -41,27 +49,83 @@ LEVELS = {
 }
 
 
+def _run_child(args: list[str], env: dict[str, str]) -> tuple[int | None, str]:
+    """(exit status, or None when it passed TIMEOUT; stdout and stderr). The run gets a session
+    of its own, so a timeout kills the processes it started too (the two-process runs' ranks),
+    which would otherwise hold its output open and keep the sweep waiting."""
+    proc = subprocess.Popen(args, cwd=HERE, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=TIMEOUT)
+        return proc.returncode, out + err
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, AttributeError):
+            proc.kill()
+        try:
+            out, err = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:  # something left the group and still holds the output
+            out, err = "", ""
+        return None, out + err + f"\nrun_all.py: killed after {TIMEOUT} s\n"
+
+
 def run_one(script: str, variant: str, tag: str, extra: list[str]) -> dict[str, Any]:
     args = [sys.executable, script, "--variant", variant] + (["--tag", tag] if tag else []) + extra
     env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(SDK), str(HERE)]))  # warnings kept: TensorQuill's are evidence
-    proc = subprocess.run(args, cwd=HERE, env=env, capture_output=True, text=True, timeout=1800)
-    lines = (proc.stdout + proc.stderr).splitlines()
+    returncode, output = _run_child(args, env)
+    lines = output.splitlines()
     result_line = next((line for line in lines if line.startswith("RESULT ")), None)
-    entry: dict[str, Any] = {"script": script, "variant": variant, "tag": tag, "args": extra, "returncode": proc.returncode}
-    if result_line is None:
+    entry: dict[str, Any] = {"script": script, "variant": variant, "tag": tag, "args": extra, "returncode": returncode}
+    name = f"{Path(script).name}-{variant}-{tag or 'default'}"
+    failure = None
+    if returncode is None:
+        failure = f"timed out after {TIMEOUT} s"
+    if result_line is not None:
+        try:
+            run_id = json.loads(result_line[len("RESULT "):])["run_id"]
+            entry["run_id"] = run_id
+            name = run_id
+            entry["result"] = json.loads((OUT / run_id / "result.json").read_text())
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            failure = failure or f"its RESULT line or result.json cannot be read: {type(error).__name__}: {error}"
+    elif failure is None:
         errors = [line for line in lines if "Error" in line or "error" in line]
+        failure = errors[-1].strip() if errors else (lines[-1] if lines else "no output")
+    entry["ok"] = True
+    failure = failure or problem(entry)
+    if failure:
         entry["ok"] = False
-        entry["error"] = errors[-1].strip() if errors else (lines[-1] if lines else "no output")
-        name = f"{script}-{variant}-{tag or 'default'}"
-    else:
-        run_id = json.loads(result_line[len("RESULT "):])["run_id"]
-        entry["ok"] = True
-        entry["run_id"] = run_id
-        entry["result"] = json.loads((OUT / run_id / "result.json").read_text())
-        name = run_id
+        entry["error"] = failure
     OUT.mkdir(exist_ok=True)
-    (OUT / f"{name}.log").write_text(proc.stdout + proc.stderr)
+    (OUT / f"{name}.log").write_text(output)
     return entry
+
+
+def problem(entry: dict[str, Any] | None) -> str | None:
+    """Why `entry` is not a completed run with valid observations, or None when it is one. The
+    sweep sets `ok` from this, and the table checks it again, since it is written from stored
+    entries."""
+    if not entry:
+        return "not run"
+    if not entry.get("ok"):
+        return str(entry.get("error") or "failed")
+    if entry.get("returncode") != 0:
+        return f"exited with status {entry.get('returncode')} after printing its result"
+    result = entry.get("result")
+    if not isinstance(result, dict):
+        return "no result"
+    ranks, world = result.get("ranks"), result.get("world_size", 1)
+    if not isinstance(ranks, dict) or not isinstance(world, int) or len(ranks) != world:
+        return f"result has {len(ranks) if isinstance(ranks, dict) else 'no'} rank summaries for world size {world}"
+    if not all(isinstance(r, dict) and isinstance(r.get("incidents"), list) for r in ranks.values()):
+        return "a rank summary has no incidents list"
+    if not isinstance(result.get("cross_rank", []), list):
+        return "cross_rank is not a list"
+    symptom = result.get("symptom")
+    if not isinstance(symptom, dict) or not isinstance(symptom.get("bug_present"), bool):
+        return "the symptom was not measured (bug_present is not true or false)"
+    return None
 
 
 def key(bug: str, tag: str, variant: str) -> str:
@@ -109,17 +173,28 @@ def _fmt(incidents: list[tuple[str, int, str]]) -> str:
 
 
 def _pair(results: dict[str, Any], bug: str, tag: str) -> dict[str, Any]:
+    """A configuration's two runs, and what the buggy one caught: only when both runs completed
+    with valid observations and the bug did not show on the healthy control. Otherwise `why`
+    says why the pair is not judged, and nothing is credited."""
     buggy = results.get(key(bug, tag, "buggy"))
     healthy = results.get(key(bug, tag, "healthy"))
     out: dict[str, Any] = {"tag": tag or "default", "buggy": buggy, "healthy": healthy}
     if not buggy or not healthy:
         return out
-    b, h = _incidents(buggy), _incidents(healthy)
-    healthy_kinds = {k for k, _, _ in h}
+    out["buggy_problem"], out["healthy_problem"] = problem(buggy), problem(healthy)
+    out["bug_showed"] = None if out["buggy_problem"] else buggy["result"]["symptom"]["bug_present"]
+    if out["healthy_problem"]:
+        out["why"] = f"the healthy control failed ({out['healthy_problem'][:120]})"
+    elif healthy["result"]["symptom"]["bug_present"]:
+        out["why"] = "the bug showed on the healthy control, so it is not a control"
+    if not out["healthy_problem"]:
+        out["false"] = _incidents(healthy)
+    if out["buggy_problem"] or out.get("why"):
+        return out
+    b = _incidents(buggy)
+    healthy_kinds = {k for k, _, _ in out["false"]}
     out["caught"] = [i for i in b if i[0] not in healthy_kinds]
     out["shared"] = [i for i in b if i[0] in healthy_kinds]
-    out["false"] = h
-    out["bug_showed"] = buggy["result"]["symptom"].get("bug_present") if buggy.get("ok") else None
     return out
 
 
@@ -156,16 +231,19 @@ def write_table(results: dict[str, Any]) -> None:
                 if not (c["buggy"] and c["healthy"]):
                     parts_caught.append(f"{tag}: not run yet")
                     continue
-                if not c["buggy"].get("ok"):
-                    parts_caught.append(f"{tag}: buggy run failed ({c['buggy']['error'][:120]})")
+                if c["buggy_problem"]:
+                    parts_caught.append(f"{tag}: buggy run failed ({c['buggy_problem'][:120]})")
                 else:
-                    shared = f"; also on healthy: {_fmt(c['shared'])}" if c["shared"] else ""
-                    verdict = (_fmt(c["caught"]) if c["caught"] else "not caught") if c["bug_showed"] else \
-                        "nothing to catch: the bug did not show"
-                    parts_caught.append(f"{tag}: {verdict}{shared}")
+                    if c.get("why"):
+                        parts_caught.append(f"{tag}: not judged: {c['why']}")
+                    else:
+                        shared = f"; also on healthy: {_fmt(c['shared'])}" if c["shared"] else ""
+                        verdict = (_fmt(c["caught"]) if c["caught"] else "not caught") if c["bug_showed"] else \
+                            "nothing to catch: the bug did not show"
+                        parts_caught.append(f"{tag}: {verdict}{shared}")
                     parts_showed.append(f"{tag}: {'yes' if c['bug_showed'] else 'no'}")
-                if not c["healthy"].get("ok"):
-                    parts_false.append(f"{tag}: healthy run failed ({c['healthy']['error'][:120]})")
+                if c["healthy_problem"]:
+                    parts_false.append(f"{tag}: healthy run failed ({c['healthy_problem'][:120]})")
                 else:
                     parts_false.append(f"{tag}: {_fmt(c['false'])}")
             caught = "<br>".join(parts_caught)
@@ -183,7 +261,8 @@ def write_table(results: dict[str, Any]) -> None:
                     entry = c.get(variant)
                     if not entry:
                         continue
-                    if entry.get("ok"):
+                    failure = problem(entry)
+                    if failure is None:
                         r0 = entry["result"]["ranks"].get("rank0", {})
                         short = ", ".join(r0.get("checked_without_enough_history", [])) or "none"
                         relevant = "; ".join(f"{k}: {v.get('value')} ({v.get('records')} of {v.get('records_needed')})"
@@ -192,7 +271,7 @@ def write_table(results: dict[str, Any]) -> None:
                         detail.append(f"| {entry['run_id']} | {_settings(entry)} | {_symptom(entry)} | {_fmt(_incidents(entry))} | "
                                       f"{r0.get('run_state')} | {relevant} | {short} | {nc} |")
                     else:
-                        detail.append(f"| {bug['id']} {c['tag']} {variant} | args {entry['args']} | run failed: {entry['error'][:200]} | | | | | |")
+                        detail.append(f"| {bug['id']} {c['tag']} {variant} | args {entry['args']} | run failed: {failure[:200]} | | | | | |")
     header = (
         "| Bug | Synopsis (Table 3) | Failure location (AE) | Reproduction in the clone | Ran here | Bug showed (plain torch) "
         "| Caught: kind @ step, buggy run only | False incidents (healthy run) | Review's reading (D7) | Notes |\n"
