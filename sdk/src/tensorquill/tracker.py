@@ -11,9 +11,10 @@ import json
 import os
 import secrets
 import sys
+import time
 import warnings
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 #: At most how long `init` on a rank other than 0 waits for rank 0's run ID, in seconds, and
@@ -59,7 +60,7 @@ def resolve_run(run_id: str | None = None) -> RunInfo:
     only, and a `run_id` given on rank 0 only (`run_id=wandb.run.id if wandb.run else None`) is
     rank 0's like any other. A rank given another `run_id` than rank 0's is warned and writes
     under rank 0's. The ID goes through the default process group's store (`set` on rank 0,
-    `wait` and `get` on the others), never a collective, so nothing is put on a GPU and rank 0
+    `check` and `get` on the others), never a collective, so nothing is put on a GPU and rank 0
     never waits. A rank that has not got it after `RUN_ID_WAIT_SECONDS` (or the group's own
     timeout, if shorter), or whose store fails, writes under an ID of its own, by the same order,
     with one warning; nothing raises. So every rank should call `tensorquill.init`, the same
@@ -92,8 +93,12 @@ def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
     """Rank 0's (run ID, source) on every rank, through the default process group's store.
 
     Rank 0 resolves the whole order, puts the pair in the store and goes on: it never waits.
-    The other ranks wait for it at most `RUN_ID_WAIT_SECONDS`. Never raises: a store that fails,
-    or a wait that runs out, leaves the rank with an ID of its own, and one warning."""
+    The other ranks wait for it at most `RUN_ID_WAIT_SECONDS`, polling with `check` (10 ms,
+    doubling to 1 s), never one long `wait`: a TCPStore client does one operation at a time,
+    and NCCL's monitor thread polls the same client with `TORCH_NCCL_DUMP_ON_TIMEOUT` (PyTorch
+    2.6, `ProcessGroupNCCL::heartbeatMonitor`), so a long `wait` would hold it up. Never raises:
+    a store that fails, or a wait that runs out, leaves the rank with an ID of its own, and one
+    warning."""
     key = _KEY.format(next(_exchanges))
     world = dist.get_world_size()
     if rank == 0:
@@ -121,12 +126,14 @@ def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
             own = 0.0
         if 0 < own < wait:
             wait = own
-        if wait > 0:
-            # At least 10 ms: the store takes whole milliseconds, and 0 means no timeout at all.
-            store.wait([key], timedelta(seconds=max(wait, 0.01)))
-        elif not store.check([key]):
-            raise TimeoutError("not in the store, and RUN_ID_WAIT_SECONDS is 0")
-        # Only after the wait: `get` on a missing key waits the group's whole timeout.
+        deadline, pause = time.monotonic() + wait, 0.01
+        while not store.check([key]):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("rank 0 has put nothing in the process group's store")
+            time.sleep(min(pause, left))
+            pause = min(pause * 2, 1.0)
+        # Only once the key is there: `get` on a missing key waits the group's whole timeout.
         shared_id, source = json.loads(store.get(key))
         if not shared_id or not isinstance(source, str):
             raise ValueError(f"unreadable entry {shared_id!r}, {source!r}")
