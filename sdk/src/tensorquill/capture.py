@@ -73,6 +73,10 @@ QUEUE_MIN_RINGS = 2
 CLOSE_SECONDS = 60.0
 STOPPED_CLOSE_SECONDS = 1.0
 FOREIGN_STEPS_WARNING = 10  # optimizer steps on other parameters before warning that none was counted
+# Index tensors kept on the session's device for sets of parameters read together (`Session._index`),
+# the one used least recently dropped first. Routed experts with no gradient when unused
+# make a new set at almost every step, so the cache is bounded rather than one tensor per set seen.
+INDEX_CACHE_SIZE = 32
 # Why the update size was not read (`updates=True`), by what it is said about: an optimizer's
 # class name, or one of these two.
 UPDATES_HOOKS_OFF = "auto_step=False"
@@ -766,14 +770,26 @@ def _block_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
     return best
 
 
+def _root_leaf(model: nn.Module) -> list[tuple[str, nn.Module]]:
+    """A model that is itself one leaf module with parameters (an `nn.Linear` alone), named by its
+    class (`_get_name()`, as sagemaker-debugger names the root module), since `named_modules` names
+    it `""`. Empty for any other model: one with children has its leaves observed instead."""
+    if not any(model.children()) and any(True for _ in model.parameters(recurse=False)):
+        return [(model._get_name(), model)]
+    return []
+
+
 def _select_layers(
-    model: nn.Module, layers: LayerFilter | Sequence[str] | str | None
+    model: nn.Module, layers: LayerFilter | Sequence[str] | str | None, *, root: bool = False
 ) -> list[tuple[str, nn.Module]]:
+    """The modules whose outputs are summarized. `root`: a model that is one leaf module is its own
+    layer (`_root_leaf`) under `"blocks"` and `"all"`, for the statistics; module names and filters
+    never see the root."""
     named = [(name, module) for name, module in model.named_modules() if name]
     if layers is None or layers == "blocks":
-        return _block_layers(model) or _leaf_layers(named)
+        return _block_layers(model) or _leaf_layers(named) or (_root_leaf(model) if root else [])
     if layers == "all":
-        return _leaf_layers(named)
+        return _leaf_layers(named) or (_root_leaf(model) if root else [])
     if isinstance(layers, str):
         raise ValueError('layers must be "blocks", "all", a list of module names or a filter')
     if callable(layers):
@@ -836,6 +852,17 @@ def _next_attempt() -> int:
     global _last_attempt
     _last_attempt = max(time.time_ns() // 1_000_000, _last_attempt + 1)
     return _last_attempt
+
+
+# The attempt of the session handing its work counter to a heartbeat on this thread, while it does
+# (`Session._install`), read by the heartbeat as the counter is set (`flight.Heartbeat._take_attempt`).
+# Per thread, so a session started on another thread in between cannot give its attempt to this one's
+# heartbeat, as `_last_attempt` alone could.
+_handing_over = threading.local()
+
+
+def _attempt_handed_over() -> int | None:
+    return getattr(_handing_over, "attempt", None)
 
 
 def _recomputing() -> bool:
@@ -1024,7 +1051,7 @@ def _plan_session(
     # The parameters the cross-GPU drift check compares: every trainable parameter by
     # default (data parallelism), or only the replicated ones under tensor parallelism.
     replicas = _select_replica_params(params, replica_params)
-    selected = _select_layers(model, layers)
+    selected = _select_layers(model, layers, root=True)
     modules = dict(model.named_modules())
     planned_routers = {
         name: spec if isinstance(spec, Router) else Router(int(spec))
@@ -1193,6 +1220,7 @@ class Session:
         # (`record_replica_spread`), and those already named in a warning (`_say_replica_unread`).
         self._replica_unread_here: dict[str, str] = {}
         self._replica_unread_said: set[str] = set()
+        self._spread_shape_said = False  # a precomputed table of the wrong shape was warned of
         self._counts = {
             name: torch.zeros(_count_width(spec), dtype=torch.int64, device=self.device)
             for name, spec in self._routers.items()
@@ -1276,7 +1304,11 @@ class Session:
         self._steps_committed = 0
         self._grads_recorded = False
         self._spread_recorded = 0
-        self._owned: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+        # Each optimizer seen stepping: whether it holds any of this model's parameters, and the size
+        # of each of its parameter groups when that was judged (`_owns`).
+        self._owned: weakref.WeakKeyDictionary[Any, tuple[bool, tuple[int, ...]]] = weakref.WeakKeyDictionary()
+        # Parameters found trainable after `init` and already named in a warning (`_say_new_trainable`).
+        self._new_trainable_said: set[str] = set()
         self._lead: weakref.ref[Any] | None = None
         self._leading = True
         self._grads_after_step = False
@@ -1319,6 +1351,10 @@ class Session:
         self._fetching = False
         self._pending_data_wait = 0.0
         self._last_step_clock: float | None = None
+        # Time spent in a phase other than "train" since the last step ended (`set_phase`), left out
+        # of `step_time`, and when the pause now under way began (None outside one).
+        self._paused_seconds = 0.0
+        self._pause_began: float | None = None
         self._ring_wait: list[tuple[float, float | None] | None] = []
         # Bounded, as TensorBoard's SummaryWriter is (`max_queue=10`): if the sink falls a full
         # queue behind, for example on a stalled network filesystem, capture stops for the
@@ -1381,9 +1417,24 @@ class Session:
 
         beat = getattr(self._sink, "heartbeat", None)
         if beat is not None:
-            had, before = "counter" in vars(beat), vars(beat).get("counter")
-            beat.counter = lambda: self._steps_committed + self._ticks
-            undo.append(lambda: setattr(beat, "counter", before) if had else vars(beat).pop("counter", None))
+            had, before = hasattr(beat, "counter"), getattr(beat, "counter", None)
+            had_attempt, attempt_before = hasattr(beat, "attempt"), getattr(beat, "attempt", None)
+
+            def give_back() -> None:
+                if had:
+                    beat.counter = before
+                else:
+                    vars(beat).pop("counter", None)
+                if had_attempt:
+                    beat.attempt = attempt_before
+
+            # The counter and this session's own attempt go over together (`_attempt_handed_over`).
+            _handing_over.attempt = self.attempt
+            try:
+                beat.counter = lambda: self._steps_committed + self._ticks
+            finally:
+                _handing_over.attempt = None
+            undo.append(give_back)
 
         def stop_writer() -> None:
             self._queue.put(None)
@@ -1419,13 +1470,16 @@ class Session:
     # ---- training-loop side -------------------------------------------------------
 
     def _owns(self, optimizer: Any) -> bool:
-        # The global hooks fire for every optimizer in the process.
-        owned = self._owned.get(optimizer)
-        if owned is None:
-            owned = any(
-                id(p) in self._param_ids for group in optimizer.param_groups for p in group["params"]
-            )
-            self._owned[optimizer] = owned
+        # The global hooks fire for every optimizer in the process. What each holds is kept with the
+        # size of each of its parameter groups, and judged again when those change: an optimizer
+        # given this model's parameters by `add_param_group` after its first step ends steps then.
+        groups = optimizer.param_groups
+        sizes = tuple(len(group["params"]) for group in groups)
+        found = self._owned.get(optimizer)
+        if found is not None and found[1] == sizes:
+            return found[0]
+        owned = any(id(p) in self._param_ids for group in groups for p in group["params"])
+        self._owned[optimizer] = (owned, sizes)
         return owned
 
     def _optimizer_ownership(self) -> dict[str, Any]:
@@ -1814,10 +1868,15 @@ class Session:
         return found
 
     def _index(self, key: tuple[int, ...]) -> torch.Tensor:
-        idx = self._grad_idx_cache.get(key)
+        """The positions `key` as an index tensor on the session's device. The `INDEX_CACHE_SIZE`
+        sets used most recently are kept; one not kept is made again, a copy of a few integers."""
+        cache = self._grad_idx_cache
+        idx = cache.pop(key, None)
         if idx is None:
             idx = torch.tensor(key, dtype=torch.int64, device=self._grad.device)
-            self._grad_idx_cache[key] = idx
+            if len(cache) >= INDEX_CACHE_SIZE:
+                del cache[next(iter(cache))]  # the one used least recently
+        cache[key] = idx
         return idx
 
     @torch.no_grad()
@@ -1829,7 +1888,8 @@ class Session:
         # Adam's moments and `distributed.py` its fingerprints. Nothing here raises into training,
         # and no norm is made up: a parameter with no values (on `meta`), or whose norm raised, gets
         # NaN and "not known" for unchanged; one read only in float32 where float64 was wanted
-        # (on MPS beside buffers elsewhere) gets its norm and "not known".
+        # (on MPS beside buffers elsewhere) gets its norm and "not known", and so does one with no
+        # elements (an empty local shard), whose norm is 0.
         n_params = len(self._params)
         dtype = torch.float64 if self._exact_weights else torch.float32
         current = torch.zeros(n_params, dtype=dtype, device=self._grad.device)
@@ -1851,6 +1911,9 @@ class Session:
             elif data.layout != torch.strided and not data.is_nested:
                 data = data.values()  # CSR, CSC, BSR, BSC: the stored values are all of them
             if data.numel() == 0:
+                # No values here (an empty local shard under FSDP): its norm is 0, and whether it
+                # changed is not known, so it is never named unchanged.
+                inexact.append(index)
                 continue
             if data.is_complex():
                 data = torch.view_as_real(data.resolve_conj())
@@ -1881,13 +1944,18 @@ class Session:
         if unread:
             current.index_fill_(0, self._index(tuple(sorted(unread))), math.nan)
         self._grad[:, 2].copy_(current)
-        # Not known where this check or the one before did not read a parameter exactly.
+        # Not known where this check or the one before did not read a parameter exactly, nor where
+        # either norm is not finite: an infinite norm equal to an infinite one compares nothing, and
+        # a parameter is flagged 1 only where its norms were compared (contract 2; `weights` in
+        # `init` says what the flag asserts). On the device, over one number per parameter.
         blind = set(unread) | set(inexact)
         before, self._weights_not_exact = getattr(self, "_weights_not_exact", frozenset()), frozenset(blind)
         if not self._exact_weights or self._prev_weight is None:
             self._grad[:, 3].fill_(-1.0)
         else:
-            self._grad[:, 3].copy_(current == self._prev_weight)
+            compared = torch.isfinite(current) & torch.isfinite(self._prev_weight)
+            same = (current == self._prev_weight).to(self._grad.dtype)
+            self._grad[:, 3].copy_(torch.where(compared, same, torch.full_like(same, -1.0)))
             if blind or before:
                 self._grad[:, 3].index_fill_(0, self._index(tuple(sorted(blind | before))), -1.0)
         if self._exact_weights:
@@ -2198,6 +2266,10 @@ class Session:
         collective, and is then left out of `replica_spread` on every rank, never written as a
         spread: a warning names it once, at the next flush. A NaN weight that was read still
         reads as drift.
+
+        A table of another shape (rows other than one per compared parameter, or other than 2 or 3
+        columns) is not recorded and is said once in a warning; what this step recorded before it
+        stays as it was. Nothing is broadcast to parameters the table has no row for.
         """
         if self._closed or not self._replica_params:
             return
@@ -2208,6 +2280,8 @@ class Session:
             if not isinstance(target, torch.Tensor):
                 self._gather_and_drop(target)  # the other ranks are entering it too
                 self._spread_recorded = 1
+            return
+        if isinstance(target, torch.Tensor) and not self._spread_table_fits(target):
             return
         spread_buf, _ = self._ensure_spread_buffers()
         unread: torch.Tensor | None = None
@@ -2226,6 +2300,22 @@ class Session:
         if unread is not None:
             spread_buf[:, -1].copy_(unread)
         self._spread_recorded = width
+
+    def _spread_table_fits(self, table: torch.Tensor) -> bool:
+        """Whether a precomputed spread table is `[n_params, 2]` or `[n_params, 3]` for this
+        session's compared parameters; if not, said once, never raised (from its shape alone)."""
+        n = len(self._replica_params)
+        if table.ndim == 2 and table.shape[0] == n and table.shape[1] in (2, FINGERPRINT_WIDTH):
+            return True
+        if not self._spread_shape_said:
+            self._spread_shape_said = True
+            _warn(
+                f"TensorQuill did not record the replica spread table passed to record_replica_spread: its shape is "
+                f"{list(table.shape)}, and this session compares {n} parameter{'s' if n != 1 else ''}, so it must "
+                f"be [{n}, 2] or [{n}, {FINGERPRINT_WIDTH}] (see spread_from_fingerprints).",
+                stacklevel=4,
+            )
+        return False
 
     def _say_replica_unread(self, spreads: torch.Tensor, seen: Sequence[int]) -> None:
         """Name once each replicated parameter left out of the cross-GPU check, from the block's
@@ -2250,9 +2340,11 @@ class Session:
     def step(self, step: int | None = None, lr: float | Sequence[float] | None = None) -> None:
         """Mark the end of one optimizer step. Only for `auto_step=False`.
 
-        Use this when the optimizer hooks would miscount, for example with
-        `torch.amp.GradScaler`, which skips `optimizer.step()` on overflow. Pass `lr` (one
-        value per parameter group, or a single value) to record the learning rate.
+        Use this when the optimizer hooks cannot see the step, as when a framework steps copies
+        of the weights (DeepSpeed ZeRO, Megatron-LM). A `torch.amp.GradScaler`, which skips
+        `optimizer.step()` on overflow, needs neither: pass it to `init` as `scaler=` and the
+        step ends at `scaler.update()`. Pass `lr` (one value per parameter group, or a single
+        value) to record the learning rate.
         """
         if self._closed_call("step()"):
             if self._stopped and not self._closed and not self.auto_step:
@@ -2419,7 +2511,11 @@ class Session:
         if self._data_timing:
             clock = time.perf_counter()
             last, self._last_step_clock = self._last_step_clock, clock
-            self._ring_wait.append((self._pending_data_wait, None if last is None else clock - last))
+            # A pause that ended before this step did is left out (`set_phase`). One still under way
+            # (a phase a callback left behind) ran this step's training, so it counts, and the
+            # `set_phase("train")` below does not end it as a pause.
+            paused, self._paused_seconds, self._pause_began = self._paused_seconds, 0.0, None
+            self._ring_wait.append((self._pending_data_wait, None if last is None else max(clock - last - paused, 0.0)))
             self._pending_data_wait = 0.0
         else:
             self._ring_wait.append(None)
@@ -2506,10 +2602,38 @@ class Session:
             self._stop(self._error)
         if self._stopped:
             return
+        self._say_new_trainable()
         try:
             self._flush_ring(hold_newest=hold_newest)
         except Exception as error:  # noqa: BLE001
             self._stop(error, f"moving a block of steps off the device raised {_short(error)}")
+
+    def _say_new_trainable(self) -> None:
+        """Name once, in a warning, each parameter of the model that is trainable now and was not when
+        the session started (unfrozen, added or replaced since `init`). The parameters a session
+        records are fixed at `init`, as are its buffers, so such a parameter has no gradient norm and
+        no weight check. Once per flush, on the host: one pass over the model's parameters, no read
+        of a tensor. Not in the router-only mode, which records no parameter."""
+        if not (self.grad_every or self.weight_every):
+            return
+        try:
+            new = [
+                name for name, p in self._model.named_parameters()
+                if p.requires_grad and id(p) not in self._param_ids and name not in self._new_trainable_said
+            ]
+        except Exception:  # noqa: BLE001
+            return
+        if not new:
+            return
+        self._new_trainable_said.update(new)
+        shown = ", ".join(repr(name) for name in new[:5]) + (f" and {len(new) - 5} more" if len(new) > 5 else "")
+        _warn(
+            f"TensorQuill is not recording the parameter{'s' if len(new) != 1 else ''} {shown}: trainable now, "
+            "but not when the session started (unfrozen, added or replaced after tensorquill.init). A session "
+            "records the parameters that were trainable at init; to record these, close it and call "
+            "tensorquill.init again.",
+            stacklevel=4,
+        )
 
     def _flush_ring(self, *, hold_newest: bool) -> None:
         if self._probe_owed and not hold_newest:
@@ -2803,9 +2927,20 @@ class Session:
         any short word. While it is not `"train"` and its heartbeats go on, the server does
         not call the missing steps a hang. Under `"eval"`, a forward in eval mode or without
         gradients is also left out of the records (`_evaluating`); without it, only one with
-        both. Otherwise a no-op unless streaming with `endpoint=`."""
+        both. With `data_wait`, the time from a change away from `"train"` to the change back is
+        left out of the next step's `step_time`, as its fetches are of `data_wait` (`datawait.py`);
+        a phase still not `"train"` when a step ends is taken as training, and that time counts.
+        Otherwise a no-op unless streaming with `endpoint=`."""
         if self._closed:  # live after a stop: the heartbeat still says what the process is doing
             return
+        if self._data_timing and (phase == "train") != (self._phase == "train"):
+            # A pause begins or ends: its time is left out of the next step's `step_time` (`_commit`).
+            now = time.perf_counter()
+            if phase != "train":
+                self._pause_began = now
+            elif self._pause_began is not None:
+                self._paused_seconds += now - self._pause_began
+                self._pause_began = None
         self._phase = phase
         self._evaluating.on = phase == "eval"
         heartbeat = getattr(self._sink, "heartbeat", None)
@@ -2845,6 +2980,8 @@ class Session:
             self._data_timing = True
             self._pending_data_wait = 0.0
             self._last_step_clock = None
+            self._paused_seconds = 0.0
+            self._pause_began = time.perf_counter() if self._phase != "train" else None
 
     @contextlib.contextmanager
     def phase(self, name: str) -> Iterator[None]:
@@ -3053,8 +3190,10 @@ class Session:
                 if isinstance(weight_seen[i], dict):
                     record["optimizer_ownership"] = weight_seen[i]["ownership"]
                     record["weight_dtypes"] = weight_seen[i]["dtypes"]
-                # Written when the check knew any parameter (1 or 0, not -1); one it did not read
-                # (`_record_weights`), the first included, is left out of the list, never the list.
+                # Written when the check compared any parameter (1 or 0, not -1); one it did not compare
+                # (`_record_weights`), the first check included, is left out of the list, never the
+                # list: no key means no comparison, and an empty list that some were compared and none
+                # had an equal norm. What a name in the list asserts: `weights` in `init`.
                 if any(row[3] >= 0 for row in grad[i]):
                     record["weights_unchanged"] = [
                         name for name, row in zip(self.param_names, grad[i]) if row[3] > 0
@@ -3406,8 +3545,9 @@ def init(
         layers: which modules' outputs to summarize. In full capture, `"blocks"`: each repeated
             block, such as each transformer layer, or every leaf module with parameters if
             the model has no repeated blocks. `"all"`: every leaf module with parameters,
-            which costs several times more. Or module names, or a `(name, module) -> bool`
-            filter; `()` for none.
+            which costs several times more. Under both, a model that is itself one leaf module
+            (an `nn.Linear` alone) is summarized under its class name (`"Linear"`). Or module
+            names, or a `(name, module) -> bool` filter; `()` for none.
         routers: MoE router module names mapped to their expert count or a `Router`.
         grads: True to record gradient norms every step, False or 0 to disable automatic
             gradient norm capture, or a positive integer N to record every Nth captured step.
@@ -3415,9 +3555,25 @@ def init(
             (True: every 50; an integer: every N; False or 0: never), so the detectors can
             tell when weights stopped changing. A check reads every weight once and also
             records that step's gradient norms; a parameter is reported after 3 checks in
-            a row find it exactly unchanged.
-        auto_step: count optimizer steps with PyTorch's global optimizer hooks. Pass False
-            and call `session.step()` yourself when using `torch.amp.GradScaler`.
+            a row find its norm exactly unchanged. A record's `weights_unchanged` lists the
+            parameters whose float64 norm at this check equals, exactly, their float64 norm
+            at the previous check, both finite. An equal norm is necessary for an unchanged
+            weight, not sufficient: two different weights can share a norm (rows swapped, a
+            sign flipped, any rotation), so a listed parameter may have changed. A parameter
+            the check did not compare is never listed: at the first check (and the first
+            after a resume), one not read or read only in float32 (on Apple MPS), one with
+            no elements, one whose norm is not finite, and one the previous check did not
+            read. A parameter missing from the list was changed or was not compared; the
+            list does not say which. With no parameter compared the record has no
+            `weights_unchanged`; an empty list means some were compared and none had an
+            equal norm. Gradient norms and weight checks cover the
+            parameters that are trainable (`requires_grad`) when `init` runs: one unfrozen
+            later is named once in a warning and not recorded.
+        auto_step: count optimizer steps with PyTorch's global optimizer hooks. With a
+            `torch.amp.GradScaler`, pass it as `scaler=`: the step then ends at
+            `scaler.update()`, so a step the scaler skipped is counted too. Pass False and call
+            `session.step()` yourself when the hooks cannot see the step, as when a framework
+            steps copies of the weights (DeepSpeed ZeRO, Megatron-LM).
         replica_group: optional replication `ProcessGroup` (or precomputed spread tensor)
             for cross-GPU parameter drift checks.
         replica_every: run the cross-GPU drift check every N steps (default 50). Each

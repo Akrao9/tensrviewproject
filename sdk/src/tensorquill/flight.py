@@ -949,13 +949,16 @@ class Heartbeat:
 
     @staticmethod
     def _take_attempt() -> int | None:
-        """The attempt of the session starting now: the last one `capture` gave out in this
-        process, which the session that sets the counter took a moment before."""
+        """The attempt of the session starting now: the one the session handing over its counter on
+        this thread names as it does (`capture._attempt_handed_over`), so a session started at the
+        same moment on another thread cannot lend its own. A counter set by other code gets the last
+        attempt `capture` gave out in this process, as before."""
         try:
-            from .capture import _last_attempt
+            from .capture import _attempt_handed_over, _last_attempt
         except Exception:  # noqa: BLE001  a beat without an attempt is a beat as before
             return None
-        return _last_attempt or None
+        attempt = _attempt_handed_over()
+        return attempt if attempt is not None else (_last_attempt or None)
 
     def set_phase(self, phase: str) -> None:
         """Name what the process is doing (`train`, `eval`, `checkpoint`, or any short word);
