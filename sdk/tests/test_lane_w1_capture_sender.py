@@ -4,19 +4,26 @@ Written first, before the fix, against `main` at 66b52d7. Each test says whether
 (fail-before) or guards behaviour the fix must keep (guard).
 
 - C06: a router's integer ids outside its experts. A negative id is no assignment: not counted,
-  not a refusal, and how many there were is recorded. An id at or above `n_experts` refuses the
+  not a refusal, and how many there were is recorded (`moe_unassigned`). An id at or above `n_experts` refuses the
   router with a reason. Never a raise. The default integer path and the `indices=` path follow
   the same rule (the `indices=` path refused a -1 before).
 - F1: a bool routing map's entries left out of the counts (their paired float is exactly zero)
   are recorded per expert, so Megatron's own count (`routing_map.sum(dim=0)`,
-  `token_dispatcher.py:558`) is the recorded count plus the left-out count.
-- C03, SDK half: after capture stops, the heartbeat says so at once, and a stop followed straight
-  by `close()` still delivers that beat. Contract 3 (lane W2) names the field; until it is signed
-  off these tests check only that a stopped rank's beat differs from a live one, never a name.
+  `token_dispatcher.py:558`) is the recorded count plus the left-out count (`moe_left_out`).
+- The author's rule for both fields: an explicit zero whenever the router was counted and the check
+  applied (ids checked; a routing map with a paired float checked); no key for a router the check did
+  not apply to or that was refused. A missing value, every older record's included, is unknown, not 0.
+- C03, SDK half (contract 3, signed): after capture stops, every beat carries
+  `"capture_stopped": "<reason>"` (`sink_error`, `writer_behind`, `close_timeout`) and no `stack`; the
+  stop sends a beat at once, and `Heartbeat.close()` sends one bounded last beat if it was not yet sent.
+- Contract 1, the sender's part (signed): each batch's `app_metadata` names `sender_attempt`. A beat or
+  batch the server refuses as UNAVAILABLE is handled as today, which the contract keeps: the heartbeat
+  retries with the same attempt at its next beat, silently; the sender prints one line per outage and
+  resends from the acknowledged offset.
 - L2: the writer never waits for an NVML reading; it attaches the newest finished one.
 
-The two record fields are proposals pending the top session's sign-off; each name is one constant
-below. No server binary is needed; the heartbeat tests skip without pyarrow.
+The record fields and the heartbeat key are signed off. No server binary is needed; the heartbeat
+and sender tests skip without pyarrow.
 """
 
 from __future__ import annotations
@@ -40,9 +47,10 @@ from tensorquill.system import SystemReadings
 
 DEADLINE = 20.0  # seconds: a call that waits for good never returns, so a deadline is the only way to see it
 
-# Proposed record fields (schema, pending sign-off by the top session; travel in `extra_json`):
-UNASSIGNED = "moe_unassigned"  # {router: n}: negative ids in the step, no assignment; written when n > 0
-LEFT_OUT = "moe_left_out"  # {router: [n per expert]}: map entries left out of `moe`; written when any > 0
+# Record fields, signed off (they travel in `extra_json`; no Arrow or Parquet column):
+UNASSIGNED = "moe_unassigned"  # {router: n}: negative ids in the step, no assignment; 0 when ids were checked
+LEFT_OUT = "moe_left_out"  # {router: [n per expert]}: map entries left out of `moe`; zeros when the map was checked
+STOPPED = "capture_stopped"  # heartbeat key, contract 3
 EXPERTS = 4
 
 
@@ -130,14 +138,15 @@ def test_c06_how_many_ids_were_no_assignment_is_recorded(route):
     """Fail-before on both paths: nothing records the two -1 ids today."""
     records = _run(IdsRouter([[-1], [2], [2], [-1], [0]]), ROUTES[route]())
     assert [r.get(UNASSIGNED) for r in records] == [{"router": 2}] * 2
+    assert not any(LEFT_OUT in r for r in records)  # ids, not a routing map: that check does not apply
 
 
 @pytest.mark.parametrize("route", ROUTES)
-def test_c06_a_step_with_every_id_in_range_records_no_unassigned_count(route):
-    """Guard: the field is written only when there is something to say."""
+def test_c06_ids_all_in_range_record_an_explicit_zero(route):
+    """Fail-before. "Checked and found none" is a result, written as 0, unlike a writer that did not check."""
     records = _run(IdsRouter([[1], [2], [2], [3], [0]]), ROUTES[route]())
     assert [r["moe"]["router"] for r in records] == [[1, 1, 2, 1]] * 2
-    assert not any(UNASSIGNED in r for r in records) and _refusal(records) is None
+    assert [r.get(UNASSIGNED) for r in records] == [{"router": 0}] * 2 and _refusal(records) is None
 
 
 @pytest.mark.parametrize("route", ROUTES)
@@ -146,6 +155,7 @@ def test_c06_a_negative_id_and_one_too_high_in_one_step_refuse(route):
     records = _run(IdsRouter([[-1], [2], [4], [1]]), ROUTES[route]())
     assert _refusal(records) is not None
     assert not any("router" in r.get("moe", {}) for r in records)
+    assert not any("router" in r.get(UNASSIGNED, {}) for r in records)  # a refused router is not counted
 
 
 def test_c06_an_id_out_of_range_from_a_later_block_refuses_from_that_block():
@@ -183,7 +193,8 @@ def test_c06_nothing_raises_under_warnings_as_errors(route):
 
 
 def test_c06_logits_through_top_k_are_counted_as_before():
-    """Guard: a router that returns only logits is counted from their top-k, with no new field."""
+    """Guard: a router that returns only logits is counted from their top-k. It has no ids to check and no
+    routing map, so neither check applies and neither key is written."""
 
     class Logits(nn.Module):
         def __init__(self):
@@ -261,10 +272,40 @@ def test_f1_the_map_entries_left_out_are_recorded_per_expert():
     assert [a + b for a, b in zip(records[0]["moe"]["router"], records[0][LEFT_OUT]["router"])] == megatron
 
 
-def test_f1_a_map_with_nothing_left_out_records_no_left_out_count():
-    """Guard: written only when an entry was left out."""
+def test_f1_a_map_with_nothing_left_out_records_explicit_zeros():
+    """Fail-before. The map was checked and nothing was left out: a vector of zeros, one per expert."""
     records = _run(MapRouter([0, 1, 1, 3], padded=[]), tensorquill.Router(EXPERTS, 1))
-    assert not any(LEFT_OUT in r for r in records)
+    assert [r.get(LEFT_OUT) for r in records] == [{"router": [0, 0, 0, 0]}] * 2
+    assert not any(UNASSIGNED in r for r in records)  # a map, not ids: that check does not apply
+
+
+def test_f1_a_map_with_no_paired_float_has_no_left_out_key():
+    """Guard. With no float tensor of the map's shape, every true entry is counted (U1's rule) and no entry
+    can be left out: the check does not apply, so no key, not zeros."""
+
+    class Unpaired(MapRouter):
+        def forward(self, h):
+            return (self.probs * self.scale).sum(-1), self.routing.clone()  # [tokens]: not the map's shape
+
+    records = _run(Unpaired([0, 1, 1, 3], padded=[(0, 2)]), tensorquill.Router(EXPERTS, 1))
+    assert [r["moe"]["router"] for r in records] == [[1, 2, 1, 1]] * 2
+    assert not any(LEFT_OUT in r or UNASSIGNED in r for r in records)
+
+
+def test_a_record_without_the_new_keys_reads_back_without_them_and_zeros_stay_zeros():
+    """Guard, on the sender's columns (`flight.py`): a record from before this change has no key and comes
+    back from the Arrow row with no key, never a filled-in 0, so a reader sees "unknown". An explicit 0 and
+    a zero vector come back as written. What the evidence makes of a missing key is lane W3's."""
+    pytest.importorskip("pyarrow")
+    from tensorquill.flight import record_to_row, row_to_record
+
+    older = {"schema_version": 1, "run_id": "r", "rank": 0, "attempt": 1, "step": 3, "ts": 1.0, "grad_norm": None,
+             "layers": {}, "moe": {"router": [1, 2, 0, 1]}}
+    back = row_to_record(record_to_row(older))
+    assert UNASSIGNED not in back and LEFT_OUT not in back
+    newer = {**older, UNASSIGNED: {"router": 0}, LEFT_OUT: {"router": [0, 0, 0, 0]}}
+    back = row_to_record(record_to_row(newer))
+    assert back[UNASSIGNED] == {"router": 0} and back[LEFT_OUT] == {"router": [0, 0, 0, 0]}
 
 
 # --- C03, SDK half: the heartbeat after capture stops -------------------------------------------
@@ -342,24 +383,20 @@ class FailingJsonl(tensorquill.JsonlSink):
         super().write(records)
 
 
-def _state(beat: dict) -> dict:
-    """What a beat says beyond the work done and where the threads are."""
-    return {k: v for k, v in beat.items() if k not in ("work", "stack")}
-
-
-def _streamed_session_that_stops(tmp_path, server):
-    """A streamed session (one beat a minute, so any later beat is one sent at once) whose sink fails
-    at its second write, stepped until capture has stopped. Returns it and the beats before the stop."""
+def _streamed_session_that_stops(tmp_path, server, heartbeat_seconds: float = 60.0, stack_seconds=None):
+    """A streamed session whose sink fails at its second write, stepped until capture has stopped. With one
+    beat a minute (the default here) any later beat is one sent at once. Returns it, its model and the beats
+    taken before the stop."""
     model = nn.Linear(4, 4)
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         session = tensorquill.init(
             model, run_id="w1-stop", every=1, sink=FailingJsonl(tmp_path / "w1-stop.rank0.jsonl", good=1),
-            endpoint=f"grpc://127.0.0.1:{server.port}", heartbeat_seconds=60.0, stack_seconds=None,
+            endpoint=f"grpc://127.0.0.1:{server.port}", heartbeat_seconds=heartbeat_seconds, stack_seconds=stack_seconds,
         )
         assert server.wait_for(lambda beats: any("work" in b for b in beats)), "no beat named the session's work"
-        live = [_state(b) for b in server.beats]
+        live = list(server.beats)
         deadline = time.monotonic() + DEADLINE
         while not session._stopped and time.monotonic() < deadline:
             opt.zero_grad()
@@ -371,16 +408,43 @@ def _streamed_session_that_stops(tmp_path, server):
     return session, model, live
 
 
+def _close(session) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        session.close()
+
+
 def test_c03_after_capture_stops_a_beat_saying_so_goes_at_once(tmp_path):
-    """Fail-before: no beat is sent at the stop, and every later one reads as a live rank's."""
+    """Fail-before: no beat is sent at the stop, and none says `capture_stopped`. Live beats never carry it."""
     server = _beat_server()
     try:
         session, model, live = _streamed_session_that_stops(tmp_path, server)
-        told = server.wait_for(lambda beats: any(_state(b) not in live for b in beats), timeout=10.0)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            session.close()
-        assert told, "no heartbeat after the stop said anything a live rank's does not"
+        told = server.wait_for(lambda beats: any(STOPPED in b for b in beats), timeout=10.0)
+        _close(session)
+        assert not any(STOPPED in b for b in live)
+        assert told, "no heartbeat said capture_stopped within 10 s of the stop (the interval is 60 s)"
+        stopped = [b for b in server.beats if STOPPED in b]
+        assert stopped[0][STOPPED] == "sink_error" and stopped[0]["attempt"] == session.attempt
+    finally:
+        server.shutdown()
+
+
+def test_c03_every_beat_after_the_stop_says_so_and_none_carries_a_stack(tmp_path):
+    """Contract 3: the key goes on every beat after the stop, so a restarted server learns it again, and no
+    beat of a stopped session carries `stack` (its work stands still while training goes on normally).
+    Beats every 0.1 s and stacks after 0.05 s of no work, so on base the stopped beats would carry stacks.
+    Fail-before."""
+    server = _beat_server()
+    try:
+        session, model, live = _streamed_session_that_stops(tmp_path, server, heartbeat_seconds=0.1,
+                                                            stack_seconds=0.05)
+        told = server.wait_for(lambda beats: sum(STOPPED in b for b in beats) >= 4, timeout=10.0)
+        _close(session)
+        assert told, "fewer than four beats said capture_stopped"
+        first = next(i for i, b in enumerate(server.beats) if STOPPED in b)
+        after = server.beats[first:]
+        assert all(b.get(STOPPED) == "sink_error" for b in after)
+        assert not any("stack" in b for b in after)
     finally:
         server.shutdown()
 
@@ -391,11 +455,71 @@ def test_c03_a_stop_followed_at_once_by_close_still_delivers_the_stopped_beat(tm
     server = _beat_server()
     try:
         session, model, live = _streamed_session_that_stops(tmp_path, server)
+        _close(session)
+        assert [b[STOPPED] for b in server.beats if STOPPED in b][:1] == ["sink_error"], \
+            "close() ended the heartbeat before the stop was told"
+    finally:
+        server.shutdown()
+
+
+def test_c03_a_writer_a_full_queue_behind_is_told_as_writer_behind(tmp_path, monkeypatch):
+    """Fail-before. A sink that stalls (not fails) with a queue of two steps: capture stops as `_put` finds the
+    queue full, and the beat says `writer_behind`."""
+    monkeypatch.setattr(capture, "QUEUE_STEPS", 2, raising=False)
+    release = threading.Event()
+
+    class Stalling(tensorquill.JsonlSink):
+        def write(self, records):
+            release.wait()
+            super().write(records)
+
+    server = _beat_server()
+    try:
+        model = nn.Linear(4, 4)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            session.close()
-        assert any(_state(b) not in live for b in server.beats), "close() ended the heartbeat before the stop was told"
+            session = tensorquill.init(model, run_id="w1-behind", every=1, sink=Stalling(tmp_path / "b.rank0.jsonl"),
+                                       endpoint=f"grpc://127.0.0.1:{server.port}", heartbeat_seconds=60.0,
+                                       stack_seconds=None)
+            deadline = time.monotonic() + DEADLINE
+            while not session._stopped and time.monotonic() < deadline:
+                _train(model, 1)
+        assert session._stopped, "capture did not stop"
+        told = server.wait_for(lambda beats: any(STOPPED in b for b in beats), timeout=10.0)
+        release.set()
+        _close(session)
+        assert told and [b[STOPPED] for b in server.beats if STOPPED in b][0] == "writer_behind"
     finally:
+        release.set()
+        server.shutdown()
+
+
+def test_c03_a_close_that_runs_out_of_time_is_told_as_close_timeout(tmp_path, monkeypatch):
+    """Fail-before. The writer is still in the sink when close()'s deadline passes: capture stops at close,
+    and the bounded last beat says `close_timeout`."""
+    monkeypatch.setattr(capture, "CLOSE_SECONDS", 0.3)
+    release = threading.Event()
+
+    class Slow(tensorquill.JsonlSink):
+        def write(self, records):
+            release.wait()
+            super().write(records)
+
+    server = _beat_server()
+    try:
+        model = nn.Linear(4, 4)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            session = tensorquill.init(model, run_id="w1-close", every=50, sink=Slow(tmp_path / "c.rank0.jsonl"),
+                                       endpoint=f"grpc://127.0.0.1:{server.port}", heartbeat_seconds=60.0,
+                                       stack_seconds=None, auto_step=False)
+            session.step()
+            session.close()
+        release.set()
+        assert session._stopped
+        assert [b[STOPPED] for b in server.beats if STOPPED in b][:1] == ["close_timeout"]
+    finally:
+        release.set()
         server.shutdown()
 
 
@@ -481,41 +605,45 @@ def test_contract1_a_sender_with_no_heartbeat_still_names_its_attempt(tmp_path):
         server.shutdown()
 
 
-def test_contract1_a_refused_heartbeat_is_retried_soon_and_training_goes_on(tmp_path):
-    """Contract 1, amendment 2: a beat whose placement the server could not write is refused and not taken,
-    so the claim must be sent again soon, not one interval (here 60 s) later. Fail-before: the heartbeat
-    waits its interval after a failed beat. Training is neither held nor raised into meanwhile."""
-    server = _beat_server(fail_beats=1)
+def test_contract1_a_refused_claim_is_sent_again_at_the_next_beat_silently(tmp_path, capfd):
+    """Contract 1 keeps today's handling of a beat the server refuses as UNAVAILABLE (it could not write the
+    attempt order): the heartbeat catches it, and its next beat, one interval later, names the same attempt.
+    Nothing is printed or raised, the stream still opens, and training goes on. Guard."""
+    server = _beat_server(fail_beats=2)
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            session, model = _streamed(server, tmp_path / "w1-claim.rank0.jsonl")
-            assert server.wait_until(lambda: server.refused_beats), "no beat was sent"
+            session, model = _streamed(server, tmp_path / "w1-claim.rank0.jsonl", heartbeat_seconds=0.2)
             _train(model, 5)
-            claimed = server.wait_for(lambda beats: any(b.get("attempt") == session.attempt for b in beats),
-                                      timeout=10.0)
+            claimed = server.wait_for(lambda beats: any(b.get("attempt") == session.attempt for b in beats))
             _train(model, 5)
             session.close()
-        assert server.refused_beats[0].get("attempt") == session.attempt
-        assert claimed, "the refused claim was not sent again within 10 s"
+        assert claimed, "the refused claim was not sent again"
+        assert [b.get("attempt") for b in server.refused_beats] == [session.attempt] * 2
+        assert sorted({r["step"] for r in server.rows}) == list(range(10))
         assert session.writer_error is None
+        assert "tensorquill" not in capfd.readouterr().err
     finally:
         server.shutdown()
 
 
-def test_contract1_a_refused_batch_is_retried_and_every_row_arrives(tmp_path):
-    """Guard: the sender already backs off and resends from its saved offset. A refused batch stops neither
-    training nor capture, and nothing raises."""
+def test_contract1_a_refused_batch_is_retried_and_every_row_arrives(tmp_path, capfd):
+    """Guard: a batch refused as UNAVAILABLE is handled as today, which contract 1 keeps. The sender says so
+    once per outage on stderr and resends from the acknowledged offset with backoff; capture does not stop,
+    training goes on, and nothing raises. The rows are waited for before close(), so the outage is a
+    streaming one (at close() the sender reports on its own)."""
     server = _beat_server(fail_batches=2)
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             session, model = _streamed(server, tmp_path / "w1-claim.rank0.jsonl")
             _train(model, 10)
+            arrived = server.wait_until(lambda: {r["step"] for r in server.rows} >= set(range(9)))
             session.close()
-        assert server.refused_batches == 2
+        assert arrived and server.refused_batches == 2
         assert sorted({r["step"] for r in server.rows}) == list(range(10))
         assert session.writer_error is None
+        assert capfd.readouterr().err.count("is failing") == 1
     finally:
         server.shutdown()
 
