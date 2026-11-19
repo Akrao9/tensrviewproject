@@ -1666,6 +1666,23 @@ def resolve_attempts(
     ]
 
 
+def superseded_rows(records: Iterable[Mapping[str, Any]]) -> int:
+    """How many records belong to an attempt that is not the newest seen so far, in the order
+    given: a late row of a superseded attempt (contract 1, a reader with only the local file).
+    They are kept and judged by the rollback as before, and do not move the run's last step."""
+    newest: dict[tuple[str, Any], int] = {}
+    places: dict[tuple[str, Any], dict[Any, int]] = {}
+    late = 0
+    for record in records:
+        key = (_run_of(record), record.get("rank", 0))
+        known = places.setdefault(key, {})
+        place = known.setdefault(record.get("attempt", 0), len(known))
+        if place < newest.get(key, -1):
+            late += 1
+        newest[key] = max(newest.get(key, -1), place)
+    return late
+
+
 def attempt_order_across(files: Iterable[Iterable[Mapping[str, Any]]]) -> dict[tuple[str, Any], list[Any]]:
     """Each rank's attempts oldest first, for a rank whose records are in several files (contract 1
     as amended by the author, Nov 19, 2026). Within a file the order is first appearance, the
@@ -5114,6 +5131,8 @@ def build_evidence(
         **({"run_end": read_end_marker(ended)} if (ended := _records_file(source, records_file)) else {}),
         **({"not_checked": not_checked} if not_checked else {}),
         **({"lines_left_out": left_out} if left_out else {}),
+        # Rows of an attempt after a later attempt's first row (contract 1): kept, not progress.
+        **({"superseded_rows": late} if (late := superseded_rows(every_attempt)) else {}),
         **({"weight_trends": trends} if trends else {}),
         **({"head_trends": head_trends} if head_trends else {}),
         **({"memory": memory} if memory else {}),

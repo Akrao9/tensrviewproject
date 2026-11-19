@@ -591,3 +591,15 @@ def test_contract1_across_files_compare_keeps_each_files_own_order(tmp_path: Any
     for given in (paths, paths[::-1]):
         kept, _ = _step_records(given, 0)
         assert sorted((r["attempt"], r["step"]) for r in kept) == EXPECTED_ACROSS
+
+
+def test_contract1_late_rows_of_a_superseded_attempt_are_counted_in_a_local_file() -> None:
+    from tensorquill.evidence import superseded_rows
+
+    records = _a_then_b()
+    assert superseded_rows(records) == 0  # A's 101 came before B's first row
+    late = records + [row(102, 900)]  # A's step 102 after B's rows: late
+    assert superseded_rows(late) == 1
+    evidence = tensorquill.build_evidence(late)
+    assert evidence["superseded_rows"] == 1
+    assert "superseded_rows" not in tensorquill.build_evidence(records)
