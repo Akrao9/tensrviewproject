@@ -270,8 +270,11 @@ def test_f1_a_map_with_nothing_left_out_records_no_left_out_count():
 # --- C03, SDK half: the heartbeat after capture stops -------------------------------------------
 
 
-def _beat_server():
-    """An in-process stand-in for the server that keeps every heartbeat body and acks every batch."""
+def _beat_server(fail_beats: int = 0, fail_batches: int = 0):
+    """An in-process stand-in for the server that keeps every heartbeat body, every batch's metadata and
+    rows, and acks every batch. The first `fail_beats` heartbeats and the first `fail_batches` batches get
+    a retryable failure (UNAVAILABLE), as the server answers when it cannot write `attempts.json`
+    (contract 1, the author's amendment 2): such a beat or batch is not taken."""
     pa = pytest.importorskip("pyarrow")
     flight = pytest.importorskip("pyarrow.flight")
 
@@ -279,12 +282,21 @@ def _beat_server():
         def __init__(self) -> None:
             super().__init__("grpc://127.0.0.1:0")
             self.beats: list[dict] = []
+            self.refused_beats: list[dict] = []
+            self.metadata: list[dict] = []  # each batch taken: its app_metadata
+            self.rows: list[dict] = []
+            self.refused_batches = 0
             self.seen = threading.Condition()
 
         def do_action(self, context, action):
             if action.type == "heartbeat":
+                beat = json.loads(action.body.to_pybytes())
                 with self.seen:
-                    self.beats.append(json.loads(action.body.to_pybytes()))
+                    if len(self.refused_beats) < fail_beats:
+                        self.refused_beats.append(beat)
+                        self.seen.notify_all()
+                        raise flight.FlightUnavailableError("could not write attempts.json")
+                    self.beats.append(beat)
                     self.seen.notify_all()
             return iter(())
 
@@ -294,12 +306,24 @@ def _beat_server():
                     chunk = reader.read_chunk()
                 except StopIteration:
                     return
-                end = json.loads(chunk.app_metadata.to_pybytes())["end_byte_offset"]
-                writer.write(pa.py_buffer(json.dumps({"end_byte_offset": end}).encode()))
+                metadata = json.loads(chunk.app_metadata.to_pybytes())
+                with self.seen:
+                    if self.refused_batches < fail_batches:
+                        self.refused_batches += 1
+                        self.seen.notify_all()
+                        raise flight.FlightUnavailableError("could not write attempts.json")
+                    self.metadata.append(metadata)
+                    self.rows.extend(chunk.data.to_pylist())
+                    self.seen.notify_all()
+                writer.write(pa.py_buffer(json.dumps({"end_byte_offset": metadata["end_byte_offset"]}).encode()))
 
         def wait_for(self, condition, timeout: float = DEADLINE) -> bool:
             with self.seen:
                 return self.seen.wait_for(lambda: condition(list(self.beats)), timeout)
+
+        def wait_until(self, condition, timeout: float = DEADLINE) -> bool:
+            with self.seen:
+                return self.seen.wait_for(condition, timeout)
 
     return Beats()
 
@@ -386,6 +410,112 @@ def test_c03_training_goes_on_after_the_stop_and_nothing_raises(tmp_path):
                 model(torch.ones(2, 4)).sum().backward()
             session.set_phase("eval")
             session.close()
+    finally:
+        server.shutdown()
+
+
+# --- Contract 1, the sender's part: `sender_attempt`, and a refused beat or batch is retried -----
+
+
+def _train(model, steps: int) -> None:
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    for _ in range(steps):
+        opt.zero_grad()
+        model(torch.ones(2, 4)).sum().backward()
+        opt.step()
+
+
+def _streamed(server, path: Path, run_id: str = "w1-claim", **options):
+    model = nn.Linear(4, 4)
+    options = {"heartbeat_seconds": 60.0, "stack_seconds": None, **options}
+    session = tensorquill.init(model, run_id=run_id, every=1, sink=tensorquill.JsonlSink(path),
+                               endpoint=f"grpc://127.0.0.1:{server.port}", **options)
+    return session, model
+
+
+def test_contract1_every_batch_names_the_attempt_of_the_session_that_sends_it(tmp_path):
+    """Fail-before: no batch's metadata names `sender_attempt`."""
+    server = _beat_server()
+    try:
+        session, model = _streamed(server, tmp_path / "w1-claim.rank0.jsonl")
+        _train(model, 6)
+        session.close()
+        assert server.metadata and {r["attempt"] for r in server.rows} == {session.attempt}
+        assert [m.get("sender_attempt") for m in server.metadata] == [session.attempt] * len(server.metadata)
+        assert {b.get("attempt") for b in server.beats} == {session.attempt}  # the same attempt the beats claim
+    finally:
+        server.shutdown()
+
+
+def test_contract1_an_earlier_attempts_backlog_goes_under_the_sending_sessions_attempt(tmp_path):
+    """The contract's backlog case: a session streams a file that still holds an earlier attempt's unsent
+    rows. Those rows keep their own `attempt`; the batches name the session sending them, so the server
+    places the earlier attempt just before it (rule 3). Fail-before."""
+    path = tmp_path / "w1-claim.rank0.jsonl"
+    model = nn.Linear(4, 4)
+    first = tensorquill.init(model, run_id="w1-claim", every=1, sink=tensorquill.JsonlSink(path))  # not streamed
+    _train(model, 3)
+    first.close()
+    server = _beat_server()
+    try:
+        session, model = _streamed(server, path)
+        _train(model, 3)
+        session.close()
+        attempts = [r["attempt"] for r in server.rows]
+        assert first.attempt in attempts and session.attempt in attempts and first.attempt != session.attempt
+        assert {m.get("sender_attempt") for m in server.metadata} == {session.attempt}
+    finally:
+        server.shutdown()
+
+
+def test_contract1_a_sender_with_no_heartbeat_still_names_its_attempt(tmp_path):
+    """Fail-before. With `heartbeat_seconds=None` the batches are the only claim the server gets."""
+    server = _beat_server()
+    try:
+        session, model = _streamed(server, tmp_path / "w1-claim.rank0.jsonl", heartbeat_seconds=None)
+        _train(model, 4)
+        session.close()
+        assert not server.beats and server.metadata
+        assert {m.get("sender_attempt") for m in server.metadata} == {session.attempt}
+    finally:
+        server.shutdown()
+
+
+def test_contract1_a_refused_heartbeat_is_retried_soon_and_training_goes_on(tmp_path):
+    """Contract 1, amendment 2: a beat whose placement the server could not write is refused and not taken,
+    so the claim must be sent again soon, not one interval (here 60 s) later. Fail-before: the heartbeat
+    waits its interval after a failed beat. Training is neither held nor raised into meanwhile."""
+    server = _beat_server(fail_beats=1)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            session, model = _streamed(server, tmp_path / "w1-claim.rank0.jsonl")
+            assert server.wait_until(lambda: server.refused_beats), "no beat was sent"
+            _train(model, 5)
+            claimed = server.wait_for(lambda beats: any(b.get("attempt") == session.attempt for b in beats),
+                                      timeout=10.0)
+            _train(model, 5)
+            session.close()
+        assert server.refused_beats[0].get("attempt") == session.attempt
+        assert claimed, "the refused claim was not sent again within 10 s"
+        assert session.writer_error is None
+    finally:
+        server.shutdown()
+
+
+def test_contract1_a_refused_batch_is_retried_and_every_row_arrives(tmp_path):
+    """Guard: the sender already backs off and resends from its saved offset. A refused batch stops neither
+    training nor capture, and nothing raises."""
+    server = _beat_server(fail_batches=2)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            session, model = _streamed(server, tmp_path / "w1-claim.rank0.jsonl")
+            _train(model, 10)
+            session.close()
+        assert server.refused_batches == 2
+        assert sorted({r["step"] for r in server.rows}) == list(range(10))
+        assert session.writer_error is None
     finally:
         server.shutdown()
 
