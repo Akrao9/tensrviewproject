@@ -2425,6 +2425,26 @@ State as of Nov 16, 2026.
       - The fake NVML measured before the change stopped capture exactly where this count puts it: 3 steps written, 1 in the write and 8 queued.
     - *Not changed.* What a streaming run reads after a stop, as measured above.
     - *Notes from other lanes.* Lane U3's loader wrapper reads `session._closed` to pass batches through. A stopped session keeps `_closed` false, because `close()` must still run, but its `data()` returns at once, so the wrapper already does nothing harmful. The wrapper could read `_closed or _stopped` to skip hashing the indices. Lane U5's `tracker._say` and this lane's `capture._warn` do the same job; one could replace the other at the merge. U5 also asks for the replica-unread warning once per reason rather than once per parameter; that is not changed here.
+  - *Item 9, lane T2's item 3, decided by the author (logged on `main` at `6f582a5`): "choose option (b): refuse unknown tensor subclasses under torch.compile only, and apply the same rule to both _router_hook and _stats_hook".* Done in commits of its own, after item 8. Option (b) had not been run anywhere before; what was run is below.
+    - *Reproduced first, on this branch before the change,* with lane T2's four scripts.
+      - The strict wrapper raised "aten.eq.Tensor got mixed torch.Tensor and Strict" as a router's output, and "aten.maximum.default got mixed" as a watched block's output, under `backend="eager"`, with and without `fullgraph`.
+      - `NoEq` raised Dynamo's "Observed exception" under `fullgraph=True`, on `eager` and `aot_eager`.
+      - In eager mode both were refused through the hook's `try`.
+    - *Built.* `_PLAIN_TYPES = (torch.Tensor, nn.Parameter)` and `_compiled_subclass(t)`, which is true only under `torch.compiler.is_compiling()` for any other type.
+      - `_stats_hook` checks the tensor it reads after the tuple or dict selection and after unwrapping a DTensor (lane R1), and leaves such a block out.
+      - `_unusable` keeps its DTensor reason first, then refuses a subclass with its own reason. The reason says the tensor "is a <class>, a tensor subclass, which TensorQuill does not count under torch.compile", with a fix of its own: an `indices=` function that returns a plain tensor, or the inner module.
+      - `_unusable`'s line "Only what raises today is refused" is reworded: in eager mode only what raises is refused; under `torch.compile` a subclass is refused by its type.
+      - Eager mode is unchanged.
+    - *Run after the change* (PyTorch 2.15, CPU, backends none, `eager` and `aot_eager`; inductor not run):
+      - No case of the strict scripts raises, router or block, with or without `fullgraph`. The eager rows are the same as before, word for word.
+      - The well-behaved subclasses are now refused under compile: `PlainTF`, `LoggingTF`, `TraceableWrapper` and `TwoTensor`. Before, `eager` and `aot_eager` counted them, 6 a step (12 for `TwoTensor`). This is the cost the author accepted. The untraceable `Wrapper` fails without TensorQuill as it did with it.
+      - `test_compile.py`, `test_router_guard.py`, `test_capture_tensors.py`, `test_capture_raises.py` and `test_eval_forwards.py`: 144 passed, 4 skipped.
+      - The full `sdk/tests` with this worktree on `PYTHONPATH`, after items 8 and 9: 1287 passed, 619 skipped, none failed.
+    - *Tests* (in `test_lane_u1_capture.py`).
+      - Each first compiles the same model without TensorQuill and skips if that fails. Subclass tracing has never run on PyTorch 2.6.
+      - `test_a_strict_subclass_is_refused_under_compile_not_raised` (default and `indices=` routers, with and without `fullgraph`) and `test_a_subclass_that_raises_on_eq_is_refused_under_fullgraph`: these 5 fail on `112ea01`.
+      - `test_eager_mode_still_reads_subclasses_through_its_try` (2 cases) and `test_a_module_that_returns_a_parameter_is_still_read_under_compile` (`eager` and `aot_eager`; router counts `[3, 3, 0, 0]` and the block's mean 0.5) pass before and after. They guard the eager behaviour and the `nn.Parameter` allowance; option (a) would have failed the second.
+    - *Open, for the author.* A refused block is visible in the records only as a block missing from `layers`. The layer statistics have no field that says why. Proposed: `layers_not_read: {block: why}`, said once, as `moe_refused` is. It would be a schema change, with readers in the evidence and the server; it is not built here.
 
 ## Sources
 
