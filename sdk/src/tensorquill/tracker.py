@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import os
 import secrets
 import sys
@@ -66,6 +67,10 @@ def resolve_run(run_id: str | None = None) -> RunInfo:
     with one warning; nothing raises. So every rank should call `tensorquill.init`, the same
     number of times.
 
+    A tracker that raises while its run is read, on any rank or on one process, is passed over
+    with one warning, and the order goes on (the launcher's ID, else a generated one). No
+    warning here can raise, even under `python -W error`.
+
     `mlflow.active_run()` is thread-local and is None when the run was created through
     `MlflowClient` (PyTorch Lightning's `MLFlowLogger` does that, and only on rank 0), so
     those setups must pass `run_id` explicitly.
@@ -76,17 +81,15 @@ def resolve_run(run_id: str | None = None) -> RunInfo:
         # Whether to exchange depends only on what every rank sees alike (the process group and
         # its size), never on `run_id`, a tracker or the environment, so every rank takes it.
         return _shared_run(dist, rank, run_id)
-    if run_id:
-        return RunInfo(run_id, "explicit", rank)
-    found = tracker_run_id()
-    if found is not None:
-        if found[1] in ("mlflow", "wandb") and _world_size() > 1:
+    # One process, or several ranks with no process group: the same guarded lookup as rank 0's,
+    # so a tracker that raises is passed over here too.
+    found = _resolve_here(rank, run_id, stacklevel=4)
+    if _world_size() > 1:
+        if found[1] in ("mlflow", "wandb"):
             _warn_tracker_unshared(found)
-        return RunInfo(found[0], found[1], rank)
-    shared = _launcher_run_id()
-    if shared is not None:
-        return RunInfo(shared, "launcher", rank)
-    return RunInfo(_unshared_generated_id(), "generated", rank)
+        elif found[1] == "generated":
+            _warn_generated_unshared(found[0])
+    return RunInfo(found[0], found[1], rank)
 
 
 def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
@@ -106,11 +109,10 @@ def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
         try:
             dist.distributed_c10d._get_default_store().set(key, json.dumps(list(found), default=str))
         except Exception as error:  # noqa: BLE001  nothing here may stop a run
-            warnings.warn(
+            _say(
                 f"tensorquill.init on rank 0 of {world} could not share its run ID {found[0]!r} through the process "
                 f"group's store ({_brief(error)}), so the other ranks each write under an ID of their own once their "
                 "wait for it runs out. Pass the same run_id= on every rank.",
-                RuntimeWarning,
                 stacklevel=4,
             )
         return RunInfo(found[0], found[1], rank)
@@ -139,43 +141,59 @@ def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
             raise ValueError(f"unreadable entry {shared_id!r}, {source!r}")
     except Exception as error:  # noqa: BLE001  nothing here may stop a run
         found = _resolve_here(rank, run_id)
-        warnings.warn(
+        _say(
             f"tensorquill.init on rank {rank} of {world} did not get rank 0's run ID ({_brief(error)}; it waits "
             f"at most {wait:g} s), so this rank writes under {found[0]!r} ({found[1]}) and may be apart from the "
             "other ranks' run. Call tensorquill.init on every rank, rank 0 too, or pass the same run_id= on every "
             "rank.",
-            RuntimeWarning,
             stacklevel=4,
         )
         return RunInfo(found[0], found[1], rank)
     if run_id and str(run_id) != str(shared_id):
-        warnings.warn(
+        _say(
             f"tensorquill.init on rank {rank} was given run_id={run_id!r}, and rank 0's run ID is {shared_id!r}: "
             "under torch.distributed every rank writes under rank 0's. Pass the same run_id= on every rank.",
-            RuntimeWarning,
             stacklevel=4,
         )
     return RunInfo(shared_id, source, rank)
 
 
 def _brief(error: BaseException) -> str:
-    return f"{type(error).__name__}: {error}"[:200]
+    try:
+        return f"{type(error).__name__}: {error}"[:200]
+    except Exception:  # noqa: BLE001  an error whose str() raises
+        return type(error).__name__
 
 
-def _resolve_here(rank: int, run_id: str | None = None) -> tuple[str, str]:
-    """(run ID, source) by the whole order, on this rank alone: what rank 0 shares, and what
-    another rank falls back to. Never raises: the other ranks may be waiting for this one, so a
-    tracker that fails is passed over."""
+def _say(message: str, stacklevel: int = 2) -> None:
+    """`warnings.warn(message, RuntimeWarning)`, which never raises: under `python -W error` (or a
+    filter that makes a RuntimeWarning an error) the message is logged on the `tensorquill`
+    logger instead (stderr, through logging's last-resort handler, when no handler is set), so
+    saying that something was passed over never becomes the failure it reports. `stacklevel`
+    counts from the caller, as `warnings.warn`'s does."""
+    try:
+        warnings.warn(message, RuntimeWarning, stacklevel=stacklevel + 1)
+    except Exception:  # noqa: BLE001  nothing here may stop a run
+        try:
+            logging.getLogger("tensorquill").warning("%s", message)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _resolve_here(rank: int, run_id: str | None = None, *, stacklevel: int = 5) -> tuple[str, str]:
+    """(run ID, source) by the whole order, on this rank alone: what one process resolves, what
+    rank 0 shares, and what another rank falls back to. Never raises: the other ranks may be
+    waiting for this one, so a tracker that fails is passed over, with one warning.
+    `stacklevel`: the warning's, counted from this function."""
     if run_id:
         return run_id, "explicit"
     try:
         found = tracker_run_id()
     except Exception as error:  # noqa: BLE001  the other ranks wait on this rank
-        warnings.warn(
-            f"tensorquill.init on rank {rank} could not read the tracker's run ({type(error).__name__}: {error}), "
+        _say(
+            f"tensorquill.init on rank {rank} could not read the tracker's run ({_brief(error)}), "
             "so the run ID is the launcher's or a generated one. Pass run_id= to name the run.",
-            RuntimeWarning,
-            stacklevel=5,
+            stacklevel=stacklevel,
         )
         found = None
     if found is not None:
@@ -190,12 +208,11 @@ def _warn_tracker_unshared(found: tuple[str, str]) -> None:
     # Several ranks and no process group: this rank's tracker run cannot be shared, and a rank
     # that does not see it (a tracker usually runs on rank 0 only) takes another ID.
     tracker = {"mlflow": "MLflow", "wandb": "W&B"}[found[1]]
-    warnings.warn(
+    _say(
         f"tensorquill.init on rank {_rank()} of {_world_size()} took the run ID {found[0]!r} from the {tracker} "
         "run, and torch.distributed is not initialized, so it cannot be shared: a rank that does not see that "
         "run writes under another ID. Call tensorquill.init after init_process_group, or pass the same run_id= "
         "on every rank.",
-        RuntimeWarning,
         stacklevel=4,
     )
 
@@ -204,7 +221,8 @@ def tracker_run_id() -> tuple[str, str] | None:
     """The tracker run this process can see, as (run ID, source), with no collective call.
 
     A tracker's run often exists on rank 0 only, so a caller with several ranks should
-    read it there and share it, as `resolve_run` does under `torch.distributed`.
+    read it there and share it, as `resolve_run` does under `torch.distributed`. A tracker
+    that fails while it is read raises here; `resolve_run` passes it over.
     """
     env = os.environ.get("MLFLOW_RUN_ID")
     if env:
@@ -254,7 +272,10 @@ def tracker_labels() -> dict[str, str]:
         if active is not None:
             take("name", lambda: active.info.run_name)
             take("project", lambda: os.environ.get("MLFLOW_EXPERIMENT_NAME"))
-    run = getattr(sys.modules.get("wandb"), "run", None)
+    try:
+        run = getattr(sys.modules.get("wandb"), "run", None)
+    except Exception:  # noqa: BLE001  a module whose `run` raises
+        run = None
     if run is not None:
         take("project", lambda: run.project)
         take("name", lambda: run.name)
@@ -289,19 +310,15 @@ def _world_size() -> int:
     return int(value) if value is not None and value.isdigit() and int(value) > 0 else 1
 
 
-def _unshared_generated_id() -> str:
+def _warn_generated_unshared(run_id: str) -> None:
     # Reached only without a process group of several ranks (`resolve_run` shares rank 0's ID
-    # under one), so nothing here can share the ID.
-    run_id = generate_run_id()
-    if _world_size() > 1:
-        # Several ranks, nothing to share an ID through yet: each rank picks its own, so the
-        # job is written as one run per rank, each missing the others, and nothing says so.
-        warnings.warn(
-            f"tensorquill.init on rank {_rank()} of {_world_size()} found no run ID the ranks share "
-            "(no tracker run, TORCHELASTIC_RUN_ID or SLURM_JOB_ID) and torch.distributed is not "
-            f"initialized, so this rank's run is {run_id!r} and the other ranks' runs have other IDs. "
-            "Pass the same run_id= on every rank, or call tensorquill.init after init_process_group.",
-            RuntimeWarning,
-            stacklevel=4,
-        )
-    return run_id
+    # under one), so nothing here can share the ID. Several ranks, nothing to share an ID
+    # through yet: each rank picks its own, so the job is written as one run per rank, each
+    # missing the others, and this says so.
+    _say(
+        f"tensorquill.init on rank {_rank()} of {_world_size()} found no run ID the ranks share "
+        "(no tracker run, TORCHELASTIC_RUN_ID or SLURM_JOB_ID) and torch.distributed is not "
+        f"initialized, so this rank's run is {run_id!r} and the other ranks' runs have other IDs. "
+        "Pass the same run_id= on every rank, or call tensorquill.init after init_process_group.",
+        stacklevel=4,
+    )
