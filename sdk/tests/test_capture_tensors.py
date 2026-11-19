@@ -412,6 +412,20 @@ def test_the_weight_check_never_raises_and_never_makes_up_a_norm(tmp_path):
 # ---- SDK-05: the update size under FSDP2 -------------------------------------------------------
 
 
+def _cpu_fsdp2_supported() -> bool:
+    """Whether `fully_shard` can run on the CPU: its all-gather records an event on a
+    `torch.cpu.Stream`, which has `record_event` only from PyTorch 2.7. On 2.6 it raises inside
+    PyTorch's own FSDP2 (`_fsdp_collectives.foreach_all_gather`), before TensorQuill reads anything.
+    Asked of the stream itself, not of a version string."""
+    stream = getattr(getattr(torch, "cpu", None), "Stream", None)
+    return stream is not None and hasattr(stream, "record_event")
+
+
+needs_cpu_fsdp2 = pytest.mark.skipif(
+    not _cpu_fsdp2_supported(), reason="PyTorch's CPU Stream lacks record_event, which FSDP2 needs on the CPU"
+)
+
+
 def _fsdp2_run(tmp_path, *, shard, steps=3):
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
@@ -432,12 +446,63 @@ def _fsdp2_run(tmp_path, *, shard, steps=3):
     return _records(path)
 
 
+@needs_cpu_fsdp2
 def test_fsdp2_updates_are_read_from_the_local_shard(tmp_path, one_gloo_rank):
     """The review's script (`sdk05.py`): step 0 said `update_not_read` with the DTensor error and
     nothing was read after. On one rank the local shard is the whole parameter, so the sizes are
     a plain model's."""
     plain = _fsdp2_run(tmp_path, shard=False)
     sharded = _fsdp2_run(tmp_path, shard=True)
+    assert not any("update_not_read" in r for r in sharded)
+    assert [set(r["update_rms"]) for r in sharded] == [{"0.weight", "0.bias", "1.weight", "1.bias"}] * 3
+    for a, b in zip(plain, sharded):
+        assert b["update_rms"] == pytest.approx(a["update_rms"], rel=1e-5)
+
+
+class _ShardedLinear(nn.Module):
+    """A linear layer whose weight and bias are DTensor parameters sharded by rows, as FSDP2
+    keeps them, made without `fully_shard`. The forward reads their local tensors, so the
+    gradients, and AdamW's `exp_avg` and `exp_avg_sq`, are DTensors as under FSDP2."""
+
+    def __init__(self, linear, mesh):
+        from torch.distributed.tensor import DTensor, Shard
+
+        super().__init__()
+        self.weight = nn.Parameter(DTensor.from_local(linear.weight.detach().clone(), mesh, [Shard(0)]))
+        self.bias = nn.Parameter(DTensor.from_local(linear.bias.detach().clone(), mesh, [Shard(0)]))
+
+    def forward(self, x):
+        return nn.functional.linear(x, self.weight.to_local(), self.bias.to_local())
+
+
+def test_dtensor_optimizer_state_is_read_without_fully_shard(tmp_path, one_gloo_rank):
+    """SDK-05 where `fully_shard` cannot run on the CPU (PyTorch 2.6): the update size reads
+    AdamW's state when it is a DTensor, through its local tensor. On one rank the local shard is
+    the whole parameter, so the sizes are a plain model's."""
+    from torch.distributed.device_mesh import init_device_mesh
+
+    torch.manual_seed(0)
+    plain_model = nn.Sequential(nn.Linear(4, 6), nn.Linear(6, 1))
+    mesh = init_device_mesh("cpu", (1,))
+    sharded_model = nn.Sequential(*(_ShardedLinear(layer, mesh) for layer in plain_model))
+
+    def run(model, name):
+        path = tmp_path / f"{name}.jsonl"
+        session = tensorquill.init(model, run_id=name, sink=tensorquill.JsonlSink(path), every=3, updates=True)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        generator = torch.Generator().manual_seed(1)
+        for _ in range(3):
+            optimizer.zero_grad()
+            model(torch.randn(8, 4, generator=generator)).pow(2).mean().backward()
+            optimizer.step()
+        session.close()
+        return _records(path), optimizer
+
+    plain, _ = run(plain_model, "plain")
+    sharded, optimizer = run(sharded_model, "sharded")
+    from torch.distributed.tensor import DTensor
+
+    assert all(isinstance(state["exp_avg"], DTensor) for state in optimizer.state.values())
     assert not any("update_not_read" in r for r in sharded)
     assert [set(r["update_rms"]) for r in sharded] == [{"0.weight", "0.bias", "1.weight", "1.bias"}] * 3
     for a, b in zip(plain, sharded):
@@ -477,6 +542,7 @@ def _fsdp2_two_ranks(out_dir, rank):
     (out_dir / f"sizes{rank}.json").write_text(json.dumps(sizes))
 
 
+@needs_cpu_fsdp2
 def test_on_two_ranks_each_rank_reads_the_rms_of_the_rows_it_holds(tmp_path):
     """FSDP2 shards each parameter by rows. A rank's `update_rms` is the RMS over its own rows;
     weighting each rank's square by its element count gives the whole parameter's (the plain
