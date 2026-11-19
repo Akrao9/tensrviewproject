@@ -9,10 +9,12 @@ function, after the model is built there, because the script builds it nowhere e
 then traces `tensorquill.init`, which fails (an AssertionError on `mark_static_address`), so
 `--disable` wraps `init` and `session.log` in `torch.compiler.disable`.
 
-The script runs one training loop eagerly and once under Dynamo. At iteration 3 no backward
-runs, so the gradients are None and Adam's `step` must be a no-op; the bug made the compiled
-loop step anyway (its step counter reaching 6 where eager stops at 5). Buggy: the compiled
-loop. Healthy: the eager one.
+The script runs one training loop eagerly and once under Dynamo, printing Adam's step counter
+after each step. At iteration 3 no backward runs, so the gradients are None and Adam's `step`
+must be a no-op: the eager counter reads 1, 2, 3, 3, 4, 5. TrainCheck's `bugs.md` describes
+the bug as missing guards that made the compiled loop use an obsolete kernel; the symptom is
+taken here as the compiled counter differing from the eager one. Buggy: the compiled loop.
+Healthy: the eager one.
 """
 
 from __future__ import annotations

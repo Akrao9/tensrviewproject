@@ -14,6 +14,7 @@ not on this machine and was not fetched. `how` is what was run here:
   cannot run here;
 - "not run".
 
+`reach`, on the rows not run, is judged from the synopsis and TensorQuill's code, not tested.
 `review` is the reading in "Research papers and SageMaker Debugger review.md", D7: up to
 seven of the 20 within reach of TensorQuill's kinds (B1, B3, B6, B8, B9, B10, B16; B1 and B3
 doubtful). `runs` names the configurations `run_all.py` runs, as (tag, extra arguments); each
@@ -100,7 +101,7 @@ BUGS: list[dict] = [
                "does not show on 2.15: the compiled loop's Adam step counter equals the eager one.",
         "how": "shipped", "script": "b08_pt115607.py", "review": "within reach",
         "runs": [("", ["--disable"]), ("nodisable", [])],
-        "needs": "a PyTorch version with the bug (the issue is from late 2023, PyTorch 2.1 to 2.2)",
+        "needs": "a PyTorch version with the bug (TrainCheck's evaluation used PyTorch 2.2.2, paper p. 10)",
     },
     {
         "id": "B9", "paper": "PT-104336", "ae": "pytorch-104336", "location": "Framework",

@@ -29,6 +29,21 @@ import harness
 BUG = "B01-PT-84911"
 
 
+class MBConvBlock(nn.Module):
+    """A small stand-in for EfficientNet's MBConvBlock, called as `block(x)` as there."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self._depthwise_conv = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False)
+        self._bn1 = nn.BatchNorm2d(channels)
+        self._project_conv = nn.Conv2d(channels, channels, 1, bias=False)
+        self._bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = torch.nn.functional.silu(self._bn1(self._depthwise_conv(x)))
+        return x + self._bn2(self._project_conv(y))
+
+
 class TinyEfficientNet(nn.Module):
     """Stands in for EfficientNet-b0 with the same parameter-name pattern."""
 
@@ -36,15 +51,7 @@ class TinyEfficientNet(nn.Module):
         super().__init__()
         self._conv_stem = nn.Conv2d(3, 16, 3, stride=2, padding=1, bias=False)
         self._bn0 = nn.BatchNorm2d(16)
-        blocks = []
-        for _ in range(2):
-            block = nn.Module()
-            block._depthwise_conv = nn.Conv2d(16, 16, 3, padding=1, groups=16, bias=False)
-            block._bn1 = nn.BatchNorm2d(16)
-            block._project_conv = nn.Conv2d(16, 16, 1, bias=False)
-            block._bn2 = nn.BatchNorm2d(16)
-            blocks.append(block)
-        self._blocks = nn.ModuleList(blocks)
+        self._blocks = nn.ModuleList([MBConvBlock(16) for _ in range(2)])
         self._conv_head = nn.Conv2d(16, 32, 1, bias=False)
         self._bn1 = nn.BatchNorm2d(32)
         self._fc = nn.Linear(32, num_classes)
@@ -52,8 +59,7 @@ class TinyEfficientNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.nn.functional.silu(self._bn0(self._conv_stem(x)))
         for block in self._blocks:
-            y = torch.nn.functional.silu(block._bn1(block._depthwise_conv(x)))
-            x = x + block._bn2(block._project_conv(y))
+            x = block(x)
         x = torch.nn.functional.silu(self._bn1(self._conv_head(x)))
         return self._fc(x.mean(dim=(2, 3)))
 

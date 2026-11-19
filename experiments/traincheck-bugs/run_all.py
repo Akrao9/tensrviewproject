@@ -173,7 +173,8 @@ def write_table(results: dict[str, Any]) -> None:
             showed = "<br>".join(parts_showed) or "no run completed"
         reach = bug.get("reach", "")
         needs = bug.get("needs", "")
-        notes = " ".join(x for x in (f"Needs: {needs}." if needs else "", reach) if x)
+        notes = " ".join(x for x in (f"Needs: {needs}." if needs else "",
+                                     f"Reach (judged, not tested): {reach}" if reach else "") if x)
         rows.append(f"| {bug['id']} {bug['paper']} | {bug['synopsis']} | {bug['location']} | {bug['in_clone']} | {ran} | "
                     f"{showed} | {caught} | {false} | {bug['review']} | {notes} |")
         if source == bug["id"]:

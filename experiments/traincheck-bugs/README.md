@@ -52,7 +52,7 @@ reference pipeline, not a fixed copy of B1.
 
 ```bash
 cd experiments/traincheck-bugs
-/Users/ak/Documents/tensrview/tensrviewproject/.venv/bin/python run_all.py          # about 10 to 20 min on a busy laptop
+/Users/ak/Documents/tensrview/tensrviewproject/.venv/bin/python run_all.py          # every configuration, buggy and healthy
 /Users/ak/Documents/tensrview/tensrviewproject/.venv/bin/python run_all.py --report # rewrite RESULTS.md only
 ```
 
@@ -62,14 +62,17 @@ cd experiments/traincheck-bugs
 
 Counts are of rows, and the levels are kept apart. B2, B17 and B18 share one run.
 
-**Caught: a kind fired on the buggy run and not on the healthy one (4 bugs, plus the simulated effect)**
+**Caught: a kind fired on the buggy run and not on the healthy one.**
+
+- **By level.** None with TrainCheck's script as it is in the clone. B1 with its script, model and data swapped. B9 and B10 re-created. B3 simulated. Plus the simulated hardware effect.
+- **B9 and B10 are one measurement.** They are the same training with the gradient sync lost two ways: the replicas end the same distance apart (0.1107).
 
 | Bug | Level | Kind @ step | Note |
 |---|---|---|---|
 | B10 X-DDP | re-created | `replica_drift` @ 49 (both ranks); @ 0 with `replica_every=1` (its first update) | The first cross-rank check. TrainCheck reports within one iteration. |
 | B9 PT-104336 | re-created | `replica_drift` @ 49 (both ranks) | The trigger is `overwrite_module_params_on_conversion`: on 2.15 it makes `.to()` put new `Parameter`s in place, so DDP's hooks stay on the old ones, as the synopsis describes. The issue's own trigger was not read. |
 | B3 DS-1801 | simulated mechanism | `replica_drift` @ 49 (both ranks); @ 1 with `replica_every=1` | LayerNorm weights end 2e-3 apart; the two runs' final losses are 0.6791 and 0.6794. |
-| B1 PT-84911 | swapped | `stalled_weights` @ 19 with `weights=5`; @ 199 over 200 steps at the default | Names the 12 BatchNorm parameters that get gradients and says no optimizer holds them: the root cause. At TrainCheck's own 22 steps with the defaults no weight check falls in the run, and nothing fires (`kind_checks` says `not_configured`, 0 of 3 records). |
+| B1 PT-84911 | swapped | `stalled_weights` @ 19 with `weights=5`; @ 199 over 200 steps at the default | Caught in 2 of its 4 configurations, under two conditions. First, enough weight checks: at TrainCheck's own 22 steps with the defaults none falls in the run (`kind_checks` says `not_configured`, 0 of 3 records). Second, `init` called before the freezing loops: called after them, it records nothing (see the gaps). The incident names the 12 BatchNorm parameters that get gradients and says no optimizer holds them: the root cause. |
 | B2, B17, B18 | simulated effect only | `replica_drift` @ 99 | Rank 1 loses a tenth of one weight at step 75; caught at the next check. Not a run of any of the three bugs. |
 
 **Not caught, though the failure showed (4)**
@@ -77,29 +80,35 @@ Counts are of rows, and the levels are kept apart. B2, B17 and B18 share one run
 | Bug | Level | What happened | Why TensorQuill does not see it |
 |---|---|---|---|
 | B4 SO-60335387 | re-created on TrainCheck's `mnist.py` | The gradient norm climbs from 5.2 to 38 over 102 steps (360 times one batch's at the end); the model stays at chance (10% against 100% healthy). | `grad_spike` compares a step with the recent median, which climbs with it. `update_spike` does not read Adadelta (`not_checked`). The one incident, `activation_drift`, fires on the healthy run too. |
-| B6 SO-67180955 | simulated (pre-1.9 seeding) | 75% of the augmentations repeat across the four workers. | Batches are hashed from their sample indices, which stay distinct; `duplicate_batches` compares ranks, not workers. The review counted B6 as within reach; as built, it is not. |
+| B6 SO-67180955 | simulated (pre-1.9 seeding) | 75% of the augmentations repeat across the four workers. | Batches are hashed from their sample indices, which stay distinct; `duplicate_batches` compares ranks, not workers. The review counted B6 as within reach; in this simulation, which is this lane's reading of the synopsis, it is not caught. |
 | B14 TF-29903 | re-created | Two LSTM tensors are missing from the checkpoint; after the resume they are fresh (changed by up to 0.41); the final loss is 1.76 against 1.35 healthy. | `resume_incomplete` checks which components a checkpoint holds, not whether the model's tensors are all in it. The manifest records the model's tensor count and a hash of its keys, and no rule compares them with the model. With `--checkpoint minimal` (no RNG state, no data position) `resume_incomplete` fires on both variants, as an observation. |
 | B19 PT-51800 | re-created | The first evaluation divides each weight by -0.038 and -0.020 times its true sigma; validation loss 1517 against 3.07. | It happens in an evaluation, outside the training steps TensorQuill records. |
 
 **Ran, but tested nothing (1).** B8 (TrainCheck's script) runs on PyTorch 2.15 once `save_config=False` is dropped, but the bug does not happen: the compiled loop's Adam step counter equals the eager one. TensorQuill cannot start inside the script as written: the model is built inside the compiled function, Dynamo traces `tensorquill.init`, and it raises an `AssertionError` on `mark_static_address` into the script. With `init` and `session.log` wrapped in `torch.compiler.disable` it records all six steps.
 
-**Not run (8).** B5, B7, B11, B12, B13, B15, B16 and B20 need a package, a download, an old library version or a GPU that is not here; each row of `RESULTS.md` says which. Seven of them are also out of TensorQuill's reach as built, whatever the setup: lengths (B5), dtypes (B7), batch shapes after a processor (B11), evaluation (B12), model loading (B13), the planned step count (B15; TrainCheck misses it too) and which parameters are meant to be frozen (B20). B16's hang would need the server's watchdog or NCCL Flight Recorder dumps.
+**Not run (8).** B5, B7, B11, B12, B13, B15, B16 and B20 need a package, a download, an old library version or a GPU that is not here; each row of `RESULTS.md` says which. Judged from the synopses and TensorQuill's code, not tested, seven of them are also out of its reach as built, whatever the setup: lengths (B5), dtypes (B7), batch shapes after a processor (B11), evaluation (B12), model loading (B13), the planned step count (B15; TrainCheck misses it too) and which parameters are meant to be frozen (B20). B16's hang would need the server's watchdog or NCCL Flight Recorder dumps.
 
-**False incidents (17 healthy configurations).**
-- **Anomalies.** `activation_drift` fired on 11 of the 17, every one but B1's four and B8's two (it also fired on 10 of the 17 buggy runs), plus one `activation_spike` (B4).
+**False incidents.** `activation_drift` needs 60 records, so it judges 12 of the 17 healthy configurations: B1's three 22-step runs and B8's two 6-step runs are too short.
+- **Anomalies.** `activation_drift` fired on 11 of the 12, plus one `activation_spike` (B4).
+  - The 12 are only seven distinct trainings: B9, B10, B10 every-step and the hardware run are one healthy training, and B3's two and B14's two are one each.
+  - So it fired on 6 of 7, B1's 200-step run the only clean one.
+  - It also fired on 10 of the 12 buggy runs long enough to judge.
 - **Observations.** One `resume_incomplete`, on B14's healthy run with the minimal checkpoint, which saves no RNG state or data position.
 - **Invariants.** None fired on a healthy run.
 
 Because `activation_drift` fires on almost every small run that learns, it never counts as a catch here.
 
-**Against the review's reading (D7: up to seven within reach, B1 and B3 doubtful).**
-- Caught: B1 (given enough weight checks), B3 (simulated), B9 and B10.
-- Not caught: B6.
+**Against the review's reading (D7: up to seven within reach, B1 and B3 doubtful).** By level, never summed:
+- Caught: B1 (swapped; with enough weight checks and `init` before the freezing), B9 and B10 (re-created; one measurement), B3 (simulated).
+- Not caught: B6 (simulated).
 - Not testable: B8 on 2.15.
 - Not run: B16.
 
 **Gaps found in TensorQuill (not fixed here)**
-- **Where `init` is called decides B1.** `init` tracks the parameters that need gradients at that moment. Called after the freezing loops, it treats the optimizer, which holds only frozen parameters, as another job's. It records no step at all (an empty file, run state `unknown`), and its only warning points at DeepSpeed and Megatron. Called where the guide says, right after `model.to(device)`, which in `84911.py` comes before the freezing, it catches the bug.
+- **Where `init` is called decides B1.** `init` tracks the parameters that need gradients at that moment.
+  - Called just before the training loop, after the freezing loops, it treats the optimizer, which holds only frozen parameters, as another job's. It records no step at all (an empty file, run state `unknown`), and its one warning names only DeepSpeed ZeRO and Megatron as causes.
+  - Called right after `model.to(device)`, which in `84911.py` comes before the freezing, it catches the bug.
+  - The guide ("after the model is on its device and before `torch.compile`") allows both.
 - **`init` raises when Dynamo traces it** (B8).
 - **`resume_incomplete` does not compare a checkpoint's model tensors with the model** (B14).
 - **The batch hash is over indices**, so identical content from different indices is not seen (B6).

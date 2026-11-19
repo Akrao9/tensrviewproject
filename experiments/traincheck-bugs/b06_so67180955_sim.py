@@ -4,9 +4,10 @@ Simulated here. TrainCheck's script is not in the clone, and its AE guide leaves
 out because it "requires older Python version no longer supported". The reading taken here:
 before PyTorch 1.9 every `DataLoader` worker inherited the parent's NumPy random state, so
 a dataset that draws its augmentation from `np.random` handed every worker the same
-sequence; PyTorch 1.9 seeds NumPy in each worker and the bug cannot happen on 2.15 as
-written. The old behaviour is put back with a `worker_init_fn` that seeds NumPy with the same
-value in every worker.
+sequence; PyTorch 1.9 seeds NumPy in each worker (`_generate_state` in
+`torch/utils/data/_utils/worker.py`, commit 3b977a0, #56797, first tagged in v1.9.0, read in
+the sibling PyTorch clone) and the bug cannot happen on 2.15 as written. The old behaviour
+is put back with a `worker_init_fn` that seeds NumPy with the same value in every worker.
 
 A map-style dataset adds NumPy noise to each sample (the augmentation), four workers, a small
 MLP, Adam. Buggy: the `worker_init_fn` above. Healthy: PyTorch's own per-worker seeding.

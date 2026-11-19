@@ -37,7 +37,10 @@
      "run_state": "degraded",
      "incidents": [],
      "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
       "data_stalled",
+      "dead_activations",
       "epoch_order_repeated",
       "grad_spike",
       "non_finite",
@@ -48,7 +51,10 @@
      "kinds_unavailable": [
       "update_spike"
      ],
-     "checked_without_enough_history": [],
+     "checked_without_enough_history": [
+      "activation_drift (22 of 60 records)",
+      "dead_activations (22 of 60 records)"
+     ],
      "not_checked": [
       {
        "check": "update_size",
@@ -119,7 +125,10 @@
      "run_state": "degraded",
      "incidents": [],
      "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
       "data_stalled",
+      "dead_activations",
       "epoch_order_repeated",
       "grad_spike",
       "non_finite",
@@ -130,7 +139,10 @@
      "kinds_unavailable": [
       "update_spike"
      ],
-     "checked_without_enough_history": [],
+     "checked_without_enough_history": [
+      "activation_drift (22 of 60 records)",
+      "dead_activations (22 of 60 records)"
+     ],
      "not_checked": [
       {
        "check": "update_size",
@@ -265,7 +277,10 @@
       }
      ],
      "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
       "data_stalled",
+      "dead_activations",
       "epoch_order_repeated",
       "grad_spike",
       "non_finite",
@@ -277,7 +292,10 @@
      "kinds_unavailable": [
       "update_spike"
      ],
-     "checked_without_enough_history": [],
+     "checked_without_enough_history": [
+      "activation_drift (22 of 60 records)",
+      "dead_activations (22 of 60 records)"
+     ],
      "not_checked": [
       {
        "check": "update_size",
@@ -351,7 +369,10 @@
      "run_state": "degraded",
      "incidents": [],
      "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
       "data_stalled",
+      "dead_activations",
       "epoch_order_repeated",
       "grad_spike",
       "non_finite",
@@ -363,7 +384,10 @@
      "kinds_unavailable": [
       "update_spike"
      ],
-     "checked_without_enough_history": [],
+     "checked_without_enough_history": [
+      "activation_drift (22 of 60 records)",
+      "dead_activations (22 of 60 records)"
+     ],
      "not_checked": [
       {
        "check": "update_size",
@@ -498,7 +522,10 @@
       }
      ],
      "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
       "data_stalled",
+      "dead_activations",
       "epoch_order_repeated",
       "grad_spike",
       "non_finite",
@@ -584,7 +611,10 @@
      "run_state": "degraded",
      "incidents": [],
      "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
       "data_stalled",
+      "dead_activations",
       "epoch_order_repeated",
       "grad_spike",
       "non_finite",
@@ -738,7 +768,10 @@
      "run_state": "degraded",
      "incidents": [],
      "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
       "data_stalled",
+      "dead_activations",
       "epoch_order_repeated",
       "grad_spike",
       "non_finite",
@@ -749,7 +782,10 @@
      "kinds_unavailable": [
       "update_spike"
      ],
-     "checked_without_enough_history": [],
+     "checked_without_enough_history": [
+      "activation_drift (22 of 60 records)",
+      "dead_activations (22 of 60 records)"
+     ],
      "not_checked": [
       {
        "check": "update_size",
