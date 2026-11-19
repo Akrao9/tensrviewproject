@@ -69,7 +69,7 @@ routers = {
 
 ## 4. Add TensorQuill to the training loop
 
-Call `init` after the model is on its device and before `torch.compile`. Pass your tracker's run ID if TensorQuill cannot find it on its own: it looks for `run_id=`, then `MLFLOW_RUN_ID`, then the active MLflow run, then the active W&B run. Without any of those it uses the launcher's job ID (torchrun's `TORCHELASTIC_RUN_ID`, or SLURM's job and step IDs), and otherwise generates a unique `run-<UTC time>-<6 hex>` ID, broadcast from rank 0 when `torch.distributed` is initialized so every rank writes under the same name. If you start several ranks with plain `torchrun` (no `--rdzv-id`, so `TORCHELASTIC_RUN_ID` is `none`) and call `init` before `init_process_group`, nothing is shared yet: each rank generates its own ID, `init` warns, and the job is written as one run per rank. Pass the same `run_id=` on every rank, or call `init` after `init_process_group`.
+Call `init` after the model is on its device and before `torch.compile`. Pass your tracker's run ID if TensorQuill cannot find it on its own: it looks for `run_id=`, then `MLFLOW_RUN_ID`, then the active MLflow run, then the active W&B run. Without any of those it uses the launcher's job ID (torchrun's `TORCHELASTIC_RUN_ID`, or SLURM's job and step IDs), and otherwise generates a unique `run-<UTC time>-<6 hex>` ID. When `torch.distributed` is initialized with several ranks, rank 0 works this out, a `run_id=` given on rank 0 only included, and every rank takes rank 0's ID through the process group's store, so every rank writes under the same name; a rank given another `run_id=` is warned and writes under rank 0's. Call `init` on every rank: a rank that has not heard from rank 0 within 300 s writes under an ID of its own, with a warning. If you start several ranks with plain `torchrun` (no `--rdzv-id`, so `TORCHELASTIC_RUN_ID` is `none`) and call `init` before `init_process_group`, nothing is shared yet: each rank generates its own ID, `init` warns, and the job is written as one run per rank. Pass the same `run_id=` on every rank, or call `init` after `init_process_group`.
 
 ### Plain PyTorch
 
@@ -107,7 +107,7 @@ from tensorquill.lightning import TensorQuillCallback
 trainer = L.Trainer(callbacks=[TensorQuillCallback(routers=routers)], logger=MLFlowLogger(...))
 ```
 
-- **Run ID.** It reads the run from the trainer's logger (`MLFlowLogger.run_id`, or `WandbLogger`'s run) on rank 0 and broadcasts it to every rank, so you do not pass `run_id=`.
+- **Run ID.** It reads the run from the trainer's logger (`MLFlowLogger.run_id`, or `WandbLogger`'s run) on rank 0 and passes it to `init`, which shares it with every rank through the process group's store, so you do not pass `run_id=`. Under Lightning's XLA strategy, which starts no `torch.distributed` group, the other ranks each write under an ID of their own.
 - **Steps** are counted from optimizer steps, like Lightning's `global_step`, and start at `trainer.global_step`, so a resumed fit continues the numbering.
 - **Loss** is logged as `train/loss` for each optimizer step, summed over `accumulate_grad_batches` microbatches (which Lightning has already divided, so it is their mean). Change the name with `loss_name=`, or turn it off with `loss_name=None`.
 - **Mixed precision.** With `precision="16-mixed"`, the plugin's `GradScaler` is passed in, so skipped steps are counted and marked.
@@ -144,7 +144,7 @@ trainer = Trainer(model=model, args=args, train_dataset=data, callbacks=[TensorQ
 
 Install with `python -m pip install -e 'sdk[huggingface]'`. `SFTTrainer` and the other TRL trainers subclass `Trainer` and take the same callback, but none has been run with it.
 
-- **Run ID.** `Trainer` starts the W&B or MLflow run on the main process only; the callback reads it there and broadcasts it to the other ranks.
+- **Run ID.** `Trainer` starts the W&B or MLflow run on the main process only; `init` reads it there and shares it with the other ranks through the process group's store.
 - **Steps** are counted from optimizer steps, like `global_step`, and start at `state.global_step`, so a resumed run continues the numbering.
 - **Loss** is logged as `train/loss` for each optimizer step: the loss `Trainer` back-propagates, summed over `gradient_accumulation_steps` microbatches, which is their mean. `loss_name=None` turns it off. The interval averages `Trainer` logs every `logging_steps`, and evaluation metrics, are not recorded.
 - **Clipping.** The norm before clipping is recorded as `clip_grad_norm`, including with `max_grad_norm=0`, where `Trainer` still computes it.

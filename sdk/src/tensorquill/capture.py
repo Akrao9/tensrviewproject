@@ -2263,10 +2263,18 @@ class Session:
         except queue.Full:
             if not self._warned_backpressure:
                 self._warned_backpressure = True
+                cause = ("The sink is slower than training, for example a stalled network filesystem; "
+                         "pass sink=tensorquill.JsonlSink(path) on local disk.")
+                if self._system is not None:
+                    # With system readings on, the writer may instead be in its bounded wait for an
+                    # NVML reading (system.py), after which NVML is off for the session.
+                    cause = ("The sink is slower than training, for example a stalled network filesystem "
+                             "(pass sink=tensorquill.JsonlSink(path) on local disk), or the writer is waiting "
+                             "for an NVML reading that is slow to come back; it waits a bounded time, then "
+                             "turns NVML off for the session.")
                 warnings.warn(
                     f"TensorQuill's writer is {WRITER_QUEUE * self.every} steps behind; training "
-                    "now waits for it. The sink is slower than training, for example a stalled "
-                    "network filesystem; pass sink=tensorquill.JsonlSink(path) on local disk.",
+                    f"now waits for it. {cause}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -2371,8 +2379,9 @@ class Session:
                 if self._error is not None:
                     continue
                 if self._system is not None:
-                    # NVML is read here, on the writer thread. A failure is written as a note
-                    # in the record (system.py) and never stops the writer, which would stop training.
+                    # NVML is asked for here, on the writer thread, and read on a thread of its own,
+                    # waited for a bounded time (system.py). A failure is written as a note in the
+                    # record and never stops the writer, which would stop training.
                     # Found by its type, not its place, so other parts of the block can come after it.
                     try:
                         item = tuple(self._system.write(x) if isinstance(x, SystemPart) else x for x in item)
@@ -2817,11 +2826,12 @@ def init(
             another norm type records nothing. Free when you clip anyway, and enough for
             gradient-spike detection.
         system: at each flush, add the CUDA caching allocator's counters (allocated,
-            reserved and peak bytes, allocation retries and OOMs; host-side, no sync) and,
-            on the writer thread, NVML's temperature, SM clock, power, ECC counters,
-            throttle reasons and Xid events (`pip install nvidia-ml-py`) to the block's
-            last record as `system`. A reading that cannot be taken is written once as
-            unavailable. Off by default until its cost is measured on a GPU. See `system.py`.
+            reserved and peak bytes, allocation retries and OOMs; host-side, no sync) and
+            NVML's temperature, SM clock, power, ECC counters, throttle reasons and Xid
+            events (`pip install nvidia-ml-py`), read on a thread of their own that the
+            writer waits for a bounded time, to the block's last record as `system`. A
+            reading that cannot be taken is written once as unavailable. Off by default
+            until its cost is measured on a GPU. See `system.py`.
         data_wait: record the host time this thread spends in `next()` on PyTorch
             `DataLoader`s during training as `data_wait`, with `step_time`, on each step
             (`session.watch_loaders()`). The Hugging Face and Lightning callbacks turn it
