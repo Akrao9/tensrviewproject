@@ -1843,6 +1843,95 @@ State as of Nov 16, 2026.
   - *Read.* The copy off the device is a blocking `.cpu()`, so the held step's slice of it is complete. The owed probe now runs between the next backward and the lead's step; `run_probe` runs under `no_grad` and `fork_rng`, restores each module's training flag, and `_run_owed_probe` puts the hook buffers back. `_decode` finds the gradient rows from the layer count, so the split block lines up with it; `refused` lays out the router counts, and the refusals are written once, from `announce`, on the first part. The optimizer hooks were registered with no guard against raising before R2, and R2's new paths are no less guarded. The six edited tests change timing only, and the two-optimizer update-size test asserts more than before.
   - *Run on the trial merge* (macOS, Python 3.12, PyTorch 2.15). With the server binary 1,799 passed; without it 1,180 passed and 619 skipped; without `pyarrow` 1,056 passed and 80 skipped (R2 had not run this setup); `experiments/` 92 passed. Each is `main`'s count plus R2's 28 new tests. The six more warnings in each setup are Lightning's own, from R2's two Lightning tests. Under load from a parallel suite run, the stall test and the flush test passed 5 out of 5 and the ten trigger tests that run the two edited worker scripts 3 out of 3. No Rust check was run: R2 changes nothing under `server/`.
   - *Open, for the author.* An optimizer that sits before the lead in the loop but starts stepping later has its update, re-check and probe one step early, where before R2 its update was on the right record (pinned by a test; the fix needs an iteration-end signal). R2's other choices to revisit are listed in its hand-over note (`lane-r2-capture-steps.md` in the session notes): a weight check due on a skipped step moves to the next step, Lightning's loss with several optimizers is a sum, and the first step a follower followed is probed twice. Nothing ran on a GPU, Linux or PyTorch 2.6. Nothing is pushed.
+- [x] **Lane T2: capture paths that still raised into training or dropped data (Nov 18, 2026, lane T2, branch `claude/lane-t2-capture-raises-dad9e1`; not merged).** These are the four items the plan's sweep found after the review's six lanes, checked on `main` at `3f93636`. The code is commit `2bfb569`, in `capture.py` and `distributed.py`. Lane T1 edits `init`'s docstring; this lane did not touch it. No record field, detector, golden file, Parquet schema, file under `server/` or protocol number changed. The hand-over note, `lane-t2-capture-raises.md` in the session notes, lists every function touched.
+  - *Outcomes.*
+    - 1, the drift check's fingerprints raised before an `all_gather`: the session path is fixed. Direct callers of public `replica_spread` can still be left waiting, which needs a decision.
+    - 2, a root parameter on `meta` put every capture buffer on `meta`: fixed, except under FSDP's CPU offload.
+    - 3, router counting with a tensor subclass under `torch.compile`: reproduced, not fixed, needs a decision.
+    - 4, `weights_unchanged` dropped for an unread first parameter: fixed.
+  - *1. The drift check's fingerprints raised right before its `all_gather`.* On `main`, `parameter_fingerprints` raised on a parameter on `meta` ("Tensor on device meta is not on the expected device cpu!"), on a sparse COO one ("reshape is not implemented for sparse tensors") and on a sparse CSR one ("Sparse CSR tensors do not have is_contiguous"). It does so inside `Session.record_replica_spread`, before the collective. In the new two-rank gloo test, where only rank 0 has a `meta` parameter, rank 0 raised and the test's process context then ended rank 1. In a real job, rank 1 would be left waiting in the `all_gather`; that wait was not observed here. What the author chose is now built:
+    - **Every rank gathers the same rows.** The session gathers `_fingerprint_table`, a `[n_params, width + 1]` tensor: each parameter's fingerprints, then a flag column.
+      - The flag is 0.0 where the parameter was read. Otherwise it is a code for why not: on `meta`, nested, each sparse layout, or its reading raised. That row's values are zeros.
+      - The tensor's shape depends only on how many parameters there are.
+      - Whether a parameter can be read is judged from its device, layout and type, with no values read.
+      - The rows that can be read are computed in one pass, as before, with the same values and seeds. Only if that pass raises is each parameter read on its own, and a raise flags only that parameter.
+    - **Left out by its flag, never by its value.** After the gather, each rank takes the largest code any rank gave (`_spread_and_unread`). Every rank sees every rank's codes, so all leave out the same rows.
+      - The flag travels on the device into the spread ring, which is one column wider. `_decode` drops flagged rows on the writer thread.
+      - A record with no row left has no `replica_spread` at all: never an empty map, never zeros.
+      - A NaN weight that was read still gives a NaN spread and reads as `non_finite` drift. Identical replicas still read `[0, 0, 0]`.
+      - No host read is added to the step. The flag is read in `_flush`, where the ring is already on the CPU.
+    - **Named once.** A `RuntimeWarning` at the next flush, the same on every rank: "TensorQuill is not comparing the parameter 'X' across replicas: <why>. It is left out of replica_spread, so the cross-GPU drift check does not cover it." The why is this rank's own reason, or "on another replica in the group, <reason>".
+    - **Which not-checked channel.** No existing channel fits a parameter left out of the drift check: `moe_refused` and `update_not_read` become the `router` and `update_size` entries of `not_checked`, which name other kinds.
+      - The channels used are the warning and the name's absence from `replica_spread`.
+      - When every replicated parameter is left out, the records carry no `replica_spread`. `replica_drift` then reads `not_configured` (no record compared any parameter), never `checked`.
+      - Reading `unavailable` with a reason would need a record field, which is a schema change.
+    - **On the wire.** The gathered tensor is one column wider: 32 bytes per parameter per rank, or 24 without the projection.
+      - Three test fakes of `dist.all_gather` copied `parameter_fingerprints` into the gathered list. They now copy `_fingerprint_table`.
+      - Two are in `test_distributed.py`. One is in `test_evidence.py`, which is not this lane's file; only that fake changed.
+    - **The public functions are unchanged.** `parameter_fingerprints` and `replica_spread` still raise on `meta` and sparse tensors for a direct caller. `replica_spread` raises before its gather, so a direct caller's ranks can still be left waiting. The session no longer calls it. See *Open*.
+  - *2. A root parameter on `meta` put every capture buffer on `meta`.* On `main`, `Session.__init__` took `self._params[0].device`, and `flush` raised "Cannot copy out of meta tensor; no data!".
+    - **What changed.** `_buffers_device` now takes the first trainable parameter not on `meta`, or the CPU when there is none. A model without a `meta` parameter gets the same device as before. No record field was added.
+    - **The same model with `probe=`** probes as usual.
+    - **Not covered: FSDP's CPU offload.** The parameters are on the CPU at `init` (FSDP2's `CPUOffloadPolicy` moves the sharded parameter with `.cpu()`, `_fsdp_param.py` at v2.6.0). The same rule therefore keeps the buffers on the CPU, and every block is left out (R1's note; by reading, not run). Fixing that is a different change with its own cost; see *Open*.
+  - *3. Router counting with a tensor subclass under `torch.compile`: reproduced on PyTorch 2.15.0, not fixed. Not run on 2.6.*
+    - **The first sweep did not reproduce it.**
+      - It covered five subclasses that accept every op the hook makes:
+        - a plain `__torch_function__` subclass;
+        - one with its own `__torch_function__`;
+        - a `_make_wrapper_subclass` wrapper, without `__tensor_flatten__` and with it;
+        - PyTorch's `TwoTensor`.
+      - It ran three router outputs, default and `indices=` routers, eager mode and the `eager`, `aot_eager` and inductor backends: 120 runs, and none raised.
+      - With `fullgraph=True` (default routers), TensorQuill made no compile fail that passes without it. The hooks are traced there, not run eagerly after a graph break. The wrapper without `__tensor_flatten__` fails under Dynamo without TensorQuill too, so that case cannot be reached.
+      - `TwoTensor` routers are counted twice: 12 assignments a step where the others give 6. `counts.add_(hits)` dispatches to the subclass, which applies the op to both of its tensors.
+    - **Two subclasses that refuse an op the hook makes reproduce it.** They refuse the way DTensor refuses a plain tensor beside it. The model itself never mixes them and trains without TensorQuill. Default and `indices=` routers behave alike.
+      - **A traceable wrapper whose `__torch_dispatch__` refuses a plain tensor argument.** With TensorQuill, training raises "aten.eq.Tensor got mixed torch.Tensor and Strict" under `backend="eager"`, with and without `fullgraph`. The raise comes from the hook's `idx == expert_ids`.
+        - Under `aot_eager` and inductor it is counted correctly (6 a step). AOTAutograd unwraps the subclass; that is by reading.
+        - In eager mode the router is refused, through the hook's `try`.
+      - **A `__torch_function__` subclass that raises on `eq`.** With TensorQuill and `fullgraph=True`, every backend raises Dynamo's `Unsupported: Observed exception`. Without `fullgraph`, Dynamo breaks the graph, the hook runs eagerly and the router is refused.
+    - **The layer statistics raise too.** The same strict wrapper as a watched block's output raises "aten.maximum.default got mixed torch.Tensor and Strict" under `backend="eager"`, with and without `fullgraph` (`_stats_hook`). Eager mode, `aot_eager` and inductor read or leave out the block without raising.
+    - **Why it is not fixed.** No check on the type alone tells a subclass that refuses the mix from one counted correctly today, and the guard's rule is "only what raises today is refused". The options:
+      - (a) Refuse every router output that is a tensor subclass, from `type(t) is not torch.Tensor` in `_unusable`, in eager mode and compiled.
+        - It was tried in a scratch copy, not committed. No run above raised, `fullgraph=True` included, with no graph break. `test_compile.py`, `test_router_guard.py` and `test_capture_tensors.py` pass (107 passed, 4 skipped).
+        - The cost: the four subclasses counted correctly today are refused (named in `moe_refused`), and so is `TwoTensor`, which ends its double count.
+        - Tensor parallelism's `AsyncCollectiveTensor` appears only in eager mode; under tracing, `wait_tensor` returns a plain tensor (`_functional_collectives.py` at v2.6.0, by reading). Eager tensor-parallel routers would be refused under (a).
+      - (b) Do (a) under `torch.compile` only, and leave eager mode as today, where the `try` catches what raises. Eager runs keep counting subclasses, `TwoTensor`'s double count included. Not tried.
+      - (c) Leave it.
+      - Whichever is chosen for routers, `_stats_hook` needs the same choice for the layer statistics.
+    - **Scripts.** The scripts are in the session notes: `lane-t2-router-subclasses.py`, `lane-t2-router-subclasses-fullgraph.py`, `lane-t2-router-strict-subclasses.py` and `lane-t2-block-strict-subclass.py`. No test was added for item 3: a strict xfail could pass unexpectedly on PyTorch 2.6, where this has never run, and turn CI red.
+  - *4. `weights_unchanged` was dropped for an unread first parameter.* `_decode` wrote the list only when the first parameter's check was known. It now writes it when the check knew any parameter.
+    - A parameter the check did not know stays out of the list, as the others already did.
+    - A check that knew none (the first check, or Apple MPS) still writes no list.
+  - *Tests.* There is a new file, `sdk/tests/test_capture_raises.py`, with 12 tests; none needs the server binary. One runs two gloo ranks with a file store, only rank 0 having a `meta` parameter. It fails rather than hangs if a rank never finishes.
+    - Run on `main`'s code, 10 of the 12 fail:
+      - the session tests, on the `meta` fingerprint raise;
+      - the others on "Cannot copy out of meta tensor", on a `meta` buffer device, on `KeyError: 'weights_unchanged'`, or on the new helpers missing.
+    - The other 2 pass on `main`. They are guards: a spread passed in is still recorded whole, and a check that knew no parameter still writes no list.
+  - *Run* on `2bfb569` (macOS, Python 3.12, PyTorch 2.15.0; the server built in the worktree with `cargo build --offline`).
+    - With the binary (`TENSORQUILL_SERVER_BIN`): 1,811 passed (`main`: 1,799).
+    - Without it (the variable unset, the binary moved out of `server/target`): 1,192 passed, 619 skipped (`main`: 1,180 and 619).
+    - Without `pyarrow` (the session notes' `nopyarrow` shim) and without the binary: 1,068 passed, 80 skipped (`main`: 1,056 and 80).
+    - `experiments/`: 92 passed (`main`: 92).
+    - Each count is `main`'s plus the 12 new tests. Nothing failed, so nothing was rerun. Six other sessions ran suites on this machine at the same time. The binary is back in `server/target`.
+  - *Not run.* Nothing ran on a GPU, NCCL, Linux or PyTorch 2.6.
+    - These PyTorch APIs were added, and each was read at v2.6.0: `Tensor.is_nested`, `Tensor.layout` with the sparse layouts, `fill_`, `amax`, `torch.multiprocessing.start_processes` with `join(timeout)`, and `init_process_group(timeout=...)`.
+    - CPU and MPS parameters together take the single pass; that was run. The parameter-at-a-time path runs only when the single pass raises, as with parameters on two GPUs; it ran only in a test that makes the pass raise.
+  - *Open, for the author.*
+    - **What public `replica_spread` and `parameter_fingerprints` should do for a direct caller** whose parameter cannot be read. Today they raise, and `replica_spread` raises before its gather. The options:
+      - (a) Gather the flag column, then raise on every rank alike. This costs one host read of the gathered flags per call.
+      - (b) Return NaN rows. These read as drift if recorded.
+      - (c) Return zero rows. These read as agreement.
+      - (d) Return the flags too. This changes the return shape.
+    - **Item 3's subclass raises,** for routers and for layer statistics. The options are listed above.
+    - **FSDP CPU offload: every block is left out** (by reading). The options:
+      - (a) Leave it. Gradient, weight and update norms are read on the CPU with no transfer.
+      - (b) Put the buffers on a DTensor parameter's mesh device (`device_mesh.device_type`, as FSDP2's `_get_device_from_mesh` does).
+        - The hooks would read the blocks with no host wait.
+        - But each step's gradient norms, clipped norm, weight check and update sizes are read on the CPU and copied to the GPU buffers with a blocking copy (`memcpy_and_sync` when `non_blocking` is false, `Copy.cu` at v2.6.0). That is a host wait for the GPU stream every step, unless those copies in `record_grads`, `_record_weights`, `_read_updates` and `record_grad_norm` are made non-blocking.
+        - FSDP1's offload has no DTensor, so (b) does not cover it.
+      - (c) Read the block outputs back to CPU buffers: a host wait at every forward, which R1 refused.
+    - **Why a parameter was left out of the drift check is in no record.** A field such as `replica_not_read` would let `replica_drift` read `unavailable` with a reason, but it is a schema change.
+    - **By reading, not run:** a rank whose replicated parameters are all on `meta` keeps its buffers on the CPU. If the other ranks gather on CUDA under NCCL, that rank's gather tensor is on the wrong device.
+    - **A session made before `to_empty`.** `to_empty` replaces `meta` parameters with new objects (checked: the old object stays on `meta`), so such a session keeps reading the stale ones. This is not new, and no warning was added.
 
 ## Sources
 
