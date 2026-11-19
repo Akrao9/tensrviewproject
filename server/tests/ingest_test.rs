@@ -3089,3 +3089,32 @@ async fn w2_an_earlier_attempts_stream_that_ends_cleanly_after_a_new_claim_does_
     assert_eq!(order["attempts"][0]["attempt"], 1);
     assert_eq!(order["attempts"][1]["attempt"], 2);
 }
+
+#[tokio::test]
+async fn w2_a_new_attempt_whose_rows_beat_its_first_heartbeat_owns_the_rank_with_a_sender_that_names_none() {
+    // Every SDK before Nov 19, 2026 names no `sender_attempt`. Attempt 1 is claimed and steps; the
+    // job starts again as attempt 2, whose rows reach the server before any beat naming it.
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        flush_steps: 1,
+        ..watch_config(60_000)
+    };
+    let server = start(dir.path(), config, None).await;
+    beat_attempt(&server, 1).await.unwrap();
+    let mut put = open_attempts(&server).await;
+    put.send(attempt_batch(&rows(1, 0..10)), 100).await;
+    assert_eq!(put.ack().await, Ok(100));
+    put.send(attempt_batch(&rows(2, 5..8)), 200).await;
+    assert_eq!(put.ack().await, Ok(200));
+    beat_attempt(&server, 2).await.unwrap();
+    let entry = &server.ingest.watchdog_statuses()[RUN]["ranks"][0];
+    assert_eq!(
+        (
+            entry["attempt"].as_i64(),
+            entry["last_step"].as_i64(),
+            entry["state"].as_str()
+        ),
+        (Some(2), Some(7), Some("active")),
+        "{entry}"
+    );
+}

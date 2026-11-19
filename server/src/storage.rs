@@ -80,10 +80,12 @@ pub struct AttemptEntry {
 
 /// The attempts of one rank, oldest first (contract 1). The newest owns the rank's live progress.
 /// An attempt is placed once and never moves: one its own process claims goes after every attempt
-/// known; one seen only in rows goes just before the attempt whose process sent them, or, when the
-/// sender named none, just before the newest if that one was claimed (a backlog the new process
-/// sends from the rank's file), and after it otherwise (a sender from before claims, whose attempts
-/// are known only from their rows, in the order they arrive). Attempt numbers never order anything.
+/// known; one seen only in rows goes just before the attempt whose process sent them. When the
+/// sender named none (every SDK before Nov 19, 2026), nothing but the attempt's number says whether
+/// its rows are a backlog or a new process whose first beat has not arrived: it is the session's
+/// start time, so a number above the newest's goes after it (the job started again; until then a
+/// new attempt whose rows beat its first heartbeat lost the rank for good) and any other just
+/// before it (a backlog). Otherwise attempt numbers order nothing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AttemptOrder {
     pub entries: Vec<AttemptEntry>,
@@ -158,10 +160,10 @@ impl AttemptOrder {
             by: PlacedBy::Rows,
             first_seen_ms: now_ms,
         };
-        let at = match sender.and_then(|sender| self.position(sender)) {
-            Some(at) => at,
-            None if self.entries.last().is_some_and(|last| last.by == PlacedBy::Claim) => self.entries.len() - 1,
-            None => self.entries.len(),
+        let at = match (sender.and_then(|sender| self.position(sender)), self.entries.last()) {
+            (Some(at), _) => at,
+            (None, Some(newest)) if attempt < newest.attempt => self.entries.len() - 1,
+            (None, _) => self.entries.len(),
         };
         self.entries.insert(at, entry);
         true
@@ -432,8 +434,8 @@ impl Storage {
     /// `attempts.json`, or numeric for a store without one), then first step, then name. Until
     /// Nov 19, 2026 by attempt number (RS05).
     pub async fn rank_parts(&self, run_id: &str, rank: i32) -> Result<Vec<StoredPart>, Error> {
-        let order = self.attempt_order(run_id, rank).await?;
         let mut parts = self.list_parts(run_id, rank).await?;
+        let order = self.order_of(run_id, rank, distinct_attempts(&parts)).await?;
         let place = |attempt: i64| order.position(attempt).unwrap_or(usize::MAX);
         parts.sort_by(|a, b| {
             (
@@ -454,15 +456,7 @@ impl Storage {
 
     /// The attempts a rank has parts of, in numeric order, each once.
     pub async fn stored_attempts(&self, run_id: &str, rank: i32) -> Result<Vec<i64>, Error> {
-        let mut attempts: Vec<i64> = self
-            .list_parts(run_id, rank)
-            .await?
-            .into_iter()
-            .map(|part| part.attempt)
-            .collect();
-        attempts.sort_unstable();
-        attempts.dedup();
-        Ok(attempts)
+        Ok(distinct_attempts(&self.list_parts(run_id, rank).await?))
     }
 
     fn attempts_path(&self, run_id: &str, rank: i32) -> Path {
@@ -506,6 +500,11 @@ impl Storage {
     /// (`kind` says `numeric`).
     pub async fn attempt_order(&self, run_id: &str, rank: i32) -> Result<AttemptOrder, Error> {
         let stored = self.stored_attempts(run_id, rank).await?;
+        self.order_of(run_id, rank, stored).await
+    }
+
+    /// `attempt_order` for attempts already listed.
+    async fn order_of(&self, run_id: &str, rank: i32, stored: Vec<i64>) -> Result<AttemptOrder, Error> {
         Ok(match self.read_attempts(run_id, rank).await? {
             Some(mut order) => {
                 for attempt in stored {
@@ -703,6 +702,14 @@ impl MetadataSuffixFetch for FooterSuffixFetch<'_> {
 
 /// Whether `path` is a part: a `part-*.parquet` file, the only files `rank_parts`, `max_step`
 /// and Python's `_parquet_parts` read.
+/// The attempts `parts` belong to, in numeric order, each once.
+fn distinct_attempts(parts: &[StoredPart]) -> Vec<i64> {
+    let mut attempts: Vec<i64> = parts.iter().map(|part| part.attempt).collect();
+    attempts.sort_unstable();
+    attempts.dedup();
+    attempts
+}
+
 fn is_part(path: &Path) -> bool {
     path.extension() == Some("parquet") && path.filename().is_some_and(|name| name.starts_with("part-"))
 }
@@ -1274,15 +1281,19 @@ mod tests {
         // Rows of an attempt never seen, sent by B's process: a backlog, older than B.
         assert!(order.place_rows(500, Some(2), 4));
         assert_eq!(order.attempts(), [900, 500, 2]);
-        // Rows with no sender named, while the newest was claimed: just before it.
-        assert!(order.place_rows(700, None, 5));
-        assert_eq!(order.attempts(), [900, 500, 700, 2]);
-        // A sender from before claims: its attempts are known from rows only, in arrival order.
+        // Rows with no sender named: only the number (the session's start time) is left. A lower
+        // one than the newest's is a backlog, just before it; a higher one is the job started
+        // again, whose first beat has not arrived, after it.
+        assert!(order.place_rows(1, None, 5));
+        assert_eq!(order.attempts(), [900, 500, 1, 2]);
+        assert!(order.place_rows(700, None, 6));
+        assert_eq!(order.attempts(), [900, 500, 1, 2, 700]);
+        // A sender from before claims: its attempts are known from rows only, by number against the newest.
         let mut rows_only = AttemptOrder::default();
         for attempt in [5, 3, 9] {
             rows_only.place_rows(attempt, None, 0);
         }
-        assert_eq!(rows_only.attempts(), [5, 3, 9]);
+        assert_eq!(rows_only.attempts(), [3, 5, 9]);
     }
 
     #[test]
@@ -1350,11 +1361,11 @@ mod tests {
             [(900, Some(0)), (900, Some(101)), (2, Some(30))]
         );
         assert_eq!(storage.attempt_order("r", 0).await.unwrap().kind(), "first_seen");
-        // An attempt stored but missing from the file is placed as rows are: just before the newest.
+        // An attempt stored but missing from the file is placed as rows with no sender are.
         storage
-            .write_part("r", 0, 7, &[make_batch(0..5, 8)], 0, 4)
+            .write_part("r", 0, 1, &[make_batch(0..5, 8)], 0, 4)
             .await
             .unwrap();
-        assert_eq!(storage.attempt_order("r", 0).await.unwrap().attempts(), [900, 7, 2]);
+        assert_eq!(storage.attempt_order("r", 0).await.unwrap().attempts(), [900, 1, 2]);
     }
 }

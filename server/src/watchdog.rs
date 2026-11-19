@@ -3865,4 +3865,24 @@ mod tests {
         assert_eq!(states(&dog, at(t0, 609)), ["reconnecting"], "under the start window");
         assert_eq!(states(&dog, at(t0, 611)), ["lost"]);
     }
+
+    #[test]
+    fn w2_a_new_attempt_whose_rows_come_before_its_first_beat_still_owns_the_rank() {
+        // A sender that names no `sender_attempt` (every SDK before Nov 19, 2026): attempt 1 is
+        // claimed and steps; the job starts again as attempt 2, and its rows reach the server before
+        // any beat naming it (its first beat was lost in an outage the stream outlived). On
+        // `66b52d7` attempt 2 owned the rank; it must still.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        assert!(dog.attempt_seen(&key(0), 1, t0));
+        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 10));
+        dog.batch(&key(0), 2, Some(30), Some(1), at(t0, 20));
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 21)));
+        let entry = &dog.statuses(at(t0, 22), true)["run"]["ranks"][0];
+        assert_eq!(
+            (&entry["attempt"], &entry["last_step"], entry["state"].as_str()),
+            (&json!(2), &json!(30), Some("active"))
+        );
+    }
 }
