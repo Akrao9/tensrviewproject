@@ -206,7 +206,8 @@ def from_store(stream: Stream) -> str:
 
 
 def as_text(incidents: list[dict]) -> str:
-    return json.dumps(incidents, sort_keys=True)
+    # As the evidence file writes it, NaN as "nan" (lane U7, Nov 19, 2026), whether read back or made here.
+    return json.dumps(tensorquill.evidence.json_safe(incidents), sort_keys=True)
 
 
 def keep_open(stream: Stream, records: list[dict]) -> FlightSender:

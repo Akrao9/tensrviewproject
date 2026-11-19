@@ -794,8 +794,8 @@ class Trigger:
                     if readable(found):
                         self._episodes[run_of(found)] = found
                     else:
-                        self._log(f"trigger: {self._state_path}: a stall episode it lists has no firing in it, or"
-                                  " cannot be read; that run's stall may fire again")
+                        self._log(f"trigger: {self._state_path}: the stall episode it lists has no firing in it, or"
+                                  " cannot be read; a stall may fire again")
             elif readable(episode):
                 # One episode, written before the run was kept: the run of its firing's id.
                 self._episodes[run_of(episode)] = episode

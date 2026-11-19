@@ -1023,8 +1023,9 @@ def test_the_webhook_posts_the_incident_as_json_once(tmp_path, receiver, capsys)
     written = json.loads(out.read_text())["incidents"][0]
     assert body["incident"]["gradients"] == written["gradients"] == ["<total>"]
     # NaN in the evidence, and in the body the string the capture and the evidence file write (lane U7,
-    # Nov 19, 2026; it was null).
-    assert body["incident"]["scalars"]["loss"]["value"] == "nan"
+    # Nov 19, 2026; it was null). Run through the Rust detectors (test_watch_rust.py), the report
+    # already has null there, as the server writes a NaN.
+    assert body["incident"]["scalars"]["loss"]["value"] in ("nan", None)
     delivery = trigger.deliveries[0]["webhook"]
     assert (delivery["status"], delivery["attempts"], delivery["http_status"]) == ("delivered", 1, 200)
     printed = capsys.readouterr().out

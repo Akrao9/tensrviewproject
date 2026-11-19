@@ -38,7 +38,7 @@ def test_lightning_records_its_checkpoints_and_the_resume_that_loads_one(tmp_pat
 
     def fit(steps, sink, ckpt_path=None):
         saver = L.callbacks.ModelCheckpoint(dirpath=tmp_path / "ckpt", every_n_train_steps=2, save_top_k=-1)
-        trainer = L.Trainer(default_root_dir=tmp_path, max_steps=steps, callbacks=[TensorQuillCallback(sink=sink), saver],
+        trainer = L.Trainer(default_root_dir=tmp_path, max_steps=steps, callbacks=[TensorQuillCallback(sink=sink, run_id="resumed"), saver],
                             enable_progress_bar=False, enable_model_summary=False, accelerator="cpu", devices=1,
                             logger=False)
         trainer.fit(Module(), ckpt_path=ckpt_path)
@@ -78,7 +78,7 @@ def test_the_trainer_records_its_checkpoint_folders_and_a_complete_resume_finds_
         args = transformers.TrainingArguments(
             output_dir=str(tmp_path), max_steps=steps, per_device_train_batch_size=8, report_to="none",
             save_strategy="steps", save_steps=2, disable_tqdm=True, use_cpu=True, learning_rate=0.01)
-        trainer = transformers.Trainer(model=Model(), args=args, train_dataset=data, callbacks=[TensorQuillCallback(sink=sink)])
+        trainer = transformers.Trainer(model=Model(), args=args, train_dataset=data, callbacks=[TensorQuillCallback(sink=sink, run_id="resumed")])
         trainer.train(resume_from_checkpoint=resume)
 
     first, second = tensorquill.MemorySink(), tensorquill.MemorySink()
