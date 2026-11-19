@@ -2819,6 +2819,58 @@ State as of Nov 16, 2026.
   - *The fix, a test only* (`f88bc9c`). The one test that draws from NumPy's random state does so only where NumPy is installed. Before the push the whole SDK suite passed locally with NumPy and pyarrow hidden: 1,211 passed, 148 skipped.
   - *CI on `f88bc9c`: every job passed* (Linux). The two PyTorch 2.6 jobs, Python 3.11 and 3.12: 1,187 passed, 160 skipped each. The eight other CPU jobs (PyTorch 2.10, 2.14 and 2.15; Python 3.11 to 3.14): 1,201 passed, 154 skipped each. Lightning, Hugging Face and Rerun: 1,421 passed, 627 skipped, then 99 and 13 in the experiment tests. The server job: 1,152 passed, 4 skipped. The `package` job passed. The GPU compiler gate is skipped, as it is on every push. The Server wheels workflow did not run on `f88bc9c`, which changed one test file.
   - *Still not run.* A GPU, NCCL, MPI, Megatron itself, inductor for the subclass rule. The Focused Plan's risk row still says CI's one run on PyTorch 2.6 failed with its fix unpushed; it is listed here, not edited.
+- [ ] **Findings still open after wave U, one by one (listed Nov 19, 2026, when the author asked whether they were all in this plan; they were not).** Until now this plan gave the count (40 of the audit's 70 groups) and named only some by ID. The full text of each is in `CODEBASE_AUDIT.md`, which is untracked and the author's. The lines below are this session's short wording of the audit's rows. Except where a lane's entry says it reproduced one, they are the audit's claims, not checked here. None is assigned to a lane and none is placed in a gate.
+  - *P1, five.*
+    - C03, in part: after capture stops on a streaming run the server reads a suspected hang, or `finished` (lane U1, measured).
+    - C06, in part: a router's integer output with indices out of range is recorded as zeros with no refusal (reproduced: `[-1, 8]` for 4 experts).
+    - The evidence readers' sixth P1: a parameter that changes without a gradient is still called a stalled-weight invariant. Held out of the wave; it changes a detector rule.
+    - RS05: a late new step from an older attempt takes ownership of live progress (lane U6, reproduced; four options in its entry, the author's choice).
+    - SDK-22: a drift-check gather that fails after it is issued raises into training (lane U5); the public `replica_spread` on `meta` or sparse raises too.
+  - *Training SDK, P2 and P3, eleven.*
+    - C11: a closed session's forward hooks still run on every forward. Kept on purpose under the C03 decision, which never removes them.
+    - C12: adding a parameter group to an optimizer after `init` silently disables step capture for it.
+    - C13: the on-device index cache grows with every distinct set of parameters that has gradients.
+    - C14: two different weights with equal L2 norms are named in `weights_unchanged`.
+    - C15: a replica-spread table with too few rows is broadcast to the other parameters.
+    - C16: different batches can encode to the same batch hash.
+    - C20 (SDK-12): evaluation time is counted as training data wait and step duration.
+    - C21 (SDK-20): a checkpoint of a model with `get_extra_state` loses its model component in the manifest.
+    - C22 (SDK-11, SDK-17): large finite statistics come out wrong or as nonfinite in the probe.
+    - C23: two sessions built at the same time can send heartbeats with each other's attempt ID.
+    - C24, P3: two reporting paths treat missing data as coverage (`state="closed"` when a marker exists and its file does not).
+  - *Evidence readers, command line and MCP, seven besides the P1.* The audit gives these rows no IDs.
+    - Rollback is applied to the detectors' input and not to `compare` or MCP progress.
+    - A scaler-reset incident is reported while `kind_checks` says that check was never configured.
+    - A benign observation marks a run `unhealthy` in `list_runs`.
+    - The physical order of steps in the file changes which fault is named first.
+    - The Python detectors accept invalid settings, such as a negative tolerance.
+    - A run with only the compact evidence file reads as `missing` in the catalog.
+    - P3: the TrainCheck import merges violations whose names share their first 200 characters, and can change the first step.
+  - *Rust server, thirteen besides RS05.*
+    - RS06: a crashed evaluation inflates `recommended_silent_seconds` for the next attempt.
+    - RS07: equal phase and work instants are saved at different precisions, so a pause can stay.
+    - RS08: before the first stored batch the severity reads `critical` ahead of its own interval.
+    - RS09: the deduplication watermark and the detector replay disagree about which files exist.
+    - RS10: the offline modes accept null run, rank or step keys as run "", rank 0, step 0.
+    - RS11: a `checkpoint_json` that does not parse is counted as a checkpoint for `resume_incomplete`.
+    - RS12: a repeated offline step attaches the later loss and the wrong median to the incident.
+    - RS13: a long-lived server keeps finished and abandoned runs' buffers and state.
+    - RS14: with the watchdog interval at zero, shutdown still writes a status file.
+    - RS15, P3: invalid duration flags panic with exit code 101.
+    - RS16, P3: the largest int64 step is read as no cutoff.
+    - RS17, P3: a negative expert count is judged as a routed sample.
+    - RS19, P3: the `detect_store --bench` example panics on an empty run.
+  - *Experiments, examples and release checks, seven.*
+    - X02: Gate 1's older speed gate reads zero tool calls as an infinite speedup. Needs the author's amendment.
+    - X06: `trainer_check.py` counts string norms as recorded and then skips every comparison.
+    - X07: the dense example drops failed probes before the loop that prints their errors.
+    - X08: the toy example writes an evidence name the reader does not pair with a rank file.
+    - X09: the Megatron example does not record `update_successful`. The guide says so since `6860e4b`; the example is unchanged.
+    - X10, P3: `capture_rerun.py` ignores an explicit step 0.
+    - X11: CI does not run Python 3.10 or PyTorch 2.9, both of which the package declares.
+  - *Raised by the lanes themselves.* U1: option (b) not run on inductor; the NVML wait can stop capture above about 200 steps a second. U4: no store ID in the server's ack; the server acks a dead stream's held offset. U5: ranks on different device types. U6: Python's readers do not look at `attempt_without_steps`; Rust writes `steps_to_total: 0.0` where Python writes null. U7: the MCP store path for another rank has no test.
+  - *The first outside review's 60 medium and low findings.* T6's verdicts: 51 hold, 1 is plausible, 8 do not. The verdicts are in the session notes (`codebase-review-verdicts-medium-low.md`), outside the repository. Many are the rows above under another ID; they were not matched one by one, so the number that remain beyond this list is not known.
+  - *What these change for the GPU runs.* C20 puts evaluation time into the data-wait readings (the group C cell). C14 can name a changed weight as unchanged (the stalled-weights seeded case). The two-GPU replica check and the Granite overhead head-to-head read neither.
 
 ## Sources
 
