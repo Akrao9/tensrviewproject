@@ -225,7 +225,7 @@ Five decisions are still the author's to make, two were settled on Nov 16, 2026,
 | Thresholds tuned on Granite and SmolLM2-360M raise false alarms elsewhere | Result 2, on the author's own job; until then anomalies do not fire the trigger by default |
 | Moving detectors to one Rust copy changes their answers | Golden files hold Python's answers, and the parity tests stay until each Python duplicate is deleted |
 | A probe flush of about 150 ms delays a live acknowledgement; 620 ms was seen once | Logged as an open gap in v3; looked at after results 1 and 2 |
-| TensorQuill itself stops or hangs a training run | An outside review of the code found four such bugs, confirmed on CPU on Nov 18, 2026: a complex parameter, blocks on two devices, a tracker on rank 0 only, and the Accelerate adapter. They are being fixed, each with a test that fails before its fix, with the review's other confirmed bugs, in six parallel lanes |
+| TensorQuill itself stops or hangs a training run | An outside review of the code found four such bugs, confirmed on CPU on Nov 18, 2026: a complex parameter, blocks on two devices, a tracker on rank 0 only, and the Accelerate adapter. They are fixed on main, each with a test that fails before its fix, with the review's 18 other confirmed bugs: six lanes, all merged on Nov 18, 2026. Not yet run on a GPU, Linux or PyTorch 2.6 |
 
 ## Sources
 
