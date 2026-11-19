@@ -35,7 +35,7 @@ There were 72 when this file was written. Wave V closed 43 of them in its two me
 
 | ID | Priority | Issue | Checked | State |
 |---|---|---|---|---|
-| SDK-22 | P1 (Medium in the review) | A drift-check gather that fails after it is issued raises out of `optimizer.step()`. The public `replica_spread` on a `meta` or sparse parameter raises too | Run (T6, U5) | Fixed in part by lane U5: the check is skipped on every rank where the gather cannot run. A catch was tried and left the other ranks waiting for the group's timeout, so none shipped |
+| SDK-22 | P1 (Medium in the review) | **Open part after M3:** a process group that fails after `init` still fails inside the training step, because the gather runs there; the agreement at `init` does not cover it. The long-term fix (no collective in the training path) changes what proof result 1 measures and is the author's decision. Fixed (lane W4): every rank consistently skips a drift check known at `init` to be incompatible, so no rank issues the gather while another skips it. The public `replica_spread` on `meta` or sparse: see lane W4's note for its outcome | Run (W4), gloo on CPU and injected failures; not NCCL | Fixed in part |
 
 ## 2. Training SDK
 
@@ -115,7 +115,6 @@ These are not in either audit.
 | L1 | U1 | The tensor-subclass rule under `torch.compile` was run on `eager` and `aot_eager`, not on inductor |
 | L2 | U1 | The writer's bounded wait for NVML can stop capture above about 200 steps a second |
 | L3 | U4 | The server's ack carries no store ID |
-| L5 | U5 | The drift check does not handle ranks on different device types |
 | L6 | U6 | **Open part after M1:** in the all-ranks evidence a rank with `attempt_without_steps` is still counted among judged ranks; only `run_state` calls it unknown. Fixed (lane V3): the readers look at the flag |
 
 ## 8. The second audit's notes on cost and narrow cases
@@ -166,3 +165,4 @@ Not from either review. Not counted in the 72.
 | Second audit (70 groups) | 30 fixed: C01, C02, C04, C05, C07 to C10, C17 to C19; C03 and C06 in part; RS01 to RS04, RS18; X01, X03, X04, X05; and eight evidence rows (five P1 and three small ones) |
 | Wave V, merge group M1 (`main` at `351ad85`, Nov 19, 2026; lanes V1, V2, V3, V6, V7) | Fixed, each with a test that failed on `66b52d7`: C13, C15, C21, C23, DET-12, DET-18, E6, L4, L7, RS06, RS07, RS08, RS09, RS11, RS12, RS13, RS14, RS15, RS16, RS19, RUST-13, RUST-16, RUST-18, SDK-15, SDK-25, SDK-26. C24: V1: the capture half is fixed (a model that is one leaf module is observed under its class name); the sink half did not reproduce on `66b52d7`. RUST-17: V6: shown for concurrency (40 rebuilds at once after a restart) and fixed with a bound of 16. Fixed in part, still listed above with what is open: C12, C14, C16, C20, C22, SDK-16, E3, DET-14, DET-17, RS10, L6, CLI-24. Checked and left as they are: C11, SDK-23, RS17, L3 (options written, nothing changed). Verified on the trial merge, macOS and CPU only; not on Linux, PyTorch 2.6 or a GPU |
 | Wave V, merge group M2 (`main` at `4b0be90`, Nov 19, 2026; lanes V4, V5, V8) | Fixed, each with a test that failed on `66b52d7` (X06, X07 and X10 by reading, since the code had no seam to test before): CLI-08, CLI-09, CLI-15, CLI-17, CLI-19, CLI-20, CLI-21, CLI-22, CLI-24, DET-07, E2, E4, E7, E8, L8, X06, X07, X08, X10. DET-07's "paused" half does not hold, as T6 said. Fixed in part, still listed above: CLI-13, X09, X11. Checked and left as they are: CLI-10, DET-13, CLI-14. `seeded_failures.py` now writes every case flat into `--out`. Verified on the trial merge, macOS and CPU only |
+| Wave W, merge group M3 (`main` at `af846f7`, Nov 19, 2026; lane W4) | SDK-22's first criterion and L5 (ranks on different device types), with W4's one call in `capture.py`. SDK-22 stays open above for a failure after `init`. Verified on the trial merge with gloo on CPU; not NCCL, MPI or a GPU |
