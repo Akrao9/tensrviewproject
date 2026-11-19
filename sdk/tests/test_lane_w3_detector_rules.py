@@ -521,3 +521,22 @@ def test_e3_a_resume_judged_from_the_loss_scale_that_finds_nothing_is_checked(en
 @pytest.mark.parametrize("engine", ENGINES)
 def test_e3_a_run_with_neither_checkpoint_nor_loss_scale_stays_not_configured(engine: str) -> None:
     assert _evidence(_scaled_resume(scale=False), engine)["kind_checks"]["resume_incomplete"]["value"] == "not_configured"
+
+
+def test_contract1_a_report_of_the_older_attempt_is_behind_not_past_the_store(tmp_path: Any) -> None:
+    # The store's order is [900, 2]: a report of A at 101 stops before B's 35, though 900 > 2.
+    import json
+
+    missing = _rust_missing()
+    if missing:
+        pytest.skip(missing)
+    from tensorquill.evidence import read_server_report
+    from tensorquill.server_detect import server_report
+
+    rank = _store(tmp_path, [900, 2])
+    report = server_report([{**rec, "run_id": "r"} for rec in _a_then_b()[:102]])
+    (rank / "incidents.json").write_text(json.dumps(report))
+    look = read_server_report(rank)
+    assert (report["attempt"], report["last_step"]) == (900, 101)
+    assert look["state"] == "behind", look["reason"]
+    assert look["attempt_order"] == "first_seen"
