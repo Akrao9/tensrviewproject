@@ -360,7 +360,7 @@ def test_the_server_stores_a_refused_router_as_no_entry_and_says_why(tmp_path, m
     """Streamed over Flight: records with a router missing from `moe`, or with no `moe` at all,
     are accepted and stored as written. The server sees no zeros, raises no MoE incident, and
     its report says the MoE kinds were not checked, as the Python evidence does."""
-    _binary()
+    binary = _binary()
     from test_flight_e2e import Server, stored_records
 
     monkeypatch.chdir(tmp_path)
@@ -379,7 +379,7 @@ def test_the_server_stores_a_refused_router_as_no_entry_and_says_why(tmp_path, m
     else:
         assert _routed(stored, "counted") == [120 * TOP_K] * 8
     python = tensorquill.build_evidence(stored)
-    rust = tensorquill.build_evidence(stored, detectors="rust")
+    rust = tensorquill.build_evidence(stored, detectors="rust", server_binary=binary)
     assert rust["detectors"] == "rust"
     for evidence in (python, rust):
         assert not _moe_incidents(evidence)
@@ -400,7 +400,7 @@ def test_the_server_stores_a_refused_router_as_no_entry_and_says_why(tmp_path, m
 def test_the_server_reads_an_indices_router_counted_and_then_refused_as_python_does(tmp_path, monkeypatch):
     """A state the shape guard never made: a router counted in the first block and refused from
     the second, when its `indices=` function returned values outside the experts."""
-    _binary()
+    binary = _binary()
     from test_flight_e2e import Server, stored_records
 
     monkeypatch.chdir(tmp_path)
@@ -420,7 +420,7 @@ def test_the_server_reads_an_indices_router_counted_and_then_refused_as_python_d
     assert stored == records and len(stored) == 8
     assert _routed(stored[:4]) == [120 * TOP_K] * 4 and _no_entry(stored[4:])
     python = tensorquill.build_evidence(stored)
-    rust = tensorquill.build_evidence(stored, detectors="rust")
+    rust = tensorquill.build_evidence(stored, detectors="rust", server_binary=binary)
     assert rust["detectors"] == "rust"
     [entry] = [e for e in rust["not_checked"] if e["check"] == "router"]
     assert entry == next(e for e in python["not_checked"] if e["check"] == "router")

@@ -699,10 +699,11 @@ def test_a_slow_sink_stops_capture_instead_of_making_training_wait(monkeypatch):
     from tensorquill import capture
 
     monkeypatch.setattr(capture, "QUEUE_STEPS", 2)  # 2 rings of one step: 2 blocks at every=1
-    release = threading.Event()
+    release, writing = threading.Event(), threading.Event()
 
     class SlowSink(tensorquill.MemorySink):
         def write(self, records):
+            writing.set()
             release.wait(10)
             super().write(records)
 
@@ -713,7 +714,12 @@ def test_a_slow_sink_stops_capture_instead_of_making_training_wait(monkeypatch):
     def train():
         with warnings.catch_warnings(record=True) as seen:
             warnings.simplefilter("always")
-            for _ in range(6):
+            session.step()
+            session.step()  # the first step's block is queued here: a step is held until the next
+            # The writer holds that block before the next step, so the queue is empty then.
+            # Without this the count below depends on which thread runs first.
+            assert writing.wait(5)
+            for _ in range(4):
                 session.step()
         caught.extend(seen)
 
