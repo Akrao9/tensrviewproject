@@ -609,8 +609,10 @@ def test_the_report_lists_the_thresholds_it_applied():
     ({"top_k": {"r1": 0}}, "top_k must be at least 1"),
     ({"overload_threshold": -0.1}, "overload_threshold must be a finite number of at least 0"),
     ({"drift_tolerance": -1.0}, "drift_tolerance must be"),
-    ({"starve_ratio": float("nan")}, "cannot be sent as JSON"),
-    ({"overload_threshold": float("inf")}, "cannot be sent as JSON"),
+    # Refused by `check_thresholds` before they are sent, in the Rust rules' words (lane V3, E6).
+    ({"starve_ratio": float("nan")}, "starve_ratio must be a finite number of at least 0"),
+    ({"overload_threshold": float("inf")}, "overload_threshold must be a finite number of at least 0"),
+    ({"top_k": 2.5}, "top_k must be a whole number"),  # was an AttributeError
 ])
 def test_values_the_rust_rules_refuse_raise_value_error_with_the_reason(option, reason):
     with pytest.raises(ValueError, match=reason):
