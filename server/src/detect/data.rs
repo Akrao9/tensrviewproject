@@ -274,14 +274,21 @@ impl DataProgress {
     }
 }
 
-/// Python's `detect_duplicate_batches` over each rank's window: the run's `duplicate_batches`,
-/// without its `kind`, or nothing.
-pub fn duplicate_batches(ranks: &BTreeMap<i32, BTreeMap<i64, (Option<i64>, String)>>) -> Option<Value> {
-    let compared: Vec<i32> = ranks
+/// The ranks [`duplicate_batches`] compares: those with a hashed batch in their window, in
+/// rank order. The run's status and `detect --run` list them as `ranks_compared` whether or not
+/// a duplicate is found, so "compared, none found" can be told from "not compared".
+pub fn ranks_compared(ranks: &BTreeMap<i32, BTreeMap<i64, (Option<i64>, String)>>) -> Vec<i32> {
+    ranks
         .iter()
         .filter(|(_, window)| !window.is_empty())
         .map(|(rank, _)| *rank)
-        .collect();
+        .collect()
+}
+
+/// Python's `detect_duplicate_batches` over each rank's window: the run's `duplicate_batches`,
+/// without its `kind`, or nothing.
+pub fn duplicate_batches(ranks: &BTreeMap<i32, BTreeMap<i64, (Option<i64>, String)>>) -> Option<Value> {
+    let compared = ranks_compared(ranks);
     if compared.len() < 2 {
         return None;
     }
@@ -392,11 +399,7 @@ pub fn detect_run(batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Resu
         windows.insert(*rank, detectors.data_window().clone());
         reports.push(report(&run_id, *rank, &detectors, 0));
     }
-    let compared: Vec<i32> = windows
-        .iter()
-        .filter(|(_, window)| !window.is_empty())
-        .map(|(rank, _)| *rank)
-        .collect();
+    let compared = ranks_compared(&windows);
     let found = duplicate_batches(&windows);
     // As the status lists it (`watchdog::incidents`): the finding with its kind and class.
     let mut incidents = Vec::new();

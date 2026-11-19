@@ -1762,6 +1762,120 @@ async fn a_status_that_cannot_be_read_does_not_stop_the_server_or_the_other_runs
     assert_eq!(new.ingest.watchdog_statuses().keys().collect::<Vec<_>>(), [RUN]);
 }
 
+/// `schema()` with a `data_json` column.
+fn data_schema() -> Arc<Schema> {
+    let mut fields = schema().fields().to_vec();
+    fields.push(Arc::new(Field::new("data_json", DataType::Utf8, true)));
+    Arc::new(Schema::new(fields))
+}
+
+/// Rows in `data_schema()` that drew one batch per step, its hash `hash(step)`; no `data_json`
+/// where that is nothing.
+fn data_batch(rank: i32, steps: std::ops::Range<i64>, hash: impl Fn(i64) -> Option<String>) -> RecordBatch {
+    let steps: Vec<i64> = steps.collect();
+    let n = steps.len();
+    let data: Vec<Option<String>> = steps
+        .iter()
+        .map(|step| hash(*step).map(|hash| format!(r#"{{"batches":1,"batch_hash":"{hash}"}}"#)))
+        .collect();
+    RecordBatch::try_new(
+        data_schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1; n])),
+            Arc::new(StringArray::from(vec![RUN; n])),
+            Arc::new(Int32Array::from(vec![rank; n])),
+            Arc::new(Int64Array::from(steps.clone())),
+            Arc::new(Float64Array::from(
+                steps.iter().map(|step| *step as f64).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec!["{}"; n])),
+            Arc::new(StringArray::from(data)),
+        ],
+    )
+    .unwrap()
+}
+
+/// The status says which ranks' batch hashes the server compared, found or not, so that
+/// "compared, none found" can be told from "not compared": before, it named them only inside a
+/// finding, and a restarted server's status read the same as a clean comparison. A restarted
+/// server has compared nothing until a rank's store is read again.
+#[tokio::test]
+async fn the_status_names_the_ranks_whose_batches_were_compared_found_or_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        flush_steps: 10,
+        ..watch_config(60_000)
+    };
+    let own = |rank: i32| move |step: i64| Some(format!("r{rank}-{step}"));
+    let compared = |server: &TestServer| server.ingest.watchdog_statuses()[RUN]["ranks_compared"].clone();
+    let old = start(dir.path(), config.clone(), None).await;
+    let mut rank0 = open_with(&old.address, RUN, 0, None, data_schema()).await;
+    let mut rank1 = open_with(&old.address, RUN, 1, None, data_schema()).await;
+    rank0.send(data_batch(0, 0..10, |_| None), 1).await; // no data: nothing to compare
+    assert_eq!(rank0.ack().await, Ok(1));
+    assert_eq!(compared(&old), serde_json::json!([]));
+    rank0.send(data_batch(0, 10..20, own(0)), 2).await;
+    assert_eq!(rank0.ack().await, Ok(2));
+    until_within("rank 0 compared", SLOW_BOUND, || {
+        compared(&old) == serde_json::json!([0])
+    })
+    .await;
+    rank1.send(data_batch(1, 0..10, own(1)), 1).await;
+    assert_eq!(rank1.ack().await, Ok(1));
+    until_within("both ranks compared", SLOW_BOUND, || {
+        compared(&old) == serde_json::json!([0, 1])
+    })
+    .await;
+    let status = &old.ingest.watchdog_statuses()[RUN];
+    assert_eq!(status["duplicate_batches"], serde_json::Value::Null, "{status}");
+    assert!(status["incidents"].as_array().unwrap().is_empty(), "{status}");
+    old.ingest.write_watchdog().await;
+    assert_eq!(read_status(dir.path())["ranks_compared"], serde_json::json!([0, 1]));
+    // The server is killed: its last file stays. (Its open streams are not the new server's.)
+    let _old_streams = (rank0, rank1);
+    drop(old);
+
+    let new = start(dir.path(), config, None).await;
+    assert_eq!(new.ingest.restore_watchdog().await.unwrap(), 1);
+    assert_eq!(
+        compared(&new),
+        serde_json::json!([]),
+        "nothing read since this server started"
+    );
+    new.ingest.write_watchdog().await;
+    assert_eq!(read_status(dir.path())["ranks_compared"], serde_json::json!([]));
+    // A rank that sends again has its store read, and its batches are compared again.
+    let mut rank1 = open_with(&new.address, RUN, 1, None, data_schema()).await;
+    rank1.send(data_batch(1, 10..20, own(1)), 2).await;
+    assert_eq!(rank1.ack().await, Ok(2));
+    until_within("rank 1 compared", SLOW_BOUND, || {
+        compared(&new) == serde_json::json!([1])
+    })
+    .await;
+    // Rank 0 draws rank 1's batches on 20..25: a duplicate, named with the same ranks compared.
+    let mut rank0 = open_with(&new.address, RUN, 0, None, data_schema()).await;
+    rank1.send(data_batch(1, 20..30, own(1)), 3).await;
+    assert_eq!(rank1.ack().await, Ok(3));
+    rank0
+        .send(
+            data_batch(0, 20..30, |step| if step < 25 { own(1)(step) } else { own(0)(step) }),
+            3,
+        )
+        .await;
+    assert_eq!(rank0.ack().await, Ok(3));
+    until_within("the duplicate found", SLOW_BOUND, || {
+        new.ingest.watchdog_statuses()[RUN]["duplicate_batches"].is_object()
+    })
+    .await;
+    let status = &new.ingest.watchdog_statuses()[RUN];
+    assert_eq!(status["ranks_compared"], serde_json::json!([0, 1]));
+    assert_eq!(
+        status["duplicate_batches"],
+        serde_json::json!({"step": 20, "ranks": [0, 1], "duplicated_steps": 5, "ranks_compared": [0, 1]})
+    );
+    assert_eq!(status["incidents"][0]["kind"], "duplicate_batches");
+}
+
 /// A server process that is killed when dropped, so a failed assertion leaves none running.
 struct Reaped(std::process::Child);
 

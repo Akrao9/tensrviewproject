@@ -210,7 +210,7 @@ pub struct Ingest {
     /// until `status_refresh` has passed.
     written: Mutex<HashMap<String, (String, Instant)>>,
     /// Each rank's last batch hashes, from its detectors, by run and rank: compared across the
-    /// ranks of a run into the status's `duplicate_batches`.
+    /// ranks of a run into the status's `duplicate_batches` and `ranks_compared`.
     data_windows: Mutex<HashMap<String, BTreeMap<i32, DataWindow>>>,
     /// What each rank's detectors last reported, for the run state in `watchdog.json`. Kept
     /// apart from the rank buffers so the watchdog never waits for a flush or a rebuild.
@@ -717,13 +717,18 @@ impl Ingest {
         self.with_data(self.watchdog.statuses(Instant::now(), true))
     }
 
-    /// Adds each run's cross-rank data finding to its status, and to the status's incidents.
-    /// Only ranks whose detectors have read their store since this server started are compared
-    /// (`ranks_compared`); the others are not known to be clean.
+    /// Adds each run's cross-rank data comparison to its status: always `ranks_compared`, the
+    /// ranks whose batch hashes were compared (an empty list when none were), and the finding as
+    /// `duplicate_batches`, also among the status's incidents, when there is one. Only ranks
+    /// whose detectors have read their store since this server started, and that drew a hashed
+    /// batch, are compared; the others are not known to be clean, and `ranks_compared` lets a
+    /// reader tell "compared, none found" from "not compared", after a restart too.
     fn with_data(&self, mut statuses: BTreeMap<String, serde_json::Value>) -> BTreeMap<String, serde_json::Value> {
         let windows = self.data_windows.lock().unwrap();
         for (run_id, status) in statuses.iter_mut() {
-            if let Some(found) = windows.get(run_id).and_then(crate::detect::duplicate_batches) {
+            let run = windows.get(run_id);
+            status["ranks_compared"] = serde_json::json!(run.map(crate::detect::ranks_compared).unwrap_or_default());
+            if let Some(found) = run.and_then(crate::detect::duplicate_batches) {
                 status["duplicate_batches"] = found;
                 status["incidents"] = serde_json::json!(crate::watchdog::incidents(status));
             }
@@ -764,7 +769,7 @@ impl Ingest {
     }
 
     /// Writes `runs/<run_id>/watchdog.json` for each run whose status changed since it was last
-    /// written: its summary, a rank's state, stream or last step, or the ranks missing. The
+    /// written: its summary, a rank's state, stream or last step, the ranks missing or compared. The
     /// clock fields change every time, so they do not count. An unchanged status is still
     /// written again once `status_refresh` has passed, unless the run finished: a reader has
     /// only this file to tell that the server is still watching a run in which nothing moves.
@@ -803,6 +808,7 @@ impl Ingest {
                 "pauses": status["pauses"],
                 "abandoned": status["abandoned"],
                 "duplicates": status["duplicate_batches"],
+                "compared": status["ranks_compared"],
                 "run_state": status["run_state"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
                     ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object())).collect::<Vec<_>>()
