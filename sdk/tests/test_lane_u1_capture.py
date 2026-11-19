@@ -1220,3 +1220,199 @@ def test_a_module_that_returns_a_parameter_is_still_read_under_compile(backend):
     assert [r["moe"]["router"] for r in records] == [[3, 3, 0, 0]] * 2  # top-2 of each of 3 tokens
     assert all("moe_refused" not in r for r in records)
     assert [r["layers"]["blocks.0"]["mean"] for r in records] == [pytest.approx(0.5)] * 2
+
+
+# --- F1, decided by the author: option (a), the bool routing map is read -------------------------
+
+
+def _drop(routing_probs, routing_map, topk, capacity_factor, drop_policy, pad_to_capacity):
+    """Megatron's `apply_router_token_dropping` (moe_utils.py), as in the reference clone; the plan's
+    F1 stand-in (`f1-megatron-capacity-drop.py`). Megatron itself is not installed here."""
+    import math
+
+    num_tokens, num_experts = routing_probs.shape
+    capacity = math.ceil((num_tokens * topk / num_experts) * capacity_factor)
+    if capacity > num_tokens:
+        capacity_mask = torch.ones_like(routing_probs).bool()
+    elif drop_policy == "probs":
+        _, keep = torch.topk(routing_probs, k=capacity, dim=0, sorted=False)
+        capacity_mask = torch.zeros_like(routing_probs).scatter(0, keep, 1).bool()
+    else:
+        _, keep = torch.topk(routing_map.int(), k=capacity, dim=0, sorted=False)
+        capacity_mask = torch.zeros_like(routing_probs).scatter(0, keep, 1).bool()
+    final_map = capacity_mask if pad_to_capacity else torch.logical_and(routing_map, capacity_mask)
+    return routing_probs * final_map, final_map
+
+
+class MegatronStyleRouter(nn.Module):
+    """Megatron's `TopKRouter` routing with a capacity factor: returns `(probs, routing_map)`."""
+
+    def __init__(self, logits, topk=2, capacity_factor=1.0, policy="probs", pad=False, extra_logits=False):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(logits.shape[1], 8))
+        self.fixed = logits
+        self.topk, self.cf, self.policy, self.pad, self.extra = topk, capacity_factor, policy, pad, extra_logits
+        self.last = None
+
+    def forward(self, x):
+        logits = x @ self.weight.t() + self.fixed
+        scores = torch.softmax(logits, dim=-1)
+        top_p, top_i = scores.topk(self.topk, dim=-1)
+        probs = torch.zeros_like(scores).scatter(1, top_i, top_p)
+        routing_map = torch.zeros_like(scores, dtype=torch.bool).scatter(1, top_i, True)
+        probs, routing_map = _drop(probs, routing_map, self.topk, self.cf, self.policy, self.pad)
+        self.last = (probs.detach().clone(), routing_map.clone())
+        return (logits, probs, routing_map) if self.extra else (probs, routing_map)
+
+
+class MoELayer(nn.Module):
+    def __init__(self, router):
+        super().__init__()
+        self.router = router
+        self.out = nn.Linear(8, 8)
+
+    def forward(self, x):
+        probs = self.router(x)[-2]
+        return self.out(x) * probs.sum(-1, keepdim=True)
+
+
+def _routed(router: nn.Module, x: torch.Tensor, *, backend: str | None = None, hooked: bool = True) -> list[int] | None:
+    torch._dynamo.reset()
+    model = MoELayer(router)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=1, routers={"router": tensorquill.Router(4, 2)}) if hooked else None
+    forward = model if backend is None else torch.compile(model, backend=backend)
+    opt = torch.optim.SGD(model.parameters(), lr=0.0)
+    try:
+        forward(x).pow(2).mean().backward()
+        opt.step()
+        if session is not None:
+            session.close()
+    finally:
+        torch._dynamo.reset()
+    return sink.records[0]["moe"]["router"] if hooked else None
+
+
+def _f1_cases() -> dict[str, tuple[nn.Module, torch.Tensor]]:
+    torch.manual_seed(0)
+    cases = {
+        "two-tokens-capacity-1": (
+            MegatronStyleRouter(torch.tensor([[4.0, 3.0, 0.0, 0.0], [3.5, 2.5, 0.0, 0.0]])), torch.zeros(2, 8)),
+        "partial-drop": (MegatronStyleRouter(torch.tensor(
+            [[4.0, 3.0, 0.0, 0.0], [3.5, 0.0, 2.5, 0.0], [0.0, 0.0, 3.0, 2.0], [0.0, 3.0, 0.0, 2.5]]),
+            capacity_factor=0.5), torch.zeros(4, 8)),
+    }
+    xs = torch.randn(64, 8)
+    for policy in ("probs", "position"):
+        for pad in (False, True):
+            cases[f"64-{policy}{'-padded' if pad else ''}"] = (
+                MegatronStyleRouter(torch.randn(64, 4) * 2, policy=policy, pad=pad), xs)
+    cases["64-no-drop"] = (MegatronStyleRouter(torch.randn(64, 4) * 2, capacity_factor=100.0), xs)
+    return cases
+
+
+# The two cases the plan's F1 entry lists that do not depend on random numbers. The 64-token cases
+# are checked against the router's own map; `f1-megatron-capacity-drop.py` (in the session notes) gives
+# the plan's numbers for them: [24, 32, 32, 32], [32, 32, 28, 32], [29, 32, 32, 31] padded, no change
+# with no capacity limit.
+F1_EXPECTED = {"two-tokens-capacity-1": [1, 1, 0, 0], "partial-drop": [1, 1, 1, 1]}
+
+
+@pytest.mark.parametrize("case", ["two-tokens-capacity-1", "partial-drop", "64-probs", "64-probs-padded",
+                                  "64-position", "64-position-padded", "64-no-drop"])
+def test_a_megatron_style_router_is_counted_as_its_routing_map_routes(case):
+    router, x = _f1_cases()[case]
+    counted = _routed(router, x)
+    probs, routing_map = router.last
+    assert counted == (probs != 0).sum(0).tolist()  # the map's entries whose probability is not zero
+    if not case.endswith("padded"):
+        assert counted == routing_map.sum(0).tolist()
+    if case in F1_EXPECTED:
+        assert counted == F1_EXPECTED[case]
+
+
+def test_every_one_of_the_121_two_token_maps_is_counted_as_it_routes():
+    """CORRECTNESS_AUDIT.md's script (`router121.py`): every map of two tokens over four experts with at
+    most two assignments a token, the empty token and the token with one assignment included. Before,
+    36 of 36 full maps matched and 0 of 85 with fewer assignments."""
+    from collections import Counter
+    from itertools import combinations, product
+
+    class Gate(nn.Module):
+        def forward(self, weights):
+            return weights, weights > 0
+
+    model = nn.Sequential(Gate())
+    model.register_parameter("scale", nn.Parameter(torch.ones(())))
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, routers={"0": tensorquill.Router(4, top_k=2)}, sink=sink, auto_step=False)
+    choices = [indices for size in range(3) for indices in combinations(range(4), size)]
+    expected = {}
+    for step, rows in enumerate(product(choices, repeat=2), start=1):
+        weights = torch.zeros(2, 4)
+        for token, experts in enumerate(rows):
+            for expert in experts:
+                weights[token, expert] = 1
+        model(weights)
+        session.step(step=step)
+        expected[step] = [sum(expert in row for row in rows) for expert in range(4)]
+    session.close()
+    matched = Counter(record["moe"]["0"] == expected[record["step"]] for record in sink.records)
+    assert matched == Counter({True: 121})
+
+
+class MaskOverExperts(nn.Module):
+    def forward(self, x):
+        logits = x[:, :4]
+        return logits, torch.tensor([True, False, True, False])  # one flag per expert, not per token
+
+
+def test_a_mask_over_the_experts_alone_is_not_taken_for_a_routing_map():
+    model = nn.Sequential(MaskOverExperts())
+    model.register_parameter("scale", nn.Parameter(torch.ones(())))
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, routers={"0": tensorquill.Router(4, top_k=1)}, sink=sink, auto_step=False)
+    model(torch.tensor([[0.0, 3.0, 1.0, 0.0, 9.0], [2.0, 0.0, 0.0, 1.0, 9.0], [0.0, 0.0, 0.0, 5.0, 9.0]]))
+    session.step()
+    session.close()
+    assert sink.records[0]["moe"]["0"] == [1, 1, 0, 1]  # the top-1 of the logits, as before
+
+
+def test_with_logits_before_the_probabilities_the_logits_are_paired_and_padding_is_counted():
+    """The documented limit: the paired float is the first of the map's shape. Logits are never zero,
+    so with `pad_to_capacity` the padding is counted, as the map holds it."""
+    torch.manual_seed(0)
+    router = MegatronStyleRouter(torch.randn(64, 4) * 2, pad=True, extra_logits=True)
+    counted = _routed(router, torch.randn(64, 8))
+    probs, routing_map = router.last
+    assert counted == routing_map.sum(0).tolist() != (probs != 0).sum(0).tolist()
+
+
+def test_a_routing_map_on_another_device_is_refused_as_any_output_there_is():
+    class MetaMap(nn.Module):
+        def forward(self, x):
+            probs = torch.softmax(x[:, :4], dim=-1)
+            return probs, torch.ones(x.shape[0], 4, dtype=torch.bool, device="meta")
+
+    model = nn.Sequential(MetaMap())
+    model.register_parameter("scale", nn.Parameter(torch.ones(())))
+    sink = tensorquill.MemorySink()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        session = tensorquill.init(model, routers={"0": tensorquill.Router(4, top_k=1)}, sink=sink, auto_step=False)
+        model(torch.randn(3, 8))
+        session.step()
+        session.close()
+    assert "its routing map is on meta" in sink.records[0]["moe_refused"]["0"]
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_a_compiled_megatron_style_router_counts_as_in_eager_mode(backend):
+    router, x = _f1_cases()["64-probs-padded"]
+    try:
+        _routed(router, x, backend=backend, hooked=False)
+    except Exception as error:  # noqa: BLE001
+        pytest.skip(f"this PyTorch cannot compile the model without TensorQuill: {type(error).__name__}")
+    eager = _routed(router, x)
+    probs, _ = router.last
+    assert _routed(router, x, backend=backend) == eager == (probs != 0).sum(0).tolist()

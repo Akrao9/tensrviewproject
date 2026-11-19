@@ -93,8 +93,12 @@ class Router:
     """An MoE router to watch.
 
     `indices` picks the tensor of chosen expert indices out of the module's output. By
-    default it is the first integer tensor in the output, or the top-`top_k` indices of
-    the first floating-point tensor whose last dimension equals `n_experts`.
+    default it is the first integer tensor in the output; else a bool routing map
+    `[..., n_experts]` with one row per token, as Megatron's `TopKRouter` returns beside its
+    probabilities, counted per expert as the map routes, leaving out entries whose paired float
+    (the first floating-point tensor of the map's shape) is exactly zero (`_routing_map`); else
+    the top-`top_k` indices of the first floating-point tensor whose last dimension equals
+    `n_experts`.
 
     A function given as `indices` is checked as the default is, and more: it must return an
     integer tensor on the counts' device, of a size that is a whole multiple of the tokens
@@ -157,6 +161,48 @@ _PLAIN_TYPES = (torch.Tensor, nn.Parameter)
 def _compiled_subclass(t: torch.Tensor) -> bool:
     """Whether `t` is a tensor subclass the hooks do not read, which only matters under `torch.compile`."""
     return torch.compiler.is_compiling() and type(t) not in _PLAIN_TYPES
+
+
+def _routing_map(output: Any, n_experts: int, tokens: int | None) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    """A router's bool routing map, and the float tensor paired with it, from its output's top level
+    (as `_first_tensor` reads it); None when there is no map. The author's decision on F1.
+
+    The map is the first bool tensor whose last dimension is `n_experts` and whose other dimensions
+    multiply to the `tokens` the router was called on (not checked where the count is symbolic, as
+    the integer branch of `_router_hook` does not), so a mask over the experts alone is not one.
+    Megatron's `TopKRouter` returns `(probs, routing_map)`, both `[tokens, n_experts]`.
+
+    Only an output that also holds a floating-point tensor is read this way, so that only an output
+    of a float tensor and a bool map is counted differently from before: a bool tensor alone is
+    refused, as it was. The paired float is the first floating-point tensor of exactly the map's
+    shape; with none of that shape, every true entry of the map is counted. Where a router
+    returns more than one (logits, then probabilities, then the map), the first is paired: logits
+    are never exactly zero, so padding in the map (`pad_to_capacity`) would then be counted. Judged
+    from types and shapes alone, so it traces the same under `torch.compile`."""
+    if isinstance(output, torch.Tensor):
+        candidates: Any = (output,)
+    elif isinstance(output, (tuple, list)):
+        candidates = output
+    elif isinstance(output, dict):
+        candidates = list(output.values())
+    else:
+        return None
+    found = None
+    for item in candidates:
+        if isinstance(item, torch.Tensor) and item.dtype == torch.bool and item.ndim >= 1 and item.shape[-1] == n_experts:
+            rows = item.numel() // n_experts if n_experts > 0 else None
+            if tokens and type(rows) is int and rows != tokens:
+                continue
+            found = item
+            break
+    if found is None or not any(isinstance(item, torch.Tensor) and item.is_floating_point() for item in candidates):
+        return None
+    paired = next(
+        (item for item in candidates
+         if isinstance(item, torch.Tensor) and item.is_floating_point() and item.shape == found.shape),
+        None,
+    )
+    return found, paired
 
 
 def _output_unread(x: torch.Tensor, device: torch.device) -> str | None:
@@ -490,6 +536,22 @@ def _router_hook(
                 if wrong is not None:
                     refuse(lambda: wrong[0], wrong[1])
                     return
+            elif (found := _routing_map(output, spec.n_experts, _tokens(args))) is not None:
+                # A bool routing map (Megatron's `routing_map`): each expert's count is the tokens the
+                # map routes to it, so an assignment dropped at capacity is not counted, and a token
+                # with fewer than top_k assignments adds only what it has. Entries whose paired
+                # float is exactly zero are left out: the padding `pad_to_capacity` adds to the map,
+                # and with it a real assignment whose weight is exactly zero (an underflow, say).
+                routing_map, paired = found
+                for tensor, what in ((routing_map, "its routing map"), (paired, "the float tensor paired with its routing map")):
+                    wrong = None if tensor is None else _unusable(tensor, counts.device, what)
+                    if wrong is not None:
+                        refuse(lambda: wrong[0], wrong[1])
+                        return
+                kept = routing_map.detach()
+                if paired is not None:
+                    kept = kept & (paired.detach() != 0)
+                hits = kept.reshape(-1, spec.n_experts).sum(0)
             else:
                 logits = _first_tensor(output, integer=False)
                 if logits is None:
@@ -528,7 +590,8 @@ def _router_hook(
                 )
         # Fixed output shape: `bincount` would make the shape depend on the data.
         # Accumulate across gradient-accumulation microbatches; `_commit` zeroes `counts`.
-        hits = (idx.detach().reshape(-1, 1) == expert_ids).sum(0)
+        if idx is not None:
+            hits = (idx.detach().reshape(-1, 1) == expert_ids).sum(0)
         if spec.indices is not None:
             # An `indices=` router's buffer has a last slot for the indices outside
             # 0..n_experts-1, which match no expert (`_count_width`): device work only, read in
