@@ -45,12 +45,12 @@ def _rust_missing() -> str | None:
     return None
 
 
-def _evidence(records: list[dict[str, Any]], engine: str) -> dict[str, Any]:
+def _evidence(records: list[dict[str, Any]], engine: str, **options: Any) -> dict[str, Any]:
     if engine == "rust":
         missing = _rust_missing()
         if missing:
             pytest.skip(missing)
-    return tensorquill.build_evidence(records, detectors=engine)
+    return tensorquill.build_evidence(records, detectors=engine, **options)
 
 
 def check(step: int, unchanged: list[str] | None, grads: dict[str, float], *, total: float | None = None) -> dict[str, Any]:
@@ -263,3 +263,105 @@ def test_rust05_a_numbering_restart_is_seen_whatever_row_comes_first(engine: str
     earlier = [row(step, 1) for step in range(10)]
     restarted = [row(step, 2) for step in (5, 6, 0, 1, 2)]
     assert ("repeated_steps", 0) in kinds(_evidence(earlier + restarted, engine))
+
+
+# --- DET-09: rates seen only in rolled-back steps -------------------------------------------
+
+MANIFEST_WITHOUT_SCHEDULER = {"components": {"model": {}, "optimizer": {"entries": 4}, "rng": {}, "data": {}}}
+
+
+def _resume_run(rolled_back_lr: float, kept_lr: float = 0.1) -> list[dict[str, Any]]:
+    """Attempt 1 runs steps 0 to 19 and attempt 2 resumes at 10 with a fixed rate and no
+    scheduler in its checkpoint. Attempt 1's steps 10 to 19 are rolled back."""
+    earlier = [row(step, 1, lr=[kept_lr if step < 10 else rolled_back_lr]) for step in range(20)]
+    resumed = [row(10, 2, lr=[kept_lr], checkpoint={"load": MANIFEST_WITHOUT_SCHEDULER})]
+    resumed += [row(step, 2, lr=[kept_lr]) for step in range(11, 15)]
+    return earlier + resumed
+
+
+def _scheduler_missing(evidence: dict[str, Any]) -> bool:
+    return any(
+        finding.get("component") == "scheduler"
+        for incident in evidence["incidents"] if incident["kind"] == "resume_incomplete"
+        for change in incident["changes"]
+        for finding in change["findings"]
+    )
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_det09_a_rate_seen_only_in_rolled_back_steps_does_not_make_a_scheduler_expected(engine: str) -> None:
+    assert not _scheduler_missing(_evidence(_resume_run(rolled_back_lr=0.2), engine))
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_det09_a_rate_that_varied_in_the_kept_history_still_does(engine: str) -> None:
+    records = _resume_run(rolled_back_lr=0.1)
+    records[3]["lr"] = [0.05]  # step 3 of attempt 1 is kept: the rate varied before the resume
+    assert _scheduler_missing(_evidence(records, engine))
+
+
+# --- DET-11: a top-k router's warm-up with n_experts <= 2k ----------------------------------
+
+
+def _router(step: int, counts: list[int], k: int) -> dict[str, Any]:
+    return {"schema_version": 1, "run_id": "lane-w3-moe", "rank": 0, "attempt": 1, "step": step, "layers": {},
+            "moe": {"router": counts}, "moe_top_k": {"router": k}}
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize(
+    ("counts", "hot"),
+    [([300, 300, 150, 150, 0, 0], [1, 2]), ([300, 300, 150, 150, 0, 0, 0, 0], [1, 2])],
+    ids=["6-experts", "8-experts"],
+)
+def test_det11_warm_up_collapse_names_the_hot_experts_when_n_experts_is_at_most_2k(
+    engine: str, counts: list[int], hot: list[int]
+) -> None:
+    # Top-3: every token picks experts 1 and 2 (each at the largest share a top-3 router allows,
+    # 1/3) and one of 3 or 4; the rest are dead. With 6 experts the threshold 2/6 cannot be passed.
+    evidence = _evidence([_router(step, counts, 3) for step in range(3)], engine)
+    first = evidence["samples"][0]
+    assert first["dead"] and first["overloaded"] == hot
+
+
+# --- DET-16: a bool is not a number ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_det16_a_bool_layer_statistic_is_not_an_activation_spike(engine: str) -> None:
+    def layer(step: int, abs_max: Any) -> dict[str, Any]:
+        return row(step, layers={"l": {"mean": 0.0, "std": 0.01, "abs_max": abs_max, "zero_frac": 0.0}})
+
+    baseline = [layer(step, 0.01) for step in range(30)]
+    assert ("activation_spike", 30) in kinds(_evidence(baseline + [layer(s, 1.0) for s in range(30, 45)], engine))
+    assert not [k for k in kinds(_evidence(baseline + [layer(s, True) for s in range(30, 45)], engine))
+                if k[0] == "activation_spike"]
+
+
+def test_det16_a_logged_bool_has_no_median() -> None:
+    # Python only: the Arrow path (`flight.record_to_row`) drops a record's whole `scalars` map
+    # when one value is a bool, so the Rust detectors never see it (reported, not this lane's file).
+    records = [row(step, scalars={"loss": 2.0, "is_best": True}) for step in range(5)]
+    records.append(row(5, grad_norm=math.nan, grad_norms={"w": math.nan}, scalars={"loss": 2.0, "is_best": True}))
+    found = [i for i in tensorquill.build_evidence(records)["incidents"] if i["kind"] == "non_finite"]
+    assert found[0]["scalars"]["loss"]["median_before"] == 2.0
+    assert found[0]["scalars"]["is_best"]["median_before"] is None
+
+
+def test_det16_system_readings_do_not_read_a_bool_as_a_number() -> None:
+    # `evidence_system._number` is lane V3's file: the change is requested, not made here.
+    from tensorquill import evidence_system
+
+    assert evidence_system._number(True) is None and evidence_system._number(False) is None
+    assert evidence_system._number(1) == 1.0
+
+
+# --- RUST-12: steps the loss scaler skipped are no update history ---------------------------
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize(("skipped", "counted"), [(True, 0), (False, 4)], ids=["skipped", "stepped"])
+def test_rust12_skipped_steps_do_not_count_toward_update_history(engine: str, skipped: bool, counted: int) -> None:
+    records = [row(step, update_rms={"w": 0.001}, step_skipped=skipped, grad_scale=1024.0) for step in range(4)]
+    check = _evidence(records, engine, update_window=2)["kind_checks"]["update_spike"]
+    assert (check["records"], check["enough_history"]) == (counted, counted >= 4)
