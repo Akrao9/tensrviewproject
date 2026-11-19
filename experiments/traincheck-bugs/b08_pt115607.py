@@ -6,8 +6,9 @@ clone's history (`git show 471f57e^:example_pipelines/115607_bug.py`; it was del
 loses `save_config=False`, a keyword PyTorch 2.15 no longer takes (it raises a TypeError), and
 the three TensorQuill lines (start, log, finish). TensorQuill is started inside the compiled
 function, after the model is built there, because the script builds it nowhere else; Dynamo
-then traces `tensorquill.init`, which fails (an AssertionError on `mark_static_address`), so
-`--disable` wraps `init` and `session.log` in `torch.compiler.disable`.
+then traces `tensorquill.init`. Until Nov 19, 2026 that failed (an AssertionError on
+`mark_static_address`), so `--disable` wraps `init` and `session.log` in
+`torch.compiler.disable`; `init` now steps out of the trace itself, and both ways run.
 
 The script runs one training loop eagerly and once under Dynamo, printing Adam's step counter
 after each step. At iteration 3 no backward runs, so the gradients are None and Adam's `step`

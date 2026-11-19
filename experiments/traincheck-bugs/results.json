@@ -2426,7 +2426,6 @@
    "--disable"
   ],
   "returncode": 0,
-  "ok": true,
   "run_id": "B08-PT-115607-buggy",
   "result": {
    "bug": "B08-PT-115607",
@@ -2511,7 +2510,8 @@
     "update_spike",
     "repeated_steps"
    ]
-  }
+  },
+  "ok": true
  },
  "B8||healthy": {
   "script": "b08_pt115607.py",
@@ -2521,7 +2521,6 @@
    "--disable"
   ],
   "returncode": 0,
-  "ok": true,
   "run_id": "B08-PT-115607-healthy",
   "result": {
    "bug": "B08-PT-115607",
@@ -2606,16 +2605,101 @@
     "update_spike",
     "repeated_steps"
    ]
-  }
+  },
+  "ok": true
  },
  "B8|nodisable|buggy": {
   "script": "b08_pt115607.py",
   "variant": "buggy",
   "tag": "nodisable",
   "args": [],
-  "returncode": 1,
-  "ok": false,
-  "error": "AssertionError: Attempt to trace forbidden callable <function mark_static_address at 0x121580c20>"
+  "returncode": 0,
+  "run_id": "B08-PT-115607-buggy-nodisable",
+  "result": {
+   "bug": "B08-PT-115607",
+   "variant": "buggy",
+   "run_id": "B08-PT-115607-buggy-nodisable",
+   "torch": "2.15.0",
+   "settings": {
+    "iterations": 6,
+    "optimizer": "Adam(lr=1e-3)",
+    "compiled": true,
+    "tensorquill_calls_under_compiler_disable": false,
+    "source": "TrainCheck 115607_bug.py from the clone's history; save_config dropped"
+   },
+   "symptom": {
+    "adam_step_counter": [
+     1.0,
+     2.0,
+     3.0,
+     3.0,
+     4.0,
+     5.0
+    ],
+    "expected_in_eager": [
+     1.0,
+     2.0,
+     3.0,
+     3.0,
+     4.0,
+     5.0
+    ],
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "healthy",
+     "incidents": [],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "dead_activations",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_lr_change",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [
+      "activation_drift (5 of 60 records)",
+      "activation_spike (5 of 11 records)",
+      "dead_activations (5 of 60 records)",
+      "grad_spike (5 of 13 records)",
+      "update_spike (5 of 102 records)"
+     ],
+     "not_checked": [],
+     "relevant_kinds": {
+      "stalled_weights": {
+       "value": "not_configured",
+       "records": 0,
+       "records_needed": 3,
+       "enough_history": false
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 5,
+       "records_needed": 102,
+       "enough_history": false
+      },
+      "repeated_steps": {
+       "value": "checked",
+       "records": 6,
+       "records_needed": 1,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "stalled_weights",
+    "update_spike",
+    "repeated_steps"
+   ]
+  },
+  "ok": true
  },
  "B8|nodisable|healthy": {
   "script": "b08_pt115607.py",
@@ -2623,7 +2707,6 @@
   "tag": "nodisable",
   "args": [],
   "returncode": 0,
-  "ok": true,
   "run_id": "B08-PT-115607-healthy-nodisable",
   "result": {
    "bug": "B08-PT-115607",
@@ -2708,7 +2791,8 @@
     "update_spike",
     "repeated_steps"
    ]
-  }
+  },
+  "ok": true
  },
  "B9||buggy": {
   "script": "b09_pt104336.py",
