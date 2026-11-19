@@ -1582,7 +1582,12 @@ class Session:
         if self._closed:
             return False
         if self._stopped:
-            return self._stepped
+            # Ends the step as a live session's does (an optimizer went through the scaler, a step it
+            # skipped included, or one of this model's stepped), so a stopped rank's drift-check
+            # gather stays on the other ranks' steps (`_count_stopped`); read without device work.
+            return self._stepped or any(
+                state.get("found_inf_per_device") for state in getattr(scaler, "_per_optimizer_states", {}).values()
+            )
         # It ends a step only after an optimizer went through the scaler (or one of this
         # model's stepped): `update(new_scale)` called on its own only sets the scale.
         ends = self._record_scaler(scaler) or self._stepped

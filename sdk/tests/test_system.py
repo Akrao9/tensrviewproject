@@ -443,6 +443,14 @@ def test_a_hung_nvml_open_never_holds_training(cuda, nvml, bounds):
         done.wait(10)
     closed = _closes_within(session, 5)
     assert finished and closed
+    # The author's decision on C03 (lane U1): the first flush waits up to 1 s for NVML to open, and the
+    # fast steps fill the 8-step queue meanwhile at every=1, so capture stops: the first block, which
+    # waited for the reading, and the 8 queued are written. A machine too slow to fill it records all 30.
+    steps = [r["step"] for r in sink.records]
+    if session.writer_error is None:
+        assert steps == list(range(30))
+    else:
+        assert steps == list(range(9)) and "NVML" in str(session.writer_error)
     assert nvml.calls == ["init"]
     nvml_parts = [r["system"]["nvml"] for r in sink.records if "nvml" in r.get("system", {})]
     assert nvml_parts == [{"unavailable": f"the first NVML reading, which opens NVML, took over {OPEN:g} s; "

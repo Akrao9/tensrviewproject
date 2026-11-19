@@ -888,3 +888,45 @@ def test_a_stopped_rank_keeps_entering_the_drift_checks_gather(tmp_path):
     records = [json.loads(line) for line in (tmp_path / "rank1.jsonl").read_text().splitlines()]
     assert [r["step"] for r in records] == list(range(8))
     assert [r["step"] for r in records if "replica_spread" in r] == [1, 3, 5, 7]
+
+
+def _scaled_run(monkeypatch, stop: bool) -> tuple[int, int]:
+    """Four iterations under a GradScaler, the second with an inf gradient (the scaler skips that
+    step), on a session with a drift-check group (its gather faked): where the session's step count
+    and its gathers end up."""
+    gathers = [0]
+
+    def fake(params, group, *, projection, device):
+        gathers[0] += 1
+        n = len(params)
+        return torch.zeros(n, 3, dtype=torch.float64), torch.zeros(n, dtype=torch.float64), [None] * n
+
+    monkeypatch.setattr(capture, "_spread_and_unread", fake)
+    torch.manual_seed(0)
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    scaler = torch.amp.GradScaler("cpu")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        session = tensorquill.init(model, sink=tensorquill.MemorySink(), every=1, scaler=scaler,
+                                   replica_group=object(), replica_every=1)
+        if stop:
+            session._stop(RuntimeError("stopped for the test"))
+        for i in range(4):
+            opt.zero_grad()
+            scaler.scale(model(torch.ones(2, 4)).sum()).backward()
+            if i == 1:
+                model.weight.grad.fill_(float("inf"))
+            scaler.step(opt)
+            scaler.update()
+        steps = session._next_step
+        session.close()
+    return steps, gathers[0]
+
+
+def test_a_stopped_rank_counts_the_steps_a_scaler_ends_as_a_live_one_does(monkeypatch):
+    """A step the scaler skipped ends a live session's step at `scaler.update()`; a stopped rank must
+    count it too, or its gather falls a step behind the other ranks'."""
+    live = _scaled_run(monkeypatch, stop=False)
+    assert live == (4, 4)
+    assert _scaled_run(monkeypatch, stop=True) == live
