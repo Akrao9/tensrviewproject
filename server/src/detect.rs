@@ -52,7 +52,7 @@
 //! - NaN and Inf are `null` in the incidents, which are strict JSON.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -71,6 +71,8 @@ pub use data::{detect_run, duplicate_batches, ranks_compared, read_batches};
 use data::{DataProgress, DataRow, ResumeFound, ResumePass, ResumeRow};
 mod system;
 use system::{System, SystemColumns};
+#[cfg(test)]
+mod lane_v7_tests;
 
 // The same values as the constants of the same names in evidence.py.
 pub const OVERLOAD_THRESHOLD: f64 = 0.35;
@@ -2777,10 +2779,15 @@ impl ReplicaDrift {
 // --- repeated_steps and resume_lr_change: what the attempts did ----------------------------
 
 /// A step whose logged scalars an incident shows, and those scalars once its row is read.
+/// They are the scalars of the step's first row that counts, as Python's `scalar_context`
+/// takes the first record with the step: a later writing of the step never replaces them
+/// (RS12, lane V7, Nov 19, 2026; until then the last writing won).
 #[derive(Default)]
 struct Wanted {
     step: Option<i64>,
     scalars: Option<Value>,
+    /// Whether the step's row was read, with or without scalars.
+    filled: bool,
 }
 
 impl Wanted {
@@ -2788,8 +2795,16 @@ impl Wanted {
         if self.step != Some(step) {
             *self = Self {
                 step: Some(step),
-                scalars: None,
+                ..Self::default()
             };
+        }
+    }
+
+    /// What was logged on a row of the wanted step, kept if it is the first such row.
+    fn fill(&mut self, context: &Option<Value>) {
+        if !self.filled {
+            self.scalars = context.clone();
+            self.filled = true;
         }
     }
 }
@@ -2802,6 +2817,12 @@ struct Attempts {
     repeated: Vec<i64>,
     repeated_count: u64,
     repeated_context: Wanted,
+    /// The steps that one attempt writes more than once, when the caller knows them in advance
+    /// (`judge`, which holds every row; a store never has them), and what was logged on the
+    /// first row of each that counts. By the time the second writing says the step is
+    /// repeated, the first one has been read.
+    written_twice: HashSet<i64>,
+    first_writings: BTreeMap<i64, Option<Value>>,
     /// When the newest attempt restarted the step numbering: the steps earlier attempts
     /// have beyond its last one, each with whether it already counts as repeated. Writing
     /// one of them again repeats it.
@@ -2822,6 +2843,9 @@ impl Attempts {
             self.repeated.truncate(20);
         }
         self.repeated_context.want(self.repeated[0]);
+        if let Some(context) = self.first_writings.get(&self.repeated[0]) {
+            self.repeated_context.fill(context);
+        }
     }
 
     fn add_change(&mut self, step: i64, change: Value) {
@@ -3173,7 +3197,7 @@ impl Inputs {
             .replica_spread
             .as_ref()
             .is_some_and(|spread| !spread.row(row).is_empty());
-        let checkpoint = text(columns.checkpoint, row).is_some_and(|text| text.trim_start().starts_with('{'));
+        let checkpoint = data::checkpoint(columns, row).is_some();
         self.grad_total += u64::from(total);
         self.weight_check += u64::from(weights && norms);
         self.lr += u64::from(columns.lr(row).is_some());
@@ -3245,12 +3269,13 @@ impl RankDetectors {
     /// Reads the rows of `batch` in order. The caller gives each row once, in step order,
     /// and only rows that count (see [`resolve`]). A batch without a `step` column is ignored.
     pub fn observe(&mut self, batch: &RecordBatch) {
-        self.read(batch, i64::MAX, None);
+        self.read(batch, None, None);
     }
 
     /// Reads the rows of `batch`, which belong to `self.attempt`. Rows at or past `cutoff`
     /// were rolled back by a later attempt: only `pass`, which reads every attempt, sees them.
-    fn read(&mut self, batch: &RecordBatch, cutoff: i64, mut pass: Option<&mut AttemptPass>) {
+    /// No cutoff (the newest attempt) is `None`, so every step counts, `i64::MAX` too (RS16).
+    fn read(&mut self, batch: &RecordBatch, cutoff: Option<i64>, mut pass: Option<&mut AttemptPass>) {
         let Some(columns) = Columns::new(batch) else { return };
         let system_columns = SystemColumns::new(batch);
         for row in 0..batch.num_rows() {
@@ -3263,7 +3288,7 @@ impl RankDetectors {
                 }
                 None => self.attempts.appended(step),
             }
-            if step >= cutoff {
+            if cutoff.is_some_and(|cutoff| step >= cutoff) {
                 continue;
             }
             let before = self.reported();
@@ -3284,15 +3309,20 @@ impl RankDetectors {
                 .row(step, &columns, row, self.thresholds.drift_tolerance);
             let after = self.reported();
             let wanted = [&self.attempts.repeated_context, &self.attempts.resume_context].map(|w| w.step == Some(step));
-            if after != before || wanted != [false, false] {
+            let twice =
+                self.attempts.written_twice.contains(&step) && !self.attempts.first_writings.contains_key(&step);
+            if after != before || wanted != [false, false] || twice {
                 // An incident was first reported on this step, or one names it: give it
                 // what was logged here.
                 let context = self.scalars.context(&columns, row);
+                if twice {
+                    self.attempts.first_writings.insert(step, context.clone());
+                }
                 if wanted[0] {
-                    self.attempts.repeated_context.scalars = context.clone();
+                    self.attempts.repeated_context.fill(&context);
                 }
                 if wanted[1] {
-                    self.attempts.resume_context.scalars = context.clone();
+                    self.attempts.resume_context.fill(&context);
                 }
                 if let Some(context) = context {
                     if !before.0[1] && after.0[1] {
@@ -3327,10 +3357,10 @@ impl RankDetectors {
             if wanted != [false, false] {
                 let context = self.scalars.context(&columns, row);
                 if wanted[0] {
-                    self.resumes.data_context.scalars = context.clone();
+                    self.resumes.data_context.fill(&context);
                 }
                 if wanted[1] {
-                    self.resumes.state_context.scalars = context;
+                    self.resumes.state_context.fill(&context);
                 }
             }
             let new = self.system.row(self.attempt, step, &system_columns, row);
@@ -3537,15 +3567,16 @@ impl RankDetectors {
 }
 
 /// Python's `resolve_attempts` for one rank: given each attempt's first step, the step at
-/// which each attempt was cut off by a later one (`i64::MAX` for the newest). A row counts
-/// when its step is below its attempt's cutoff, and read by attempt and then by step the
-/// rows that count are in step order.
-pub fn resolve(first_steps: &BTreeMap<i64, i64>) -> BTreeMap<i64, i64> {
+/// which each attempt was cut off by a later one (none for the newest, and for an attempt no
+/// later one cuts). A row counts when its step is below its attempt's cutoff, and read by
+/// attempt and then by step the rows that count are in step order. Until lane V7 (Nov 19,
+/// 2026) no cutoff was `i64::MAX`, and a row at that step was never read (RS16).
+pub fn resolve(first_steps: &BTreeMap<i64, i64>) -> BTreeMap<i64, Option<i64>> {
     let mut cutoffs = BTreeMap::new();
-    let mut cut = i64::MAX;
+    let mut cut: Option<i64> = None;
     for (attempt, first) in first_steps.iter().rev() {
         cutoffs.insert(*attempt, cut);
-        cut = cut.min(*first);
+        cut = Some(cut.map_or(*first, |cut| cut.min(*first)));
     }
     cutoffs
 }
@@ -3637,6 +3668,19 @@ fn judge_with(mut detectors: RankDetectors, rank: i32, batches: &[RecordBatch]) 
             start = end;
         }
     }
+    // The steps an attempt writes twice, whose first writing's scalars a `repeated_steps`
+    // incident shows (RS12). Only rows from outside a store can hold them.
+    let mut seen: HashSet<(i64, i64)> = HashSet::new();
+    for (attempt, piece) in &pieces {
+        if let Some(steps) = column::<Int64Array>(piece, "step") {
+            for step in steps.values().iter() {
+                if !seen.insert((*attempt, *step)) {
+                    detectors.attempts.written_twice.insert(*step);
+                }
+            }
+        }
+    }
+    drop(seen);
     let cutoffs = resolve(&first_steps);
     let mut pass = AttemptPass::new(rank, &first_steps);
     for (attempt, piece) in &pieces {
@@ -3709,6 +3753,44 @@ pub fn detect_stream_samples(
     .map_err(|error| format!("cannot write the report: {error}"))
 }
 
+/// The key columns of rows given to the offline modes (`detect` and `detect --run`), checked
+/// before anything is judged: a `run_id` string, a `rank` int32 and a `step` int64, none of
+/// them null, and an `attempt` int64 without nulls when the column is there. A batch with no
+/// `attempt` column is from a sender before attempts, and is attempt 0. Until lane V7 (Nov 19,
+/// 2026, RS10) a null read as run "", rank 0 or step 0, and an attempt that was not int64 as
+/// attempt 0. Live ingest checks its own (`ingest.rs`).
+pub(crate) fn check_keys(batch: &RecordBatch) -> Result<(), String> {
+    let (Some(run_ids), Some(ranks)) = (
+        column::<StringArray>(batch, "run_id"),
+        column::<Int32Array>(batch, "rank"),
+    ) else {
+        return Err("the rows need a run_id (string) and a rank (int32) column".to_string());
+    };
+    let Some(steps) = column::<Int64Array>(batch, "step") else {
+        return Err("the rows need a step (int64) column".to_string());
+    };
+    let attempts = match batch.column_by_name("attempt") {
+        None => None,
+        Some(attempts) => Some(attempts.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+            format!(
+                "the attempt column is {}, not int64: leave it out for attempt 0",
+                attempts.data_type()
+            )
+        })?),
+    };
+    for (name, nulls) in [
+        ("run_id", run_ids.null_count()),
+        ("rank", ranks.null_count()),
+        ("step", steps.null_count()),
+        ("attempt", attempts.map_or(0, Array::null_count)),
+    ] {
+        if nulls > 0 {
+            return Err(format!("{nulls} row(s) have a null {name}: every row needs its {name}"));
+        }
+    }
+    Ok(())
+}
+
 /// Reads one rank's rows from an Arrow IPC stream into `detectors`: whose rows they are, and
 /// the detectors after the last row.
 fn detect_rows(input: impl std::io::Read, detectors: RankDetectors) -> Result<(String, i32, RankDetectors), String> {
@@ -3722,15 +3804,13 @@ fn detect_rows(input: impl std::io::Read, detectors: RankDetectors) -> Result<(S
         if batch.num_rows() == 0 {
             continue;
         }
+        check_keys(batch)?;
         let (Some(run_ids), Some(ranks)) = (
             column::<StringArray>(batch, "run_id"),
             column::<Int32Array>(batch, "rank"),
         ) else {
-            return Err("the rows need a run_id (string) and a rank (int32) column".to_string());
+            unreachable!("check_keys found both columns");
         };
-        if column::<Int64Array>(batch, "step").is_none() {
-            return Err("the rows need a step (int64) column".to_string());
-        }
         for row in 0..batch.num_rows() {
             let (run_id, rank) = (run_ids.value(row), ranks.value(row));
             match &whose {
@@ -4807,8 +4887,13 @@ mod tests {
     fn a_later_attempt_cuts_off_the_earlier_ones() {
         // Attempt 1 from step 0, attempt 2 resumed at 100, attempt 3 at 50.
         let cutoffs = resolve(&BTreeMap::from([(1, 0), (2, 100), (3, 50)]));
-        assert_eq!(cutoffs, BTreeMap::from([(1, 50), (2, 50), (3, i64::MAX)]));
-        assert_eq!(resolve(&BTreeMap::from([(7, 0)])), BTreeMap::from([(7, i64::MAX)]));
+        assert_eq!(cutoffs, BTreeMap::from([(1, Some(50)), (2, Some(50)), (3, None)]));
+        assert_eq!(resolve(&BTreeMap::from([(7, 0)])), BTreeMap::from([(7, None)]));
+        // An attempt that starts at the largest step still cuts the one before it (RS16).
+        assert_eq!(
+            resolve(&BTreeMap::from([(1, 0), (2, i64::MAX)])),
+            BTreeMap::from([(1, Some(i64::MAX)), (2, None)])
+        );
     }
 
     #[test]
