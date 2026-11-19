@@ -94,7 +94,7 @@ session.close()
 - **Logging the loss and other scalars:** `session.log` takes the values your tracker logs, as numbers or one-element tensors, and attaches them to the step in progress. Call it before `optimizer.step()`; afterwards, the value lands on the next step. Log the unscaled loss, not `scaler.scale(loss)`. With gradient accumulation, log the step's mean once, since a name logged twice keeps the last value.
 - **Histograms and attention:** pass `probe=` a fixed batch, for example `probe={"input_ids": fixed_batch}`, to run it through the model every 1,000 steps (`probe_every=`) for activation histograms per block and attention statistics per layer. It runs without the compiler and without gradients, so expect a pause of about one forward pass each time; on a model that does not use `scaled_dot_product_attention`, only histograms are recorded.
 - **Two optimizers on one model**, such as Muon and AdamW: steps count training iterations, not optimizer steps. Nothing to change.
-- **Resuming from a checkpoint:** pass `start_step=` the step you resume from, or step numbers start at 0 again. If the checkpoint is older than the last recorded step, the steps written again replace the earlier ones in the evidence.
+- **Resuming from a checkpoint:** pass `start_step=` the step you resume from, or step numbers start at 0 again. If the checkpoint is older than the last recorded step, the steps written again replace the earlier ones in the evidence. Keep the run ID as well: pass the same `run_id=`, or let the tracker or the launcher give it. A resume under another run ID is a second run with a file of its own, and the resume checks do not reach across the two.
 - **`from torch.nn.utils import clip_grad_norm_` at the top of your script** binds the function before `init` wraps it. Either call `torch.nn.utils.clip_grad_norm_`, or pass the returned norm yourself: `session.record_grad_norm(norm)`.
 
 ### PyTorch Lightning
@@ -131,6 +131,8 @@ session.step(step=iteration, lr=optimizer.param_groups[0]["lr"])
 ```
 
 This follows Megatron's `train_step` in `megatron/training/training.py`; it has not been run.
+
+With `routers=`, a `TopKRouter`'s output `(probs, routing_map)` is counted from the map, so an assignment dropped at `moe_expert_capacity_factor` is not counted, and with `pad_to_capacity` the padding is left out. That was run on a CPU stand-in that follows Megatron's code (Nov 19, 2026), not on Megatron. `update_successful` is not recorded: a step Megatron skipped is written as a step.
 
 ### Hugging Face Trainer (and TRL)
 

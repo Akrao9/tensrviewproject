@@ -66,6 +66,7 @@ For a run folder, also name the ranks from `on_ranks`. When `numbers_differ` is 
 
 - `stride` above 1 means only every nth recorded step is shown. `over_range` still covers every recorded step in the range, so a one-step spike is in its `max` and `max_step` even when no shown point has it.
 - A value that is not a number is the string `"nan"`, `"inf"` or `"-inf"`.
+- `lines_left_out` counts lines of the capture that were not whole JSON records, torn by a killed process or still being written. The steps after them were read; the step on a torn line was not.
 - A router's series comes with `first_flagged_step` when the detectors' per-step samples are available.
 - A router's series read from compact evidence (the file a trigger hands you) says so under `compact`. With the file alone it covers only the steps the file keeps, around each MoE incident, not the run. With the step records beside it, every step's routing is there, and only the flags (`overloaded`, `dead`, `first_flagged_step`) are limited to the kept steps.
 - An answer that was cut says where, under `truncated`.

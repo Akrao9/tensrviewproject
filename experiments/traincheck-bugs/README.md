@@ -62,7 +62,7 @@ cd experiments/traincheck-bugs
 
 Counts are of rows, and the levels are kept apart. B2, B17 and B18 share one run.
 
-**Caught: a kind fired on the buggy run and not on the healthy one.**
+**Caught: a kind fired on the buggy run and not on the healthy one, and both runs completed with valid observations.**
 
 - **By level.** None with TrainCheck's script as it is in the clone. B1 with its script, model and data swapped. B9 and B10 re-created. B3 simulated. Plus the simulated hardware effect.
 - **B9 and B10 are one measurement.** They are the same training with the gradient sync lost two ways: the replicas end the same distance apart (0.1107).
