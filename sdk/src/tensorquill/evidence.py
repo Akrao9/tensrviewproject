@@ -1779,6 +1779,24 @@ def attempt_order_across(
     return {key: info["order"] for key, info in attempt_order_report(files, names).items()}
 
 
+def in_attempt_order(
+    records: Iterable[Mapping[str, Any]], order: Mapping[tuple[str, Any], list[Any]]
+) -> list[dict[str, Any]]:
+    """`records` with each rank's attempts in `order` (oldest first, by `(run_id, rank)`): a
+    stable sort, so the records of one attempt keep their order. An attempt `order` does not
+    list keeps its place of first appearance after those it lists. Every reader that takes
+    first appearance as the order (`resolve_attempts`, the detectors, the stream to the Rust
+    detectors) then reads `order`."""
+    listed = list(records)
+    places: dict[tuple[str, Any], dict[Any, int]] = {}
+    for key, attempts in order.items():
+        places[key] = {attempt: at for at, attempt in enumerate(attempts)}
+    for record in listed:
+        known = places.setdefault((_run_of(record), record.get("rank", 0)), {})
+        known.setdefault(record.get("attempt", 0), len(known))
+    return sorted(listed, key=lambda r: places[(_run_of(r), r.get("rank", 0))][r.get("attempt", 0)])  # type: ignore[return-value]
+
+
 def resolve_attempts_across(files: Iterable[Iterable[Mapping[str, Any]]]) -> list[dict[str, Any]]:
     """`resolve_attempts` over a rank's several files, with the attempts in `attempt_order_across`
     order: the records of every file, in the order given, with those a later attempt replaced
@@ -4921,8 +4939,14 @@ def build_evidence(
     run_manifest: str | Path | Mapping[str, Any] | None = None,
     update_window: int = UPDATE_WINDOW,
     records_file: str | Path | None = None,
+    attempt_order: Mapping[tuple[str, Any], list[Any]] | None = None,
 ) -> dict[str, Any]:
     """Build viewer-neutral detector evidence from captured step records.
+
+    `attempt_order` gives each rank's attempts oldest first by `(run_id, rank)` where the
+    records' own order cannot, as for a rank's several local files (`attempt_order_across`,
+    contract 1). The records are put in that order first (`in_attempt_order`), so the Python
+    detectors and the stream sent to the Rust ones judge the same order.
 
     `run_end` says whether the session that wrote a local `.jsonl` file closed it
     (`sink.read_end_marker`): read from `source` when that is the file, or from `records_file`
@@ -4984,6 +5008,8 @@ def build_evidence(
                      starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,
                      update_window=update_window, none_given=True)
     every_attempt, left_out = _load_counted(source, rank)
+    if attempt_order:
+        every_attempt = in_attempt_order(every_attempt, attempt_order)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
         raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")

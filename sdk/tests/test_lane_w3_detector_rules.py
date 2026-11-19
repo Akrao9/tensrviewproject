@@ -634,15 +634,44 @@ def test_contract1_across_files_compare_step_records(name: str, tmp_path: Any) -
         assert sorted((r["attempt"], r["step"]) for r in kept) == sorted(case["kept"])
 
 
-@pytest.mark.xfail(strict=True, reason="compare's open_run (`_open_local`, `_open_local_all_ranks`) still concatenates a "
-                   "rank's files in path order: not in the two edits granted to lane W3; asked of the top session")
-@pytest.mark.parametrize("name", [n for n in CASES_ACROSS if n != "null-ts"])
+@pytest.mark.parametrize("name", CASES_ACROSS)
 def test_contract1_across_files_compare_open_run(name: str, tmp_path: Any) -> None:
     from tensorquill import compare
 
     case = _case(name)
     _write_case(tmp_path / "runs", case)
-    assert compare.open_run(ACROSS_RUN, tmp_path / "runs")["last_step"] == case["last"]
+    opened = compare.open_run(ACROSS_RUN, tmp_path / "runs")
+    assert opened["last_step"] == case["last"]
+    said = opened["read_from"]
+    assert said["attempt_order"] == case["attempt_order"]
+    if case["attempt_order"] == "numeric":
+        assert "disagree" in said["attempt_order_reason"] and sorted(said["attempt_order_files"]) == sorted(case["files"])
+    assert said.get("attempts_by_number") == case.get("by_number")
+
+
+@pytest.mark.parametrize("name", CASES_ACROSS)
+def test_contract1_across_files_both_engines_judge_the_same_order(name: str) -> None:
+    from tensorquill.evidence import attempt_order_across
+
+    case = _case(name)
+    files = list(case["files"].values())
+    order = attempt_order_across(files)
+    records = [r for f in files[::-1] for r in f]  # given in the other order: `attempt_order` decides
+    python = tensorquill.build_evidence(records, attempt_order=order)
+    rust = _evidence(records, "rust", attempt_order=order)
+    assert kinds(python) == kinds(rust)
+    report = server_report_of(records, order)
+    assert (report["attempt"], report["last_step"]) == (case["order"][-1], case["last"])
+
+
+def server_report_of(records: list[dict[str, Any]], order: Any) -> dict[str, Any]:
+    from tensorquill.evidence import in_attempt_order
+    from tensorquill.server_detect import server_report
+
+    missing = _rust_missing()
+    if missing:
+        pytest.skip(missing)
+    return server_report(in_attempt_order(records, order))
 
 
 @pytest.mark.parametrize("name", CASES_ACROSS)

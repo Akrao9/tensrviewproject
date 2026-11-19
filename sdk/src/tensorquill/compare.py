@@ -125,6 +125,25 @@ def _last_step(records: list[dict[str, Any]]) -> int | None:
     return max(steps) if steps else None
 
 
+def _across_files(per_file: list[list[dict[str, Any]]], names: list[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """A rank's records from several files, with its attempts put in contract 1's order across
+    files (each file's own order first, then `ts`, then number; never path order: lane W3), and
+    what `read_from` says of that order: `attempt_order`, and `reason` and `files` when the files
+    disagree, or `by_number` when attempt numbers decided."""
+    from .evidence import attempt_order_report, in_attempt_order
+
+    report = attempt_order_report(per_file, names)
+    ordered = in_attempt_order([r for records in per_file for r in records], {k: v["order"] for k, v in report.items()})
+    said: dict[str, Any] = {}
+    for info in report.values():
+        said = {"attempt_order": info["attempt_order"],
+                **({"attempt_order_reason": info["reason"], "attempt_order_files": names} if "reason" in info else {}),
+                **({"attempts_by_number": info["by_number"]} if "by_number" in info else {})}
+        if info["attempt_order"] == "numeric":
+            break
+    return ordered, said
+
+
 def _world_size(manifest: Mapping[str, Any] | None) -> int:
     """The run manifest's `world_size`, or 0 when it does not say one that can be counted."""
     from .evidence import MAX_EXPECTED_RANKS
@@ -152,10 +171,14 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
     extra = [Path(more) for more in ((run.get("more_files") or {}).get(key) or ())]
     own, torn = list(records), unfinished
     seen = {_record_key(record) for record in records} if extra else set()
+    per_file = [list(records)]
     for more in extra:
         found, cut = _read_local(more)
-        own += _not_read_yet(found, seen)
+        per_file.append(_not_read_yet(found, seen))
         torn = torn or cut
+    order_said: dict[str, Any] = {}
+    if extra:
+        own, order_said = _across_files(per_file, [path.name, *(more.name for more in extra)])
     if not own:
         raise _runs.RunLookupError(f"run {run['run_id']} has no whole record in {path} yet: nothing to compare")
     held = sorted({_rank_of(r) for r in own})
@@ -175,7 +198,7 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
     return {
         "evidence": evidence, "last_step": _last_step(records),
         "read_from": {"path": str(path), "kind": "local records", "rank": picked, "ranks": ranks,
-                      **({"paths": every} if every else {}),
+                      **({"paths": every} if every else {}), **order_said,
                       "judged_by": "the Python detectors, here, with the default thresholds",
                       **({"unfinished_lines_left_out": True} if torn else {})},
         "records": {"path": str(path), "rank": picked, **({"paths": every} if every else {})},
@@ -208,6 +231,7 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
     more_of = {str(path): number for number, more in (run.get("more_files") or {}).items() for path in more}
     extra_read: dict[int, list[str]] = {}
     seen: dict[int, set[str]] = {}  # of a rank with other files: the records read so far, from the files before
+    per_file: dict[int, dict[str, list[dict[str, Any]]]] = {}  # of a rank with other files: its records by file
     for path in [first, *(files[n] for n in sorted(files) if files[n] != first),
                  *(Path(p) for p in more_of if Path(p) not in files.values())]:
         found, torn = (records, unfinished) if path == first else _read_local(path)
@@ -229,6 +253,7 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
                 continue
             if number in (run.get("more_files") or {}):
                 added.setdefault(number, set()).add(_record_key(record))
+                per_file.setdefault(number, {}).setdefault(str(path), []).append(record)
         for number, keys in added.items():
             seen.setdefault(number, set()).update(keys)
     if not by_rank:
@@ -247,6 +272,10 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
            "this rank was not read" if run.get("files_given") else
            f"the run manifest says world size {world}, and no file holds a record of this rank")
     unknown.update((n, why) for n in range(world) if n not in by_rank and n not in unknown)
+    orders_said: dict[int, dict[str, Any]] = {}
+    for number, files_of in per_file.items():
+        if len(files_of) > 1:
+            by_rank[number], orders_said[number] = _across_files(list(files_of.values()), [Path(p).name for p in files_of])
     per_rank = {}
     for number, own in sorted(by_rank.items()):
         per_rank[number] = {**build_evidence(own, run_manifest=run.get("manifest") or {}), "last_step": _last_step(own)}
@@ -259,6 +288,7 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
                       "rank": None, "ranks": ranks, "all_ranks": True,
                       "judged_ranks": combined["judged_ranks"], "unknown_ranks": combined["unknown_ranks"],
                       **({"unknown_why": unknown} if unknown else {}),
+                      **({"attempt_orders": orders_said} if orders_said else {}),
                       "judged_by": "the Python detectors, here, with the default thresholds, on each rank; the ranks put "
                                    "together by the all-ranks view's rules",
                       **({"unfinished_lines_left_out": True, "unfinished_in": unfinished_in} if unfinished_in else {})},
