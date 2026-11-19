@@ -87,6 +87,8 @@ BASELINE_STEPS = 50  # the "typical value" is the median of this many recorded s
 
 GATE_ACCURACY_PP = 5.0
 GATE_SPEEDUP = 2.0
+# Three trials per fixture per arm, numbered 1 to 3 (PREREGISTRATION.md, "Running the trial").
+TRIALS = (1, 2, 3)
 
 
 # --- What each arm is given ------------------------------------------------------------
@@ -517,6 +519,25 @@ def _model(participant: str) -> str:
     return participant.split(":", 1)[1].strip()
 
 
+def design_gaps(c: list[dict], r: list[dict]) -> list[str]:
+    """What keeps arms C and R (their agent rows on held-out fixtures) from the preregistered design:
+    the same model in both arms, and trials 1, 2 and 3 exactly, once each, on every one of the six
+    held-out fixtures in each arm. An empty list means the design is complete and balanced."""
+    gaps = []
+    models = sorted({_model(x["participant"]) for x in c + r})
+    if len(models) != 1:
+        gaps.append(f"one model in both arms (the answer files name {', '.join(models)})")
+    for arm, mine in (("C", c), ("R", r)):
+        off = []
+        for fixture in HELD_OUT:
+            have = sorted(x["trial"] for x in mine if x["fixture"] == fixture)
+            if have != list(TRIALS):
+                off.append(f"{fixture} has {'trials ' + ', '.join(map(str, have)) if have else 'none'}")
+        if off:
+            gaps.append(f"arm {arm} trials 1, 2 and 3 on each held-out fixture ({'; '.join(off)})")
+    return gaps
+
+
 def evidence_gate_checks(rows: list[dict]) -> list[str]:
     """The gate as the amendment of Nov 17, 2026 sets it: arm C (evidence and its summary) against
     arm R (stock Rerun with the same evidence, summary and `run.rrd`), agent trials only, on the
@@ -526,9 +547,10 @@ def evidence_gate_checks(rows: list[dict]) -> list[str]:
     2. Tool calls: C's median agent tool calls to a correct answer is no more than R's. With no
        correct trial in C the part fails; with none in R and one in C it is met.
 
-    The model is compared and reported beside the verdict; the amendment requires the same model in
-    every arm but gives no rule that changes the verdict, so it does not. The time limit is not in
-    the answer format and is reported as not recorded.
+    A verdict is given only for the preregistered design: one model in both arms, and trials 1 to
+    3 on all six held-out fixtures in each arm (`design_gaps`). Short of that the two parts are
+    still worked out, marked provisional, and the verdict reads "not decided" with what is
+    missing. The time limit is not in the answer format and is reported as not recorded.
     """
     agent = {arm: [r for r in rows if r["arm"] == arm and r["held_out"] and r["agent"]] for arm in ("C", "R")}
     missing = [arm for arm in ("C", "R") if not agent[arm]]
@@ -545,6 +567,11 @@ def evidence_gate_checks(rows: list[dict]) -> list[str]:
     if len(shared) < len(HELD_OUT):
         lines.append(f"C against R on {len(shared)} of the {len(HELD_OUT)} held-out fixtures only ({names}); "
                      f"the others lack agent trials in one arm or both.")
+    gaps = design_gaps(agent["C"], agent["R"])
+    if gaps:
+        lines.append("The answer files are not the preregistered design, so the two parts below are "
+                     "provisional arithmetic and no release verdict is given.")
+    mark = "Provisional: " if gaps else ""
 
     # 1. Accuracy, compared in integers, not rounded percentages:
     # 100 (cr/cs - rr/rs) >= -5  <=>  100 (cr rs - rr cs) >= -5 cs rs.
@@ -552,7 +579,7 @@ def evidence_gate_checks(rows: list[dict]) -> list[str]:
     rr, rs = sum(x["right"] for x in r_), sum(x["scored"] for x in r_)
     accuracy_ok = (100 * (cr * rs - rr * cs) >= -GATE_ACCURACY_PP * cs * rs)
     c_acc, r_acc = 100.0 * cr / cs, 100.0 * rr / rs
-    lines.append(f"Accuracy, C against R on {names}: {cr} of {cs} ({c_acc:.1f}%) against {rr} of {rs} ({r_acc:.1f}%), "
+    lines.append(f"{mark}Accuracy, C against R on {names}: {cr} of {cs} ({c_acc:.1f}%) against {rr} of {rs} ({r_acc:.1f}%), "
                  f"{c_acc - r_acc:+.1f} pp: {'met' if accuracy_ok else 'FAILS'} (C may be at most 5.0 pp behind R).")
 
     # 2. Tool calls to a correct answer. "Has a correct trial" is read from `correct`, so a correct
@@ -564,25 +591,28 @@ def evidence_gate_checks(rows: list[dict]) -> list[str]:
     r_median = _median([x["tool_calls"] for x in r_correct if x["tool_calls"] is not None])
     if not c_correct:
         calls_ok = False
-        lines.append("Median agent tool calls to a correct answer: FAILS; arm C has no correct trial.")
+        lines.append(f"{mark}Median agent tool calls to a correct answer: FAILS; arm C has no correct trial.")
     elif not r_correct:
         calls_ok = True
-        lines.append(f"Median agent tool calls to a correct answer: met; arm C has {len(c_correct)} correct "
+        lines.append(f"{mark}Median agent tool calls to a correct answer: met; arm C has {len(c_correct)} correct "
                      f"trials (median {_fmt(c_median)}), and arm R has no correct trial.")
     elif any(uncounted.values()):
         # Both arms have correct trials, but not every one has a count: the amendment does not say
         # how such a trial counts, so the part is left undecided rather than guessed.
         calls_ok = None
-        gaps = ", ".join(f"{n} in arm {arm}" for arm, n in uncounted.items() if n)
-        lines.append(f"Median agent tool calls to a correct answer: cannot be judged; correct agent trials "
-                     f"without a tool-call count: {gaps}.")
+        missing = ", ".join(f"{n} in arm {arm}" for arm, n in uncounted.items() if n)
+        lines.append(f"{mark}Median agent tool calls to a correct answer: cannot be judged; correct agent trials "
+                     f"without a tool-call count: {missing}.")
     else:
         calls_ok = c_median <= r_median
-        lines.append(f"Median agent tool calls to a correct answer, C against R: {_fmt(c_median)} against "
+        lines.append(f"{mark}Median agent tool calls to a correct answer, C against R: {_fmt(c_median)} against "
                      f"{_fmt(r_median)} ({len(c_correct)} and {len(r_correct)} correct trials): "
                      f"{'met' if calls_ok else 'FAILS'} (C must be no more than R).")
 
-    if calls_ok is None:
+    if gaps:
+        # Checked before anything else: the arithmetic of an incomplete or mixed design is not the gate.
+        verdict = "not decided; the preregistered design needs " + "; and ".join(gaps)
+    elif calls_ok is None:
         verdict = "not decided, since the tool-call part cannot be judged" + ("" if accuracy_ok else
                                                                               "; the accuracy part already FAILS")
     else:
@@ -594,8 +624,8 @@ def evidence_gate_checks(rows: list[dict]) -> list[str]:
         lines.append(f"Model: {models['C'][0]} in both arms.")
     else:
         lines.append(f"Model: the arms' answer files differ or mix models (C: {', '.join(models['C'])}; "
-                     f"R: {', '.join(models['R'])}). The amendment requires the same model in every arm; "
-                     f"the verdict above does not account for it.")
+                     f"R: {', '.join(models['R'])}). The amendment requires the same model in every arm, "
+                     f"so no verdict is given.")
     lines.append("Time limit per trial: not recorded in the answer files, so whether it was the same in both arms "
                  "is not checked here; compare it with the amendment by hand.")
     return lines
