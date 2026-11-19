@@ -2489,6 +2489,198 @@ State as of Nov 16, 2026.
   - *Seen, not in this lane.* RS06: a new attempt keeps the earlier attempt's phase clock, untouched here. A finished run is not taken up by a restarted server, so a heartbeat-only resume after a restart starts as a new rank (`starting`, then `silent`) with no `last_step`. A rank whose stream dropped longer ago than `abandon` and that beats with a new attempt still reads `abandoned` (only a finished rank's clock is reset). The data window of a rank whose new attempt is seen only in its beats stays in `ranks_compared` until a part is stored. A status written by an older server with a finished stream and `attempt_without_steps` is restored as finished. Lane T4's open items stay open.
   - *Open, for the author.* RS05's ordering: option 1, 2, 3 or 4 above, which also decides RS01's open case. Whether 30 s is the right `report_grace` for the server, and whether it should be a command-line option.
 
+- [ ] **Lane U1: capture paths that could still raise into or block training, no decision needed (Nov 19, 2026, lane U1, branch `claude/lane-u1-capture-65695e`; not merged).** Cut from `main` at `1767a4a`. The code is in `capture.py`. The tests are in the new `sdk/tests/test_lane_u1_capture.py`, which needs no server binary. Two lines of `sdk/tests/test_capture.py` changed too; see below. The hand-over note, `lane-u1.md` in the session notes, lists every function touched, with the scripts.
+  - *Found on the base, before any change* (macOS, CPU, PyTorch 2.15).
+    - C01: `c01.py` gives 0.5 with capture off and raises `NotImplementedError` with it on. This lane also found three more cases in the same read. CSR, CSC, BSR and BSC gradients raised. A float8 gradient raised. A sparse gradient on `meta` was dropped with nothing said.
+    - C04: `c04.py` commits 8 steps after `close()`, then blocks; it had not finished after 20 s.
+    - B8: the experiment's buggy variant, run on a scratch copy, exits 1 with "Attempt to trace forbidden callable `mark_static_address`". A compiled loop that calls `optimizer.step()` also raised under `-W error`, even with `init` called outside it: Dynamo warned while tracing the session's optimizer hook (`sys._getframe`).
+    - C10: `probe_head="nope"` raised its `ValueError`. It left 6 hooks on the model, which had none before, and wrote the run manifest.
+    - C19: a `scaler.update` installed before `init` was gone after `close()`. With two sessions on one scaler, the second session's hook was gone once the first closed.
+    - The probe: under `-W error`, `optimizer.step()` raised "TensorQuill probe failed and was skipped".
+    - The docstring said 24 bytes. The gather is 32 (`distributed.py:236`).
+  - *Fixed, each with tests that fail on the base.* 28 of the file's 36 tests fail when run on the base's code; the other 8 check behaviour that must stay as it was.
+    - **Gradients (C01).** An unreadable gradient is now left out on its own.
+      - `meta` and nested gradients are judged from device and layout alone.
+      - Sparse gradients are read from their stored values, as the weight check reads sparse weights.
+      - A group whose norm raises is read again one tensor at a time.
+      - The step runs as it does without TensorQuill. The other gradients keep their norms, and `grad_norm` sums only the gradients that were read.
+      - Each unread parameter is named once, under a new record field `grads_not_read: {name: why}`, on the first record written after it was found. It is carried the way `update_not_read` is. The Python row conversion for the stream (`flight.record_to_row`) puts it in `extra_json`; the Rust side was not run. The evidence reads past it.
+      - Tests: `test_a_gradient_on_meta_is_left_out_on_its_own_and_the_step_runs_as_without_tensorquill`, `test_a_sparse_gradient_is_read_from_its_stored_values` (5 layouts), `test_an_unreadable_gradient_is_named_and_the_others_keep_their_norms` (3 kinds).
+    - **A closed session (C04).** Every public entry point returns at once when the session is closed: no raise, nothing queued and no warning. The brief first allowed one warning. The session that started the lane corrected that: the shared rule wins, because a warning on the training thread is an exception under `python -W error`. To tell a user once, a later change could log at DEBUG on the `tensorquill` logger, which `-W error` does not touch, or count the calls and write the count on the end marker. Neither is built.
+      - `watch_loader` and `time_data` hand back what they were given.
+      - `close()` flushes through the private path.
+      - The four `RuntimeError("the session is closed")` raises are gone.
+      - Tests: `test_every_public_call_on_a_closed_session_returns_at_once_and_queues_nothing`, which runs 24 rounds of every public call (three times the writer queue's size) under a 20 s deadline; `test_a_closed_session_does_not_raise_under_warnings_as_errors`.
+    - **`init` under tracing (B8).** `init` is now `@torch.compiler.disable`. The optimizer hooks and the scaler's wrapper are registered through it too, so a traced `optimizer.step()` runs them eagerly. Behind that wrapper the pre-hook finds the optimizer's frame by skipping `torch/_dynamo/` frames.
+      - Tests: `test_init_inside_a_compiled_function_runs_and_captures`, which is B8's loop (counter 1, 2, 3, 3, 4, 5, and six records); `test_init_then_compile_the_model_still_captures`; `test_the_optimizer_hooks_do_not_raise_when_optimizer_step_is_traced_under_warnings_as_errors`.
+      - `test_compile.py`: 4 passed, so 0 graph breaks and 0 recompiles.
+    - **A rejected `init` (C10).** `_plan_session` now makes every check of the model and the options, with nothing changed. `init` runs it before it resolves the run.
+      - `Session` then makes its effects in `_install`. Each effect registers its undo as it is made: hooks, the heartbeat counter, the writer thread, clipping, the scaler, the optimizer hooks and the loader timer.
+      - `init` undoes its own effects: the default sink with its file and folders, the run manifest (the earlier bytes or no file), and the stream's heartbeat and sender. It never closes a sink the caller passed in.
+      - Removing an earlier run's end marker is now the last step.
+      - Tests: `test_a_rejected_init_leaves_hooks_threads_globals_and_files_as_they_were` (7 rejections), `test_a_later_failure_undoes_every_effect_made_before_it`, `test_a_later_failure_puts_an_earlier_runs_manifest_and_end_marker_back`.
+    - **The scaler (C19).** Each scaler now has one `update` wrapper, shared by every session that watches it. When the last session leaves, the wrapper is taken out, but only while it is still the instance attribute. A wrapper someone installed on top after `init` is left in place, and ours under it passes calls through. `_scaler_original` is gone.
+      - Tests: `test_closing_puts_back_an_update_someone_installed_before_init`, `test_two_sessions_on_one_scaler_keep_counting_whichever_closes_first` (both orders), `test_a_wrapper_installed_on_top_after_init_is_left_in_place`, `test_closing_leaves_a_scaler_with_its_class_method`.
+    - **Warnings (the probe's, and the others training reaches).** `_warn` calls `warnings.warn`. Where a filter turns the warning into an error, it logs the message on the `tensorquill` logger instead.
+      - It is used for the probe's warning, the foreign-step warning, the router refusal, and the replica-unread warning.
+      - The backpressure warning in `_put` is left as it is (C03).
+      - The probe's failure is still in its record as `{"error": ...}`.
+      - Tests: `test_a_failed_probe_does_not_raise_out_of_the_step_under_warnings_as_errors`, `test_a_refused_router_and_steps_of_another_model_do_not_raise_under_warnings_as_errors`.
+    - **The docstring.** It now says 32 bytes per parameter tensor, or 24 without the projection, with the flag named. Test: `test_init_says_how_many_bytes_the_drift_check_gathers`.
+  - *Existing test changed, outside this lane's two files.* `test_capture.py`'s `test_log_records_scalars_for_the_step_in_progress` asserted that `log()` raises after `close()`. That is the contract C04 replaces. Its last two lines now assert that the call returns, with no warning, and writes nothing. This needs the author's yes.
+  - *Made safe for PyTorch 2.6 without running it.* The float8 case and the compressed sparse layouts skip where this PyTorch cannot make them. The float8 case also skips where the CPU can take a float8 norm. The three Dynamo tests first run the same compiled loop without TensorQuill, under the same warning filter, and skip if that control fails. Each check is by capability, as in the plan's PyTorch 2.6 entry.
+  - *Run.* The new file: 36 passed, none skipped here. On the base's code, 28 of its tests fail, run again after the 2.6 guards were added. `test_compile.py`: 4 passed. The full `sdk/tests` with this worktree on `PYTHONPATH`: 1254 passed, 619 skipped, 1 failed. The failure was `test_capture.py`'s old contract, in a run that started before that test was changed. After the change, `test_capture.py`, the new file and `test_compile.py` were run again: 77 passed. `test_update_size.py`'s `test_a_subclass_that_leaves_the_step_alone_is_read` fails when run alone, on the base too, and passes in its file's order. That order dependency is older than this lane.
+  - *Not run.* PyTorch 2.6, which is the minimum: `torch.compiler.disable` exists there, but the frame skip and the tests have not run on it, and CI is the check. Also not run: Linux, a GPU, NCCL.
+  - *Left, with why.*
+    - B8 under `-W error`, with `init` inside the traced function: Dynamo warns while tracing any forward hook on a model built there, and `-W error` raises that warning. A user's hook that only calls `isinstance(output, torch.Tensor)` does the same with no TensorQuill. Under the default filters it is fixed.
+    - If `init` fails after the stream started, the sender may already have sent the manifest. That cannot be undone. Validation errors now come before the sender starts.
+  - *Stale, not edited.*
+    - B8's recorded result in `experiments/traincheck-bugs/` (U8's tree): the buggy variant now runs to the end, with counter 1, 2, 3, 3, 4, 5 and no `--disable`. The B8 docstring there says Dynamo fails on `init`.
+    - The Focused Plan's row on TensorQuill stopping a run still lists "init when torch.compile traces it" as able to raise, and leaves out C01, C04, C10 and C19.
+    - `sdk/README.md` line 31 describes `grad_norms` without saying that an unread gradient is left out and named under `grads_not_read`.
+    - `sdk/README.md` line 331, "Nothing raises once training runs": still not true of the local sink (C03).
+  - *Needed in a file that is not this lane's.* `divergence.py:81`, `_NOTE_KEYS`, should name `grads_not_read`. Today `compare` lists that key under `left_out.not_compared` as if it were data; this was run on two records files with a `meta` parameter. Also, the new tests read `datawait._watching` and `flight.record_to_row`, which are U3's and U4's names.
+  - *Open, for the author.*
+    - The new field `grads_not_read`: its name and shape (said once per parameter, as `update_not_read` is). It has no reader yet: no not-checked entry in the evidence and none in the server.
+    - Tests that assert "no warning" with `simplefilter("error", RuntimeWarning)`: four in `test_router_guard.py` and one in `test_eval_forwards.py`. They would no longer catch one of the converted warnings, which is logged instead. Their other assertions still hold.
+    - Under `-W error`, the foreign-step and replica-unread messages reach only the log. Neither has a record field.
+  - *Item 8, C03, added to this lane after the author's decision (logged on `main` at `5c44ae7`): "stop capture, warn loudly once, and let training go on."* Done in commits of its own, after items 1 to 7 (`a037441`), so those can be merged alone.
+    - *Reproduced first* (`c03.py`, `c03tb.py`): a sink whose `write` raised made `optimizer.step()` raise `RuntimeError: the TensorQuill writer thread failed` at step 1 (`_after_optimizer_step` > `_commit` > `_flush` > `_raise_worker_error`). Inside `with session:` the same error replaced the user's own `LookupError`. A writer that fell behind made `_put` wait without bound.
+    - *Built.* One stopped state, `_stop(cause)`. It runs on the training thread only; the writer thread only keeps the sink's error, which the next step turns into a stop.
+      - The causes are a sink that raised, a queue found full at `_put` (the block is dropped), and at `close()` a writer that has not finished within `CLOSE_SECONDS`.
+      - The cause is kept as `session.writer_error`. One `RuntimeWarning` names it, sent through `_warn`, which cannot raise.
+      - After the stop, every public entry point returns at once and says nothing (`_closed_call`). The exceptions are `set_phase`, `tick` and `phase`, which the heartbeat reads: they stay live.
+      - The writer writes the blocks queued before the stop, which are an unbroken run of steps, then ends. Nothing more is copied off the device.
+      - `_raise_worker_error` and the wait in `_put` are gone. The queue's capacity is in one place (`WRITER_QUEUE`, `_queue_blocks`).
+    - *Hooks.* The forward hooks stay as they are. The clipping and loader hooks come off.
+      - The optimizer hooks become a no-op in PyTorch's hook dictionary, and `close()` removes them. Removing them at the stop would raise: the stop is reached inside PyTorch's loop over those hooks, and an `OrderedDict` changed in size during iteration raises (run here). `RemovableHandle.hooks_dict_ref` and `.id` exist at PyTorch v2.6.0 (read in the clone).
+      - The scaler's wrapper comes off, as `close()` takes it off.
+      - With a `replica_group`, the stopped rank keeps its optimizer and scaler hooks. It counts steps and enters the drift check's `all_gather` on the same steps as the other ranks, and drops the result. Without that, the other ranks wait in the collective. That costs one float64 pass over the replicated weights per check on the stopped rank. It is a third point the decision did not settle; see "Open" below.
+    - *After a stop.* The forward hooks keep their cost on every forward, since they stay on the model. Their buffers are no longer read.
+    - *`close()`.* It never raises and never waits without bound.
+      - On a streaming run with a stuck sink, `close()` after a stop waits about 8 s at most: 1 s for the writer, then the heartbeat's join (2 s) and the sender's `close` (`CLOSE_TIMEOUT`, 5 s). Both bounds were read in `flight.py`; this path was not run.
+      - Its own flush, the sentinel put and the join share one deadline, `CLOSE_SECONDS` (60 s). Past it, capture is taken as stopped.
+      - After a stop it waits `STOPPED_CLOSE_SECONDS` (1 s) for the writer. A sink still in a write is not closed under it; only a stream's heartbeat and sender are stopped. The writer is a daemon thread and does not hold the process.
+      - No `<name>.end.json` after a stop, so the file reads as cut off.
+      - A failing `write_end_marker` is caught.
+      - Inside `with session:` the user's exception comes out as the same object, with no context from TensorQuill.
+    - *Tests* (`test_lane_u1_capture.py`, 14 new; all 14 fail on `a037441`, and the file's other 36 pass there):
+      - `test_a_failing_sink_stops_capture_and_every_step_runs_as_without_tensorquill`: `every` 1 and 4, plain and under `-W error`; the final weights equal a run without TensorQuill, with one warning or one log line.
+      - `test_the_users_own_exception_comes_out_unchanged_after_the_sink_failed`
+      - `test_a_sink_that_never_returns_holds_neither_training_nor_close`
+      - `test_after_a_stop_no_end_marker_the_cause_kept_and_exactly_one_warning`
+      - `test_after_a_stop_the_optimizer_hooks_do_nothing_and_close_takes_them_off`
+      - `test_what_the_heartbeat_reads_stays_live_after_a_stop`
+      - `test_close_returns_within_its_bound_when_the_last_write_is_slow`
+      - `test_a_stop_causes_no_graph_break_and_no_recompile`, under `eager` and `aot_eager`: `error_on_recompile`, with no graph-break counters.
+      - `test_a_stopped_rank_counts_the_steps_a_scaler_ends_as_a_live_one_does`: under a GradScaler, a step the scaler skipped (an inf gradient) ends a live session's step at `scaler.update()`. A stopped rank's count now matches, 4 steps and 4 gathers; before this, it read 3 and 3, which would leave its gather a step behind the other ranks'.
+      - `test_a_stopped_rank_keeps_entering_the_drift_checks_gather`: two gloo ranks, with rank 0's sink failing. With the schedule-keeping turned off for one run, rank 1 waited in the `all_gather` until gloo's 60 s timeout and the test failed.
+    - *Existing tests changed.* All are outside this lane's two files and need the author's yes.
+      - `test_capture.py::test_a_failing_sink_is_reported_on_close` is now `test_a_failing_sink_stops_capture_and_close_returns`.
+      - `test_capture.py::test_a_slow_sink_makes_training_wait_instead_of_growing_memory` is now `test_a_slow_sink_stops_capture_instead_of_making_training_wait`. It expects steps 0 to 2 and one warning.
+      - `test_system.py::test_a_hung_nvml_call_never_holds_training` now expects steps 0 to 10 and a stop naming NVML. It also accepts all 43 steps with no stop, on a machine too slow to fill the queue in 0.5 s.
+      - `test_system.py::test_a_hung_nvml_open_never_holds_training` passed unchanged, but it stopped capture after step 8 of 30 (the same in three runs) without checking records. It now says so: steps 0 to 8 and a stop naming NVML, or all 30 on a machine too slow to fill the queue.
+      - The comment at `test_system.py:341` now asserts no stop.
+      - In the full run, these two NVML tests are the only existing tests that emitted the stop's warning.
+    - *The trigger, measured and not chosen.* The queue holds `WRITER_QUEUE` rings, 8: 8 steps at `every=1` and 400 steps at `every=50`, plus the block being written.
+      - A writer stall of T seconds stops capture when training runs faster than the capacity divided by T.
+      - The bounded wait for NVML (`system=True`) can be such a stall. At `every=1` a 2 s wait (`NVML_SLOW_SECONDS`) stops capture above 4 steps/s, and the 10 s wait for the first reading, which opens NVML (`NVML_OPEN_SECONDS`), stops it above 0.8 steps/s. At `every=50` the same waits stop it above 200 and 40 steps/s.
+      - Measured with the fake NVML at a 0.5 s bound: 40 fast steps at `every=1` stopped capture after step 10, the same in three runs.
+      - Measured with the fake NVML at its 1 s open bound: 30 fast steps at `every=1` stopped capture after step 8.
+      - A short disk pause fills 8 steps at the same rates.
+      - `close()`'s last flush goes through the same `_put`, which does not wait. So a writer that is healthy but still busy with the queued blocks can lose the last block and, with it, the end marker.
+      - Options:
+        - (a) A capacity counted in steps, for example at least 256 steps whatever `every` is. A block holds only the CPU copy of a few numbers per layer and parameter, so this costs little memory.
+        - (b) A writer that skips the system reading while it is behind.
+        - (c) A bound in seconds of lag instead of a count.
+    - *A streaming run, measured and not fixed.* One rank streamed to the read-only server binary (silent after 2 s), and its local sink failed after 3 writes while training went on. Script: `lane-u1-c03-stream.py` in the session notes.
+      - Still training after the stop: about 2 s later the server read the rank as `silent`, the run as `stalled`, with `job_stalled` / `suspected_hang`. The heartbeat still said phase `train`, but its step counter no longer moved.
+      - Stopped, then `close()` while training went on for 8 s more: `finished`, and one look at the store said "No incidents detected" and "Run state: healthy".
+      - Both are wrong verdicts on a healthy run. Nothing in the stream says that capture stopped.
+      - What it would take is in other lanes' files: a message or heartbeat field saying that capture stopped and why (`flight.py`, the heartbeat), and a server state for it that is neither a hang nor `finished` (`server/`).
+      - One option inside `capture.py`: at the stop, keep the heartbeat counter moving or set a phase such as `capture_stopped`. The server then would not call it a hang, but it still would not say why. Not built: the brief asks to measure here.
+    - *Run.* The new file: 49 passed. The full `sdk/tests` with this worktree on `PYTHONPATH`: 1267 passed, 619 skipped, 1 failed. The failure was one of the new tests, which checked the stop before the writer thread had stored its error, a race under the machine's load. That test and one other now step until the stop has happened, and the new file then passed 49 of 49 three times in a row. `test_capture.py` and `test_system.py` pass.
+    - *Stale wording, not edited.*
+      - `sdk/README.md` line 768: a hung NVML call "can make training wait once".
+      - `sdk/README.md` line 839, under "Things to know": the bounded writer queue, where training waits if the sink falls behind.
+      - `sdk/README.md` line 331, "Nothing raises once training runs": the earlier note that this was not true of the local sink can now be dropped.
+      - The Focused Plan's row on TensorQuill stopping a run.
+      - `_put`'s own text ("training now waits for it") is rewritten here; it now names the stop.
+    - *A compiled loop that calls `optimizer.step()`.* A stop while compiled made no recompile, with `error_on_recompile`. With `clip_grad_norm_` inside the compiled function, TensorQuill recompiles at step 1, before any stop, and does so on the base `1767a4a` too. Without TensorQuill it does not recompile. That is older than this lane and is left open.
+    - *Open, for the author.*
+      - The trigger, with the options above.
+      - What a streaming run should say after a stop.
+      - Whether a stopped rank in a `replica_group` should go on paying for the drift check's gather. The other way is for every rank to stop together, which needs a collective of its own.
+  - *Item 8, the queue's size, decided by the author after the measurement above (logged on `main` at `148cecf`): "Sizing the queue in steps (~400, with a 2-ring floor)".* This replaces the trigger's "measure, do not choose".
+    - *Built.* `QUEUE_STEPS = 400` and `QUEUE_MIN_RINGS = 2` are the one place the size is set. `_queue_rings(every)` is `max(2, ceil(400 / every))`: 400 rings at `every=1`, 8 at 50, 4 at 100, 2 from 200 up. `_queue_blocks` keeps one queue entry per ring at `every=1` and two otherwise.
+      - The stop's warning now counts its steps from the real capacity.
+      - `WRITER_QUEUE` is gone. Its uses changed: in `capture.py`, the constant, `_queue_blocks` and `_put`'s message; in the tests, `test_capture.py`'s slow-sink test (it now monkeypatches `QUEUE_STEPS` to 2, giving 2 blocks at `every=1`) and two tests in the new file (they set `QUEUE_STEPS` to 8 and count with `_queue_blocks(1)`).
+    - *`close()` at the floor.* `close()`'s last flush may now wait for room in the queue, up to `close()`'s own deadline, `CLOSE_SECONDS` (60 s). Training only ever uses the put that does not wait.
+      - The bound: a wait inside `close()` pauses no training step. 60 s covers a slow network filesystem writing a few blocks, and it still lets a process with a sink that is truly stuck end within a minute, and then without an end marker.
+      - Test: `test_close_at_the_two_ring_floor_waits_for_a_slow_but_working_writer`, at `every=200` with the queue full at close. All 600 steps and the end marker are written.
+    - *`_flush` cannot leave the ring broken.* Lane U5 found that one raise inside `_flush` (the replica-unread warning under `-W error`, on the base) made every later step raise `IndexError`. `_flush` now turns any exception into a stop, which clears the ring. Test: `test_an_exception_part_way_through_a_flush_stops_capture_and_later_steps_run`. U5's own reproducer, `lane-u5-werror-flush.py`, runs every step on this branch.
+    - *Tests.* Also `test_the_writer_queue_holds_about_400_steps_with_a_floor_of_two_rings` (`every` 1, 3, 50, 100, 200 and 1000) and `test_the_stop_warning_names_the_real_capacity`. All fail on `0add73a`. The `every=50` case fails only by the new function's name: its size, 16 blocks, is unchanged. The two tests that now monkeypatch `QUEUE_STEPS` fail there only on that name.
+    - *Existing tests changed again.* The two NVML hang tests in `test_system.py` no longer stop: their 40 and 30 steps fit in a queue of 400. Each now asserts that every step is written and there is no stop.
+    - *The NVML wait, by the bounds and not run on a GPU.*
+      - A writer stall of T seconds stops capture when training runs faster than the queue's steps divided by T. The queue holds about 400 steps, plus the block being written; it holds 2 rings, so 2 × `every` steps, from `every=200` up.
+      - With `system=True`, a hung reading (`NVML_SLOW_SECONDS`, 2 s) stops capture above about 200 steps/s. The first reading, which opens NVML (`NVML_OPEN_SECONDS`, 10 s), stops it above about 40 steps/s, and only at the start of the run. At `every=1000` the same waits stop capture above 1000 and 200 steps/s.
+      - The fake NVML measured before the change stopped capture exactly where this count puts it: 3 steps written, 1 in the write and 8 queued.
+    - *Not changed.* What a streaming run reads after a stop, as measured above.
+    - *Notes from other lanes.* Lane U3's loader wrapper reads `session._closed` to pass batches through. A stopped session keeps `_closed` false, because `close()` must still run, but its `data()` returns at once, so the wrapper already does nothing harmful. The wrapper could read `_closed or _stopped` to skip hashing the indices. Lane U5's `tracker._say` and this lane's `capture._warn` do the same job; one could replace the other at the merge. U5 also asks for the replica-unread warning once per reason rather than once per parameter; that is not changed here.
+  - *Item 9, lane T2's item 3, decided by the author (logged on `main` at `6f582a5`): "choose option (b): refuse unknown tensor subclasses under torch.compile only, and apply the same rule to both _router_hook and _stats_hook".* Done in commits of its own, after item 8. Option (b) had not been run anywhere before; what was run is below.
+    - *Reproduced first, on this branch before the change,* with lane T2's four scripts.
+      - The strict wrapper raised "aten.eq.Tensor got mixed torch.Tensor and Strict" as a router's output, and "aten.maximum.default got mixed" as a watched block's output, under `backend="eager"`, with and without `fullgraph`.
+      - `NoEq` raised Dynamo's "Observed exception" under `fullgraph=True`, on `eager` and `aot_eager`.
+      - In eager mode both were refused through the hook's `try`.
+    - *Built.* `_PLAIN_TYPES = (torch.Tensor, nn.Parameter)` and `_compiled_subclass(t)`, which is true only under `torch.compiler.is_compiling()` for any other type.
+      - `_stats_hook` checks the tensor it reads after the tuple or dict selection and after unwrapping a DTensor (lane R1), and leaves such a block out.
+      - `_unusable` keeps its DTensor reason first, then refuses a subclass with its own reason. The reason says the tensor "is a <class>, a tensor subclass, which TensorQuill does not count under torch.compile", with a fix of its own: an `indices=` function that returns a plain tensor, or the inner module.
+      - `_unusable`'s line "Only what raises today is refused" is reworded: in eager mode only what raises is refused; under `torch.compile` a subclass is refused by its type.
+      - Eager mode is unchanged.
+    - *Run after the change* (PyTorch 2.15, CPU, backends none, `eager` and `aot_eager`; inductor not run):
+      - No case of the strict scripts raises, router or block, with or without `fullgraph`. The eager rows are the same as before, word for word.
+      - The well-behaved subclasses are now refused under compile: `PlainTF`, `LoggingTF`, `TraceableWrapper` and `TwoTensor`. Before, `eager` and `aot_eager` counted them, 6 a step (12 for `TwoTensor`). This is the cost the author accepted. The untraceable `Wrapper` fails without TensorQuill as it did with it.
+      - `test_compile.py`, `test_router_guard.py`, `test_capture_tensors.py`, `test_capture_raises.py` and `test_eval_forwards.py`: 144 passed, 4 skipped.
+      - The full `sdk/tests` with this worktree on `PYTHONPATH`, after items 8 and 9: 1287 passed, 619 skipped, none failed.
+    - *Tests* (in `test_lane_u1_capture.py`).
+      - Each first compiles the same model without TensorQuill and skips if that fails. Subclass tracing has never run on PyTorch 2.6.
+      - `test_a_strict_subclass_is_refused_under_compile_not_raised` (default and `indices=` routers, with and without `fullgraph`) and `test_a_subclass_that_raises_on_eq_is_refused_under_fullgraph`: these 5 fail on `112ea01`.
+      - `test_eager_mode_still_reads_subclasses_through_its_try` (2 cases) and `test_a_module_that_returns_a_parameter_is_still_read_under_compile` (`eager` and `aot_eager`; router counts `[3, 3, 0, 0]` and the block's mean 0.5) pass before and after. They guard the eager behaviour and the `nn.Parameter` allowance; option (a) would have failed the second.
+    - *Open, for the author.* A refused block is visible in the records only as a block missing from `layers`. The layer statistics have no field that says why. Proposed: `layers_not_read: {block: why}`, said once, as `moe_refused` is. It would be a schema change, with readers in the evidence and the server; it is not built here.
+  - *Item 10, F1, decided by the author (logged on `main` at `543f2cc`): "read the bool routing map [..., n_experts], filtering probs != 0 when paired with a same-shape float tensor. option a".* Done in commits of its own, after item 9. With it, nothing in `capture.py` is held back.
+    - *Reproduced first, on this branch.*
+      - `f1-megatron-capacity-drop.py` counted `[2, 2, 0, 0]` where the map routes `[1, 1, 0, 0]`, and the other misreads as the F1 entry lists them.
+      - `router121.py`, the script from `CORRECTNESS_AUDIT.md`: 36 of 36 full maps matched, 0 of 85 with fewer assignments.
+    - *Built* (`_routing_map`, `_router_hook`). The order of sources: an `indices=` function, then an integer tensor, as before; then a bool routing map; then the top-`top_k` of a float tensor.
+      - A map is the first bool tensor whose last dimension is `n_experts` and whose other dimensions multiply to the tokens the hook was called on. The token check is skipped where that count is symbolic.
+      - A map is read only when the output also holds a floating-point tensor, so only an output of a float tensor and a bool map is counted differently. A bool tensor alone is refused as before; `test_router_guard.py`'s bool case holds that.
+      - The count, per expert, is the true entries of the map. Entries whose paired float is exactly zero are left out. The paired float is the first floating-point tensor of exactly the map's shape; with none of that shape, every true entry counts.
+      - `_unusable` (device, layout and dtype, and item 9's subclass check) applies to the map and to its paired float.
+      - There is no branch on the data, so it traces the same under `torch.compile`. `Router`'s docstring states the order and the pairing rule.
+    - *Run after the change.*
+      - `f1-megatron-capacity-drop.py`: two tokens `[1, 1, 0, 0]`; the partial drop `[1, 1, 1, 1]`; 64 tokens `[24, 32, 32, 32]` ("probs" policy) and `[32, 32, 28, 32]` ("position"); no capacity limit `[34, 31, 33, 30]`, as before; padded to capacity `[29, 32, 32, 31]` and `[32, 32, 24, 30]`, the entries with a nonzero probability.
+      - `router121.py`: 121 of 121 maps match. Tokens with fewer than `top_k` assignments, and with none, are counted as the map says.
+    - *Tests* (13 new; 11 fail on `ee0166e`, and the 2 that pass there guard what must not change).
+      - `test_a_megatron_style_router_is_counted_as_its_routing_map_routes` (7 cases): each checks the router's own map or nonzero probabilities, and the two cases that use no random numbers check the plan's numbers too.
+      - `test_every_one_of_the_121_two_token_maps_is_counted_as_it_routes`
+      - `test_a_mask_over_the_experts_alone_is_not_taken_for_a_routing_map` (guard)
+      - `test_with_logits_before_the_probabilities_the_logits_are_paired_and_padding_is_counted`, which pins the limit below.
+      - `test_a_routing_map_on_another_device_is_refused_as_any_output_there_is`
+      - `test_a_compiled_megatron_style_router_counts_as_in_eager_mode` (`eager` and `aot_eager`, each with a control that compiles without TensorQuill).
+      - `test_compile.py`: 0 graph breaks and 0 recompiles. The full `sdk/tests` with this worktree on `PYTHONPATH`: 1300 passed, 619 skipped, none failed.
+    - *Limits, stated.*
+      - The pairing takes the first float tensor of the map's shape. An output of logits, probabilities and a map pairs the logits, which are never zero, so with `pad_to_capacity` the padding is counted.
+      - A real assignment whose weight is exactly zero, after an underflow in half precision for example, is left out together with the padding.
+    - *Downstream* (script `lane-u1-f1-downstream.py`): a capture of 120 steps whose router keeps 80 of 128 assignments a step (capacity factor 0.6), run through `build_evidence` with the Python detectors and with the read-only server binary's `detect`.
+      - Both ran and agreed: no incident, with `moe_imbalance` and `starved_experts` checked. The same with no capacity limit.
+      - No MoE rule needs tokens × `top_k` assignments: shares are taken over each step's own total.
+      - One soft assumption: the top-k ≥ 3 jump rule estimates tokens as the total divided by k (`evidence.py` `_jump_overloaded`, `detect.rs:1006`). With drops that estimate falls with the kept assignments.
+      - `moe_stats.routed_tokens` is the number of assignments, not tokens. It already was with `top_k` above 1, and is now the assignments kept.
+    - *Open, for the author.*
+      - Nothing in the record or the manifest shows which source a router was counted from. A router that returns `(probs, routing_map)` now counts differently from before, with nothing in the record saying so. Proposed: `moe_source: {router: "indices=" | "integer" | "routing_map" | "top_k"}`, said once, as `moe_refused` is. Not built: a schema change with readers in the evidence and the server.
+      - The audit's C06 integer case, `[-1, 8]` for 4 experts recorded as `[0, 0, 0, 0]`, is still open and undecided; not touched here.
+    - *Not run.* Megatron itself is not installed; the stand-in follows the reference clone. Also not run: a GPU, inductor, PyTorch 2.6.
+
 ## Sources
 
 - [TechInformed: OpenAI buying Neptune](https://techinformed.com/openai-buying-neptune-ai-in-all-stock-deal-what-it-means-for-ai-architecture/)

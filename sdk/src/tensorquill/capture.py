@@ -13,6 +13,7 @@ Rules this module follows (see the Capture SDK section of the v3 plan):
 from __future__ import annotations
 
 import contextlib
+import logging
 import math
 import numbers
 import queue
@@ -61,8 +62,16 @@ WEIGHT_EVERY = 50
 SCHEMA_VERSION = 1
 # Probe passes are rare, like wandb.watch's histograms (every 1,000 batches by default).
 PROBE_EVERY = 1000
-# Blocks of `every` steps waiting for the writer thread before training waits for it.
-WRITER_QUEUE = 8
+# How far the writer thread may fall behind before capture stops for the session (`Session._put`),
+# the author's decision: about QUEUE_STEPS steps at any `every`, and never fewer than
+# QUEUE_MIN_RINGS rings (`_queue_rings`). Training never waits for the sink.
+QUEUE_STEPS = 400
+QUEUE_MIN_RINGS = 2
+# How long `close()` waits for the writer to take and write what is left, at most, in seconds; then
+# capture is taken as stopped (no end marker) and `close()` returns. After a stop it waits
+# `STOPPED_CLOSE_SECONDS` at most for a writer that may be stuck in the sink.
+CLOSE_SECONDS = 60.0
+STOPPED_CLOSE_SECONDS = 1.0
 FOREIGN_STEPS_WARNING = 10  # optimizer steps on other parameters before warning that none was counted
 # Why the update size was not read (`updates=True`), by what it is said about: an optimizer's
 # class name, or one of these two.
@@ -84,8 +93,12 @@ class Router:
     """An MoE router to watch.
 
     `indices` picks the tensor of chosen expert indices out of the module's output. By
-    default it is the first integer tensor in the output, or the top-`top_k` indices of
-    the first floating-point tensor whose last dimension equals `n_experts`.
+    default it is the first integer tensor in the output; else a bool routing map
+    `[..., n_experts]` with one row per token, as Megatron's `TopKRouter` returns beside its
+    probabilities, counted per expert as the map routes, leaving out entries whose paired float
+    (the first floating-point tensor of the map's shape) is exactly zero (`_routing_map`); else
+    the top-`top_k` indices of the first floating-point tensor whose last dimension equals
+    `n_experts`.
 
     A function given as `indices` is checked as the default is, and more: it must return an
     integer tensor on the counts' device, of a size that is a whole multiple of the tokens
@@ -137,6 +150,61 @@ def _first_tensor(output: Any, *, integer: bool) -> torch.Tensor | None:
     return None
 
 
+# The tensor types a hook reads under `torch.compile` (the author's decision on lane T2's item 3,
+# option (b)): a plain tensor, or a parameter a module returns as it is. Any other subclass is
+# refused there by its type alone: under tracing an op it refuses fails the trace before any
+# `except` could see it, and its type does not tell such a subclass from one that would be read.
+# In eager mode the hooks' `try` still catches what raises, so nothing is refused for its type.
+_PLAIN_TYPES = (torch.Tensor, nn.Parameter)
+
+
+def _compiled_subclass(t: torch.Tensor) -> bool:
+    """Whether `t` is a tensor subclass the hooks do not read, which only matters under `torch.compile`."""
+    return torch.compiler.is_compiling() and type(t) not in _PLAIN_TYPES
+
+
+def _routing_map(output: Any, n_experts: int, tokens: int | None) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    """A router's bool routing map, and the float tensor paired with it, from its output's top level
+    (as `_first_tensor` reads it); None when there is no map. The author's decision on F1.
+
+    The map is the first bool tensor whose last dimension is `n_experts` and whose other dimensions
+    multiply to the `tokens` the router was called on (not checked where the count is symbolic, as
+    the integer branch of `_router_hook` does not), so a mask over the experts alone is not one.
+    Megatron's `TopKRouter` returns `(probs, routing_map)`, both `[tokens, n_experts]`.
+
+    Only an output that also holds a floating-point tensor is read this way, so that only an output
+    of a float tensor and a bool map is counted differently from before: a bool tensor alone is
+    refused, as it was. The paired float is the first floating-point tensor of exactly the map's
+    shape; with none of that shape, every true entry of the map is counted. Where a router
+    returns more than one (logits, then probabilities, then the map), the first is paired: logits
+    are never exactly zero, so padding in the map (`pad_to_capacity`) would then be counted. Judged
+    from types and shapes alone, so it traces the same under `torch.compile`."""
+    if isinstance(output, torch.Tensor):
+        candidates: Any = (output,)
+    elif isinstance(output, (tuple, list)):
+        candidates = output
+    elif isinstance(output, dict):
+        candidates = list(output.values())
+    else:
+        return None
+    found = None
+    for item in candidates:
+        if isinstance(item, torch.Tensor) and item.dtype == torch.bool and item.ndim >= 1 and item.shape[-1] == n_experts:
+            rows = item.numel() // n_experts if n_experts > 0 else None
+            if tokens and type(rows) is int and rows != tokens:
+                continue
+            found = item
+            break
+    if found is None or not any(isinstance(item, torch.Tensor) and item.is_floating_point() for item in candidates):
+        return None
+    paired = next(
+        (item for item in candidates
+         if isinstance(item, torch.Tensor) and item.is_floating_point() and item.shape == found.shape),
+        None,
+    )
+    return found, paired
+
+
 def _output_unread(x: torch.Tensor, device: torch.device) -> str | None:
     """Why a watched block's output is not read into the layer statistics kept on `device`, from
     its type, layout and device alone: no data, so no sync, and the same under `torch.compile`,
@@ -176,7 +244,9 @@ def _stats_hook(
     Nothing in it raises into training. An output it cannot read leaves no entry for the block
     in that step's `layers` and is said once in `problems` (the hook's `problems` attribute when
     none is given): judged first from type, layout and device alone (`_output_unread`), so the
-    same under `torch.compile`, and in eager mode from any exception left, which is caught.
+    same under `torch.compile`, and in eager mode from any exception left, which is caught. Under
+    `torch.compile` an output that is a tensor subclass other than `nn.Parameter` is not read
+    (`_compiled_subclass`); a DTensor is unwrapped to its local tensor first.
 
     A DTensor output (tensor parallelism with `use_local_output=False`) is read on its local
     tensor: under Replicate that is the output, under Shard it is this rank's part, read as
@@ -206,6 +276,12 @@ def _stats_hook(
                 ))
                 return
             x = x.detach().to_local()
+        if _compiled_subclass(x):
+            refuse(lambda: (
+                f"its output is a {type(x).__name__}, a tensor subclass, which TensorQuill does not read under "
+                "torch.compile"
+            ))
+            return
         wrong = _output_unread(x, buf.device)
         if wrong is not None:
             refuse(lambda: wrong)
@@ -291,6 +367,11 @@ def _refusal(name: str, spec: Router, why: str, fix: str | None = None, device: 
             f"pass routers={{{name!r}: tensorquill.Router({spec.n_experts}, {spec.top_k}, indices=...)}} with a "
             f"function that returns the chosen expert indices from its output on {device}, where the counts are"
         )
+    elif fix == "subclass":
+        fix = (
+            f"pass routers={{{name!r}: tensorquill.Router({spec.n_experts}, {spec.top_k}, indices=...)}} with a "
+            f"function that returns the chosen expert indices as a plain torch.Tensor, or {inner}"
+        )
     elif fix == "top_k":
         fix = (
             f"pass routers={{{name!r}: tensorquill.Router(n_experts, top_k)}} with its number of experts and a "
@@ -307,6 +388,24 @@ def _refusal(name: str, spec: Router, why: str, fix: str | None = None, device: 
             f"{spec.n_experts - 1}, one or {spec.top_k} for each token, or drop indices= and {inner}"
         )
     return f"{why}. To count it, {fix}"
+
+
+_log = logging.getLogger("tensorquill")
+
+
+def _warn(message: str, stacklevel: int = 2) -> None:
+    """`warnings.warn(message, RuntimeWarning)` for code the training thread reaches, which must
+    never raise into training. Under `python -W error` (or any filter that makes a
+    `RuntimeWarning` an error) `warnings.warn` raises the warning instead: it is then logged
+    on the `tensorquill` logger, which prints it to stderr when no handler is set, and the
+    caller goes on. A filter that ignores the warning still silences it."""
+    try:
+        warnings.warn(message, RuntimeWarning, stacklevel=stacklevel + 1)
+    except Exception:  # noqa: BLE001
+        try:
+            _log.warning("%s", message)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _short(error: BaseException) -> str:
@@ -342,9 +441,14 @@ def _unusable(t: torch.Tensor, device: torch.device, what: str) -> tuple[str, st
     its type, layout, device and dtype alone: no data, so no sync, and the same under
     `torch.compile`, where an op that raises fails the trace before any `except` could see
     it. The reason, and the fix `_refusal` names for it; None when the counting can read the
-    tensor. Only what raises today is refused: nothing counted before is."""
+    tensor. In eager mode only what raises is refused (and the hook's `try` catches the rest).
+    Under `torch.compile` a tensor subclass other than `nn.Parameter` is refused by its type alone
+    (`_compiled_subclass`), the well-behaved ones that AOTAutograd would have counted included:
+    the author's decision on lane T2's item 3, since a raising op fails the trace there."""
     if _DTensor is not None and isinstance(t, _DTensor):
         return f"{what} is a DTensor, not a plain tensor", None
+    if _compiled_subclass(t):
+        return f"{what} is a {type(t).__name__}, a tensor subclass, which TensorQuill does not count under torch.compile", "subclass"
     if t.is_nested:
         return f"{what} is a nested tensor", None
     if t.layout != torch.strided:
@@ -432,6 +536,22 @@ def _router_hook(
                 if wrong is not None:
                     refuse(lambda: wrong[0], wrong[1])
                     return
+            elif (found := _routing_map(output, spec.n_experts, _tokens(args))) is not None:
+                # A bool routing map (Megatron's `routing_map`): each expert's count is the tokens the
+                # map routes to it, so an assignment dropped at capacity is not counted, and a token
+                # with fewer than top_k assignments adds only what it has. Entries whose paired
+                # float is exactly zero are left out: the padding `pad_to_capacity` adds to the map,
+                # and with it a real assignment whose weight is exactly zero (an underflow, say).
+                routing_map, paired = found
+                for tensor, what in ((routing_map, "its routing map"), (paired, "the float tensor paired with its routing map")):
+                    wrong = None if tensor is None else _unusable(tensor, counts.device, what)
+                    if wrong is not None:
+                        refuse(lambda: wrong[0], wrong[1])
+                        return
+                kept = routing_map.detach()
+                if paired is not None:
+                    kept = kept & (paired.detach() != 0)
+                hits = kept.reshape(-1, spec.n_experts).sum(0)
             else:
                 logits = _first_tensor(output, integer=False)
                 if logits is None:
@@ -470,7 +590,8 @@ def _router_hook(
                 )
         # Fixed output shape: `bincount` would make the shape depend on the data.
         # Accumulate across gradient-accumulation microbatches; `_commit` zeroes `counts`.
-        hits = (idx.detach().reshape(-1, 1) == expert_ids).sum(0)
+        if idx is not None:
+            hits = (idx.detach().reshape(-1, 1) == expert_ids).sum(0)
         if spec.indices is not None:
             # An `indices=` router's buffer has a last slot for the indices outside
             # 0..n_experts-1, which match no expert (`_count_width`): device work only, read in
@@ -669,6 +790,36 @@ _clip_sessions: list["Session"] = []
 _clip_original: Callable[..., Any] | None = None
 
 
+# Where `torch.compiler.disable`'s wrapper runs (`torch/_dynamo/eval_frame.py`): its frames sit
+# between a hook that runs eagerly under it and the code that called the hook (`_caller_frame`).
+_DYNAMO_DIR = str(Path(torch._dynamo.__file__).parent)
+
+
+def _queue_rings(every: int) -> int:
+    """Rings of `every` steps the writer may fall behind: `max(QUEUE_MIN_RINGS, ceil(QUEUE_STEPS /
+    every))`, so 400 at every=1, 8 at the default 50, 4 at 100 and 2 from every=200 up."""
+    return max(QUEUE_MIN_RINGS, math.ceil(QUEUE_STEPS / every))
+
+
+def _queue_blocks(every: int) -> int:
+    """The writer queue's size in blocks: `_queue_rings` rings. A full ring is queued as two blocks,
+    all but its newest step and then that step (`_hold_newest`), one when it is one step."""
+    return _queue_rings(every) * (1 if every == 1 else 2)
+
+
+def _noop_hook(*args: Any, **kwargs: Any) -> None:
+    """What a stopped session's optimizer hooks become until `close()` removes them (`_stop`)."""
+    return None
+
+
+def _caller_frame(depth: int) -> Any:
+    """The frame `depth` levels above the caller, not counting `torch.compiler.disable`'s own."""
+    frame = sys._getframe(depth + 1)
+    while frame is not None and frame.f_code.co_filename.startswith(_DYNAMO_DIR):
+        frame = frame.f_back
+    return frame
+
+
 def _on_stack(frame: Any, start: Any, limit: int = 64) -> bool:
     while start is not None and limit > 0:
         if start is frame:
@@ -812,6 +963,137 @@ def _unwatch_clipping(session: "Session") -> None:
             clip_module.clip_grad_norm_ = _clip_original  # type: ignore[assignment]
 
 
+@dataclass(frozen=True)
+class _Plan:
+    """What `Session` checks and works out from its options before it changes anything
+    (`_plan_session`)."""
+
+    grad_every: int
+    weight_every: int
+    probe_fn: Callable[[nn.Module], Any] | None
+    params: list[tuple[str, torch.Tensor]]
+    replicas: list[tuple[str, torch.Tensor]]
+    selected: list[tuple[str, nn.Module]]
+    routers: dict[str, Router]
+    probe_blocks: list[tuple[str, nn.Module]]
+    head: tuple[str | None, str | None, str | None]
+    scaler: Any
+
+
+def _plan_session(
+    model: nn.Module,
+    *,
+    every: int,
+    layers: LayerFilter | Sequence[str] | str | None,
+    routers: Mapping[str, Router | int] | None,
+    grads: bool | int,
+    weights: bool | int,
+    replica_every: int,
+    probe: Any,
+    probe_every: int,
+    probe_head: str | bool | None,
+    replica_params: Any,
+    scaler: Any,
+) -> _Plan:
+    """Every check `init` and `Session` make of the model and the options, and what they work
+    out from them, with nothing changed: no hook, thread, file or global. `init` runs it before
+    it resolves the run or opens anything, so an option it rejects leaves everything as it was.
+    A layer filter, a `replica_params` filter and `get_output_embeddings` are each called once."""
+    if hasattr(model, "_orig_mod"):
+        raise ValueError("call tensorquill.init(model) before torch.compile(model)")
+    if every < 1:
+        raise ValueError("every must be at least 1")
+    if isinstance(grads, bool):
+        grad_every = 1 if grads else 0
+    elif isinstance(grads, int) and grads >= 0:
+        grad_every = grads
+    else:
+        raise ValueError("grads must be a bool or a non-negative integer")
+    if isinstance(weights, bool):
+        weight_every = WEIGHT_EVERY if weights else 0
+    elif isinstance(weights, int) and weights >= 0:
+        weight_every = weights
+    else:
+        raise ValueError("weights must be a bool or a non-negative integer")
+    if isinstance(replica_every, bool) or not isinstance(replica_every, int) or replica_every < 1:
+        raise ValueError("replica_every must be a positive integer")
+    if isinstance(probe_every, bool) or not isinstance(probe_every, int) or probe_every < 1:
+        raise ValueError("probe_every must be a positive integer")
+    probe_fn = probe_callable(probe) if probe is not None else None
+    params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
+    # The parameters the cross-GPU drift check compares: every trainable parameter by
+    # default (data parallelism), or only the replicated ones under tensor parallelism.
+    replicas = _select_replica_params(params, replica_params)
+    selected = _select_layers(model, layers)
+    modules = dict(model.named_modules())
+    planned_routers = {
+        name: spec if isinstance(spec, Router) else Router(int(spec))
+        for name, spec in (routers or {}).items()
+    }
+    unknown = [name for name in planned_routers if name not in modules]
+    if unknown:
+        raise ValueError(f"no such router modules: {unknown}")
+    probe_blocks: list[tuple[str, nn.Module]] = []
+    head: tuple[str | None, str | None, str | None] = (None, None, None)
+    if probe_fn is not None:
+        probe_blocks = _select_layers(model, "blocks")
+        head = find_head(model, probe_head)
+    return _Plan(
+        grad_every=grad_every, weight_every=weight_every, probe_fn=probe_fn, params=params, replicas=replicas,
+        selected=selected, routers=planned_routers, probe_blocks=probe_blocks, head=head,
+        scaler=scaler if scaler is not None and scaler.is_enabled() else None,
+    )
+
+
+def _undo(undo: list[Callable[[], Any]]) -> None:
+    """Run the undo steps registered so far, newest first. Each is tried on its own, so one that
+    fails leaves the others to run; the error that started the undoing is the one raised."""
+    while undo:
+        try:
+            undo.pop()()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _ScalerWatch:
+    """The `update` wrapper TensorQuill installs on one `GradScaler`, and its state: the sessions
+    that watch the scaler, in the order they began, and what `scaler.update` was before (an
+    instance attribute someone else installed, or the class's method)."""
+
+    __slots__ = ("sessions", "original", "had_attribute", "wrapper", "__weakref__")
+
+    def __init__(self, original: Callable[..., Any], had_attribute: bool) -> None:
+        self.sessions: list[Session] = []
+        self.original = original
+        self.had_attribute = had_attribute
+        self.wrapper: Callable[..., Any] | None = None
+
+
+def _scaler_watch(scaler: Any) -> _ScalerWatch | None:
+    """The TensorQuill wrapper that is `scaler.update` now, if one is."""
+    watch = getattr(vars(scaler).get("update"), "_tensorquill_watch", None)
+    return watch if isinstance(watch, _ScalerWatch) else None
+
+
+def _install_scaler_watch(scaler: Any) -> _ScalerWatch:
+    had_attribute = "update" in vars(scaler)
+    watch = _ScalerWatch(scaler.update, had_attribute)
+
+    def update(*args: Any, **kwargs: Any) -> Any:
+        sessions = list(watch.sessions)
+        ends = [session._scaler_before_update(scaler) for session in sessions]
+        out = watch.original(*args, **kwargs)
+        for session, end in zip(sessions, ends):
+            session._scaler_after_update(end)
+        return out
+
+    update = torch.compiler.disable(update)  # eagerly, as the optimizer hooks run (`Session._install`)
+    update._tensorquill_watch = watch  # type: ignore[attr-defined]
+    watch.wrapper = update
+    scaler.update = update  # an instance attribute; the last session to close takes it out
+    return watch
+
+
 class Session:
     """One model's capture. Create it with `tensorquill.init`."""
 
@@ -840,17 +1122,15 @@ class Session:
         data_wait: bool = False,
         updates: bool = False,
         probe_head: str | bool | None = None,
+        _plan: _Plan | None = None,
     ) -> None:
-        if hasattr(model, "_orig_mod"):
-            raise ValueError("call tensorquill.init(model) before torch.compile(model)")
-        if every < 1:
-            raise ValueError("every must be at least 1")
-        if isinstance(grads, bool):
-            grad_every = 1 if grads else 0
-        elif isinstance(grads, int) and grads >= 0:
-            grad_every = grads
-        else:
-            raise ValueError("grads must be a bool or a non-negative integer")
+        # Every check first, with nothing changed (`_plan_session`); `init` has made them already.
+        plan = _plan if _plan is not None else _plan_session(
+            model, every=every, layers=layers, routers=routers, grads=grads, weights=weights,
+            replica_every=replica_every, probe=probe, probe_every=probe_every, probe_head=probe_head,
+            replica_params=replica_params, scaler=scaler,
+        )
+        grad_every, weight_every = plan.grad_every, plan.weight_every
         self.run = run
         # When this session started, in Unix milliseconds. A job that resumes from an
         # earlier checkpoint under the same run ID writes the same step numbers again;
@@ -858,46 +1138,32 @@ class Session:
         self.attempt = _next_attempt()
         self.every = every
         self.grad_every = grad_every
-        if isinstance(weights, bool):
-            weight_every = WEIGHT_EVERY if weights else 0
-        elif isinstance(weights, int) and weights >= 0:
-            weight_every = weights
-        else:
-            raise ValueError("weights must be a bool or a non-negative integer")
         self.weight_every = weight_every
         self.weights = weight_every > 0
-        if isinstance(replica_every, bool) or not isinstance(replica_every, int) or replica_every < 1:
-            raise ValueError("replica_every must be a positive integer")
         self.replica_every = replica_every
         self._replica_projection = replica_projection
-        if isinstance(probe_every, bool) or not isinstance(probe_every, int) or probe_every < 1:
-            raise ValueError("probe_every must be a positive integer")
         self.probe_every = probe_every
-        self._probe_fn = probe_callable(probe) if probe is not None else None
+        self._probe_fn = plan.probe_fn
         self._model = model
         self.auto_step = auto_step
         self._sink = sink
         self._replica_group = replica_group
 
-        params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
+        params = plan.params
         self._params = [p for _, p in params]
         self._param_ids = {id(p) for p in self._params}
         self._param_index = {id(p): index for index, p in enumerate(self._params)}
         self.param_names = [name for name, _ in params]
-        # The parameters the cross-GPU drift check compares: every trainable parameter by
-        # default (data parallelism), or only the replicated ones under tensor parallelism.
-        replicas = _select_replica_params(params, replica_params)
+        # The parameters the cross-GPU drift check compares (`_plan_session`).
+        replicas = plan.replicas
         self._replica_params = [p for _, p in replicas]
         self.replica_names = [name for name, _ in replicas]
         self.device = _buffers_device(self._params)
 
-        selected = _select_layers(model, layers)
+        selected = plan.selected
         self.layer_names = [name for name, _ in selected]
         modules = dict(model.named_modules())
-        self._routers = {
-            name: spec if isinstance(spec, Router) else Router(int(spec))
-            for name, spec in (routers or {}).items()
-        }
+        self._routers = dict(plan.routers)
         # What a router's hook found wrong with its output, said once at the next step (`_commit`).
         # A router with a problem is refused for the rest of the session: its counts leave no
         # entry in any record written after that (`_decode`), and the first such record says
@@ -908,9 +1174,6 @@ class Session:
         self._router_problems: dict[str, list[tuple[str, str | None]]] = {name: [] for name in self._routers}
         self._router_problems_said: set[str] = set()
         self._router_refusals_written: set[str] = set()
-        unknown = [name for name in self._routers if name not in modules]
-        if unknown:
-            raise ValueError(f"no such router modules: {unknown}")
 
         n_layers, n_params = len(self.layer_names), len(self._params)
         f32 = {"dtype": torch.float32, "device": self.device}
@@ -973,33 +1236,22 @@ class Session:
         self._counts_list = list(self._counts.values())
         self._ring_counts_list = list(self._ring_counts.values())
         self._grad_idx_cache: dict[tuple[int, ...], torch.Tensor] = {}
+        # Parameters whose gradient could not be read (`record_grads`), with why, and those already
+        # said under `grads_not_read` on a record.
+        self._grad_why: dict[str, str] = {}
+        self._grad_why_written: set[str] = set()
         for buf in (self._act, self._stat_idx, *self._counts_list, *self._expert_ids.values()):
             _mark_static(buf)
 
         # Forwards that are not training (evaluation, the probe) are left out by the hooks
         # (`_evaluating`); this says whether the session's phase is "eval" (`set_phase`).
         self._evaluating = _Evaluating()
-        self._handles = [
-            module.register_forward_hook(_stats_hook(self._act, self._stat_idx, row, self._evaluating))
-            for row, (_, module) in enumerate(selected)
-        ]
-        self._handles += [
-            modules[name].register_forward_hook(
-                _router_hook(
-                    self._counts[name], self._expert_ids[name], spec, self._router_problems[name], self._evaluating
-                )
-            )
-            for name, spec in self._routers.items()
-        ]
+        self._handles: list[Any] = []  # the forward hooks, registered by `_install`
         self._probe_state = ProbeState()
         if self._probe_fn is not None:
-            self._handles += install_probe_hooks(_select_layers(model, "blocks"), self._probe_state)
-            head, found_by, note = find_head(model, probe_head)
             state = self._probe_state
-            state.head_name, state.head_found_by, state.head_note = head, found_by, note
+            state.head_name, state.head_found_by, state.head_note = plan.head
             state.head_off = probe_head is False
-            if head is not None:
-                self._handles += install_head_hook(dict(model.named_modules())[head], state)
 
         self._steps: list[int] = []
         self._ring_lr: list[list[float] | None] = []
@@ -1058,9 +1310,6 @@ class Session:
         self._closed = False
         self._phase = "train"
         self._ticks = 0
-        beat = getattr(self._sink, "heartbeat", None) if hasattr(self, "_sink") else None
-        if beat is not None:
-            beat.counter = lambda: self._steps_committed + self._ticks
         self._error: BaseException | None = None
         # GPU memory and NVML readings once per flush (system.py), and the host time spent
         # waiting for batches (datawait.py). Both off unless asked for.
@@ -1071,38 +1320,101 @@ class Session:
         self._pending_data_wait = 0.0
         self._last_step_clock: float | None = None
         self._ring_wait: list[tuple[float, float | None] | None] = []
-        # Bounded, as TensorBoard's SummaryWriter is (`max_queue=10`): if the sink falls
-        # behind, for example on a stalled network filesystem, training waits for it
-        # instead of holding every unwritten step in memory. No step is dropped.
-        # A full ring is queued as two items, all but its newest step and then that step
-        # (`_hold_newest`), one when it is one step: the bound stays WRITER_QUEUE rings.
-        self._queue: queue.Queue[Any] = queue.Queue(maxsize=WRITER_QUEUE * (1 if every == 1 else 2))
-        self._warned_backpressure = False
+        # Bounded, as TensorBoard's SummaryWriter is (`max_queue=10`): if the sink falls a full
+        # queue behind, for example on a stalled network filesystem, capture stops for the
+        # session (`_stop`) instead of holding every unwritten step in memory or making training
+        # wait (the author's decision on C03).
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=_queue_blocks(every))
+        # Capture stopped for the rest of the session (`_stop`), and why: the sink's exception, or
+        # the writer falling a full queue behind. Training goes on either way.
+        self._stopped = False
+        self.writer_error: BaseException | None = None
+        # While `close()` flushes, the time by which `_put` may wait for room (`close`); None while
+        # training, when `_put` never waits.
+        self._close_by: float | None = None
         self._worker = threading.Thread(target=self._drain, name="tensorquill-writer", daemon=True)
-        self._worker.start()
-        if getattr(sink, "path", None) is not None:
-            clear_end_marker(sink.path)  # the file is being written again (see `sink.write_end_marker`)
-
         self._clip_watched = clip_norm
-        if clip_norm:
-            _watch_clipping(self)
-
-        self._scaler = scaler if scaler is not None and scaler.is_enabled() else None
+        self._scaler = plan.scaler
         # With a GradScaler, `scaler.update()` runs once per iteration whether or not the
         # optimizer stepped, so it ends the TensorQuill step; optimizer hooks still read
         # gradients. Without it, a step the scaler skipped would never be counted.
         self._commit_on_update = self._scaler is not None and auto_step
+        self._scaler_watch_of: _ScalerWatch | None = None
+        self._optimizer_handles: list[Any] = []
+
+        # Everything above changed nothing outside this object. What follows does, and is undone
+        # if a later part of it fails, so a session that is not made leaves nothing behind.
+        undo: list[Callable[[], Any]] = []
+        try:
+            self._install(undo, plan=plan, modules=modules, clip_norm=clip_norm, auto_step=auto_step,
+                          data_wait=data_wait)
+        except BaseException:
+            _undo(undo)
+            raise
+
+    def _install(
+        self, undo: list[Callable[[], Any]], *, plan: _Plan, modules: Mapping[str, nn.Module], clip_norm: bool,
+        auto_step: bool, data_wait: bool,
+    ) -> None:
+        """What the session changes outside itself, each registered in `undo` as it is made: the
+        forward hooks, the heartbeat's step counter, the writer thread, the clipping, scaler and
+        optimizer hooks and the data-loader timer; last, the end marker of an earlier run is
+        removed, the one effect that is not undone, so it happens only once all else has."""
+        undo.append(lambda: [handle.remove() for handle in self._handles])
+        self._handles += [
+            module.register_forward_hook(_stats_hook(self._act, self._stat_idx, row, self._evaluating))
+            for row, (_, module) in enumerate(plan.selected)
+        ]
+        self._handles += [
+            modules[name].register_forward_hook(
+                _router_hook(
+                    self._counts[name], self._expert_ids[name], spec, self._router_problems[name], self._evaluating
+                )
+            )
+            for name, spec in self._routers.items()
+        ]
+        if self._probe_fn is not None:
+            self._handles += install_probe_hooks(plan.probe_blocks, self._probe_state)
+            head = plan.head[0]
+            if head is not None:
+                self._handles += install_head_hook(modules[head], self._probe_state)
+
+        beat = getattr(self._sink, "heartbeat", None)
+        if beat is not None:
+            had, before = "counter" in vars(beat), vars(beat).get("counter")
+            beat.counter = lambda: self._steps_committed + self._ticks
+            undo.append(lambda: setattr(beat, "counter", before) if had else vars(beat).pop("counter", None))
+
+        def stop_writer() -> None:
+            self._queue.put(None)
+            self._worker.join()
+
+        self._worker.start()
+        undo.append(stop_writer)
+        if clip_norm:
+            _watch_clipping(self)
+            undo.append(lambda: _unwatch_clipping(self))
         if self._scaler is not None:
             self._watch_scaler(self._scaler)
-
-        self._optimizer_handles = []
+            undo.append(self._unwatch_scaler)
         if auto_step:
-            self._optimizer_handles = [
-                register_optimizer_step_pre_hook(self._before_optimizer_step),
-                register_optimizer_step_post_hook(self._after_optimizer_step),
-            ]
+            # Run eagerly where `optimizer.step()` is called inside a function `torch.compile` traces
+            # (`init` there too, say): traced, these hooks would make Dynamo warn on what it cannot
+            # trace, which `python -W error` raises into the step. Outside tracing the wrapper only
+            # adds a call.
+            for register, hook in (
+                (register_optimizer_step_pre_hook, torch.compiler.disable(self._before_optimizer_step)),
+                (register_optimizer_step_post_hook, torch.compiler.disable(self._after_optimizer_step)),
+            ):
+                handle = register(hook)
+                self._optimizer_handles.append(handle)
+                undo.append(handle.remove)
         if data_wait:
             self.watch_loaders()
+            undo.append(lambda: datawait.unwatch(self))
+        path = getattr(self._sink, "path", None)
+        if path is not None:
+            clear_end_marker(path)  # the file is being written again (see `sink.write_end_marker`)
 
     # ---- training-loop side -------------------------------------------------------
 
@@ -1168,11 +1480,10 @@ class Session:
         self._foreign_steps += 1
         if self._foreign_steps == FOREIGN_STEPS_WARNING:
             self._foreign_steps = -1  # warn once
-            warnings.warn(
+            _warn(
                 f"TensorQuill has recorded no steps: {FOREIGN_STEPS_WARNING} optimizer steps ran, none on this "
                 "model's parameters. If your framework steps copies of the weights (DeepSpeed ZeRO, "
                 "Megatron-LM), pass auto_step=False and call session.step() after each update.",
-                RuntimeWarning,
                 stacklevel=2,
             )
 
@@ -1181,14 +1492,15 @@ class Session:
             return
         if not self._owns(optimizer):
             self._foreign_stepped = True
-            self._note_foreign_step()
+            if not self._stopped:
+                self._note_foreign_step()
             return
         # PyTorch wraps each optimizer class's own `step` with the global hooks, so an
         # optimizer that subclasses another and calls `super().step()` fires them again,
         # nested inside the outer call. A call is nested only while the outer call's
         # wrapper frame is still running; after an outer step raised, it is not, and the
         # next call starts afresh instead of being ignored forever.
-        wrapper = sys._getframe(1)
+        wrapper = _caller_frame(1)
         if self._step_depth and _on_stack(self._outer_frame, wrapper.f_back):
             self._step_depth += 1
             return
@@ -1203,6 +1515,8 @@ class Session:
         if lead is None:
             self._lead, lead = weakref.ref(optimizer), optimizer
         self._leading = optimizer is lead
+        if self._stopped:
+            return  # only the step count goes on, for the drift check's schedule (`_count_stopped`)
         if self._leading and self._probe_owed:
             # Every optimizer of the previous iteration has stepped: its probe runs now.
             self._run_owed_probe()
@@ -1223,6 +1537,10 @@ class Session:
             return
         self._step_depth, self._outer_frame = 0, None
         self._stepped = True
+        if self._stopped:
+            if self._leading and not self._commit_on_update:
+                self._count_stopped(None)
+            return
         # An optimizer that steps after the lead ended the step (two optimizers on one model,
         # `opt1.step(); opt2.step()`: Muon and AdamW, a GAN's two halves in one module) belongs to
         # that step, which is still the newest in the ring (when it filled the ring, `_commit` kept
@@ -1317,7 +1635,7 @@ class Session:
         lead = self._lead() if self._lead is not None else None
         return (
             lead is not None and optimizer is not lead and self.auto_step and not self._commit_on_update
-            and bool(self._steps) and not self._closed and self._owns(optimizer)
+            and bool(self._steps) and not self._closed and not self._stopped and self._owns(optimizer)
         )
 
     def _add_to_newest(self, name: str, value: Any) -> None:
@@ -1335,28 +1653,64 @@ class Session:
         self._mark_held("scalars")
 
     def _watch_scaler(self, scaler: Any) -> None:
-        original = scaler.update
+        """Have `scaler.update()` end this session's steps (`_scaler_update`), by an instance
+        attribute on the scaler: one wrapper per scaler, shared by every session that watches it,
+        installed by the first and taken out when the last closes (`_unwatch_scaler`)."""
+        watch = _scaler_watch(scaler)
+        if watch is None:
+            watch = _install_scaler_watch(scaler)
+        watch.sessions.append(self)
+        self._scaler_watch_of = watch
 
-        def update(*args: Any, **kwargs: Any) -> Any:
-            ends = False
-            if not self._closed:
-                # It ends a step only after an optimizer went through the scaler (or one of this
-                # model's stepped): `update(new_scale)` called on its own only sets the scale.
-                ends = self._record_scaler(scaler) or self._stepped
-                if ends and self._commit_on_update and not self._grads_recorded and self._grads_wanted():
-                    # A step the scaler skipped never reaches the optimizer hooks. Its gradients are
-                    # still there, unscaled by `scaler.step`, Inf or NaN where they overflowed:
-                    # read them here, so the record names the parameters that did.
-                    self.record_grads()
-            out = original(*args, **kwargs)
-            if ends and self._commit_on_update and not self._closed:
-                if self._pending_lr is None and self._lead is not None and self._lead() is not None:
-                    self._pending_lr = _learning_rates(self._lead())
-                self._commit(None)
-            return out
+    def _unwatch_scaler(self) -> None:
+        """Leave the scaler's shared wrapper, and when no session is left on it put the scaler back
+        as it was before the first one: the instance attribute someone else had installed, or
+        none, so the class's own method runs again. A wrapper someone installed on top of ours
+        after `init` is left alone, with ours under it passing every call through."""
+        scaler = self._scaler
+        watch = self._scaler_watch_of
+        self._scaler_watch_of = None
+        if watch is None:
+            return
+        if self in watch.sessions:
+            watch.sessions.remove(self)
+        if watch.sessions:
+            return
+        if vars(scaler).get("update") is watch.wrapper:
+            if watch.had_attribute:
+                scaler.update = watch.original
+            else:
+                del scaler.update
 
-        scaler.update = update  # an instance attribute; `close()` removes it
-        self._scaler_original = original
+    def _scaler_before_update(self, scaler: Any) -> bool:
+        """Before the scaler's own `update()`: whether it ends this session's step."""
+        if self._closed:
+            return False
+        if self._stopped:
+            # Ends the step as a live session's does (an optimizer went through the scaler, a step it
+            # skipped included, or one of this model's stepped), so a stopped rank's drift-check
+            # gather stays on the other ranks' steps (`_count_stopped`); read without device work.
+            return self._stepped or any(
+                state.get("found_inf_per_device") for state in getattr(scaler, "_per_optimizer_states", {}).values()
+            )
+        # It ends a step only after an optimizer went through the scaler (or one of this
+        # model's stepped): `update(new_scale)` called on its own only sets the scale.
+        ends = self._record_scaler(scaler) or self._stepped
+        if ends and self._commit_on_update and not self._grads_recorded and self._grads_wanted():
+            # A step the scaler skipped never reaches the optimizer hooks. Its gradients are
+            # still there, unscaled by `scaler.step`, Inf or NaN where they overflowed:
+            # read them here, so the record names the parameters that did.
+            self.record_grads()
+        return ends
+
+    def _scaler_after_update(self, ends: bool) -> None:
+        if ends and self._commit_on_update and not self._closed and self._stopped:
+            self._count_stopped(None)
+            return
+        if ends and self._commit_on_update and not self._closed:
+            if self._pending_lr is None and self._lead is not None and self._lead() is not None:
+                self._pending_lr = _learning_rates(self._lead())
+            self._commit(None)
 
     def _record_scaler(self, scaler: Any) -> bool:
         # Read before `update()` resets them: whether any optimizer's gradients had an Inf
@@ -1383,7 +1737,17 @@ class Session:
 
         With `auto_step` this runs just before `optimizer.step()`, which is after any
         gradient clipping. Call it yourself before clipping to record unclipped norms.
+
+        Nothing here raises into training. A gradient that cannot be read is left out on its
+        own, with no norm in `grad_norms` (so none in `grad_norm` either), and the others keep
+        theirs: one on `meta`, which holds no values, or nested, judged from its device and
+        layout alone; or one whose norm raised (float8 on the CPU, say), found by reading the
+        rest of its group one at a time. Which parameters, and why, is said once per parameter
+        under `grads_not_read` on the first record written after it was found. A sparse
+        gradient is read from its stored values, as the weight check reads a sparse weight.
         """
+        if self._closed_call("record_grads()"):
+            return
         n_params = len(self._params)
         if self._grads_recorded:
             self._grad.zero_()
@@ -1396,18 +1760,39 @@ class Session:
             grad = param.grad
             if grad is None:
                 continue
-            if type(grad) is not torch.Tensor:
-                grad = unwrap_local(grad)
-            if grad.is_sparse:
-                grad = grad.coalesce().values()
+            try:
+                if type(grad) is not torch.Tensor:
+                    grad = unwrap_local(grad)
+                why = _grad_unread(grad)
+                if why is not None:
+                    self._grad_not_read(index, why)
+                    continue
+                if grad.layout == torch.sparse_coo:
+                    grad = grad.coalesce().values()
+                elif grad.layout != torch.strided:
+                    grad = grad.values()  # CSR, CSC, BSR, BSC: the stored values are all of them
+            except Exception as error:  # noqa: BLE001
+                self._grad_not_read(index, f"reading it raised {_short(error)}")
+                continue
             if grad.numel() == 0:
                 continue
             groups.setdefault((grad.device, grad.dtype), []).append((index, grad))
 
         for (_, dtype), items in groups.items():
-            grads = [grad for _, grad in items]
-            norms = _foreach_norm(grads, torch.float32 if dtype in _LOW_PRECISION else None)
-            stacked = torch.stack(norms).to(self._grad)
+            out = torch.float32 if dtype in _LOW_PRECISION else None
+            try:
+                stacked = torch.stack(_foreach_norm([grad for _, grad in items], out)).to(self._grad)
+            except Exception:  # noqa: BLE001
+                # One at a time, so only a gradient whose norm raises is left out.
+                read: list[tuple[int, torch.Tensor]] = []
+                for index, grad in items:
+                    try:
+                        read.append((index, torch.linalg.vector_norm(grad, 2, dtype=out).reshape(()).to(self._grad)))
+                    except Exception as error:  # noqa: BLE001
+                        self._grad_not_read(index, f"reading it raised {_short(error)}")
+                if not read:
+                    continue
+                items, stacked = read, torch.stack([norm for _, norm in read])
             if len(items) == n_params:
                 self._grad[:, 0].copy_(stacked)
                 self._grad[:, 1].fill_(1.0)
@@ -1417,6 +1802,16 @@ class Session:
                     0, idx, torch.stack((stacked, torch.ones_like(stacked)), dim=1)
                 )
         self._grads_recorded = True
+
+    def _grad_not_read(self, index: int, why: str) -> None:
+        """Keep why parameter `index`'s gradient was not read, for `grads_not_read` (`_flush`)."""
+        self._grad_why.setdefault(self.param_names[index], why)
+
+    def _new_grad_why(self) -> dict[str, str]:
+        """The parameters whose gradients were found unreadable since the last record that said so."""
+        found = {name: why for name, why in self._grad_why.items() if name not in self._grad_why_written}
+        self._grad_why_written.update(found)
+        return found
 
     def _index(self, key: tuple[int, ...]) -> torch.Tensor:
         idx = self._grad_idx_cache.get(key)
@@ -1509,10 +1904,11 @@ class Session:
         after the step with `auto_step=False`. An optimizer that is not Adam or AdamW is not
         read, and the record says why once (`update_not_read`). It never raises.
         """
+        if self._closed_call("record_updates()"):
+            return
         if not self.updates:
             raise RuntimeError("pass updates=True to tensorquill.init to record update sizes")
-        if not self._closed:
-            self._read_updates(optimizer)
+        self._read_updates(optimizer)
 
     @torch.no_grad()
     def _read_updates(self, optimizer: Any) -> None:
@@ -1632,6 +2028,8 @@ class Session:
         Call it yourself with a norm computed elsewhere, such as the `grad_norm` that
         Megatron's `optimizer.step()` returns. A tensor stays on its device; no sync.
         """
+        if self._closed_call("record_grad_norm()"):
+            return
         if isinstance(norm, torch.Tensor):
             value = norm.detach()
             if type(value) is not torch.Tensor:
@@ -1656,8 +2054,8 @@ class Session:
         and other non-scalar values raise `TypeError`; pass the tracker the same values
         it already logs, not a replacement for it.
         """
-        if self._closed:
-            raise RuntimeError("the session is closed")
+        if self._closed_call("log()"):
+            return
         items = dict(values or {}, **named)
         for name, value in items.items():
             if not isinstance(name, str) or not name:
@@ -1701,8 +2099,8 @@ class Session:
         after the first call records how many batches it drew. Host-side and cheap: one
         BLAKE2b over the indices. `session.watch_loader(loader)` calls it for you.
         """
-        if self._closed:
-            raise RuntimeError("the session is closed")
+        if self._closed_call("data()"):
+            return
         if self._data_step is None:
             self._data_step = DataStep()
         self._data_step.add(
@@ -1719,8 +2117,11 @@ class Session:
         `IterableDataset` has no indices: pass `ids`, a callable that takes a batch and returns
         its sample ids (CPU values). Each `iter()` is one pass, counted from `epoch`; the
         sampler's own epoch, whether it shuffles and its rank are read from a
-        `DistributedSampler`, `RandomSampler` or `SequentialSampler`.
+        `DistributedSampler`, `RandomSampler` or `SequentialSampler`. On a closed session it
+        returns `loader` itself, untouched.
         """
+        if self._closed_call("watch_loader()"):
+            return loader
         return WatchedLoader(self, loader, ids=ids, epoch=epoch)
 
     def checkpoint(self, state: Mapping[str, Any], *, event: str = "save") -> None:
@@ -1733,6 +2134,8 @@ class Session:
         `after_step`); a load with the next step, the first of the resumed run. The detectors
         then say what a resume did not restore.
         """
+        if self._closed_call("checkpoint()"):
+            return
         self._record_manifest(checkpoint_manifest(state), event)
 
     def checkpoint_files(self, folder: str | Path, *, event: str = "save") -> None:
@@ -1740,6 +2143,8 @@ class Session:
         `save_state` write: the components are read from the file names (`optimizer.pt`,
         `scheduler.pt`, `scaler.pt`, `rng_state*.pth` or `random_states_*.pkl`, the model's
         weights, `trainer_state.json` or `sampler*.bin` for the data position). No file is opened."""
+        if self._closed_call("checkpoint_files()"):
+            return
         try:
             names = [entry.name for entry in Path(folder).iterdir()]
         except OSError:
@@ -1747,8 +2152,6 @@ class Session:
         self._record_manifest(files_manifest(names), event)
 
     def _record_manifest(self, manifest: dict[str, Any], event: str) -> None:
-        if self._closed:
-            raise RuntimeError("the session is closed")
         if event not in ("save", "load"):
             raise ValueError('event must be "save" or "load"')
         last = self._next_step - 1 if self._steps_committed else None
@@ -1796,11 +2199,16 @@ class Session:
         spread: a warning names it once, at the next flush. A NaN weight that was read still
         reads as drift.
         """
-        if not self._replica_params:
+        if self._closed or not self._replica_params:
             return
         target = self._replica_group if group_or_spread is None else group_or_spread
         if target is None:
             raise ValueError("pass a replication process group or precomputed spread tensor")
+        if self._stopped:
+            if not isinstance(target, torch.Tensor):
+                self._gather_and_drop(target)  # the other ranks are entering it too
+                self._spread_recorded = 1
+            return
         spread_buf, _ = self._ensure_spread_buffers()
         unread: torch.Tensor | None = None
         if isinstance(target, torch.Tensor):
@@ -1833,10 +2241,10 @@ class Session:
                     continue
                 self._replica_unread_said.add(name)
                 why = self._replica_unread_here.get(name) or f"on another replica in the group, {_unread_reason(code)}"
-                warnings.warn(
+                _warn(
                     f"TensorQuill is not comparing the parameter {name!r} across replicas: {why}. It is left out "
                     "of replica_spread, so the cross-GPU drift check does not cover it.",
-                    RuntimeWarning, stacklevel=4,
+                    stacklevel=4,
                 )
 
     def step(self, step: int | None = None, lr: float | Sequence[float] | None = None) -> None:
@@ -1846,6 +2254,10 @@ class Session:
         `torch.amp.GradScaler`, which skips `optimizer.step()` on overflow. Pass `lr` (one
         value per parameter group, or a single value) to record the learning rate.
         """
+        if self._closed_call("step()"):
+            if self._stopped and not self._closed and not self.auto_step:
+                self._count_stopped(step)  # the drift check's schedule goes on (`_count_stopped`)
+            return
         if self.auto_step:
             raise RuntimeError("step() is called automatically; pass auto_step=False to call it yourself")
         if not self._grads_recorded and self._should_record_grads():
@@ -1866,9 +2278,9 @@ class Session:
         for name, reason in self._router_refusals().items():
             if name not in self._router_problems_said:
                 self._router_problems_said.add(name)
-                warnings.warn(
+                _warn(
                     f"TensorQuill is not counting the router {name!r}: {reason}. Its expert loads are not recorded.",
-                    RuntimeWarning, stacklevel=stacklevel,
+                    stacklevel=stacklevel,
                 )
 
     def _judge_index_ranges(self, counts: torch.Tensor, n: int) -> None:
@@ -1894,11 +2306,19 @@ class Session:
 
     @torch.no_grad()
     def _commit(self, step: int | None) -> None:
+        if self._error is not None and not self._stopped:
+            self._stop(self._error)  # the sink failed on the writer thread: said here, on this one
+        if self._stopped:
+            self._count_stopped(step)
+            return
         current = self._next_step if step is None else step
         if self._probe_owed:
             self._run_owed_probe()  # the previous step's, before this one becomes the newest
         if self._held is not None:
             self._release_held()  # the step kept back when the ring last filled: this one ends it
+            if self._stopped:  # the writer was a full queue behind (`_put`)
+                self._count_stopped(step)
+                return
         self._say_router_problems(stacklevel=4)
         if (
             not self._spread_recorded
@@ -2045,7 +2465,9 @@ class Session:
         try:
             return run_probe(self._model, self._probe_fn, self._probe_state, devices)
         except Exception as error:  # noqa: BLE001
-            warnings.warn(f"TensorQuill probe failed and was skipped: {error!r}", RuntimeWarning, stacklevel=3)
+            # The failure is in the step's record (`probe.error`); the warning only points at it, and
+            # cannot raise out of `optimizer.step()` under `python -W error` (`_warn`).
+            _warn(f"TensorQuill probe failed and was skipped: {error!r}", stacklevel=3)
             return {"error": f"{type(error).__name__}: {error}"}
         finally:
             buffers = [b for b in (self._act, *self._counts_list) if b.numel() > 0]
@@ -2054,6 +2476,8 @@ class Session:
 
     def flush(self) -> None:
         """Move the ring to the CPU and queue it for the sink."""
+        if self._closed_call("flush()"):
+            return
         self._flush(hold_newest=False)
 
     def _clear_ring_lists(self) -> None:
@@ -2074,11 +2498,20 @@ class Session:
         self._ring_wait = []
 
     def _flush(self, *, hold_newest: bool) -> None:
-        if self._error is not None:
-            self._clear_ring_lists()
-            self._probe_owed = False
-            self._held = None
-            self._raise_worker_error()
+        """Move the ring to the CPU and queue it (`_flush_ring`). An exception part way would leave
+        the ring's lists longer than the ring and every later step raising (lane U5 saw an
+        `IndexError` at each step after one raise here), so it stops capture instead (`_stop`),
+        which clears the ring: nothing raises into training from here."""
+        if self._error is not None and not self._stopped:
+            self._stop(self._error)
+        if self._stopped:
+            return
+        try:
+            self._flush_ring(hold_newest=hold_newest)
+        except Exception as error:  # noqa: BLE001
+            self._stop(error, f"moving a block of steps off the device raised {_short(error)}")
+
+    def _flush_ring(self, *, hold_newest: bool) -> None:
         if self._probe_owed and not hold_newest:
             self._run_owed_probe()  # the newest step's, before it leaves the ring (a held one stays)
         if self._held is not None:
@@ -2133,6 +2566,7 @@ class Session:
             )
         update_why = {name: why for name, why in self._update_why.items() if name not in self._update_why_written}
         self._update_why_written.update(update_why)
+        grad_why = self._new_grad_why()
         grad_seen = self._ring_grad_seen
         weight_seen = self._ring_weight_seen
         spread_seen = self._ring_spread_seen
@@ -2161,7 +2595,7 @@ class Session:
         block = (
             steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
             spread_seen, scalars, probes, stamps, amps, data_rows, checkpoints, waits, system,
-            refused, announce, updates, update_seen, update_why,
+            refused, announce, updates, update_seen, update_why, grad_why,
         )
         if hold_newest:
             first = self._hold_newest(dict(zip(_BLOCK_FIELDS, block)), act_size=self._act.numel() if has_act else 0,
@@ -2208,7 +2642,7 @@ class Session:
         # What is said once for the block goes on its first record, written now (with one step, on
         # that step); the system readings on its last, as for any block.
         last = n == 1
-        for key in ("announce", "update_why"):
+        for key in ("announce", "update_why", "grad_why"):
             first[key], held[key] = (None, block[key]) if last else (block[key], {})
         first["system"], held["system"] = None, block["system"]
         first["refused"] = held["refused"] = block["refused"]
@@ -2249,6 +2683,7 @@ class Session:
         update_why = {name: why for name, why in self._update_why.items() if name not in self._update_why_written}
         self._update_why_written.update(update_why)
         block["update_why"] = {**block["update_why"], **update_why}
+        block["grad_why"] = {**block["grad_why"], **self._new_grad_why()}
         self._clear_ring_lists()
         self._put(tuple(block[key] for key in _BLOCK_FIELDS))
 
@@ -2258,27 +2693,110 @@ class Session:
             self._held["dirty"].add(part)
 
     def _put(self, block: tuple[Any, ...]) -> None:
+        """Hand a block to the writer thread, never waiting for it. A writer a full queue behind
+        stops capture for the session (`_stop`) and this block is dropped: the steps already
+        queued are still written, so the records stay one unbroken run of steps."""
+        if self._stopped:
+            return
         try:
-            self._queue.put_nowait(block)
+            if self._close_by is None:
+                self._queue.put_nowait(block)
+            else:
+                # In `close()` no training step waits, and a writer that is slow but working gets
+                # until the close's deadline to make room for the last block.
+                self._queue.put(block, timeout=max(self._close_by - time.monotonic(), 0.0))
         except queue.Full:
-            if not self._warned_backpressure:
-                self._warned_backpressure = True
-                cause = ("The sink is slower than training, for example a stalled network filesystem; "
-                         "pass sink=tensorquill.JsonlSink(path) on local disk.")
-                if self._system is not None:
-                    # With system readings on, the writer may instead be in its bounded wait for an
-                    # NVML reading (system.py), after which NVML is off for the session.
-                    cause = ("The sink is slower than training, for example a stalled network filesystem "
-                             "(pass sink=tensorquill.JsonlSink(path) on local disk), or the writer is waiting "
-                             "for an NVML reading that is slow to come back; it waits a bounded time, then "
-                             "turns NVML off for the session.")
-                warnings.warn(
-                    f"TensorQuill's writer is {WRITER_QUEUE * self.every} steps behind; training "
-                    f"now waits for it. {cause}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            self._queue.put(block)
+            blocks = self._queue.maxsize
+            if self._close_by is not None:
+                self._stop(RuntimeError(f"the writer had not made room for the last block within {CLOSE_SECONDS:g} s "
+                                        "at close"))
+                return
+            cause = ("for example on a stalled network filesystem (pass sink=tensorquill.JsonlSink(path) on "
+                     "local disk)")
+            if self._system is not None:
+                # With system readings on, the writer may instead be in its bounded wait for an NVML
+                # reading (system.py), after which NVML is off for the session.
+                cause += ", or while the writer waited for an NVML reading that was slow to come back"
+            self._stop(RuntimeError(
+                f"the writer fell {blocks} blocks ({_queue_rings(self.every) * self.every} steps) behind training, "
+                f"{cause}"
+            ))
+
+    def _stop(self, cause: BaseException, what: str | None = None) -> None:
+        """Stop capture for the rest of the session, on the training thread, and say so once.
+
+        The author's decision on C03: a sink that fails, or a writer a full queue behind, stops
+        capture; nothing is raised into training and nothing waits. The cause is kept as
+        `writer_error`. Every public entry point then returns at once (`_closed_call`), except
+        what the heartbeat reads (`set_phase`, `tick`, `phase`). The forward hooks stay: a flag
+        they read under `torch.compile` would be guarded, and flipping it would recompile; their
+        buffers are never read again. The clipping and loader hooks come off. The optimizer hooks
+        become no-ops (taking them out now could be inside PyTorch's loop over them, which would
+        raise) and `close()` removes them; with a `replica_group` they instead keep counting steps,
+        so this rank keeps entering the drift check's gather on the same steps as the others
+        (`_count_stopped`). `close()` then writes no end marker, so the file reads as cut off."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self.writer_error = cause
+        self._clear_ring_lists()
+        self._held = None
+        self._probe_owed = False
+        try:  # an idle writer ends now; a busy one ends once the queue is empty (`_drain`)
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        for undo in (lambda: _unwatch_clipping(self), lambda: datawait.unwatch(self)):
+            try:
+                undo()
+            except Exception:  # noqa: BLE001
+                pass
+        if not self._keeps_schedule():
+            for handle in self._optimizer_handles:
+                try:
+                    hooks = handle.hooks_dict_ref()
+                    if hooks is not None and handle.id in hooks:
+                        hooks[handle.id] = _noop_hook  # same key: safe while PyTorch iterates them
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                self._unwatch_scaler()
+            except Exception:  # noqa: BLE001
+                pass
+        if what is None:
+            what = f"its sink raised {_short(cause)}" if cause is self._error else str(cause)
+        _warn(
+            f"TensorQuill stopped capturing for this session: {what}. Training goes on and does not wait; "
+            "the steps already handed to the writer are written, no later step is, and the records file gets "
+            "no end marker, so it reads as cut off. The cause is session.writer_error.",
+            stacklevel=4,
+        )
+
+    def _keeps_schedule(self) -> bool:
+        """Whether a stopped session must keep counting steps: it takes part in the drift check's
+        `all_gather`, which every rank of the group must enter on the same steps."""
+        return (
+            self._replica_group is not None and not isinstance(self._replica_group, torch.Tensor)
+            and bool(self._replica_params)
+        )
+
+    def _count_stopped(self, step: int | None) -> None:
+        """A step ended on a stopped session: only the drift check's gather goes on, on the steps it
+        was due (as `_commit` schedules it), and its result is dropped."""
+        current = self._next_step if step is None else step
+        self._stepped = self._foreign_stepped = False
+        if self._keeps_schedule() and not self._spread_recorded and (current + 1) % self.replica_every == 0:
+            self._gather_and_drop(self._replica_group)
+        self._spread_recorded = 0
+        self._next_step = current + 1
+
+    def _gather_and_drop(self, group: Any) -> None:
+        try:
+            spread_buf, _ = self._ensure_spread_buffers()
+            _spread_and_unread(self._replica_params, group, projection=self._replica_projection,
+                               device=spread_buf.device)
+        except Exception:  # noqa: BLE001
+            pass  # nothing is recorded any more; a failed gather is as it would be without TensorQuill
 
     def set_phase(self, phase: str = "train") -> None:
         """Say what the process is doing: `"train"` (the default), `"eval"`, `"checkpoint"`, or
@@ -2286,6 +2804,8 @@ class Session:
         not call the missing steps a hang. Under `"eval"`, a forward in eval mode or without
         gradients is also left out of the records (`_evaluating`); without it, only one with
         both. Otherwise a no-op unless streaming with `endpoint=`."""
+        if self._closed:  # live after a stop: the heartbeat still says what the process is doing
+            return
         self._phase = phase
         self._evaluating.on = phase == "eval"
         heartbeat = getattr(self._sink, "heartbeat", None)
@@ -2297,14 +2817,16 @@ class Session:
         evaluation batch. A pause whose work stops moving is reported as a suspected hang;
         one that keeps ticking is not limited. The Lightning and Hugging Face callbacks tick
         for you. Cheap: it only adds one to a counter."""
+        if self._closed:  # live after a stop, as `set_phase`
+            return
         self._ticks += 1
 
     def watch_loaders(self) -> None:
         """Record the host time this thread spends in `next()` on any PyTorch `DataLoader`
         during training, as `data_wait` on each step, until the session closes. See
         `tensorquill.datawait`. `init(..., data_wait=True)` calls it."""
-        if self._closed:
-            raise RuntimeError("the session is closed")
+        if self._closed_call("watch_loaders()"):
+            return
         self._start_data_timing()
         datawait.watch(self)
 
@@ -2312,7 +2834,10 @@ class Session:
         """`for batch in session.time_data(loader):` records the host time spent fetching each
         batch, as `data_wait` on each step. Move the batch to the device after this, outside
         the timer. For loops whose loader is not a PyTorch `DataLoader`; with one,
-        `watch_loaders()` does the same without changing the loop."""
+        `watch_loaders()` does the same without changing the loop. On a closed session it
+        returns `iterable` itself, untimed."""
+        if self._closed_call("time_data()"):
+            return iterable
         return datawait.TimedData(iterable, self)
 
     def _start_data_timing(self) -> None:
@@ -2324,38 +2849,86 @@ class Session:
     @contextlib.contextmanager
     def phase(self, name: str) -> Iterator[None]:
         """`with session.phase("eval"): ...` marks a stretch with no training steps, and goes
-        back to the phase it interrupted afterwards, even if the block raises."""
+        back to the phase it interrupted afterwards, even if the block raises. On a closed
+        session, or one closed inside the block, it marks nothing."""
+        if self._closed:  # live after a stop, as `set_phase`
+            yield
+            return
         previous = self._phase
         self.set_phase(name)
         try:
             yield
         finally:
-            self.set_phase(previous)
+            if not self._closed:
+                self.set_phase(previous)
+
+    def _closed_call(self, what: str) -> bool:
+        """Whether the session is closed, so the public call `what` must do nothing. A closed
+        session's writer thread has stopped: a step or flush queued for it would fill the writer's
+        bounded queue and then wait for good (`_put`). So every public entry point returns at once
+        on a closed session: no raise, nothing queued, and no warning, since a warning on the
+        caller's thread is an exception under `python -W error`. `what` names the call for a
+        reader of this code; nothing is said. A session whose capture stopped (`_stop`) is the same
+        state for these calls: its one warning was given when it stopped."""
+        return self._closed or self._stopped
 
     def close(self, *, _exception: BaseException | None = None) -> None:
         """Flush what is left and stop the writer. Forward hooks stay on the model, because
         removing a hook from a compiled module triggers a recompile. Once the records file is
         closed and complete, `<name>.end.json` is left beside it (`sink.write_end_marker`), so a
-        reader can tell this run from one that was killed; none when the writer failed."""
+        reader can tell this run from one that was killed.
+
+        It never raises and never waits without bound. A sink that fails here, or a writer that
+        has not finished within `CLOSE_SECONDS`, stops capture (`_stop`), as during training: one
+        warning, `writer_error` set, and no end marker, so the file reads as cut off. After a stop
+        the writer, which may be stuck in the sink, is waited for `STOPPED_CLOSE_SECONDS` at most;
+        a sink still in a write is not closed under it (only a stream's heartbeat and sender are
+        stopped), and the writer, a daemon thread, does not hold the process. Inside `with
+        session:` the training's own exception comes out unchanged."""
         if self._closed:
             return
         self._closed = True
-        datawait.unwatch(self)
-        for handle in self._optimizer_handles:
-            handle.remove()
-        _unwatch_clipping(self)
-        if self._scaler is not None and "update" in vars(self._scaler):
-            del self._scaler.update
+        for undo in (
+            lambda: datawait.unwatch(self),
+            lambda: [handle.remove() for handle in self._optimizer_handles],
+            lambda: _unwatch_clipping(self),
+            self._unwatch_scaler,
+        ):
+            try:
+                undo()
+            except Exception:  # noqa: BLE001
+                pass
+        deadline = time.monotonic() + CLOSE_SECONDS
+        if not self._stopped:
+            self._close_by = deadline  # the last block may wait for room, up to the deadline (`_put`)
+            self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
+        if not self._stopped:
+            try:
+                self._queue.put(None, timeout=max(deadline - time.monotonic(), 0.0))
+            except queue.Full:
+                self._stop(RuntimeError(f"the writer had not taken what was left within {CLOSE_SECONDS:g} s at close"))
+        wait = STOPPED_CLOSE_SECONDS if self._stopped else max(deadline - time.monotonic(), 0.0)
+        self._worker.join(wait)
+        if self._worker.is_alive():
+            self._stop(RuntimeError(f"the writer had not finished within {wait:g} s at close"))
+            try:
+                _close_stream(self._sink)  # the stream's threads, not the sink the writer is still in
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            if self._error is not None:
+                self._stop(self._error)  # the last write failed
+            try:
+                self._sink.close()
+            except Exception as error:  # noqa: BLE001
+                self._stop(error)
+        if self._stopped or getattr(self._sink, "path", None) is None:
+            return
         try:
-            self.flush()
-        finally:
-            self._queue.put(None)
-            self._worker.join()
-            self._sink.close()
-        self._raise_worker_error()
-        if getattr(self._sink, "path", None) is not None:
             write_end_marker(self._sink.path, run_id=self.run.run_id, rank=self.run.rank, attempt=self.attempt,
                              exception=_exception)
+        except Exception:  # noqa: BLE001
+            pass  # no marker: the file reads as cut off, which is less than it is, never more
 
     def __enter__(self) -> "Session":
         return self
@@ -2365,32 +2938,32 @@ class Session:
 
     # ---- writer thread ------------------------------------------------------------
 
-    def _raise_worker_error(self) -> None:
-        if self._error is not None:
-            error, self._error = self._error, None
-            raise RuntimeError("the TensorQuill writer thread failed") from error
-
     def _drain(self) -> None:
+        """The writer thread. It never raises and never stops training: a sink that raises is kept
+        as `_error`, which the training thread turns into a stop at its next step (`_commit`); the
+        blocks after it are passed over. Once capture has stopped it writes what was queued before
+        the stop and ends when the queue is empty, or at the `None` that `_stop` or `close` put."""
         try:
             while True:
                 item = self._queue.get()
                 if item is None:
                     return
-                if self._error is not None:
-                    continue
-                if self._system is not None:
-                    # NVML is asked for here, on the writer thread, and read on a thread of its own,
-                    # waited for a bounded time (system.py). A failure is written as a note in the
-                    # record and never stops the writer, which would stop training.
-                    # Found by its type, not its place, so other parts of the block can come after it.
+                if self._error is None:
+                    if self._system is not None:
+                        # NVML is asked for here, on the writer thread, and read on a thread of its own,
+                        # waited for a bounded time (system.py). A failure is written as a note in the
+                        # record and never stops the writer.
+                        # Found by its type, not its place, so other parts of the block can come after it.
+                        try:
+                            item = tuple(self._system.write(x) if isinstance(x, SystemPart) else x for x in item)
+                        except Exception:  # noqa: BLE001
+                            pass
                     try:
-                        item = tuple(self._system.write(x) if isinstance(x, SystemPart) else x for x in item)
-                    except Exception:  # noqa: BLE001
-                        pass
-                try:
-                    self._sink.write(self._decode(*item))
-                except BaseException as error:  # noqa: BLE001
-                    self._error = error
+                        self._sink.write(self._decode(*item))
+                    except BaseException as error:  # noqa: BLE001
+                        self._error = error
+                if self._stopped and self._queue.empty():
+                    return
         finally:
             if self._system is not None:
                 self._system.close()
@@ -2420,6 +2993,7 @@ class Session:
         updates: torch.Tensor | None = None,
         update_seen: list[bool] | None = None,
         update_why: Mapping[str, str] | None = None,
+        grad_why: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
         split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
@@ -2537,6 +3111,9 @@ class Session:
             # Once for each: why an optimizer's update size is not in these records, so a reader
             # can say the update size was not checked, and not that nothing was found.
             records[0]["update_not_read"] = dict(update_why)
+        if grad_why and records:
+            # Once for each parameter: why its gradient has no norm in `grad_norms` (`record_grads`).
+            records[0]["grads_not_read"] = dict(grad_why)
         if system and records:
             records[-1]["system"] = system
         return records
@@ -2546,7 +3123,7 @@ class Session:
 _BLOCK_FIELDS = (
     "steps", "lrs", "floats", "counts", "spreads", "clips", "clip_seen", "grad_seen", "weight_seen",
     "spread_seen", "scalars", "probes", "stamps", "amps", "data_rows", "checkpoints", "waits", "system",
-    "refused", "announce", "updates", "update_seen", "update_why",
+    "refused", "announce", "updates", "update_seen", "update_why", "grad_why",
 )
 
 
@@ -2574,6 +3151,17 @@ def _scalars_to_cpu(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for (i, name, _), value in zip(entries, values):
             out[i][name] = value
     return out
+
+
+def _grad_unread(grad: torch.Tensor) -> str | None:
+    """Why a gradient is not read into `grad_norms`, from its device and layout alone (no values
+    read, so no sync); None when it is read. As the weight check (`_record_weights`) and the drift
+    check (`distributed._unread_reason`) leave out a parameter on `meta` or a nested one."""
+    if grad.device.type == "meta":
+        return "its gradient is on meta, which holds no values"
+    if grad.is_nested:
+        return "its gradient is a nested tensor"
+    return None
 
 
 def _buffers_device(params: Sequence[torch.Tensor]) -> torch.device:
@@ -2688,6 +3276,55 @@ def _foreach_norm(
     return [torch.linalg.vector_norm(t, 2, dtype=dtype) for t in tensors]
 
 
+def _open_default_sink(path: Path, undo: list[Callable[[], Any]]) -> JsonlSink:
+    """`init`'s default `JsonlSink`, with what undoes it: closed, and the file and the folders made
+    for it removed when they did not exist before and are still empty."""
+    made = [folder for folder in (path.parent, *path.parent.parents) if not folder.exists()]
+    existed = path.exists()
+    sink = JsonlSink(path)
+
+    def remove() -> None:
+        sink.close()
+        if not existed and path.exists() and path.stat().st_size == 0:
+            path.unlink()
+        for folder in made:  # innermost first
+            try:
+                folder.rmdir()
+            except OSError:
+                break
+
+    undo.append(remove)
+    return sink
+
+
+def _restore_file(path: Path) -> Callable[[], None]:
+    """An undo step that puts `path` back as it is now: its bytes, or no file."""
+    try:
+        before: bytes | None = path.read_bytes()
+    except OSError:
+        before = None
+
+    def restore() -> None:
+        if before is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(before)
+
+    return restore
+
+
+def _close_stream(sink: Any) -> None:
+    """Stop what `flight.attach` started (heartbeat and sender) without closing the sink it wraps,
+    which is `init`'s to close (its default) or the caller's."""
+    heartbeat = getattr(sink, "heartbeat", None)
+    if heartbeat is not None:
+        heartbeat.close()
+    sender = getattr(sink, "sender", None)
+    if sender is not None:
+        sender.close()
+
+
+@torch.compiler.disable
 def init(
     model: nn.Module,
     *,
@@ -2723,6 +3360,11 @@ def init(
     updates: bool = False,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
+
+    Called inside a function that `torch.compile` traces, it runs eagerly
+    (`torch.compiler.disable`), and the model's calls after it are traced with its hooks.
+    Nothing is changed when it raises: every option is checked first, and what was opened before
+    a later step failed is closed again.
 
     Args:
         run_id: the tracker's run ID. Defaults to MLFLOW_RUN_ID, the active MLflow run or
@@ -2779,11 +3421,13 @@ def init(
         replica_group: optional replication `ProcessGroup` (or precomputed spread tensor)
             for cross-GPU parameter drift checks.
         replica_every: run the cross-GPU drift check every N steps (default 50). Each
-            check reads every weight in float64 and gathers 24 bytes per parameter tensor
+            check reads every weight in float64 and gathers 32 bytes per parameter tensor
             from each rank: norm, sum and a seeded random projection, which catches
-            changes that keep the other two, such as swapped elements. It is a screen,
-            not proof of equality. `session.record_replica_spread()` records one on demand.
-        replica_projection: set False to skip the projection (two values per tensor). On
+            changes that keep the other two, such as swapped elements, and a flag for a
+            parameter some replica could not read. It is a screen, not proof of equality.
+            `session.record_replica_spread()` records one on demand.
+        replica_projection: set False to skip the projection (two values per tensor, 24 bytes
+            with the flag). On
             CPU it takes about seven times the norm and sum; GPU cost is not yet measured.
         heartbeat_seconds: with `endpoint=`, a thread of its own tells the server every this
             many seconds that the process is alive and in which phase (see
@@ -2861,55 +3505,74 @@ def init(
         raise ValueError(f"group must be a string, not {type(group).__name__}")
     _manifest.resolve_name(name, None)
     tags, config = _manifest.clean_tags(tags), _manifest.clean_config(config)
-    run = resolve_run(run_id)
-    if sink is None:
-        sink = JsonlSink(Path("tensorquill-out") / f"{run.run_id}.rank{run.rank}.jsonl")
-    # The project and the name are facts of the run, and a tracker's run exists on rank 0
-    # only, so rank 0 alone resolves and writes them: no collective call is needed.
-    run_manifest = None
-    if run.rank == 0:
-        labels = tracker_labels()
-        run_manifest = _manifest.build_manifest(
-            run_id=run.run_id, run_id_source=run.source,
-            project=_manifest.resolve_project(project, labels.get("project")),
-            name=_manifest.resolve_name(name, run.run_id, labels.get("name")),
-            group=group or labels.get("group"), tags=tags, config=config, world_size=_world_size(),
-        )
-        records_file = getattr(sink, "path", None)
-        if records_file is not None and run.run_id:
-            manifest_file = _manifest.local_manifest_path(records_file, run.run_id)
-            _manifest.write_manifest(manifest_file, run_manifest)
-            # A run started again under its run ID keeps the first start's time.
-            run_manifest = _manifest.read_manifest(manifest_file) or run_manifest
-    from .flight import attach  # a no-op unless endpoint= or TENSORQUILL_ENDPOINT is set
+    # Every check of the model and the options too, before the run is resolved (which tells other
+    # ranks its ID) or anything is opened: an `init` that is rejected changes nothing.
+    plan = _plan_session(
+        model, every=every, layers=layers, routers=routers, grads=grads, weights=weights,
+        replica_every=replica_every, probe=probe, probe_every=probe_every, probe_head=probe_head,
+        replica_params=replica_params, scaler=scaler,
+    )
+    # What `init` opens is undone if a later step fails (`_undo`): the default sink and its file,
+    # the run manifest, the stream to a server. A sink the caller passed in is never closed here.
+    undo: list[Callable[[], Any]] = []
+    try:
+        run = resolve_run(run_id)
+        if sink is None:
+            sink = _open_default_sink(Path("tensorquill-out") / f"{run.run_id}.rank{run.rank}.jsonl", undo)
+        # The project and the name are facts of the run, and a tracker's run exists on rank 0
+        # only, so rank 0 alone resolves and writes them: no collective call is needed.
+        run_manifest = None
+        if run.rank == 0:
+            labels = tracker_labels()
+            run_manifest = _manifest.build_manifest(
+                run_id=run.run_id, run_id_source=run.source,
+                project=_manifest.resolve_project(project, labels.get("project")),
+                name=_manifest.resolve_name(name, run.run_id, labels.get("name")),
+                group=group or labels.get("group"), tags=tags, config=config, world_size=_world_size(),
+            )
+            records_file = getattr(sink, "path", None)
+            if records_file is not None and run.run_id:
+                manifest_file = _manifest.local_manifest_path(records_file, run.run_id)
+                undo.append(_restore_file(manifest_file))
+                _manifest.write_manifest(manifest_file, run_manifest)
+                # A run started again under its run ID keeps the first start's time.
+                run_manifest = _manifest.read_manifest(manifest_file) or run_manifest
+        from .flight import attach  # a no-op unless endpoint= or TENSORQUILL_ENDPOINT is set
 
-    sink = attach(
-        sink, run.run_id, run.rank, endpoint, world_size=_world_size(), heartbeat_seconds=heartbeat_seconds,
-        stack_seconds=stack_seconds, manifest=run_manifest,
-    )
-    session = Session(
-        model,
-        run=run,
-        every=every,
-        sink=sink,
-        layers=layers,
-        routers=routers,
-        grads=grads,
-        weights=weights,
-        auto_step=auto_step,
-        replica_group=replica_group,
-        start_step=start_step,
-        clip_norm=clip_norm,
-        replica_every=replica_every,
-        replica_projection=replica_projection,
-        probe=probe,
-        probe_every=probe_every,
-        probe_head=probe_head,
-        scaler=scaler,
-        replica_params=replica_params,
-        system=system,
-        data_wait=data_wait,
-        updates=updates,
-    )
+        given = sink
+        sink = attach(
+            sink, run.run_id, run.rank, endpoint, world_size=_world_size(), heartbeat_seconds=heartbeat_seconds,
+            stack_seconds=stack_seconds, manifest=run_manifest,
+        )
+        if sink is not given:
+            undo.append(lambda: _close_stream(sink))
+        session = Session(
+            model,
+            run=run,
+            every=every,
+            sink=sink,
+            layers=layers,
+            routers=routers,
+            grads=grads,
+            weights=weights,
+            auto_step=auto_step,
+            replica_group=replica_group,
+            start_step=start_step,
+            clip_norm=clip_norm,
+            replica_every=replica_every,
+            replica_projection=replica_projection,
+            probe=probe,
+            probe_every=probe_every,
+            probe_head=probe_head,
+            scaler=scaler,
+            replica_params=replica_params,
+            system=system,
+            data_wait=data_wait,
+            updates=updates,
+            _plan=plan,
+        )
+    except BaseException:
+        _undo(undo)
+        raise
     session.manifest = run_manifest  # the run manifest rank 0 wrote; None on every other rank
     return session

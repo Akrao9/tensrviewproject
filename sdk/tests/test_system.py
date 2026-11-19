@@ -338,7 +338,8 @@ def test_readings_that_fail_mid_run_never_stop_training(cuda, nvml, monkeypatch)
     cuda["stats"] = RuntimeError("allocator gone")
     monkeypatch.setattr(Nvml, "read", lambda self: (_ for _ in ()).throw(Exception("driver fell off the bus")))
     _train(session, model, 9)
-    session.close()  # raises if the writer thread failed
+    session.close()
+    assert session.writer_error is None  # a failed reading is a note, never a stop
     assert [r["step"] for r in sink.records] == list(range(15))
     notes = [r["system"] for r in sink.records if "system" in r]
     assert notes[1] == {"cuda": {"unavailable": "RuntimeError: allocator gone"},
@@ -392,7 +393,7 @@ def bounds(monkeypatch):
 
 
 def test_a_hung_nvml_call_never_holds_training(cuda, nvml, bounds):
-    session, model, sink = _session(every=1, system=True)  # a queue of 8 blocks, one reading each
+    session, model, sink = _session(every=1, system=True)  # a queue of 400 blocks, one reading each
     session._system = SystemReadings(CUDA0)
     _train(session, model, 3)
     _written(sink, 2)  # each step is written when the next one ends
@@ -410,9 +411,13 @@ def test_a_hung_nvml_call_never_holds_training(cuda, nvml, bounds):
     assert stuck.is_alive()  # still in the hung call: never joined
     assert nvml.calls[asked:] == ["temperature"]  # nothing asked of NVML after it hung, not even a shutdown
 
-    assert [r["step"] for r in sink.records] == list(range(43))
+    # The author's decisions on C03 (lane U1): a writer a full queue behind stops capture and training
+    # does not wait; the queue holds about 400 steps at any `every`. The 40 steps fit while the writer
+    # waits 0.5 s for the hung reading, so nothing stops and every step is written.
+    steps = [r["step"] for r in sink.records]
+    assert session.writer_error is None and steps == list(range(43))
     systems = [r["system"] for r in sink.records if "system" in r]
-    assert len(systems) == 43 and all("cuda" in s for s in systems)  # memory goes on at every flush
+    assert len(systems) == len(steps) and all("cuda" in s for s in systems)  # memory goes on at every flush
     nvml_parts = [s["nvml"] for s in systems if "nvml" in s]
     assert nvml_parts[0]["temperature_c"] == 71 and nvml_parts[1]["temperature_c"] == 71
     assert nvml_parts[2:] == [{"unavailable": f"an NVML reading took over {SLOW:g} s; NVML is off for this session"}]
@@ -420,7 +425,7 @@ def test_a_hung_nvml_call_never_holds_training(cuda, nvml, bounds):
     nvml.release.set()  # the driver answers after all: the late reading is dropped, NVML shut down
     assert _exits_within(stuck, 5)
     assert nvml.shutdowns == 1
-    assert [r["step"] for r in sink.records] == list(range(43))
+    assert [r["step"] for r in sink.records] == steps
 
 
 def test_a_hung_nvml_open_never_holds_training(cuda, nvml, bounds):
@@ -434,6 +439,10 @@ def test_a_hung_nvml_open_never_holds_training(cuda, nvml, bounds):
         done.wait(10)
     closed = _closes_within(session, 5)
     assert finished and closed
+    # The author's decisions on C03 (lane U1): the 30 steps fit in the queue of about 400 while the first
+    # flush waits up to 1 s for NVML to open, so nothing stops and every step is written.
+    steps = [r["step"] for r in sink.records]
+    assert session.writer_error is None and steps == list(range(30))
     assert nvml.calls == ["init"]
     nvml_parts = [r["system"]["nvml"] for r in sink.records if "nvml" in r.get("system", {})]
     assert nvml_parts == [{"unavailable": f"the first NVML reading, which opens NVML, took over {OPEN:g} s; "

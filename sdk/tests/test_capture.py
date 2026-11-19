@@ -168,7 +168,8 @@ def test_jsonl_sink_writes_standard_json_with_non_finite_values(tmp_path):
     assert json.loads(text) == {"step": 0, "layers": {"a": {"mean": "nan", "abs_max": "inf"}}}
 
 
-def test_a_failing_sink_is_reported_on_close(toy_moe):
+def test_a_failing_sink_stops_capture_and_close_returns(toy_moe):
+    # The author's decision on C03 (lane U1): one warning, the cause kept, nothing raised.
     class Broken:
         def write(self, records):
             raise OSError("disk full")
@@ -178,8 +179,9 @@ def test_a_failing_sink_is_reported_on_close(toy_moe):
 
     session = tensorquill.init(toy_moe, sink=Broken(), every=1)
     train(toy_moe, 1)
-    with pytest.raises(RuntimeError, match="writer thread failed"):
+    with pytest.warns(RuntimeWarning, match="stopped capturing"):
         session.close()
+    assert isinstance(session.writer_error, OSError)
 
 
 def test_single_element_layer_output_has_zero_std_not_nan():
@@ -606,8 +608,8 @@ def test_log_records_scalars_for_the_step_in_progress():
     assert [s["peak"] for s in scalars] == [1.0, 0.0, 0.0]
     assert [s["train/loss"] for s in scalars] == pytest.approx(losses)
     assert all("after_last_step" not in s for s in scalars)
-    with pytest.raises(RuntimeError, match="closed"):
-        session.log(x=1.0)
+    session.log(x=1.0)  # a closed session does nothing (lane U1, C04): no raise, no warning, nothing written
+    assert len(sink.records) == 3
 
 
 def test_log_rejects_non_scalars():
@@ -690,13 +692,13 @@ def test_drift_check_follows_the_step_number_not_the_rank_local_count(monkeypatc
     assert [r["step"] for r in sink.records if "replica_spread" in r] == [5, 8]
 
 
-def test_a_slow_sink_makes_training_wait_instead_of_growing_memory(monkeypatch):
+def test_a_slow_sink_stops_capture_instead_of_making_training_wait(monkeypatch):
     import threading
     import warnings
 
     from tensorquill import capture
 
-    monkeypatch.setattr(capture, "WRITER_QUEUE", 2)
+    monkeypatch.setattr(capture, "QUEUE_STEPS", 2)  # 2 rings of one step: 2 blocks at every=1
     release = threading.Event()
 
     class SlowSink(tensorquill.MemorySink):
@@ -717,14 +719,20 @@ def test_a_slow_sink_makes_training_wait_instead_of_growing_memory(monkeypatch):
 
     worker = threading.Thread(target=train)
     worker.start()
-    worker.join(0.5)
-    assert worker.is_alive()  # waiting on the full queue: one block in the sink, two queued
+    worker.join(5)
+    assert not worker.is_alive()  # the author's decision on C03 (lane U1): training never waits
     assert session._queue.qsize() <= 2
     release.set()
-    worker.join(10)
     session.close()
-    assert [r["step"] for r in sink.records] == list(range(6))  # nothing dropped
-    assert any("behind" in str(w.message) for w in caught)
+    # One block in the sink and two queued when the fourth step found the queue full: those three
+    # steps are written, an unbroken run; capture stopped there, with one warning.
+    assert [r["step"] for r in sink.records] == [0, 1, 2]
+    assert [str(w.message) for w in caught if "TensorQuill" in str(w.message)] == [
+        f"TensorQuill stopped capturing for this session: {session.writer_error}. Training goes on and does not "
+        "wait; the steps already handed to the writer are written, no later step is, and the records file gets "
+        "no end marker, so it reads as cut off. The cause is session.writer_error."
+    ]
+    assert "2 blocks (2 steps) behind" in str(session.writer_error)
 
 
 def test_every_record_carries_schema_version_and_timestamp(tmp_path):
