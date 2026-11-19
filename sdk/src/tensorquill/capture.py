@@ -1024,6 +1024,31 @@ class Session:
         self._lead: weakref.ref[Any] | None = None
         self._leading = True
         self._grads_after_step = False
+        # Step accounting under a loss scaler (`_commit`, `_watch_scaler`): whether an optimizer
+        # that holds this model's parameters, or one that holds none of them, stepped since the
+        # last step ended (on a step the scaler skipped, neither did); a weight check that fell
+        # on a skipped step, owed to the next step that was not; and for each row of the ring,
+        # whether its step ended with no optimizer of this model seen stepping yet, which
+        # `flush` says as `update_not_read` only for a row the scaler did not skip.
+        self._stepped = False
+        self._foreign_stepped = False
+        self._weight_check_owed = False
+        self._ring_no_optimizer: list[bool] = []
+        # Several optimizers on one model, stepped one after the other (`_after_optimizer_step`):
+        # whether one has ever stepped after the lead ended the step (a follower); whether the
+        # newest step had a weight check, and the weights that check compared with, so that a
+        # follower reads it again after its own step; and the newest step's probe, owed until
+        # every optimizer of its iteration has stepped.
+        self._followers = False
+        self._recheck = False
+        self._weights_before: torch.Tensor | None = None
+        self._not_exact_before: Any = None
+        self._probe_owed = False
+        # The newest step of a full ring, kept back when the others were written (`_commit`,
+        # `_hold_newest`) until the next step ends or the ring is flushed (`_release_held`): its
+        # rows already on the CPU, and which of its device rows changed since (a follower's
+        # update, its weight check read again, a follower's loss).
+        self._held: dict[str, Any] | None = None
         self._step_depth = 0
         self._outer_frame: Any = None
         self._closed = False
@@ -1045,7 +1070,9 @@ class Session:
         # Bounded, as TensorBoard's SummaryWriter is (`max_queue=10`): if the sink falls
         # behind, for example on a stalled network filesystem, training waits for it
         # instead of holding every unwritten step in memory. No step is dropped.
-        self._queue: queue.Queue[Any] = queue.Queue(maxsize=WRITER_QUEUE)
+        # A full ring is queued as two items, all but its newest step and then that step
+        # (`_hold_newest`), one when it is one step: the bound stays WRITER_QUEUE rings.
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=WRITER_QUEUE * (1 if every == 1 else 2))
         self._warned_backpressure = False
         self._worker = threading.Thread(target=self._drain, name="tensorquill-writer", daemon=True)
         self._worker.start()
@@ -1120,6 +1147,10 @@ class Session:
     def _should_check_weights(self) -> bool:
         return self._cadence(self.weight_every)
 
+    def _grads_wanted(self) -> bool:
+        # A weight check owed by a step the scaler skipped needs this step's gradient norms too.
+        return self._should_record_grads() or self._weight_check_owed
+
     def _cadence(self, every: int) -> bool:
         # The every-th, 2*every-th, ... step, counting from 1 (as Lightning and wandb do).
         return every > 0 and (self._steps_committed + 1) % every == 0
@@ -1145,6 +1176,7 @@ class Session:
         if self._closed:
             return
         if not self._owns(optimizer):
+            self._foreign_stepped = True
             self._note_foreign_step()
             return
         # PyTorch wraps each optimizer class's own `step` with the global hooks, so an
@@ -1159,20 +1191,24 @@ class Session:
         self._step_depth, self._outer_frame = 1, wrapper
         # One TensorQuill step per training iteration. With several optimizers on one
         # model, the first one that ever stepped leads: its steps end TensorQuill steps,
-        # and the others' steps add none and record nothing twice. Gradients are read
-        # before the lead steps, after backward, so they include every optimizer's
-        # parameters.
+        # and the others' steps add none and record nothing twice; what they change is
+        # written on the step the lead ended (`_after_optimizer_step`), which assumes they
+        # step after it in each iteration. Gradients are read before the lead steps, after
+        # backward, so they include every optimizer's parameters.
         lead = self._lead() if self._lead is not None else None
         if lead is None:
             self._lead, lead = weakref.ref(optimizer), optimizer
         self._leading = optimizer is lead
+        if self._leading and self._probe_owed:
+            # Every optimizer of the previous iteration has stepped: its probe runs now.
+            self._run_owed_probe()
         if self._leading and self._snapshot_due:
             self._snapshot_before = optimizer_entries(optimizer)
         # With `step(closure)`, the closure runs forward and backward inside the step, so
         # gradients are read after it instead (Lightning steps this way).
         closure = kwargs.get("closure", args[1] if len(args) > 1 else None)
         self._grads_after_step = callable(closure)
-        if self._leading and not self._grads_after_step and not self._grads_recorded and self._should_record_grads():
+        if self._leading and not self._grads_after_step and not self._grads_recorded and self._grads_wanted():
             self.record_grads()
 
     def _after_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
@@ -1182,13 +1218,25 @@ class Session:
             self._step_depth -= 1
             return
         self._step_depth, self._outer_frame = 0, None
+        self._stepped = True
+        # An optimizer that steps after the lead ended the step (two optimizers on one model,
+        # `opt1.step(); opt2.step()`: Muon and AdamW, a GAN's two halves in one module) belongs to
+        # that step, which is still the newest in the ring (when it filled the ring, `_commit` kept
+        # it back): what it changes is written on that step's record, not the next one's. Under a
+        # loss scaler, `scaler.update()` ends the step after every optimizer has stepped, so
+        # nothing follows there.
+        follows = not self._leading and not self._commit_on_update and bool(self._steps)
         if self.updates:
-            # Every optimizer that holds some of this model's parameters, not only the lead: one
-            # that steps after the lead has ended the step is read into the next record.
-            self._read_updates(optimizer)
+            # Every optimizer that holds some of this model's parameters, not only the lead.
+            if follows and not self._update_recorded:
+                self._read_late_updates(optimizer)
+            else:
+                self._read_updates(optimizer)
+        if follows:
+            self._follow()
         if not self._leading:
             return
-        if self._grads_after_step and not self._grads_recorded and self._should_record_grads():
+        if self._grads_after_step and not self._grads_recorded and self._grads_wanted():
             self.record_grads()
         if self._snapshot_due and self._snapshot_before is not None:
             self._snapshot_due = False
@@ -1201,14 +1249,103 @@ class Session:
         if not self._commit_on_update:
             self._commit(None)
 
+    @torch.no_grad()
+    def _read_late_updates(self, optimizer: Any) -> None:
+        """`_read_updates` for an optimizer that stepped after the lead ended the step: merged
+        into the newest row of the ring parameter by parameter, so the lead's entries stay."""
+        self._read_updates(optimizer)
+        if not self._update_recorded:
+            return
+        target = self._ring_update[len(self._steps) - 1]
+        if not self._ring_update_seen[-1]:
+            target.zero_()  # nothing was read into this row yet: it still holds an older step's values
+        target.copy_(torch.where(self._update[:, 1:] > 0, self._update, target))
+        self._update.zero_()
+        self._update_recorded = False
+        self._ring_update_seen[-1] = True
+        self._mark_held("update")
+
+    @torch.no_grad()
+    def _follow(self) -> None:
+        """After an optimizer that stepped later than the lead in the same iteration."""
+        first = not self._followers
+        self._followers = True
+        if self._recheck:
+            # The newest step's weight check is read again now that this optimizer has moved its
+            # parameters, against the same earlier check; and which parameters an optimizer that
+            # has stepped holds is judged again, now that this one has (at the first step it had not).
+            # One more read of the weights per follower, on weight-check steps only.
+            self._prev_weight = None if self._weights_before is None else self._weights_before.clone()
+            if self._not_exact_before is not None:
+                self._weights_not_exact = self._not_exact_before
+            self._record_weights()
+            self._ring_grad[len(self._steps) - 1, :, 2:].copy_(self._grad[:, 2:])
+            self._grad[:, 2:].zero_()
+            self._mark_held("grad")
+            self._ring_weight_seen[-1] = {"ownership": self._optimizer_ownership(), "dtypes": self._weight_dtypes}
+        if first and self._ring_probe[-1] is not None:
+            # The probe ran when the lead ended the step, before any follower was known: it runs
+            # again once every optimizer of this iteration has stepped. Later probes wait (`_commit`).
+            self._probe_owed = True
+
+    def _run_owed_probe(self) -> None:
+        """The newest step's probe, held until every optimizer of its iteration stepped: run at the
+        lead's next step, or when the next step ends, the ring is flushed or the session closes."""
+        self._probe_owed = False
+        if not self._steps:
+            return
+        # The next iteration's forward may have begun filling the buffers that the probe clears
+        # after it runs: they are put back as they were, versions included (see `_commit`).
+        buffers = [b for b in (self._act, *self._counts_list) if b.numel() > 0]
+        versions = [b._version for b in buffers]
+        kept = [b.clone() for b in buffers]
+        try:
+            self._ring_probe[-1] = self._probe()
+        finally:
+            with torch.no_grad():
+                for buf, value in zip(buffers, kept):
+                    buf.copy_(value)
+            _restore_versions(buffers, versions)
+
+    def _follows(self, optimizer: Any) -> bool:
+        """Whether `optimizer` steps after the lead ended the step, so what it brings belongs to
+        the newest step in the ring (for the Lightning callback's loss)."""
+        lead = self._lead() if self._lead is not None else None
+        return (
+            lead is not None and optimizer is not lead and self.auto_step and not self._commit_on_update
+            and bool(self._steps) and not self._closed and self._owns(optimizer)
+        )
+
+    def _add_to_newest(self, name: str, value: Any) -> None:
+        """Add `value` to the scalar `name` of the newest step in the ring (or set it there): the
+        loss back-propagated for an optimizer that steps after the lead ended the step."""
+        pending, self._pending_scalars = self._pending_scalars, {}
+        try:
+            self.log({name: value})  # the same checks and the same copy on the device as `log`
+            new = self._pending_scalars[name]
+        finally:
+            self._pending_scalars = pending
+        row = dict(self._ring_scalars[-1])
+        row[name] = new if row.get(name) is None else row[name] + new
+        self._ring_scalars[-1] = row
+        self._mark_held("scalars")
+
     def _watch_scaler(self, scaler: Any) -> None:
         original = scaler.update
 
         def update(*args: Any, **kwargs: Any) -> Any:
+            ends = False
             if not self._closed:
-                self._record_scaler(scaler)
+                # It ends a step only after an optimizer went through the scaler (or one of this
+                # model's stepped): `update(new_scale)` called on its own only sets the scale.
+                ends = self._record_scaler(scaler) or self._stepped
+                if ends and self._commit_on_update and not self._grads_recorded and self._grads_wanted():
+                    # A step the scaler skipped never reaches the optimizer hooks. Its gradients are
+                    # still there, unscaled by `scaler.step`, Inf or NaN where they overflowed:
+                    # read them here, so the record names the parameters that did.
+                    self.record_grads()
             out = original(*args, **kwargs)
-            if self._commit_on_update and not self._closed:
+            if ends and self._commit_on_update and not self._closed:
                 if self._pending_lr is None and self._lead is not None and self._lead() is not None:
                     self._pending_lr = _learning_rates(self._lead())
                 self._commit(None)
@@ -1217,22 +1354,24 @@ class Session:
         scaler.update = update  # an instance attribute; `close()` removes it
         self._scaler_original = original
 
-    def _record_scaler(self, scaler: Any) -> None:
+    def _record_scaler(self, scaler: Any) -> bool:
         # Read before `update()` resets them: whether any optimizer's gradients had an Inf
         # or NaN this iteration (the scaler then skipped its step), and the scale used.
         # Both stay tensors on the device until the next flush, so no sync is added.
+        # Returns whether any optimizer went through the scaler since its last update; with
+        # none, there is nothing to say of a step and nothing is recorded.
         scale = getattr(scaler, "_scale", None)
         if scale is None:
-            return
+            return False
         found = [
             f for state in scaler._per_optimizer_states.values()
             for f in state["found_inf_per_device"].values()
         ]
-        skipped = (
-            torch.stack([f.to(scale.device).reshape(()) for f in found]).sum() > 0
-            if found else torch.ones((), dtype=torch.bool, device=scale.device)
-        )
+        if not found:
+            return False
+        skipped = torch.stack([f.to(scale.device).reshape(()) for f in found]).sum() > 0
         self._pending_amp = {"step_skipped": skipped.float(), "grad_scale": scale.detach().clone()}
+        return True
 
     @torch.no_grad()
     def record_grads(self) -> None:
@@ -1611,7 +1750,13 @@ class Session:
         last = self._next_step - 1 if self._steps_committed else None
         if event == "save":
             manifest["after_step"] = last
-            if self._steps:  # the step it follows is still in the ring: record it there
+            # The step it follows is still in the ring, also when it filled the ring (`_commit`
+            # keeps the newest step back until the next one ends): record it there. The ring is
+            # empty only before the first step, or after an explicit `flush()` with no step since;
+            # the save then waits for the next step's record (its `after_step` still names the
+            # step it followed), and is not written if the session closes first: no record is
+            # invented.
+            if self._steps:
                 row = self._ring_checkpoint[-1] or {}
                 row["save"] = manifest
                 self._ring_checkpoint[-1] = row
@@ -1712,6 +1857,10 @@ class Session:
     @torch.no_grad()
     def _commit(self, step: int | None) -> None:
         current = self._next_step if step is None else step
+        if self._probe_owed:
+            self._run_owed_probe()  # the previous step's, before this one becomes the newest
+        if self._held is not None:
+            self._release_held()  # the step kept back when the ring last filled: this one ends it
         self._say_router_problems(stacklevel=4)
         if (
             not self._spread_recorded
@@ -1726,9 +1875,27 @@ class Session:
             # rank's own count of recorded steps, which can differ (a rank that started
             # its session later, or skipped a step), and would leave the others waiting.
             self.record_replica_spread(self._replica_group)
-        weights_checked = self._grads_recorded and self._should_check_weights() and bool(self._params)
+        # A step `scaler.update()` ended with no optimizer stepping is one the scaler skipped: its
+        # weights are the previous step's. Told on the host, with no sync. (The record's own
+        # `step_skipped` is the scaler's verdict, read at the flush.)
+        skipped = self._commit_on_update and not self._stepped and not self._foreign_stepped
+        self._stepped = self._foreign_stepped = False
+        # A weight check is not made on a skipped step, so that an unchanged weight always means
+        # an optimizer step that left it alone: one due there is made on the next step instead.
+        check_due = self._should_check_weights() or self._weight_check_owed
+        weights_checked = check_due and self._grads_recorded and bool(self._params) and not skipped
         if weights_checked:
+            self._weight_check_owed = False
+            # What this check compares with, kept for an optimizer that steps after the lead to
+            # read the check again (`_follow`). A copy of one number per parameter. Lane R1's
+            # `_record_weights` also keeps which parameters the previous check did not read
+            # exactly (`_weights_not_exact`); that is kept the same way where it exists.
+            self._weights_before = None if self._prev_weight is None else self._prev_weight.clone()
+            self._not_exact_before = getattr(self, "_weights_not_exact", None)
             self._record_weights()
+        elif check_due and skipped:
+            self._weight_check_owed = True
+        self._recheck = weights_checked
         row = len(self._steps)
         has_act = self._act.numel() > 0
         # The buffers the forward hooks write; their versions are kept over the zeroing below.
@@ -1753,6 +1920,7 @@ class Session:
         self._ring_clip_seen.append(self._clip_recorded)
         self._clip_recorded = False
         if self.updates:
+            no_optimizer = False
             if self._update_recorded:
                 self._ring_update[row].copy_(self._update)
                 self._update.zero_()
@@ -1762,12 +1930,11 @@ class Session:
                     "the optimizer hooks are off, so call session.record_updates(optimizer) after each optimizer.step()",
                 )
             elif self._lead is None:
-                # A step ended by `scaler.update()` with no optimizer of this model seen stepping.
-                self._update_why.setdefault(
-                    UPDATES_NO_OPTIMIZER,
-                    "no optimizer that has stepped holds this model's parameters (DeepSpeed ZeRO, Megatron-LM and "
-                    "FSDP1 step flattened or copied parameters), so there is no Adam state to read for them",
-                )
+                # A step ended by `scaler.update()` with no optimizer of this model seen stepping:
+                # one that steps copies of the weights, or a step the scaler skipped, where no
+                # optimizer stepped at all. Which, `flush` tells from the record's `step_skipped`.
+                no_optimizer = True
+            self._ring_no_optimizer.append(no_optimizer)
             self._ring_update_seen.append(self._update_recorded)
             self._update_recorded = False
         if self._spread_recorded and self._spread is not None and self._ring_spread is not None:
@@ -1816,9 +1983,19 @@ class Session:
         if probe_due:
             # The step is complete before the probe runs, so a failing probe loses only
             # its own result, recorded against the step, and never the step.
-            self._ring_probe[-1] = self._probe()
+            if self._followers:
+                # Other optimizers step after the lead in this run: the probe waits until they
+                # have (`_run_owed_probe`), so it reads the model as the whole step left it.
+                self._probe_owed = True
+            else:
+                self._ring_probe[-1] = self._probe()
         if len(self._steps) == self.every:
-            self.flush()
+            # A full ring is written at once but for its newest step, kept back until the next
+            # step ends (or a flush, or close): what arrives for that step after it ended, a save
+            # right after it (`_record_manifest`) or the update of an optimizer that steps after
+            # the lead (`_after_optimizer_step`), is written on its own record. A run that hangs
+            # or is killed in the next step has one step fewer on disk, never a block.
+            self._flush(hold_newest=True)
 
     def _cadence_probe(self) -> bool:
         return self._probe_fn is not None and self._cadence(self.probe_every)
@@ -1839,22 +2016,37 @@ class Session:
 
     def flush(self) -> None:
         """Move the ring to the CPU and queue it for the sink."""
+        self._flush(hold_newest=False)
+
+    def _clear_ring_lists(self) -> None:
+        self._steps = []
+        self._ring_lr = []
+        self._ring_ts = []
+        self._ring_scalars = []
+        self._ring_amp = []
+        self._ring_probe = []
+        self._ring_grad_seen = []
+        self._ring_weight_seen = []
+        self._ring_clip_seen = []
+        self._ring_update_seen = []
+        self._ring_no_optimizer = []
+        self._ring_spread_seen = []
+        self._ring_data = []
+        self._ring_checkpoint = []
+        self._ring_wait = []
+
+    def _flush(self, *, hold_newest: bool) -> None:
         if self._error is not None:
-            self._steps = []
-            self._ring_lr = []
-            self._ring_ts = []
-            self._ring_scalars = []
-            self._ring_amp = []
-            self._ring_probe = []
-            self._ring_grad_seen = []
-            self._ring_weight_seen = []
-            self._ring_clip_seen = []
-            self._ring_update_seen = []
-            self._ring_spread_seen = []
-            self._ring_data = []
-            self._ring_checkpoint = []
-            self._ring_wait = []
+            self._clear_ring_lists()
+            self._probe_owed = False
+            self._held = None
             self._raise_worker_error()
+        if self._probe_owed and not hold_newest:
+            self._run_owed_probe()  # the newest step's, before it leaves the ring (a held one stays)
+        if self._held is not None:
+            # The ring holds only the step kept back when it last filled.
+            self._release_held()
+            return
         n = len(self._steps)
         if n == 0:
             return
@@ -1888,14 +2080,23 @@ class Session:
         clip_seen = self._ring_clip_seen
         update_seen, self._ring_update_seen = self._ring_update_seen, []
         updates = _cpu_copy(self._ring_update[:n]) if any(update_seen) else None
+        amps = _scalars_to_cpu(self._ring_amp)
+        self._ring_amp = []
+        no_optimizer, self._ring_no_optimizer = self._ring_no_optimizer, []
+        if any(flag and not (amp and amp.get("step_skipped")) for flag, amp in zip(no_optimizer, amps)):
+            # A step that was not skipped, yet no optimizer of this model stepped: the one that
+            # did holds none of its parameters. A skipped step says nothing of that.
+            self._update_why.setdefault(
+                UPDATES_NO_OPTIMIZER,
+                "no optimizer that has stepped holds this model's parameters (DeepSpeed ZeRO, Megatron-LM and "
+                "FSDP1 step flattened or copied parameters), so there is no Adam state to read for them",
+            )
         update_why = {name: why for name, why in self._update_why.items() if name not in self._update_why_written}
         self._update_why_written.update(update_why)
         grad_seen = self._ring_grad_seen
         weight_seen = self._ring_weight_seen
         spread_seen = self._ring_spread_seen
         scalars = _scalars_to_cpu(self._ring_scalars)
-        amps = _scalars_to_cpu(self._ring_amp)
-        self._ring_amp = []
         probes = self._ring_probe
         data_rows, checkpoints = self._ring_data, _checkpoints_to_cpu(self._ring_checkpoint)
         self._ring_data = []
@@ -1922,6 +2123,101 @@ class Session:
             spread_seen, scalars, probes, stamps, amps, data_rows, checkpoints, waits, system,
             refused, announce, updates, update_seen, update_why,
         )
+        if hold_newest:
+            first = self._hold_newest(dict(zip(_BLOCK_FIELDS, block)), act_size=self._act.numel() if has_act else 0,
+                                      originals=(steps, lrs, stamps, data_rows, waits, no_optimizer))
+            if first is None:
+                return
+            block = tuple(first[key] for key in _BLOCK_FIELDS)
+        self._put(block)
+
+    def _hold_newest(self, block: dict[str, Any], *, act_size: int, originals: tuple[Any, ...]) -> dict[str, Any] | None:
+        """Split a full ring's block, already on the CPU in one transfer: the steps but the newest,
+        returned to be queued now, and the newest, kept as `self._held` (`_release_held`). Its
+        rows stay in the ring too, as its only row, so what arrives for it after it ended is
+        recorded there as for any step in the ring; only a device row changed since is read
+        again when it is written. None when the ring held one step (`every=1`)."""
+        n = len(block["steps"])
+        first: dict[str, Any] = {}
+        held: dict[str, Any] = {}
+        for key in ("steps", "lrs", "clip_seen", "grad_seen", "weight_seen", "spread_seen", "scalars", "probes",
+                    "stamps", "amps", "data_rows", "checkpoints", "waits", "update_seen"):
+            first[key], held[key] = block[key][:-1], block[key][-1:]
+        for key in ("spreads", "clips", "updates"):
+            rows = block[key]
+            first[key], held[key] = (None, None) if rows is None else (rows[:-1], rows[-1:].clone())
+        floats = block["floats"]
+        if floats is None:
+            first["floats"] = held["floats"] = None
+        else:
+            act = floats[: n * act_size].view(n, act_size)
+            grad = floats[n * act_size :].view(n, (floats.numel() - n * act_size) // n)
+            first["floats"] = torch.cat([act[:-1].reshape(-1), grad[:-1].reshape(-1)])
+            held["floats"] = torch.cat([act[-1], grad[-1]])
+        counts = block["counts"]
+        if counts is None:
+            first["counts"] = held["counts"] = None
+        else:
+            parts, offset = [], 0
+            for ring in self._ring_counts.values():
+                width = ring[0].numel()
+                parts.append(counts[offset : offset + n * width].view(n, width))
+                offset += n * width
+            first["counts"] = torch.cat([part[:-1].reshape(-1) for part in parts])
+            held["counts"] = torch.cat([part[-1] for part in parts])
+        # What is said once for the block goes on its first record, written now (with one step, on
+        # that step); the system readings on its last, as for any block.
+        last = n == 1
+        for key in ("announce", "update_why"):
+            first[key], held[key] = (None, block[key]) if last else (block[key], {})
+        first["system"], held["system"] = None, block["system"]
+        first["refused"] = held["refused"] = block["refused"]
+        self._held = {"block": held, "act_size": act_size, "dirty": set()}
+        # The ring keeps the newest step as its only row, at row 0: its Python entries as they were
+        # (logged tensors still on the device), and its update row on the device for a follower's.
+        steps, lrs, stamps, data_rows, waits, no_optimizer = originals
+        self._steps, self._ring_lr, self._ring_ts = steps[-1:], lrs[-1:], stamps[-1:]
+        self._ring_data, self._ring_wait, self._ring_no_optimizer = data_rows[-1:], waits[-1:], no_optimizer[-1:]
+        self._ring_scalars, self._ring_amp = block["scalars"][-1:], block["amps"][-1:]  # on the CPU now
+        self._ring_probe, self._ring_checkpoint = block["probes"][-1:], block["checkpoints"][-1:]
+        self._ring_grad_seen, self._ring_weight_seen = block["grad_seen"][-1:], block["weight_seen"][-1:]
+        self._ring_clip_seen, self._ring_spread_seen = block["clip_seen"][-1:], block["spread_seen"][-1:]
+        self._ring_update_seen = block["update_seen"][-1:]
+        if self.updates and n > 1:
+            self._ring_update[0].copy_(self._ring_update[n - 1])
+        return None if last else first
+
+    def _release_held(self) -> None:
+        """Queue the step kept back when the ring last filled, with what arrived for it since:
+        a save, a probe, a follower's update, weight check or loss. Only what changed on the
+        device is read again (with a follower, once a block); otherwise no transfer."""
+        held, self._held = self._held, None
+        if held is None:
+            return
+        block, dirty = held["block"], held["dirty"]
+        block["checkpoints"] = _checkpoints_to_cpu(self._ring_checkpoint)
+        block["probes"] = self._ring_probe
+        block["weight_seen"] = self._ring_weight_seen
+        block["update_seen"] = self._ring_update_seen
+        if "scalars" in dirty:
+            block["scalars"] = _scalars_to_cpu(self._ring_scalars)
+        if "update" in dirty:
+            block["updates"] = _cpu_copy(self._ring_update[:1])
+        if "grad" in dirty and block["floats"] is not None:
+            weights = block["floats"][held["act_size"] :].view(-1, 4)
+            weights[:, 2:] = self._ring_grad[0, :, 2:].cpu()
+        update_why = {name: why for name, why in self._update_why.items() if name not in self._update_why_written}
+        self._update_why_written.update(update_why)
+        block["update_why"] = {**block["update_why"], **update_why}
+        self._clear_ring_lists()
+        self._put(tuple(block[key] for key in _BLOCK_FIELDS))
+
+    def _mark_held(self, part: str) -> None:
+        """The held step's device row `part` changed after it was read (`_release_held`)."""
+        if self._held is not None:
+            self._held["dirty"].add(part)
+
+    def _put(self, block: tuple[Any, ...]) -> None:
         try:
             self._queue.put_nowait(block)
         except queue.Full:
@@ -2186,6 +2482,14 @@ class Session:
         if system and records:
             records[-1]["system"] = system
         return records
+
+
+# The parts of a block queued for the writer, in `Session._decode`'s order.
+_BLOCK_FIELDS = (
+    "steps", "lrs", "floats", "counts", "spreads", "clips", "clip_seen", "grad_seen", "weight_seen",
+    "spread_seen", "scalars", "probes", "stamps", "amps", "data_rows", "checkpoints", "waits", "system",
+    "refused", "announce", "updates", "update_seen", "update_why",
+)
 
 
 def _checkpoints_to_cpu(rows: list[dict[str, Any] | None]) -> list[dict[str, Any] | None]:
