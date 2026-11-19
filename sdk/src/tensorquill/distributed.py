@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+import itertools
+import json
+import time
+import weakref
+from typing import Any, Iterable
 
 import torch
 import torch.distributed as dist
+
+from .tracker import _brief, _say
 
 try:
     from torch.distributed.tensor import DTensor
@@ -133,6 +139,10 @@ def parameter_fingerprints(params: Iterable[torch.Tensor], *, projection: bool =
     a change that keeps all three values is possible, just far less likely, and equal
     fingerprints are not proof that tensors are equal. A complex tensor is read as its real
     pairs (`torch.view_as_real`): the same three values as the float tensor of those pairs.
+
+    This rank's own values only, with no collective: a parameter it cannot read (on `meta`,
+    sparse, nested, or tensors on different devices) raises here. `replica_spread` does not
+    call it, so a rank that cannot read a parameter never leaves the others waiting.
     """
     local = [unwrap_local(p) for p in params]
     if not local:
@@ -265,6 +275,168 @@ def _gather_problem(group: object, device: torch.device) -> str | None:
     return None
 
 
+#: At most how long `_agree_on_gather` waits at `init` for every member of the replica group to
+#: say whether it can take part in the drift check's gather, in seconds, and never longer than
+#: the default store's own timeout. After this the check is off on every rank, with the reason.
+AGREE_WAIT_SECONDS = 300.0
+
+# One set of keys in the default store for each agreement: the group's global ranks, then the
+# n-th agreement for those ranks in this process. Every member makes the same agreements in the
+# same order (one per session with that replica group, as for a collective), so the n-th on every
+# member reads the same keys, and a second session never reads the first one's verdicts.
+_AGREE_KEY = "tensorquill/replica_check/{}/{}"
+_agreements: dict[tuple[int, ...], Any] = {}
+# What the newest agreement on a group decided: (the table's device type, None for "gather", or
+# the reason every member skips). Weak, so a destroyed group's entry goes with it.
+_agreed: weakref.WeakKeyDictionary[Any, tuple[str, str | None]] = weakref.WeakKeyDictionary()
+
+
+def _agree_on_gather(group: object, device: torch.device, params: Iterable[torch.Tensor] = ()) -> str | None:
+    """At `init`, before the first scheduled check: make every member of `group` take the same
+    decision on whether the drift check's gather runs. Returns None (gather) or why every member
+    skips it, and keeps it for `_spread_and_unread` and `replica_spread` on `group`. Never raises.
+
+    `_gather_problem` alone is judged by each rank from what it sees, which ranks that differ do
+    not see alike (L5: a session on another device type; also a different number of replicated
+    parameters, whose gather of unequal shapes aborts the process under Gloo). So each member
+    puts its own verdict (`_gather_problem`, its table's device type, how many parameters it
+    compares) in the default process group's store, waits a bounded time for every member's, and
+    then puts "gather" (every member could, alike) or "skip" (any could not, they differ, or the
+    wait ran out) under one key with `compare_set`, first writer wins. Every member takes what
+    the store holds, so a member whose own wait ran out still follows one that saw every verdict.
+    No collective is issued and nothing is put on a device.
+
+    Only a real `ProcessGroup` of two or more members, on a rank in it, takes part: a stand-in
+    group (tests and tools with their own `all_gather`) and a rank outside the group are judged
+    as before, by `_gather_problem` at each check.
+
+    What this does not cover: a group that fails after `init` (a rank that dies, a timeout, an
+    aborted communicator) still fails in the gather inside the training step, as the training
+    run's own collectives on it do; and a member whose store fails after it has put its verdict
+    in cannot learn the decision, so it skips while the others may gather."""
+    try:
+        if dist.distributed_c10d._rank_not_in_group(group) or not isinstance(group, dist.ProcessGroup):
+            return None
+        if not dist.is_initialized():
+            return None
+        ranks = tuple(int(r) for r in dist.get_process_group_ranks(group))
+        me = int(dist.get_rank(group))
+        device = torch.device(device)
+        count = len(list(params))
+    except Exception:  # noqa: BLE001  an API this PyTorch does not have: each check decides alone
+        return None
+    if len(ranks) < 2 or not 0 <= me < len(ranks):
+        return None
+    try:
+        verdict = {"problem": _gather_problem(group, device), "device": device.type, "count": count}
+        base = _AGREE_KEY.format("-".join(map(str, ranks)), next(_agreements.setdefault(ranks, itertools.count())))
+        try:
+            store = dist.distributed_c10d._get_default_store()
+        except Exception as error:  # noqa: BLE001  nothing put in: no member can decide "gather"
+            why: str | None = f"rank {ranks[me]} could not reach the process group's store ({_brief(error)})"
+        else:
+            why = _exchange_verdicts(store, base, me, ranks, verdict, wait=_agree_wait(store))
+        _agreed[group] = (device.type, why)
+        return why
+    except Exception:  # noqa: BLE001  nothing here may stop a run
+        return None
+
+
+def _agree_wait(store: Any) -> float:
+    try:
+        wait = max(float(AGREE_WAIT_SECONDS), 0.0)
+    except (TypeError, ValueError):  # set to something that is not a number
+        wait = 300.0
+    try:
+        own = store.timeout.total_seconds()
+    except Exception:  # noqa: BLE001  a store with no timeout of its own
+        own = 0.0
+    return own if 0 < own < wait else wait
+
+
+def _exchange_verdicts(
+    store: Any, base: str, me: int, ranks: Iterable[int], verdict: dict, *, wait: float
+) -> str | None:
+    """`_agree_on_gather`'s exchange through `store`: this member's `verdict` under `base/<me>`
+    (`me` its index in the group), every member's read once all are there, and the decision
+    under `base/decision`, whichever member put it there first. Returns None ("gather") or the
+    reason. Polls with `check` (10 ms, doubling to 1 s) as `tracker._shared_run` does, never a
+    `get` on a missing key, which waits the store's whole timeout. Never raises."""
+    ranks = list(ranks)
+    keys = [f"{base}/{i}" for i in range(len(ranks))]
+    try:
+        store.set(keys[me], json.dumps(verdict))
+    except Exception as error:  # noqa: BLE001  this verdict is missing: no member can decide "gather"
+        return f"rank {ranks[me]} could not put its verdict in the process group's store ({_brief(error)})"
+    try:
+        deadline, pause = time.monotonic() + wait, 0.01
+        while not store.check(keys):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            time.sleep(min(pause, left))
+            pause = min(pause * 2, 1.0)
+        missing = [ranks[i] for i, key in enumerate(keys) if not store.check([key])]
+        if missing:
+            proposal = (
+                f"rank {ranks[me]} did not hear from {_ranks_text(missing)} of the replica group within {wait:g} s "
+                "at init (every rank must call tensorquill.init with the same replica_group)"
+            )
+        else:
+            proposal = _decide([json.loads(store.get(key)) for key in keys], ranks)
+        decided = json.loads(store.compare_set(f"{base}/decision", "", json.dumps({"why": proposal})))
+        why = decided["why"]
+        return None if why is None else str(why)
+    except Exception as error:  # noqa: BLE001  the window this cannot close: see `_agree_on_gather`
+        return (
+            f"the process group's store failed on rank {ranks[me]} while the ranks agreed whether to run it "
+            f"({_brief(error)})"
+        )
+
+
+def _ranks_text(ranks: list[int]) -> str:
+    return f"rank {ranks[0]}" if len(ranks) == 1 else "ranks " + ", ".join(map(str, ranks))
+
+
+def _decide(verdicts: list[Any], ranks: list[int]) -> str | None:
+    """None when every member can gather, alike; else why none does. The same on every member,
+    since each reads the same verdicts in the same order."""
+    problems = []
+    for rank, verdict in zip(ranks, verdicts):
+        if not isinstance(verdict, dict):
+            problems.append((rank, "its verdict could not be read"))
+        elif verdict.get("problem"):
+            problems.append((rank, str(verdict["problem"])))
+    if problems:
+        rank, problem = problems[0]
+        more = f" (as do {len(problems) - 1} more)" if len(problems) > 1 else ""
+        return f"rank {rank} of the replica group cannot take part{more}: {problem}"
+    for field, what in (
+        ("device", "the replicas' sessions are on different device types ({}), and fingerprints made on different "
+                   "devices are neither gathered alike nor computed alike"),
+        ("count", "the replicas compare different numbers of parameters ({}), and a gather of tables of different "
+                  "shapes cannot be issued"),
+    ):
+        seen: dict[str, list[int]] = {}
+        for rank, verdict in zip(ranks, verdicts):
+            seen.setdefault(str(verdict.get(field)), []).append(rank)
+        if len(seen) > 1:
+            return what.format("; ".join(f"{value} on {_ranks_text(members)}" for value, members in seen.items()))
+    return None
+
+
+def _agreed_problem(group: object, device: torch.device) -> str | None:
+    """Why the agreement at `init` (`_agree_on_gather`) turned the check off on `group` for a
+    table on `device`'s type, or None: it decided to gather, or it was never made."""
+    try:
+        found = _agreed.get(group)
+    except TypeError:  # a stand-in group that cannot be weakly referenced: never agreed
+        return None
+    if found is None or found[0] != device.type:
+        return None
+    return found[1]
+
+
 @torch.no_grad()
 def _spread_and_unread(
     params: Iterable[torch.Tensor], group: dist.ProcessGroup, *, projection: bool, device: torch.device | None = None
@@ -281,9 +453,13 @@ def _spread_and_unread(
     process group, a rank outside the group), no collective is issued: every row comes back
     with the code `_NOT_GATHERED`, zeros for its spread and the reason, so the session leaves
     every parameter out of `replica_spread` and names each once, as for a parameter that could
-    not be read. Every rank of the group decides this alike, so none waits for another. A gather
-    that raises once issued is not caught: a rank that caught it and went on would issue its
-    next collective (the training run's own) while its peers still wait in this one."""
+    not be read. The same holds where the agreement at `init` (`_agree_on_gather`) turned the
+    check off: every member of the group took that one decision, so where ranks would judge
+    differently by themselves (sessions on different device types) none gathers while another
+    skips. Without an agreement, each rank judges alone, which every rank of a data-parallel job
+    does alike. A gather that raises once issued is not caught: a rank that caught it and went
+    on would issue its next collective (the training run's own) while its peers still wait in
+    this one. So a group that fails after `init` still fails here, inside the training step."""
     params = list(params)
     if device is None:
         locals_ = [unwrap_local(p) for p in params]
@@ -291,7 +467,7 @@ def _spread_and_unread(
             (torch.device("cpu") if p.device.type == "mps" else p.device for p in locals_ if not _unread_code(p)),
             torch.device("cpu"),
         )
-    why = _gather_problem(group, device)
+    why = _agreed_problem(group, device) or _gather_problem(group, device)
     if why is not None:
         width = FINGERPRINT_WIDTH if projection else 2
         n = len(params)
@@ -329,10 +505,36 @@ def replica_spread(
     costs about seven times the norm and sum on CPU; its GPU cost is not yet measured.
     `group`: the replication group. Pass `dist.group.WORLD` only for plain DDP;
     under tensor, pipeline or hybrid-FSDP parallelism WORLD compares the wrong ranks.
+
+    A parameter that some replica cannot read (on `meta`, nested or sparse, or one whose reading
+    raised) is still gathered, so every rank enters the same `all_gather` with the same shape and
+    none is left waiting; its row is NaN on every rank, and one warning per call names it with
+    why. Where the gather cannot run at all (as the session's check judges it: no backend for the
+    tensors' device, no process group, a rank outside `group`, or a session's agreement at
+    `init` that turned the check off on `group`), no collective is issued and every row is NaN,
+    with the reason. A NaN weight that was read gives NaN too, with no warning. A gather that
+    fails once issued still raises here. It gathers 32 bytes per parameter per rank (24 without
+    the projection), the session's table, so every rank must run a TensorQuill that gathers alike.
     """
     if group is None:
         raise ValueError("pass the replication process group explicitly")
-    fp = parameter_fingerprints(params, projection=projection)
-    out = [torch.empty_like(fp) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(out, fp, group=group)  # 24 bytes per tensor per rank
-    return spread_from_fingerprints(torch.stack(out))
+    params = list(params)
+    if not params:
+        raise ValueError("no replicated parameters to check")
+    spread, unread, reasons = _spread_and_unread(params, group, projection=projection)
+    codes = unread.tolist()  # one transfer: which rows to name
+    if not any(codes):
+        return spread
+    spread = torch.where(unread[:, None] != 0, torch.full_like(spread, float("nan")), spread)
+    named = [
+        f"parameter {i} of {len(params)}: {reasons[i] or f'on another replica in the group, {_unread_reason(code)}'}"
+        for i, code in enumerate(codes)
+        if code
+    ]
+    shown = "; ".join(named[:8]) + (f"; and {len(named) - 8} more" if len(named) > 8 else "")
+    _say(
+        f"tensorquill.distributed.replica_spread did not compare {len(named)} of {len(params)} parameters across "
+        f"replicas, which are NaN in its result: {shown}.",
+        stacklevel=3,
+    )
+    return spread
