@@ -515,3 +515,11 @@ def test_c16_the_shared_fixture():
             assert found is None, name
         else:
             assert found is not None and {k: found.get(k) for k in want} == want, name
+
+
+def test_c16_a_lone_rank_with_hashes_is_listed_as_before():
+    lone = [{**r, "rank": 0} for r in _drawn(0, range(3), NEW[:3])]
+    assert dc._ranks_compared(dc._hashed_steps(lone)) == [0]
+    assert dc.detect_duplicate_batches(lone) is None
+    two_kinds = lone + [{**r, "rank": 1} for r in _drawn(0, range(3), OLD[:3])]
+    assert dc._ranks_compared(dc._hashed_steps(two_kinds)) == []

@@ -204,7 +204,10 @@ def _ranks_compared(by_rank: Mapping[int, list[tuple[int, int, str]]]) -> list[i
     """The ranks a comparison is made for: each that wrote, among its last `DUPLICATE_WINDOW`
     hashed steps, a hash of a kind another rank wrote there too. Hashes of two kinds are never
     compared (C16, Nov 19, 2026: every rank with a hash was listed, which claimed comparisons
-    across an encoding change that were never made)."""
+    across an encoding change that were never made). A lone rank with hashed batches is listed,
+    as before (`detect_duplicate_batches` makes no incident for it)."""
+    if len(by_rank) == 1:
+        return sorted(by_rank)
     kinds = {rank: {hash_kind(digest) for _, _, digest in rows[-DUPLICATE_WINDOW:]} for rank, rows in by_rank.items()}
     return sorted(rank for rank in by_rank if any(kinds[rank] & kinds[other] for other in by_rank if other != rank))
 
