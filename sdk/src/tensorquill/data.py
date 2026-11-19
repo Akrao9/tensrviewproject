@@ -20,9 +20,11 @@ same samples in the same order gets the same hash. It is written as 16 hex digit
 from __future__ import annotations
 
 import collections
+import copyreg
 import hashlib
 import numbers
 import sys
+import threading
 import warnings
 from array import array
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -150,54 +152,145 @@ def _sampler_info(loader: Any) -> tuple[Any, Any, Any]:
     return with_epoch, getattr(with_epoch, "shuffle", None), getattr(with_epoch, "rank", None)
 
 
-def _record_indices(target: Any, fifo: collections.deque) -> bool:
-    """Make `target` (a batch sampler, or a sampler when batching is off) put each item it
-    yields into `fifo`. `iter()` looks `__iter__` up on the type, so the instance's class is
-    swapped for a subclass; the DataLoader refuses a new `batch_sampler` attribute."""
-    base = type(target)
-    if getattr(base, "_tensorquill_recording", False):
-        target._tensorquill_fifo = fifo
+# Index batches a watched pass may hold before they are noted. A DataLoader draws ahead only as
+# far as its workers prefetch; a pass that draws further notes the rest of its batches as
+# unknown rather than risk pairing a batch with another batch's indices.
+_FIFO_LIMIT = 4096
+
+_claim = threading.local()  # .target, .fifo: the pass being opened on this thread
+_swap_lock = threading.Lock()
+_swapped: dict[int, list[Any]] = {}  # id(target) -> [target, its own class, open windows]
+_recording_classes: dict[type, type] = {}
+
+
+class _Fifo:
+    """One watched pass's index batches, in the order the sampler yielded them."""
+
+    __slots__ = ("items", "lost")
+
+    def __init__(self) -> None:
+        self.items: collections.deque = collections.deque()
+        self.lost = False
+
+
+def _recorded(inner: Iterator[Any], fifo: _Fifo) -> Iterator[Any]:
+    for item in inner:
+        if not fifo.lost:
+            if len(fifo.items) >= _FIFO_LIMIT:
+                fifo.lost = True
+                fifo.items.clear()
+            else:
+                fifo.items.append(item)
+        yield item
+
+
+def _plain_copy(obj: Any, base: type) -> Any:
+    """`obj` as an instance of its own class `base`, for pickling and copying."""
+    clone = object.__new__(base)
+    if hasattr(obj, "__dict__"):
+        clone.__dict__.update(obj.__dict__)
+    for name in copyreg._slotnames(base):  # type: ignore[attr-defined]
+        if hasattr(obj, name):
+            object.__setattr__(clone, name, getattr(obj, name))
+    return clone
+
+
+def _recording_class(base: type) -> type:
+    """A subclass of `base` whose `__iter__` records into the pass this thread is opening, if
+    it is opening one on this very object, and is `base.__iter__` otherwise. No slots of its
+    own, so an instance's class can be swapped to it and back; it pickles and copies as `base`."""
+    cls = _recording_classes.get(base)
+    if cls is not None:
+        return cls
+
+    def __iter__(self: Any) -> Iterator[Any]:
+        # A plain function, not a generator: the pass is claimed when the iterator is made.
+        inner = base.__iter__(self)
+        if getattr(_claim, "target", None) is not self:
+            return inner
+        return _recorded(iter(inner), _claim.fifo)
+
+    def __reduce_ex__(self: Any, protocol: Any) -> Any:
+        return _plain_copy(self, base).__reduce_ex__(protocol)
+
+    cls = type(base.__name__, (base,), {
+        "__slots__": (), "__iter__": __iter__, "__reduce_ex__": __reduce_ex__, "__qualname__": base.__qualname__,
+    })
+    _recording_classes[base] = cls
+    return cls
+
+
+def _swap_in(target: Any) -> bool:
+    """Give `target` its recording class for one window; False when its class cannot change."""
+    with _swap_lock:
+        entry = _swapped.get(id(target))
+        if entry is not None and entry[0] is target:
+            entry[2] += 1
+            return True
+        base = type(target)
+        try:
+            target.__class__ = _recording_class(base)
+        except (TypeError, AttributeError):
+            return False
+        _swapped[id(target)] = [target, base, 1]
         return True
 
-    class Recording(base):  # type: ignore[misc, valid-type]
-        _tensorquill_recording = True
 
-        def __iter__(self) -> Iterator[Any]:
-            queue = self.__dict__.get("_tensorquill_fifo")
-            if queue is not None:
-                queue.clear()  # a new pass: what an abandoned one drew ahead is not coming
-            for item in base.__iter__(self):
-                if queue is not None:
-                    queue.append(item)
-                yield item
+def _swap_out(target: Any) -> None:
+    """End one window: when it was the last open one, `target` has its own class back."""
+    with _swap_lock:
+        entry = _swapped.get(id(target))
+        if entry is None or entry[0] is not target:
+            return
+        entry[2] -= 1
+        if entry[2] > 0:
+            return
+        del _swapped[id(target)]
+        if type(target) is _recording_classes.get(entry[1]):
+            try:
+                target.__class__ = entry[1]
+            except (TypeError, AttributeError):
+                pass
 
-    Recording.__name__ = base.__name__
-    Recording.__qualname__ = base.__qualname__
+
+def _report(message: str) -> None:
+    """Say what went wrong without raising into training: a RuntimeWarning, and where warnings
+    are turned into errors (`python -W error`), a line on stderr instead."""
     try:
-        target.__class__ = Recording
-        target._tensorquill_fifo = fifo
-    except (TypeError, AttributeError):
-        return False
-    return True
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+    except Exception:  # noqa: BLE001
+        try:
+            sys.stderr.write(f"{message}\n")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class WatchedLoader:
     """Iterates a DataLoader and notes each batch with `session.data`. Every other attribute
-    is the loader's. Made by `session.watch_loader(loader)`."""
+    is the loader's. Made by `session.watch_loader(loader)`.
+
+    The indices are read from the loader's batch sampler (or its sampler, with batching off)
+    while one of this wrapper's passes draws them. The sampler's class is swapped for a
+    recording subclass only while a pass is opened, from `iter()` to its first batch (Accelerate's
+    loaders draw from the sampler only at the first `next()`), and the recording reaches only
+    the pass being opened on that thread. At every other moment the sampler is its own class:
+    it pickles, a pass over the unwrapped loader records nothing, and two wrappers of one loader,
+    or two passes of one wrapper, each have their own queue. Once the session is closed the
+    wrapper yields the loader's batches and notes nothing.
+    """
 
     def __init__(self, session: Any, loader: Any, *, ids: Callable[[Any], Any] | None = None, epoch: int = 0) -> None:
         self._session = session
         self._loader = loader
         self._ids = ids
         self._epoch = epoch - 1  # incremented at the start of each pass
-        self._fifo: collections.deque = collections.deque()
         self._warned = False
         self._sampler, self._shuffle, self._data_rank = _sampler_info(loader)
-        self._indices = False
+        self._target: Any = None
         if ids is None and getattr(loader, "in_order", True) is not False:
             batch_sampler = getattr(loader, "batch_sampler", None)
-            target = batch_sampler if batch_sampler is not None else getattr(loader, "sampler", None)
-            self._indices = target is not None and _record_indices(target, self._fifo)
+            self._target = batch_sampler if batch_sampler is not None else getattr(loader, "sampler", None)
+        self._indices = self._target is not None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._loader, name)
@@ -205,22 +298,59 @@ class WatchedLoader:
     def __len__(self) -> int:
         return len(self._loader)
 
+    def _session_closed(self) -> bool:
+        return bool(getattr(self._session, "_closed", False))
+
     def __iter__(self) -> Iterator[Any]:
         self._epoch += 1
-        for batch in self._loader:
-            try:
-                self._note(batch)
-            except Exception as error:  # noqa: BLE001 - bookkeeping never stops training
-                if not self._warned:
-                    self._warned = True
-                    warnings.warn(f"TensorQuill could not note a batch: {error!r}", RuntimeWarning, stacklevel=2)
+        if self._session_closed():
+            yield from self._loader
+            return
+        fifo = _Fifo() if self._indices else None
+        iterator, first, done = self._open(fifo)
+        if done:
+            return
+        batch = first
+        while True:
+            if not self._session_closed():
+                try:
+                    self._note(batch, fifo)
+                except Exception as error:  # noqa: BLE001 - bookkeeping never stops training
+                    if not self._warned:
+                        self._warned = True
+                        _report(f"TensorQuill could not note a batch: {error!r}")
             yield batch
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                return
 
-    def _note(self, batch: Any) -> None:
+    def _open(self, fifo: _Fifo | None) -> tuple[Iterator[Any], Any, bool]:
+        """Make the loader's iterator and take its first batch, recording into `fifo` the
+        index batches the sampler yields to this pass. Returns (iterator, first batch, empty)."""
+        target = self._target
+        swapped = fifo is not None and _swap_in(target)
+        previous = (getattr(_claim, "target", None), getattr(_claim, "fifo", None))
+        if swapped:
+            _claim.target, _claim.fifo = target, fifo
+        elif fifo is not None:
+            self._indices = False  # the sampler's class cannot change: no indices from now on
+        try:
+            iterator = iter(self._loader)
+            try:
+                return iterator, next(iterator), False
+            except StopIteration:
+                return iterator, None, True
+        finally:
+            if swapped:
+                _claim.target, _claim.fifo = previous
+                _swap_out(target)
+
+    def _note(self, batch: Any, fifo: _Fifo | None) -> None:
         if self._ids is not None:
             values = self._ids(batch)
-        elif self._indices and self._fifo:
-            values = self._fifo.popleft()
+        elif fifo is not None and fifo.items:
+            values = fifo.items.popleft()
         else:
             values = None
         sampler = self._sampler

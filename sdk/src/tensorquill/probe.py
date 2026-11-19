@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import contextlib
 import math
+import random
+import sys
+import threading
 from typing import Any, Callable, Iterator, Mapping
 
 import torch
@@ -33,11 +36,14 @@ class ProbeState:
 
     The hooks do nothing while `active` is False. Compiled code only runs while it is
     False, so Dynamo traces the hooks as no-ops and guards on the flag, and the probe,
-    which runs without the compiler, never causes a recompile.
+    which runs without the compiler, never causes a recompile. While it is True they read
+    only calls made on `thread`, the thread running the probe: another thread's forward of
+    the same model is not the probe's.
     """
 
     def __init__(self) -> None:
         self.active = False
+        self.thread: int | None = None
         self.block: str | None = None
         self.histograms: dict[str, dict[str, Any]] = {}
         self.attention: dict[str, dict[str, Any]] = {}
@@ -57,11 +63,11 @@ def install_probe_hooks(blocks: list[tuple[str, nn.Module]], state: ProbeState) 
     handles = []
     for name, module in blocks:
         def pre(_module: nn.Module, _args: Any, name: str = name) -> None:
-            if state.active:
+            if state.active and state.thread == threading.get_ident():
                 state.block = name
 
         def post(_module: nn.Module, _args: Any, output: Any, name: str = name) -> None:
-            if state.active:
+            if state.active and state.thread == threading.get_ident():
                 tensor = _first_float(output)
                 if tensor is not None:
                     state.histograms[name] = _histogram(tensor, state.bins)
@@ -92,8 +98,36 @@ def _histogram(tensor: torch.Tensor, bins: int) -> dict[str, Any]:
     lo, hi = (float(v) for v in torch.aminmax(values))
     if lo == hi:
         lo, hi = lo - 0.5, hi + 0.5
-    counts = torch.histc(values, bins=bins, min=lo, max=hi)
-    return {"lo": lo, "hi": hi, "counts": [int(c) for c in counts.tolist()], "nonfinite": nonfinite}
+    if torch.are_deterministic_algorithms_enabled():
+        counts = _histc_counts(values, bins, lo, hi)
+    else:
+        counts = [int(c) for c in torch.histc(values, bins=bins, min=lo, max=hi).tolist()]
+    return {"lo": lo, "hi": hi, "counts": counts, "nonfinite": nonfinite}
+
+
+def _histc_counts(values: torch.Tensor, bins: int, lo: float, hi: float) -> list[int]:
+    """`torch.histc(values, bins, lo, hi)`'s counts, for when deterministic algorithms are on.
+
+    `histc` has no deterministic CUDA kernel and raises then; `bincount` without weights
+    counts with integer atomics and is allowed (`SummaryOps.cu`, PyTorch 2.6 and later). Each
+    float32 value v goes to bin `int((v - lo) * bins / (hi - lo))`, in float32 and in that
+    order, the top value to the last bin: histc's own arithmetic, on the CPU
+    (`HistogramKernel.cpp`, LINEAR_INTERPOLATION, its edges from `linspace`, whose first and
+    last are lo and hi) and on CUDA (`getBin`). `hi - lo` stays a tensor on the values'
+    device, because CUDA divides by a CPU scalar as a product with its reciprocal. Two
+    differences: counts are int64, where histc adds in float32 and stops counting a bin at
+    2^24, and where `(v - lo) * bins` overflows float32 (a span above about 5e36) histc's
+    index is undefined, while here the value goes to the last bin. The bin index is made a
+    chunk at a time, CHUNK_ELEMENTS int64 values at most.
+    """
+    left = torch.tensor(lo, dtype=torch.float32, device=values.device)
+    span = torch.tensor(hi, dtype=torch.float32, device=values.device) - left
+    counts = torch.zeros(bins, dtype=torch.int64, device=values.device)
+    for start in range(0, values.numel(), CHUNK_ELEMENTS):
+        pos = (values[start : start + CHUNK_ELEMENTS] - left) * bins / span
+        pos = pos.nan_to_num_(0.0, bins - 1, 0.0).clamp_(0, bins - 1)
+        counts += torch.bincount(pos.to(torch.int64), minlength=bins)
+    return [int(c) for c in counts.tolist()]
 
 
 def _not_plain_linear(module: nn.Module) -> str | None:
@@ -156,7 +190,7 @@ def install_head_hook(head: nn.Module, state: ProbeState) -> list[Any]:
     is gathered then, and may be sharded again once the forward is over."""
 
     def pre(module: nn.Module, args: Any) -> None:
-        if not state.active or state.head_problem is not None:
+        if not state.active or state.thread != threading.get_ident() or state.head_problem is not None:
             return
         hidden = args[0] if args else None
         if not isinstance(hidden, torch.Tensor) or not hidden.is_floating_point():
@@ -405,43 +439,153 @@ def _attention_stats_fp32(
     }
 
 
-@contextlib.contextmanager
-def _interpose_sdpa(state: ProbeState) -> Iterator[None]:
-    original = F.scaled_dot_product_attention
+# The probe reads attention by replacing `F.scaled_dot_product_attention`, which is one
+# attribute for the whole process. One wrapper serves every probe: it is put in place when the
+# first probe opens and taken out when the last one closes (`_interpose_sdpa`), and it reads a
+# call only on a thread with a probe open, the newest one there. Any other call goes straight
+# to the function it replaced, with the arguments it was given.
+_sdpa_lock = threading.Lock()
+_sdpa_original: Any = None  # what the wrapper calls; kept, since a caller may hold the wrapper
+_sdpa_open = 0
+_sdpa_probes: dict[int, list[ProbeState]] = {}  # thread id -> its open probes, newest last
 
-    def probe_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kw):
-        out = original(
-            query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
-            is_causal=is_causal, scale=scale, **kw,
-        )
+
+def _probe_sdpa(*args: Any, **kwargs: Any) -> Any:
+    original = _sdpa_original
+    if torch.compiler.is_compiling():
+        return original(*args, **kwargs)
+    probes = _sdpa_probes.get(threading.get_ident())
+    if not probes:
+        return original(*args, **kwargs)
+    out = original(*args, **kwargs)
+    _note_attention(probes[-1], args, kwargs)
+    return out
+
+
+def _sdpa_arguments(query: Any, key: Any, value: Any, attn_mask: Any = None, dropout_p: float = 0.0,
+                    is_causal: bool = False, scale: Any = None, **_: Any) -> tuple[Any, Any, Any, bool, Any]:
+    return query, key, attn_mask, is_causal, scale
+
+
+def _note_attention(state: ProbeState, args: tuple, kwargs: dict) -> None:
+    """Record one call's statistics. The call itself has already returned; statistics that
+    cannot be read from inputs SDPA accepts (5-D query and key, no keys) are that entry's
+    `error`, and the rest of the probe goes on."""
+    try:
         name = state.block or "attention"
         label, n = name, 1
         while label in state.attention:
             label, n = f"{name}#{n}", n + 1
+    except Exception:  # noqa: BLE001  # bookkeeping never reaches the forward
+        return
+    try:
+        query, key, attn_mask, is_causal, scale = _sdpa_arguments(*args, **kwargs)
         state.attention[label] = _attention_stats(query, key, attn_mask, is_causal, scale, state.map_size)
-        return out
+    except Exception as error:  # noqa: BLE001
+        state.attention[label] = {"error": f"{type(error).__name__}: {error}"}
 
-    F.scaled_dot_product_attention = probe_sdpa
+
+@contextlib.contextmanager
+def _interpose_sdpa(state: ProbeState) -> Iterator[None]:
+    """Read the SDPA calls this thread makes while open (see `_probe_sdpa`)."""
+    global _sdpa_original, _sdpa_open
+    thread = threading.get_ident()
+    with _sdpa_lock:
+        if _sdpa_open == 0 and F.scaled_dot_product_attention is not _probe_sdpa:
+            _sdpa_original = F.scaled_dot_product_attention
+            F.scaled_dot_product_attention = _probe_sdpa
+        _sdpa_open += 1
+        _sdpa_probes.setdefault(thread, []).append(state)
     try:
         yield
     finally:
-        F.scaled_dot_product_attention = original
+        with _sdpa_lock:
+            probes = _sdpa_probes.get(thread, [])
+            if state in probes:
+                # The newest entry for this state: probes on one thread close in reverse order.
+                del probes[len(probes) - 1 - probes[::-1].index(state)]
+            if not probes:
+                _sdpa_probes.pop(thread, None)
+            _sdpa_open -= 1
+            # Something that replaced the wrapper since stays: it may call the wrapper, which
+            # with no probe open is a plain call to the original.
+            if _sdpa_open == 0 and F.scaled_dot_product_attention is _probe_sdpa:
+                F.scaled_dot_product_attention = _sdpa_original
+
+
+def _configs(config: Any) -> list[tuple[Any, Any]]:
+    """The model's config and its nested sub-configs (a Llava config's `text_config` and
+    `vision_config`), each with its attention setting, a config before its own sub-configs."""
+    found: list[tuple[Any, Any]] = []
+    seen: set[int] = set()
+
+    def visit(c: Any) -> None:
+        if c is None or id(c) in seen:
+            return
+        seen.add(id(c))
+        found.append((c, getattr(c, "_attn_implementation", None)))
+        subs = getattr(c, "sub_configs", None)
+        for key in subs if isinstance(subs, Mapping) else ():
+            visit(getattr(c, key, None))
+
+    visit(config)
+    return found
+
+
+def _set_attention(configs: list[tuple[Any, Any]], values: list[Any]) -> None:
+    """Give each config its value, through its own setter, in order. Transformers' setter
+    writes a config's value into every sub-config below it too, so a config is set before its
+    sub-configs (the order `_configs` lists them in) and each is written only when it differs."""
+    for (config, _), value in zip(configs, values):
+        try:
+            if getattr(config, "_attn_implementation", None) != value:
+                config._attn_implementation = value
+        except Exception:  # noqa: BLE001  # the others are still set
+            pass
 
 
 @contextlib.contextmanager
 def _sdpa_instead_of_flash(model: nn.Module) -> Iterator[bool]:
     """Hugging Face models loaded with FlashAttention never call SDPA; switch them to
-    SDPA for the probe. Yields whether the switch happened."""
-    config = getattr(model, "config", None)
-    impl = getattr(config, "_attn_implementation", None)
-    if impl not in FLASH_IMPLEMENTATIONS:
+    SDPA for the probe. Each config set to FlashAttention, the model's own or a sub-config's,
+    is switched and the others are left; afterwards every one has its own setting back.
+    Yields whether a switch happened."""
+    try:
+        configs = _configs(getattr(model, "config", None))
+    except Exception:  # noqa: BLE001
+        configs = []
+    before = [impl for _, impl in configs]
+    during = ["sdpa" if impl in FLASH_IMPLEMENTATIONS else impl for impl in before]
+    if during == before:
         yield False
         return
-    config._attn_implementation = "sdpa"
     try:
+        _set_attention(configs, during)
         yield True
     finally:
-        config._attn_implementation = impl
+        _set_attention(configs, before)
+
+
+@contextlib.contextmanager
+def _fork_host_rng() -> Iterator[None]:
+    """Python's `random` and, when NumPy is already imported, NumPy's global state are as they
+    were afterwards (`torch.random.fork_rng` does it for PyTorch's generators). Both are the
+    process's: a draw another thread makes in between is rolled back too, as with fork_rng."""
+    python = random.getstate()
+    numpy = sys.modules.get("numpy")
+    try:
+        numpy_state = numpy.random.get_state() if numpy is not None else None
+    except Exception:  # noqa: BLE001
+        numpy_state = None
+    try:
+        yield
+    finally:
+        random.setstate(python)
+        if numpy_state is not None:
+            try:
+                numpy.random.set_state(numpy_state)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _eager_stance() -> contextlib.AbstractContextManager[Any]:
@@ -455,20 +599,21 @@ def run_probe(
     state: ProbeState,
     devices: list[torch.device],
 ) -> dict[str, Any]:
-    """Run `fn(model)` once with probing on and return what the hooks recorded."""
+    """Run `fn(model)` once with probing on and return what the hooks recorded.
+
+    The deterministic-algorithms setting is the process's and is left as it is: with it on,
+    the histograms count without `histc` (`_histc_counts`) and `index_add_` takes PyTorch's
+    deterministic path on CUDA, so the probe's own work runs either way."""
     training = {module: module.training for module in model.modules()}
-    deterministic = torch.are_deterministic_algorithms_enabled()
-    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     cuda = [d for d in devices if d.type == "cuda"]
     state.histograms, state.attention, state.block = {}, {}, None
     state.head_calls, state.head_problem = [], None
+    state.thread = threading.get_ident()
     try:
         model.eval()
-        # `histc` and `index_add_` have no deterministic CUDA kernels; the probe's
-        # results do not feed training, so it turns the check off while it runs.
-        torch.use_deterministic_algorithms(False)
         with contextlib.ExitStack() as stack:
             stack.enter_context(torch.random.fork_rng(devices=cuda))
+            stack.enter_context(_fork_host_rng())
             stack.enter_context(torch.no_grad())
             stack.enter_context(_eager_stance())
             switched = stack.enter_context(_sdpa_instead_of_flash(model))
@@ -483,7 +628,6 @@ def run_probe(
         # unfreeze submodules kept in eval mode and trip Dynamo's `training` guards.
         for module, flag in training.items():
             module.training = flag
-        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
     result: dict[str, Any] = {"histograms": state.histograms, "attention": state.attention}
     if switched:
         result["attention_note"] = "FlashAttention switched to SDPA for the probe"
