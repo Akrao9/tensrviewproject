@@ -2136,6 +2136,73 @@ State as of Nov 16, 2026.
     - Of the review's seven "within reach": B1 caught (swapped, two conditions), B9 and B10 caught (re-created), B3 caught (simulated), B6 not caught (simulated), B8 untestable on 2.15, B16 not run.
   - *Run.* `run_all.py` with the project venv: 34 runs (17 configurations, buggy and healthy), 33 completed; the one that did not is B8 compiled without `torch.compiler.disable`, the `init` failure above. B1's stand-in model first had blocks without a `forward` of their own, so no activation statistics were recorded; it now calls `block(x)` as EfficientNet does, and B1 was run again with the same incidents. The `experiments/` tests from `sdk/`: 95 passed (the 92 and this folder's 3). The SDK suite was not run, since no SDK file changed. Nothing ran on a GPU, NCCL or Linux. Nothing is pushed.
 
+- [x] **Lane T1: run identity across ranks (Nov 18, 2026, lane T1, branch `claude/lane-t1-run-identity-a8d17d`; not merged).** Four open items from the sweep after the R1–R6 merges: R3's broadcast under NCCL and a `run_id` passed on rank 0 only (both from the Open list of "Lanes R6, R4, R5, R3 and R1 merged"), the callbacks' `project=` and `name=` (from "Projects, run names and comparing runs"), and the docs R3 left incomplete. Code in `tracker.py`, `huggingface.py` and `lightning.py`; in `capture.py` only `init`'s docstring. No record field, detector, golden file, Gate 1 fixture, file under `server/` or protocol number changed.
+  - *Read first.*
+    - **PyTorch at `v2.6.0`.**
+      - `broadcast_object_list` puts its tensors on `_get_object_coll_device`, which under NCCL is CUDA's current device.
+      - `distributed_c10d._get_default_store()` returns the default group's store, with the group's own prefix on every key (`_new_process_group_helper`). PyTorch itself uses the default store this way (`torch/distributed/_transport/_api.py`).
+      - `Store.set`, `get`, `check`, `wait(keys, timedelta)` and the `timeout` property are all bound in `init.cpp`.
+      - torchrun's agent creates a new TCPStore for each restart (`rendezvous.py`).
+    - **A TCPStore client does one operation at a time.** `set`, `get`, `check` and `wait` each hold one mutex for their whole length (`activeOpLock_`). `ProcessGroupNCCL`'s `globalStore_` is the same underlying TCPStore as the default store. With `TORCH_NCCL_DUMP_ON_TIMEOUT=1` or `TORCH_DISTRIBUTED_DEBUG=DETAIL` (off by default), NCCL's heartbeat monitor `check`s it every second, and the watchdog `set`s a dump signal on a timeout. One long `wait` would hold both up, though for less than the monitor's 480 s heartbeat timeout. So the ranks poll with `check` rather than wait.
+    - **Accelerate and Lightning.** Accelerate (`utils.operations.broadcast_object_list`) and Lightning (`DDPStrategy.broadcast`) share objects with `broadcast_object_list`, after setting each process's device: `PartialState.set_device`, and Lightning's `setup_environment`, which runs before `on_fit_start`. Accelerate's trackers run on the main process only and share no run ID.
+    - **W&B's `init_timeout`** defaults to 90 s.
+  - *Item 1: sharing the ID touches no GPU.* Confirmed open on `main` by reading the code; not run, since there is no NCCL here. `resolve_run` and `huggingface._shared_tracker_run_id` each called `broadcast_object_list`.
+    - **What it does now.** Under a process group of several ranks, `resolve_run` calls `_shared_run`. Rank 0 resolves the whole order, puts `[run ID, source]` as JSON under `tensorquill/run_id/<n>` in the default store, and never waits. Every other rank polls for that key with `check` (10 ms, doubling to 1 s), then reads it with `get`. `n` counts the exchanges in each process, so a second `init` reads its own key.
+    - **The bound.** A rank polls for at most `RUN_ID_WAIT_SECONDS`: 300 s, or the store's own timeout if that is shorter.
+    - **Failures.** Any failure gives the rank an ID of its own, by the same order (its explicit one, its tracker's, the launcher's or a generated one), and one warning: no store, MPI's placeholder store, the bound running out, an unreadable entry. A failed write on rank 0 gives one warning. Nothing raises.
+    - **The Hugging Face callback.** Its own exchange is removed; it passes its arguments to `init`, which resolves and shares the ID. Its runs now say `run_id_source: "wandb"` or `"mlflow"`, where they said `"explicit"` (R3's open point). A tracker that raises on rank 0 is passed over on this path too.
+  - *Item 2: a `run_id` on some ranks only.* Reproduced on `main` with two Gloo processes and the collectives allowed:
+    - With a `run_id` on rank 0 only, rank 1 sat in the broadcast until gloo's 15 s timeout raised. With one on rank 1 only, rank 0 raised the same way.
+    - Both callbacks had the same fault: each entered its own collective only on ranks with no `run_id`. Lightning's `ddp_spawn` with a `run_id` on rank 0 only failed with `ProcessRaisedException`.
+    - **Decided here.** Under a group of several ranks, every rank exchanges whatever it was given. `run_id` is the first step of rank 0's order, so rank 0's resolution wins on every rank, as for the other sources. A rank given a different `run_id` from rank 0's writes under rank 0's, with one warning. A rank whose bound runs out keeps its own.
+    - **The Lightning callback** no longer broadcasts. Rank 0 passes the logger's run ID (or its own `run_id`), the other ranks pass what they were given, and `init` shares rank 0's. Making the broadcast unconditional instead is the other way; both are under *Open*.
+  - *Item 3: the callbacks' `project=` and `name=`.* Not reproduced. Both callbacks pass every keyword argument they do not use to `init`, so `TensorQuillCallback(project=..., name=...)` already reaches the manifest. Run on `main` for both callbacks, in one process. Nothing changed for it.
+  - *Item 4: the docs.* Changed: `sdk/README.md`'s run ID row and `clip_grad_norm` field, and the `run_id` and `clip_norm` paragraphs of `init`'s docstring. They now say:
+    - rank 0's whole resolution, a `run_id` included, is every rank's, through the store, with the bound and the fallback;
+    - a clip call counts when any of the model's trainable parameters is in it;
+    - only an L2 norm is recorded.
+  - *Tests.* 13 new; none needs the server binary.
+    - **`sdk/tests/test_run_id_ranks.py`:** 16 runs of two Gloo CPU processes, up from 7.
+      - **Set-up.** A file store, or a TCP store on loopback; a 15 s group timeout and a 60 s limit on the processes. While TensorQuill runs, the worker makes every collective that could carry the ID raise.
+      - **Cases:**
+        - W&B on rank 0, with no launcher ID, with torchrun's and with SLURM's;
+        - the Hugging Face callback;
+        - a launcher ID alone, and a generated ID;
+        - MLflow raising on rank 0;
+        - a `run_id` on rank 0 only, through `init` and through the callback;
+        - the same `run_id` on both ranks;
+        - a `run_id` on rank 1 only;
+        - rank 0 three seconds late, through either store;
+        - two `init`s in one group;
+        - rank 0 never calling `init`, through either store.
+      - **On `main` (`3f93636`)**, run from a copy of its `sdk/` holding these tests:
+        - With the guard, 15 of the 16 failed. The one that passed, the same `run_id` on both ranks, makes no collective on `main` either; it is kept as a check that such a run neither waits long nor warns.
+        - With the collectives allowed, the five item 2 runs failed: a `run_id` on rank 0 only (twice), on rank 1 only, and rank 0 never calling `init` (twice). So did the Hugging Face case, whose source was `explicit`. The others passed: on `main` the broadcast does agree there. So the late rank 0 and the two `init`s fail on `main` only on the guard.
+    - **`sdk/tests/test_tracker.py`:** four new tests, and two reworked to run on a real `HashStore` behind a faked group of two (the helper is `_ranks_sharing_a_store`). They cover rank 0's ID and source reaching rank 1, an explicit ID on some ranks only, the bound running out, a store that fails (MPI's placeholder, or no store at all), and a tracker that raises on rank 0. On `main` the five that exchange failed on the collective.
+    - **`sdk/tests/test_huggingface.py`:** one test replaced, checking that the callback's run takes its source from the tracker. On `main` the source read `explicit`.
+    - **`sdk/tests/test_lightning.py`:** one new test, a `run_id` on rank 0 only, under `ddp_spawn` with a 20 s timeout. It failed on `main`.
+  - *Checked* (macOS, Python 3.12, PyTorch 2.15.0, Transformers 5.23.0, Accelerate 1.16.0, Lightning 2.6.6), on the final code, while six other sessions ran their suites on the machine. The four suites ran one after another, twice: first with one long `wait`, then on the `check` polling. Each round gave the same counts, and nothing failed, so no test needed a rerun.
+    - With this worktree's server binary: 1,812 passed (`main` 1,799).
+    - Without the binary: 1,193 passed and 619 skipped (1,180 and 619).
+    - Without `pyarrow` or the binary: 1,069 passed and 80 skipped (1,056 and 80).
+    - `experiments/` (`moe-bakeoff/test_fixtures.py`, `gate1/test_gate1.py`): 92 passed (92).
+    - Each SDK count is the baseline plus the 13 new tests.
+  - *Not run.* NCCL or a GPU. Linux. PyTorch 2.6. A real W&B or MLflow run. torchrun's agent store: the TCP case uses a TCPStore that rank 0 hosts. MPI.
+  - *Open, for the author.*
+    - **The bound, 300 s, is this lane's choice.** It is above W&B's 90 s init timeout and below NCCL's default group timeout of 10 min. It is a module constant, `tensorquill.tracker.RUN_ID_WAIT_SECONDS`. A rank 0 later than that splits the run, with a warning on each other rank.
+    - **The cost of item 2's rule, nearest the rule that nothing may pause training.**
+      - A rank other than 0 now waits at `init` until rank 0 reaches `init`, even when it was given a `run_id`; before, an explicit `run_id` returned at once.
+      - When rank 0 is late, for example in `wandb.init`, which the Trainer runs in the same event, the wait comes where the first collective would have waited anyway.
+      - When rank 0 never calls `init`, each other rank waits up to 300 s and then writes under an ID of its own. Before, it waited in the broadcast for the group's timeout and raised, or returned at once if it had a `run_id`.
+      - Options: keep this; or let a rank that has its own `run_id` skip the wait and keep its ID. The second avoids the pause but splits the run whenever ranks are given different IDs, and gives up the warning.
+    - **Lightning: dropped or unconditional.** The callback's `strategy.broadcast` was GPU-safe, since Lightning sets the device first, but it ran only on ranks with no `run_id`.
+      - **Dropped (done here):** bounded, never raises, no collective. But Lightning's XLA strategy, which starts no `torch.distributed` group, no longer shares the logger's run ID.
+      - **Unconditional broadcast instead:** keeps XLA sharing, but stays a collective that can raise into `on_fit_start`, or hang to the group's timeout.
+    - **Lightning with `MLFlowLogger`.** The experiment and run names are not read: the logger creates its run through `MlflowClient`, so `tracker_labels` sees no active run, and such a run is `uncategorized` unless `project=` is passed. Reading the names would mean using `MLFlowLogger._experiment_name` and `_run_name`, which are private attributes.
+    - **MPI.** Its default group's store is a placeholder, so every rank writes under its own ID, with a warning.
+    - **Other docs still say "broadcast"; none is this lane's.** `sdk/README.md` rows 53 and 55 (the adapters), and `sdk/RUN_ON_YOUR_JOB.md` lines 72 (a generated ID "broadcast from rank 0"), 110 (Lightning) and 147 (Hugging Face).
+    - **The single-process path** still lets a tracker's exception out of `init` (R3's open point). Unchanged.
+
 ## Sources
 
 - [TechInformed: OpenAI buying Neptune](https://techinformed.com/openai-buying-neptune-ai-in-all-stock-deal-what-it-means-for-ai-architecture/)

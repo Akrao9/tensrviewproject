@@ -18,7 +18,9 @@ class TensorQuillCallback(L.Callback):
     - **Run ID.** `MLFlowLogger` creates its run through `MlflowClient` on rank 0 only, so
       `mlflow.active_run()` is empty and the other ranks know nothing of it. The callback
       reads the run ID from the trainer's logger (`MLFlowLogger.run_id`, `WandbLogger`'s run)
-      on rank 0 and broadcasts it, so every rank writes under the tracker's run.
+      on rank 0 and passes it to `init`, which shares rank 0's run ID with every rank through
+      the process group's store, so every rank writes under the tracker's run. A `run_id=`
+      given to the callback wins over the logger's; with several ranks, rank 0's wins.
     - **Steps** start at `trainer.global_step`, so a resumed fit continues the numbering.
       They are counted from optimizer steps, as Lightning's `global_step` is.
     - **Mixed precision.** With `precision="16-mixed"`, the plugin's `GradScaler` is passed
@@ -48,10 +50,11 @@ class TensorQuillCallback(L.Callback):
 
     def on_fit_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         kwargs = dict(self.init_kwargs)
-        run_id = kwargs.pop("run_id", None)
-        if run_id is None:
-            run_id = _logger_run_id(trainer) if trainer.is_global_zero else None
-            run_id = trainer.strategy.broadcast(run_id, src=0)
+        if kwargs.get("run_id") is None and trainer.is_global_zero:
+            # The logger's run is known on rank 0 only. `init` gives every rank rank 0's run ID
+            # through the process group's store, so the other ranks pass what they were given:
+            # every rank takes the same path, and there is no collective here.
+            kwargs["run_id"] = _logger_run_id(trainer)
         scaler = getattr(trainer.precision_plugin, "scaler", None)
         if scaler is not None:
             kwargs.setdefault("scaler", scaler)
@@ -59,7 +62,7 @@ class TensorQuillCallback(L.Callback):
         # here, and the step comes from the checkpoint `on_load_checkpoint` was given.
         kwargs.setdefault("start_step", max(trainer.global_step, self._loaded_step))
         kwargs.setdefault("data_wait", True)
-        self.session = init(pl_module, run_id=run_id, **kwargs)
+        self.session = init(pl_module, **kwargs)
         if self._loaded is not None:
             loaded, self._loaded, self._loaded_step = self._loaded, None, 0
             self.session._record_manifest(loaded, "load")
