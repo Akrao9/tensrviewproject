@@ -2499,7 +2499,8 @@ fn optimizer_evidence(extra: Option<&Value>, stalled: &[&str]) -> Value {
 struct Weight {
     /// How many weight checks in a row it was unchanged with a gradient.
     streak: u32,
-    /// Seen changing at some weight check.
+    /// Not shown unchanged at some weight check: changed there, or not compared (the list
+    /// leaves out both, and the record does not say which).
     changed: bool,
     /// Already listed under an onset: a parameter is reported once.
     reported: bool,
@@ -2517,19 +2518,27 @@ struct Stalled {
 
 impl Stalled {
     fn row(&mut self, step: i64, columns: &Columns, row: usize) {
-        // No list: no weight check on this step. An empty list is a check that found
-        // every parameter changed.
+        // No list: no weight check on this step, and every streak holds. An empty list is a
+        // check that showed no parameter unchanged (contract 2).
         let Some(unchanged) = &columns.weights_unchanged else {
             return;
         };
         let Some(listed) = unchanged.row(row) else { return };
-        if value(columns.grad_norm, row).is_some_and(|norm| !norm.is_finite()) {
-            return; // a loss scaler skips the optimizer step on purpose when a gradient is not finite
-        }
-        let unchanged: Vec<&str> = listed
+        // A loss scaler skips the optimizer step on purpose when a gradient is not finite: such
+        // a row adds nothing to a streak, but what it shows changing still breaks one.
+        let evidence = !value(columns.grad_norm, row).is_some_and(|norm| !norm.is_finite());
+        let unchanged: HashSet<&str> = listed
             .filter(|at| !unchanged.values.is_null(*at))
             .map(|at| unchanged.values.value(at))
             .collect();
+        // A parameter seen before and missing from the list changed or was not compared: its
+        // streak starts again, with or without a gradient here.
+        for (name, weight) in &mut self.weights.items {
+            if !unchanged.contains(name.as_str()) {
+                weight.streak = 0;
+                weight.changed = true;
+            }
+        }
         let mut with_gradients = 0;
         if let Some(norms) = &columns.grad_norms {
             let entries = norms.row(row);
@@ -2539,14 +2548,21 @@ impl Stalled {
                 let positive = !norms.values.is_null(entry) && norm.is_finite() && norm > 0.0;
                 with_gradients += usize::from(positive);
                 let name = norms.keys.value(entry);
-                let same = unchanged.contains(&name);
-                // A parameter this row does not list keeps its streak.
+                let same = unchanged.contains(name);
+                // Listed with no gradient entry: not reached here, so the streak holds.
                 let weight = self.weights.slot(entry - first_entry, name);
-                weight.streak = if positive && same { weight.streak + 1 } else { 0 };
+                if !(positive && same) {
+                    weight.streak = 0;
+                } else if evidence {
+                    weight.streak += 1;
+                }
                 // It cannot be newly stalled on the row that shows it changing, so marking
-                // it here is the same as Python's marking after the row.
+                // it here is the same as Python's marking before the stall check.
                 weight.changed |= !same;
             }
+        }
+        if !evidence {
+            return;
         }
         let stalled: Vec<&str> = self
             .weights
@@ -2584,7 +2600,7 @@ impl Stalled {
             self.first = Some(first);
         }
         // Each parameter on its own history: those that stall on this row for the first time,
-        // the ones that had changed at an earlier check first.
+        // the ones not shown unchanged at an earlier check (changed, or not compared) first.
         let new: Vec<(&str, bool)> = self
             .weights
             .items

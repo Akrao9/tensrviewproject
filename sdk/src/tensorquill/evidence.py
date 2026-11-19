@@ -992,30 +992,45 @@ def detect_stalled_weights(
     Uses `weights_unchanged`, which the capture sets when a parameter's float64 norm is
     exactly what it was at the previous weight check. Equal norms are strong evidence
     but not proof that the weights are equal, so this is a warning: a parameter is reported
-    once that holds on `steps` checks in a row while its gradient is finite and non-zero.
+    once that holds on `steps` checks in a row while its gradient is finite and non-zero
+    (contract 2, signed off Nov 19, 2026). At a weight check (a row with the list):
+
+    - listed, with a finite gradient above zero: the streak grows;
+    - listed, with no gradient entry: the streak holds (it was not asked to move then);
+    - listed, with a zero or non-finite gradient: the streak starts again;
+    - not listed, a parameter seen before with a gradient: the streak starts again, with or
+      without a gradient there. The list leaves out a parameter the check found changed and
+      one it could not compare, and either breaks the streak; neither ends the parameter's
+      history, so a later streak can still fire.
+
+    A row whose total gradient norm is not finite adds nothing to a streak (mixed-precision
+    loss scaling skips those optimizer steps on purpose) but its resets apply. A row
+    without the list is no weight check, and every streak holds.
 
     There is one incident, dated at the first step any parameter stalled; `step`,
     `parameters`, `stalled` and `optimizer` describe that first onset. Every parameter is
     judged on its own history, so one that stalls later is named too: `onsets` lists each
-    step at which parameters first stalled, with the parameters (those that had changed at
-    an earlier check first), how many had (`trained_before`), and the optimizer evidence for
-    them; `stalled_total` counts every parameter that stalled at any step. A parameter that has never changed since the first check and one that trained and
-    then stopped are different findings: with bf16 or fp16 weights and no float32 master
-    copy, an update smaller than the weight's spacing rounds away from the first step (norm
-    weights near 1.0 at a small learning rate), while a parameter that trained and then
-    stopped was frozen during the run. `weight_dtypes` (how many trainable parameters have
-    each dtype, when the capture recorded it) says which precision that is.
+    step at which parameters first stalled, with the parameters (those not shown unchanged at
+    an earlier check first), how many were (`trained_before`), and the optimizer evidence for
+    them; `stalled_total` counts every parameter that stalled at any step. `trained_before`
+    counts a parameter that was missing from the list at an earlier check: it changed there,
+    or the check could not compare it, and the record does not say which. A parameter never
+    seen changing and one seen changing or not compared are different findings: with bf16 or
+    fp16 weights and no float32 master copy, an update smaller than the weight's spacing
+    rounds away from the first step (norm weights near 1.0 at a small learning rate), while a
+    parameter that trained and then stopped was frozen during the run. `weight_dtypes` (how
+    many trainable parameters have each dtype, when the capture recorded it) says which
+    precision that is.
 
     `optimizer` says whether an optimizer that stepped holds the parameters: `known` with
     the stalled parameters no optimizer holds, or `unknown` with the reason, for DeepSpeed,
     Megatron, FSDP1, `auto_step=False` or captures that did not record it. A stalled
-    parameter that no optimizer holds is the likely cause. Steps with a non-finite gradient
-    norm are skipped, because mixed-precision loss scaling skips those optimizer steps on
-    purpose. Captures without `weights_unchanged` (older files, or Apple MPS) are not
-    checked: a float32 norm stays the same while bf16 weights change by a few elements.
+    parameter that no optimizer holds is the likely cause. Captures without
+    `weights_unchanged` (older files, or Apple MPS) are not checked: a float32 norm stays the
+    same while bf16 weights change by a few elements.
     """
     streak: dict[str, int] = {}
-    changed: set[str] = set()  # seen changing at some weight check
+    changed: set[str] = set()  # not shown unchanged at some weight check: changed, or not compared
     reported: set[str] = set()
     onsets: list[dict[str, Any]] = []
     first: dict[str, Any] | None = None
@@ -1025,17 +1040,24 @@ def detect_stalled_weights(
         unchanged = record.get("weights_unchanged")
         if unchanged is None:
             continue
-        if _finite(record.get("grad_norm")) is None and record.get("grad_norm") is not None:
-            continue
+        evidence = _finite(record.get("grad_norm")) is not None or record.get("grad_norm") is None
         grads = record.get("grad_norms", {})
         unchanged_set = set(unchanged)
+        for name in streak:
+            if name not in unchanged_set:
+                streak[name] = 0
         for name, value in grads.items():
             grad = _finite(value)
-            if grad is not None and grad > 0 and name in unchanged_set:
+            if grad is None or grad <= 0 or name not in unchanged_set:
+                streak[name] = 0
+            elif evidence:
                 streak[name] = streak.get(name, 0) + 1
             else:
-                streak[name] = 0
-        stalled = [name for name, count in streak.items() if count >= steps]
+                streak.setdefault(name, 0)
+        changed.update(name for name in streak if name not in unchanged_set)
+        if not evidence:
+            continue
+        stalled =[name for name, count in streak.items() if count >= steps]
         if stalled:
             stalled_steps += 1
             new = [name for name in stalled if name not in reported]
@@ -1065,7 +1087,6 @@ def detect_stalled_weights(
                 dtypes = record.get("weight_dtypes")
                 if isinstance(dtypes, dict) and dtypes:
                     first["weight_dtypes"] = dtypes
-        changed.update(name for name in grads if name not in unchanged_set)
     if first is not None:
         first["stalled_steps"] = stalled_steps
         first["stalled_total"] = len(reported)
@@ -5273,8 +5294,8 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         if onsets:
             trained = onsets[0].get("trained_before", 0)
             since = (
-                "; none of them has changed since the first weight check" if trained == 0
-                else f"; {trained} of them had changed at an earlier check"
+                "; none of them was seen changing at an earlier weight check" if trained == 0
+                else f"; {trained} of them changed, or could not be compared, at an earlier weight check"
             )
         later = ""
         if len(onsets) > 1:
@@ -5283,9 +5304,9 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
                 shown = ", ".join(onset["parameters"][:2])
                 rest = onset["stalled"] - min(2, onset["stalled"])
                 was = (
-                    "after changing at earlier checks" if onset["trained_before"] == onset["stalled"]
+                    "changed or not compared at an earlier check" if onset["trained_before"] == onset["stalled"]
                     else "never seen changing" if onset["trained_before"] == 0
-                    else f"{onset['trained_before']} after changing at earlier checks"
+                    else f"{onset['trained_before']} changed or not compared at an earlier check"
                 )
                 parts.append(f"step {onset['step']}: {shown}{f', and {rest} more' if rest > 0 else ''} ({was})")
             more_onsets = len(onsets) - 4 + int(incident.get("onsets_omitted") or 0)
