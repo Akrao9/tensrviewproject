@@ -89,7 +89,7 @@ ROUTES = {
 
 
 def _run(router: nn.Module, spec: tensorquill.Router, steps: int = 2, every: int = 1, backend: str | None = None,
-         tokens: int | None = None) -> list[dict]:
+         tokens: int | None = None, fullgraph: bool = False) -> list[dict]:
     torch.manual_seed(0)
     model = OneRouter(router)
     sink = tensorquill.MemorySink()
@@ -97,7 +97,7 @@ def _run(router: nn.Module, spec: tensorquill.Router, steps: int = 2, every: int
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         session = tensorquill.init(model, sink=sink, every=every, routers={"router": spec})
-        stepped = torch.compile(model, backend=backend) if backend else model
+        stepped = torch.compile(model, backend=backend, fullgraph=fullgraph) if backend else model
         opt = torch.optim.SGD(model.parameters(), lr=0.01)
         for _ in range(steps):
             opt.zero_grad()
@@ -212,22 +212,31 @@ def test_c06_logits_through_top_k_are_counted_as_before():
 @pytest.mark.parametrize("backend", ["eager", "aot_eager"])
 def test_c06_compiled_counts_and_refuses_as_eager_does(backend):
     """Counted in fixed slots in the hook and judged at the flush, so a compiled run records what an
-    eager one does and nothing raises. Fail-before (the unassigned count; the refusal)."""
+    eager one does and nothing raises. Compiled with `fullgraph=True`, so a graph break in the hook
+    fails here instead of falling back to eager. Fail-before (the unassigned count; the refusal)."""
     torch.manual_seed(0)
-    control = torch.compile(OneRouter(IdsRouter([[0], [1]])), backend=backend)
-    try:
-        control(torch.ones(2, 4)).backward()
-    except Exception as error:  # noqa: BLE001
-        pytest.skip(f"this PyTorch cannot compile the model without TensorQuill: {type(error).__name__}")
-    torch._dynamo.reset()
+    for control in (OneRouter(IdsRouter([[0], [1]])), OneRouter(MapRouter([0, 1], padded=[(0, 2)]))):
+        try:
+            torch.compile(control, backend=backend, fullgraph=True)(torch.ones(2, 4)).backward()
+        except Exception as error:  # noqa: BLE001
+            pytest.skip(f"this PyTorch cannot compile the model without TensorQuill: {type(error).__name__}")
+        torch._dynamo.reset()
     eager = _run(IdsRouter([[-1], [2], [2], [-1], [0]]), tensorquill.Router(EXPERTS, 1))
     torch._dynamo.reset()
-    compiled = _run(IdsRouter([[-1], [2], [2], [-1], [0]]), tensorquill.Router(EXPERTS, 1), backend=backend)
+    compiled = _run(IdsRouter([[-1], [2], [2], [-1], [0]]), tensorquill.Router(EXPERTS, 1), backend=backend,
+                    fullgraph=True)
     assert [(r["moe"], r.get(UNASSIGNED)) for r in compiled] == [(r["moe"], r.get(UNASSIGNED)) for r in eager]
     assert compiled[0][UNASSIGNED] == {"router": 2}
     torch._dynamo.reset()
-    refused = _run(IdsRouter([[-1], [8]]), tensorquill.Router(EXPERTS, 1), backend=backend)
+    refused = _run(IdsRouter([[-1], [8]]), tensorquill.Router(EXPERTS, 1), backend=backend, fullgraph=True)
     assert _refusal(refused) is not None and not any("router" in r.get("moe", {}) for r in refused)
+    torch._dynamo.reset()
+    padded = MapRouter([0, 1, 1, 3], padded=[(0, 2), (2, 2), (3, 0)])
+    eager_map = _run(padded, tensorquill.Router(EXPERTS, 1))
+    torch._dynamo.reset()
+    compiled_map = _run(MapRouter([0, 1, 1, 3], padded=[(0, 2), (2, 2), (3, 0)]), tensorquill.Router(EXPERTS, 1),
+                        backend=backend, fullgraph=True)
+    assert [(r["moe"], r[LEFT_OUT]) for r in compiled_map] == [(r["moe"], r[LEFT_OUT]) for r in eager_map]
 
 
 # --- F1: the routing map's entries left out ----------------------------------------------------
@@ -898,36 +907,35 @@ def test_l2_a_finished_reading_is_attached_once_at_a_later_flush(fake_gpu):
     assert sum(p.get("xid", []).count(79) for p in parts) == 1
 
 
-def test_l2_a_hung_nvml_reading_never_stops_capture_however_fast_the_steps(fake_gpu, monkeypatch):
-    """The row: T3's bounded wait holds the writer, and a writer a full queue behind stops capture
-    (lane U1's decision on C03). With a queue of two steps and the bound at 30 s, the hung reading
-    stops capture on base. Fail-before."""
-    monkeypatch.setattr(capture, "QUEUE_STEPS", 2, raising=False)
+def test_l2_the_writer_keeps_up_while_an_nvml_reading_hangs(fake_gpu):
+    """The row: with T3's bounded wait the writer sat in it (here 30 s), so its queue filled and, by lane U1's
+    decision on C03, capture stopped above about 200 steps a second. Shown without depending on speed: after
+    each step the writer must have written the step before it, while every NVML reading hangs from the
+    first. Fail-before (the writer waits for the first reading)."""
     model = nn.Linear(4, 4)
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
     sink = tensorquill.MemorySink()
+    fake_gpu.hang.add("init")  # the first reading, which opens NVML, never comes back in this test
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         session = tensorquill.init(model, sink=sink, every=1, system=True)
         session._system = SystemReadings(CUDA0)  # as on a CUDA model
-        fake_gpu.hang.add("temperature")
-        done = threading.Event()
-
-        def train():
-            for _ in range(40):
-                opt.zero_grad()
-                model(torch.ones(2, 4)).sum().backward()
-                opt.step()
-            done.set()
-
-        threading.Thread(target=train, daemon=True).start()
-        finished = done.wait(DEADLINE)
-        stopped = session.writer_error
+        kept_up = True
+        for step in range(10):
+            opt.zero_grad()
+            model(torch.ones(2, 4)).sum().backward()
+            opt.step()
+            deadline = time.monotonic() + 5.0  # each step is written when the next one ends
+            while len(sink.records) < step and time.monotonic() < deadline:
+                time.sleep(0.005)
+            if len(sink.records) < step:
+                kept_up = False
+                break
         fake_gpu.release.set()
         session.close()
-    assert finished, "training waited"
-    assert stopped is None, f"capture stopped: {stopped}"
-    assert [r["step"] for r in sink.records] == list(range(40))
+    assert kept_up, f"the writer waited for NVML: {len(sink.records)} records after step {step}"
+    assert session.writer_error is None
+    assert [r["step"] for r in sink.records] == list(range(10))
     assert all("cuda" in r.get("system", {}) for r in sink.records)  # memory is read at every flush
 
 
