@@ -353,6 +353,44 @@ def test_cli13_compare_reads_every_file_of_a_rank_and_resolves_the_attempts_acro
     assert result["divergence"]["runs"]["a"]["last_step"] == 199
 
 
+def test_cli13_the_files_are_read_the_same_whichever_sorts_first(tmp_path):
+    seen = []
+    for first, second in (("a-first.jsonl", "b-second.jsonl"), ("b-first.jsonl", "a-second.jsonl")):
+        folder = tmp_path / first
+        write(folder / first, records(300, run="resumed", attempt=1, spike=250))
+        write(folder / second, records(range(100, 200), run="resumed", attempt=2))
+        opened = cmp.open_run("resumed", folder)
+        seen.append((opened["last_step"], sorted(i["kind"] for i in opened["evidence"]["incidents"])))
+    assert seen[0] == seen[1] == (199, [])
+
+
+def test_cli13_a_copy_of_a_rank_file_is_read_once_not_as_a_repeat(tmp_path):
+    folder = tmp_path / "out"
+    path = write(folder / "x.rank0.jsonl", records(60, run="x"))
+    (folder / "x.bak.jsonl").write_bytes(path.read_bytes())
+    (found,) = runs_module.discover_runs(folder)
+    assert found.get("more_files")  # both files are kept
+    opened = cmp.open_run("x", folder)
+    assert opened["last_step"] == 59
+    assert not [i for i in opened["evidence"]["incidents"] if i.get("kind") == "repeated_steps"]
+    part = tensorquill.compare_runs("x", str(write(tmp_path / "o" / "y.jsonl", records(60, run="y"))), source=folder)
+    assert part["divergence"]["runs"]["a"]["records"] == 60
+    # A step written twice within one file is still a repeat.
+    twice = write(tmp_path / "t" / "t.rank0.jsonl", records(60, run="t") + records(range(30, 31), run="t"))
+    assert [i["kind"] for i in cmp.open_run(twice)["evidence"]["incidents"]] == ["repeated_steps"]
+
+
+def test_cli13_a_copy_of_one_ranks_file_in_a_run_of_several_ranks_is_read_once(tmp_path):
+    folder = tmp_path / "out"
+    write(folder / "two.rank0.jsonl", records(60, run="two"))
+    one = write(folder / "two.rank1.jsonl", records(60, run="two", rank=1))
+    (folder / "two-copy.jsonl").write_bytes(one.read_bytes())
+    manifest(folder, "two", world_size=2)
+    opened = cmp.open_run("two", folder)
+    assert opened["read_from"]["judged_ranks"] == [0, 1]
+    assert not [g for g in opened["evidence"]["incident_groups"] if g["incident"].get("kind") == "repeated_steps"]
+
+
 # --- CLI-20 -----------------------------------------------------------------------------------
 
 

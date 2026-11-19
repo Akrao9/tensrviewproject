@@ -100,6 +100,20 @@ def _rank_of(record: Mapping[str, Any]) -> int:
     return int(record.get("rank", 0))
 
 
+def _record_key(record: Mapping[str, Any]) -> str:
+    return json.dumps(record, sort_keys=True, default=str)
+
+
+def _not_read_yet(found: list[dict[str, Any]], seen: set[str]) -> list[dict[str, Any]]:
+    """Of the records of one of a rank's several files, those not already read, whole and
+    identical, from another of its files; `seen` then holds this file's too. A copy of a file
+    (`x.rank0.bak.jsonl`) is read once, not as a second attempt: twice gave `repeated_steps`.
+    A step written twice within one file is kept, as one file is read (lane V4, CLI-13)."""
+    new = [record for record in found if _record_key(record) not in seen]
+    seen.update(_record_key(record) for record in found)
+    return new
+
+
 def _last_step(records: list[dict[str, Any]]) -> int | None:
     """The last step of one rank's records as the run stands: the highest step of the records
     `resolve_attempts` keeps, the same records the detectors judge. After a resume from an
@@ -137,9 +151,10 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
     # across them resolved as within one file (`build_evidence`, `_last_step`) (lane V4, CLI-13).
     extra = [Path(more) for more in ((run.get("more_files") or {}).get(key) or ())]
     own, torn = list(records), unfinished
+    seen = {_record_key(record) for record in records} if extra else set()
     for more in extra:
         found, cut = _read_local(more)
-        own += found
+        own += _not_read_yet(found, seen)
         torn = torn or cut
     if not own:
         raise _runs.RunLookupError(f"run {run['run_id']} has no whole record in {path} yet: nothing to compare")
@@ -192,20 +207,30 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
     # A rank's other files (`more_files`): its records there are read with it (lane V4, CLI-13).
     more_of = {str(path): number for number, more in (run.get("more_files") or {}).items() for path in more}
     extra_read: dict[int, list[str]] = {}
+    seen: dict[int, set[str]] = {}  # of a rank with other files: the records read so far, from the files before
     for path in [first, *(files[n] for n in sorted(files) if files[n] != first),
                  *(Path(p) for p in more_of if Path(p) not in files.values())]:
         found, torn = (records, unfinished) if path == first else _read_local(path)
         if torn and str(path) not in unfinished_in:
             unfinished_in.append(str(path))
+        added: dict[int, set[str]] = {}
         for record in found:
             number = _rank_of(record)
             held_in.setdefault(str(path), set()).add(number)
             if paths.setdefault(number, str(path)) == str(path):  # a rank is read from the first file that holds it
                 by_rank.setdefault(number, []).append(record)
-            elif more_of.get(str(path)) == number:  # and from its other files
+            elif more_of.get(str(path)) == number:  # and from its other files, a record already read there once
+                if _record_key(record) in seen.get(number, ()):
+                    continue
                 by_rank.setdefault(number, []).append(record)
                 if str(path) not in extra_read.setdefault(number, []):
                     extra_read[number].append(str(path))
+            else:
+                continue
+            if number in (run.get("more_files") or {}):
+                added.setdefault(number, set()).add(_record_key(record))
+        for number, keys in added.items():
+            seen.setdefault(number, set()).update(keys)
     if not by_rank:
         names = ", ".join(sorted({p.name for p in files.values()}))
         raise _runs.RunLookupError(f"run {run['run_id']} has no whole record in any of its files ({names}) yet: nothing to compare")
@@ -858,18 +883,20 @@ def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[st
 
     if isinstance(path, (list, tuple)):
         every: list[dict[str, Any]] = []
+        seen: set[str] = set()
         torn = False
         for one in path:
             try:
-                every += load_records(one, rank=rank, all_attempts=True)
+                found = load_records(one, rank=rank, all_attempts=True)
             except ValueError:
                 source = Path(one)
                 if source.is_dir() or source.suffix == ".parquet":
                     raise
                 tail = _Tail(source, rank)
                 tail.poll()
-                every += tail.records
+                found = tail.records
                 torn = True
+            every += _not_read_yet(found, seen)
         return resolve_attempts(every), torn
     try:
         return load_records(path, rank=rank), False
