@@ -34,6 +34,10 @@ if [ -e "$out" ] && { [ ! -d "$out" ] || [ -n "$(ls -A "$out")" ]; }; then
   echo "$out is not empty (an earlier run with the label $label?); nothing was deleted. Choose another label or OUT." >&2
   exit 2
 fi
+if nc -z 127.0.0.1 "$port" 2>/dev/null; then
+  echo "something already listens on port $port; set PORT to a free one" >&2
+  exit 1
+fi
 mkdir -p "$store" || exit
 
 server=; timer=; sampler=
@@ -56,9 +60,6 @@ fail() { # $1 = exit status, $2 = what failed
   exit "$1"
 }
 
-if nc -z 127.0.0.1 "$port" 2>/dev/null; then
-  fail 1 "something already listens on port $port; set PORT to a free one"
-fi
 
 start_server() { # $1 = tag
   /usr/bin/time -l "$bin/tensorquill-server" --listen 127.0.0.1:"$port" --store "$store" --flush-steps 50 \

@@ -386,3 +386,19 @@ def test_a_completed_run_exits_0_and_stops_the_server(tmp_path):
     # The same label again is refused, and the first run's results stay.
     again = drive(tmp_path, fake_build(tmp_path / "again", "exit 0"), out)
     assert again.returncode == 2 and (out / "r2" / "client-first.txt").exists()
+
+
+@needs_bash
+@needs_macos
+def test_a_busy_port_is_refused_before_anything_is_made(tmp_path):
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen()
+        source = tmp_path / "source"
+        source.mkdir()
+        env = dict(os.environ, OUT=str(tmp_path / "results"), BIN_DIR=str(fake_build(tmp_path, "exit 0")),
+                   PORT=str(busy.getsockname()[1]), FAKE_PID_FILE=str(tmp_path / "server.pid"))
+        result = subprocess.run(["bash", str(DRIVER), "r2", str(source), "2"], env=env, capture_output=True, text=True,
+                                timeout=60)
+    assert result.returncode == 1 and "already listens on port" in result.stderr, result
+    assert not (tmp_path / "results" / "r2").exists()  # the same label can be run again at once

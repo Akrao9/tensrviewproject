@@ -55,19 +55,27 @@ def _run_child(args: list[str], env: dict[str, str]) -> tuple[int | None, str]:
     which would otherwise hold its output open and keep the sweep waiting."""
     proc = subprocess.Popen(args, cwd=HERE, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             start_new_session=True)
-    try:
-        out, err = proc.communicate(timeout=TIMEOUT)
-        return proc.returncode, out + err
-    except subprocess.TimeoutExpired:
+
+    def kill_group() -> None:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, AttributeError):
             proc.kill()
+
+    try:
+        out, err = proc.communicate(timeout=TIMEOUT)
+        return proc.returncode, out + err
+    except subprocess.TimeoutExpired:
+        kill_group()
         try:
             out, err = proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:  # something left the group and still holds the output
             out, err = "", ""
         return None, out + err + f"\nrun_all.py: killed after {TIMEOUT} s\n"
+    except BaseException:
+        # Ctrl-C reaches only this process now that the run has its own session: stop the run too.
+        kill_group()
+        raise
 
 
 def run_one(script: str, variant: str, tag: str, extra: list[str]) -> dict[str, Any]:
