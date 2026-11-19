@@ -27,7 +27,9 @@
 //!
 //! The run's summary is `stalled` when no rank is active and some are silent or lost,
 //! `degraded` when some are silent, lost or never connected while another is active,
-//! `finished` when every rank finished, and `active` otherwise. The server writes it to
+//! `finished` when every rank finished and every rank expected has been seen (inside the grace a
+//! rank not seen yet is not called missing, and the run is `active` while it waits for it), and
+//! `active` otherwise. The server writes it to
 //! `runs/<run_id>/watchdog.json` every few seconds, using its own clock, so a reader sees
 //! the verdict as of `written_at_ms` whenever it reads. It can only see ranks that
 //! connected since the server started (or, after a restart, were in the status of a run that was
@@ -92,6 +94,14 @@
 //! restart on a host whose clock is behind), and its step is the rank's. A beat that names no
 //! attempt (an older sender) is taken as before, and its new attempt is known from its first
 //! stored batch.
+//!
+//! A higher attempt on a rank whose stream had finished is the job started again after a clean
+//! end: the rank is no longer finished, but a stream not open yet, `reconnecting` for the start
+//! window from that beat and then `lost`, until the new attempt opens its stream (decided Nov 19,
+//! 2026; until then the rank read finished for good, the new attempt shown beside it). So is a
+//! rank whose stream, opened before the new attempt's first beat, then ends cleanly: that is the
+//! earlier attempt's process closing. A stream the new attempt opened itself and closed cleanly
+//! is finished, whether or not it stored anything.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
@@ -698,12 +708,26 @@ impl Watchdog {
         });
     }
 
-    /// `clean` is true when the sender ended the stream itself, as `close()` does.
+    /// `clean` is true when the sender ended the stream itself, as `close()` does. A clean end of
+    /// a stream that opened before a new attempt was seen in the beats is the earlier attempt's
+    /// process closing: the new attempt has not connected, so the rank is not finished. It is a
+    /// stream not open yet, `reconnecting` for the start window from the new attempt's first beat
+    /// (decided Nov 19, 2026; until then the rank read finished for good).
     pub fn stream_ended(&self, key: &Key, clean: bool, now: Instant) {
+        let window = self.config.start_limit;
         self.with(key, now, |p| {
             p.open_streams = p.open_streams.saturating_sub(1);
             if p.open_streams == 0 {
-                p.stream = if clean { Stream::Finished } else { Stream::Dropped };
+                let earlier_attempts = p.attempt_since.is_some_and(|since| p.last_change < since);
+                p.stream = if clean && !earlier_attempts {
+                    Stream::Finished
+                } else {
+                    Stream::Dropped
+                };
+                if clean && earlier_attempts {
+                    let since = p.attempt_since.unwrap_or(now);
+                    p.fresh = Some((since.checked_add(window).unwrap_or(since), RankState::Lost));
+                }
                 p.last_change = now;
             }
         });
@@ -734,7 +758,17 @@ impl Watchdog {
             }
             let known = p.attempt != 0 || p.last_step.is_some();
             p.attempt = attempt;
-            if known {
+            // A rank whose stream had finished: the job was started again, and the new process
+            // has not opened its stream. It is a stream not open yet from this beat, under the start
+            // window, and not finished (decided Nov 19, 2026; until then it read finished for good,
+            // with the new attempt shown beside it). The time it had been finished is not time
+            // disconnected, which would give the run up at once after a long gap.
+            let reopened = p.stream == Stream::Finished;
+            if reopened {
+                p.stream = Stream::Dropped;
+                p.last_change = now;
+            }
+            if known || reopened {
                 p.attempt_since = Some(now);
                 p.restarted = Some(now);
                 // Only a stream that is not open yet waits for this window; one already open is
@@ -892,11 +926,12 @@ pub fn run_status(
     // longer than the silence floor.
     let first_seen = members.iter().map(|(_, p)| p.created).min();
     let settled = first_seen.is_some_and(|first| now.saturating_duration_since(first) > config.silent_floor);
-    let missing: Vec<i32> = if settled {
-        (0..expected).filter(|rank| !seen.contains(rank)).collect()
-    } else {
-        Vec::new()
-    };
+    // Every expected rank not seen. Inside the grace none is called missing, and no alarm is
+    // raised for it, but a run is not finished while one has not been seen (decided Nov 19, 2026;
+    // until then a rank that finished inside the grace finished a run whose other ranks had not
+    // connected yet, and a restarted server did not take it up).
+    let unseen: Vec<i32> = (0..expected).filter(|rank| !seen.contains(rank)).collect();
+    let missing: Vec<i32> = if settled { unseen.clone() } else { Vec::new() };
     let states: Vec<RankState> = members.iter().map(|(_, p)| p.state(now, config)).collect();
     let count = |wanted: &[RankState]| states.iter().filter(|state| wanted.contains(state)).count();
     let active = count(&[
@@ -909,10 +944,12 @@ pub fn run_status(
     let all_finished = !members.is_empty() && count(&[RankState::Finished]) == members.len();
     let summary = if !running {
         "server_stopped"
-    } else if all_finished && missing.is_empty() {
+    } else if all_finished && unseen.is_empty() {
         "finished"
-    } else if all_finished {
+    } else if all_finished && !missing.is_empty() {
         "degraded"
+    } else if all_finished {
+        "active" // inside the grace, waiting for the ranks not seen yet
     } else if active == 0 && stopped > 0 {
         "stalled"
     } else if stopped > 0 || !missing.is_empty() {
@@ -1009,11 +1046,15 @@ pub fn run_status(
 
 /// What this server's detectors last reported for one rank: the incident kinds in order and
 /// the checks it could not make (Flight Recorder and TrainCheck left out: they are never
-/// expected here). Present only while the rank's detectors are on and current.
+/// expected here), and the attempt and last step they had read, the report's own `attempt` and
+/// `last_step`. Present only while the rank's detectors are on; [`run_state`] counts it only
+/// while its attempt is the one the status shows for the rank.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RankReport {
     pub kinds: Vec<String>,
     pub not_checked: Vec<String>,
+    pub attempt: i64,
+    pub last_step: Option<i64>,
 }
 
 const RUN_STATES: [&str; 4] = ["healthy", "degraded", "unknown", "unhealthy"];
@@ -1022,7 +1063,11 @@ const RUN_STATES: [&str; 4] = ["healthy", "degraded", "unknown", "unhealthy"];
 /// the status, and the reports its detectors keep per rank. `{"state", "reasons"}`, where each
 /// reason has `state`, `code`, `detail` and, by code, `kinds`, `ranks`, `summary` or `checks`.
 /// A rank this server has not judged since it started (it has not sent a part, its detectors
-/// failed, or `--no-detect`) is unknown; so is a missing rank, a stopped server and any summary
+/// failed, or `--no-detect`) is unknown; so is a rank whose report is of another attempt than
+/// the status shows for it, or that the status marks `attempt_without_steps` (the job was started
+/// again and the new attempt has stored nothing: decided Nov 19, 2026, until then any report the
+/// rank had counted). The caller passes only the reports that cover the last part it stored
+/// (see `Ingest::write_statuses`). So is a missing rank, a stopped server and any summary
 /// other than `active` or `finished` (a stall among them: the stream cannot tell a hang from a
 /// pause). A reader of a `watchdog.json` that is no longer being rewritten must not trust it:
 /// Python calls such a status old, and the run state unknown. Each incident's class comes from
@@ -1037,10 +1082,22 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
         .iter()
         .filter_map(|rank| rank["rank"].as_i64().and_then(|rank| i32::try_from(rank).ok()))
         .collect();
+    // The reports about what the status shows: of the attempt the status names for the rank (a
+    // status entry without one is attempt 0, as a sender that names none), and not of a rank whose
+    // new attempt has stored nothing yet. Another rank's report says nothing here.
+    let entries = status["ranks"].as_array().map_or(&[][..], Vec::as_slice);
+    let current = |rank: &i32| -> Option<&RankReport> {
+        let report = reports.get(rank)?;
+        let entry = entries
+            .iter()
+            .find(|entry| entry["rank"].as_i64() == Some(i64::from(*rank)))?;
+        let same_attempt = entry["attempt"].as_i64().unwrap_or(0) == report.attempt;
+        (same_attempt && entry["attempt_without_steps"] != true).then_some(report)
+    };
     let stream = status["incidents"].as_array().map_or(&[][..], Vec::as_slice);
     let mut listed: Vec<String> = Vec::new();
     for rank in &ranks {
-        if let Some(report) = reports.get(rank) {
+        if let Some(report) = current(rank) {
             listed.extend(report.kinds.iter().cloned());
         }
     }
@@ -1069,7 +1126,7 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
     let judged: Vec<i32> = ranks
         .iter()
         .copied()
-        .filter(|rank| detect && reports.contains_key(rank))
+        .filter(|rank| detect && current(rank).is_some())
         .collect();
     if judged.is_empty() {
         reasons.push(json!({"state": "unknown", "code": "no_steps", "detail": "no step has been judged yet"}));
@@ -1674,7 +1731,13 @@ mod tests {
             dog.batch(&key(rank), 1, Some(9), Some(3), at(t0, 1));
             dog.stream_ended(&key(rank), true, at(t0, 2));
         }
-        assert_eq!(summary(&dog, at(t0, 3)), "finished"); // rank 2 is not missing yet: inside the grace
+        // Rank 2 is not missing yet (inside the grace), and the run has not finished without it
+        // (until Nov 19, 2026 this read "finished": RS02).
+        let early = dog.statuses(at(t0, 3), true)["run"].clone();
+        assert_eq!(
+            (&early["summary"], &early["missing_ranks"]),
+            (&json!("active"), &json!([]))
+        );
         for rank in 0..2 {
             dog.stream_opened(&key(rank), at(t0, 4));
             dog.stream_ended(&key(rank), true, at(t0, 70));
@@ -2733,6 +2796,7 @@ mod tests {
                     RankReport {
                         kinds: kinds.iter().map(|k| k.to_string()).collect(),
                         not_checked: checks.iter().map(|k| k.to_string()).collect(),
+                        ..Default::default()
                     },
                 )
             })
@@ -2847,7 +2911,7 @@ mod tests {
                 0,
                 RankReport {
                     kinds: observed.iter().map(|k| k.to_string()).collect(),
-                    not_checked: vec![],
+                    ..Default::default()
                 },
             )]
             .into_iter()
@@ -2899,5 +2963,166 @@ mod tests {
                 ("duplicate_batches".into(), "invariant".into())
             ]
         );
+    }
+
+    // --- Lane U6 (Nov 19, 2026): a run read as finished or healthy when it is not ---------------
+
+    #[test]
+    fn a_finished_rank_whose_job_starts_again_and_only_beats_is_not_finished() {
+        // RS01. config(60): floor 60 s, critical 180 s, start limit 600 s. Attempt 1 stores a
+        // batch and closes its stream cleanly: the run is finished.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        assert!(dog.attempt_seen(&key(0), 1, t0));
+        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 5));
+        dog.stream_ended(&key(0), true, at(t0, 6));
+        assert_eq!(summary(&dog, at(t0, 7)), "finished");
+        // A beat of the same attempt after the close (its process's last one) changes nothing.
+        assert!(dog.attempt_seen(&key(0), 1, at(t0, 8)));
+        assert_eq!(summary(&dog, at(t0, 9)), "finished");
+        // The job is started again; the new process beats and never opens its stream.
+        for second in (100..1200).step_by(15) {
+            assert!(dog.attempt_seen(&key(0), 2, at(t0, second)));
+            dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, second));
+        }
+        let status = &dog.statuses(at(t0, 101), true)["run"];
+        let rank = &status["ranks"][0];
+        assert_eq!(
+            (
+                &rank["attempt"],
+                &rank["attempt_without_steps"],
+                &rank["state"],
+                &status["summary"]
+            ),
+            (&json!(2), &json!(true), &json!("reconnecting"), &json!("active"))
+        );
+        // Not given up: the time it had been finished is not counted as time disconnected.
+        assert_eq!(status["abandoned"], false);
+        // It has the start window from its first beat, then it is a stream that did not come
+        // back, critical the configured time after the window, as a new attempt dropped is.
+        assert_eq!(states(&dog, at(t0, 699)), ["reconnecting"]);
+        assert_eq!(states(&dog, at(t0, 701)), ["lost"]);
+        assert_eq!(summary(&dog, at(t0, 701)), "stalled");
+        assert_eq!(rank_field(&dog, at(t0, 701), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 100 + 781), "severity"), "critical");
+        // A restarted server takes the run up: it is not finished.
+        let before = dog.statuses(at(t0, 701), true)["run"].clone();
+        let now = Instant::now();
+        let fresh = Watchdog::new(config(60));
+        assert_eq!(fresh.restore("run", &as_file(&before), now), Ok(true));
+        let status = &fresh.statuses(now, true)["run"];
+        assert_eq!(
+            (
+                &status["ranks"][0]["state"],
+                &status["ranks"][0]["attempt_without_steps"]
+            ),
+            (&json!("reconnecting"), &json!(true))
+        );
+        // Its stream opens at last and it stores a batch: active.
+        dog.stream_opened(&key(0), at(t0, 1200));
+        dog.batch(&key(0), 2, Some(9), Some(1), at(t0, 1210));
+        assert_eq!(states(&dog, at(t0, 1211)), ["active"]);
+    }
+
+    #[test]
+    fn a_new_attempt_seen_before_the_earlier_attempts_stream_closes_is_not_finished_by_that_close() {
+        // RS01, the other order: the new attempt's first beat comes while the earlier attempt's
+        // stream is still open, and that stream then ends cleanly.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 5));
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 100)));
+        dog.stream_ended(&key(0), true, at(t0, 110));
+        assert_eq!(states(&dog, at(t0, 111)), ["reconnecting"]);
+        assert_eq!(summary(&dog, at(t0, 111)), "active");
+        assert_eq!(states(&dog, at(t0, 701)), ["lost"]);
+        // A new attempt that opens its own stream, stores nothing and closes it cleanly finished.
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 5));
+        dog.stream_ended(&key(0), true, at(t0, 6));
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 100)));
+        dog.stream_opened(&key(0), at(t0, 101));
+        dog.stream_ended(&key(0), true, at(t0, 102));
+        assert_eq!(summary(&dog, at(t0, 103)), "finished");
+        assert_eq!(summary(&dog, at(t0, 5000)), "finished");
+    }
+
+    #[test]
+    fn a_run_is_not_finished_while_an_expected_rank_has_not_been_seen() {
+        // RS02. A world of two: rank 0 runs and closes cleanly inside the grace; rank 1 has not
+        // connected. Inside the grace nothing is missing yet and no alarm is raised, but the run
+        // has not finished.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(9), Some(2), at(t0, 1));
+        dog.stream_ended(&key(0), true, at(t0, 2));
+        let status = dog.statuses(at(t0, 3), true)["run"].clone();
+        assert_eq!(
+            (&status["summary"], &status["missing_ranks"]),
+            (&json!("active"), &json!([]))
+        );
+        assert!(status["incidents"].as_array().unwrap().is_empty());
+        // After the grace rank 1 is missing.
+        let late = dog.statuses(at(t0, 61), true)["run"].clone();
+        assert_eq!(
+            (&late["summary"], &late["missing_ranks"]),
+            (&json!("degraded"), &json!([1]))
+        );
+        // A restart inside the grace takes the run up; rank 1 is missing once the grace that began
+        // when the run was first seen has passed, and the run finishes when it has finished too.
+        let now = Instant::now();
+        let fresh = Watchdog::new(config(60));
+        assert_eq!(fresh.restore("run", &as_file(&status), now), Ok(true));
+        assert_eq!(fresh.statuses(now, true)["run"]["summary"], "active");
+        let later = now + Duration::from_secs(60);
+        assert_eq!(fresh.statuses(later, true)["run"]["missing_ranks"], json!([1]));
+        fresh.stream_opened(&key(1), later);
+        fresh.batch(&key(1), 1, Some(9), Some(2), later + Duration::from_secs(1));
+        fresh.stream_ended(&key(1), true, later + Duration::from_secs(2));
+        assert_eq!(
+            fresh.statuses(later + Duration::from_secs(3), true)["run"]["summary"],
+            "finished"
+        );
+        // A restart after the grace takes it up too, with rank 1 missing at once.
+        let now = Instant::now();
+        let fresh = Watchdog::new(config(60));
+        assert_eq!(fresh.restore("run", &as_file(&late), now), Ok(true));
+        let status = &fresh.statuses(now, true)["run"];
+        assert_eq!(
+            (&status["summary"], &status["missing_ranks"]),
+            (&json!("degraded"), &json!([1]))
+        );
+    }
+
+    #[test]
+    fn a_report_of_an_earlier_attempt_does_not_make_the_rank_judged() {
+        // RS04. The rank's detectors reported on attempt 1; attempt 2 has been seen in the beats
+        // and has stored nothing. The cached report is not about what the status shows.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        assert!(dog.attempt_seen(&key(0), 1, t0));
+        dog.batch(&key(0), 1, Some(9), Some(1), at(t0, 1));
+        let status = dog.statuses(at(t0, 2), true)["run"].clone();
+        let ours = BTreeMap::from([(0, RankReport::default())]);
+        // Default reports are of attempt 0, as are status entries without one; here the status
+        // names attempt 1, so the report is current only once it names attempt 1 too.
+        let mut current = status.clone();
+        current["ranks"][0]["attempt"] = json!(0);
+        assert_eq!(run_state(&current, &ours, true)["state"], "healthy");
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 3)));
+        let status = dog.statuses(at(t0, 4), true)["run"].clone();
+        assert_eq!(status["ranks"][0]["attempt_without_steps"], true);
+        let mut stale = status.clone();
+        stale["ranks"][0]["attempt"] = json!(0); // the report's attempt, and still without steps
+        let found = run_state(&stale, &ours, true);
+        assert_eq!(found["state"], "unknown", "{found}");
+        assert_eq!(found["reasons"][1]["ranks"], json!([0]), "{found}");
+        let found = run_state(&status, &ours, true);
+        assert_eq!(found["state"], "unknown", "{found}");
     }
 }

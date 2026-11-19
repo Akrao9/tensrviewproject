@@ -258,10 +258,14 @@ impl Storage {
                     && object.location.filename().is_some_and(|name| name.starts_with("part-"))
             })
             .map(|object| StoredPart {
+                // The partition directly under the rank's folder, read relative to it: a folder
+                // above it (in the store's root) that looks like a partition says nothing about
+                // the part (until Nov 19, 2026 the first `attempt=` anywhere in the path was taken).
                 attempt: object
                     .location
-                    .parts()
-                    .find_map(|part| {
+                    .prefix_match(&dir)
+                    .and_then(|mut below| below.next())
+                    .and_then(|part| {
                         part.as_ref()
                             .strip_prefix("attempt=")
                             .and_then(|attempt| attempt.parse().ok())
@@ -855,5 +859,27 @@ mod tests {
             .unwrap();
         assert_eq!(storage.list_runs().await.unwrap(), ["run-1"]);
         assert_eq!(storage.read_status("run-1").await.unwrap().unwrap()["run_id"], "run-1");
+    }
+
+    #[tokio::test]
+    async fn a_parts_attempt_is_the_partition_under_its_rank_not_one_in_the_store_root() {
+        // RS03 (lane U6, Nov 19, 2026). A store whose root has partition-like folders of its own:
+        // each part's attempt is the folder directly under its rank's, and nothing above it.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let storage = Storage::new(store.clone(), Path::from("data/attempt=7/rank=3"));
+        storage
+            .write_part("prefix", 0, 1, &[make_batch(0..100, 4)], 0, 99)
+            .await
+            .unwrap();
+        storage
+            .write_part("prefix", 0, 2, &[make_batch(50..60, 4)], 50, 59)
+            .await
+            .unwrap();
+        // A part straight in the rank's folder, not in an attempt's: attempt 0, as always.
+        let loose = Path::from("data/attempt=7/rank=3/runs/prefix/rank=0/part-00000000-00000001.parquet");
+        store.put(&loose, PutPayload::from_static(b"x")).await.unwrap();
+        let parts = storage.rank_parts("prefix", 0).await.unwrap();
+        let read: Vec<(i64, Option<i64>)> = parts.iter().map(|part| (part.attempt, part.first_step)).collect();
+        assert_eq!(read, [(0, Some(0)), (1, Some(0)), (2, Some(50))], "{parts:?}");
     }
 }

@@ -215,6 +215,10 @@ pub struct Ingest {
     /// What each rank's detectors last reported, for the run state in `watchdog.json`. Kept
     /// apart from the rank buffers so the watchdog never waits for a flush or a rebuild.
     reports: Mutex<HashMap<Key, RankReport>>,
+    /// Per rank, the newest `(attempt, last step)` of the parts this server stored, set as soon
+    /// as a part is written and before it is judged: a report that stops before it is behind the
+    /// store, and does not judge the rank (as `read_server_report` in `evidence.py` reads it).
+    stored: Mutex<HashMap<Key, (i64, i64)>>,
     /// The manifest last written per run, as JSON text, so the same one is written once.
     manifests: Mutex<HashMap<String, String>>,
 }
@@ -236,6 +240,7 @@ impl Ingest {
             written: Mutex::new(HashMap::new()),
             data_windows: Mutex::new(HashMap::new()),
             reports: Mutex::new(HashMap::new()),
+            stored: Mutex::new(HashMap::new()),
             manifests: Mutex::new(HashMap::new()),
             used: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -384,6 +389,12 @@ impl Ingest {
                 return Err(Status::unavailable(format!("cannot write to the store: {error}")));
             }
             buffer.sealed = false;
+            {
+                let part = (buffer.attempt, buffer.max_step);
+                let mut stored = self.stored.lock().unwrap();
+                let newest = stored.entry(key.clone()).or_insert(part);
+                *newest = (*newest).max(part);
+            }
             self.used.fetch_sub(buffer.bytes, Ordering::SeqCst);
             stored = std::mem::take(&mut buffer.batches);
             buffer.rows = 0;
@@ -409,7 +420,7 @@ impl Ingest {
     /// a rebuild turns this rank's detectors off.
     async fn detect(&self, key: &Key, buffer: &mut RankBuffer, stored: &[RecordBatch]) {
         if buffer.detect_off {
-            self.reports.lock().unwrap().remove(key);
+            self.forget_report(key);
             return;
         }
         let (attempt, first_step) = (buffer.attempt, buffer.min_step);
@@ -454,7 +465,7 @@ impl Ingest {
             };
         }
         let Some(detectors) = &buffer.detectors else {
-            self.reports.lock().unwrap().remove(key);
+            self.forget_report(key);
             return;
         };
         {
@@ -477,6 +488,8 @@ impl Ingest {
                 .collect()
         };
         let report = RankReport {
+            attempt: detectors.attempt(),
+            last_step: detectors.last_step(),
             kinds: names(&document["incidents"], "kind"),
             not_checked: names(&document["not_checked"], "check")
                 .into_iter()
@@ -496,6 +509,16 @@ impl Ingest {
                     key.0, key.1
                 );
             }
+        }
+    }
+
+    /// The rank has no detectors (a rebuild failed or panicked): its report and its batch hashes
+    /// are dropped, since both came from rows before the ones just stored. (Until Nov 19, 2026 the
+    /// hashes stayed, and the status still said the rank's batches were compared.)
+    fn forget_report(&self, key: &Key) {
+        self.reports.lock().unwrap().remove(key);
+        if let Some(run) = self.data_windows.lock().unwrap().get_mut(&key.0) {
+            run.remove(&key.1);
         }
     }
 
@@ -790,14 +813,23 @@ impl Ingest {
 
     async fn write_statuses(&self, statuses: std::collections::BTreeMap<String, serde_json::Value>) {
         let now = Instant::now();
+        // The reports first and the parts stored after: a part stored in between can only make a
+        // report read behind, never current.
+        let all_reports = self.reports.lock().unwrap().clone();
+        let stored = self.stored.lock().unwrap().clone();
         for (run_id, mut status) in statuses {
             status["refresh_seconds"] = serde_json::json!(self.config.status_refresh.as_secs_f64());
-            let reports: std::collections::BTreeMap<i32, RankReport> = self
-                .reports
-                .lock()
-                .unwrap()
+            // A report that stops before the last part stored for its rank is behind: it is left
+            // out, and the rank is not judged until its report catches up. Rows still in the
+            // buffer are not stored, and do not make a report behind.
+            let reports: std::collections::BTreeMap<i32, RankReport> = all_reports
                 .iter()
                 .filter(|((run, _), _)| *run == run_id)
+                .filter(|(key, report)| {
+                    stored
+                        .get(*key)
+                        .is_none_or(|newest| (report.attempt, report.last_step.unwrap_or(i64::MIN)) >= *newest)
+                })
                 .map(|((_, rank), report)| (*rank, report.clone()))
                 .collect();
             status["run_state"] = crate::watchdog::run_state(&status, &reports, self.config.detect);
