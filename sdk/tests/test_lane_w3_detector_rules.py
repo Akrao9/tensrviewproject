@@ -268,20 +268,26 @@ def test_rust05_a_numbering_restart_is_seen_whatever_row_comes_first(engine: str
 # --- DET-09: rates seen only in rolled-back steps -------------------------------------------
 
 MANIFEST_WITHOUT_SCHEDULER = {"components": {"model": {}, "optimizer": {"entries": 4}, "rng": {}, "data": {}}}
+MANIFEST_WITH_SCHEDULER = {"components": {**MANIFEST_WITHOUT_SCHEDULER["components"], "scheduler": {"last_epoch": 10}}}
 
 
 def _resume_run(rolled_back_lr: float, kept_lr: float = 0.1) -> list[dict[str, Any]]:
-    """Attempt 1 runs steps 0 to 19 and attempt 2 resumes at 10 with a fixed rate and no
-    scheduler in its checkpoint. Attempt 1's steps 10 to 19 are rolled back."""
-    earlier = [row(step, 1, lr=[kept_lr if step < 10 else rolled_back_lr]) for step in range(20)]
-    resumed = [row(10, 2, lr=[kept_lr], checkpoint={"load": MANIFEST_WITHOUT_SCHEDULER})]
-    resumed += [row(step, 2, lr=[kept_lr]) for step in range(11, 15)]
-    return earlier + resumed
+    """An abandoned branch: attempt 1 runs steps 0 to 19, changing its rate at 10; attempt 2
+    resumes at 10 with a fixed rate (its checkpoint has a scheduler); attempt 3 resumes at 15
+    from attempt 2 with no scheduler in its checkpoint. By then attempt 1's steps 10 to 19 are
+    rolled back, and the history attempt 3 resumes into kept one rate throughout."""
+    first = [row(step, 1, lr=[kept_lr if step < 10 else rolled_back_lr]) for step in range(20)]
+    second = [row(10, 2, lr=[kept_lr], checkpoint={"load": MANIFEST_WITH_SCHEDULER})]
+    second += [row(step, 2, lr=[kept_lr]) for step in range(11, 20)]
+    third = [row(15, 3, lr=[kept_lr], checkpoint={"load": MANIFEST_WITHOUT_SCHEDULER})]
+    third += [row(step, 3, lr=[kept_lr]) for step in range(16, 20)]
+    return first + second + third
 
 
 def _scheduler_missing(evidence: dict[str, Any]) -> bool:
+    """Whether the resume at step 15 is said to lack a scheduler."""
     return any(
-        finding.get("component") == "scheduler"
+        change["step"] == 15 and finding.get("component") == "scheduler"
         for incident in evidence["incidents"] if incident["kind"] == "resume_incomplete"
         for change in incident["changes"]
         for finding in change["findings"]

@@ -478,12 +478,18 @@ def test_a_step_written_twice_in_one_attempt_is_reported_with_the_scalars_of_its
     assert python[0]["scalars"]["train/loss"]["value"] == pytest.approx(1.7)
 
 
-def test_attempts_out_of_order_in_the_input_are_read_oldest_first_as_a_store_holds_them():
+def test_attempts_are_read_in_the_order_they_first_appear_whatever_their_numbers():
+    # Contract 1 (Nov 19, 2026): an attempt number is an identity, not an order. Until then the
+    # attempts were read by number, so `resumed + first` was judged as `first + resumed`.
     first = [record(s, 1, grad_norm=wobble(s), lr=[1e-3 * min(1.0, (s + 1) / 100)], scalars={"train/loss": 2.0 - s / 1000}) for s in range(120)]
     resumed = [record(s, 2, grad_norm=wobble(s), lr=[1e-3 * min(1.0, (s - 99) / 100)], scalars={"train/loss": 2.02 - s / 1000}) for s in range(100, 150)]
-    rust = tensorquill.build_evidence(resumed + first, detectors="rust")["incidents"]
+    rust = tensorquill.build_evidence(first + resumed, detectors="rust")["incidents"]
     assert [i["kind"] for i in rust] == ["resume_lr_change"]
     assert differences(tensorquill.build_evidence(first + resumed)["incidents"], rust) == []
+    # The other way round, attempt 1 is the later one: it starts the numbering again at step 0.
+    rust = tensorquill.build_evidence(resumed + first, detectors="rust")["incidents"]
+    assert "repeated_steps" in [i["kind"] for i in rust]
+    assert differences(tensorquill.build_evidence(resumed + first)["incidents"], rust) == []
 
 
 # --- what the Rust path refuses -------------------------------------------------------------

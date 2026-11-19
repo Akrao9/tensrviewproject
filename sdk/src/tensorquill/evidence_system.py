@@ -58,7 +58,10 @@ def _count(value: Any) -> int | None:
 
 
 def _number(value: Any) -> float | None:
-    return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else None
+    """A finite number, else None; a bool is not a number (DET-16), as Rust's `system::number`."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
 
 
 def _median(values: list[float]) -> float:

@@ -45,10 +45,9 @@ fn count(value: Option<&Value>) -> Option<i64> {
     value.filter(|value| value.is_i64()).and_then(Value::as_i64)
 }
 
-/// Python's `_number`: a finite JSON number, a boolean as 0 or 1, nothing else.
+/// Python's `_number`: a finite JSON number, nothing else. A boolean is not a number (DET-16).
 fn number(value: Option<&Value>) -> Option<f64> {
     match value? {
-        Value::Bool(flag) => Some(f64::from(u8::from(*flag))),
         Value::Number(number) => number.as_f64().filter(|number| number.is_finite()),
         _ => None,
     }

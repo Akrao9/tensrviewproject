@@ -220,7 +220,7 @@ pub const INPUT_NEEDS: [(&str, &str); 16] = [
     ("loss_scale", "step_skipped (scaler=)"),
     ("lr", "lr"),
     ("data", "data (session.watch_loader)"),
-    ("checkpoint", "checkpoint"),
+    ("checkpoint", "checkpoint, or grad_scale (scaler=)"),
     ("layers", "layers (full capture)"),
     ("attention", "probe with attention (probe=)"),
     ("numbers", "layers, grad_norm, clip_grad_norm or grad_norms"),
@@ -838,8 +838,9 @@ impl<'de> Deserialize<'de> for Number {
             fn visit_u64<E>(self, number: u64) -> Result<Number, E> {
                 Ok(Number(Some(number as f64)))
             }
-            fn visit_bool<E>(self, flag: bool) -> Result<Number, E> {
-                Ok(Number(Some(f64::from(u8::from(flag)))))
+            // A bool is not a number (DET-16): an imported `true` is not a measurement of 1.
+            fn visit_bool<E>(self, _: bool) -> Result<Number, E> {
+                Ok(Number(None))
             }
             fn visit_str<E>(self, _: &str) -> Result<Number, E> {
                 Ok(Number(None))
@@ -898,8 +899,9 @@ impl<'de> Deserialize<'de> for Stat {
             fn visit_u64<E>(self, number: u64) -> Result<Stat, E> {
                 Ok(Stat::of(number as f64))
             }
-            fn visit_bool<E>(self, flag: bool) -> Result<Stat, E> {
-                Ok(Stat::of(f64::from(u8::from(flag))))
+            // A bool is not a number (DET-16), as Python's `_finite` reads it.
+            fn visit_bool<E>(self, _: bool) -> Result<Stat, E> {
+                Ok(Stat::ABSENT)
             }
             fn visit_str<E>(self, text: &str) -> Result<Stat, E> {
                 Ok(Stat {
@@ -1299,7 +1301,13 @@ impl Moe {
                 // Before a top-k router has a baseline, a dead-expert collapse is attributed by share.
                 let mean = 1.0 / experts as f64;
                 let se = (mean * (1.0 - mean) / tokens as f64).sqrt();
-                let threshold = (2.0 * mean).max(mean + 3.0 * se);
+                let mut threshold = (2.0 * mean).max(mean + 3.0 * se);
+                let most = 1.0 / router.top_k as f64;
+                if threshold >= most {
+                    // A top-k expert's share cannot pass 1/k, so with n_experts <= 2k that bound
+                    // names nothing (DET-11): the midpoint between an even share and the largest.
+                    threshold = (mean + most) / 2.0;
+                }
                 rule = OverloadRule::Collapse { threshold };
                 overloaded = (1..=experts)
                     .filter(|expert| share(&router_counts[expert - 1]) > threshold)
@@ -1829,8 +1837,10 @@ impl Updates {
         let Some(sizes) = &columns.update_rms else { return };
         let entries = sizes.row(row);
         let either = value(columns.grad_norm, row).is_some() || value(columns.clip_grad_norm, row).is_some();
-        self.carried += u64::from(either && !entries.is_empty());
-        if flag(columns.step_skipped, row) {
+        // A step the loss scaler skipped is no update history (RUST-12), as below.
+        let skipped = flag(columns.step_skipped, row);
+        self.carried += u64::from(either && !entries.is_empty() && !skipped);
+        if skipped {
             return; // the loss scaler skipped the step: the optimizer's state did not move
         }
         let total = value(
@@ -3013,8 +3023,9 @@ struct AttemptPass {
 }
 
 impl AttemptPass {
-    fn new(rank: i32, first_steps: &BTreeMap<i64, i64>) -> Self {
-        let first = first_steps.iter().next();
+    /// `order` is the rank's attempts, oldest first, each with its first step (contract 1).
+    fn new(rank: i32, order: &[(i64, i64)]) -> Self {
+        let first = order.first();
         Self {
             rank,
             first_attempt: first.map(|(attempt, _)| *attempt),
@@ -3035,7 +3046,8 @@ impl AttemptPass {
         let lr = resume_row.lr.clone();
         let first_attempt = self.first_attempt == Some(attempt);
         if self.current != Some(attempt) {
-            // The first row of an attempt, which is its lowest step.
+            // The first row of an attempt, which is its lowest step: the caller reads each
+            // attempt's rows in step order (`in_step_order`; a store's parts are in it).
             self.earlier.append(&mut self.current_steps);
             self.earlier.sort_unstable();
             self.earlier.dedup();
@@ -3213,7 +3225,10 @@ impl Inputs {
             .replica_spread
             .as_ref()
             .is_some_and(|spread| !spread.row(row).is_empty());
-        let checkpoint = data::checkpoint(columns, row).is_some();
+        // `resume_incomplete` judges a resume from a checkpoint manifest or from the loss scale
+        // (E3): either is its input.
+        let checkpoint = data::checkpoint(columns, row).is_some()
+            || value(columns.grad_scale, row).is_some_and(f64::is_finite);
         self.grad_total += u64::from(total);
         self.weight_check += u64::from(weights && norms);
         self.lr += u64::from(columns.lr(row).is_some());
@@ -3582,15 +3597,17 @@ impl RankDetectors {
     }
 }
 
-/// Python's `resolve_attempts` for one rank: given each attempt's first step, the step at
-/// which each attempt was cut off by a later one (none for the newest, and for an attempt no
-/// later one cuts). A row counts when its step is below its attempt's cutoff, and read by
-/// attempt and then by step the rows that count are in step order. Until lane V7 (Nov 19,
-/// 2026) no cutoff was `i64::MAX`, and a row at that step was never read (RS16).
-pub fn resolve(first_steps: &BTreeMap<i64, i64>) -> BTreeMap<i64, Option<i64>> {
+/// Python's `resolve_attempts` for one rank: given the rank's attempts oldest first, each with
+/// its first step, the step at which each attempt was cut off by a later one (none for the
+/// newest, and for an attempt no later one cuts). A row counts when its step is below its
+/// attempt's cutoff, and read by attempt and then by step the rows that count are in step
+/// order. Until lane V7 (Nov 19, 2026) no cutoff was `i64::MAX`, and a row at that step was
+/// never read (RS16). Until lane W3 the order was the attempt numbers'; it is now the order
+/// the attempts were first seen in (contract 1): an attempt number is an identity, not an order.
+pub fn resolve(order: &[(i64, i64)]) -> BTreeMap<i64, Option<i64>> {
     let mut cutoffs = BTreeMap::new();
     let mut cut: Option<i64> = None;
-    for (attempt, first) in first_steps.iter().rev() {
+    for (attempt, first) in order.iter().rev() {
         cutoffs.insert(*attempt, cut);
         cut = Some(cut.map_or(*first, |cut| cut.min(*first)));
     }
@@ -3609,7 +3626,9 @@ pub async fn replay(
     thresholds: &Arc<Thresholds>,
 ) -> Result<RankDetectors, Error> {
     let parts = storage.rank_parts(run_id, rank).await?;
-    let mut first_steps: BTreeMap<i64, i64> = BTreeMap::new();
+    // The attempts in the order `rank_parts` lists their parts, which is the rank's attempt
+    // order (contract 1), each with its first step.
+    let mut order: Vec<(i64, i64)> = Vec::new();
     for part in &parts {
         let first = match part.first_step {
             Some(first) => Some(first),
@@ -3623,13 +3642,12 @@ pub async fn replay(
                 .min(),
         };
         if let Some(first) = first {
-            let known = first_steps.entry(part.attempt).or_insert(first);
-            *known = (*known).min(first);
+            first_step_of(&mut order, part.attempt, first);
         }
     }
-    let cutoffs = resolve(&first_steps);
+    let cutoffs = resolve(&order);
     let mut detectors = RankDetectors::new(thresholds);
-    let mut pass = AttemptPass::new(rank, &first_steps);
+    let mut pass = AttemptPass::new(rank, &order);
     for part in &parts {
         let Some(cutoff) = cutoffs.get(&part.attempt).copied() else {
             continue;
@@ -3643,10 +3661,55 @@ pub async fn replay(
     Ok(detectors)
 }
 
+/// Notes `first` as a step of `attempt` in `order` (the attempts oldest first, each with its
+/// first step): a new attempt goes last, a known one keeps its place and its lowest step.
+fn first_step_of(order: &mut Vec<(i64, i64)>, attempt: i64, first: i64) {
+    match order.iter_mut().find(|(known, _)| *known == attempt) {
+        Some((_, known)) => *known = (*known).min(first),
+        None => order.push((attempt, first)),
+    }
+}
+
+/// Each attempt's pieces as one batch with its rows in step order, rows of one step in the
+/// order given (a stable sort). Pieces already in step order are passed through as they are.
+fn in_step_order(pieces: Vec<(i64, RecordBatch)>) -> Result<Vec<(i64, RecordBatch)>, String> {
+    let mut grouped: Vec<(i64, Vec<RecordBatch>)> = Vec::new();
+    for (attempt, piece) in pieces {
+        match grouped.last_mut() {
+            Some((last, group)) if *last == attempt => group.push(piece),
+            _ => grouped.push((attempt, vec![piece])),
+        }
+    }
+    let mut out = Vec::new();
+    for (attempt, group) in grouped {
+        let steps: Vec<i64> = group
+            .iter()
+            .filter_map(|piece| column::<Int64Array>(piece, "step"))
+            .flat_map(|steps| steps.values().iter().copied())
+            .collect();
+        if steps.is_sorted() {
+            out.extend(group.into_iter().map(|piece| (attempt, piece)));
+            continue;
+        }
+        let schema = group[0].schema();
+        let joined = arrow::compute::concat_batches(&schema, &group).map_err(|error| error.to_string())?;
+        let mut index: Vec<u32> = (0..steps.len() as u32).collect();
+        index.sort_by_key(|at| steps[*at as usize]); // stable
+        let index = arrow::array::UInt32Array::from(index);
+        let sorted = arrow::compute::take_record_batch(&joined, &index).map_err(|error| error.to_string())?;
+        out.push((attempt, sorted));
+    }
+    Ok(out)
+}
+
 /// The detectors over one rank's rows held in memory: [`replay`] without a store, for
-/// `tensorquill-server detect`. The rows must be grouped by attempt, oldest attempt first,
-/// and within an attempt in the order they were recorded, as stored parts are. A batch
-/// without an `attempt` column is attempt 0, and one without a `step` column is ignored.
+/// `tensorquill-server detect`. The rows must be grouped by attempt; the attempts are taken in
+/// the order they first appear (contract 1: a local file is appended across attempts, so its
+/// order is arrival order), and an attempt whose rows appear again after another attempt's is
+/// refused. Within an attempt the rows are read in step order, rows of one step in the order
+/// given (lane W3's step-order rule: the first fault is the lowest step, and an attempt's
+/// resume boundary is its lowest step, not its first row). A batch without an `attempt`
+/// column is attempt 0, and one without a `step` column is ignored.
 pub fn judge(rank: i32, batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Result<RankDetectors, String> {
     judge_with(RankDetectors::new(thresholds), rank, batches)
 }
@@ -3655,7 +3718,7 @@ pub fn judge(rank: i32, batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -
 fn judge_with(mut detectors: RankDetectors, rank: i32, batches: &[RecordBatch]) -> Result<RankDetectors, String> {
     // Each batch cut where the attempt changes, so every piece belongs to one attempt.
     let mut pieces: Vec<(i64, RecordBatch)> = Vec::new();
-    let mut first_steps: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut order: Vec<(i64, i64)> = Vec::new();
     for batch in batches {
         let Some(steps) = column::<Int64Array>(batch, "step") else {
             continue;
@@ -3670,15 +3733,15 @@ fn judge_with(mut detectors: RankDetectors, rank: i32, batches: &[RecordBatch]) 
                 end += 1;
             }
             if let Some((last, _)) = pieces.last() {
-                if *last > attempt {
+                if *last != attempt && order.iter().any(|(known, _)| *known == attempt) {
                     return Err(format!(
-                        "rows of attempt {attempt} follow rows of attempt {last}: group the rows by attempt, oldest first"
+                        "rows of attempt {attempt} appear again after rows of attempt {last}: group the rows by attempt, \
+                         in the order the attempts were first seen"
                     ));
                 }
             }
             if let Some(first) = steps.values()[start..end].iter().copied().min() {
-                let known = first_steps.entry(attempt).or_insert(first);
-                *known = (*known).min(first);
+                first_step_of(&mut order, attempt, first);
             }
             pieces.push((attempt, batch.slice(start, end - start)));
             start = end;
@@ -3697,8 +3760,9 @@ fn judge_with(mut detectors: RankDetectors, rank: i32, batches: &[RecordBatch]) 
         }
     }
     drop(seen);
-    let cutoffs = resolve(&first_steps);
-    let mut pass = AttemptPass::new(rank, &first_steps);
+    let pieces = in_step_order(pieces)?;
+    let cutoffs = resolve(&order);
+    let mut pass = AttemptPass::new(rank, &order);
     for (attempt, piece) in &pieces {
         let Some(cutoff) = cutoffs.get(attempt).copied() else {
             continue;
@@ -4051,8 +4115,15 @@ mod tests {
         assert_eq!(repeated.len(), 1, "{incidents:?}");
         assert_eq!(repeated[0]["repeated"], 10);
         assert_eq!((detectors.attempt(), detectors.last_step()), (3, Some(9)));
-        // An older attempt after a newer one is refused, not read in the wrong order.
-        let error = judge(0, &[key_rows(&rest), first], &usual()).err().unwrap();
+        // Attempts are taken in the order they first appear, whatever their numbers
+        // (contract 1): attempt 1 after 2 and 3 is the newest, a restart from step 0.
+        let detectors = judge(0, &[key_rows(&rest), first.clone()], &usual()).unwrap();
+        assert_eq!((detectors.attempt(), detectors.last_step()), (1, Some(29)));
+        // An attempt whose rows appear again after another attempt's is refused.
+        let mut again = steps("run", 0, 1, 0..10);
+        again.extend(steps("run", 0, 2, 5..10));
+        again.extend(steps("run", 0, 1, 10..20));
+        let error = judge(0, &[key_rows(&again)], &usual()).err().unwrap();
         assert!(error.contains("group the rows by attempt"), "{error}");
     }
 
@@ -4343,12 +4414,13 @@ mod tests {
         assert_eq!(report["moe_flagged"], json!({"samples": 1, "last_step": 12}));
 
         // Before there is a baseline, a top-4 router with dead experts is attributed by share:
-        // above twice an even share, which here is the larger bound.
+        // above twice an even share, which here is the larger bound; a top-4 expert cannot pass
+        // 1/4, so the midpoint between an even share and 1/4 is used instead (DET-11).
         let collapsed = [(1, 0, vec![("a", vec![9000, 1000, 0, 0])])];
         let (samples, _) = samples_of(&[moe_rows(&collapsed, 4)], &usual());
         assert_eq!(
             samples[0]["overload_rule"],
-            json!({"rule": "collapse", "threshold": 0.5})
+            json!({"rule": "collapse", "threshold": 0.25})
         );
         assert_eq!(
             (&samples[0]["overloaded"], &samples[0]["dead"]),
@@ -4902,14 +4974,16 @@ mod tests {
     #[test]
     fn a_later_attempt_cuts_off_the_earlier_ones() {
         // Attempt 1 from step 0, attempt 2 resumed at 100, attempt 3 at 50.
-        let cutoffs = resolve(&BTreeMap::from([(1, 0), (2, 100), (3, 50)]));
+        let cutoffs = resolve(&[(1, 0), (2, 100), (3, 50)]);
         assert_eq!(cutoffs, BTreeMap::from([(1, Some(50)), (2, Some(50)), (3, None)]));
-        assert_eq!(resolve(&BTreeMap::from([(7, 0)])), BTreeMap::from([(7, None)]));
+        assert_eq!(resolve(&[(7, 0)]), BTreeMap::from([(7, None)]));
         // An attempt that starts at the largest step still cuts the one before it (RS16).
         assert_eq!(
-            resolve(&BTreeMap::from([(1, 0), (2, i64::MAX)])),
+            resolve(&[(1, 0), (2, i64::MAX)]),
             BTreeMap::from([(1, Some(i64::MAX)), (2, None)])
         );
+        // The order given, not the numbers (contract 1): 900 first, then 2 resumed at 30.
+        assert_eq!(resolve(&[(900, 0), (2, 30)]), BTreeMap::from([(900, Some(30)), (2, None)]));
     }
 
     #[test]

@@ -641,10 +641,11 @@ def test_a_kind_can_report_through_a_faster_rule_before_it_has_enough_history():
     check = evidence["kind_checks"]["loss_scale_trouble"]
     assert (check["records"], check["records_needed"], check["enough_history"]) == (1, 10, False)
     assert evidence["run_state"]["state"] == "unhealthy"
-    # The incident stands, and the line and the listing say so beside the count.
+    # The incident stands, and the line and the listing say so beside the count. The loss scale
+    # is also `resume_incomplete`'s input since lane W3 (E3), so that kind is checked too.
     assert ev.checked_line(evidence) == (
-        "2 of 33 kinds checked, 1 of them without enough history yet"
-        " (loss_scale_trouble 1 of 10 records but reported by a faster rule), 31 not configured"
+        "3 of 33 kinds checked, 1 of them without enough history yet"
+        " (loss_scale_trouble 1 of 10 records but reported by a faster rule), 30 not configured"
     )
     assert ev.kinds_by_value(evidence)["not_enough_history"] == {
         "loss_scale_trouble": {"records": 1, "records_needed": 10, "reported": True},

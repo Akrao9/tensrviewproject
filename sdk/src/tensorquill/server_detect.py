@@ -181,23 +181,19 @@ def resolve_detectors(
 
 
 def records_stream(records: Iterable[Mapping[str, Any]]) -> bytes:
-    """One rank's records as the Arrow IPC stream `tensorquill-server detect` reads: grouped
-    by attempt, oldest first, and otherwise in the order given."""
+    """One rank's records as the Arrow IPC stream `tensorquill-server detect` reads, in
+    `stream_order`: grouped by attempt in the order the attempts first appear, each attempt's
+    rows in step order, rows of one step in the order given."""
     try:
         import pyarrow as pa
     except ImportError as error:
         raise RuntimeError("the Rust detectors read Arrow: pip install 'tensorquill[flight]'") from error
     from .flight import flight_schema, record_to_row
 
-    def attempt(record: Mapping[str, Any]) -> int:
-        value = record.get("attempt", 0)
-        return value if isinstance(value, int) and not isinstance(value, bool) else 0
-
-    # A stable sort: within an attempt the rows stay in recorded order, as the server stores them.
     rows = [
         # Records written without a run ID still have to travel in the column.
         record_to_row(record if isinstance(record.get("run_id"), str) else {**record, "run_id": ""})
-        for record in sorted(records, key=attempt)
+        for record in stream_order(records)
     ]
     schema = flight_schema()
     out = io.BytesIO()
@@ -283,10 +279,27 @@ def _whole(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def stream_order(records: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """`records` in the order the Rust detectors read them: by rank, then each rank's attempts in
+    the order they first appear (contract 1: an attempt number is an identity, not an order),
+    then by step within an attempt, rows of one step in the order given (lane W3's step-order
+    rule). A stable sort, so nothing else moves. A key that is not a whole number sorts as 0;
+    the binary refuses such a row anyway."""
+    listed = list(records)
+    places: dict[tuple[int, int], int] = {}
+    for record in listed:
+        places.setdefault((_whole(record.get("rank", 0)), _whole(record.get("attempt", 0))), len(places))
+
+    def key(record: Mapping[str, Any]) -> tuple[int, int, int]:
+        rank, attempt = _whole(record.get("rank", 0)), _whole(record.get("attempt", 0))
+        return rank, places[(rank, attempt)], _whole(record.get("step", 0))
+
+    return sorted(listed, key=key)
+
+
 def run_stream(records: Iterable[Mapping[str, Any]]) -> bytes:
     """The records of every rank of one run as the Arrow IPC stream `tensorquill-server detect
-    --run` reads: grouped by rank and then by attempt, oldest first, and otherwise in the
-    order given (as `records_stream` orders one rank)."""
+    --run` reads, in `stream_order` (as `records_stream` orders one rank)."""
     try:
         import pyarrow as pa
     except ImportError as error:
@@ -295,7 +308,7 @@ def run_stream(records: Iterable[Mapping[str, Any]]) -> bytes:
 
     rows = [
         record_to_row(record if isinstance(record.get("run_id"), str) else {**record, "run_id": ""})
-        for record in sorted(records, key=lambda r: (_whole(r.get("rank", 0)), _whole(r.get("attempt", 0))))
+        for record in stream_order(records)
     ]
     schema = flight_schema()
     out = io.BytesIO()

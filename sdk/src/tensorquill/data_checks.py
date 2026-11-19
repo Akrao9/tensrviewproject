@@ -378,7 +378,7 @@ def detect_resume_state(
     data_skipped: list[dict[str, Any]] = []
     state_skipped: list[dict[str, Any]] = []
     for rank, attempts in sorted(by_rank.items(), key=lambda kv: str(kv[0])):
-        order = sorted(attempts)
+        order = list(attempts)  # in the order they first appear (contract 1)
         run_start = min(attempts[order[0]])
         # Whether the rows read so far (every row of the earlier attempts) had the field.
         seen_data = seen_checkpoint = False
@@ -389,7 +389,7 @@ def detect_resume_state(
                 break
         hashes: dict[int, tuple[str | None, int]] = {}  # step -> (batch hash, attempt)
         scales: dict[int, float] = {}
-        lrs: set[tuple[float, ...]] = set()
+        lrs: dict[int, tuple[float, ...]] = {}  # step -> learning rate, rolled back as the rest (DET-09)
         saves: list[tuple[int, Mapping[str, Any]]] = []  # (after_step, manifest), in the order written
         for attempt in order:
             steps = attempts[attempt]
@@ -412,7 +412,7 @@ def detect_resume_state(
                     # The last one written among those after the same step.
                     saved = [s for s in saves if s[0] == saved[0]][-1]
                 findings, source, checked = _state_findings(
-                    first, resumed_at, run_start, saved, len(lrs) > 1, first_scale, previous_scale
+                    first, resumed_at, run_start, saved, len(set(lrs.values())) > 1, first_scale, previous_scale
                 )
                 if findings:
                     change: dict[str, Any] = {"step": resumed_at, "rank": rank, "attempt": attempt, "source": source,
@@ -428,6 +428,7 @@ def detect_resume_state(
             # This attempt rolls back whatever earlier attempts recorded from its first step on.
             hashes = {k: v for k, v in hashes.items() if k < resumed_at}
             scales = {k: v for k, v in scales.items() if k < resumed_at}
+            lrs = {k: v for k, v in lrs.items() if k < resumed_at}
             saves = [s for s in saves if s[0] < resumed_at]
             for step in sorted(steps):
                 record = steps[step]
@@ -441,7 +442,7 @@ def detect_resume_state(
                     scales[step] = scale
                 lr = record.get("lr")
                 if isinstance(lr, list) and lr and all(_number(v) is not None for v in lr):
-                    lrs.add(tuple(float(v) for v in lr))
+                    lrs[step] = tuple(float(v) for v in lr)
                 checkpoint = record.get("checkpoint")
                 save = checkpoint.get("save") if isinstance(checkpoint, Mapping) else None
                 if isinstance(save, Mapping):

@@ -553,9 +553,9 @@ impl ResumeFound {
 pub(super) struct ResumePass {
     hashes: BTreeMap<i64, (Option<String>, i64)>,
     scales: BTreeMap<i64, f64>,
-    /// The first learning rate seen and whether another one followed.
-    lr: Option<Vec<f64>>,
-    lr_varies: bool,
+    /// Each step's learning rate, rolled back as the rest of the history: a rate seen only in
+    /// steps a later attempt rolled back does not make a scheduler expected (DET-09).
+    lrs: BTreeMap<i64, Vec<f64>>,
     /// (after step, manifest), in the order written.
     saves: Vec<(i64, Value)>,
     first_scale: Option<f64>,
@@ -719,7 +719,7 @@ impl ResumePass {
             let components = manifest["components"].as_object();
             let has = |name: &str| components.is_some_and(|components| components.contains_key(name));
             let mut expected = vec!["model", "optimizer"];
-            if self.lr_varies {
+            if self.lr_varies() {
                 expected.push("scheduler");
             }
             if self.first_scale.is_some() {
@@ -776,7 +776,14 @@ impl ResumePass {
     pub(super) fn roll_back(&mut self, step: i64) {
         self.hashes.split_off(&step);
         self.scales.split_off(&step);
+        self.lrs.split_off(&step);
         self.saves.retain(|(after, _)| *after < step);
+    }
+
+    /// Whether the history before the resume holds more than one learning rate.
+    fn lr_varies(&self) -> bool {
+        let mut rates = self.lrs.values();
+        rates.next().is_some_and(|first| rates.any(|other| other != first))
     }
 
     /// Adds a row of the attempt being read; `first_attempt` when it belongs to the run's first.
@@ -793,11 +800,7 @@ impl ResumePass {
             }
         }
         if let Some(lr) = row.lr {
-            match &self.lr {
-                None => self.lr = Some(lr),
-                Some(first) if *first != lr => self.lr_varies = true,
-                Some(_) => {}
-            }
+            self.lrs.insert(step, lr);
         }
         if let Some(checkpoint) = row.checkpoint {
             if let Some(save) = checkpoint.get("save").filter(|save| save.is_object()) {
@@ -959,9 +962,12 @@ mod tests {
         assert!(error.contains("send the ranks of one run"), "{error}");
         let error = detect_run(&[rows("run", &[])], &usual()).err().unwrap();
         assert!(error.contains("no rows"), "{error}");
-        // A rank's attempts out of order are refused with the rank named.
+        // A rank's attempt whose rows appear again after another attempt's is refused with the
+        // rank named. (A lower attempt number after a higher one is not: contract 1 orders
+        // attempts by first appearance.)
         let mut backwards: Vec<_> = (0..5).map(|step| (1, 2, step, None)).collect();
         backwards.extend((0..5).map(|step| (1, 1, step, None)));
+        backwards.extend((5..10).map(|step| (1, 2, step, None)));
         let error = detect_run(&[rows("run", &rank(0, 0..5, 0..0)), rows("run", &backwards)], &usual())
             .err()
             .unwrap();
