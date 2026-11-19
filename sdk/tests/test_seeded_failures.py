@@ -247,7 +247,7 @@ def run_main(out, *argv):
 
 
 def evidence_of(out, case):
-    records = tensorquill.load_records(Path(out) / case / f"{case}.jsonl")
+    records = tensorquill.load_records(Path(out) / f"{case}.jsonl")  # every case in --out itself (CLI-19)
     return records, tensorquill.build_evidence(records)
 
 
@@ -408,7 +408,7 @@ def update_case(tmp_path_factory):
     pytest.importorskip("transformers")
     out = tmp_path_factory.mktemp("update") / "out"
     code, text = run_main(out, "--case", "update_spike")
-    records = tensorquill.load_records(out / "update_spike" / "update_spike.jsonl")
+    records = tensorquill.load_records(out / "update_spike.jsonl")
     return {"code": code, "text": text, "records": records}
 
 
