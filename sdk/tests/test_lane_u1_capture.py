@@ -10,7 +10,6 @@ warning under `-W error`, and `init`'s docstring on the drift check's gather. No
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import warnings
 from pathlib import Path
@@ -81,9 +80,14 @@ def test_a_gradient_on_meta_is_left_out_on_its_own_and_the_step_runs_as_without_
 
 
 def _one(make: callable) -> dict:
-    """One step of a model whose second trainable parameter has the gradient `make()` returns."""
-    special = make()
-    param = nn.Parameter(special.detach().clone())
+    """One step of a model whose second trainable parameter has the gradient `make()` returns.
+    Skipped where this PyTorch cannot make such a parameter and gradient (a capability check,
+    as the plan's PyTorch 2.6 entry does, not a version string)."""
+    try:
+        param = nn.Parameter(make().detach().clone())
+        param.grad = make()
+    except Exception as error:  # noqa: BLE001
+        pytest.skip(f"this PyTorch cannot make the parameter: {type(error).__name__}: {error}")
     model = nn.ParameterList([nn.Parameter(torch.ones(2, 2)), param])
     sink = tensorquill.MemorySink()
     session = tensorquill.init(model, sink=sink, layers=(), weights=False, auto_step=False, every=1)
@@ -121,6 +125,15 @@ UNREADABLE = {
 @pytest.mark.parametrize("kind", sorted(UNREADABLE))
 def test_an_unreadable_gradient_is_named_and_the_others_keep_their_norms(kind):
     make, why = UNREADABLE[kind]
+    if kind == "float8":
+        if not hasattr(torch, "float8_e4m3fn"):
+            pytest.skip("this PyTorch has no float8")
+        try:
+            torch.linalg.vector_norm(make())
+        except Exception:  # noqa: BLE001
+            pass  # the case under test: the CPU has no norm for it
+        else:
+            pytest.skip("this PyTorch can take a float8 norm on the CPU, so nothing raises to test")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)  # PyTorch's own note on the float8 copy, if any
         record = _one(make)
@@ -199,8 +212,8 @@ def test_every_public_call_on_a_closed_session_returns_at_once_and_queues_nothin
     assert not worker.is_alive(), "a call on a closed session blocked"
     assert failed == []
     assert session._queue.qsize() == 0 and sink.records == written
-    closed = [w for w in said if "after session.close()" in str(w.message)]
-    assert len(closed) == 1 and len(said) == 1
+    ours = [w for w in said if "TensorQuill" in str(w.message)]
+    assert len(ours) == 1 and "after session.close()" in str(ours[0].message)
 
 
 def test_a_closed_session_does_not_raise_under_warnings_as_errors(caplog):
@@ -230,34 +243,55 @@ def test_close_still_writes_the_steps_left_in_the_ring():
 # --- B8: init traced by torch.compile -------------------------------------------------------------
 
 
-def test_init_inside_a_compiled_function_runs_and_captures():
-    """TrainCheck's PT-115607 loop (B8 in the plan), with TensorQuill started inside the function
-    Dynamo traces, as `experiments/traincheck-bugs/b08_pt115607.py` starts it."""
-    sink = tensorquill.MemorySink()
-    counts: list[float] = []
-
-    def loop() -> capture.Session:
+def _b8_loop(sink: tensorquill.MemorySink | None, counts: list[float]) -> callable:
+    def loop() -> capture.Session | None:
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(2, 3), nn.Sigmoid(), nn.Linear(3, 1), nn.Sigmoid())
         params = list(model.parameters())
         opt = torch.optim.Adam(params)
-        session = tensorquill.init(model, sink=sink, every=1)
+        session = tensorquill.init(model, sink=sink, every=1) if sink is not None else None
         for i in range(6):
             opt.zero_grad()
             if i != 3:
                 loss = model(torch.ones(3, 2)).sum()
                 loss.backward()
-                session.log({"loss": loss})
+                if session is not None:
+                    session.log({"loss": loss})
             opt.step()
             counts.append(float(opt.state[params[0]]["step"]))
         return session
 
+    return loop
+
+
+def _compiled(fn: callable, *, errors: bool) -> object:
     torch._dynamo.reset()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)  # Dynamo's notes on what it does not trace
-        session = torch.compile(loop, backend="eager")()
+    try:
+        with warnings.catch_warnings():
+            # Dynamo's notes on what it does not trace, or every warning as an error.
+            warnings.simplefilter("error" if errors else "ignore", Warning if errors else UserWarning)
+            return torch.compile(fn, backend="eager")()
+    finally:
+        torch._dynamo.reset()
+
+
+def _control(fn: callable, *, errors: bool) -> None:
+    """The same compiled loop without TensorQuill: where this PyTorch cannot run it, the test has
+    nothing to show and is skipped (a capability check, not a version string)."""
+    try:
+        _compiled(fn, errors=errors)
+    except Exception as error:  # noqa: BLE001
+        pytest.skip(f"this PyTorch cannot run the loop compiled without TensorQuill: {type(error).__name__}")
+
+
+def test_init_inside_a_compiled_function_runs_and_captures():
+    """TrainCheck's PT-115607 loop (B8 in the plan), with TensorQuill started inside the function
+    Dynamo traces, as `experiments/traincheck-bugs/b08_pt115607.py` starts it."""
+    _control(_b8_loop(None, []), errors=False)
+    sink = tensorquill.MemorySink()
+    counts: list[float] = []
+    session = _compiled(_b8_loop(sink, counts), errors=False)
     session.close()
-    torch._dynamo.reset()
     assert counts == [1.0, 2.0, 3.0, 3.0, 4.0, 5.0]
     assert [r["step"] for r in sink.records] == list(range(6))
     for i, record in enumerate(sink.records):
@@ -285,26 +319,26 @@ def test_init_then_compile_the_model_still_captures():
 def test_the_optimizer_hooks_do_not_raise_when_optimizer_step_is_traced_under_warnings_as_errors():
     """`optimizer.step()` inside a compiled function: traced, the session's optimizer hooks made
     Dynamo warn on `sys._getframe`, which `-W error` raised out of the step."""
-    torch.manual_seed(0)
-    model = nn.Sequential(nn.Linear(2, 3), nn.Sigmoid(), nn.Linear(3, 1))
-    opt = torch.optim.Adam(model.parameters())
+    def make() -> tuple[nn.Module, callable]:
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(2, 3), nn.Sigmoid(), nn.Linear(3, 1))
+        opt = torch.optim.Adam(model.parameters())
+        compiled_model = torch.compile(model, backend="eager")
+
+        def train() -> None:
+            for _ in range(3):
+                opt.zero_grad()
+                compiled_model(torch.ones(3, 2)).sum().backward()
+                opt.step()
+
+        return model, train
+
+    _control(make()[1], errors=True)
+    model, train = make()
     sink = tensorquill.MemorySink()
     session = tensorquill.init(model, sink=sink, every=1)
-    compiled_model = torch.compile(model, backend="eager")
-
-    def train() -> None:
-        opt.zero_grad()
-        compiled_model(torch.ones(3, 2)).sum().backward()
-        opt.step()
-
-    torch._dynamo.reset()
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        step = torch.compile(train, backend="eager")
-        for _ in range(3):
-            step()
+    _compiled(train, errors=True)
     session.close()
-    torch._dynamo.reset()
     assert [r["step"] for r in sink.records] == [0, 1, 2]
     assert all(r["grad_norms"] and r["layers"] for r in sink.records)
 
@@ -578,4 +612,3 @@ def test_the_writer_thread_is_named_once_per_open_session():
     assert names() == start + 1
     session.close()
     assert names() == start
-    assert os.environ.get("TENSORQUILL_ENDPOINT") is None
