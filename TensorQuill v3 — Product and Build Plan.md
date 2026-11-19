@@ -1843,6 +1843,48 @@ State as of Nov 16, 2026.
   - *Read.* The copy off the device is a blocking `.cpu()`, so the held step's slice of it is complete. The owed probe now runs between the next backward and the lead's step; `run_probe` runs under `no_grad` and `fork_rng`, restores each module's training flag, and `_run_owed_probe` puts the hook buffers back. `_decode` finds the gradient rows from the layer count, so the split block lines up with it; `refused` lays out the router counts, and the refusals are written once, from `announce`, on the first part. The optimizer hooks were registered with no guard against raising before R2, and R2's new paths are no less guarded. The six edited tests change timing only, and the two-optimizer update-size test asserts more than before.
   - *Run on the trial merge* (macOS, Python 3.12, PyTorch 2.15). With the server binary 1,799 passed; without it 1,180 passed and 619 skipped; without `pyarrow` 1,056 passed and 80 skipped (R2 had not run this setup); `experiments/` 92 passed. Each is `main`'s count plus R2's 28 new tests. The six more warnings in each setup are Lightning's own, from R2's two Lightning tests. Under load from a parallel suite run, the stall test and the flush test passed 5 out of 5 and the ten trigger tests that run the two edited worker scripts 3 out of 3. No Rust check was run: R2 changes nothing under `server/`.
   - *Open, for the author.* An optimizer that sits before the lead in the loop but starts stepping later has its update, re-check and probe one step early, where before R2 its update was on the right record (pinned by a test; the fix needs an iteration-end signal). R2's other choices to revisit are listed in its hand-over note (`lane-r2-capture-steps.md` in the session notes): a weight check due on a skipped step moves to the next step, Lightning's loss with several optimizers is a sum, and the first step a follower followed is probed twice. Nothing ran on a GPU, Linux or PyTorch 2.6. Nothing is pushed.
+- [x] **An NVML call that never returns no longer holds training (Nov 18, 2026, lane T3, branch `claude/lane-t3-nvml-74e3e2`; not merged).** The open item in the C entry ("a hung NVML call, which blocks the writer thread and, once the 8-block queue fills, training"). Code in `system.py` only, tests in `test_system.py`. `capture.py`, the record format, the detectors, the golden files, the server and the protocol number are unchanged.
+  - *Found, on `main` at `3f93636`.* NVML was read on the writer thread (`SystemReadings.write` → `Nvml.read`). The `NVML_SLOW_SECONDS` check runs only after a call returns, so a call that never returns held the writer. Once the queue was full, `Session._put` made training wait for it. Reproduced on CPU with a fake `pynvml` whose `nvmlDeviceGetTemperature` blocks until the test releases it: at `every=1` (a queue of 8 blocks, one reading each), after 3 healthy steps, 40 more steps did not finish in 10 s, and the backpressure warning ("8 steps behind; training now waits for it") was raised. `test_a_hung_nvml_call_never_holds_training` fails on `main` with "training waited for a hung NVML call". Two more hangs were found the same way:
+    - a hung `nvmlInit` at the first reading, which was never timed;
+    - a hung `nvmlShutdown` at the end. `Session.close()` joins the writer, which shut NVML down in `_drain`'s `finally`, so `close()` itself hung.
+  - *Read first.*
+    - **wandb.** NVML is kept out of the user's process. Its Go `core` starts the `wandb-symon` sidecar (Rust), bounds the start and the stop at 5 s each and then kills it (`core/internal/monitor/symonresourcemanager.go`). The sidecar runs each collector in its own task (`symon/src/monitors.rs`), with no timeout on any one NVML call. wandb's older Python assets sampled on daemon threads in wandb's own internal process, and `finish()` joined them with no bound.
+    - **mlflow's system-metrics monitor** is the same: a daemon thread, joined with no bound.
+    - **Lightning** runs `nvidia-smi` with no timeout.
+    - **No reference bounds a single NVML call.** TensorQuill reads in the training process, so it bounds the writer's wait instead.
+    - **pynvml** loads the library with `CDLL` (wandb's vendored copy, `pynvml.py:2026`), so a call in progress releases the GIL, and a thread hung in NVML does not stop the others.
+  - *Changed.*
+    - **Every NVML call of the session now runs on one daemon thread, `tensorquill-nvml`**: the import, `nvmlInit`, the readings, the error path's close and `nvmlShutdown`. The writer thread starts it on its first reading, so nothing is added on the training thread. Once it exists, the writer never touches `Nvml`. `Nvml` itself is unchanged, its in-reader slow check included.
+    - **The writer waits a bounded time for each reading** (`SystemReadings._ask`): `NVML_SLOW_SECONDS` (2 s), or `NVML_OPEN_SECONDS` (10 s, new) for the first reading, which also opens NVML.
+    - **A reading not back by then is left behind**, and that flush gets the one note `{"unavailable": "an NVML reading took over 2 s; NVML is off for this session"}`. For the first reading the note is `the first NVML reading, which opens NVML, took over 10 s; …`. This is the shape `server/src/detect/system.rs` already reads. NVML is then off for the session.
+    - **The stuck thread is never joined and never asked again.** If its call ever returns, the reading is dropped, and the thread shuts NVML down and exits.
+    - **At close** (`SystemReadings.close`) the writer asks the thread to shut NVML down and waits at most `NVML_SLOW_SECONDS`. Once a reading has been left behind, it does not wait at all.
+    - **When NVML is unavailable** (a CPU model, no `pynvml`, a failed `nvmlInit`), the thread exits after the one note.
+  - *Choices for the author to revisit (none blocks).*
+    - **The open is now bounded, at 10 s;** before, it was not timed. It gets more room than a reading so that an NVML that is only slow to start is not turned off; how long `nvmlInit` takes on a real node was not measured. A working open that takes longer than 10 s now turns NVML off.
+    - **A reading that comes back after the bound** is written as the note on that flush. `main` kept it and wrote the note on the next flush. The format is the same; only that case's content differs. A reading back in time but over 2 s inside NVML (the in-reader check) is kept, as before.
+    - **Training can still wait once, up to the bound** (2 s, or 10 s at the first reading), when the writer's queue fills during that wait. At `every=1` with fast CPU steps it does: the backpressure warning shows in two of the new tests.
+  - *Tests.* Seven new tests in `test_system.py`:
+    - a hung reading mid-run: every step is recorded, `cuda` stays on every flush, the one note is written, and close is bounded. Nothing is asked of NVML after the hang, not even a shutdown. Once released, the thread shuts NVML down and exits;
+    - a hung open;
+    - a hung shutdown at close;
+    - a reading slower than the bound that does come back: one note, the late reading dropped, never asked again;
+    - the thread's name, that it is a daemon, and that it ends with NVML;
+    - an unavailable NVML ending its thread;
+    - no thread for a session that never flushes.
+    `FakeNvml` gains `hang`, `release` and `calls`. Its fixture releases any hung call at teardown, and the session tests close on a thread with a bounded wait, so a regression fails instead of hanging the run. Against `main`'s `system.py` (plus one shim line, `NVML_OPEN_SECONDS`, so the fixture can set it), 7 failed and 16 passed. The four behaviour tests fail for the reasons above; the other three because `main` has no NVML thread. The 16 existing tests are unchanged.
+  - *Run* (macOS, Python 3.12, PyTorch 2.15, CPU, while six other sessions ran suites on the machine). Each count is `main`'s baseline plus the seven new tests, and nothing failed, so nothing was rerun:
+    - with the server binary: 1,806 passed (baseline 1,799);
+    - without it: 1,187 passed and 619 skipped (1,180 and 619);
+    - without `pyarrow` or the binary: 1,063 passed and 80 skipped (1,056 and 80);
+    - `experiments/moe-bakeoff/test_fixtures.py` and `experiments/gate1/test_gate1.py`: 92 passed.
+
+    A code comment in `system.py` changed after the first run started; `test_system.py` was run again on the final tree (23 passed) and three times in a row before (23 passed each time).
+  - *Not run.* Nothing on a GPU, on Linux, with the real `pynvml`, or on PyTorch 2.6 (this lane calls no new PyTorch API). A real hung driver was not reproduced, only the fake.
+  - *Open.*
+    - **Two docs outside this lane's files are now stale.** `sdk/README.md:768`, under Limits, still says a hung NVML call blocks the writer thread and then training. Line 755 still says NVML is "read on the writer thread". The C entry's Open list above (line 625) still names the hung call; this entry supersedes it.
+    - **A process that keeps running after a hang keeps one thread stuck in the driver for its lifetime.** It is a daemon thread and does not keep the process from exiting.
+    - **Hand-over note:** `lane-t3-nvml.md` in the session notes, which lists every function touched.
 
 ## Sources
 
