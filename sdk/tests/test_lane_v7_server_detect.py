@@ -134,11 +134,13 @@ def test_c16_the_rust_reader_compares_only_hashes_of_one_kind():
     for case in fixture["cases"]:
         name, kind = case["name"], case["detector"]
         if kind == "duplicate_batches":
+            # A kind across ranks: `build_evidence` judges one rank, so the run's Rust reader
+            # (`detect --run`, what the all-ranks view and the server's status use) is asked.
             document = server_run_report(case["records"], binary=str(BINARY))
             incidents, not_checked = document["incidents"], []
         else:
-            report = server_report(case["records"], binary=str(BINARY))
-            incidents, not_checked = report["incidents"], report["not_checked"]
+            evidence = tensorquill.build_evidence(case["records"], detectors="rust", server_binary=str(BINARY))
+            incidents, not_checked = evidence["incidents"], evidence.get("not_checked", [])  # left out when empty
         found = [i for i in incidents if i["kind"] == kind]
         if case["incident"] is None:
             assert found == [], name
