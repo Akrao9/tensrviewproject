@@ -48,6 +48,15 @@ class RunLogger(L.loggers.Logger):
         pass
 
 
+class GivenOnRankZero(TensorQuillCallback):
+    """A `run_id=` on rank 0 only, as `run_id=wandb.run.id if wandb.run else None` gives."""
+
+    def on_fit_start(self, trainer, pl_module):
+        if trainer.is_global_zero:
+            self.init_kwargs = {**self.init_kwargs, "run_id": "given-0"}
+        super().on_fit_start(trainer, pl_module)
+
+
 def _trainer(tmp_path, callback, **kwargs):
     return L.Trainer(
         default_root_dir=tmp_path, max_steps=4, callbacks=[callback], enable_checkpointing=False,
@@ -121,5 +130,27 @@ def test_rank_zero_run_id_reaches_every_rank_under_ddp(tmp_path, monkeypatch):
     trainer.fit(Module())
     out = tmp_path / "tensorquill-out"
     assert sorted(p.name for p in out.glob("*.jsonl")) == ["mlflow-run-7.rank0.jsonl", "mlflow-run-7.rank1.jsonl"]
+    for path in out.glob("*.jsonl"):
+        assert [r["step"] for r in tensorquill.load_records(path)] == [0, 1, 2]
+
+
+@pytest.mark.skipif(not torch.distributed.is_available(), reason="needs torch.distributed")
+def test_a_run_id_given_on_rank_zero_only_reaches_every_rank(tmp_path, monkeypatch):
+    # Every rank takes the same path whatever it was given: before lane T1 the callback
+    # broadcast only on ranks with no run_id, so rank 1 waited in a broadcast rank 0 skipped.
+    from datetime import timedelta
+
+    from lightning.pytorch.strategies import DDPStrategy
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo")
+    trainer = L.Trainer(
+        default_root_dir=tmp_path, max_steps=3, callbacks=[GivenOnRankZero()], logger=RunLogger(),
+        enable_checkpointing=False, enable_progress_bar=False, enable_model_summary=False,
+        accelerator="cpu", devices=2, strategy=DDPStrategy(start_method="spawn", timeout=timedelta(seconds=20)),
+    )
+    trainer.fit(Module())
+    out = tmp_path / "tensorquill-out"
+    assert sorted(p.name for p in out.glob("*.jsonl")) == ["given-0.rank0.jsonl", "given-0.rank1.jsonl"]
     for path in out.glob("*.jsonl"):
         assert [r["step"] for r in tensorquill.load_records(path)] == [0, 1, 2]

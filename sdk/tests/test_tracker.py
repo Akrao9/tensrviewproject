@@ -81,48 +81,136 @@ def test_launcher_job_id_is_shared_by_every_rank(monkeypatch):
     assert resolve_run().run_id == "run-5c1e"
 
 
-def test_rank_zeros_run_id_and_source_are_broadcast(monkeypatch):
-    # Under torch.distributed rank 0 resolves the whole order and broadcasts (ID, source);
-    # every rank calls the broadcast, whatever it sees itself. Two real processes run in
-    # test_run_id_ranks.py; this checks what each rank sends and keeps.
+def _ranks_sharing_a_store(monkeypatch, store=None):
+    """Fake a process group of two ranks whose default store is a real in-process HashStore,
+    and make every collective that could carry the run ID raise: under NCCL each one puts
+    tensors on `torch.cuda.current_device()`. `as_rank(r)` makes this process rank r and starts
+    its count of exchanges again, as a process of its own would."""
+    import itertools
+
     import torch.distributed as dist
+    from torch.distributed import distributed_c10d
+
+    from tensorquill import tracker
 
     clear(monkeypatch)
-    rank = {"now": 1}
-    sent = []
+    store = dist.HashStore() if store is None else store
+    rank = {"now": 0}
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
     monkeypatch.setattr(dist, "get_rank", lambda group=None: rank["now"])
+    monkeypatch.setattr(distributed_c10d, "_get_default_store", lambda: store)
 
-    def broadcast(box, src=0):
-        sent.append((rank["now"], src, list(box)))
-        if rank["now"] != 0:
-            box[0] = ("run-from-rank-0", "wandb")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the run ID was shared by a collective")
 
-    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
-    # Rank 1 sees a launcher ID, and still takes rank 0's.
+    for name in ("broadcast_object_list", "all_gather_object", "broadcast", "all_gather", "barrier"):
+        monkeypatch.setattr(dist, name, forbidden)
+
+    def as_rank(r):
+        rank["now"] = r
+        monkeypatch.setattr(tracker, "_exchanges", itertools.count(), raising=False)
+
+    return as_rank
+
+
+def test_rank_zeros_run_id_and_source_are_shared_through_the_store(monkeypatch, recwarn):
+    # Under torch.distributed rank 0 resolves the whole order and puts (ID, source) in the
+    # process group's store; every other rank takes it from there, whatever it sees itself.
+    # Two real processes run in test_run_id_ranks.py; this checks what each rank keeps.
+    as_rank = _ranks_sharing_a_store(monkeypatch)
     monkeypatch.setenv("TORCHELASTIC_RUN_ID", "5c1e")
-    assert resolve_run() == tensorquill.RunInfo("run-from-rank-0", "wandb", 1)
-    assert sent == [(1, 0, [None])]
-    # Rank 0 sends what it resolves: its W&B run over the launcher's ID.
-    rank["now"] = 0
+    # Rank 0 takes its W&B run over the launcher's ID, and shares it.
+    as_rank(0)
     monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(run=types.SimpleNamespace(id="w-0")))
     assert resolve_run() == tensorquill.RunInfo("w-0", "wandb", 0)
-    assert sent[-1] == (0, 0, [("w-0", "wandb")])
-    # A run_id passed in is used as given, with no collective.
+    # Rank 1 sees no W&B run and a launcher ID, and still takes rank 0's.
+    as_rank(1)
+    monkeypatch.delitem(sys.modules, "wandb")
+    assert resolve_run() == tensorquill.RunInfo("w-0", "wandb", 1)
+    assert not [w for w in recwarn if "run ID" in str(w.message)]
+
+
+def test_a_run_id_on_some_ranks_takes_the_same_path(monkeypatch, recwarn):
+    # A run_id passed on rank 0 only (`run_id=wandb.run.id if wandb.run else None`) used to
+    # leave the other ranks waiting in the broadcast alone. Now every rank exchanges, and an
+    # explicit ID is rank 0's resolution like any other: rank 0's wins.
+    import pytest
+
+    as_rank = _ranks_sharing_a_store(monkeypatch)
+    as_rank(0)
     assert resolve_run("mine") == tensorquill.RunInfo("mine", "explicit", 0)
-    assert len(sent) == 2
+    as_rank(1)
+    assert resolve_run() == tensorquill.RunInfo("mine", "explicit", 1)
+    assert not [w for w in recwarn if "run ID" in str(w.message)]
+    # The same ID on every rank: no warning.
+    as_rank(1)
+    assert resolve_run("mine") == tensorquill.RunInfo("mine", "explicit", 1)
+    assert not [w for w in recwarn if "run ID" in str(w.message)]
+    # Another ID on rank 1: rank 0's wins, and rank 1 is told.
+    as_rank(1)
+    with pytest.warns(RuntimeWarning, match="rank 1 was given run_id='theirs', and rank 0's run ID is 'mine'"):
+        assert resolve_run("theirs") == tensorquill.RunInfo("mine", "explicit", 1)
+
+
+def test_a_rank_that_never_hears_from_rank_zero_falls_back(monkeypatch):
+    # Rank 0 never shares an ID (it never calls init). Another rank waits a bounded time, then
+    # writes under an ID of its own (its explicit one, else the launcher's, else a generated
+    # one), with one warning, and raises nothing.
+    import time
+
+    import pytest
+
+    from tensorquill import tracker
+
+    as_rank = _ranks_sharing_a_store(monkeypatch)
+    monkeypatch.setattr(tracker, "RUN_ID_WAIT_SECONDS", 0.3, raising=False)
+    monkeypatch.setenv("SLURM_JOB_ID", "9")
+    as_rank(1)
+    started = time.monotonic()
+    fell_back = r"rank 1 of 2 did not get rank 0's run ID \(.*; it waits at most 0.3 s\)"
+    with pytest.warns(RuntimeWarning, match=fell_back) as caught:
+        assert resolve_run() == tensorquill.RunInfo("run-slurm9", "launcher", 1)
+    assert 0.25 < time.monotonic() - started < 5
+    assert len([w for w in caught if "run ID" in str(w.message)]) == 1
+    as_rank(1)
+    with pytest.warns(RuntimeWarning, match="did not get rank 0's run ID"):
+        assert resolve_run("mine") == tensorquill.RunInfo("mine", "explicit", 1)
+
+
+def test_a_store_that_fails_never_raises(monkeypatch):
+    # No usable store (MPI's default group has a placeholder one): every rank keeps an ID of
+    # its own at once, with one warning, and nothing raises.
+    import pytest
+    import torch.distributed as dist
+
+    from tensorquill import tracker
+
+    monkeypatch.setattr(tracker, "RUN_ID_WAIT_SECONDS", 60, raising=False)
+    as_rank = _ranks_sharing_a_store(monkeypatch, store=dist.Store())
+    monkeypatch.setenv("SLURM_JOB_ID", "9")
+    for rank, match in ((0, "rank 0 of 2 could not share its run ID"), (1, "rank 1 of 2 did not get rank 0's run ID")):
+        as_rank(rank)
+        with pytest.warns(RuntimeWarning, match=match) as caught:
+            assert resolve_run() == tensorquill.RunInfo("run-slurm9", "launcher", rank)
+        assert len([w for w in caught if "run ID" in str(w.message)]) == 1
+
+    from torch.distributed import distributed_c10d
+
+    def no_store():
+        raise ValueError("Default process group has not been initialized")
+
+    monkeypatch.setattr(distributed_c10d, "_get_default_store", no_store)
+    as_rank(1)
+    with pytest.warns(RuntimeWarning, match="did not get rank 0's run ID"):
+        assert resolve_run() == tensorquill.RunInfo("run-slurm9", "launcher", 1)
 
 
 def test_rank_zero_passes_over_a_tracker_that_raises(monkeypatch):
     import pytest
-    import torch.distributed as dist
 
-    clear(monkeypatch)
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
-    monkeypatch.setattr(dist, "broadcast_object_list", lambda box, src=0: None)
+    as_rank = _ranks_sharing_a_store(monkeypatch)
+    as_rank(0)
 
     def active_run():
         raise RuntimeError("tracking server unreachable")
@@ -131,6 +219,8 @@ def test_rank_zero_passes_over_a_tracker_that_raises(monkeypatch):
     monkeypatch.setenv("SLURM_JOB_ID", "9")
     with pytest.warns(RuntimeWarning, match="could not read the tracker's run"):
         assert resolve_run() == tensorquill.RunInfo("run-slurm9", "launcher", 0)
+    as_rank(1)
+    assert resolve_run() == tensorquill.RunInfo("run-slurm9", "launcher", 1)
 
 
 def test_tracker_run_without_a_process_group_is_warned(monkeypatch, recwarn):

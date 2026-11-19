@@ -104,17 +104,21 @@ def test_a_failed_train_can_be_closed_and_the_next_one_starts_clean(tmp_path):
     assert callback.session is None and [r["step"] for r in sink.records] == [0, 1]
 
 
-def test_tracker_run_on_rank_zero_reaches_every_rank(monkeypatch):
-    import torch.distributed as dist
+def test_the_callback_leaves_the_run_id_to_init(tmp_path, monkeypatch):
+    # `init` resolves the run ID and shares rank 0's with every rank through the process
+    # group's store, so the callback no longer shares it itself (that was a collective, and it
+    # was called as "explicit"): the run's source is the tracker's.
+    import types
 
-    from tensorquill import huggingface
-
-    for name in ("MLFLOW_RUN_ID",):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MLFLOW_RUN_ID", raising=False)
     monkeypatch.delitem(sys.modules, "mlflow", raising=False)
-    monkeypatch.delitem(sys.modules, "wandb", raising=False)  # rank 1 has no W&B run
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda group=None: 1)
-    monkeypatch.setattr(dist, "broadcast_object_list", lambda box, src=0: box.__setitem__(0, "wandb-run-3"))
-    assert huggingface._shared_tracker_run_id() == "wandb-run-3"
+    run = types.SimpleNamespace(id="wandb-run-3", project="proj-3", name="name-3", group=None)
+    monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(run=run))
+    callback = TensorQuillCallback(sink=tensorquill.MemorySink())
+    callback.on_train_begin(types.SimpleNamespace(output_dir=str(tmp_path)), types.SimpleNamespace(global_step=0),
+                            None, model=Model())
+    try:
+        assert (callback.session.run.run_id, callback.session.run.source) == ("wandb-run-3", "wandb")
+    finally:
+        callback.close()

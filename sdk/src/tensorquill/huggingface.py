@@ -10,12 +10,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import torch
 from transformers import TrainerCallback
 
 from .accelerator import Watch, watch_accelerator
 from .capture import Session, init
-from .tracker import tracker_run_id
 
 
 class TensorQuillCallback(TrainerCallback):
@@ -24,8 +22,11 @@ class TensorQuillCallback(TrainerCallback):
     - **Model.** `Trainer` compiles the model (`torch_compile=True`) before any callback
       runs, but the compiled forward is traced on its first call, so hooks added in
       `on_train_begin` are part of it.
-    - **Run ID.** `Trainer` starts the W&B or MLflow run on the main process only. The
-      callback reads it there and broadcasts it, so every rank writes under one run.
+    - **Run ID.** `Trainer` starts the W&B or MLflow run on the main process only. `init`
+      reads it there and shares it, with where it came from, with every rank through the
+      process group's store (no collective, nothing on a GPU), so every rank writes under one
+      run. A `run_id=` given to the callback goes to `init` as it is: with several ranks,
+      rank 0's wins.
     - **Steps** start at `state.global_step`, so a resumed run continues the numbering,
       and are counted from optimizer steps, as `global_step` is.
     - **Mixed precision.** Accelerate's `GradScaler`, when it has one, is passed as
@@ -56,17 +57,17 @@ class TensorQuillCallback(TrainerCallback):
 
     def on_train_begin(self, args: Any, state: Any, control: Any, model: Any = None, optimizer: Any = None, **_: Any) -> None:
         self.close()  # a previous train() that raised leaves its session open
+        # The run ID, a `run_id=` given here included, is init's to resolve: rank 0's goes to
+        # every rank through the process group's store, so every rank takes the same path
+        # whatever it was given.
         kwargs = dict(self.init_kwargs)
-        run_id = kwargs.pop("run_id", None)
-        if run_id is None:
-            run_id = _shared_tracker_run_id()
         # AcceleratedOptimizer keeps the scaler it steps and updates.
         scaler = getattr(optimizer, "scaler", None)
         if scaler is not None:
             kwargs.setdefault("scaler", scaler)
         kwargs.setdefault("start_step", state.global_step)
         kwargs.setdefault("data_wait", True)
-        self.session = init(model, run_id=run_id, **kwargs)
+        self.session = init(model, **kwargs)
         self._watch = watch_accelerator(self.session, loss_name=self.loss_name, checkpoints=False, data_wait=False)
         if state.global_step > 0:
             # Resumed: the Trainer loaded `checkpoint-<global_step>` (or the folder it was given).
@@ -131,16 +132,3 @@ def _checkpoint_folder(args: Any, state: Any, given: Any = None) -> Path | None:
         return None
     folder = Path(output) / f"checkpoint-{step}"
     return folder if folder.is_dir() else None
-
-
-def _shared_tracker_run_id() -> str | None:
-    """The tracker run rank 0 sees, on every rank. None when there is none, in which case
-    `init` falls back to the launcher's job ID or a generated one, shared the same way."""
-    dist = torch.distributed
-    if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
-        found = tracker_run_id()
-        return found[0] if found else None
-    found = tracker_run_id() if dist.get_rank() == 0 else None
-    box = [found[0] if found else None]
-    dist.broadcast_object_list(box, src=0)
-    return box[0]

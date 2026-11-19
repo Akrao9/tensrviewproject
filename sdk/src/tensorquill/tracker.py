@@ -6,13 +6,29 @@ script has already imported, so it adds no import cost and no dependency.
 
 from __future__ import annotations
 
+import itertools
+import json
 import os
 import secrets
 import sys
 import warnings
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+#: At most how long `init` on a rank other than 0 waits for rank 0's run ID, in seconds, and
+#: never longer than the process group's own timeout. Rank 0 is often later to `init` than the
+#: others: it may still be starting its tracker's run (`wandb.init` waits up to 90 s by default),
+#: and the Hugging Face `Trainer` starts it in the same event as TensorQuill's callback. After
+#: this a rank writes under an ID of its own, with a warning.
+RUN_ID_WAIT_SECONDS = 300.0
+
+# One key in the process group's store for each exchange. Every rank calls `init` the same
+# number of times (as for a collective), so the n-th call on every rank reads the n-th key, and
+# a second `init` in the same group never reads the first one's ID. torchrun gives each restart
+# a new store, and `init_process_group` puts the group's own prefix on every key.
+_KEY = "tensorquill/run_id/{}"
+_exchanges = itertools.count()
 
 
 @dataclass(frozen=True)
@@ -38,29 +54,29 @@ def resolve_run(run_id: str | None = None) -> RunInfo:
     launcher's job ID (torchrun, SLURM), and otherwise a generated unique ID, so separate
     runs never append to the same file.
 
-    Under `torch.distributed` with several ranks, rank 0 resolves it and broadcasts it, with
-    where it came from, to every rank: a tracker's run usually exists on rank 0 only, and the
-    other ranks would otherwise take the launcher's ID or wait for a generated one that rank 0
-    never sends. That broadcast is a collective, so every rank must call `tensorquill.init`
-    (one broadcast each) unless `run_id` is passed, which is used as given with no collective;
-    pass the same one on every rank. The order above is rank 0's.
+    Under `torch.distributed` with several ranks, rank 0 resolves it, `run_id` included, and
+    every rank takes rank 0's ID and where it came from: a tracker's run usually exists on rank 0
+    only, and a `run_id` given on rank 0 only (`run_id=wandb.run.id if wandb.run else None`) is
+    rank 0's like any other. A rank given another `run_id` than rank 0's is warned and writes
+    under rank 0's. The ID goes through the default process group's store (`set` on rank 0,
+    `wait` and `get` on the others), never a collective, so nothing is put on a GPU and rank 0
+    never waits. A rank that has not got it after `RUN_ID_WAIT_SECONDS` (or the group's own
+    timeout, if shorter), or whose store fails, writes under an ID of its own, by the same order,
+    with one warning; nothing raises. So every rank should call `tensorquill.init`, the same
+    number of times.
 
     `mlflow.active_run()` is thread-local and is None when the run was created through
     `MlflowClient` (PyTorch Lightning's `MLFlowLogger` does that, and only on rank 0), so
     those setups must pass `run_id` explicitly.
     """
     rank = _rank()
-    if run_id:
-        return RunInfo(run_id, "explicit", rank)
     dist = sys.modules.get("torch.distributed")
     if dist is not None and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        # Whether to broadcast depends only on what every rank sees alike (no run_id passed,
-        # the process group and its size), never on a tracker or the environment, so every
-        # rank enters the same collective. Rank 0 resolves the whole order before it.
-        box: list[Any] = [_resolve_here(rank) if rank == 0 else None]
-        dist.broadcast_object_list(box, src=0)
-        shared_id, source = box[0]
-        return RunInfo(shared_id, source, rank)
+        # Whether to exchange depends only on what every rank sees alike (the process group and
+        # its size), never on `run_id`, a tracker or the environment, so every rank takes it.
+        return _shared_run(dist, rank, run_id)
+    if run_id:
+        return RunInfo(run_id, "explicit", rank)
     found = tracker_run_id()
     if found is not None:
         if found[1] in ("mlflow", "wandb") and _world_size() > 1:
@@ -72,9 +88,79 @@ def resolve_run(run_id: str | None = None) -> RunInfo:
     return RunInfo(_unshared_generated_id(), "generated", rank)
 
 
-def _resolve_here(rank: int) -> tuple[str, str]:
-    """(run ID, source) by the whole order, on the rank that broadcasts it. Never raises: the
-    other ranks are waiting in the broadcast, so a tracker that fails is passed over."""
+def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
+    """Rank 0's (run ID, source) on every rank, through the default process group's store.
+
+    Rank 0 resolves the whole order, puts the pair in the store and goes on: it never waits.
+    The other ranks wait for it at most `RUN_ID_WAIT_SECONDS`. Never raises: a store that fails,
+    or a wait that runs out, leaves the rank with an ID of its own, and one warning."""
+    key = _KEY.format(next(_exchanges))
+    world = dist.get_world_size()
+    if rank == 0:
+        found = _resolve_here(rank, run_id)
+        try:
+            dist.distributed_c10d._get_default_store().set(key, json.dumps(list(found), default=str))
+        except Exception as error:  # noqa: BLE001  nothing here may stop a run
+            warnings.warn(
+                f"tensorquill.init on rank 0 of {world} could not share its run ID {found[0]!r} through the process "
+                f"group's store ({_brief(error)}), so the other ranks each write under an ID of their own once their "
+                "wait for it runs out. Pass the same run_id= on every rank.",
+                RuntimeWarning,
+                stacklevel=4,
+            )
+        return RunInfo(found[0], found[1], rank)
+    try:
+        wait = max(float(RUN_ID_WAIT_SECONDS), 0.0)
+    except (TypeError, ValueError):  # set to something that is not a number
+        wait = 300.0
+    try:
+        store = dist.distributed_c10d._get_default_store()
+        try:
+            own = store.timeout.total_seconds()
+        except Exception:  # noqa: BLE001  a store with no timeout of its own
+            own = 0.0
+        if 0 < own < wait:
+            wait = own
+        if wait > 0:
+            # At least 10 ms: the store takes whole milliseconds, and 0 means no timeout at all.
+            store.wait([key], timedelta(seconds=max(wait, 0.01)))
+        elif not store.check([key]):
+            raise TimeoutError("not in the store, and RUN_ID_WAIT_SECONDS is 0")
+        # Only after the wait: `get` on a missing key waits the group's whole timeout.
+        shared_id, source = json.loads(store.get(key))
+        if not shared_id or not isinstance(source, str):
+            raise ValueError(f"unreadable entry {shared_id!r}, {source!r}")
+    except Exception as error:  # noqa: BLE001  nothing here may stop a run
+        found = _resolve_here(rank, run_id)
+        warnings.warn(
+            f"tensorquill.init on rank {rank} of {world} did not get rank 0's run ID ({_brief(error)}; it waits "
+            f"at most {wait:g} s), so this rank writes under {found[0]!r} ({found[1]}) and may be apart from the "
+            "other ranks' run. Call tensorquill.init on every rank, rank 0 too, or pass the same run_id= on every "
+            "rank.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+        return RunInfo(found[0], found[1], rank)
+    if run_id and str(run_id) != str(shared_id):
+        warnings.warn(
+            f"tensorquill.init on rank {rank} was given run_id={run_id!r}, and rank 0's run ID is {shared_id!r}: "
+            "under torch.distributed every rank writes under rank 0's. Pass the same run_id= on every rank.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+    return RunInfo(shared_id, source, rank)
+
+
+def _brief(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}"[:200]
+
+
+def _resolve_here(rank: int, run_id: str | None = None) -> tuple[str, str]:
+    """(run ID, source) by the whole order, on this rank alone: what rank 0 shares, and what
+    another rank falls back to. Never raises: the other ranks may be waiting for this one, so a
+    tracker that fails is passed over."""
+    if run_id:
+        return run_id, "explicit"
     try:
         found = tracker_run_id()
     except Exception as error:  # noqa: BLE001  the other ranks wait on this rank
@@ -82,7 +168,7 @@ def _resolve_here(rank: int) -> tuple[str, str]:
             f"tensorquill.init on rank {rank} could not read the tracker's run ({type(error).__name__}: {error}), "
             "so the run ID is the launcher's or a generated one. Pass run_id= to name the run.",
             RuntimeWarning,
-            stacklevel=4,
+            stacklevel=5,
         )
         found = None
     if found is not None:
@@ -111,7 +197,7 @@ def tracker_run_id() -> tuple[str, str] | None:
     """The tracker run this process can see, as (run ID, source), with no collective call.
 
     A tracker's run often exists on rank 0 only, so a caller with several ranks should
-    read it there and broadcast it, as `resolve_run` does under `torch.distributed`.
+    read it there and share it, as `resolve_run` does under `torch.distributed`.
     """
     env = os.environ.get("MLFLOW_RUN_ID")
     if env:
@@ -197,8 +283,8 @@ def _world_size() -> int:
 
 
 def _unshared_generated_id() -> str:
-    # Reached only without a process group of several ranks (`resolve_run` broadcasts rank 0's
-    # ID under one), so nothing here can share the ID.
+    # Reached only without a process group of several ranks (`resolve_run` shares rank 0's ID
+    # under one), so nothing here can share the ID.
     run_id = generate_run_id()
     if _world_size() > 1:
         # Several ranks, nothing to share an ID through yet: each rank picks its own, so the

@@ -2655,8 +2655,16 @@ def init(
 
     Args:
         run_id: the tracker's run ID. Defaults to MLFLOW_RUN_ID, the active MLflow run or
-            the active W&B run, in that order. It is the run's identity: every file and
-            every folder in a server's store is named by it, whatever the project.
+            the active W&B run, in that order, then torchrun's or SLURM's job ID, then a
+            generated one. It is the run's identity: every file and every folder in a
+            server's store is named by it, whatever the project. Under `torch.distributed`
+            with several ranks, rank 0 resolves it, this argument included, and every rank
+            takes rank 0's ID and where it came from through the process group's store (no
+            collective, nothing on a GPU): a `run_id` given on rank 0 only is every rank's,
+            and a rank given another one is warned and writes under rank 0's. So call `init`
+            on every rank: a rank that has not heard from rank 0 within
+            `tensorquill.tracker.RUN_ID_WAIT_SECONDS` (300 s, or the group's timeout if
+            shorter) writes under an ID of its own, with a warning.
         project: the project the run is listed and compared under. Defaults to
             `TENSORQUILL_PROJECT`, then the tracker's (W&B's project, or
             `MLFLOW_EXPERIMENT_NAME`), then `uncategorized`. W&B's rule applies: at most 128
@@ -2742,7 +2750,10 @@ def init(
             run does not repeat step numbers already written.
         clip_norm: record the total gradient norm that `torch.nn.utils.clip_grad_norm_`
             returns for this model's parameters, as `clip_grad_norm`, in any capture mode.
-            Free when you clip anyway, and enough for gradient-spike detection.
+            A call counts when any parameter it is given is one of the model's trainable
+            ones. Only an L2 norm (`norm_type` 2, the default) is recorded: a call with
+            another norm type records nothing. Free when you clip anyway, and enough for
+            gradient-spike detection.
         system: at each flush, add the CUDA caching allocator's counters (allocated,
             reserved and peak bytes, allocation retries and OOMs; host-side, no sync) and,
             on the writer thread, NVML's temperature, SM clock, power, ECC counters,
