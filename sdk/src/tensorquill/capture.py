@@ -43,7 +43,7 @@ from .data import (
     optimizer_step_value,
 )
 from . import datawait
-from .distributed import FINGERPRINT_WIDTH, _spread_and_unread, _unread_reason, unwrap_local
+from .distributed import FINGERPRINT_WIDTH, _agree_on_gather, _spread_and_unread, _unread_reason, unwrap_local
 from .probe import ProbeState, find_head, install_head_hook, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink, clear_end_marker, write_end_marker
 from .system import SystemPart, SystemReadings
@@ -1294,6 +1294,7 @@ class Session:
         self._ring_spread_seen: list[int] = []  # columns recorded at each step; 0 if none
         if replica_group is not None and self._replica_params:
             self._ensure_spread_buffers()
+            _agree_on_gather(replica_group, self._spread.device, self._replica_params)
         self._ring_counts = {
             name: torch.zeros(every, *counts.shape, dtype=torch.int64, device=self.device)
             for name, counts in self._counts.items()

@@ -247,7 +247,7 @@ def run_main(out, *argv):
 
 
 def evidence_of(out, case):
-    records = tensorquill.load_records(Path(out) / case / f"{case}.jsonl")
+    records = tensorquill.load_records(Path(out) / f"{case}.jsonl")  # every case in --out itself (CLI-19)
     return records, tensorquill.build_evidence(records)
 
 
@@ -267,6 +267,13 @@ def test_both_cases_pass_and_the_script_exits_zero(both):
     assert both["code"] == 0, both["text"]
     assert "PASS: grad_spike" in both["text"] and "PASS: stalled_weights" in both["text"]
     assert "FAIL" not in both["text"] and "All cases passed" in both["text"]
+
+
+def test_one_listing_of_the_out_folder_shows_every_case(both):
+    # CLI-19: until lane V8 each case was a folder below --out, and `tensorquill runs <out>` found none.
+    rows = tensorquill.list_runs(both["out"])
+    assert sorted(row["run_id"] for row in rows) == ["seeded-grad_spike", "seeded-stalled_weights"]
+    assert all(row["project"] == sf.PROJECT and row["evidence"]["state"] != "missing" for row in rows), rows
 
 
 def test_the_default_factor_is_raised_until_the_total_can_move(both):
@@ -408,7 +415,7 @@ def update_case(tmp_path_factory):
     pytest.importorskip("transformers")
     out = tmp_path_factory.mktemp("update") / "out"
     code, text = run_main(out, "--case", "update_spike")
-    records = tensorquill.load_records(out / "update_spike" / "update_spike.jsonl")
+    records = tensorquill.load_records(out / "update_spike.jsonl")
     return {"code": code, "text": text, "records": records}
 
 

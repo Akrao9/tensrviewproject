@@ -118,21 +118,28 @@ Tested on CPU with Lightning 2.6.5, on one process and on two with `strategy="dd
 
 ### Megatron-LM
 
-Megatron's mixed-precision optimizer steps float32 copies of the weights, so TensorQuill's automatic step counting does not see it. Count steps yourself and pass the norm `optimizer.step()` returns:
+Megatron's mixed-precision optimizer steps float32 copies of the weights, so TensorQuill's automatic step counting does not see it. Count steps yourself, pass the norm `optimizer.step()` returns, and record whether Megatron applied the update:
 
 ```python
 session = tensorquill.init(model_chunk, routers=routers, auto_step=False, start_step=iteration)
 ...
 update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+# In train_step, after Megatron has combined these over the model-parallel group:
+#   update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
+#   grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
 if grad_norm is not None:
     session.record_grad_norm(grad_norm)
-session.log({"train/loss": loss})  # e.g. the reduced loss train_step returns; before session.step
+# The iteration is recorded as step `iteration` whether or not it updated the weights; whether it
+# did is its own value, 1 or 0. Both before session.step.
+session.log({"train/loss": loss, "megatron/update_successful": int(update_successful)})
 session.step(step=iteration, lr=optimizer.param_groups[0]["lr"])
 ```
 
-This follows Megatron's `train_step` in `megatron/training/training.py`; it has not been run.
+This follows Megatron's `train_step` in `megatron/training/training.py` (at `4b11b8168`: `optimizer.step()` at line 3645, the model-parallel AND at 3676, and the learning-rate scheduler stepped only when `update_successful`, at 3691, as `skipped_iter` records); it has not been run on Megatron. The block above is run by `sdk/tests/test_lane_v8_examples.py` with a stand-in optimizer that skips its update.
 
-With `routers=`, a `TopKRouter`'s output `(probs, routing_map)` is counted from the map, so an assignment dropped at `moe_expert_capacity_factor` is not counted, and with `pad_to_capacity` the padding is left out. That was run on a CPU stand-in that follows Megatron's code (Nov 19, 2026), not on Megatron. `update_successful` is not recorded: a step Megatron skipped is written as a step.
+A step Megatron skipped (Inf or NaN gradients under its loss scaler) is still a step in the record, numbered by the iteration it was attempted at, with `scalars["megatron/update_successful"]` 0. The detectors do not read that value yet: unlike a step a `torch.amp.GradScaler` skipped (`step_skipped`), it is judged as a step that updated the weights.
+
+With `routers=`, a `TopKRouter`'s output `(probs, routing_map)` is counted from the map, so an assignment dropped at `moe_expert_capacity_factor` is not counted, and with `pad_to_capacity` the padding is left out. That was run on a CPU stand-in that follows Megatron's code (Nov 19, 2026), not on Megatron.
 
 ### Hugging Face Trainer (and TRL)
 
