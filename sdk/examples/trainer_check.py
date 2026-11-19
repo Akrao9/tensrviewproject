@@ -213,6 +213,9 @@ def main() -> None:
         fp16=precision == "fp16", bf16=precision == "bf16", use_cpu=not cuda,
         torch_compile=not args.eager, torch_compile_backend=None if args.eager else args.backend,
         dataloader_drop_last=True,
+        # Trainer's default replaces a NaN or infinite step loss with its running average before
+        # logging; off, the logged loss is the plain interval mean that `trainer_agreement` compares.
+        logging_nan_inf_filter=False,
     )
 
     class InOrder(Trainer):

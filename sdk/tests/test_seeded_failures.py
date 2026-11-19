@@ -269,6 +269,13 @@ def test_both_cases_pass_and_the_script_exits_zero(both):
     assert "FAIL" not in both["text"] and "All cases passed" in both["text"]
 
 
+def test_one_listing_of_the_out_folder_shows_every_case(both):
+    # CLI-19: until lane V8 each case was a folder below --out, and `tensorquill runs <out>` found none.
+    rows = tensorquill.list_runs(both["out"])
+    assert sorted(row["run_id"] for row in rows) == ["seeded-grad_spike", "seeded-stalled_weights"]
+    assert all(row["project"] == sf.PROJECT and row["evidence"]["state"] != "missing" for row in rows), rows
+
+
 def test_the_default_factor_is_raised_until_the_total_can_move(both):
     # x100 on the toy's k_proj holds 0.2% of the total norm: the script says so and picks the factor itself.
     assert "x100 on it moves the total x1.0" in both["text"] and "using x" in both["text"]

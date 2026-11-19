@@ -265,8 +265,8 @@ def test_x11_ci_runs_python_310_at_the_torch_floor_and_torch_29():
     assert re.search(r'- python: "3\.10"\s*\n\s*torch: "2\.6"', text)
     assert re.search(r'- python: "3\.\d+"\s*\n\s*torch: "2\.9"', text)
     pyproject = (SDK / "pyproject.toml").read_text(encoding="utf-8")
+    # The jobs test what `requires-python` already declares. No 3.10 classifier until a 3.10 job has passed.
     assert 'requires-python = ">=3.10"' in pyproject
-    assert '"Programming Language :: Python :: 3.10"' in pyproject
 
 
 def test_cli17_clippy_runs_with_the_default_features_too():
