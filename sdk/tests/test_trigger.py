@@ -1876,7 +1876,8 @@ def test_a_job_started_again_that_hangs_before_its_first_stored_step_fires_after
     new = [(t, r) for t, r, _ in found["seen"] if r.get("attempt") not in (None, found["old_attempt"])]
     assert new, "the new attempt never showed in the status"
     first_seen, rank = new[0]
-    assert rank["attempt_without_steps"] is True and rank["last_step"] == 99
+    # Contract 1, amendment 1 (Nov 19, 2026): no step of its own yet, so `last_step` is null, not the earlier attempt's 99.
+    assert rank["attempt_without_steps"] is True and rank["last_step"] is None
     assert first_seen < 4.0, first_seen  # from its first beat, sent as the session starts
     # Not called stopped inside its start window: starting (or reconnecting) until it has passed.
     assert all(r["state"] in ("starting", "reconnecting", "active") for t, r in new if t < first_seen + 3.5), new
