@@ -32,6 +32,7 @@ BATCH_BYTES = 4 * 1024 * 1024
 BACKOFF_BASE = 0.1
 BACKOFF_CAP = 30.0
 HEARTBEAT_SECONDS = 15.0
+LAST_BEAT_SECONDS = 1.5  # the bound on `Heartbeat.close()`'s last beat, under the join's 2 s
 # At most this long, a new process's first heartbeat waits for the session to name its attempt,
 # and its stream waits for that beat, so the server knows a job started again before the stream
 # opens (see `Heartbeat`). Background threads only: training never waits for it.
@@ -196,6 +197,10 @@ def record_to_row(record: Mapping[str, Any]) -> dict[str, Any]:
         if spec is None or (value is None and key not in _ALWAYS):
             extra[key] = value
             continue
+        if key == "scalars" and isinstance(value, dict):
+            # A logged bool is not a number in either engine (lane W3, DET-16): that one value is left
+            # out of the row, and the rest of the map stays in its column for the Rust detectors.
+            value = {k: v for k, v in value.items() if not isinstance(v, bool)}
         try:
             row[spec[0]] = spec[1](value)
         except (TypeError, ValueError):
@@ -490,6 +495,7 @@ class FlightSender:
         backoff_base: float = BACKOFF_BASE,
         backoff_cap: float = BACKOFF_CAP,
         hold: threading.Event | None = None,
+        await_attempt: bool = False,
     ) -> None:
         import pyarrow.flight  # noqa: F401  fail here, at init, when pyarrow is missing
 
@@ -540,10 +546,27 @@ class FlightSender:
         self._closing = threading.Event()
         self._deadline = math.inf
         self._hold = hold  # set once the heartbeat has named the attempt (or given up waiting)
+        # The attempt of the session whose process sends this stream (contract 1): every batch names
+        # it as `sender_attempt`, so the server can tell a claim from backlog rows of an earlier
+        # attempt. Set by the session as it starts (`capture.Session`); `attach` makes the first
+        # connection wait for it, `FIRST_BEAT_HOLD_SECONDS` at most, so the first batch names it too.
+        self._attempt: int | None = None
+        self._named = threading.Event()
+        self._await_attempt = await_attempt
         self._thread = threading.Thread(
             target=self._run, name=f"tensorquill-flight-rank{rank}", daemon=True
         )
         self._thread.start()
+
+    @property
+    def attempt(self) -> int | None:
+        return self._attempt
+
+    @attempt.setter
+    def attempt(self, attempt: int | None) -> None:
+        self._attempt = attempt
+        if attempt is not None:
+            self._named.set()
 
     @property
     def acked_offset(self) -> int:
@@ -592,11 +615,15 @@ class FlightSender:
     # Everything below runs on the sender thread.
 
     def _run(self) -> None:
-        if self._hold is not None:
-            # The first connection waits for the heartbeat that names the attempt, a moment at most.
-            deadline = time.monotonic() + FIRST_BEAT_HOLD_SECONDS + 1.0
-            while not self._hold.is_set() and not self._closing.is_set() and time.monotonic() < deadline:
-                self._hold.wait(0.05)
+        # The first connection waits for the heartbeat that names the attempt, and for the session to
+        # name its attempt to this sender, a moment at most.
+        deadline = time.monotonic() + FIRST_BEAT_HOLD_SECONDS + 1.0
+        while (
+            ((self._hold is not None and not self._hold.is_set())
+             or (self._await_attempt and not self._named.is_set()))
+            and not self._closing.is_set() and time.monotonic() < deadline
+        ):
+            (self._hold if self._hold is not None and not self._hold.is_set() else self._named).wait(0.05)
         ceiling = self._backoff_base  # the next delay's upper bound, doubled after each failure up to the cap
         retried_on_close = False
         while True:
@@ -769,6 +796,8 @@ class FlightSender:
                             "end_byte_offset": end,
                             **({"world_size": self.world_size} if self.world_size else {}),
                             # Optional, and unknown to a server older than it, which ignores it.
+                            **({"sender_attempt": self._attempt} if self._attempt is not None else {}),
+                            # Optional, and unknown to a server older than it, which ignores it.
                             **({MANIFEST_KEY: self.manifest} if first_batch and self.manifest else {}),
                         }
                         first_batch = False
@@ -893,7 +922,19 @@ class Heartbeat:
     it, `FIRST_BEAT_HOLD_SECONDS` at most, and the stream's first connection waits for the first
     beat (`first_sent`), so a new process names its attempt before its stream opens. So the server knows a
     job that was started again before the new attempt stores any step, and gives it a start
-    window of its own (see `watchdog.rs`). It is read once, so a beat costs nothing more."""
+    window of its own (see `watchdog.rs`). It is read once, so a beat costs nothing more.
+
+    After the session stops capture (`capture.Session._stop`; contract 3), every beat carries
+    `"capture_stopped": <reason>`, a short word (`sink_error`, `writer_behind`, `close_timeout`, ...),
+    and no `stack`: the work counter stands still while training goes on, so a stack would read as a
+    stuck step that is not one. The stop sends a beat at once, and `close()` sends one last beat,
+    bounded by `LAST_BEAT_SECONDS`, when no beat carrying the stop has been taken by the server yet.
+    If every one of them is lost and the stream then closes cleanly, the server reads the rank as
+    finished: the documented limit. A server built before this key ignores it.
+
+    A beat the server refuses (a retryable UNAVAILABLE when it cannot write the attempt order,
+    contract 1) is caught like any failed beat: the next beat, one interval later, names the same
+    attempt. Nothing is printed or raised."""
 
     def __init__(
         self,
@@ -915,6 +956,8 @@ class Heartbeat:
         self._place: Any = None  # the main thread's frames at the last look, and since when
         self._place_since = 0.0
         self.phase = "train"
+        self.capture_stopped: str | None = None  # the stop's reason, once the session stopped capture
+        self._stop_told = False  # a beat carrying the stop was taken by the server
         self._counter: Any = None  # a callable returning the work done so far (steps + ticks)
         self.attempt: int | None = None  # the session's attempt, once it has handed over its counter
         self._location = _location(endpoint)
@@ -968,6 +1011,14 @@ class Heartbeat:
         self.phase = str(phase)[:40] or "train"
         self._changed.set()
 
+    def stop_capture(self, reason: str) -> None:
+        """The session stopped capture (contract 3): from now on every beat says so, with `reason`,
+        and the next beat goes at once."""
+        if os.getpid() != self._pid or self.capture_stopped is not None:
+            return
+        self.capture_stopped = str(reason)[:40] or "unknown"
+        self._changed.set()
+
     def close(self) -> None:
         if os.getpid() != self._pid:
             return
@@ -985,33 +1036,47 @@ class Heartbeat:
         while not self._stopped.is_set():
             # Clear first, so a phase change made while this beat is being sent wakes the next wait.
             self._changed.clear()
-            try:
-                if client is None:
-                    kwargs: dict[str, Any] = {}
-                    if self._tls_root_certs is not None:
-                        kwargs["tls_root_certs"] = self._tls_root_certs
-                    client = flight.FlightClient(self._location, **kwargs)
-                payload = {"run_id": self._run_id, "rank": self._rank, "phase": self.phase,
-                           "interval_seconds": self.interval}
-                if self.attempt is not None:
-                    payload["attempt"] = self.attempt
-                if self.counter is not None:
-                    payload["work"] = int(self.counter())
-                    stack = self._stalled_stack(payload["work"])
-                    if stack is not None:
-                        payload["stack"] = stack
-                body = json.dumps(payload).encode()
-                for _ in client.do_action(
-                    flight.Action("heartbeat", body), flight.FlightCallOptions(headers=headers, timeout=10.0)
-                ):
-                    pass
-                self.sent += 1
-            except BaseException:  # noqa: BLE001  a missed beat is the server's to notice
-                _close_quietly(client)  # its channel is closed now, not when the collector gets to it
-                client = None
+            client = self._beat(flight, client, headers, timeout=10.0)
             self.first_sent.set()
             self._changed.wait(self.interval)
+        if self.capture_stopped is not None and not self._stop_told:
+            # The stop was not delivered yet: one last beat, bounded, so a session closed right after
+            # its capture stopped does not read as finished.
+            client = self._beat(flight, client, headers, timeout=LAST_BEAT_SECONDS)
         _close_quietly(client)
+
+    def _beat(self, flight: Any, client: Any, headers: list[Any], timeout: float) -> Any:
+        """Send one beat; the client to use next (None after a failure, so the next beat reconnects)."""
+        try:
+            if client is None:
+                kwargs: dict[str, Any] = {}
+                if self._tls_root_certs is not None:
+                    kwargs["tls_root_certs"] = self._tls_root_certs
+                client = flight.FlightClient(self._location, **kwargs)
+            stopped = self.capture_stopped  # read once: the same value is sent and marked told
+            payload: dict[str, Any] = {"run_id": self._run_id, "rank": self._rank, "phase": self.phase,
+                                       "interval_seconds": self.interval}
+            if self.attempt is not None:
+                payload["attempt"] = self.attempt
+            if stopped is not None:
+                payload["capture_stopped"] = stopped
+            if self.counter is not None:
+                payload["work"] = int(self.counter())
+                stack = None if stopped is not None else self._stalled_stack(payload["work"])
+                if stack is not None:
+                    payload["stack"] = stack
+            body = json.dumps(payload).encode()
+            for _ in client.do_action(
+                flight.Action("heartbeat", body), flight.FlightCallOptions(headers=headers, timeout=timeout)
+            ):
+                pass
+            self.sent += 1
+            if stopped is not None:
+                self._stop_told = True
+            return client
+        except BaseException:  # noqa: BLE001  a missed beat is the server's to notice
+            _close_quietly(client)  # its channel is closed now, not when the collector gets to it
+            return None
 
 
     def _stalled_stack(self, work: int) -> dict[str, Any] | None:
@@ -1050,10 +1115,21 @@ class StreamingSink:
         self._sink.write(records)
 
     def close(self) -> None:
+        """The local file first, then the heartbeat and the sender. A local file whose close raises
+        stops capture: the heartbeat is told (`sink_error`) before it ends, so its last beat carries
+        the stop, and the error is raised after the stream is closed."""
+        failure: BaseException | None = None
+        try:
+            self._sink.close()
+        except BaseException as error:  # noqa: BLE001  raised again below, once the stream is closed
+            failure = error
+            if self.heartbeat is not None:
+                self.heartbeat.stop_capture("sink_error")
         if self.heartbeat is not None:
             self.heartbeat.close()
-        self._sink.close()
         self.sender.close()
+        if failure is not None:
+            raise failure
 
 
 def attach(
@@ -1092,6 +1168,7 @@ def attach(
         sender = FlightSender(
             path, endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs,
             world_size=world_size, manifest=manifest, hold=heartbeat.first_sent if heartbeat else None,
+            await_attempt=True,
         )
     except ImportError as error:
         if heartbeat is not None:

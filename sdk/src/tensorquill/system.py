@@ -22,16 +22,15 @@ out; one NVML metric that fails is listed once under `"unavailable"` and not ask
 as wandb's system monitor does. Nothing here raises into training: every failure becomes
 such a note.
 
-A hung driver call never holds training. The writer thread's queue is bounded, so a writer
-that waited for NVML would in the end make training wait too. Every NVML call is made on
-the NVML thread (`SystemReadings`), and the writer waits for a reading at most
-`NVML_SLOW_SECONDS`, or `NVML_OPEN_SECONDS` for the first one, which opens NVML. A reading
-that has not come back by then is left behind and written as the note, and NVML is off for
-the session. The stuck thread is never joined and never asked again; if its call ever
-returns, it shuts NVML down and exits. A reading that comes back in time but took over
-`NVML_SLOW_SECONDS` inside NVML is kept, and NVML goes off after it. The writer may wait up
-to the bound once, so training waits at most that long, and only if the writer's queue
-fills meanwhile.
+A hung or slow driver call never holds the writer, and so never training: the writer never waits
+for NVML (the author's decision on L2). Every NVML call is made on the NVML thread
+(`SystemReadings`). Each flush attaches the newest reading that has finished and asks for the next,
+so the first flush carries no NVML part and a reading is at most one flush old; `read_at` in it is
+the wall-clock time it finished. A reading still in the driver longer than `NVML_SLOW_SECONDS`
+(`NVML_OPEN_SECONDS` for the first, which opens NVML) is found at a later flush and written as the
+note, and NVML is off for the session. The stuck thread is never joined and never asked again; if
+its call ever returns, it shuts NVML down and exits. A reading that comes back in time but took over
+`NVML_SLOW_SECONDS` inside NVML is kept, and NVML goes off after it.
 """
 
 from __future__ import annotations
@@ -57,9 +56,9 @@ THROTTLE_REASONS = {
 }
 _IDLE = 0x1
 NVML_SLOW_SECONDS = 2.0  # one NVML reading slower than this turns NVML off for the session
-# How long the writer waits for the first reading, which also opens NVML (nvmlInit, the
-# device, the Xid event set). Opening was not timed before the NVML thread, so it gets more
-# room than a reading rather than turning off an NVML that is only slow to start.
+# How long the first reading, which also opens NVML (nvmlInit, the device, the Xid event set), may
+# stay in the driver before a later flush turns NVML off. The writer never waits for it. Opening gets
+# more room than a reading rather than turning off an NVML that is only slow to start.
 NVML_OPEN_SECONDS = 10.0
 XID_PER_READING = 64  # Xid events drained per reading at most
 _NVML_ERROR_TIMEOUT = 10  # NVML_ERROR_TIMEOUT: no event waiting
@@ -67,6 +66,11 @@ _NVML_ERROR_TIMEOUT = 10  # NVML_ERROR_TIMEOUT: no event waiting
 
 def _reason(error: BaseException) -> str:
     return f"{type(error).__name__}: {error}"
+
+
+def _cuda_device_type(device: torch.device) -> bool:
+    """Whether `device` is a CUDA device, from its type alone: no CUDA call."""
+    return device.type == "cuda"
 
 
 def _cuda_device(device: torch.device) -> int | None:
@@ -292,26 +296,39 @@ class SystemPart(dict):
 
 
 class _Ask:
-    """One reading the writer thread asks of the NVML thread."""
+    """One reading the writer thread asks of the NVML thread. The writer never waits on it: it looks
+    at `done` at its next flush (`SystemReadings._take`)."""
 
-    __slots__ = ("done", "reading", "off")
+    __slots__ = ("done", "reading", "off", "asked", "first")
 
-    def __init__(self) -> None:
+    def __init__(self, first: bool) -> None:
         self.done = threading.Event()
         self.reading: dict[str, Any] | None = None
         self.off = False  # NVML is off for the session and its note is written: ask no more
+        self.asked = time.monotonic()
+        self.first = first  # the first reading, which opens NVML
 
 
 class SystemReadings:
-    """One session's readings: CUDA memory at each flush on the training thread, NVML asked
-    for by the writer thread and read on the NVML thread, a daemon thread started by the
-    first `write`. Once that thread exists, only it touches `self.nvml`."""
+    """One session's readings: CUDA memory at each flush on the training thread, NVML asked for by the
+    writer thread and read on the NVML thread, a daemon thread started by the first `write` on a CUDA
+    model. Once that thread exists, only it touches `self.nvml`.
+
+    The writer never waits for NVML (the author's decision on L2). Each `write` attaches the newest
+    reading that has finished and was not attached yet, then asks for the next one if none is in
+    flight. So the first flush carries no NVML part, and a reading rides on the flush after the one
+    that asked for it: at most one flush old. `read_at` in the reading is the wall-clock time it
+    finished, so a reader can place it. A reading still in the driver longer than
+    `NVML_SLOW_SECONDS` (`NVML_OPEN_SECONDS` for the first) is found at a later flush, never waited
+    for: that flush writes the note once and NVML is off for the session."""
 
     def __init__(self, device: torch.device) -> None:
         self.memory = CudaMemory(device)
         self.nvml = Nvml(device)
+        self._cuda = _cuda_device_type(device)
         self._asks: queue.SimpleQueue[_Ask | None] = queue.SimpleQueue()  # None: shut down and exit
         self._thread: threading.Thread | None = None
+        self._pending: _Ask | None = None  # the reading asked for and not attached yet
         self._off = False  # writer side: no more readings are asked for
         self._stuck = False  # a reading did not come back in time: its thread is never waited for
         self._closed = False
@@ -322,17 +339,45 @@ class SystemReadings:
         return SystemPart() if reading is None else SystemPart(cuda=reading)
 
     def write(self, system: dict[str, Any]) -> dict[str, Any] | None:
-        """On the writer thread: add the NVML part to what `flush` read. None when empty."""
-        reading = self._ask()
+        """On the writer thread: add the newest finished NVML part to what `flush` read. Never waits.
+        None when empty."""
+        reading = self._take()
         system = dict(system)  # a plain dict in the record
         if reading is not None:
             system["nvml"] = reading
         return system or None
 
-    def _ask(self) -> dict[str, Any] | None:
-        """On the writer thread: one NVML reading from the NVML thread, waited for a bounded time."""
+    def _take(self) -> dict[str, Any] | None:
+        """On the writer thread: the reading that finished since the last flush (or the note), and the
+        next one asked for. Nothing here waits."""
         if self._off:
             return None
+        if not self._cuda:
+            # No NVML call is needed to know there is no reading: said at the first flush, no thread.
+            self._off = True
+            return self.nvml.read()
+        reading = None
+        pending = self._pending
+        if pending is not None:
+            if not pending.done.is_set():
+                bound = NVML_OPEN_SECONDS if pending.first else NVML_SLOW_SECONDS
+                if time.monotonic() - pending.asked <= bound:
+                    return None  # still in the driver, within its bound: nothing new to attach
+                # A hung driver call. The thread is left to it: never joined, never asked again,
+                # and what it reads, if it ever returns, is dropped with `pending`.
+                self._off = self._stuck = True
+                self._pending = None
+                self._asks.put(None)  # if the call returns: shut NVML down and exit
+                if pending.first:
+                    return {"unavailable": f"the first NVML reading, which opens NVML, took over {bound:g} s; "
+                                           "NVML is off for this session"}
+                return {"unavailable": f"an NVML reading took over {bound:g} s; NVML is off for this session"}
+            self._pending = None
+            reading = pending.reading
+            if pending.off:
+                self._off = True
+                self._asks.put(None)  # nothing more to read: the thread exits
+                return reading
         first = self._thread is None
         if first:
             thread = threading.Thread(target=self._serve, name="tensorquill-nvml", daemon=True)
@@ -342,22 +387,9 @@ class SystemReadings:
                 self._off = True
                 return {"unavailable": f"the NVML thread did not start: {_reason(error)}"}
             self._thread = thread
-        bound = NVML_OPEN_SECONDS if first else NVML_SLOW_SECONDS
-        ask = _Ask()
-        self._asks.put(ask)
-        if not ask.done.wait(bound):
-            # A hung driver call. The thread is left to it: never joined, never asked again,
-            # and what it reads, if it ever returns, is dropped with `ask`.
-            self._off = self._stuck = True
-            self._asks.put(None)  # if the call returns: shut NVML down and exit
-            if first:
-                return {"unavailable": f"the first NVML reading, which opens NVML, took over {bound:g} s; "
-                                       "NVML is off for this session"}
-            return {"unavailable": f"an NVML reading took over {bound:g} s; NVML is off for this session"}
-        if ask.off:
-            self._off = True
-            self._asks.put(None)  # nothing more to read: the thread exits
-        return ask.reading
+        self._pending = _Ask(first)
+        self._asks.put(self._pending)
+        return reading
 
     def _serve(self) -> None:
         """The NVML thread: every NVML call of the session is made here."""
@@ -367,7 +399,10 @@ class SystemReadings:
                 if ask is None:
                     return
                 try:
-                    ask.reading = self._read()
+                    reading = self._read()
+                    if reading is not None and set(reading) - {"unavailable"}:
+                        reading["read_at"] = time.time()  # when it finished: it is attached a flush later
+                    ask.reading = reading
                     ask.off = self.nvml.unavailable is not None and self.nvml._reported
                 finally:
                     ask.done.set()
@@ -388,8 +423,9 @@ class SystemReadings:
             return reading
 
     def close(self) -> None:
-        """On the writer thread, at the end: the NVML thread shuts NVML down and exits. It is
-        waited for at most `NVML_SLOW_SECONDS`, and not at all once a reading was left behind."""
+        """On the writer thread, at the end: the NVML thread shuts NVML down and exits. It is waited for
+        at most `NVML_SLOW_SECONDS`, and not at all once a reading was left behind. A reading that
+        finished after the last flush is dropped: no record is left to carry it."""
         if self._closed:
             return
         self._closed = True
