@@ -519,11 +519,14 @@ def test_c_against_r_counts_only_the_fixtures_both_arms_answered(built):
     lines, verdict = c_against_r(key, files)
     assert lines[0] == ("C against R on 2 of the 6 held-out fixtures only (unseen-3, unseen-4); "
                         "the others lack agent trials in one arm or both.")
-    assert part(lines, "Accuracy, C against R") == ("Accuracy, C against R on unseen-3, unseen-4: 36 of 36 (100.0%) "
-                                                    "against 36 of 36 (100.0%), +0.0 pp: met "
-                                                    "(C may be at most 5.0 pp behind R).")
-    assert "5.0 against 5.0 (6 and 6 correct trials)" in part(lines, "Median agent tool calls")
-    assert verdict.endswith("PASSES. Both parts must hold.")
+    assert part(lines, "Provisional: Accuracy, C against R") == (
+        "Provisional: Accuracy, C against R on unseen-3, unseen-4: 36 of 36 (100.0%) against 36 of 36 (100.0%), "
+        "+0.0 pp: met (C may be at most 5.0 pp behind R).")
+    assert "5.0 against 5.0 (6 and 6 correct trials)" in part(lines, "Provisional: Median agent tool calls")
+    # Lane U8 (audit X01): this case read PASSES until Nov 19, 2026. Two of six fixtures are not the
+    # preregistered design, so the arithmetic is shown and the verdict is not given.
+    assert "PASSES" not in verdict and "not decided; the preregistered design needs" in verdict
+    assert ("arm R trials 1, 2 and 3 on each held-out fixture (unseen-1 has none; unseen-2 has none)" in verdict)
 
 
 def test_c_against_r_ignores_human_trials_and_the_practice_fixture(built):
@@ -564,7 +567,95 @@ def test_the_results_table_says_when_the_models_differ(built):
     files = trials("C", participant="agent:model-x") + trials("R", participant="agent:model-y")
     lines = harness.evidence_gate_checks(harness.score(key, files))
     assert ("Model: the arms' answer files differ or mix models (C: model-x; R: model-y). The amendment requires "
-            "the same model in every arm; the verdict above does not account for it.") in lines
+            "the same model in every arm, so no verdict is given.") in lines
+    # Lane U8 (audit X01): different models read PASSES until Nov 19, 2026.
+    verdict = part(lines, "Gate (C against R")
+    assert verdict == ("Gate (C against R, amendment of Nov 17, 2026): not decided; the preregistered design needs "
+                       "one model in both arms (the answer files name model-x, model-y). Both parts must hold.")
     table = harness.results_table(harness.score(key, files))
     assert "## Gate 1: arm C against arm R (amendment of Nov 17, 2026; agent trials only)" in table
     assert "- Model: the arms' answer files differ" in table
+    assert "PASSES" not in table
+
+
+# --- Lane U8 (audit X01): a release verdict only for the preregistered design ------------------
+#
+# Six held-out fixtures, three trials each (numbered 1 to 3), one model in every arm. Anything
+# less still shows the two parts' arithmetic, marked provisional, and the verdict reads "not
+# decided" with what is missing. Every case below read PASSES before Nov 19, 2026.
+
+
+def whole_table(key, files):
+    return harness.results_table(harness.score(key, files))
+
+
+def test_one_perfect_paired_trial_on_one_fixture_is_not_a_verdict(built):
+    """The audit's case: one perfect agent answer per arm on unseen-1."""
+    _, key = built
+    files = [(f"{arm}-1", answer_file) for arm, answer_file in
+             ((arm, {**json.loads((VALIDATION / "perfect" / "unseen-1.json").read_text(encoding="utf-8")),
+                     "arm": arm, "trial": 1, "participant": "agent:model-x", "tool_calls": calls})
+              for arm, calls in (("C", 3), ("R", 5)))]
+    lines, verdict = c_against_r(key, files)
+    assert lines[1] == ("The answer files are not the preregistered design, so the two parts below are provisional "
+                        "arithmetic and no release verdict is given.")
+    assert part(lines, "Provisional: Accuracy, C against R on unseen-1: 6 of 6 (100.0%) against 6 of 6")
+    assert part(lines, "Provisional: Median agent tool calls").endswith("3 against 5 (1 and 1 correct trials): met "
+                                                                        "(C must be no more than R).")
+    missing = ("unseen-1 has trials 1; unseen-2 has none; unseen-3 has none; unseen-4 has none; unseen-5 has none; "
+               "unseen-6 has none")
+    assert verdict == ("Gate (C against R, amendment of Nov 17, 2026): not decided; the preregistered design needs "
+                       f"arm C trials 1, 2 and 3 on each held-out fixture ({missing}); and arm R trials 1, 2 and 3 on "
+                       f"each held-out fixture ({missing}). Both parts must hold.")
+    assert "PASSES" not in whole_table(key, files)
+
+
+def test_one_fixture_with_all_three_trials_is_not_a_verdict(built):
+    _, key = built
+    files = trials("C", fixtures=["unseen-1"], calls=3) + trials("R", fixtures=["unseen-1"], calls=5)
+    lines, verdict = c_against_r(key, files)
+    assert "not decided" in verdict and "unseen-1 has" not in verdict and "unseen-2 has none" in verdict
+    assert "PASSES" not in whole_table(key, files)
+
+
+@pytest.mark.parametrize("arm", ["C", "R"])
+def test_six_fixtures_with_a_repetition_missing_is_not_a_verdict(built, arm):
+    _, key = built
+    files = trials("C", calls=8) + trials("R", calls=12)
+    files = [(n, b) for n, b in files if not (b["arm"] == arm and b["fixture"] == "unseen-4" and b["trial"] == 3)]
+    lines, verdict = c_against_r(key, files)
+    assert verdict == ("Gate (C against R, amendment of Nov 17, 2026): not decided; the preregistered design needs "
+                       f"arm {arm} trials 1, 2 and 3 on each held-out fixture (unseen-4 has trials 1, 2). "
+                       "Both parts must hold.")
+    assert not any("held-out fixtures only" in line for line in lines)  # all six are still shared
+    assert part(lines, "Provisional: Accuracy, C against R")
+    assert "PASSES" not in whole_table(key, files)
+
+
+def test_an_extra_trial_is_not_the_preregistered_design(built):
+    _, key = built
+    extra = [(f"C-fourth-{n}", {**b, "trial": 4}) for n, b in trials("C", fixtures=["unseen-2"], calls=8)][:1]
+    files = trials("C", calls=8) + trials("R", calls=12) + extra
+    _, verdict = c_against_r(key, files)
+    assert "arm C trials 1, 2 and 3 on each held-out fixture (unseen-2 has trials 1, 2, 3, 4)" in verdict
+    assert "PASSES" not in verdict
+
+
+def test_two_models_within_one_arm_is_not_a_verdict(built):
+    _, key = built
+    files = trials("C", calls=8) + trials("R", calls=12)
+    files = [(n, {**b, "participant": "agent:model-z"}) if b["arm"] == "R" and b["fixture"] == "unseen-6" else (n, b)
+             for n, b in files]
+    lines, verdict = c_against_r(key, files)
+    assert "one model in both arms (the answer files name model-x, model-z)" in verdict
+    assert "PASSES" not in whole_table(key, files)
+
+
+def test_the_complete_design_gets_its_verdict_and_no_provisional_mark(built):
+    _, key = built
+    for c_calls, expected in ((8, "PASSES"), (13, "FAILS")):
+        files = trials("C", calls=c_calls) + trials("R", calls=12)
+        lines, verdict = c_against_r(key, files)
+        assert verdict == f"Gate (C against R, amendment of Nov 17, 2026): {expected}. Both parts must hold."
+        assert not any(line.startswith("Provisional") or "preregistered design" in line for line in lines)
+    assert harness.design_gaps(*[[r for r in harness.score(key, files) if r["arm"] == arm] for arm in ("C", "R")]) == []

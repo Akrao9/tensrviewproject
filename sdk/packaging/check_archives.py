@@ -1,10 +1,11 @@
 """Check what a built tensorquill wheel and sdist actually contain.
 
-    python packaging-check-archives.py <dist-dir>
+    python packaging/check_archives.py <dist-dir>
 
 Fails (exit 1) if tests, examples, experiments or bytecode ship, if either license file is missing
-or differs between the two archives, if the metadata lacks the dual license expression, or if it
-carries author, maintainer or URL fields the project owner has not chosen yet.
+or differs between the two archives, if the wheel's dist-info lacks exactly one METADATA (or the
+sdist exactly one PKG-INFO), if the metadata lacks the dual license expression, or if it carries
+author, maintainer or URL fields the project owner has not chosen yet.
 """
 import re
 import sys
@@ -46,19 +47,22 @@ if wheels:
             top = n.split("/", 1)[0]
             check(top == "tensorquill" or top in distinfo, f"wheel: unexpected top-level entry {n}")
             check("__pycache__" not in n and not n.endswith((".pyc", ".pyo")), f"wheel: bytecode shipped: {n}")
+        info = next(iter(distinfo)) if len(distinfo) == 1 else "<dist-info>"
         for lic in LICENSES:
-            member = f"{next(iter(distinfo))}/licenses/{lic}"
+            member = f"{info}/licenses/{lic}"
             check(member in names, f"wheel: {member} missing")
             if member in names:
                 wheel_licenses[lic] = z.read(member)
-        meta = [n for n in names if n.endswith(".dist-info/METADATA")]
+        # Exactly one metadata record, at the dist-info's top: pip reads that file and no other.
+        meta = [n for n in names if n == f"{info}/METADATA"]
+        check(len(meta) == 1, f"wheel: expected exactly one {info}/METADATA, found {len(meta)}")
         if meta:
             check_metadata(z.read(meta[0]).decode(), "wheel METADATA")
             # The server package by a version range, on every platform: no marker after it.
             required = re.findall(r"^Requires-Dist: (tensorquill-server\b.*)$", z.read(meta[0]).decode().split("\n\n", 1)[0], re.M)
             check(len(required) == 1 and ";" not in required[0] and ">=" in required[0] and "<" in required[0],
                   f"wheel METADATA: expected one tensorquill-server requirement with a version range and no marker, found {required}")
-        scripts = [n for n in names if n.endswith(".dist-info/entry_points.txt")]
+        scripts = [n for n in names if n == f"{info}/entry_points.txt"]
         entry_points = z.read(scripts[0]).decode() if scripts else ""
         for script in ("tensorquill = tensorquill.evidence:main", "tensorquill-mcp = tensorquill.mcp_server:main"):
             check(script in entry_points, f"wheel: console script `{script}` missing")
@@ -78,7 +82,9 @@ if sdists:
         for lic in LICENSES:
             if f"{root}/{lic}" in names:
                 sdist_licenses[lic] = t.extractfile(f"{root}/{lic}").read()
-        if f"{root}/PKG-INFO" in names:
+        pkg_info = [n for n in names if n == f"{root}/PKG-INFO"]
+        check(len(pkg_info) <= 1, f"sdist: expected exactly one {root}/PKG-INFO, found {len(pkg_info)}")
+        if pkg_info:
             check_metadata(t.extractfile(f"{root}/PKG-INFO").read().decode(), "sdist PKG-INFO")
 
 for lic in LICENSES:
