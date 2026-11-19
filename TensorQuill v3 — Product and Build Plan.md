@@ -1848,7 +1848,7 @@ State as of Nov 16, 2026.
     - a hung `nvmlInit` at the first reading, which was never timed;
     - a hung `nvmlShutdown` at the end. `Session.close()` joins the writer, which shut NVML down in `_drain`'s `finally`, so `close()` itself hung.
   - *Read first.*
-    - **wandb.** NVML is kept out of the user's process. Its Go `core` starts the `wandb-symon` sidecar (Rust), bounds the start and the stop at 5 s each and then kills it (`core/internal/monitor/symonresourcemanager.go`). The sidecar runs each collector in its own task (`symon/src/monitors.rs`), with no timeout on any one NVML call. wandb's older Python assets sampled on daemon threads in wandb's own internal process, and `finish()` joined them with no bound.
+    - **wandb.** NVML is kept out of the user's process. Its Go `core` starts the `wandb-symon` sidecar (Rust), bounds the start and the stop at 5 s each and then kills it (`core/internal/monitor/symonresourcemanager.go`). The sidecar runs each collector in its own task (`symon/src/monitors.rs`), with no timeout on any one NVML call. wandb's older Python assets (removed in `a1d03799a`) sampled on daemon threads, and `finish()` joined them with no bound. Their `SystemMonitor` was built in `wandb/sdk/internal/handler.py`, inside what that package's docstring calls the "Internal process".
     - **mlflow's system-metrics monitor** is the same: a daemon thread, joined with no bound.
     - **Lightning** runs `nvidia-smi` with no timeout.
     - **No reference bounds a single NVML call.** TensorQuill reads in the training process, so it bounds the writer's wait instead.
@@ -1879,10 +1879,15 @@ State as of Nov 16, 2026.
     - without `pyarrow` or the binary: 1,063 passed and 80 skipped (1,056 and 80);
     - `experiments/moe-bakeoff/test_fixtures.py` and `experiments/gate1/test_gate1.py`: 92 passed.
 
-    A code comment in `system.py` changed after the first run started; `test_system.py` was run again on the final tree (23 passed) and three times in a row before (23 passed each time).
+    After these runs, `system.py`'s comment on `NVML_OPEN_SECONDS` was reworded. In `test_system.py`, the late-reading test's margin was widened (the reading now comes back 2 s after the bound, and the writer must return within 1 s of it, against 0.3 s and 0.25 s before), so a busy machine cannot fail it. `_written`'s docstring was corrected. `test_system.py` alone then passed three times in a row (23 passed each time); the four suites were not run again on that final tree.
   - *Not run.* Nothing on a GPU, on Linux, with the real `pynvml`, or on PyTorch 2.6 (this lane calls no new PyTorch API). A real hung driver was not reproduced, only the fake.
   - *Open.*
-    - **Two docs outside this lane's files are now stale.** `sdk/README.md:768`, under Limits, still says a hung NVML call blocks the writer thread and then training. Line 755 still says NVML is "read on the writer thread". The C entry's Open list above (line 625) still names the hung call; this entry supersedes it.
+    - **Wording outside this lane's files is now stale.**
+      - `sdk/README.md:768`, under Limits, still says a hung NVML call blocks the writer thread and then training. Line 755 still says NVML is "read on the writer thread".
+      - The C entry's Open list above (line 625) still names the hung call; this entry supersedes it.
+      - In `capture.py`, `_drain`'s comment still says "NVML is read here, on the writer thread".
+      - **The backpressure warning can now name the wrong cause.** If the writer's queue fills during the one bounded NVML wait, `_put`'s warning blames a slow sink, when NVML is the cause.
+    - **One existing test name** in `test_system.py`, `…_nvml_on_the_writer`, was left as it was. The test itself now checks that NVML is read on one thread that is not the trainer's.
     - **A process that keeps running after a hang keeps one thread stuck in the driver for its lifetime.** It is a daemon thread and does not keep the process from exiting.
     - **Hand-over note:** `lane-t3-nvml.md` in the session notes, which lists every function touched.
 

@@ -280,7 +280,8 @@ def _train(session, model, steps):
 
 
 def _written(sink, count):
-    """Wait for the writer thread, which reads NVML, to have written `count` records."""
+    """Wait for the writer thread, which asks the NVML thread for its readings, to have written
+    `count` records."""
     deadline = time.monotonic() + 10
     while len(sink.records) < count:
         assert time.monotonic() < deadline, "the writer thread did not write the records"
@@ -459,11 +460,11 @@ def test_a_hung_nvml_shutdown_never_holds_the_close(cuda, nvml, bounds):
 def test_a_reading_that_comes_back_too_late_is_noted_once_and_dropped(cuda, nvml, bounds):
     readings = SystemReadings(CUDA0)
     assert readings.write({})["nvml"]["temperature_c"] == 71  # the first reading opens NVML
-    nvml.delay = SLOW + 0.3  # slower than the bound, but it does come back
+    nvml.delay = SLOW + 2  # slower than the bound, but it does come back
     note = {"unavailable": f"an NVML reading took over {SLOW:g} s; NVML is off for this session"}
     started = time.monotonic()
     assert readings.write({"cuda": {"allocated": 1}}) == {"cuda": {"allocated": 1}, "nvml": note}
-    assert time.monotonic() - started < SLOW + 0.25  # the writer did not wait for it
+    assert time.monotonic() - started < SLOW + 1  # the writer did not wait for it
     assert _exits_within(readings._thread, 5)  # it came back: NVML shut down, the thread gone
     assert nvml.shutdowns == 1 and nvml.calls[-1] == "shutdown"
     asked = len(nvml.calls)
