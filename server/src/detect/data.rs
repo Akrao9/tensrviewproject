@@ -912,10 +912,12 @@ mod tests {
             (&json!([]), &json!([0, 1]))
         );
         // One rank, and a rank that hashed nothing: no finding, and not "compared and clean".
+        // Neither lists a rank as compared: a rank is compared only with another rank's hashes
+        // of the same kind (C16, lane V7, Nov 19, 2026; until then a rank with any hash was).
         let alone = detect_run(&[rows("run", &rank(0, 0..5, 0..0))], &usual()).unwrap();
         assert_eq!(
             (&alone["duplicate_batches"], &alone["ranks_compared"]),
-            (&Value::Null, &json!([0]))
+            (&Value::Null, &json!([]))
         );
         let unhashed: Vec<_> = (0..5)
             .map(|step| (1, 1, step, Some(json!({"batches": 1}).to_string())))
@@ -923,7 +925,7 @@ mod tests {
         let document = detect_run(&[rows("run", &rank(0, 0..5, 0..0)), rows("run", &unhashed)], &usual()).unwrap();
         assert_eq!(
             (&document["ranks"], &document["ranks_compared"]),
-            (&json!([0, 1]), &json!([0]))
+            (&json!([0, 1]), &json!([]))
         );
         assert_eq!(document["duplicate_batches"], Value::Null);
     }
