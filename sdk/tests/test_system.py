@@ -393,7 +393,7 @@ def bounds(monkeypatch):
 
 
 def test_a_hung_nvml_call_never_holds_training(cuda, nvml, bounds):
-    session, model, sink = _session(every=1, system=True)  # a queue of 8 blocks, one reading each
+    session, model, sink = _session(every=1, system=True)  # a queue of 400 blocks, one reading each
     session._system = SystemReadings(CUDA0)
     _train(session, model, 3)
     _written(sink, 2)  # each step is written when the next one ends
@@ -411,15 +411,11 @@ def test_a_hung_nvml_call_never_holds_training(cuda, nvml, bounds):
     assert stuck.is_alive()  # still in the hung call: never joined
     assert nvml.calls[asked:] == ["temperature"]  # nothing asked of NVML after it hung, not even a shutdown
 
-    # The author's decision on C03 (lane U1): a writer a full queue behind stops capture, and training
-    # does not wait. At every=1 the queue is 8 steps, and the 40 fast steps fill it during the 0.5 s
-    # wait for the hung reading: 3 steps written, 1 in the write waiting on NVML, 8 queued, then the
-    # stop. A machine too slow to fill it in 0.5 s records all 43 and does not stop.
+    # The author's decisions on C03 (lane U1): a writer a full queue behind stops capture and training
+    # does not wait; the queue holds about 400 steps at any `every`. The 40 steps fit while the writer
+    # waits 0.5 s for the hung reading, so nothing stops and every step is written.
     steps = [r["step"] for r in sink.records]
-    if session.writer_error is None:
-        assert steps == list(range(43))
-    else:
-        assert steps == list(range(11)) and "NVML" in str(session.writer_error)
+    assert session.writer_error is None and steps == list(range(43))
     systems = [r["system"] for r in sink.records if "system" in r]
     assert len(systems) == len(steps) and all("cuda" in s for s in systems)  # memory goes on at every flush
     nvml_parts = [s["nvml"] for s in systems if "nvml" in s]
@@ -443,14 +439,10 @@ def test_a_hung_nvml_open_never_holds_training(cuda, nvml, bounds):
         done.wait(10)
     closed = _closes_within(session, 5)
     assert finished and closed
-    # The author's decision on C03 (lane U1): the first flush waits up to 1 s for NVML to open, and the
-    # fast steps fill the 8-step queue meanwhile at every=1, so capture stops: the first block, which
-    # waited for the reading, and the 8 queued are written. A machine too slow to fill it records all 30.
+    # The author's decisions on C03 (lane U1): the 30 steps fit in the queue of about 400 while the first
+    # flush waits up to 1 s for NVML to open, so nothing stops and every step is written.
     steps = [r["step"] for r in sink.records]
-    if session.writer_error is None:
-        assert steps == list(range(30))
-    else:
-        assert steps == list(range(9)) and "NVML" in str(session.writer_error)
+    assert session.writer_error is None and steps == list(range(30))
     assert nvml.calls == ["init"]
     nvml_parts = [r["system"]["nvml"] for r in sink.records if "nvml" in r.get("system", {})]
     assert nvml_parts == [{"unavailable": f"the first NVML reading, which opens NVML, took over {OPEN:g} s; "

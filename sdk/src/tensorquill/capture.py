@@ -62,9 +62,11 @@ WEIGHT_EVERY = 50
 SCHEMA_VERSION = 1
 # Probe passes are rare, like wandb.watch's histograms (every 1,000 batches by default).
 PROBE_EVERY = 1000
-# Rings of `every` steps the writer thread may fall behind before capture stops for the session
-# (`Session._put`, `_queue_blocks`): training never waits for the sink. At every=1 that is 8 steps.
-WRITER_QUEUE = 8
+# How far the writer thread may fall behind before capture stops for the session (`Session._put`),
+# the author's decision: about QUEUE_STEPS steps at any `every`, and never fewer than
+# QUEUE_MIN_RINGS rings (`_queue_rings`). Training never waits for the sink.
+QUEUE_STEPS = 400
+QUEUE_MIN_RINGS = 2
 # How long `close()` waits for the writer to take and write what is left, at most, in seconds; then
 # capture is taken as stopped (no end marker) and `close()` returns. After a stop it waits
 # `STOPPED_CLOSE_SECONDS` at most for a writer that may be stuck in the sink.
@@ -699,10 +701,16 @@ _clip_original: Callable[..., Any] | None = None
 _DYNAMO_DIR = str(Path(torch._dynamo.__file__).parent)
 
 
+def _queue_rings(every: int) -> int:
+    """Rings of `every` steps the writer may fall behind: `max(QUEUE_MIN_RINGS, ceil(QUEUE_STEPS /
+    every))`, so 400 at every=1, 8 at the default 50, 4 at 100 and 2 from every=200 up."""
+    return max(QUEUE_MIN_RINGS, math.ceil(QUEUE_STEPS / every))
+
+
 def _queue_blocks(every: int) -> int:
-    """The writer queue's size in blocks: `WRITER_QUEUE` rings. A full ring is queued as two blocks,
+    """The writer queue's size in blocks: `_queue_rings` rings. A full ring is queued as two blocks,
     all but its newest step and then that step (`_hold_newest`), one when it is one step."""
-    return WRITER_QUEUE * (1 if every == 1 else 2)
+    return _queue_rings(every) * (1 if every == 1 else 2)
 
 
 def _noop_hook(*args: Any, **kwargs: Any) -> None:
@@ -1227,6 +1235,9 @@ class Session:
         # the writer falling a full queue behind. Training goes on either way.
         self._stopped = False
         self.writer_error: BaseException | None = None
+        # While `close()` flushes, the time by which `_put` may wait for room (`close`); None while
+        # training, when `_put` never waits.
+        self._close_by: float | None = None
         self._worker = threading.Thread(target=self._drain, name="tensorquill-writer", daemon=True)
         self._clip_watched = clip_norm
         self._scaler = plan.scaler
@@ -2393,10 +2404,20 @@ class Session:
         self._ring_wait = []
 
     def _flush(self, *, hold_newest: bool) -> None:
+        """Move the ring to the CPU and queue it (`_flush_ring`). An exception part way would leave
+        the ring's lists longer than the ring and every later step raising (lane U5 saw an
+        `IndexError` at each step after one raise here), so it stops capture instead (`_stop`),
+        which clears the ring: nothing raises into training from here."""
         if self._error is not None and not self._stopped:
             self._stop(self._error)
         if self._stopped:
             return
+        try:
+            self._flush_ring(hold_newest=hold_newest)
+        except Exception as error:  # noqa: BLE001
+            self._stop(error, f"moving a block of steps off the device raised {_short(error)}")
+
+    def _flush_ring(self, *, hold_newest: bool) -> None:
         if self._probe_owed and not hold_newest:
             self._run_owed_probe()  # the newest step's, before it leaves the ring (a held one stays)
         if self._held is not None:
@@ -2584,9 +2605,18 @@ class Session:
         if self._stopped:
             return
         try:
-            self._queue.put_nowait(block)
+            if self._close_by is None:
+                self._queue.put_nowait(block)
+            else:
+                # In `close()` no training step waits, and a writer that is slow but working gets
+                # until the close's deadline to make room for the last block.
+                self._queue.put(block, timeout=max(self._close_by - time.monotonic(), 0.0))
         except queue.Full:
             blocks = self._queue.maxsize
+            if self._close_by is not None:
+                self._stop(RuntimeError(f"the writer had not made room for the last block within {CLOSE_SECONDS:g} s "
+                                        "at close"))
+                return
             cause = ("for example on a stalled network filesystem (pass sink=tensorquill.JsonlSink(path) on "
                      "local disk)")
             if self._system is not None:
@@ -2594,10 +2624,11 @@ class Session:
                 # reading (system.py), after which NVML is off for the session.
                 cause += ", or while the writer waited for an NVML reading that was slow to come back"
             self._stop(RuntimeError(
-                f"the writer fell {blocks} blocks ({WRITER_QUEUE * self.every} steps) behind training, {cause}"
+                f"the writer fell {blocks} blocks ({_queue_rings(self.every) * self.every} steps) behind training, "
+                f"{cause}"
             ))
 
-    def _stop(self, cause: BaseException) -> None:
+    def _stop(self, cause: BaseException, what: str | None = None) -> None:
         """Stop capture for the rest of the session, on the training thread, and say so once.
 
         The author's decision on C03: a sink that fails, or a writer a full queue behind, stops
@@ -2638,10 +2669,8 @@ class Session:
                 self._unwatch_scaler()
             except Exception:  # noqa: BLE001
                 pass
-        if cause is self._error:
-            what = f"its sink raised {_short(cause)}"
-        else:
-            what = str(cause)
+        if what is None:
+            what = f"its sink raised {_short(cause)}" if cause is self._error else str(cause)
         _warn(
             f"TensorQuill stopped capturing for this session: {what}. Training goes on and does not wait; "
             "the steps already handed to the writer are written, no later step is, and the records file gets "
@@ -2777,10 +2806,8 @@ class Session:
                 pass
         deadline = time.monotonic() + CLOSE_SECONDS
         if not self._stopped:
-            try:
-                self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
-            except Exception as error:  # noqa: BLE001
-                self._stop(error)
+            self._close_by = deadline  # the last block may wait for room, up to the deadline (`_put`)
+            self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
         if not self._stopped:
             try:
                 self._queue.put(None, timeout=max(deadline - time.monotonic(), 0.0))

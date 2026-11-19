@@ -698,7 +698,7 @@ def test_a_slow_sink_stops_capture_instead_of_making_training_wait(monkeypatch):
 
     from tensorquill import capture
 
-    monkeypatch.setattr(capture, "WRITER_QUEUE", 2)
+    monkeypatch.setattr(capture, "QUEUE_STEPS", 2)  # 2 rings of one step: 2 blocks at every=1
     release = threading.Event()
 
     class SlowSink(tensorquill.MemorySink):

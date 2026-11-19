@@ -188,7 +188,8 @@ def _every_public_call(session: capture.Session, model: nn.Module, tmp_path: Pat
     session.close()
 
 
-def test_every_public_call_on_a_closed_session_returns_at_once_and_queues_nothing(tmp_path):
+def test_every_public_call_on_a_closed_session_returns_at_once_and_queues_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(capture, "QUEUE_STEPS", 8)  # a queue of 8 blocks at every=1, to go past quickly
     model = nn.Linear(4, 4)
     sink = tensorquill.MemorySink()
     session = tensorquill.init(model, sink=sink, every=1, auto_step=False, updates=True,
@@ -202,7 +203,7 @@ def test_every_public_call_on_a_closed_session_returns_at_once_and_queues_nothin
 
     def calls() -> None:
         try:
-            for _ in range(capture.WRITER_QUEUE * 3):  # past the writer queue's capacity
+            for _ in range(capture._queue_blocks(1) * 3):  # past the writer queue's capacity
                 _every_public_call(session, model, tmp_path)
         except BaseException as error:  # noqa: BLE001
             failed.append(error)
@@ -718,7 +719,8 @@ def test_the_users_own_exception_comes_out_unchanged_after_the_sink_failed():
     assert isinstance(session.writer_error, OSError)
 
 
-def test_a_sink_that_never_returns_holds_neither_training_nor_close():
+def test_a_sink_that_never_returns_holds_neither_training_nor_close(monkeypatch):
+    monkeypatch.setattr(capture, "QUEUE_STEPS", 8)  # fill the queue in 8 steps rather than 400
     sink = StuckSink()
     model = nn.Linear(4, 4)
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -726,7 +728,7 @@ def test_a_sink_that_never_returns_holds_neither_training_nor_close():
 
     def run() -> None:
         session = tensorquill.init(model, sink=sink, every=1)
-        for _ in range(capture.WRITER_QUEUE * 4):
+        for _ in range(capture._queue_blocks(1) * 4):
             opt.zero_grad()
             model(torch.ones(2, 4)).sum().backward()
             opt.step()
@@ -930,3 +932,79 @@ def test_a_stopped_rank_counts_the_steps_a_scaler_ends_as_a_live_one_does(monkey
     live = _scaled_run(monkeypatch, stop=False)
     assert live == (4, 4)
     assert _scaled_run(monkeypatch, stop=True) == live
+
+
+# --- C03's trigger, decided by the author: the queue sized in steps, about 400, floor 2 rings -----
+
+
+@pytest.mark.parametrize(("every", "rings", "blocks"), [
+    (1, 400, 400), (3, 134, 268), (50, 8, 16), (100, 4, 8), (200, 2, 4), (1000, 2, 4),
+])
+def test_the_writer_queue_holds_about_400_steps_with_a_floor_of_two_rings(every, rings, blocks):
+    assert capture._queue_rings(every) == rings and capture._queue_blocks(every) == blocks
+    session = tensorquill.init(nn.Linear(2, 2), sink=tensorquill.MemorySink(), every=every, auto_step=False)
+    assert session._queue.maxsize == blocks
+    session.close()
+
+
+def test_the_stop_warning_names_the_real_capacity(monkeypatch):
+    monkeypatch.setattr(capture, "QUEUE_STEPS", 6)  # 2 rings of 3 steps: 4 blocks
+    sink = StuckSink()
+    session = tensorquill.init(nn.Linear(2, 2), sink=sink, every=3, auto_step=False)
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        for _ in range(30):
+            session.step()
+    sink.release.set()
+    session.close()
+    assert "4 blocks (6 steps) behind" in str(session.writer_error)
+    assert len([w for w in said if "TensorQuill" in str(w.message)]) == 1
+
+
+def test_close_at_the_two_ring_floor_waits_for_a_slow_but_working_writer(tmp_path):
+    """At every=200 the queue holds 2 rings, 4 blocks, and here it is full when `close()` flushes the
+    step kept back. A writer that is slow but working gets until the close's deadline: every step is
+    written and the end marker is left, as for any run that closed normally."""
+    path = tmp_path / "floor.rank0.jsonl"
+    release = threading.Event()
+
+    class Slow(tensorquill.JsonlSink):
+        def write(self, records):
+            release.wait(DEADLINE)
+            super().write(records)
+
+    session = tensorquill.init(nn.Linear(2, 2), sink=Slow(path), run_id="floor", every=200, auto_step=False)
+    for _ in range(600):  # 3 rings: one block in the write, 4 queued, the newest step kept back
+        session.step()
+    assert session._queue.full() and not session._stopped
+    threading.Timer(0.5, release.set).start()
+    session.close()
+    assert session.writer_error is None
+    assert [json.loads(line)["step"] for line in path.read_text().splitlines()] == list(range(600))
+    assert (tmp_path / "floor.rank0.end.json").exists()
+
+
+def test_an_exception_part_way_through_a_flush_stops_capture_and_later_steps_run(monkeypatch):
+    """Lane U5 saw every step after one raise inside `_flush` raise `IndexError`: the ring's lists were
+    left longer than the ring. A flush that raises now stops capture, which clears the ring."""
+    real = capture._scalars_to_cpu
+    calls = [0]
+
+    def once(rows):
+        calls[0] += 1
+        if calls[0] == 3:  # in the second flush (each flush converts two lists of scalars)
+            raise RuntimeError("device lost for a moment")
+        return real(rows)
+
+    monkeypatch.setattr(capture, "_scalars_to_cpu", once)
+    without, _ = _train_plain(None, steps=12)
+    sink = tensorquill.MemorySink()
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        with_tq, session = _train_plain(sink, steps=12, every=2)
+    assert torch.equal(without, with_tq)
+    assert "device lost" in str(session.writer_error)
+    told = [str(w.message) for w in said if "TensorQuill" in str(w.message)]
+    assert len(told) == 1 and "moving a block of steps off the device raised" in told[0]
+    steps = [r["step"] for r in sink.records]
+    assert steps and steps == list(range(len(steps))) and len(steps) < 12  # an unbroken run, then nothing
