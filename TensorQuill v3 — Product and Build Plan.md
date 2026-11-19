@@ -2932,6 +2932,15 @@ State as of Nov 16, 2026.
   - *A change the author's GPU runs meet.* `seeded_failures.py` writes every case straight into `--out`, with no per-case folder, so `tensorquill runs` lists them. The README's commands are unchanged; it now says where the output lands.
   - *The register.* 29 of the 72 rows remain, 14 of them fixed in part; the five P1 rows are wave W's.
   - *Kept by the author the same day:* both of lane V1's additions to the data-wait rule, now stated in the README.
+- [x] **Wave W, merge group M3: lane W4 is in `main` (Nov 19, 2026, at the author's word: "Merge M3 locally at af846f7").** Fast-forwarded to the trial merge's commit. Not pushed.
+  - *Run on the trial merge* (macOS, CPU), before the merge. Python with the server binary: 2,312 passed, none skipped. The experiment tests: 112. Without the binary: 1,650 passed, 662 skipped. Without pyarrow: 1,501 passed, 120 skipped. Without NumPy and pyarrow: 1,422 passed, 188 skipped. Rust was not run again: W4 changes nothing under `server/`.
+  - *In.* SDK-22's first criterion: every rank consistently skips a drift check known at `init` to be incompatible, by an agreement among the group's members with a bounded wait. L5, ranks on different device types. One call in `capture.py`, `_agree_on_gather(...)`, the recorded exception to file ownership.
+  - *Still open, as the author required it be said.* A process group that fails after `init` still fails inside the training step. Not run on NCCL, MPI or a GPU: gloo on CPU and injected failures.
+- [x] **Contract 1, two changes after sign-off, decided by the author (Nov 19, 2026).**
+  - *The legacy-sender fallback is approved.* Rows from a stream that names no `sender_attempt` go after the newest known attempt if their number is higher, and just before it otherwise. Lane W2 found by a test that under the signed text a new attempt whose rows reached the server before its first heartbeat lost the rank for good, with every current SDK.
+  - *Both clock-skew cases are to be documented:* a lower-numbered replacement (a host whose clock is behind) whose rows arrive before its first beat from a sender with no `sender_attempt` is taken as backlog; and across separate local files the order rests on each record's `ts`, which is only as good as the hosts' clocks.
+  - *Cross-file ordering, the author's amendment to W2's draft:* the known order within each file is preserved first, before timestamps or attempt numbers are used. An overlapping-files regression test is added before M4.
+  - *Parked or pending:* `skipped=` on `session.step()`; the push.
 
 ## Sources
 
