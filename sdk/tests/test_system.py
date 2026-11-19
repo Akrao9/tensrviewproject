@@ -261,11 +261,34 @@ def test_a_slow_nvml_turns_nvml_off(cuda, nvml, monkeypatch):
 
 def test_an_unexpected_error_inside_a_reading_turns_nvml_off_and_never_raises(cuda, nvml, monkeypatch):
     readings = SystemReadings(CUDA0)
+    assert readings.write({}) is None  # the first flush asks; no reading has finished yet
+    _settle(readings)
     assert "nvml" in readings.write({})
+    _settle(readings)  # the reading asked by that flush finishes before the failure is set
     monkeypatch.setattr(Nvml, "_drain_xid", lambda self: (_ for _ in ()).throw(KeyError("odd")))
     monkeypatch.setattr(Nvml, "_metric", lambda self, out, metric, read: (_ for _ in ()).throw(ValueError("bad")))
+    assert readings.write({})["nvml"]["temperature_c"] == 71  # read before the failure
+    _settle(readings)
     assert readings.write({"cuda": {"allocated": 1}}) == {"cuda": {"allocated": 1}, "nvml": {"unavailable": "ValueError: bad"}}
     assert readings.write({}) is None
+
+
+def _settle(readings):
+    """Wait, on its own event, for the NVML reading the last flush asked for to finish. The writer never
+    waits for it (the author's decision on L2): a reading rides on the flush after the one that asked."""
+    pending = readings._pending
+    if pending is not None:
+        assert pending.done.wait(10), "the NVML reading did not finish"
+
+
+def _until(sink, found, train):
+    """Train one step at a time until a written record satisfies `found` (a deadline, not a delay):
+    a hung reading is noted at the first flush after its bound, never waited for."""
+    deadline = time.monotonic() + 10
+    while not any(found(r) for r in sink.records):
+        assert time.monotonic() < deadline, "no record showed it"
+        train()
+        time.sleep(0.01)
 
 
 # --- through a session ---------------------------------------------------------------------
@@ -311,20 +334,27 @@ def test_off_by_default_and_on_a_cpu_model_unavailable_once():
 
 
 def test_each_flush_adds_one_reading_memory_on_the_training_thread_nvml_on_the_writer(cuda, nvml):
+    """Memory is read at each flush on the training thread. NVML is asked for by each flush and attached
+    to the next one (L2): the first flush has none, each later one the reading the one before asked for."""
     session, model, sink = _session(system=True)
     session._system = SystemReadings(CUDA0)  # as on a CUDA model
     trainer_thread = threading.get_ident()
     cuda["calls"].clear()
     _train(session, model, 6)  # a full ring's newest step is written when the next step ends
     _written(sink, 5)
+    _settle(session._system)  # asked at step 4's flush, read before the counters change
     nvml.ecc[0] = 2
     nvml.xid = [79]
     _train(session, model, 5)
+    _written(sink, 10)
+    _settle(session._system)  # asked at step 9's flush: it sees the new counters
     session.close()
     systems = [(r["step"], r["system"]) for r in sink.records if "system" in r]
     assert [step for step, _ in systems] == [4, 9, 10]  # each flush's last step, and the close
-    assert systems[0][1]["cuda"]["allocated"] == 2 * GIB and systems[0][1]["nvml"]["ecc_uncorrected"] == 0
-    assert systems[1][1]["nvml"]["ecc_uncorrected"] == 2 and systems[1][1]["nvml"]["xid"] == [79]
+    assert systems[0][1]["cuda"]["allocated"] == 2 * GIB and "nvml" not in systems[0][1]
+    assert systems[1][1]["nvml"]["ecc_uncorrected"] == 0 and systems[1][1]["nvml"]["xid"] == []
+    assert systems[2][1]["nvml"]["ecc_uncorrected"] == 2 and systems[2][1]["nvml"]["xid"] == [79]
+    assert all(isinstance(s["nvml"]["read_at"], float) for _, s in systems[1:])
     assert set(cuda["calls"]) == {trainer_thread}
     assert trainer_thread not in nvml.threads and len(nvml.threads) == 1
     assert nvml.shutdowns == 1
@@ -333,18 +363,33 @@ def test_each_flush_adds_one_reading_memory_on_the_training_thread_nvml_on_the_w
 def test_readings_that_fail_mid_run_never_stop_training(cuda, nvml, monkeypatch):
     session, model, sink = _session(system=True)
     session._system = SystemReadings(CUDA0)
-    _train(session, model, 6)  # a full ring's newest step is written when the next step ends
+    # One optimizer throughout: the allocator error below is one exception object raised at every flush,
+    # whose traceback would keep a finished `_train` call's optimizer alive as the session's lead.
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    def train(steps):
+        for _ in range(steps):
+            model(torch.randn(2, 4)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+    train(6)  # a full ring's newest step is written when the next step ends
     _written(sink, 5)
+    _settle(session._system)  # the reading asked at step 4 is taken before the failures
     cuda["stats"] = RuntimeError("allocator gone")
     monkeypatch.setattr(Nvml, "read", lambda self: (_ for _ in ()).throw(Exception("driver fell off the bus")))
-    _train(session, model, 9)
+    train(5)
+    _written(sink, 10)
+    _settle(session._system)  # the failing reading, asked at step 9
+    train(4)
     session.close()
     assert session.writer_error is None  # a failed reading is a note, never a stop
     assert [r["step"] for r in sink.records] == list(range(15))
     notes = [r["system"] for r in sink.records if "system" in r]
-    assert notes[1] == {"cuda": {"unavailable": "RuntimeError: allocator gone"},
-                        "nvml": {"unavailable": "Exception: driver fell off the bus"}}
-    assert len(notes) == 2  # each note once, then nothing
+    assert notes[1]["cuda"] == {"unavailable": "RuntimeError: allocator gone"}
+    assert notes[1]["nvml"]["temperature_c"] == 71  # taken before the failure, attached a flush later
+    assert notes[2] == {"nvml": {"unavailable": "Exception: driver fell off the bus"}}
+    assert len(notes) == 3  # each note once, then nothing
 
 
 def _train_on_a_thread(session, model, steps):
@@ -393,10 +438,11 @@ def bounds(monkeypatch):
 
 
 def test_a_hung_nvml_call_never_holds_training(cuda, nvml, bounds):
-    session, model, sink = _session(every=1, system=True)  # a queue of 400 blocks, one reading each
+    session, model, sink = _session(every=1, system=True)  # one flush, and one reading asked, per step
     session._system = SystemReadings(CUDA0)
     _train(session, model, 3)
     _written(sink, 2)  # each step is written when the next one ends
+    _settle(session._system)
     asked = len(nvml.calls)
     nvml.hang.add("temperature")  # the driver stops answering, and never does again in this run
     done = _train_on_a_thread(session, model, 40)
@@ -404,23 +450,23 @@ def test_a_hung_nvml_call_never_holds_training(cuda, nvml, bounds):
     if not finished:  # on a writer that waits for NVML: let it go, so the session can close
         nvml.release.set()
         done.wait(10)
-    closed = _closes_within(session, 5)
     assert finished, "training waited for a hung NVML call"
+    note = {"unavailable": f"an NVML reading took over {SLOW:g} s; NVML is off for this session"}
+    _until(sink, lambda r: r.get("system", {}).get("nvml") == note, lambda: _train(session, model, 1))
+    closed = _closes_within(session, 5)
     assert closed, "closing the session waited for a hung NVML call"
     stuck = session._system._thread
     assert stuck.is_alive()  # still in the hung call: never joined
     assert nvml.calls[asked:] == ["temperature"]  # nothing asked of NVML after it hung, not even a shutdown
 
-    # The author's decisions on C03 (lane U1): a writer a full queue behind stops capture and training
-    # does not wait; the queue holds about 400 steps at any `every`. The 40 steps fit while the writer
-    # waits 0.5 s for the hung reading, so nothing stops and every step is written.
+    # The writer never waits for NVML (L2), so nothing stops and every step is written.
     steps = [r["step"] for r in sink.records]
-    assert session.writer_error is None and steps == list(range(43))
+    assert session.writer_error is None and steps == list(range(len(steps))) and len(steps) >= 43
     systems = [r["system"] for r in sink.records if "system" in r]
     assert len(systems) == len(steps) and all("cuda" in s for s in systems)  # memory goes on at every flush
     nvml_parts = [s["nvml"] for s in systems if "nvml" in s]
-    assert nvml_parts[0]["temperature_c"] == 71 and nvml_parts[1]["temperature_c"] == 71
-    assert nvml_parts[2:] == [{"unavailable": f"an NVML reading took over {SLOW:g} s; NVML is off for this session"}]
+    assert nvml_parts[:-1] and all(p["temperature_c"] == 71 for p in nvml_parts[:-1])
+    assert nvml_parts[-1] == note  # once, and nothing after it
 
     nvml.release.set()  # the driver answers after all: the late reading is dropped, NVML shut down
     assert _exits_within(stuck, 5)
@@ -437,17 +483,19 @@ def test_a_hung_nvml_open_never_holds_training(cuda, nvml, bounds):
     if not finished:
         nvml.release.set()
         done.wait(10)
+    assert finished
+    note = {"unavailable": f"the first NVML reading, which opens NVML, took over {OPEN:g} s; "
+                           "NVML is off for this session"}
+    _until(sink, lambda r: r.get("system", {}).get("nvml") == note, lambda: _train(session, model, 1))
     closed = _closes_within(session, 5)
-    assert finished and closed
-    # The author's decisions on C03 (lane U1): the 30 steps fit in the queue of about 400 while the first
-    # flush waits up to 1 s for NVML to open, so nothing stops and every step is written.
+    assert closed
+    # The writer never waits for NVML (L2): nothing stops and every step is written.
     steps = [r["step"] for r in sink.records]
-    assert session.writer_error is None and steps == list(range(30))
+    assert session.writer_error is None and steps == list(range(len(steps))) and len(steps) >= 30
     assert nvml.calls == ["init"]
     nvml_parts = [r["system"]["nvml"] for r in sink.records if "nvml" in r.get("system", {})]
-    assert nvml_parts == [{"unavailable": f"the first NVML reading, which opens NVML, took over {OPEN:g} s; "
-                                          "NVML is off for this session"}]
-    assert sink.records[0]["system"]["nvml"] == nvml_parts[0]  # on the first flush, which waited for it
+    assert nvml_parts == [note]
+    assert "nvml" not in sink.records[0]["system"]  # the first flush asked and went on: nothing waited
     stuck = session._system._thread
     nvml.release.set()
     assert _exits_within(stuck, 5) and nvml.shutdowns == 1  # it opened late, and was shut down
@@ -456,24 +504,35 @@ def test_a_hung_nvml_open_never_holds_training(cuda, nvml, bounds):
 def test_a_hung_nvml_shutdown_never_holds_the_close(cuda, nvml, bounds):
     session, model, sink = _session(every=5, system=True)
     session._system = SystemReadings(CUDA0)
-    _train(session, model, 10)
+    _train(session, model, 6)
+    _written(sink, 5)
+    _settle(session._system)
+    _train(session, model, 4)
     nvml.hang.add("shutdown")
     started = time.monotonic()
     assert _closes_within(session, 5)
     assert time.monotonic() - started < SLOW + 2  # one bounded wait for the shutdown
     assert [r["step"] for r in sink.records] == list(range(10))
-    assert [r["system"]["nvml"]["temperature_c"] for r in sink.records if "system" in r] == [71, 71]
+    # The first flush asks; the close's flush carries that reading (L2).
+    assert [r["system"].get("nvml", {}).get("temperature_c") for r in sink.records if "system" in r] == [None, 71]
     assert session._system._thread.is_alive() and nvml.calls[-1] == "shutdown"
 
 
 def test_a_reading_that_comes_back_too_late_is_noted_once_and_dropped(cuda, nvml, bounds):
     readings = SystemReadings(CUDA0)
-    assert readings.write({})["nvml"]["temperature_c"] == 71  # the first reading opens NVML
+    assert readings.write({}) is None  # the first reading, which opens NVML, is asked for
+    _settle(readings)
     nvml.delay = SLOW + 2  # slower than the bound, but it does come back
+    assert readings.write({})["nvml"]["temperature_c"] == 71  # the first reading; the slow one is asked
     note = {"unavailable": f"an NVML reading took over {SLOW:g} s; NVML is off for this session"}
     started = time.monotonic()
-    assert readings.write({"cuda": {"allocated": 1}}) == {"cuda": {"allocated": 1}, "nvml": note}
-    assert time.monotonic() - started < SLOW + 1  # the writer did not wait for it
+    written = None
+    while written is None or "nvml" not in written:
+        assert time.monotonic() - started < 10
+        written = readings.write({"cuda": {"allocated": 1}})  # never waits: nothing new until the bound
+        time.sleep(0.01)
+    assert written == {"cuda": {"allocated": 1}, "nvml": note}
+    assert time.monotonic() - started < SLOW + 1  # noted at the bound, not when the reading came back
     assert _exits_within(readings._thread, 5)  # it came back: NVML shut down, the thread gone
     assert nvml.shutdowns == 1 and nvml.calls[-1] == "shutdown"
     asked = len(nvml.calls)
@@ -484,7 +543,10 @@ def test_a_reading_that_comes_back_too_late_is_noted_once_and_dropped(cuda, nvml
 
 def test_nvml_is_read_on_its_own_thread_and_the_thread_ends_with_nvml(cuda, nvml):
     readings = SystemReadings(CUDA0)
+    assert readings.write({}) is None
+    _settle(readings)
     assert readings.write({})["nvml"]["temperature_c"] == 71
+    _settle(readings)
     assert readings.write({})["nvml"]["temperature_c"] == 71
     thread = readings._thread
     assert thread.daemon and thread.name == "tensorquill-nvml"
@@ -498,6 +560,8 @@ def test_nvml_is_read_on_its_own_thread_and_the_thread_ends_with_nvml(cuda, nvml
 def test_unavailable_nvml_ends_its_thread_after_the_note(cuda, monkeypatch):
     monkeypatch.setitem(sys.modules, "pynvml", None)
     readings = SystemReadings(CUDA0)
+    assert readings.write({}) is None  # asked; the NVML thread finds no library
+    _settle(readings)
     assert readings.write({})["nvml"]["unavailable"].startswith("pynvml is not installed")
     assert _exits_within(readings._thread, 5)
     assert readings.write({}) is None

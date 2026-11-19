@@ -106,9 +106,16 @@ class Router:
 
     A function given as `indices` is checked as the default is, and more: it must return an
     integer tensor on the counts' device, of a size that is a whole multiple of the tokens
-    the router was called on, with values in `0..n_experts-1`. One that raises, or returns
-    anything else, has its router refused for the session (`_router_hook`), never an error
-    in training.
+    the router was called on. One that raises, or returns anything else, has its router refused
+    for the session (`_router_hook`), never an error in training.
+
+    Expert ids, from `indices` or the default integer tensor, are judged on their values (the
+    author's decision on C06): an id below 0 is no assignment (Megatron's -1 for no route), not
+    counted, and how many there were in a step is recorded as `moe_unassigned`; an id at or above
+    `n_experts` matches no expert and refuses the router from the block in which it appears. A
+    routing map's entries left out of the counts (their paired float is exactly zero) are recorded
+    per expert as `moe_left_out`, so `moe[e] + moe_left_out[e]` is the map's own count. Both are
+    written with explicit zeros whenever their check ran, and left out when it did not apply.
 
     The function need not detach: it is called with grad off, on a detached view of the
     output, so it changes nothing in the model's autograd graph (activation checkpointing
@@ -465,10 +472,24 @@ def _unusable(t: torch.Tensor, device: torch.device, what: str) -> tuple[str, st
     return None
 
 
+# The author's decision on C06 and F1: `moe_unassigned` and `moe_left_out` are written with explicit
+# zeros whenever the router was counted and the check applied, and left out when it did not apply.
+# Readers take a missing value, every older record's included, as unknown.
+
+
 def _count_width(spec: Router) -> int:
-    """Slots in a router's counts buffer: one per expert, and for an `indices=` router one more
-    for the indices that match no expert (`_router_hook`, judged in `flush`)."""
-    return spec.n_experts + (spec.indices is not None)
+    """Slots in a router's counts buffer, filled by `_router_hook` and read in `flush` with the copy to
+    the CPU made anyway, so the values are judged without a sync and the hook's shapes depend on the
+    `Router` alone (the same under `torch.compile`). For `E = n_experts`:
+
+    - `[0, E)`: assignments per expert (`moe`);
+    - `E`: ids below 0, which are no assignment (Megatron's -1 for no route): `moe_unassigned`;
+    - `E + 1`: ids at or above `E`, which match no expert: the router is refused (`_judge_index_ranges`);
+    - `[E + 2, 2E + 2)`: true routing-map entries left out because their paired float is exactly 0,
+      per expert, so `moe[e] + moe_left_out[e]` is Megatron's own `routing_map.sum(dim=0)`: `moe_left_out`;
+    - `2E + 2`: forwards whose expert ids were checked (the integer and `indices=` paths);
+    - `2E + 3`: forwards whose routing map was checked against a paired float."""
+    return 2 * spec.n_experts + 4
 
 
 def _router_hook(
@@ -485,6 +506,13 @@ def _router_hook(
     exception left, which is caught. A forward that is not training (`_evaluating`) is left
     out before anything is read, so an evaluation batch is neither counted nor refused."""
     phase = phase or _Evaluating()
+    experts = spec.n_experts
+    # Constant tails of the slots `_count_width` lays out, made once on the counts' device.
+    ids_tail = torch.zeros(experts + 2, dtype=counts.dtype, device=counts.device)
+    ids_tail[experts] = 1  # the ids were checked; no routing map
+    no_ids = torch.zeros(2, dtype=counts.dtype, device=counts.device)
+    map_checked = torch.tensor([0, 1], dtype=counts.dtype, device=counts.device)
+    unchecked = torch.zeros(experts + 4, dtype=counts.dtype, device=counts.device)
 
     def refuse(why: Callable[[], str], fix: str | None = None) -> None:
         # Built only the first time: a refused router's hook still runs on every forward, and
@@ -493,11 +521,12 @@ def _router_hook(
             problems.append((why(), fix))
 
     def count(args: Any, output: Any) -> None:
+        logits = None  # set only on the top-k-of-logits path
         if spec.indices is not None:
             # The user's function: one that raises, or returns what cannot be expert indices,
             # refuses this router and never raises into training. Checked from types and
-            # shapes only; its values are judged in `flush`, from the last slot of `counts`, after the
-            # copy to the CPU that is made anyway.
+            # shapes only; its values are counted into fixed slots of `counts` (`_count_width`) and
+            # judged in `flush`, after the copy to the CPU that is made anyway.
             # Read with grad off, on a detached view of the output, so the function builds no
             # autograd graph and saves nothing for backward, whether or not it detaches: under
             # non-reentrant checkpointing the recomputation, where this hook does not run, must
@@ -553,9 +582,14 @@ def _router_hook(
                         refuse(lambda: wrong[0], wrong[1])
                         return
                 kept = routing_map.detach()
-                if paired is not None:
-                    kept = kept & (paired.detach() != 0)
-                hits = kept.reshape(-1, spec.n_experts).sum(0)
+                if paired is None:
+                    # No float of the map's shape: every true entry is counted, none can be left out,
+                    # so that check did not apply (no `moe_left_out` for this forward).
+                    hits = torch.cat([kept.reshape(-1, experts).sum(0), unchecked])
+                else:
+                    zero = paired.detach() == 0
+                    left = (kept & zero).reshape(-1, experts).sum(0)
+                    hits = torch.cat([(kept & ~zero).reshape(-1, experts).sum(0), no_ids, left, map_checked])
             else:
                 logits = _first_tensor(output, integer=False)
                 if logits is None:
@@ -595,12 +629,15 @@ def _router_hook(
         # Fixed output shape: `bincount` would make the shape depend on the data.
         # Accumulate across gradient-accumulation microbatches; `_commit` zeroes `counts`.
         if idx is not None:
-            hits = (idx.detach().reshape(-1, 1) == expert_ids).sum(0)
-        if spec.indices is not None:
-            # An `indices=` router's buffer has a last slot for the indices outside
-            # 0..n_experts-1, which match no expert (`_count_width`): device work only, read in
-            # `flush` with the counts (no sync here). Default routers keep the work they had.
-            hits = torch.cat([hits, (idx.numel() - hits.sum()).reshape(1)])
+            flat = idx.detach().reshape(-1, 1)
+            hits = (flat == expert_ids).sum(0)
+            if spec.indices is not None or logits is None:
+                # Ids the router or its `indices=` function gave: those below 0 are no assignment
+                # (counted, not refused), those at or above n_experts refuse the router at the flush
+                # (`_judge_index_ranges`). Device work only; no sync here.
+                hits = torch.cat([hits, (flat < 0).sum().reshape(1), (flat >= experts).sum().reshape(1), ids_tail])
+            else:
+                hits = torch.cat([hits, unchecked])  # top-k of logits: always in range, nothing to check
         if torch.compiler.is_compiling():
             _add_compiled(counts, hits)
         else:
@@ -1416,6 +1453,13 @@ class Session:
             if head is not None:
                 self._handles += install_head_hook(modules[head], self._probe_state)
 
+        sender = getattr(self._sink, "sender", None)
+        if sender is not None and hasattr(type(sender), "attempt"):
+            # Contract 1: every batch the sender sends names this session's attempt (`sender_attempt`).
+            # Named before the heartbeat's hand-over, which releases the stream's first connection.
+            sender_attempt_before = sender.attempt
+            sender.attempt = self.attempt
+            undo.append(lambda: setattr(sender, "attempt", sender_attempt_before))
         beat = getattr(self._sink, "heartbeat", None)
         if beat is not None:
             had, before = hasattr(beat, "counter"), getattr(beat, "counter", None)
@@ -2377,21 +2421,25 @@ class Session:
                 )
 
     def _judge_index_ranges(self, counts: torch.Tensor, n: int) -> None:
-        """Refuse an `indices=` router whose function returned indices outside 0..n_experts-1
-        on any step of this block. Read from the counts' last slot, already on the CPU: the
-        check adds no transfer and no sync. Default routers are not judged on their values:
-        their indices come from `topk`/`argmax` of logits, or from an integer tensor that the
-        shape guard alone judges, as before."""
+        """Refuse a router whose expert ids reached n_experts on any step of this block: from its
+        `indices=` function, or from the integer tensor in its output (the author's decision on C06).
+        Ids below 0 are no assignment and are only counted (`moe_unassigned`). Read from the counts'
+        slot for them (`_count_width`), already on the CPU: the check adds no transfer and no sync.
+        Ids from `topk`/`argmax` of logits are always in range."""
         offset = 0
         for name, spec in self._routers.items():
             width = _count_width(spec)
             size = n * width
-            if spec.indices is not None and not self._router_problems[name]:
-                outside = counts[offset : offset + size].reshape(n, width)[:, -1].tolist()
+            if not self._router_problems[name]:
+                outside = counts[offset : offset + size].reshape(n, width)[:, spec.n_experts + 1].tolist()
                 bad = next((i for i, v in enumerate(outside) if v), None)
                 if bad is not None:
+                    source = (
+                        "its indices= function returned" if spec.indices is not None
+                        else "its output's first integer tensor held"
+                    )
                     self._router_problems[name].append((
-                        f"its indices= function returned {outside[bad]} value{'s' if outside[bad] != 1 else ''} "
+                        f"{source} {outside[bad]} value{'s' if outside[bad] != 1 else ''} "
                         f"outside 0 to {spec.n_experts - 1} at step {self._steps[bad]}, which match no expert",
                         None,
                     ))
@@ -2607,7 +2655,7 @@ class Session:
         try:
             self._flush_ring(hold_newest=hold_newest)
         except Exception as error:  # noqa: BLE001
-            self._stop(error, f"moving a block of steps off the device raised {_short(error)}")
+            self._stop(error, f"moving a block of steps off the device raised {_short(error)}", reason="flush_error")
 
     def _say_new_trainable(self) -> None:
         """Name once, in a warning, each parameter of the model that is trainable now and was not when
@@ -2839,20 +2887,17 @@ class Session:
             blocks = self._queue.maxsize
             if self._close_by is not None:
                 self._stop(RuntimeError(f"the writer had not made room for the last block within {CLOSE_SECONDS:g} s "
-                                        "at close"))
+                                        "at close"), reason="close_timeout")
                 return
+            # The writer never waits for NVML (system.py, the author's decision on L2): only the sink.
             cause = ("for example on a stalled network filesystem (pass sink=tensorquill.JsonlSink(path) on "
                      "local disk)")
-            if self._system is not None:
-                # With system readings on, the writer may instead be in its bounded wait for an NVML
-                # reading (system.py), after which NVML is off for the session.
-                cause += ", or while the writer waited for an NVML reading that was slow to come back"
             self._stop(RuntimeError(
                 f"the writer fell {blocks} blocks ({_queue_rings(self.every) * self.every} steps) behind training, "
                 f"{cause}"
-            ))
+            ), reason="writer_behind")
 
-    def _stop(self, cause: BaseException, what: str | None = None) -> None:
+    def _stop(self, cause: BaseException, what: str | None = None, reason: str | None = None) -> None:
         """Stop capture for the rest of the session, on the training thread, and say so once.
 
         The author's decision on C03: a sink that fails, or a writer a full queue behind, stops
@@ -2864,11 +2909,23 @@ class Session:
         become no-ops (taking them out now could be inside PyTorch's loop over them, which would
         raise) and `close()` removes them; with a `replica_group` they instead keep counting steps,
         so this rank keeps entering the drift check's gather on the same steps as the others
-        (`_count_stopped`). `close()` then writes no end marker, so the file reads as cut off."""
+        (`_count_stopped`). `close()` then writes no end marker, so the file reads as cut off.
+
+        A streamed session's heartbeat is told (contract 3): every later beat carries
+        `capture_stopped` with `reason`, a short word (`sink_error`, `writer_behind`, `close_timeout`,
+        `flush_error`), and the next beat goes at once."""
         if self._stopped:
             return
         self._stopped = True
         self.writer_error = cause
+        # Contract 3: a streamed session's heartbeat says so from now on, with a short reason word
+        # (`sink_error` for the sink's own error, unless the call site names another).
+        beat = getattr(self._sink, "heartbeat", None)
+        if beat is not None:
+            try:
+                beat.stop_capture(reason or ("sink_error" if cause is self._error else "stopped"))
+            except Exception:  # noqa: BLE001  a beat that cannot be told is the server's limit, not training's
+                pass
         self._clear_ring_lists()
         self._held = None
         self._probe_owed = False
@@ -3049,11 +3106,12 @@ class Session:
             try:
                 self._queue.put(None, timeout=max(deadline - time.monotonic(), 0.0))
             except queue.Full:
-                self._stop(RuntimeError(f"the writer had not taken what was left within {CLOSE_SECONDS:g} s at close"))
+                self._stop(RuntimeError(f"the writer had not taken what was left within {CLOSE_SECONDS:g} s at close"),
+                           reason="close_timeout")
         wait = STOPPED_CLOSE_SECONDS if self._stopped else max(deadline - time.monotonic(), 0.0)
         self._worker.join(wait)
         if self._worker.is_alive():
-            self._stop(RuntimeError(f"the writer had not finished within {wait:g} s at close"))
+            self._stop(RuntimeError(f"the writer had not finished within {wait:g} s at close"), reason="close_timeout")
             try:
                 _close_stream(self._sink)  # the stream's threads, not the sink the writer is still in
             except Exception:  # noqa: BLE001
@@ -3064,7 +3122,7 @@ class Session:
             try:
                 self._sink.close()
             except Exception as error:  # noqa: BLE001
-                self._stop(error)
+                self._stop(error, reason="sink_error")
         if self._stopped or getattr(self._sink, "path", None) is None:
             return
         try:
@@ -3093,9 +3151,9 @@ class Session:
                     return
                 if self._error is None:
                     if self._system is not None:
-                        # NVML is asked for here, on the writer thread, and read on a thread of its own,
-                        # waited for a bounded time (system.py). A failure is written as a note in the
-                        # record and never stops the writer.
+                        # NVML is asked for here, on the writer thread, and read on a thread of its own;
+                        # the newest finished reading is attached and nothing waits for one (system.py).
+                        # A failure is written as a note in the record and never stops the writer.
                         # Found by its type, not its place, so other parts of the block can come after it.
                         try:
                             item = tuple(self._system.write(x) if isinstance(x, SystemPart) else x for x in item)
@@ -3155,12 +3213,17 @@ class Session:
         )
         update_rows = updates.reshape(n, n_params, 2).tolist() if updates is not None and n_params > 0 else None
         moe: dict[str, list[list[int]]] = {}
+        unassigned: dict[str, list[int | None]] = {}  # None: the ids were not checked on that step
+        left_out: dict[str, list[list[int] | None]] = {}  # None: no routing map was checked on that step
         offset = 0
         for name, spec in self._routers.items():
-            width = _count_width(spec)
+            width, e = _count_width(spec), spec.n_experts
             size = n * width
             if not refused or name not in refused:
-                moe[name] = counts[offset : offset + size].reshape(n, width)[:, : spec.n_experts].tolist()
+                rows = counts[offset : offset + size].reshape(n, width).tolist()
+                moe[name] = [row[:e] for row in rows]
+                unassigned[name] = [row[e] if row[2 * e + 2] else None for row in rows]
+                left_out[name] = [row[e + 2 : 2 * e + 2] if row[2 * e + 3] else None for row in rows]
             offset += size
 
         records = []
@@ -3247,6 +3310,13 @@ class Session:
                 record["moe_stats"] = {
                     name: _router_stats(row_counts) for name, row_counts in step_moe.items()
                 }
+                # Explicit zeros where a check ran, no key where it did not (`_count_width`).
+                step_unassigned = {name: rows[i] for name, rows in unassigned.items() if rows[i] is not None}
+                if step_unassigned:
+                    record["moe_unassigned"] = step_unassigned
+                step_left_out = {name: rows[i] for name, rows in left_out.items() if rows[i] is not None}
+                if step_left_out:
+                    record["moe_left_out"] = step_left_out
             records.append(record)
         if announce and records:
             # Once per router and session: the reason it is not counted, so a reader of the

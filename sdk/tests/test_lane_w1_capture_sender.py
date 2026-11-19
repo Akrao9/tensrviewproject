@@ -651,6 +651,83 @@ def test_contract1_a_refused_batch_is_retried_and_every_row_arrives(tmp_path, ca
         server.shutdown()
 
 
+# --- Mixed versions: this sender against a server built before wave W -----------------------------
+
+
+def _named_server(tmp_path):
+    """The server binary `TENSORQUILL_SERVER_BIN` names (for these tests, the one built from `main` before
+    wave W: `wave-vw/bin/tensorquill-server-main`), started on a free port; skipped when none is named."""
+    import os
+    import subprocess
+
+    binary = os.environ.get("TENSORQUILL_SERVER_BIN")
+    if not binary:
+        pytest.skip("TENSORQUILL_SERVER_BIN names no server binary")
+    pytest.importorskip("pyarrow")
+    env = {k: v for k, v in os.environ.items() if k != "TENSORQUILL_TOKEN"}
+    process = subprocess.Popen([binary, "--listen", "127.0.0.1:0", "--store", str(tmp_path / "store")],
+                               stdout=subprocess.PIPE, text=True, env=env)
+    port = int(process.stdout.readline().rsplit(":", 1)[1])
+    return process, f"grpc://127.0.0.1:{port}"
+
+
+def _stop_server(process) -> None:
+    import signal
+
+    process.send_signal(signal.SIGTERM)
+    process.wait(20)
+    process.stdout.close()
+
+
+def test_mixed_versions_batches_naming_sender_attempt_are_stored_by_an_older_server(tmp_path):
+    """Contract 1's compatibility: a server that does not know `sender_attempt` ignores it and stores
+    every batch. Passes on base too (no key sent there)."""
+    process, endpoint = _named_server(tmp_path)
+    try:
+        model = nn.Linear(4, 4)
+        path = tmp_path / "w1-mixed.rank0.jsonl"
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            session = tensorquill.init(model, run_id="w1-mixed", every=1, sink=tensorquill.JsonlSink(path),
+                                       endpoint=endpoint, heartbeat_seconds=0.2, stack_seconds=None)
+            _train(model, 6)
+            sender = session._sink.sender
+            session.close()
+        assert sender.acked_offset == path.stat().st_size, "the server did not store every batch"
+        assert session.writer_error is None
+    finally:
+        _stop_server(process)
+
+
+def test_mixed_versions_an_older_server_takes_the_capture_stopped_beat_and_nothing_raises(tmp_path):
+    """Contract 3's compatibility: a server whose heartbeat has no `capture_stopped` field accepts the beat
+    (no `deny_unknown_fields`), and training goes on. Fail-before on the "a stopped beat was taken" half."""
+    process, endpoint = _named_server(tmp_path)
+    try:
+        model = nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            session = tensorquill.init(model, run_id="w1-mixed-stop", every=1,
+                                       sink=FailingJsonl(tmp_path / "w1-mixed-stop.rank0.jsonl", good=2),
+                                       endpoint=endpoint, heartbeat_seconds=60.0, stack_seconds=None)
+            beat = session._sink.heartbeat
+            deadline = time.monotonic() + DEADLINE
+            while not session._stopped and time.monotonic() < deadline:
+                opt.zero_grad()
+                model(torch.ones(2, 4)).sum().backward()
+                opt.step()
+                if session._error is None:
+                    time.sleep(0.01)  # the writer's turn
+            assert session._stopped
+            for _ in range(5):
+                _train(model, 1)  # training goes on
+            session.close()
+        assert getattr(beat, "_stop_told", False), "no beat carrying capture_stopped was taken by the server"
+    finally:
+        _stop_server(process)
+
+
 # --- Lane W3's finding: one bool in `scalars` drops the whole map from the Arrow column ------------
 
 
