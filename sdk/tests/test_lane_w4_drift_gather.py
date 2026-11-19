@@ -196,10 +196,9 @@ def test_sdk22_ranks_with_different_numbers_of_replicated_parameters_skip(tmp_pa
 
 
 # --------------------------------------------------------------------------------------------
-# SDK-22 criterion 1 end to end, through `tensorquill.init`. It needs `capture.py`'s call to
-# `_agree_on_gather` at init, which lane W4 adds once lane V1 is merged (the top session's recorded
-# exception to file ownership); until then the ranks still decide alone and rank 0 waits in a gather
-# rank 1 skips. Remove the xfail marker in the commit that adds the line.
+# SDK-22 criterion 1 end to end, through `tensorquill.init`: `Session.__init__` calls
+# `_agree_on_gather` (the one line lane W4 added to `capture.py`, the top session's recorded exception
+# to file ownership). Without it the ranks decide alone and rank 0 waits in a gather rank 1 skips.
 
 _SESSION_BODY = """
 if rank == 1:
@@ -232,11 +231,6 @@ found["warnings"] = [str(w.message) for w in caught if "across replicas" in str(
 
 
 @needs_dist
-@pytest.mark.xfail(
-    strict=True,
-    reason="needs capture.py to call distributed._agree_on_gather at init (Session.__init__, beside "
-    "_ensure_spread_buffers); lane W4 adds the line after lane V1 is merged",
-)
 def test_sdk22_a_session_whose_ranks_decide_differently_skips_on_every_rank(tmp_path):
     found = _ranks(tmp_path, 2, _SESSION_BODY, {})
     for f in found:
