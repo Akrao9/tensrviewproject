@@ -713,3 +713,20 @@ def test_toy_weights_frozen_before_the_second_check_are_named_at_the_first_check
     assert (found["before"] or {}).get("step") == before
     if before is not None:
         assert found["before"]["a"] == found["before"]["b"]
+
+
+def test_a_note_written_once_is_not_a_series_and_is_not_listed_as_left_out():
+    """`moe_refused` and `update_not_read` say once why a series is not in the records (a refused
+    router, an optimizer whose update size is not read). They are not data, so part 4 lists
+    them neither as compared nor as not compared; the evidence's `not_checked` names them."""
+    def notes(step):
+        return {"moe_refused": {"blocks.0.router": "8 counts on 4 tokens"}, "update_not_read": {"0": "why"}} if step == 0 else {}
+
+    a, b = make(extra=notes), make(run_id="b")
+    result = first_divergence(a, b)
+    assert result["answer"] == "no_divergence"
+    assert result["left_out"] == {"wall_clock": ["ts"], "not_compared": []}
+    assert not any(name.startswith(("moe_refused", "update_not_read")) for name in result["series"])
+    # Data that is not compared is still listed.
+    with_lr = first_divergence(make(extra=lambda s: {**notes(s), "lr": [0.001]}), b)
+    assert with_lr["left_out"]["not_compared"] == ["lr"]

@@ -1088,7 +1088,9 @@ def test_a_file_named_for_its_rank_or_of_one_rank_is_counted_as_before(tmp_path)
     zero, one = dense(6, run="ends-alike"), dense(5, run="ends-alike", rank=1)
     write_capture(folder / "ends-alike.jsonl", zero[:5] + one + zero[5:])
     rows = {row["run_id"]: row for row in tensorquill.list_runs(folder)}
-    assert (rows["named"]["rank_count"], rows["hf-run"]["rank_count"]) == (1, 1)
+    # The `.rank0.jsonl` file is trusted to hold rank 0 alone; with world size 2 and no file for
+    # rank 1, rank 1 is counted and unknown (lane T5: it was counted as 1 before).
+    assert (rows["named"]["ranks"], rows["named"]["rank_count"], rows["hf-run"]["rank_count"]) == ([0, 1], 2, 1)
     assert "rank_count_not_known" not in rows["named"] and "rank_count_not_known" not in rows["hf-run"]
     # A file of its own name whose first and last records are one rank, with nothing to say
     # whether others are in between: not printed as 1.
@@ -1278,3 +1280,184 @@ def test_where_runs_of_several_ranks_part_reads_a_live_resumed_file_as_its_whole
     assert part["unfinished_lines_left_out"] == {"B": [1]}
     assert part["detail"] == whole["detail"] + (" A line that is not whole was left out of B's records (rank 1): the run may "
                                                 "still be going.")
+
+
+# --- What a rank's file name, the manifest's world size and a shared file's ends say ----------
+# (lane T5, Nov 18, 2026: the open items of "Two gaps left by ... closed")
+
+
+def cheap(monkeypatch) -> None:
+    """The listing runs no detector and reads no file whole."""
+    monkeypatch.setattr(ev, "build_evidence", lambda *a, **k: pytest.fail("the listing ran a detector"))
+    monkeypatch.setattr(ev, "load_records", lambda *a, **k: pytest.fail("the listing read every record"))
+    monkeypatch.setattr(cmp, "_read_local", lambda *a, **k: pytest.fail("the listing read every record"))
+
+
+def judged(path: Path, rank: int | None = None) -> None:
+    """The evidence file beside `path`, as `python -m tensorquill <path> [--rank N]` writes it."""
+    ev.write_evidence(ev.build_evidence(path, rank=rank), path.with_suffix(".evidence.json"))
+
+
+def test_a_file_named_for_a_rank_whose_first_or_last_record_names_another_is_not_trusted_to_hold_it_alone(
+        tmp_path, monkeypatch):
+    folder = tmp_path / "out"
+    # Named for rank 0, holding ranks 0 and 1 (a copy, a merged file).
+    both = shared_file(folder, "x.rank0.jsonl", (0, 1), run="x")
+    # Named for rank 0, holding rank 1 only.
+    other = write_capture(folder / "y.rank0.jsonl", dense(60, run="y", rank=1))
+    with monkeypatch.context() as patched:
+        cheap(patched)
+        rows = {row["run_id"]: row for row in tensorquill.list_runs(folder)}
+    for run, file in (("x", both), ("y", other)):
+        row = rows[run]
+        assert (row["ranks"], row["rank_count"]) == ([0, 1], None), run
+        assert f"{file.name} is named for rank 0 and its first and last records name rank" in row["rank_count_not_known"]
+        # Its evidence file would be one rank's without saying which, as for a file of its own name.
+        assert (row["evidence"]["state"], row["evidence"]["rank"]) == ("missing", None)
+    # The manifest's world size settles the count, as for a file of its own name.
+    manifest_file(folder, "x", world_size=2)
+    judged(both, rank=1)
+    row = {r["run_id"]: r for r in tensorquill.list_runs(folder)}["x"]
+    assert (row["ranks"], row["rank_count"], row["run_state"], row["kinds_checked"]) == ([0, 1], 2, "unknown", None)
+    assert (row["evidence"]["state"], row["evidence"]["rank"]) == ("ranks_unknown", None)
+    # `compare` reads every record, and says what the file named for rank 0 holds.
+    reference = local_run(tmp_path / "other", "one")
+    assert tensorquill.compare_runs(both, reference)["runs"][0]["rank_count"] == 2
+    read = tensorquill.compare_runs(other, reference)["runs"][0]["read_from"]
+    assert (read["ranks"], read["judged_ranks"], read["unknown_ranks"]) == ([0, 1], [1], [0])
+    assert read["unknown_why"] == {0: "its file y.rank0.jsonl holds no record of rank 0: its whole records are rank 1's"}
+
+    # In a run of several files: rank 1's file holds rank 2's records.
+    folder = tmp_path / "several"
+    local_run(folder, "z", project="p", name="z")
+    write_capture(folder / "z.rank1.jsonl", dense(60, run="z", rank=2))
+    (row,) = tensorquill.list_runs(folder)
+    assert (row["ranks"], row["rank_count"]) == ([0, 1, 2], None)
+    assert "z.rank1.jsonl is named for rank 1 and its first and last records name rank 2" in row["rank_count_not_known"]
+    # A file whose first and last records name its own rank is trusted, as before.
+    folder = tmp_path / "trusted"
+    for rank in (0, 1):
+        local_run(folder, "t", dense(60, run="t", rank=rank), rank=rank, project="p", name="t", world_size=2)
+    (row,) = tensorquill.list_runs(folder)
+    assert (row["ranks"], row["rank_count"]) == ([0, 1], 2) and "rank_count_not_known" not in row
+
+
+def test_a_local_run_with_fewer_rank_files_than_its_world_size_has_the_missing_ranks_unknown(tmp_path, monkeypatch):
+    folder = tmp_path / "out"
+    # The manifest says world size 2, and only rank 0 has a file.
+    path = local_run(folder, "a", project="p", name="a", world_size=2, evidence=True)
+    with monkeypatch.context() as patched:
+        cheap(patched)
+        (row,) = tensorquill.list_runs(folder)
+    # Counted as the store counts a rank its status expects and that stored nothing: unknown, never clean.
+    assert (row["ranks"], row["rank_count"], row["run_state"]) == ([0, 1], 2, "unknown")
+    assert (row["evidence"]["state"], row["evidence"]["judged_ranks"], row["evidence"]["unknown_ranks"]) == ("ranks_unknown", 1, 1)
+    assert "rank 1 has no file: the run manifest says world size 2" in row["evidence"]["detail"]
+    assert row["end"]["state"] == "not_closed" and 1 in row["end"]["not_closed_ranks"]
+    assert " 2 " in runs_module.listing_text([row], folder).splitlines()[2]
+    # An incident on the rank that has a file still makes the run unhealthy.
+    spiky = tmp_path / "spiky"
+    local_run(spiky, "s", spiked("s"), project="p", name="s", world_size=2, evidence=True)
+    (row,) = tensorquill.list_runs(spiky)
+    assert (row["run_state"], row["incidents"], row["ranks_with_incidents"]) == ("unhealthy", {"anomaly": 1}, [0])
+
+    # `compare` reads the run whole, with rank 1 unknown, and part 4 compares rank 0 only.
+    for rank in (0, 1):
+        local_run(folder, "b", dense(60, run="b", rank=rank), rank=rank, project="p", name="b", world_size=2)
+    result = tensorquill.compare_runs("a", "b", source=folder)
+    read = result["runs"][0]["read_from"]
+    assert (read["all_ranks"], read["ranks"], read["judged_ranks"], read["unknown_ranks"]) == (True, [0, 1], [0], [1])
+    assert read["unknown_why"] == {1: "the run manifest says world size 2, and no file holds a record of this rank"}
+    assert result["runs"][0]["rank_count"] == 2 and result["incidents"]["other_ranks_not_compared"] == {"A": [1]}
+    part = result["divergence"]
+    assert (part["state"], part["ranks_compared"], part["ranks_without_records"]) == ("no_divergence", [0], {1: ["A"]})
+    # `rank=0` reads rank 0 alone, as before.
+    one = tensorquill.compare_runs("a", "b", source=folder, rank=0)["runs"][0]["read_from"]
+    assert (one["rank"], one["ranks"]) == (0, [0])
+    # Without an evidence file for rank 0 either: no rank is judged, and both are counted.
+    path.with_suffix(".evidence.json").unlink()
+    row = {r["run_id"]: r for r in tensorquill.list_runs(folder)}["a"]
+    assert (row["rank_count"], row["evidence"]["state"], row["evidence"]["unknown_ranks"]) == (2, "missing", 2)
+    assert "rank 1 has no file: the run manifest says world size 2" in row["evidence"]["detail"]
+    # A world size of 1, or no manifest, is counted by the files as before.
+    manifest_file(folder, "a", world_size=1)
+    assert {r["run_id"]: r for r in tensorquill.list_runs(folder)}["a"]["rank_count"] == 1
+    assert tensorquill.compare_runs("a", "b", source=folder)["runs"][0]["read_from"]["rank"] == 0
+
+    # A run given as the path of one rank's file: the other rank's file was not looked for, and
+    # the row and `compare` say so rather than that it has none.
+    given = folder / "b.rank0.jsonl"
+    (row,) = tensorquill.list_runs(given)
+    assert (row["ranks"], row["rank_count"]) == ([0, 1], 2)
+    assert "rank 1 was not read: only b.rank0.jsonl was given, and the run manifest says world size 2" in row["evidence"]["detail"]
+    assert "has no file" not in row["evidence"]["detail"]
+    assert row["end"]["not_closed_ranks"] == [0, 1]
+    read = tensorquill.compare_runs(given, "a", source=folder)["runs"][0]["read_from"]
+    assert read["unknown_why"] == {1: "the run manifest says world size 2, and only b.rank0.jsonl was given: this rank was not read"}
+    # By its ID at the folder, both files are read.
+    assert tensorquill.compare_runs("b", "a", source=folder)["runs"][0]["read_from"]["judged_ranks"] == [0, 1]
+
+
+def test_in_a_run_of_several_files_a_file_of_several_ranks_is_not_read_as_one_ranks_evidence(tmp_path, monkeypatch):
+    folder = tmp_path / "out"
+    named = local_run(folder, "w", project="p", name="w", world_size=3, evidence=True)
+    # A file of its own name holding ranks 1 and 2, with a spike on rank 2. Its evidence file is
+    # rank 2's (written with --rank 2) and does not say so.
+    extra = shared_file(folder, "extra.jsonl", (1, 2), run="w", spike_on=2)
+    judged(extra, rank=2)
+    with monkeypatch.context() as patched:
+        cheap(patched)
+        (row,) = tensorquill.list_runs(folder)
+    assert (row["ranks"], row["rank_count"]) == ([0, 1, 2], 3)
+    # Its incidents are listed with no rank, and its ranks are not judged.
+    assert (row["run_state"], row["incidents"], row["first_incident"]) == ("unhealthy", {"anomaly": 1}, {"kind": "grad_spike", "step": 40})
+    assert row["ranks_with_incidents"] == []
+    assert (row["evidence"]["state"], row["evidence"]["judged_ranks"], row["evidence"]["unknown_ranks"]) == ("ranks_unknown", 1, 2)
+    assert "extra.jsonl holds ranks 1, 2, and its evidence file is one rank's, without saying which" in row["evidence"]["detail"]
+    # Its evidence written for rank 1, which has no incident: the run is unknown, never healthy.
+    judged(extra, rank=1)
+    (row,) = tensorquill.list_runs(folder)
+    assert (row["run_state"], row["incidents"], row["evidence"]["state"]) == ("unknown", {}, "ranks_unknown")
+    # The same incident on a judged rank and in the shared file is counted once.
+    folder = tmp_path / "same"
+    local_run(folder, "v", spiked("v"), project="p", name="v", world_size=3, evidence=True)
+    judged(shared_file(folder, "extra.jsonl", (1, 2), run="v", spike_on=2), rank=2)
+    (row,) = tensorquill.list_runs(folder)
+    assert (row["run_state"], row["incidents"], row["ranks_with_incidents"]) == ("unhealthy", {"anomaly": 1}, [0])
+    # `compare` reads every rank of both files and judges each.
+    result = tensorquill.compare_runs("w", local_run(tmp_path / "ref", "r"), source=named.parent)
+    assert result["runs"][0]["read_from"]["judged_ranks"] == [0, 1, 2]
+    assert [(e["kind"], e["ranks"]) for e in result["incidents"]["entries"]] == [("grad_spike", {"A": [2]})]
+
+
+def test_the_last_step_of_a_file_of_several_ranks_is_the_furthest_ranks_as_compare_says(tmp_path, monkeypatch):
+    folder = tmp_path / "out"
+    zero, one = dense(61, run="v"), dense(60, run="v", rank=1)
+    # Rank 0 has written step 60; rank 1, behind it, wrote the last line, at step 59.
+    lines = [record for pair in zip(zero, one) for record in pair]
+    lines = lines[:-1] + [zero[60], one[59]]
+    folder.mkdir(parents=True)
+    lone = write_capture(folder / "v.jsonl", lines)
+    manifest_file(folder, "v", world_size=2)
+    with monkeypatch.context() as patched:
+        cheap(patched)
+        (row,) = tensorquill.list_runs(folder)
+    assert (row["ranks"], row["rank_count"], row["last_step"]) == ([0, 1], 2, 60)
+    assert tensorquill.compare_runs(lone, local_run(tmp_path / "ref", "r"))["runs"][0]["last_step"] == 60
+    # A resumed rank: its last record is where it is, not a step its first attempt reached and rolled back.
+    folder = tmp_path / "resumed"
+    first = [{**r, "attempt": 1} for r in dense(120, run="u")]
+    again = [{**r, "attempt": 2} for r in dense(101, run="u")[50:]]
+    other = [{**r, "attempt": 2} for r in dense(100, run="u", rank=1)[50:]]
+    folder.mkdir()
+    write_capture(folder / "u.jsonl", first + [record for pair in zip(again, other) for record in pair] + [again[-1]])
+    manifest_file(folder, "u", world_size=2)
+    (row,) = tensorquill.list_runs(folder)
+    assert row["last_step"] == 100
+    # In a run of several files, the shared file's ranks count the same way.
+    folder = tmp_path / "several"
+    local_run(folder, "s", dense(50, run="s"), project="p", name="s", world_size=3)
+    lines = [record for pair in zip(dense(61, run="s", rank=1), dense(60, run="s", rank=2)) for record in pair]
+    write_capture(folder / "extra.jsonl", lines[:-1] + [dense(61, run="s", rank=1)[60], dense(60, run="s", rank=2)[59]])
+    (row,) = tensorquill.list_runs(folder)
+    assert row["last_step"] == 60

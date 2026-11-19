@@ -34,7 +34,10 @@ unknown there, and the command line judges it from its parts, as for one rank, w
 be read. When they cannot (no `pyarrow`, a torn part), the rank stays unknown with why
 (`read_from.unknown_why`), for one rank read alone too: the comparison is still made, and
 never counts that rank as clean. Local files are judged here by the Python detectors with the default thresholds,
-each rank on its own, and put together by the same rules (`combine_rank_evidence`). Ranks
+each rank on its own, and put together by the same rules (`combine_rank_evidence`). A local
+run's ranks are the ranks its records hold, its files are named for and its manifest's
+`world_size` counts: one of them that no file holds a record of is unknown, with why, as a
+store's rank its status expects that stored nothing. Ranks
 that are not judged are named (`other_ranks_not_compared`, `read_from.unknown_ranks`), never
 counted as clean. A run of one rank is read as before.
 
@@ -92,6 +95,14 @@ def _rank_of(record: Mapping[str, Any]) -> int:
     return int(record.get("rank", 0))
 
 
+def _world_size(manifest: Mapping[str, Any] | None) -> int:
+    """The run manifest's `world_size`, or 0 when it does not say one that can be counted."""
+    from .evidence import MAX_EXPECTED_RANKS
+
+    world = (manifest or {}).get("world_size")
+    return world if isinstance(world, int) and not isinstance(world, bool) and 0 < world <= MAX_EXPECTED_RANKS else 0
+
+
 def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
     from .evidence import build_evidence
 
@@ -109,7 +120,9 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
         raise _runs.RunLookupError(f"run {run['run_id']} has no whole record in {path} yet: nothing to compare")
     held = sorted({_rank_of(r) for r in records})
     ranks = sorted(set(files) | set(held))
-    if rank is None and len(ranks) > 1:
+    # A rank the manifest's world size counts that no file holds is unknown, as a store's rank its
+    # status expects that stored nothing: the run is read whole, never as the ranks it has.
+    if rank is None and (len(ranks) > 1 or any(n not in ranks for n in range(_world_size(run.get("manifest"))))):
         return _open_local_all_ranks(run, files, path, records, unfinished)
     # The rank asked for; a run with one rank is read on the rank it has, and says which.
     picked = rank if rank in held else held[0] if held and (rank is None or len(ranks) == 1) else None
@@ -141,11 +154,14 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
                           records: list[dict[str, Any]], unfinished: bool) -> dict[str, Any]:
     """Every rank of a run kept as local files: each rank judged here by `build_evidence`, as
     one rank's is, and the ranks put together by the all-ranks view's rules
-    (`combine_rank_evidence`)."""
+    (`combine_rank_evidence`). The ranks are those the records hold, the files' names and the
+    run manifest's `world_size`: a rank named by a file or counted by the world size that no
+    file holds a record of is unknown, with why."""
     from .evidence import build_evidence, combine_rank_evidence
 
     by_rank: dict[int, list[dict[str, Any]]] = {}
     paths: dict[int, str] = {}
+    held_in: dict[str, set[int]] = {}
     unfinished_in: list[str] = [str(first)] if unfinished else []
     for path in [first, *(files[n] for n in sorted(files) if files[n] != first)]:
         found, torn = (records, unfinished) if path == first else _read_local(path)
@@ -153,12 +169,25 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
             unfinished_in.append(str(path))
         for record in found:
             number = _rank_of(record)
+            held_in.setdefault(str(path), set()).add(number)
             if paths.setdefault(number, str(path)) == str(path):  # a rank is read from the first file that holds it
                 by_rank.setdefault(number, []).append(record)
     if not by_rank:
         names = ", ".join(sorted({p.name for p in files.values()}))
         raise _runs.RunLookupError(f"run {run['run_id']} has no whole record in any of its files ({names}) yet: nothing to compare")
-    unknown = {n: f"its file {files[n].name} holds no whole record yet" for n in files if n not in by_rank}
+    unknown: dict[int, str] = {}
+    for number in sorted(n for n in files if n not in by_rank):
+        holds = sorted(held_in.get(str(files[number])) or ())
+        # A file named for a rank whose records are another rank's says so, not that it is empty.
+        unknown[number] = (f"its file {files[number].name} holds no record of rank {number}: its whole records are "
+                           f"{_rank_text(holds)}'s" if holds else f"its file {files[number].name} holds no whole record yet")
+    world = _world_size(run.get("manifest"))
+    # A run given as the path of one file: its other ranks' files were not looked for.
+    names = ", ".join(sorted({p.name for p in files.values()}))
+    why = (f"the run manifest says world size {world}, and only {names} {'was' if len(files) == 1 else 'were'} given: "
+           "this rank was not read" if run.get("files_given") else
+           f"the run manifest says world size {world}, and no file holds a record of this rank")
+    unknown.update((n, why) for n in range(world) if n not in by_rank and n not in unknown)
     per_rank = {}
     for number, own in sorted(by_rank.items()):
         steps = [r["step"] for r in own if _is_step(r.get("step"))]
