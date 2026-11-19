@@ -189,3 +189,77 @@ def test_trained_before_wording_claims_no_more_than_the_list_shows(engine: str) 
     assert "has changed since the first weight check" not in summary
     assert "step 5: p (changed or not compared at an earlier check)" in summary
     assert "after changing at earlier checks" not in summary
+
+
+# --- one rule for step order within an attempt (E5, DET-10, RUST-05) -----------------------
+#
+# The effective run is judged in ascending step order (rows of one step keep their arrival
+# order); an attempt's resume boundary is its lowest step, not its first row.
+
+
+def row(step: int, attempt: int = 1, **fields: Any) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "schema_version": 1, "run_id": "lane-w3-order", "rank": 0, "attempt": attempt, "step": step,
+        "layers": {}, "grad_norm": 1.0, "grad_norms": {"w": 1.0}, "lr": [0.1],
+    }
+    record.update(fields)
+    return record
+
+
+def kinds(evidence: dict[str, Any]) -> list[tuple[str, int]]:
+    return sorted((i["kind"], i["step"]) for i in evidence["incidents"])
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_e5_the_first_fault_is_the_lowest_step_not_the_first_row(engine: str) -> None:
+    def fine(step: int) -> dict[str, Any]:
+        return row(step, scalars={"loss": float(step)})
+
+    def bad(step: int) -> dict[str, Any]:
+        return row(step, grad_norm=math.nan, grad_norms={"w": math.nan}, scalars={"loss": float(step)})
+
+    records = [fine(3), fine(4), bad(9), fine(0), fine(1), bad(2)]
+    evidence = _evidence(records, engine)
+    found = [i for i in evidence["incidents"] if i["kind"] == "non_finite"]
+    assert [i["step"] for i in found] == [2]
+    # The baseline is the steps before it in step order (0 and 1), not the rows before it in the file.
+    assert found[0]["scalars"]["loss"]["median_before"] == 0.5
+
+
+def _moe_run() -> list[dict[str, Any]]:
+    """Lane T6's DET-10 records: a gradient spike at 150, and routing that collapses at 100."""
+    out = []
+    for step in range(200):
+        grad = 400.0 if step == 150 else 1.0 + 0.01 * (step % 7)
+        counts = [30, 30, 30, 30] if step < 100 else [118, 1, 1, 0]
+        out.append({
+            "schema_version": 1, "run_id": "lane-w3-det10", "rank": 0, "attempt": 1, "step": step, "ts": float(step),
+            "grad_norm": grad, "grad_norms": {"w": grad}, "moe": {"router": counts}, "moe_top_k": {"router": 1},
+        })
+    return out
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_det10_rows_out_of_order_within_an_attempt_give_the_in_order_incidents(engine: str) -> None:
+    import random
+
+    ordered = _moe_run()
+    shuffled = ordered[:]
+    random.Random(0).shuffle(shuffled)
+    expected = kinds(tensorquill.build_evidence(ordered, detectors="python"))
+    assert expected, "the in-order run must have incidents for this to test anything"
+    assert kinds(_evidence(shuffled, engine)) == expected
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_rust05_a_resume_is_compared_at_the_attempts_lowest_step(engine: str) -> None:
+    earlier = [row(step, 1) for step in range(21)]
+    resumed = [row(step, 2, lr=[0.5] if step == 12 else [0.1]) for step in (15, 16, 17, 12, 13, 14)]
+    assert ("resume_lr_change", 12) in kinds(_evidence(earlier + resumed, engine))
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_rust05_a_numbering_restart_is_seen_whatever_row_comes_first(engine: str) -> None:
+    earlier = [row(step, 1) for step in range(10)]
+    restarted = [row(step, 2) for step in (5, 6, 0, 1, 2)]
+    assert ("repeated_steps", 0) in kinds(_evidence(earlier + restarted, engine))
