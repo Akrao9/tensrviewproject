@@ -2232,8 +2232,9 @@ State as of Nov 16, 2026.
     - Run ID: the Hugging Face and Lightning rows of `sdk/README.md`, three places in `RUN_ON_YOUR_JOB.md` (with Lightning's XLA strategy, which starts no `torch.distributed` group and so loses the sharing), and this plan's run ID line under Setup.
     - NVML: the README's system readings and their limit (training can still wait once, up to the bound, if the writer's queue fills meanwhile; checked with a stand-in `pynvml`), the writer queue paragraph, `init`'s `system=` docstring, `_drain`'s comment and the Open item of the system readings entry above. `_put`'s backpressure warning names the NVML wait as a cause when system readings are on; with them off its text is unchanged.
     - Duplicate batches: the rule in the README's "What was checked", its line under the build table and `AGENT_INSTRUCTIONS.md`, which now tells the agent that `checked` means every judged rank was compared and that an unlisted rank reads `not_configured`. The note for a status from an older server is unchanged in the code and kept in the docs.
+    - Drift check (T2, which listed no stale docs, checked the same way): the README's gather size, now 32 bytes per parameter per rank (24 without the projection), and what happens to a parameter some replica cannot read.
     - Rank files: the README's `runs` paragraph (only a file's first and last records are read; ranks the world size counts with no file are unknown; a shared file's evidence goes to no rank and its last step is its furthest rank's) and one clause on `compare`.
-    - The titles of the T1 to T7 entries above, and of R5's and R6's, which still said "not merged".
+    - The titles of the T1 to T5 and T7 entries above, and of R5's and R6's, which still said "not merged".
     - These describe choices still open for the author as what `main` does: T1's 300 s wait, T4's `not_configured` for an unlisted rank, and T5's `unknown` for ranks with no file.
 
 ## Sources
