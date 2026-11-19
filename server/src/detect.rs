@@ -71,6 +71,8 @@ pub use data::{detect_run, duplicate_batches, ranks_compared, read_batches};
 use data::{DataProgress, DataRow, ResumeFound, ResumePass, ResumeRow};
 mod system;
 use system::{System, SystemColumns};
+#[cfg(test)]
+mod lane_v7_tests;
 
 // The same values as the constants of the same names in evidence.py.
 pub const OVERLOAD_THRESHOLD: f64 = 0.35;

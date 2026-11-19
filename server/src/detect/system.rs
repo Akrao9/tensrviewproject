@@ -409,6 +409,34 @@ mod tests {
     }
 
     #[test]
+    fn l7_growth_at_one_repeated_step_has_no_rate_and_no_steps_to_total() {
+        // Lane V7, Nov 19, 2026. Python: `per_step` is None when the step did not move, and so
+        // is `steps_to_total`; Rust divided by zero and wrote 0.0 steps to the total.
+        let gib = 1i64 << 30;
+        let rising: Vec<String> = (0..6)
+            .map(|k| format!(r#"{{"cuda":{{"allocated":{},"total":{}}}}}"#, gib + k * 100 * (1 << 20), 16 * gib))
+            .collect();
+        let rows = batch(
+            &[None; 6],
+            &[None; 6],
+            &rising.iter().map(|s| Some(s.as_str())).collect::<Vec<_>>(),
+        );
+        let mut system = System::default();
+        let columns = SystemColumns::new(&rows);
+        for row in 0..6 {
+            system.row(1, 7, &columns, row);
+        }
+        let found = system.found[0].as_ref().expect("memory_growth");
+        assert_eq!(found["bytes_per_step"], Value::Null, "{found}");
+        assert_eq!(found["steps_to_total"], Value::Null, "{found}");
+        // Over moving steps the rate and the steps left are numbers.
+        let mut system = System::default();
+        run(&mut system, 1, 0, &rows);
+        let found = system.found[0].as_ref().expect("memory_growth");
+        assert!(found["bytes_per_step"].is_f64() && found["steps_to_total"].is_f64(), "{found}");
+    }
+
+    #[test]
     fn the_found_slots_are_in_ported_order() {
         let mut system = System::default();
         let kinds = [

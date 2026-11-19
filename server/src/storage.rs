@@ -861,6 +861,81 @@ mod tests {
         assert_eq!(storage.read_status("run-1").await.unwrap().unwrap()["run_id"], "run-1");
     }
 
+    /// Writes `batch` at `path` as a Parquet file, with or without the footer's statistics.
+    async fn put_parquet(store: &dyn ObjectStore, path: &Path, batch: &RecordBatch, statistics: bool) {
+        use parquet::file::properties::EnabledStatistics;
+        let properties = WriterProperties::builder()
+            .set_statistics_enabled(if statistics {
+                EnabledStatistics::Chunk
+            } else {
+                EnabledStatistics::None
+            })
+            .build();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(properties)).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        store.put(path, PutPayload::from(Bytes::from(buf))).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rs09_the_watermark_counts_the_parts_replay_reads_and_no_other_file() {
+        // Lane V7, Nov 19, 2026. A named part holds steps 0-1 and a file this server never
+        // names holds 2-3. Replay reads only the part, so the watermark is 1: with 3, ingest
+        // would drop the rows of steps 2 and 3 that replay never sees.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let storage = Storage::new(store.clone(), Path::from("root"));
+        storage
+            .write_part("run-1", 0, 1, &[make_batch(0..2, 4)], 0, 1)
+            .await
+            .unwrap();
+        let foreign = storage.attempt_dir("run-1", 0, 1).join("legacy.parquet");
+        put_parquet(store.as_ref(), &foreign, &make_batch(2..4, 4), true).await;
+        let parts = storage.rank_parts("run-1", 0).await.unwrap();
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(storage.max_step("run-1", 0, 1).await.unwrap(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn rs09_a_part_without_footer_statistics_is_read_by_its_step_column() {
+        // Lane V7, Nov 19, 2026. A part named as this server names them, written without
+        // statistics: the watermark is its highest step, not none.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let storage = Storage::new(store.clone(), Path::from("root"));
+        let path = storage
+            .attempt_dir("run-1", 0, 1)
+            .join("part-00000000-00000009.parquet");
+        put_parquet(store.as_ref(), &path, &make_batch(0..10, 4), false).await;
+        assert_eq!(storage.max_step("run-1", 0, 1).await.unwrap(), Some(9));
+        // A part whose name gives no step range, also without statistics.
+        let path = storage.attempt_dir("run-1", 0, 2).join("part-x.parquet");
+        put_parquet(store.as_ref(), &path, &make_batch(5..8, 4), false).await;
+        assert_eq!(storage.max_step("run-1", 0, 2).await.unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn rust14_negative_steps_round_trip_through_a_parts_name() {
+        // Lane V7, Nov 19, 2026. `part--0000010--0000001.parquet` is steps -10 to -1.
+        for (name, range) in [
+            ("part--0000010--0000001.parquet", (Some(-10), Some(-1))),
+            ("part--0000010-00000005.parquet", (Some(-10), Some(5))),
+            ("part-00000000-00000049.parquet", (Some(0), Some(49))),
+            ("part-00000000.parquet", (None, None)),
+            ("part-x-y.parquet", (None, None)),
+        ] {
+            let path = Path::from(format!("a/{name}"));
+            assert_eq!((name_min_step(&path), name_max_step(&path)), range, "{name}");
+        }
+        let storage = Storage::new(Arc::new(InMemory::new()), Path::from("root"));
+        storage
+            .write_part("run-1", 0, 1, &[make_batch(-10..0, 4)], -10, -1)
+            .await
+            .unwrap();
+        let parts = storage.rank_parts("run-1", 0).await.unwrap();
+        assert_eq!(parts[0].first_step, Some(-10), "{parts:?}");
+        assert_eq!(storage.max_step("run-1", 0, 1).await.unwrap(), Some(-1));
+    }
+
     #[tokio::test]
     async fn a_parts_attempt_is_the_partition_under_its_rank_not_one_in_the_store_root() {
         // RS03 (lane U6, Nov 19, 2026). A store whose root has partition-like folders of its own:
