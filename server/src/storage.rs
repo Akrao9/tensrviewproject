@@ -36,6 +36,188 @@ pub struct StoredPart {
     pub location: Path,
 }
 
+/// The file beside a rank's parts that keeps the order of its attempts (contract 1, decided Nov 19,
+/// 2026): `runs/<run_id>/rank=<rank>/attempts.json`.
+pub const ATTEMPTS_FILE: &str = "attempts.json";
+
+/// How an attempt got its place in a rank's order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacedBy {
+    /// Its own process named it: a heartbeat's `attempt`, or a batch's `sender_attempt`.
+    Claim,
+    /// Only its rows were seen (a backlog sent by a later process, or a process the server never heard).
+    Rows,
+    /// It was in the store before the store kept an order: numeric order among such attempts.
+    Store,
+}
+
+impl PlacedBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlacedBy::Claim => "claim",
+            PlacedBy::Rows => "rows",
+            PlacedBy::Store => "store",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "claim" => Some(PlacedBy::Claim),
+            "rows" => Some(PlacedBy::Rows),
+            "store" => Some(PlacedBy::Store),
+            _ => None,
+        }
+    }
+}
+
+/// One attempt in a rank's order. `first_seen_ms` is for people to read; it never orders anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttemptEntry {
+    pub attempt: i64,
+    pub by: PlacedBy,
+    pub first_seen_ms: i64,
+}
+
+/// The attempts of one rank, oldest first (contract 1). The newest owns the rank's live progress.
+/// An attempt is placed once and never moves: one its own process claims goes after every attempt
+/// known; one seen only in rows goes just before the attempt whose process sent them, or, when the
+/// sender named none, just before the newest if that one was claimed (a backlog the new process
+/// sends from the rank's file), and after it otherwise (a sender from before claims, whose attempts
+/// are known only from their rows, in the order they arrive). Attempt numbers never order anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttemptOrder {
+    pub entries: Vec<AttemptEntry>,
+    /// The order is the one in the store's `attempts.json`. False for a rank whose store has no
+    /// such file yet (stored before contract 1, or nothing stored): written at the first placement.
+    pub on_disk: bool,
+}
+
+impl AttemptOrder {
+    /// The attempts already stored for a rank with no `attempts.json`: numeric order, except
+    /// `owner`, the attempt a restored status names as the rank's own, which goes last (the server
+    /// last saw it live; a replacement with a lower number than its predecessor is one).
+    pub fn legacy(stored: &[i64], owner: Option<i64>) -> Self {
+        let mut attempts: Vec<i64> = stored
+            .iter()
+            .copied()
+            .filter(|attempt| Some(*attempt) != owner)
+            .collect();
+        attempts.sort_unstable();
+        attempts.dedup();
+        attempts.extend(owner);
+        Self {
+            entries: attempts
+                .into_iter()
+                .map(|attempt| AttemptEntry {
+                    attempt,
+                    by: PlacedBy::Store,
+                    first_seen_ms: 0,
+                })
+                .collect(),
+            on_disk: false,
+        }
+    }
+
+    pub fn attempts(&self) -> Vec<i64> {
+        self.entries.iter().map(|entry| entry.attempt).collect()
+    }
+
+    pub fn newest(&self) -> Option<i64> {
+        self.entries.last().map(|entry| entry.attempt)
+    }
+
+    pub fn position(&self, attempt: i64) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.attempt == attempt)
+    }
+
+    pub fn contains(&self, attempt: i64) -> bool {
+        self.position(attempt).is_some()
+    }
+
+    /// Places an attempt its own process named. True when it was not known.
+    pub fn place_claim(&mut self, attempt: i64, now_ms: i64) -> bool {
+        if self.contains(attempt) {
+            return false;
+        }
+        self.entries.push(AttemptEntry {
+            attempt,
+            by: PlacedBy::Claim,
+            first_seen_ms: now_ms,
+        });
+        true
+    }
+
+    /// Places an attempt seen in rows that `sender` sent (the stream's `sender_attempt`, none from
+    /// an older sender). True when it was not known.
+    pub fn place_rows(&mut self, attempt: i64, sender: Option<i64>, now_ms: i64) -> bool {
+        if self.contains(attempt) {
+            return false;
+        }
+        let entry = AttemptEntry {
+            attempt,
+            by: PlacedBy::Rows,
+            first_seen_ms: now_ms,
+        };
+        let at = match sender.and_then(|sender| self.position(sender)) {
+            Some(at) => at,
+            None if self.entries.last().is_some_and(|last| last.by == PlacedBy::Claim) => self.entries.len() - 1,
+            None => self.entries.len(),
+        };
+        self.entries.insert(at, entry);
+        true
+    }
+
+    /// What reports say of the order: `first_seen` when the store's file has kept it from the
+    /// start, `numeric` when the store has no file, `numeric_then_first_seen` when the file began
+    /// with attempts stored before it.
+    pub fn kind(&self) -> &'static str {
+        if !self.on_disk {
+            "numeric"
+        } else if self.entries.iter().any(|entry| entry.by == PlacedBy::Store) {
+            "numeric_then_first_seen"
+        } else {
+            "first_seen"
+        }
+    }
+
+    pub fn to_json(&self, run_id: &str, rank: i32) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "rank": rank,
+            "attempts": self.entries.iter().map(|entry| serde_json::json!({
+                "attempt": entry.attempt,
+                "by": entry.by.as_str(),
+                "first_seen_ms": entry.first_seen_ms,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// The order an `attempts.json` holds; `None` when it is not one (another schema, an attempt
+    /// twice, a field missing).
+    pub fn from_json(document: &serde_json::Value) -> Option<Self> {
+        if document["schema_version"] != 1 {
+            return None;
+        }
+        let mut order = Self {
+            entries: Vec::new(),
+            on_disk: true,
+        };
+        for entry in document["attempts"].as_array()? {
+            let attempt = entry["attempt"].as_i64()?;
+            if order.contains(attempt) {
+                return None;
+            }
+            order.entries.push(AttemptEntry {
+                attempt,
+                by: PlacedBy::parse(entry["by"].as_str()?)?,
+                first_seen_ms: entry["first_seen_ms"].as_i64().unwrap_or(0),
+            });
+        }
+        Some(order)
+    }
+}
+
 /// What the server asks of a cloud store besides its URL.
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
@@ -246,12 +428,100 @@ impl Storage {
         self.root.clone().join("runs").join(run_id).join(format!("rank={rank}"))
     }
 
-    /// Every part stored for a rank, ordered by attempt, then first step, then name: the
-    /// order `load_records` reads them in.
+    /// Every part stored for a rank, ordered by the rank's attempt order (`attempt_order`: its
+    /// `attempts.json`, or numeric for a store without one), then first step, then name. Until
+    /// Nov 19, 2026 by attempt number (RS05).
     pub async fn rank_parts(&self, run_id: &str, rank: i32) -> Result<Vec<StoredPart>, Error> {
+        let order = self.attempt_order(run_id, rank).await?;
+        let mut parts = self.list_parts(run_id, rank).await?;
+        let place = |attempt: i64| order.position(attempt).unwrap_or(usize::MAX);
+        parts.sort_by(|a, b| {
+            (
+                place(a.attempt),
+                a.attempt,
+                a.first_step.unwrap_or(0),
+                a.location.filename(),
+            )
+                .cmp(&(
+                    place(b.attempt),
+                    b.attempt,
+                    b.first_step.unwrap_or(0),
+                    b.location.filename(),
+                ))
+        });
+        Ok(parts)
+    }
+
+    /// The attempts a rank has parts of, in numeric order, each once.
+    pub async fn stored_attempts(&self, run_id: &str, rank: i32) -> Result<Vec<i64>, Error> {
+        let mut attempts: Vec<i64> = self
+            .list_parts(run_id, rank)
+            .await?
+            .into_iter()
+            .map(|part| part.attempt)
+            .collect();
+        attempts.sort_unstable();
+        attempts.dedup();
+        Ok(attempts)
+    }
+
+    fn attempts_path(&self, run_id: &str, rank: i32) -> Path {
+        self.rank_dir(run_id, rank).join(ATTEMPTS_FILE)
+    }
+
+    /// The rank's `attempts.json` (contract 1), `None` when there is none. A file that cannot be
+    /// read as one is logged and taken as none: the rank is then read in numeric order, as a store
+    /// written before the file existed, rather than refused for good.
+    pub async fn read_attempts(&self, run_id: &str, rank: i32) -> Result<Option<AttemptOrder>, Error> {
+        match self.store.get(&self.attempts_path(run_id, rank)).await {
+            Ok(response) => {
+                let bytes = response.bytes().await?;
+                let order = serde_json::from_slice(&bytes)
+                    .ok()
+                    .and_then(|document| AttemptOrder::from_json(&document));
+                if order.is_none() {
+                    eprintln!(
+                        "tensorquill-server: {ATTEMPTS_FILE} of {run_id} rank {rank} cannot be read; its attempts are taken in numeric order"
+                    );
+                }
+                Ok(order)
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Replaces the rank's `attempts.json` with `order`.
+    pub async fn write_attempts(&self, run_id: &str, rank: i32, order: &AttemptOrder) -> Result<(), Error> {
+        let bytes = serde_json::to_vec_pretty(&order.to_json(run_id, rank))?;
+        self.store
+            .put(&self.attempts_path(run_id, rank), PutPayload::from(Bytes::from(bytes)))
+            .await?;
+        Ok(())
+    }
+
+    /// The order of a rank's attempts, oldest first, as every reader of the store takes it: its
+    /// `attempts.json`, with any attempt stored but not in the file placed as rows are (just before
+    /// the newest when that one was claimed). With no file, the stored attempts in numeric order
+    /// (`kind` says `numeric`).
+    pub async fn attempt_order(&self, run_id: &str, rank: i32) -> Result<AttemptOrder, Error> {
+        let stored = self.stored_attempts(run_id, rank).await?;
+        Ok(match self.read_attempts(run_id, rank).await? {
+            Some(mut order) => {
+                for attempt in stored {
+                    order.place_rows(attempt, None, 0);
+                }
+                order
+            }
+            None => AttemptOrder::legacy(&stored, None),
+        })
+    }
+
+    /// Every part of a rank, unordered.
+    async fn list_parts(&self, run_id: &str, rank: i32) -> Result<Vec<StoredPart>, Error> {
         let dir = self.rank_dir(run_id, rank);
         let objects: Vec<_> = self.store.list(Some(&dir)).try_collect().await?;
-        let mut parts: Vec<StoredPart> = objects
+        let parts: Vec<StoredPart> = objects
             .into_iter()
             .filter(|object| is_part(&object.location))
             .map(|object| StoredPart {
@@ -272,13 +542,6 @@ impl Storage {
                 location: object.location,
             })
             .collect();
-        parts.sort_by(|a, b| {
-            (a.attempt, a.first_step.unwrap_or(0), a.location.filename()).cmp(&(
-                b.attempt,
-                b.first_step.unwrap_or(0),
-                b.location.filename(),
-            ))
-        });
         Ok(parts)
     }
 
@@ -995,5 +1258,103 @@ mod tests {
         let parts = storage.rank_parts("prefix", 0).await.unwrap();
         let read: Vec<(i64, Option<i64>)> = parts.iter().map(|part| (part.attempt, part.first_step)).collect();
         assert_eq!(read, [(0, Some(0)), (1, Some(0)), (2, Some(50))], "{parts:?}");
+    }
+
+    // Contract 1 (RS05, decided Nov 19, 2026): the order of a rank's attempts.
+
+    #[test]
+    fn w2_a_claim_is_newest_and_rows_go_before_the_attempt_that_sent_them() {
+        let mut order = AttemptOrder::default();
+        assert!(order.place_claim(900, 1));
+        // B claims after A, with a smaller number: it is the newest.
+        assert!(order.place_claim(2, 2));
+        assert!(!order.place_claim(900, 3), "an attempt is placed once and never moves");
+        assert_eq!(order.attempts(), [900, 2]);
+        assert_eq!(order.newest(), Some(2));
+        // Rows of an attempt never seen, sent by B's process: a backlog, older than B.
+        assert!(order.place_rows(500, Some(2), 4));
+        assert_eq!(order.attempts(), [900, 500, 2]);
+        // Rows with no sender named, while the newest was claimed: just before it.
+        assert!(order.place_rows(700, None, 5));
+        assert_eq!(order.attempts(), [900, 500, 700, 2]);
+        // A sender from before claims: its attempts are known from rows only, in arrival order.
+        let mut rows_only = AttemptOrder::default();
+        for attempt in [5, 3, 9] {
+            rows_only.place_rows(attempt, None, 0);
+        }
+        assert_eq!(rows_only.attempts(), [5, 3, 9]);
+    }
+
+    #[test]
+    fn w2_a_store_without_an_order_is_numeric_with_the_restored_owner_last() {
+        let order = AttemptOrder::legacy(&[1000, 900, 3], Some(900));
+        assert_eq!(order.attempts(), [3, 1000, 900]);
+        assert_eq!(order.kind(), "numeric");
+        let mut extended = order.clone();
+        extended.place_claim(5, 0);
+        extended.on_disk = true;
+        assert_eq!(extended.attempts(), [3, 1000, 900, 5]);
+        assert_eq!(extended.kind(), "numeric_then_first_seen");
+        let mut fresh = AttemptOrder::default();
+        fresh.place_claim(5, 0);
+        fresh.on_disk = true;
+        assert_eq!(fresh.kind(), "first_seen");
+        // The file round-trips; a file that is not one is none.
+        let back = AttemptOrder::from_json(&extended.to_json("r", 0)).unwrap();
+        assert_eq!(back, extended);
+        assert!(AttemptOrder::from_json(&serde_json::json!({"schema_version": 2, "attempts": []})).is_none());
+        assert!(
+            AttemptOrder::from_json(&serde_json::json!({"schema_version": 1, "attempts": [
+            {"attempt": 1, "by": "claim"}, {"attempt": 1, "by": "rows"}]}))
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn w2_parts_are_listed_in_the_ranks_order_of_attempts_not_by_number() {
+        let storage = Storage::new(Arc::new(InMemory::new()), Path::from("s"));
+        storage
+            .write_part("r", 0, 900, &[make_batch(0..101, 8)], 0, 100)
+            .await
+            .unwrap();
+        storage
+            .write_part("r", 0, 2, &[make_batch(30..31, 8)], 30, 30)
+            .await
+            .unwrap();
+        storage
+            .write_part("r", 0, 900, &[make_batch(101..102, 8)], 101, 101)
+            .await
+            .unwrap();
+        let read = |parts: Vec<StoredPart>| {
+            parts
+                .iter()
+                .map(|part| (part.attempt, part.first_step))
+                .collect::<Vec<_>>()
+        };
+        // No order kept: by number, as a store written before contract 1.
+        assert_eq!(storage.attempt_order("r", 0).await.unwrap().kind(), "numeric");
+        assert_eq!(
+            read(storage.rank_parts("r", 0).await.unwrap()),
+            [(2, Some(30)), (900, Some(0)), (900, Some(101))]
+        );
+        let mut order = AttemptOrder::default();
+        order.place_claim(900, 1);
+        order.place_claim(2, 2);
+        storage.write_attempts("r", 0, &order).await.unwrap();
+        assert_eq!(
+            storage.read_attempts("r", 0).await.unwrap().unwrap().attempts(),
+            [900, 2]
+        );
+        assert_eq!(
+            read(storage.rank_parts("r", 0).await.unwrap()),
+            [(900, Some(0)), (900, Some(101)), (2, Some(30))]
+        );
+        assert_eq!(storage.attempt_order("r", 0).await.unwrap().kind(), "first_seen");
+        // An attempt stored but missing from the file is placed as rows are: just before the newest.
+        storage
+            .write_part("r", 0, 7, &[make_batch(0..5, 8)], 0, 4)
+            .await
+            .unwrap();
+        assert_eq!(storage.attempt_order("r", 0).await.unwrap().attempts(), [900, 7, 2]);
     }
 }

@@ -16,7 +16,12 @@ use tokio::net::TcpListener;
 /// for the old number would get wrong: a kind added or removed, a threshold or option added, a
 /// report key renamed or dropped. `PROTOCOL` in `sdk/src/tensorquill/server_detect.py` is the
 /// same number, and a test in `sdk/tests/test_auto_detectors.py` holds the two together.
-const PROTOCOL: u32 = 2;
+///
+/// 3 (Nov 19, 2026, lanes W2 and W3, once for both): attempts are ordered by when each was first
+/// seen, not by number (contract 1: `attempts.json`, the report's `attempt_order`, rows grouped in
+/// order of first appearance), and a capture that stopped has a watchdog state of its own
+/// (contract 3: `capture_stopped`).
+const PROTOCOL: u32 = 3;
 
 /// Self-hosted TensorQuill ingest: Arrow Flight DoPut in, partitioned Parquet out.
 #[derive(Parser)]

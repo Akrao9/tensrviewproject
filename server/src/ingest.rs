@@ -42,7 +42,7 @@ use crate::detect::RankDetectors;
 
 /// A rank's last batch hashes: step -> (data rank, hash).
 type DataWindow = BTreeMap<i64, (Option<i64>, String)>;
-use crate::storage::Storage;
+use crate::storage::{AttemptOrder, Storage};
 use crate::watchdog::{RankReport, Watchdog, WatchdogConfig, DEFAULT_WATCHDOG_INTERVAL};
 
 pub const SCHEMA_VERSION: i64 = 1;
@@ -189,6 +189,19 @@ struct Heartbeat {
     /// than the rank's is the job started again, seen before it stores a step.
     #[serde(default)]
     attempt: Option<i64>,
+    /// Present once the session's capture has stopped (contract 3, senders from Nov 19, 2026 on):
+    /// the reason, a short word. Any other value that is not null is a stop for an unknown reason.
+    #[serde(default)]
+    capture_stopped: Option<serde_json::Value>,
+}
+
+/// The reason a heartbeat's `capture_stopped` gives, none when it says nothing stopped.
+fn capture_reason(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(word) if !word.is_empty() => Some(word.chars().take(40).collect()),
+        _ => Some("unknown".to_string()),
+    }
 }
 
 fn default_phase() -> String {
@@ -212,6 +225,20 @@ struct BatchMetadata {
     /// sender keeps working with this server.
     #[serde(default)]
     run_manifest: Option<serde_json::Value>,
+    /// The attempt of the session whose process sends this stream (contract 1, senders from
+    /// Nov 19, 2026 on): a claim, as a heartbeat's `attempt` is. It attributes the stream to that
+    /// attempt, and an attempt first seen in this stream's rows is placed just before it.
+    #[serde(default)]
+    sender_attempt: Option<i64>,
+}
+
+/// One `DoPut` stream of a rank: the attempt its first batch named, and whether it counts for the
+/// rank's stream state (it does until it turns out to be a stream of an attempt that does not own
+/// the rank).
+struct OpenStream {
+    id: u64,
+    attempt: Option<i64>,
+    counted: bool,
 }
 
 /// The largest manifest stored, as JSON text. A sender's `config` is a flat dictionary of
@@ -271,6 +298,13 @@ fn reported(report: &RankReport) -> (i64, i64) {
     (report.attempt, report.last_step.unwrap_or(i64::MIN))
 }
 
+/// A report that stops at `at` is behind the newest part of the owner attempt, `newest`: it is of
+/// another attempt, or stops before that part's last step. (Until Nov 19, 2026 the two were
+/// compared as numbers, attempt first, so a replacement with a lower number read behind for good.)
+fn behind(at: (i64, i64), newest: (i64, i64)) -> bool {
+    at.0 != newest.0 || at.1 < newest.1
+}
+
 pub struct Ingest {
     storage: Storage,
     config: IngestConfig,
@@ -303,6 +337,12 @@ pub struct Ingest {
     /// Runs whose status has read finished or abandoned, and been written so (or, with the file
     /// off, has read so), since when: let go of after `evict_after` (see `evict_settled`).
     settled: Mutex<HashMap<String, Instant>>,
+    /// One lock per rank around reading and writing its `attempts.json` (contract 1), so a beat
+    /// and a stream that place attempts at once write one after the other.
+    order_locks: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>,
+    /// The streams open per rank, with the attempt each named (RS01's open case).
+    streams: Mutex<HashMap<Key, Vec<OpenStream>>>,
+    next_stream: std::sync::atomic::AtomicU64,
 }
 
 impl Ingest {
@@ -328,6 +368,9 @@ impl Ingest {
             stream_errors: std::sync::atomic::AtomicU64::new(0),
             error_log: Mutex::new(ErrorLog::default()),
             settled: Mutex::new(HashMap::new()),
+            order_locks: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
+            next_stream: std::sync::atomic::AtomicU64::new(0),
             used: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             stopping: tokio::sync::watch::Sender::new(false),
@@ -417,27 +460,42 @@ impl Ingest {
         batch: RecordBatch,
         end_byte_offset: i64,
         world_size: Option<i32>,
+        sender: Option<i64>,
         ack: &AckSender,
     ) -> Result<(), Status> {
+        let pieces = split_by_attempt(batch)?;
+        // Every attempt of the batch has its place in the store's order before any row of it is
+        // taken (contract 1): a batch that cannot have it is refused, and its sender sends it again.
+        let attempts: Vec<i64> = pieces.iter().map(|(attempt, _)| *attempt).collect();
+        self.place(key, sender, &attempts).await?;
         let buffer = self.buffer(key);
         let mut buffer = buffer.lock().await;
         if self.closed.load(Ordering::SeqCst) {
             return Err(Status::unavailable("the server is shutting down"));
         }
-        // The last attempt that kept rows, the newest in the sender's file, and its own highest
-        // step kept: a batch that ends one attempt and starts the next is the next one's progress.
+        // The owner attempt's highest step kept is its progress. Rows of any other attempt are
+        // stored and counted, never progress (RS05; until Nov 19, 2026 the last attempt of the batch
+        // to keep rows was taken as the rank's).
+        let owner = self.watchdog.owner(key);
         let mut progressed: Option<(i64, i64)> = None;
-        for (attempt, batch) in split_by_attempt(batch)? {
-            if let Some(last) = self.accept_attempt(key, attempt, batch, &mut buffer).await? {
-                progressed = Some((attempt, last));
+        let mut superseded = 0;
+        for (attempt, batch) in pieces {
+            if let Some((last, rows)) = self.accept_attempt(key, attempt, batch, &mut buffer).await? {
+                if owner.is_none_or(|owner| owner == attempt) {
+                    progressed = Some((attempt, last));
+                } else {
+                    superseded += rows as u64;
+                }
             }
         }
+        let now = Instant::now();
+        self.watchdog.superseded(key, superseded, now);
         self.watchdog.batch(
             key,
-            progressed.map_or(buffer.attempt, |(attempt, _)| attempt),
+            progressed.map_or(owner.unwrap_or(buffer.attempt), |(attempt, _)| attempt),
             progressed.map(|(_, step)| step),
             world_size,
-            Instant::now(),
+            now,
         );
         // An offset is acknowledged only on the stream that sent it. One held for another stream
         // (one that ended before its rows were stored, or one of the same rank still open) is not
@@ -461,7 +519,7 @@ impl Ingest {
         attempt: i64,
         batch: RecordBatch,
         buffer: &mut RankBuffer,
-    ) -> Result<Option<i64>, Status> {
+    ) -> Result<Option<(i64, usize)>, Status> {
         let watermark = match buffer.watermarks.get(&attempt) {
             Some(watermark) => *watermark,
             None => {
@@ -501,10 +559,11 @@ impl Ingest {
             buffer.attempt = attempt;
             buffer.max_step = last;
             buffer.watermarks.insert(attempt, Some(last));
-            buffer.rows += batch.num_rows();
+            let rows = batch.num_rows();
+            buffer.rows += rows;
             buffer.bytes += bytes;
             buffer.batches.push(batch);
-            return Ok(Some(last));
+            return Ok(Some((last, rows)));
         }
         Ok(None)
     }
@@ -532,14 +591,21 @@ impl Ingest {
             buffer.sealed = false;
             {
                 let part = (buffer.attempt, buffer.max_step);
+                let owner = self.watchdog.owner(key);
                 let report = self.reports.lock().unwrap().get(key).map(reported);
                 let mut stored = self.stored.lock().unwrap();
                 let entry = stored.entry(key.clone()).or_insert(Stored {
                     newest: part,
                     behind_since: None,
                 });
-                entry.newest = entry.newest.max(part);
-                if entry.behind_since.is_none() && report.is_none_or(|report| report < entry.newest) {
+                // The newest part of the owner attempt: a part of another attempt (a backlog, a
+                // late row of an earlier one) does not make the owner's report behind (RS05).
+                if entry.newest.0 == part.0 {
+                    entry.newest.1 = entry.newest.1.max(part.1);
+                } else if owner == Some(part.0) {
+                    entry.newest = part;
+                }
+                if entry.behind_since.is_none() && report.is_none_or(|report| behind(report, entry.newest)) {
                     entry.behind_since = Some(Instant::now());
                 }
             }
@@ -650,7 +716,11 @@ impl Ingest {
                 run.insert(key.1, window.clone());
             }
         }
-        let document = crate::detect::report(&key.0, key.1, detectors, buffer.rebuilds);
+        let mut document = crate::detect::report(&key.0, key.1, detectors, buffer.rebuilds);
+        // How the rank's attempts were ordered (contract 1): from the store's `attempts.json`
+        // since its first attempt, numerically for a store without one, or numerically and then
+        // as first seen for a store that had attempts before its file.
+        document["attempt_order"] = serde_json::json!(self.watchdog.order(key).kind());
         let names = |list: &serde_json::Value, key: &str| -> Vec<String> {
             list.as_array()
                 .into_iter()
@@ -674,7 +744,7 @@ impl Ingest {
                 let at = reported(&report);
                 self.reports.lock().unwrap().insert(key.clone(), report);
                 if let Some(stored) = self.stored.lock().unwrap().get_mut(key) {
-                    if at >= stored.newest {
+                    if !behind(at, stored.newest) {
                         stored.behind_since = None;
                     }
                 }
@@ -804,9 +874,11 @@ impl Ingest {
         &self,
         stream: Streaming<FlightData>,
         key: &mut Option<Key>,
+        stream_id: u64,
         ack: &AckSender,
     ) -> Result<(), Status> {
         let mut decoder = FlightDataDecoder::new(stream.map_err(FlightError::from));
+        let mut named = false;
         while let Some(message) = decoder.next().await {
             let message = message.map_err(|error| match error {
                 FlightError::Tonic(status) => *status,
@@ -816,6 +888,16 @@ impl Ingest {
                 if let Some(descriptor) = &message.inner.flight_descriptor {
                     let parsed = parse_descriptor(descriptor)?;
                     self.watchdog.stream_opened(&parsed, Instant::now());
+                    self.streams
+                        .lock()
+                        .unwrap()
+                        .entry(parsed.clone())
+                        .or_default()
+                        .push(OpenStream {
+                            id: stream_id,
+                            attempt: None,
+                            counted: true,
+                        });
                     *key = Some(parsed);
                 }
             }
@@ -838,8 +920,30 @@ impl Ingest {
                     "app_metadata names another run or rank than the descriptor",
                 ));
             }
-            self.accept(key, batch, metadata.end_byte_offset, metadata.world_size, ack)
-                .await?;
+            if let (false, Some(sender)) = (named, metadata.sender_attempt) {
+                // The first batch names the attempt whose process sends the stream: a claim.
+                self.place(key, Some(sender), &[]).await?;
+                if let Some(open) = self
+                    .streams
+                    .lock()
+                    .unwrap()
+                    .get_mut(key)
+                    .and_then(|streams| streams.iter_mut().find(|open| open.id == stream_id))
+                {
+                    open.attempt = Some(sender);
+                }
+                named = true;
+                self.reconcile_streams(key);
+            }
+            self.accept(
+                key,
+                batch,
+                metadata.end_byte_offset,
+                metadata.world_size,
+                metadata.sender_attempt,
+                ack,
+            )
+            .await?;
             // After the rows, which matter more: a manifest that cannot be stored never
             // refuses a batch.
             if let Some(manifest) = metadata.run_manifest {
@@ -915,9 +1019,125 @@ impl Ingest {
         );
     }
 
-    /// Records how a stream ended: cleanly (the sender closed it) or not (an error or a drop).
-    fn stream_ended(&self, key: &Key, clean: bool) {
-        self.watchdog.stream_ended(key, clean, Instant::now());
+    /// Records how a stream ended: cleanly (the sender closed it) or not (an error or a drop). A
+    /// stream of an attempt that does not own the rank no longer counts, and its end changes
+    /// nothing (contract 1).
+    fn stream_ended(&self, key: &Key, stream_id: u64, clean: bool) {
+        let counted = {
+            let mut streams = self.streams.lock().unwrap();
+            let open = streams.get_mut(key);
+            let counted = open
+                .as_ref()
+                .and_then(|open| open.iter().find(|open| open.id == stream_id))
+                .is_none_or(|open| open.counted);
+            if let Some(open) = open {
+                open.retain(|open| open.id != stream_id);
+                if open.is_empty() {
+                    streams.remove(key);
+                }
+            }
+            counted
+        };
+        if counted {
+            self.watchdog.stream_ended(key, clean, Instant::now());
+        }
+    }
+
+    /// Every open stream of the rank that names an attempt other than its owner stops counting.
+    fn reconcile_streams(&self, key: &Key) {
+        let Some(owner) = self.watchdog.owner(key) else {
+            return;
+        };
+        let now = Instant::now();
+        let mut streams = self.streams.lock().unwrap();
+        for open in streams.get_mut(key).into_iter().flatten() {
+            if open.counted && open.attempt.is_some_and(|attempt| attempt != owner) {
+                open.counted = false;
+                self.watchdog.stream_superseded(key, now);
+            }
+        }
+    }
+
+    /// Reads the rank's order from the store once since this server took it up: its
+    /// `attempts.json`, or, for a store written before contract 1, the attempts it holds in
+    /// numeric order with the attempt the watchdog shows for the rank last.
+    async fn load_order(&self, key: &Key) -> Result<(), Status> {
+        if self.watchdog.order_loaded(key) {
+            return Ok(());
+        }
+        let unreadable = |error: crate::storage::Error| Status::unavailable(format!("cannot read the store: {error}"));
+        let order = match self.storage.read_attempts(&key.0, key.1).await.map_err(unreadable)? {
+            Some(order) => order,
+            None => {
+                let stored = self.storage.stored_attempts(&key.0, key.1).await.map_err(unreadable)?;
+                AttemptOrder::legacy(&stored, self.watchdog.shown_attempt(key))
+            }
+        };
+        self.watchdog.load_order(key, order, Instant::now());
+        Ok(())
+    }
+
+    /// Gives every attempt not known yet its place in the rank's order (contract 1): `claim`, the
+    /// attempt a process names as its own, after every attempt known; `rows`, attempts seen only in
+    /// rows that `claim`'s process sent, just before it. A new place is written to `attempts.json`
+    /// before anything of it is taken: when the write fails, nothing is placed and the caller is
+    /// refused with `UNAVAILABLE`, which its sender retries (decided Nov 19, 2026). The order the
+    /// server acknowledged is then always the one a restarted server reads.
+    async fn place(&self, key: &Key, claim: Option<i64>, rows: &[i64]) -> Result<(), Status> {
+        let lock = self.order_locks.lock().unwrap().entry(key.clone()).or_default().clone();
+        let _held = lock.lock().await;
+        self.load_order(key).await?;
+        let mut order = self.watchdog.order(key);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as i64);
+        let mut changed = claim.is_some_and(|attempt| order.place_claim(attempt, now_ms));
+        for attempt in rows {
+            changed |= order.place_rows(*attempt, claim, now_ms);
+        }
+        if !changed {
+            return Ok(());
+        }
+        if let Err(error) = self.storage.write_attempts(&key.0, key.1, &order).await {
+            return Err(Status::unavailable(format!(
+                "cannot write the attempt order of {} rank {}: {error}",
+                key.0, key.1
+            )));
+        }
+        order.on_disk = true;
+        self.watchdog.set_order(key, order, Instant::now());
+        Ok(())
+    }
+
+    /// A heartbeat: its attempt placed (and the beat refused when that cannot be stored), then
+    /// taken unless its attempt does not own the rank, with its capture stop if it says one.
+    async fn beat(&self, beat: Heartbeat, stack: Option<serde_json::Value>) -> Result<(), Status> {
+        let key = (beat.run_id.clone(), beat.rank);
+        if let Some(attempt) = beat.attempt {
+            self.place(&key, Some(attempt), &[]).await?;
+        }
+        let taken = beat
+            .attempt
+            .is_none_or(|attempt| self.attempt_seen(&beat.run_id, beat.rank, attempt));
+        if beat.attempt.is_some() {
+            self.reconcile_streams(&key);
+        }
+        if !taken {
+            return Ok(());
+        }
+        let phase: String = beat.phase.chars().take(40).collect();
+        if let Some(reason) = capture_reason(beat.capture_stopped.as_ref()) {
+            self.watchdog.capture_stopped(&key, &reason, Instant::now());
+        }
+        self.heartbeat(
+            &beat.run_id,
+            beat.rank,
+            &phase,
+            beat.interval_seconds.unwrap_or(0.0),
+            beat.work,
+            stack,
+        );
+        Ok(())
     }
 
     /// The progress status of every run, as the server sees it now.
@@ -962,15 +1182,38 @@ impl Ingest {
             .await;
         let now = Instant::now();
         let mut restored = 0;
+        let mut taken_up = Vec::new();
         for (run_id, status) in documents {
             match status {
                 Ok(Some(status)) => match self.watchdog.restore(&run_id, &status, now) {
-                    Ok(true) => restored += 1,
+                    Ok(true) => {
+                        restored += 1;
+                        taken_up.extend(self.watchdog.rank_keys(&run_id));
+                    }
                     Ok(false) => {}
                     Err(reason) => eprintln!("tensorquill-server: not resuming the watchdog of {run_id}: {reason}"),
                 },
                 Ok(None) => {}
                 Err(error) => eprintln!("tensorquill-server: cannot read the watchdog status of {run_id}: {error}"),
+            }
+        }
+        // Each rank taken up gets its order of attempts from the store's `attempts.json`, one small
+        // read per rank (contract 1): a claim the store kept after the status was last written owns
+        // the rank from now. A rank with no such file (a store written before it), or whose file
+        // cannot be read now, reads its order at its first heartbeat or batch.
+        let read: Vec<_> = futures::stream::iter(taken_up)
+            .map(|key| async move { (self.storage.read_attempts(&key.0, key.1).await, key) })
+            .buffer_unordered(RESTORE_CONCURRENCY)
+            .collect()
+            .await;
+        for (result, key) in read {
+            match result {
+                Ok(Some(order)) => self.watchdog.load_order(&key, order, now),
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "tensorquill-server: the attempt order of {} rank {} is read later: {error}",
+                    key.0, key.1
+                ),
             }
         }
         Ok(restored)
@@ -1054,6 +1297,7 @@ impl Ingest {
         self.data_windows.lock().unwrap().remove(run_id);
         self.manifests.lock().unwrap().remove(run_id);
         self.written.lock().unwrap().remove(run_id);
+        self.order_locks.lock().unwrap().retain(|key, _| key.0 != run_id);
         drop(buffers);
         true
     }
@@ -1086,7 +1330,7 @@ impl Ingest {
                 .filter(|((run, _), _)| *run == run_id)
                 .map(|(key, report)| {
                     let behind = stored.get(key).is_some_and(|stored| {
-                        reported(report) < stored.newest
+                        behind(reported(report), stored.newest)
                             && stored
                                 .behind_since
                                 .is_none_or(|since| now.saturating_duration_since(since) >= self.config.report_grace)
@@ -1111,7 +1355,7 @@ impl Ingest {
                 "compared": status["ranks_compared"],
                 "run_state": status["run_state"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
-                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object())).collect::<Vec<_>>()
+                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object(), (r["attempt"].clone(), r["attempt_without_steps"].clone(), r["superseded_rows"].clone(), r["capture_stopped"]["reason"].clone()))).collect::<Vec<_>>()
                 }),
             })
             .to_string();
@@ -1313,9 +1557,10 @@ impl FlightService for IngestService {
         let (ack, acks) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut key = None;
-            let result = ingest.run_stream(stream, &mut key, &ack).await;
+            let stream_id = ingest.next_stream.fetch_add(1, Ordering::SeqCst);
+            let result = ingest.run_stream(stream, &mut key, stream_id, &ack).await;
             if let Some(key) = &key {
-                ingest.stream_ended(key, result.is_ok());
+                ingest.stream_ended(key, stream_id, result.is_ok());
                 ingest.detach(key, &ack).await;
             }
             if let Err(status) = result {
@@ -1344,9 +1589,11 @@ impl FlightService for IngestService {
     async fn do_get(&self, _: Request<Ticket>) -> Reply<Self::DoGetStream> {
         unimplemented()
     }
-    /// `heartbeat`: `{"run_id", "rank", "phase", "interval_seconds", "work", "stack", "attempt"}`,
-    /// sent by the training process's own thread every few seconds, whether or not it is
-    /// stepping. `work`, `stack` and `attempt` are optional (an older sender sends no `attempt`).
+    /// `heartbeat`: `{"run_id", "rank", "phase", "interval_seconds", "work", "stack", "attempt",
+    /// "capture_stopped"}`, sent by the training process's own thread every few seconds, whether
+    /// or not it is stepping. All but `run_id` and `rank` are optional (an older sender sends no
+    /// `attempt` and no `capture_stopped`). A beat whose attempt is new and whose place in the
+    /// rank's order cannot be stored is refused with `UNAVAILABLE` (contract 1).
     async fn do_action(&self, request: Request<Action>) -> Reply<Self::DoActionStream> {
         let action = request.into_inner();
         if action.r#type != "heartbeat" {
@@ -1355,28 +1602,15 @@ impl FlightService for IngestService {
                 action.r#type
             )));
         }
-        let beat: Heartbeat = serde_json::from_slice(&action.body)
+        let mut beat: Heartbeat = serde_json::from_slice(&action.body)
             .map_err(|error| Status::invalid_argument(format!("bad heartbeat: {error}")))?;
         if !plain_run_id(&beat.run_id) || beat.rank < 0 {
             return Err(Status::invalid_argument("bad run_id or rank in the heartbeat"));
         }
-        let phase: String = beat.phase.chars().take(40).collect();
         // A stack is what the sender says it is, so it is kept only as a JSON object of a
         // bounded size: it goes into the status file as it came.
-        let stack = kept_stack(beat.stack, action.body.len());
-        let taken = beat
-            .attempt
-            .is_none_or(|attempt| self.ingest.attempt_seen(&beat.run_id, beat.rank, attempt));
-        if taken {
-            self.ingest.heartbeat(
-                &beat.run_id,
-                beat.rank,
-                &phase,
-                beat.interval_seconds.unwrap_or(0.0),
-                beat.work,
-                stack,
-            );
-        }
+        let stack = kept_stack(beat.stack.take(), action.body.len());
+        self.ingest.beat(beat, stack).await?;
         let reply = arrow_flight::Result { body: "{}".into() };
         Ok(Response::new(futures::stream::once(async move { Ok(reply) }).boxed()))
     }
