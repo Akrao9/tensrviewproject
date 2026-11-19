@@ -1550,25 +1550,36 @@ def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     is history that training rolled back, including steps the new attempt has not reached
     yet. Records without `attempt` (written before it existed) count as attempt 0. The
     order of the remaining records is unchanged.
+
+    An attempt is of one run: a later attempt of another run ID never rolls back this one's
+    records (lane U7, Nov 19, 2026). A record with no `run_id` is of no named run (`_run_of`).
     """
-    first_step: dict[tuple[Any, int], int] = {}
+    first_step: dict[tuple[str, Any, int], int] = {}
     for record in records:
-        key = (record.get("rank", 0), record.get("attempt", 0))
+        key = (_run_of(record), record.get("rank", 0), record.get("attempt", 0))
         step = int(record["step"])
         if key not in first_step or step < first_step[key]:
             first_step[key] = step
-    if len({rank for rank, _ in first_step}) == len(first_step):
-        return records  # one attempt per rank: nothing was replaced
-    cutoff: dict[tuple[Any, int], float] = {}
-    for rank in {rank for rank, _ in first_step}:
+    if len({(run, rank) for run, rank, _ in first_step}) == len(first_step):
+        return records  # one attempt per rank of each run: nothing was replaced
+    cutoff: dict[tuple[str, Any, int], float] = {}
+    for run, rank in {(run, rank) for run, rank, _ in first_step}:
         cut = math.inf
-        for attempt in sorted((a for r, a in first_step if r == rank), reverse=True):
-            cutoff[(rank, attempt)] = cut
-            cut = min(cut, first_step[(rank, attempt)])
+        for attempt in sorted((a for n, r, a in first_step if (n, r) == (run, rank)), reverse=True):
+            cutoff[(run, rank, attempt)] = cut
+            cut = min(cut, first_step[(run, rank, attempt)])
     return [
         record for record in records
-        if int(record["step"]) < cutoff[(record.get("rank", 0), record.get("attempt", 0))]
+        if int(record["step"]) < cutoff[(_run_of(record), record.get("rank", 0), record.get("attempt", 0))]
     ]
+
+
+def _run_of(record: Mapping[str, Any]) -> str:
+    """A record's run ID, with "" for a record that names none (written before `run_id` existed,
+    or not a string): as the Rust detectors read it (`server_detect.records_stream`), so rows
+    with no run ID make one stream with each other and none with a named run."""
+    run = record.get("run_id")
+    return run if isinstance(run, str) else ""
 
 
 _PART_NAME = re.compile(r"part-(-?\d+)-(-?\d+)\.parquet$")
@@ -2515,6 +2526,7 @@ def _report_evidence(
     evidence = {
         "schema_version": 1,
         "run_id": report.get("run_id"),
+        "rank": report.get("rank") if isinstance(report.get("rank"), int) else _own_rank(folder),
         "run": _manifest.run_block(report.get("run_id"), _manifest.find_manifest(folder, report.get("run_id"))),
         "overload_threshold": applied.get("overload_threshold", OVERLOAD_THRESHOLD),
         "starve_window": applied.get("starve_window", STARVE_WINDOW),
@@ -4456,6 +4468,16 @@ def build_evidence(
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
         raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
+    # One run, checked before attempts are resolved or any rule runs (lane U7, Nov 19, 2026): two
+    # jobs appending to one file gave evidence for the first run showing the second's incidents.
+    # The Rust detectors refuse the same rows (`detect_rows` in detect.rs).
+    runs = sorted({_run_of(r) for r in every_attempt})
+    if len(runs) > 1:
+        raise ValueError(
+            f"these records come from more than one run ({', '.join(repr(run) if run else 'no run_id' for run in runs)}):"
+            " evidence is of one rank of one run, so read each run's records on their own. A record with no run_id"
+            " (written before it existed) is of no named run, and joins only records that have none either"
+        )
     records = resolve_attempts(every_attempt)
     router_sizes = _router_sizes(records)
     routers = list(router_sizes)
@@ -4614,6 +4636,9 @@ def build_evidence(
     evidence = {
         "schema_version": 1,
         "run_id": run_id,
+        # The rank judged (lane U7, Nov 19, 2026): a reader that holds records of several ranks
+        # beside this file (`mcp_server`) uses its samples only for this rank.
+        "rank": ranks[0] if ranks else rank,
         "run": _manifest.run_block(run_id, _manifest.find_manifest(
             run_manifest if run_manifest is not None else source, run_id)),
         "layer_count": len(routers),

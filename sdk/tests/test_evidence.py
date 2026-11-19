@@ -594,8 +594,10 @@ def test_repeated_steps_after_resume_and_start_step(toy_moe):
         session.close()
 
     sink = tensorquill.MemorySink()
-    run(sink)
-    run(sink)  # resumed without start_step
+    # One run ID, as a resume under torchrun, SLURM or a tracker keeps it: records of two runs in
+    # one sink are refused (lane U7, Nov 19, 2026), as the Rust detectors refuse them.
+    run(sink, run_id="resumed")
+    run(sink, run_id="resumed")  # resumed without start_step
     hit = tensorquill.detect_repeated_steps(sink.records)
     assert hit["steps"] == [0, 1, 2]
     assert "pass start_step=" in tensorquill.incident_summary(tensorquill.build_evidence(sink.records))
