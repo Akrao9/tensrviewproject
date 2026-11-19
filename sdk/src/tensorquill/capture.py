@@ -1189,7 +1189,6 @@ class Session:
         self._step_depth = 0
         self._outer_frame: Any = None
         self._closed = False
-        self._said_closed = False  # `_closed_call`
         self._phase = "train"
         self._ticks = 0
         self._error: BaseException | None = None
@@ -2619,18 +2618,10 @@ class Session:
         """Whether the session is closed, so the public call `what` must do nothing. A closed
         session's writer thread has stopped: a step or flush queued for it would fill the writer's
         bounded queue and then wait for good (`_put`). So every public entry point returns at once
-        on a closed session, with no raise and nothing queued, and the first such call is said
-        once, by a warning that cannot raise (`_warn`)."""
-        if not self._closed:
-            return False
-        if not self._said_closed:
-            self._said_closed = True
-            _warn(
-                f"TensorQuill: session.{what} was called after session.close(). A closed session records "
-                "nothing, so this call and any later one on it do nothing.",
-                stacklevel=3,
-            )
-        return True
+        on a closed session: no raise, nothing queued, and no warning, since a warning on the
+        caller's thread is an exception under `python -W error`. `what` names the call for a
+        reader of this code; nothing is said."""
+        return self._closed
 
     def close(self, *, _exception: BaseException | None = None) -> None:
         """Flush what is left and stop the writer. Forward hooks stay on the model, because

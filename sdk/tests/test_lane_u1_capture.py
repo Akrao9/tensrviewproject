@@ -212,20 +212,20 @@ def test_every_public_call_on_a_closed_session_returns_at_once_and_queues_nothin
     assert not worker.is_alive(), "a call on a closed session blocked"
     assert failed == []
     assert session._queue.qsize() == 0 and sink.records == written
-    ours = [w for w in said if "TensorQuill" in str(w.message)]
-    assert len(ours) == 1 and "after session.close()" in str(ours[0].message)
+    assert [w for w in said if "TensorQuill" in str(w.message)] == []  # nothing said on the caller's thread
 
 
 def test_a_closed_session_does_not_raise_under_warnings_as_errors(caplog):
     model = nn.Linear(4, 4)
     session = tensorquill.init(model, sink=tensorquill.MemorySink(), every=1)  # auto_step: step() raised before
     session.close()
-    with warnings.catch_warnings(), caplog.at_level(logging.WARNING, logger="tensorquill"):
+    with warnings.catch_warnings(), caplog.at_level(logging.DEBUG, logger="tensorquill"):
         warnings.simplefilter("error")
         session.step()
         session.log({"loss": 1.0})
         session.data([1])
-    assert sum("after session.close()" in r.getMessage() for r in caplog.records) == 1
+        session.flush()
+    assert caplog.records == []  # no warning and no log line: it returns and does nothing
 
 
 def test_close_still_writes_the_steps_left_in_the_ring():
