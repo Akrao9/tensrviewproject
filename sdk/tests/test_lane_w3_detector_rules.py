@@ -542,55 +542,102 @@ def test_contract1_a_report_of_the_older_attempt_is_behind_not_past_the_store(tm
     assert look["attempt_order"] == "first_seen"
 
 
-# --- contract 1 across files (the author's amendment, Nov 19, 2026) ---------------------------
+# --- contract 1 across files (final, Nov 19, 2026): the four fixture cases --------------------
 #
-# File 1 holds A then C, file 2 holds B then C. C's first `ts` (30) is before B's (50), so an
-# order by timestamp alone, or by first appearance in path order, puts B last. Each file's own
-# order says C came after A and after B: C is the newest, and A and B are ordered by `ts`.
+# A run and rank in several local files. Each file keeps its own order; the rank's order honours
+# every file at once; `ts`, then attempt number, decide only between attempts no file orders;
+# files that disagree give numeric order, reported. Path order never decides.
 
-def _overlapping_files() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    def at(attempt: int, step: int, ts: float) -> dict[str, Any]:
-        return {**row(step, attempt), "ts": ts}
-
-    first = [at(1, step, float(step)) for step in range(20)] + [at(3, step, 30.0 + step - 15) for step in range(15, 18)]
-    second = [at(2, step, 50.0 + step - 10) for step in range(10, 15)] + [at(3, step, 33.0 + step - 18) for step in range(18, 21)]
-    return first, second
+ACROSS_RUN = "lane-w3-across"
 
 
-EXPECTED_ACROSS = [(1, s) for s in range(10)] + [(2, s) for s in range(10, 15)] + [(3, s) for s in range(15, 21)]
+def _file_rows(attempt: int, steps: range, first_ts: float | None) -> list[dict[str, Any]]:
+    out = []
+    for at, step in enumerate(steps):
+        ts = None if first_ts is None and at == 0 else (first_ts if first_ts is not None else 0.0) + at
+        out.append({"schema_version": 1, "run_id": ACROSS_RUN, "rank": 0, "attempt": attempt, "step": step,
+                    "ts": ts, "layers": {}, "grad_norm": 1.0, "grad_norms": {"w": 1.0}, "lr": [0.1]})
+    return out
 
 
-def test_contract1_across_files_each_files_own_order_comes_first() -> None:
-    from tensorquill.evidence import attempt_order_across, resolve_attempts, resolve_attempts_across
-
-    first, second = _overlapping_files()
-    assert attempt_order_across([first, second]) == {("lane-w3-order", 0): [1, 2, 3]}
-    # The order the files are given in never decides.
-    assert attempt_order_across([second, first]) == {("lane-w3-order", 0): [1, 2, 3]}
-    for files in ([first, second], [second, first]):
-        kept = resolve_attempts_across(files)
-        assert sorted((r["attempt"], r["step"]) for r in kept) == EXPECTED_ACROSS
-    order = attempt_order_across([first, second])
-    kept = resolve_attempts(first + second, order=order)
-    assert sorted((r["attempt"], r["step"]) for r in kept) == EXPECTED_ACROSS
+A, B, C = 900, 500, 2
 
 
-def test_contract1_across_files_compare_keeps_each_files_own_order(tmp_path: Any) -> None:
-    # `compare` reads a rank's several files (`_step_records`, lane V4's file): it must resolve
-    # them with `resolve_attempts_across`, not by concatenating them in path order.
+def _case(name: str) -> dict[str, Any]:
+    """Each case: its files (name -> records), the expected order, effective run and report."""
+    if name == "path-against-ts":
+        files = {"z-first.jsonl": _file_rows(900, range(0, 101), 1000.0), "a-second.jsonl": _file_rows(2, range(30, 41), 2000.0)}
+        kept = [(900, s) for s in range(30)] + [(2, s) for s in range(30, 41)]
+        return {"files": files, "order": [900, 2], "kept": kept, "last": 40, "attempt_order": "first_seen"}
+    if name == "overlapping":
+        files = {
+            "one.jsonl": _file_rows(A, range(0, 60), 1000.0) + _file_rows(C, range(50, 65), 1500.0),
+            "two.jsonl": _file_rows(B, range(20, 70), 2000.0) + _file_rows(C, range(65, 81), 2500.0),
+        }
+        kept = [(A, s) for s in range(20)] + [(B, s) for s in range(20, 50)] + [(C, s) for s in range(50, 81)]
+        return {"files": files, "order": [A, B, C], "kept": kept, "last": 80, "attempt_order": "first_seen"}
+    if name == "disagree":
+        files = {
+            "one.jsonl": _file_rows(900, range(0, 10), 1000.0) + _file_rows(2, range(5, 15), 2000.0),
+            "two.jsonl": _file_rows(2, range(15, 20), 3000.0) + _file_rows(900, range(10, 13), 4000.0),
+        }
+        kept = [(900, s) for s in range(13)]  # numeric [2, 900]: A = 900 newest, from step 0
+        return {"files": files, "order": [2, 900], "kept": kept, "last": 12, "attempt_order": "numeric"}
+    assert name == "null-ts"
+    files = {"z-first.jsonl": _file_rows(900, range(0, 101), None), "a-second.jsonl": _file_rows(2, range(30, 41), 2000.0)}
+    kept = [(900, s) for s in range(101)]  # by number [2, 900]: A owns at 100, B's rows left out
+    return {"files": files, "order": [2, 900], "kept": kept, "last": 100, "attempt_order": "first_seen",
+            "by_number": [{"attempts": [2, 900], "why": "no ts"}]}
+
+
+CASES_ACROSS = ["path-against-ts", "overlapping", "disagree", "null-ts"]
+
+
+@pytest.mark.parametrize("name", CASES_ACROSS)
+def test_contract1_across_files_resolve_attempts(name: str) -> None:
+    from tensorquill.evidence import attempt_order_report, resolve_attempts, resolve_attempts_across
+
+    case = _case(name)
+    names, files = list(case["files"]), list(case["files"].values())
+    for given_names, given in ((names, files), (names[::-1], files[::-1])):  # the order given never decides
+        (report,) = attempt_order_report(given, given_names).values()
+        assert report["order"] == case["order"]
+        assert report["attempt_order"] == case["attempt_order"]
+        assert report.get("by_number") == case.get("by_number")
+        if case["attempt_order"] == "numeric":
+            assert all(str(a) in report["reason"] for a in (900, 2)) and all(n in report["reason"] for n in names)
+        kept = resolve_attempts_across(given)
+        assert sorted((r["attempt"], r["step"]) for r in kept) == sorted(case["kept"])
+    kept = resolve_attempts([r for f in files for r in f], order={(ACROSS_RUN, 0): case["order"]})
+    assert sorted((r["attempt"], r["step"]) for r in kept) == sorted(case["kept"])
+
+
+def _write_case(folder: Any, case: dict[str, Any]) -> None:
     import json
 
-    from tensorquill.compare import _step_records
+    folder.mkdir(parents=True)
+    for file_name, records in case["files"].items():
+        (folder / file_name).write_text("".join(json.dumps(r) + "\n" for r in records))
 
-    first, second = _overlapping_files()
-    paths = []
-    for name, records in (("a.jsonl", first), ("b.jsonl", second)):
-        path = tmp_path / name
-        path.write_text("".join(json.dumps(r) + "\n" for r in records))
-        paths.append(str(path))
-    for given in (paths, paths[::-1]):
-        kept, _ = _step_records(given, 0)
-        assert sorted((r["attempt"], r["step"]) for r in kept) == EXPECTED_ACROSS
+
+@pytest.mark.parametrize("name", CASES_ACROSS)
+def test_contract1_across_files_compare(name: str, tmp_path: Any) -> None:
+    # `compare` reads every file of a rank (lane V4's compare.py): it must resolve them with
+    # `resolve_attempts_across`, not by concatenating them in path order.
+    from tensorquill import compare
+
+    case = _case(name)
+    _write_case(tmp_path / "runs", case)
+    assert compare.open_run(ACROSS_RUN, tmp_path / "runs")["last_step"] == case["last"]
+
+
+@pytest.mark.parametrize("name", CASES_ACROSS)
+def test_contract1_across_files_runs(name: str, tmp_path: Any) -> None:
+    # `runs` lists a rank's several files from their first and last records (lane V4's runs.py).
+    case = _case(name)
+    _write_case(tmp_path / "runs", case)
+    (row,) = [r for r in tensorquill.list_runs(tmp_path / "runs") if r["run_id"] == ACROSS_RUN]
+    assert row["last_step"] == case["last"]
 
 
 def test_contract1_late_rows_of_a_superseded_attempt_are_counted_in_a_local_file() -> None:

@@ -1683,57 +1683,100 @@ def superseded_rows(records: Iterable[Mapping[str, Any]]) -> int:
     return late
 
 
-def attempt_order_across(files: Iterable[Iterable[Mapping[str, Any]]]) -> dict[tuple[str, Any], list[Any]]:
-    """Each rank's attempts oldest first, for a rank whose records are in several files (contract 1
-    as amended by the author, Nov 19, 2026). Within a file the order is first appearance, the
-    file being appended across attempts; that order is kept first. Only between attempts no
-    single file orders does the attempt's earliest `ts` decide, then its number. The order the
-    files are given in (a path order) never decides. Files that disagree (one has A before B,
-    another B before A) are a contradiction no rule settles: the same tie rule picks then."""
-    import functools
+def attempt_order_report(
+    files: Iterable[Iterable[Mapping[str, Any]]], names: Iterable[str] | None = None
+) -> dict[tuple[str, Any], dict[str, Any]]:
+    """How the attempts of each rank are ordered when its records are in several local files
+    (contract 1, "One run and rank in more than one local file", as the author amended it,
+    Nov 19, 2026), by `(run_id, rank)`: `order` (oldest first), `attempt_order` and, when it
+    applies, `reason` and `by_number`.
 
-    seen: dict[tuple[str, Any], dict[Any, float | None]] = {}
-    after: dict[tuple[str, Any], dict[Any, set[Any]]] = {}
-    for records in files:
+    1. In each file an attempt's place is its first appearance there, and any two attempts in
+       one file keep that file's order.
+    2. An attempt is placed once every attempt any file puts before it is placed.
+    3. Among attempts ready at once, the earliest first-record `ts` goes first (an attempt held
+       by several files counts its earliest finite first `ts`); the lower attempt number decides
+       when a candidate has no finite `ts`, or two share the earliest. Those pairs are named in
+       `by_number`, each with why (`"no ts"` or `"same ts"`).
+    4. Files that disagree (one puts A before B, another B before A, directly or through other
+       attempts) give numeric order, `attempt_order: "numeric"`, and a `reason` naming the
+       attempts and the files (`names`, else "file 1", "file 2", ...).
+    5. Otherwise `attempt_order: "first_seen"`. The order the files are given in never decides.
+    """
+    listed = [list(records) for records in files]
+    labels = list(names) if names is not None else [f"file {n}" for n in range(1, len(listed) + 1)]
+    firsts: dict[tuple[str, Any], dict[Any, float | None]] = {}
+    edges: dict[tuple[str, Any], dict[Any, dict[Any, set[str]]]] = {}  # earlier -> later -> files
+    for label, records in zip(labels, listed):
         places: dict[tuple[str, Any], list[Any]] = {}
         for record in records:
             key, attempt = (_run_of(record), record.get("rank", 0)), record.get("attempt", 0)
-            ts = _finite(record.get("ts"))
-            stamps = seen.setdefault(key, {})
+            here = places.setdefault(key, [])
+            if attempt in here:
+                continue
+            here.append(attempt)  # its first record in this file
+            ts, stamps = _finite(record.get("ts")), firsts.setdefault(key, {})
             if attempt not in stamps:
                 stamps[attempt] = ts
             elif ts is not None and (stamps[attempt] is None or ts < stamps[attempt]):  # type: ignore[operator]
-                stamps[attempt] = ts
-            listed = places.setdefault(key, [])
-            if attempt not in listed:
-                listed.append(attempt)
-        for key, listed in places.items():
-            edges = after.setdefault(key, {})
-            for earlier, later in zip(listed, listed[1:]):
-                edges.setdefault(earlier, set()).add(later)
+                stamps[attempt] = ts  # the earliest finite first `ts` among the files
+        for key, here in places.items():
+            later_of = edges.setdefault(key, {})
+            for at, earlier in enumerate(here):
+                for later in here[at + 1:]:
+                    later_of.setdefault(earlier, {}).setdefault(later, set()).add(label)
 
-    orders: dict[tuple[str, Any], list[Any]] = {}
-    for key, stamps in seen.items():
-        def before(a: Any, b: Any) -> int:
-            ta, tb = stamps[a], stamps[b]
-            if ta is not None and tb is not None and ta != tb:
-                return -1 if ta < tb else 1
-            na, nb = _whole_attempt(a) or 0, _whole_attempt(b) or 0
-            return (na > nb) - (na < nb)
+    def number(attempt: Any) -> int:
+        return _whole_attempt(attempt) or 0
 
-        edges = after.get(key, {})
-        waiting = {a: sum(a in later for later in edges.values()) for a in stamps}
+    out: dict[tuple[str, Any], dict[str, Any]] = {}
+    for key, stamps in firsts.items():
+        later_of = edges.get(key, {})
+        clash = sorted(
+            ((a, b) for a, laters in later_of.items() for b in laters if a in later_of.get(b, {})), key=str
+        )
+        waiting = {a: sum(a in laters for laters in later_of.values()) for a in stamps}
         order: list[Any] = []
-        while waiting:
-            ready = [a for a, n in waiting.items() if n == 0] or list(waiting)  # a contradiction: pick anyway
-            pick = min(ready, key=functools.cmp_to_key(before))
+        by_number: list[dict[str, Any]] = []
+        while waiting and not clash:
+            ready = [a for a, n in waiting.items() if n == 0]
+            if not ready:  # a disagreement through other attempts
+                clash = sorted(((a, b) for a in waiting for b in later_of.get(a, {}) if b in waiting), key=str)
+                break
+            if len(ready) == 1:
+                pick = ready[0]
+            elif any(stamps[a] is None for a in ready):
+                pick = min(ready, key=number)
+                by_number += [{"attempts": [pick, other], "why": "no ts"} for other in ready if other != pick]
+            else:
+                earliest = min(stamps[a] for a in ready)  # type: ignore[type-var]
+                tied = [a for a in ready if stamps[a] == earliest]
+                pick = min(tied, key=number)
+                by_number += [{"attempts": [pick, other], "why": "same ts"} for other in tied if other != pick]
             order.append(pick)
             del waiting[pick]
-            for later in edges.get(pick, ()):
+            for later in later_of.get(pick, {}):
                 if later in waiting:
                     waiting[later] -= 1
-        orders[key] = order
-    return orders
+        if clash:
+            attempts = sorted({a for pair in clash for a in pair}, key=number)
+            named = sorted({f for a, b in clash for f in later_of[a][b]} | {f for a, b in clash for f in later_of.get(b, {}).get(a, ())})
+            out[key] = {
+                "order": sorted(stamps, key=number), "attempt_order": "numeric",
+                "reason": f"the files disagree on the order of attempts {', '.join(map(str, attempts))}"
+                          f" ({', '.join(named)}): ordered by number",
+            }
+        else:
+            out[key] = {"order": order, "attempt_order": "first_seen", **({"by_number": by_number} if by_number else {})}
+    return out
+
+
+def attempt_order_across(
+    files: Iterable[Iterable[Mapping[str, Any]]], names: Iterable[str] | None = None
+) -> dict[tuple[str, Any], list[Any]]:
+    """Each rank's attempts oldest first when its records are in several local files: the
+    `order` of `attempt_order_report`."""
+    return {key: info["order"] for key, info in attempt_order_report(files, names).items()}
 
 
 def resolve_attempts_across(files: Iterable[Iterable[Mapping[str, Any]]]) -> list[dict[str, Any]]:
