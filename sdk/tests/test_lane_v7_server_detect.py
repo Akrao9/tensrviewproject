@@ -131,6 +131,7 @@ def test_rs16_the_largest_step_is_judged():
 
 def test_c16_the_rust_reader_compares_only_hashes_of_one_kind():
     fixture = json.loads(FIXTURE.read_text())
+    assert len(fixture["cases"]) == 11
     for case in fixture["cases"]:
         name, kind = case["name"], case["detector"]
         if kind == "duplicate_batches":
@@ -138,6 +139,8 @@ def test_c16_the_rust_reader_compares_only_hashes_of_one_kind():
             # (`detect --run`, what the all-ranks view and the server's status use) is asked.
             document = server_run_report(case["records"], binary=str(BINARY))
             incidents, not_checked = document["incidents"], []
+            # `compared`: both ranks are listed as compared, or neither is.
+            assert document["ranks_compared"] == ([0, 1] if case["compared"] else []), name
         else:
             evidence = tensorquill.build_evidence(case["records"], detectors="rust", server_binary=str(BINARY))
             incidents, not_checked = evidence["incidents"], evidence.get("not_checked", [])  # left out when empty

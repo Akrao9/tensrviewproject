@@ -7,7 +7,7 @@
 //! the ranks of a run: for the run's status in the server, and in [`detect_run`] for
 //! `tensorquill-server detect --run`, which reads every rank's rows without a server.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::array::{Int32Array, StringArray};
@@ -42,11 +42,14 @@ fn number(value: &Value) -> Option<f64> {
 
 /// A batch hash's kind: the text before its first `:` (`v2` for `v2:cd09ce7a08834a9e`), and
 /// `""` for a hash with none, which the writer before C16 made (lane V2, Nov 19, 2026). Two
-/// hashes are compared only when their kinds are equal. `data_stalled`,
-/// `epoch_order_repeated` and `duplicate_batches` need nothing more: they look for equal
-/// hashes, and two of different kinds are never equal, so a pair across the change ends a
-/// stretch, breaks an order or makes no duplicate. A resume compares hashes for a difference
-/// too, so [`ResumePass::compare_data`] keeps to the resumed hash's kind.
+/// hashes are compared only when their kinds are equal, the same rule as `data_checks.py`:
+///
+/// - `data_stalled`: a hash of another kind than the one before it counts as a missing hash.
+/// - `epoch_order_repeated`: a position whose hashes differ in kind breaks the order, as a
+///   missing hash does (two hashes of different kinds are never equal, so no code is needed).
+/// - `duplicate_batches`: never a match across kinds (no code needed either), and
+///   [`ranks_compared`] lists a rank only when another rank wrote a hash of a kind it wrote.
+/// - `resume_data_mismatch`: [`ResumePass::compare_data`] keeps to the resumed hash's kind.
 fn hash_kind(hash: &str) -> &str {
     hash.split_once(':').map_or("", |(kind, _)| kind)
 }
@@ -107,15 +110,22 @@ impl Stalled {
             self.previous = None;
             return false;
         };
+        // C16: a hash of another kind than the one before it is treated as a missing hash is:
+        // the stretch ends, and the next row has nothing to be compared with.
+        let hash = data.hash.as_ref().filter(|hash| {
+            self.previous
+                .as_deref()
+                .is_none_or(|previous| hash_kind(previous) == hash_kind(hash))
+        });
         let why = if data.batches == Some(0) {
             Some("no_batch")
-        } else if data.drew() && data.hash.is_some() && data.hash == self.previous {
+        } else if data.drew() && hash.is_some() && hash == self.previous.as_ref() {
             Some("same_batch")
         } else {
             None
         };
         if data.drew() {
-            self.previous = data.hash.clone();
+            self.previous = hash.cloned();
         }
         let Some(why) = why else {
             self.run = 0;
@@ -285,13 +295,24 @@ impl DataProgress {
     }
 }
 
-/// The ranks [`duplicate_batches`] compares: those with a hashed batch in their window, in
-/// rank order. The run's status and `detect --run` list them as `ranks_compared` whether or not
-/// a duplicate is found, so "compared, none found" can be told from "not compared".
+/// The ranks [`duplicate_batches`] compares: those with a hashed batch in their window of a
+/// kind ([`hash_kind`]) that another rank's window also holds, in rank order. The run's status
+/// and `detect --run` list them as `ranks_compared` whether or not a duplicate is found, so
+/// "compared, none found" can be told from "not compared". Until C16 (lane V7, Nov 19, 2026)
+/// any rank with a hashed batch was listed, which claimed a comparison across hash kinds that
+/// never happened.
 pub fn ranks_compared(ranks: &BTreeMap<i32, BTreeMap<i64, (Option<i64>, String)>>) -> Vec<i32> {
-    ranks
+    let kinds: Vec<(i32, BTreeSet<&str>)> = ranks
         .iter()
-        .filter(|(_, window)| !window.is_empty())
+        .map(|(rank, window)| (*rank, window.values().map(|(_, hash)| hash_kind(hash)).collect()))
+        .collect();
+    kinds
+        .iter()
+        .filter(|(rank, own)| {
+            kinds
+                .iter()
+                .any(|(other, theirs)| other != rank && !own.is_disjoint(theirs))
+        })
         .map(|(rank, _)| *rank)
         .collect()
 }
@@ -359,7 +380,7 @@ pub fn read_batches(input: impl std::io::Read) -> Result<Vec<RecordBatch>, Strin
 /// alone, as `detect` judges one rank, and its [`report`] is in `reports`. Then the ranks'
 /// batch-hash windows are compared as the server compares them for a run's status
 /// ([`duplicate_batches`]): `duplicate_batches` is that finding or null, `incidents` holds it
-/// as an incident, and `ranks_compared` lists the ranks that had a hashed batch to compare,
+/// as an incident, and `ranks_compared` lists the ranks that had a hashed batch to compare with another rank's,
 /// found or not, so "no duplicates" can be told from "nothing to compare". Rows of a second
 /// run are refused.
 pub fn detect_run(batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Result<Value, String> {

@@ -315,6 +315,13 @@ fn c16_hashes_of_two_kinds_are_not_compared() {
         let (incidents, not_checked): (Vec<Value>, Vec<Value>) = if detector == "duplicate_batches" {
             let all: Vec<RecordBatch> = batches.values().cloned().collect();
             let run = detect_run(&all, &usual()).unwrap();
+            // `compared`: both ranks are listed as compared, or neither is.
+            let listed = if case["compared"] == true {
+                json!([0, 1])
+            } else {
+                json!([])
+            };
+            assert_eq!(run["ranks_compared"], listed, "{name}");
             (run["incidents"].as_array().unwrap().clone(), Vec::new())
         } else {
             assert_eq!(batches.len(), 1, "{name}");
@@ -348,4 +355,58 @@ fn c16_hashes_of_two_kinds_are_not_compared() {
             }
         }
     }
+}
+
+/// One rank's rows as (step, batch hash or none), each drawing one batch.
+fn hashed(rows: &[(i64, Option<&str>)]) -> RecordBatch {
+    let steps: Vec<i64> = rows.iter().map(|(step, _)| *step).collect();
+    let mut columns = keys(&steps);
+    columns.push((
+        "data_json",
+        Arc::new(StringArray::from_iter_values(rows.iter().map(|(_, hash)| match hash {
+            Some(hash) => json!({"batches": 1, "batch_hash": hash}).to_string(),
+            None => json!({"batches": 1}).to_string(),
+        }))),
+    ));
+    batch(columns)
+}
+
+/// C16, `data_stalled`: a hash of another kind than the one before it is treated exactly as a
+/// missing hash, so the row after it is not compared with it either.
+#[test]
+fn c16_a_change_of_hash_kind_stalls_as_a_missing_hash_does() {
+    let (legacy, new) = ("5330bfb822ed0aaf", "v2:cd09ce7a08834a9e");
+    let stall = |at_one: Option<&str>| {
+        let mut rows = vec![(0, Some(legacy)), (1, at_one)];
+        rows.extend((2..7).map(|step| (step, Some(new))));
+        let detectors = judge(0, &[hashed(&rows)], &usual()).unwrap();
+        detectors
+            .incidents()
+            .into_iter()
+            .find(|incident| incident["kind"] == "data_stalled")
+    };
+    let missing = stall(None).expect("a stall after the missing hash");
+    assert_eq!((&missing["step"], &missing["through_step"]), (&json!(3), &json!(5)));
+    assert_eq!(stall(Some(new)), Some(missing));
+}
+
+/// C16, `ranks_compared`: a rank is listed only when another rank wrote a hash of a kind it
+/// wrote too.
+#[test]
+fn c16_ranks_compared_lists_ranks_with_a_kind_in_common() {
+    use std::collections::BTreeMap;
+    let window = |hashes: &[&str]| -> BTreeMap<i64, (Option<i64>, String)> {
+        hashes
+            .iter()
+            .enumerate()
+            .map(|(step, hash)| (step as i64, (None, hash.to_string())))
+            .collect()
+    };
+    let (a, b) = ("5330bfb822ed0aaf", "v2:cd09ce7a08834a9e");
+    let ranks = BTreeMap::from([(0, window(&[a])), (1, window(&[b])), (2, window(&[]))]);
+    assert_eq!(super::ranks_compared(&ranks), Vec::<i32>::new());
+    let ranks = BTreeMap::from([(0, window(&[a])), (1, window(&[b])), (2, window(&[a, b]))]);
+    assert_eq!(super::ranks_compared(&ranks), vec![0, 1, 2]);
+    let ranks = BTreeMap::from([(0, window(&[b])), (1, window(&[a])), (3, window(&[b]))]);
+    assert_eq!(super::ranks_compared(&ranks), vec![0, 3]);
 }
