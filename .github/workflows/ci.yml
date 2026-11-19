@@ -86,6 +86,8 @@ jobs:
         run: pytest -ra
       - name: Gate 1 fixtures through the SDK pipeline
         run: pytest -ra ../experiments/moe-bakeoff/test_fixtures.py ../experiments/gate1/test_gate1.py
+      - name: TrainCheck's silent errors against TensorQuill, the catalog and one short run
+        run: pytest -ra ../experiments/traincheck-bugs/test_traincheck_bugs.py
       - name: Trainer callback acceptance script, toy model
         run: python examples/trainer_check.py --toy --backend aot_eager --steps 150 --seed-step 100 --probe-every 50 --out "$RUNNER_TEMP/trainer-check"
       - name: Seeded gradient-spike and stalled-weight cases, toy model

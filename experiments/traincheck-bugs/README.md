@@ -9,7 +9,7 @@ is written down as a gap, not fixed.
 
 ## First: only 2 of the 20 reproduction scripts are on this machine
 
-The TrainCheck clone (`/Users/ak/Documents/tensrview/TrainCheck` at `7a62cbb`) holds
+The TrainCheck clone (`../TrainCheck` from the repository root, at `7a62cbb`) holds
 something for three of the 20, and the third is not a script:
 
 - **B1's script** is in the tree, `docs/assets/code/84911.py` (the 5-minute tutorial's).
@@ -52,8 +52,8 @@ reference pipeline, not a fixed copy of B1.
 
 ```bash
 cd experiments/traincheck-bugs
-/Users/ak/Documents/tensrview/tensrviewproject/.venv/bin/python run_all.py          # every configuration, buggy and healthy
-/Users/ak/Documents/tensrview/tensrviewproject/.venv/bin/python run_all.py --report # rewrite RESULTS.md only
+../../.venv/bin/python run_all.py          # every configuration, buggy and healthy
+../../.venv/bin/python run_all.py --report # rewrite RESULTS.md only
 ```
 
 `out/` (records, evidence, logs) is not committed; `results.json` holds every run's summary.

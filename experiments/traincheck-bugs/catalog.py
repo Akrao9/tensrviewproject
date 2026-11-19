@@ -3,7 +3,7 @@
 `paper` and `synopsis` are Table 3's; `ae` and `location` are the bug ID and failure
 location in TrainCheck's AE guide (`docs/ae-eval-s5.1-silent-issue-detection.md`, which
 lists 18: TF-29903 and TF-33455 are not in it). `in_clone` says where the reproduction is in
-the TrainCheck clone at /Users/ak/Documents/tensrview/TrainCheck (7a62cbb), its history
+the TrainCheck clone at ../TrainCheck from the repository root (7a62cbb), its history
 included; the other reproductions are in OrderLab/TrainCheck-Evaluation-Workloads, which is
 not on this machine and was not fetched. `how` is what was run here:
 
