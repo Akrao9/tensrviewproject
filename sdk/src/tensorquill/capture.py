@@ -1309,6 +1309,7 @@ class Session:
         self._owned: weakref.WeakKeyDictionary[Any, tuple[bool, tuple[int, ...]]] = weakref.WeakKeyDictionary()
         # Parameters found trainable after `init` and already named in a warning (`_say_new_trainable`).
         self._new_trainable_said: set[str] = set()
+        self._trainable_scan_at = 0  # the committed step count from which the next scan is due
         self._lead: weakref.ref[Any] | None = None
         self._leading = True
         self._grads_after_step = False
@@ -2612,10 +2613,15 @@ class Session:
         """Name once, in a warning, each parameter of the model that is trainable now and was not when
         the session started (unfrozen, added or replaced since `init`). The parameters a session
         records are fixed at `init`, as are its buffers, so such a parameter has no gradient norm and
-        no weight check. Once per flush, on the host: one pass over the model's parameters, no read
-        of a tensor. Not in the router-only mode, which records no parameter."""
+        no weight check. At a flush, at most once per `WEIGHT_EVERY` steps, and at close; on the host:
+        one pass over the model's parameters, no read of a tensor (about 0.45 ms for 600 parameter
+        tensors on a CPU, so under 10 µs a step). Not in the router-only mode, which records no
+        parameter."""
         if not (self.grad_every or self.weight_every):
             return
+        if not self._closed and self._steps_committed < self._trainable_scan_at:
+            return
+        self._trainable_scan_at = self._steps_committed + WEIGHT_EVERY
         try:
             new = [
                 name for name, p in self._model.named_parameters()

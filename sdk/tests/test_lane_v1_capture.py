@@ -400,6 +400,31 @@ def test_a_root_leaf_is_named_for_both_default_layer_choices(layers):
     assert session.layer_names == ["Linear"]
 
 
+def test_a_compiled_root_leaf_gives_the_eager_statistics_without_recompiling():
+    from torch._dynamo.testing import CompileCounter
+
+    results, frames = [], None
+    for compile_it in (False, True):
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+        model = nn.Linear(4, 3)
+        sink = tensorquill.MemorySink()
+        session = tensorquill.init(model, sink=sink, every=1, auto_step=False)
+        counter = CompileCounter()
+        run = torch.compile(model, backend=counter) if compile_it else model
+        for _ in range(3):
+            run(torch.randn(8, 4)).sum().backward()
+            session.step()
+        session.close()
+        results.append([r["layers"] for r in _steps(sink.records)])
+        frames = counter.frame_count
+    eager, compiled = results
+    assert set(eager[0]) == {"Linear"}
+    for e, c in zip(eager, compiled):
+        assert c["Linear"] == pytest.approx(e["Linear"], rel=1e-5, abs=1e-7)
+    assert frames == 1
+
+
 def test_a_model_with_children_does_not_add_its_root():
     session = tensorquill.init(nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 1)), sink=tensorquill.MemorySink(),
                                every=1, layers="all")
