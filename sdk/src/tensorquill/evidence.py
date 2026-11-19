@@ -15,6 +15,8 @@ import json
 import math
 import os
 import re
+import secrets
+import statistics
 import sys
 import time
 import warnings
@@ -590,7 +592,8 @@ def weight_norm_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
         highest = max(ratios, key=lambda item: item[1])
         summary[kind] = {
             "parameters": len(ratios),
-            "median_ratio": values[len(values) // 2],
+            # The middle value, or the mean of the two middle ones (lane U7, Nov 19, 2026: the upper one).
+            "median_ratio": statistics.median(values),
             "lowest": {"name": lowest[0], "ratio": lowest[1]},
             "highest": {"name": highest[0], "ratio": highest[1]},
         }
@@ -1541,6 +1544,48 @@ def load_records(
     return records if all_attempts else resolve_attempts(records)
 
 
+def read_jsonl(path: str | Path) -> tuple[list[dict[str, Any]], int]:
+    """Every record of a `.jsonl` capture, and how many lines were left out because they are not
+    a JSON object: a line torn by a killed process, which a restarted writer then appends after
+    (the writer keeps the fragment on a line of its own, lane U4), or a last line still being
+    written. The records after such a line are read (lane U7, Nov 19, 2026: a plain read raised
+    on it and gave no evidence at all). A whole last line with no newline is read, as before."""
+    data = Path(path).read_bytes()
+    records: list[dict[str, Any]] = []
+    left_out = 0
+    for line in data.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            record = None
+        if isinstance(record, dict):
+            records.append(record)
+        else:
+            left_out += 1
+    return records, left_out
+
+
+def _load_counted(source: Any, rank: int | None) -> tuple[list[dict[str, Any]], int]:
+    """`load_records(source, rank=rank, all_attempts=True)`, with a `.jsonl` file read by
+    `read_jsonl`: its records and the lines left out (0 for any other source)."""
+    if isinstance(source, (str, Path)) and not Path(source).is_dir() and Path(source).suffix not in (".parquet",):
+        records, left_out = read_jsonl(source)
+        return load_records(records, rank=rank, all_attempts=True), left_out
+    return load_records(source, rank=rank, all_attempts=True), 0
+
+
+def lines_left_out_line(evidence: Mapping[str, Any]) -> str | None:
+    """One line on the capture's lines that were not whole records, or None."""
+    left_out = evidence.get("lines_left_out")
+    if not isinstance(left_out, int) or isinstance(left_out, bool) or left_out <= 0:
+        return None
+    return (f"Lines left out: {left_out} line{'s' if left_out != 1 else ''} of the capture"
+            f" {'are' if left_out != 1 else 'is'} not a whole JSON record (torn by a killed process, or still being"
+            " written) and were skipped; the steps after them are read.")
+
+
 def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Leave out the records a later attempt replaced.
 
@@ -1550,25 +1595,50 @@ def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     is history that training rolled back, including steps the new attempt has not reached
     yet. Records without `attempt` (written before it existed) count as attempt 0. The
     order of the remaining records is unchanged.
+
+    An attempt is of one run: a later attempt of another run ID never rolls back this one's
+    records (lane U7, Nov 19, 2026). A record with no `run_id` is of no named run (`_run_of`).
     """
-    first_step: dict[tuple[Any, int], int] = {}
+    first_step: dict[tuple[str, Any, int], int] = {}
     for record in records:
-        key = (record.get("rank", 0), record.get("attempt", 0))
+        key = (_run_of(record), record.get("rank", 0), record.get("attempt", 0))
         step = int(record["step"])
         if key not in first_step or step < first_step[key]:
             first_step[key] = step
-    if len({rank for rank, _ in first_step}) == len(first_step):
-        return records  # one attempt per rank: nothing was replaced
-    cutoff: dict[tuple[Any, int], float] = {}
-    for rank in {rank for rank, _ in first_step}:
+    if len({(run, rank) for run, rank, _ in first_step}) == len(first_step):
+        return records  # one attempt per rank of each run: nothing was replaced
+    cutoff: dict[tuple[str, Any, int], float] = {}
+    for run, rank in {(run, rank) for run, rank, _ in first_step}:
         cut = math.inf
-        for attempt in sorted((a for r, a in first_step if r == rank), reverse=True):
-            cutoff[(rank, attempt)] = cut
-            cut = min(cut, first_step[(rank, attempt)])
+        for attempt in sorted((a for n, r, a in first_step if (n, r) == (run, rank)), reverse=True):
+            cutoff[(run, rank, attempt)] = cut
+            cut = min(cut, first_step[(run, rank, attempt)])
     return [
         record for record in records
-        if int(record["step"]) < cutoff[(record.get("rank", 0), record.get("attempt", 0))]
+        if int(record["step"]) < cutoff[(_run_of(record), record.get("rank", 0), record.get("attempt", 0))]
     ]
+
+
+def check_one_run(records: Iterable[Mapping[str, Any]]) -> None:
+    """Raise `ValueError` when `records` are of more than one run. Checked before attempts are
+    resolved or any rule runs (lane U7, Nov 19, 2026): two jobs appending to one file gave evidence
+    for the first run showing the second's incidents. The Rust detectors refuse the same rows
+    (`detect_rows` in detect.rs)."""
+    runs = sorted({_run_of(r) for r in records})
+    if len(runs) > 1:
+        raise ValueError(
+            f"these records come from more than one run ({', '.join(repr(run) if run else 'no run_id' for run in runs)}):"
+            " evidence is of one rank of one run, so read each run's records on their own. A record with no run_id"
+            " (written before it existed) is of no named run, and joins only records that have none either"
+        )
+
+
+def _run_of(record: Mapping[str, Any]) -> str:
+    """A record's run ID, with "" for a record that names none (written before `run_id` existed,
+    or not a string): as the Rust detectors read it (`server_detect.records_stream`), so rows
+    with no run ID make one stream with each other and none with a named run."""
+    run = record.get("run_id")
+    return run if isinstance(run, str) else ""
 
 
 _PART_NAME = re.compile(r"part-(-?\d+)-(-?\d+)\.parquet$")
@@ -1621,14 +1691,43 @@ def _read_part(path: Path) -> list[dict[str, Any]]:
     return [row_to_record(row) for row in pq.read_table(path, partitioning=None).to_pylist()]
 
 
+def json_safe(value: Any) -> Any:
+    """`value` with every NaN and infinity as the string the capture writes for it (`"nan"`,
+    `"inf"`, `"-inf"`, as `sink._finite` does), so it is strict JSON. The evidence in memory keeps
+    its floats; only what is written changes (lane U7, Nov 19, 2026: a bare NaN made the file
+    unreadable to a strict JSON parser on exactly the job that was failing)."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return "nan" if math.isnan(value) else ("inf" if value > 0 else "-inf")
+    if isinstance(value, Mapping):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
+
+
+def replace_atomically(path: Path, text: str) -> None:
+    """Write `text` to `path` through a temporary file of this writer's own in the same folder
+    and a rename, so a reader never sees half of it and two writers to one path never take each
+    other's temporary file (lane U7, Nov 19, 2026: both used `<path>.tmp`, and the second rename
+    raised `FileNotFoundError`). The file gets the usual permissions, as `write_text` gives them."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def write_evidence(evidence: Mapping[str, Any], path: str | Path) -> Path:
-    """Write `evidence` as JSON through a temporary file and a rename, so a reader polling
-    the file never sees half of it."""
+    """Write `evidence` as strict JSON (`json_safe`) through a temporary file and a rename, so
+    a reader polling the file never sees half of it."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(evidence, separators=(",", ":")) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    replace_atomically(path, json.dumps(json_safe(evidence), separators=(",", ":"), allow_nan=False) + "\n")
     return path
 
 
@@ -1650,6 +1749,7 @@ class _Tail:
         self.records: list[dict[str, Any]] = []
         self._offset = 0
         self._seen: set[Path] = set()
+        self.left_out = 0  # whole lines that were not a JSON object (lane U7, Nov 19, 2026)
 
     def poll(self) -> bool:
         """Add newly written records; return whether there were any."""
@@ -1667,9 +1767,13 @@ class _Tail:
             for line in data[:end].splitlines():
                 if line.strip():
                     try:
-                        new.append(json.loads(line))
+                        record = json.loads(line)
                     except ValueError:
-                        pass  # a line torn by a killed process
+                        record = None
+                    if isinstance(record, dict):
+                        new.append(record)
+                    else:
+                        self.left_out += 1  # a line torn by a killed process: counted, and said
             self._offset += end
         if self.rank is not None:
             new = [r for r in new if r.get("rank", 0) == self.rank]
@@ -2515,6 +2619,7 @@ def _report_evidence(
     evidence = {
         "schema_version": 1,
         "run_id": report.get("run_id"),
+        "rank": report.get("rank") if isinstance(report.get("rank"), int) else _own_rank(folder),
         "run": _manifest.run_block(report.get("run_id"), _manifest.find_manifest(folder, report.get("run_id"))),
         "overload_threshold": applied.get("overload_threshold", OVERLOAD_THRESHOLD),
         "starve_window": applied.get("starve_window", STARVE_WINDOW),
@@ -3044,6 +3149,8 @@ def watch(
                 if look is not None:
                     evidence["detection"] = {**_detection(look, "python", picked_rank),
                                              "thresholds": {**THRESHOLD_DEFAULTS, **here}}
+                if tail.left_out:
+                    evidence["lines_left_out"] = tail.left_out
                 path = Path(output) if output else default_evidence_path(source, tail.records)
             if status_age is not None and "watchdog" in evidence:
                 evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
@@ -4275,8 +4382,11 @@ def _check_other_sources(
                         # A stuck collective in PyTorch's own dump is a second source for a hang the
                         # stream only suggested, if the dump is complete and was written after the last
                         # step TensorQuill recorded. An old or partial dump proves nothing about now.
+                        # Only a stall is corroborated: the status also lists `duplicate_batches`,
+                        # which has no assessment (lane U7, Nov 19, 2026: it raised KeyError here).
                         for incident in stream_incidents:
-                            if incident["assessment"] == "suspected_hang":
+                            if incident.get("kind") in ("job_stalled", "rank_silent") \
+                                    and incident.get("assessment") == "suspected_hang":
                                 incident["assessment"] = "confirmed_hang"
                                 incident["corroborated_by"] = "collective_hang"
     return traincheck_summary, recorder_summary
@@ -4449,10 +4559,11 @@ def build_evidence(
     detectors = _detectors_option(detectors, server_binary)  # "auto" becomes one of the two here
     if isinstance(update_window, bool) or not isinstance(update_window, int) or update_window < 1:
         raise ValueError(f"update_window must be a whole number of at least 1, not {update_window!r}")
-    every_attempt = load_records(source, rank=rank, all_attempts=True)
+    every_attempt, left_out = _load_counted(source, rank)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
         raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
+    check_one_run(every_attempt)
     records = resolve_attempts(every_attempt)
     router_sizes = _router_sizes(records)
     routers = list(router_sizes)
@@ -4611,6 +4722,9 @@ def build_evidence(
     evidence = {
         "schema_version": 1,
         "run_id": run_id,
+        # The rank judged (lane U7, Nov 19, 2026): a reader that holds records of several ranks
+        # beside this file (`mcp_server`) uses its samples only for this rank.
+        "rank": ranks[0] if ranks else rank,
         "run": _manifest.run_block(run_id, _manifest.find_manifest(
             run_manifest if run_manifest is not None else source, run_id)),
         "layer_count": len(routers),
@@ -4632,6 +4746,7 @@ def build_evidence(
         **({"detectors": "rust"} if from_rust is not None else {}),
         **({"run_end": read_end_marker(ended)} if (ended := _records_file(source, records_file)) else {}),
         **({"not_checked": not_checked} if not_checked else {}),
+        **({"lines_left_out": left_out} if left_out else {}),
         **({"weight_trends": trends} if trends else {}),
         **({"head_trends": head_trends} if head_trends else {}),
         **({"memory": memory} if memory else {}),
@@ -5231,6 +5346,9 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
     ended = run_end_line(evidence)
     if ended:
         notes.append(ended)
+    left_out = lines_left_out_line(evidence)
+    if left_out:
+        notes.append(left_out)
     if not lines:
         return "\n".join(["No incidents detected.", *notes])
     if evidence.get("layer_count"):
@@ -5982,7 +6100,11 @@ def main() -> None:
     if fallback is not None:
         print(f"tensorquill: warning: {fallback}. `--detectors python` asks for the Python detectors without this "
               "warning", file=sys.stderr)
-    records = load_records(args.input, rank=rank, all_attempts=True)
+    records, left_out = _load_counted(args.input, rank)
+    try:
+        check_one_run(records)  # a usage error with either detectors, as the Rust path gives it
+    except ValueError as error:
+        parser.error(str(error))
     try:
         evidence = build_evidence(
             records, **args.thresholds, watchdog=_watchdog_beside(args.input),
@@ -5993,6 +6115,8 @@ def main() -> None:
         if detectors != "rust":
             raise
         parser.error(str(error))
+    if left_out:
+        evidence["lines_left_out"] = left_out
     out_json = _write_output(
         evidence, args.output or default_evidence_path(args.input, records), args.output is not None,
         args.compact_window,

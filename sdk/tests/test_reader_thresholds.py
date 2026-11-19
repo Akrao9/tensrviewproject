@@ -339,7 +339,8 @@ def test_the_command_lines_watcher_of_one_rank(tmp_path, typed, source, state):
 
 def test_each_of_the_six_flags_reaches_the_detectors_on_a_local_file(tmp_path):
     def text(evidence):  # a logged NaN is in these incidents: as text it equals itself
-        return json.dumps(evidence, sort_keys=True)
+        # As the file writes it, "nan" (lane U7, Nov 19, 2026), whether read back or made here.
+        return json.dumps(tensorquill.evidence.json_safe(evidence), sort_keys=True)
 
     capture = tmp_path / "run.jsonl"
     capture.write_text("".join(json.dumps(r) + "\n" for r in everything()), encoding="utf-8")

@@ -147,12 +147,15 @@ def _memory(step: int, cuda: Mapping[str, Any], growth: list[tuple[int, int]], f
         if "memory_growth" not in found and len(growth) == MEMORY_GROWTH_READINGS:
             (first_step, first), rise = growth[0], allocated - growth[0][1]
             if rise >= MEMORY_GROWTH_BYTES and rise >= MEMORY_GROWTH_FRACTION * first:
-                per_step = rise / (step - first_step)
+                # A rate per step needs the readings to span steps: readings at one repeated step
+                # (itself `repeated_steps`) are growth with no rate (lane U7, Nov 19, 2026: this
+                # divided by zero and took the whole report down).
+                per_step = rise / (step - first_step) if step > first_step else None
                 found["memory_growth"] = {
                     "kind": "memory_growth", "step": step, "first_step": first_step, "allocated_first": first,
                     "allocated": allocated, "readings": MEMORY_GROWTH_READINGS, "bytes_per_step": per_step,
                     "total": total,
-                    "steps_to_total": max(total - allocated, 0) / per_step if total is not None else None,
+                    "steps_to_total": max(total - allocated, 0) / per_step if total is not None and per_step else None,
                 }
     if "memory_pressure" not in found and reserved is not None and total is not None and total > 0:
         if reserved >= MEMORY_RESERVED_FRACTION * total:
@@ -233,11 +236,16 @@ def describe_system(incident: Mapping[str, Any]) -> str | None:
     """One sentence for an incident of `SYSTEM_KINDS` or `memory_imbalance`, or None."""
     kind, step = incident["kind"], incident.get("step")
     if kind == "memory_growth":
-        left = incident.get("steps_to_total")
+        rate, left = incident.get("bytes_per_step"), incident.get("steps_to_total")
+        if not isinstance(rate, (int, float)) or isinstance(rate, bool):
+            # No rate: every reading at one repeated step (the Rust detectors write a null rate there).
+            rate = left = None
         return (
             f"GPU memory kept growing up to step {step}: allocated rose at each of {incident['readings']} readings"
             f" from step {incident['first_step']}, {_gib(incident['allocated_first'])} to {_gib(incident['allocated'])}"
-            f" (about {incident['bytes_per_step'] / 2**20:.1f} MiB per step), as when tensors are kept across steps"
+            + (f" (about {rate / 2**20:.1f} MiB per step)" if rate is not None
+               else f" (every reading at step {step}, so no rate per step)")
+            + ", as when tensors are kept across steps"
             + (f"; at this rate the device is full in about {left:.0f} steps" if isinstance(left, (int, float)) else "")
         )
     if kind == "memory_pressure":

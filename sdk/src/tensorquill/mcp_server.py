@@ -298,9 +298,8 @@ class Source:
             kind = "store" if where.is_dir() else "capture"
             if kind == "store" and _rank_number(where.resolve().name) is not None:
                 default_rank, where = _rank_number(where.resolve().name), where.resolve().parent
-            detection = document.get("detection")
-            if default_rank is None and isinstance(detection, dict) and isinstance(detection.get("rank"), int):
-                default_rank = detection["rank"]
+            if default_rank is None:
+                default_rank = _judged_rank(document)
         if kind == "capture":
             every, _ = self.capture(where)
             ranks = sorted({_rank_of(r) for r in every})
@@ -389,8 +388,7 @@ class Source:
                 source["kind"] = "all_ranks_evidence"
                 source["written_at_ms"] = evidence.get("written_at_ms")
             else:
-                detection = evidence.get("detection")
-                own = detection.get("rank") if isinstance(detection, dict) else None
+                own = _judged_rank(evidence)
                 if rank is not None and isinstance(own, int) and own != rank:
                     raise ToolError(f"{where} is rank {own}'s evidence; it says nothing about rank {rank}.")
                 if isinstance(own, int):
@@ -406,6 +404,24 @@ class Source:
             shape = "all_ranks"
         source["run_id"] = evidence.get("run_id")
         return {"shape": shape, "evidence": evidence, "source": source, "default_rank": own_rank}
+
+
+def _judged_rank(document: Mapping[str, Any]) -> int | None:
+    """The rank one rank's evidence file judged: its `rank` (lane U7, Nov 19, 2026), else the
+    `detection` a watcher adds; None when it says neither (a file written before the key)."""
+    detection = document.get("detection")
+    for value in (document.get("rank"), detection.get("rank") if isinstance(detection, Mapping) else None):
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _same_rank_and_run(document: Mapping[str, Any], rank: int, records: list[dict[str, Any]]) -> bool:
+    """Whether an evidence file judged exactly these records' rank and run, so its samples and
+    flags can stand for them. A file that does not say its rank is not taken on trust."""
+    runs = {record.get("run_id") if isinstance(record.get("run_id"), str) else "" for record in records}
+    own_run = document.get("run_id") if isinstance(document.get("run_id"), str) else ""
+    return _judged_rank(document) == rank and len(runs) <= 1 and own_run in (runs or {own_run})
 
 
 def _pick_rank(asked: int | None, default: int | None, ranks: list[int], what: str) -> int:
@@ -893,6 +909,7 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
     # series is read from them and only its flags from this file's samples (CLI-06, Nov 18, 2026).
     window: Mapping[str, Any] | None = None
     compact_note: str | None = None
+    other_note: str | None = None
     if held is None:
         opened = source.open(rank)
         if opened["shape"] != "rank":
@@ -923,9 +940,27 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
             if path_kind == "capture":
                 evidence = source.capture_evidence(path, origin["rank"])
             elif path_kind == "evidence" and source.document(path).get("view") != ALL_RANKS_VIEW:
-                evidence = source.document(path)
-                if _compact._omits(evidence) is not None:
-                    window, evidence = evidence, None
+                document = source.document(path)
+                if _same_rank_and_run(document, origin["rank"], records):
+                    evidence = document
+                    if _compact._omits(evidence) is not None:
+                        window, evidence = evidence, None
+                else:
+                    # Another rank's or run's evidence, or one that does not say whose (lane U7,
+                    # Nov 19, 2026: rank 0's samples were answered as rank 1's). This rank is
+                    # read from its own records, and judged on them where they are a capture.
+                    held_in = Path(origin["records"])
+                    if held_in.is_file() and held_in.suffix == ".jsonl":
+                        evidence = source.capture_evidence(held_in, origin["rank"])
+                    judged = _judged_rank(document)
+                    other_note = (
+                        f"The evidence file {source.path} judged "
+                        + (f"rank {judged}" if judged is not None else "a rank it does not name")
+                        + (f" of run {document.get('run_id')!r}" if document.get("run_id") else "")
+                        + f", not rank {origin['rank']}'s records read here, so its samples and flags are not used:"
+                        + (" this series and its flags are from the detectors run on those records."
+                           if evidence is not None else " this series is from those records, with no flags.")
+                    )
     kind = _resolve(name, kind, names, what)
     if expert is not None and kind != "router":
         raise ToolError(f"`expert` is for a router's series; {name!r} is a {kind}.")
@@ -983,6 +1018,8 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
                 answer["first_flagged_step"] = flagged[0]
         if compact_note is not None:
             answer["compact"] = compact_note
+        if other_note is not None:
+            answer["evidence_file"] = other_note
         if stride > 1:
             answer["note"] = (
                 f"every {stride}th recorded step is shown; over_range covers every recorded step in the range, so a"

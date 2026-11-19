@@ -4,8 +4,8 @@
         --on-incident 'my-agent "Explain the $TENSORQUILL_INCIDENT_KIND incident in $TENSORQUILL_EVIDENCE"'
     python -m tensorquill store/runs/r --rank all --watch --webhook https://example.com/hooks/tensorquill
 
-**What fires.** An incident is new when its rank, kind and step have not fired before, and a
-stall when no stall episode of its run is open (below). By
+**What fires.** An incident is new when its rank, kind and step have not fired before in its run
+(the evidence's `run_id`), and a stall when no stall episode of its run is open (below). By
 default the invariants (`evidence.INCIDENT_CLASSES`) fire, and so does a stall that has reached
 `critical`: a `job_stalled` or `rank_silent` incident (`STALL_KINDS`) whose `severity` is
 `critical`, whatever its `assessment`. `--fire-anomalies` adds the anomalies, whose thresholds
@@ -67,7 +67,11 @@ summary says the connection was lost and that this is not read as a hang.
 
 **What has fired** is kept in a small state file beside the evidence (`run.evidence.json` and
 `run.evidence.compact.json` both give `run.evidence.fired.json`), so a watcher that is
-restarted does not fire again. Delete the file to start over.
+restarted does not fire again. What has fired and each open stall episode are kept by run (from
+Nov 19, 2026), so a new run whose evidence is written to the same path fires its own incidents,
+even one at the same rank, kind and step as the run before. A state file written before that is
+read with each firing's run taken from the start of its id (`<run_id>/...`).
+Delete the file to start over.
 
 **The compact file.** On the command line a trigger turns on `--compact` (decided Nov 17, 2026),
 so the agent that is woken reads the compact evidence: the watcher writes the full file as
@@ -111,7 +115,8 @@ a repeat. The body:
      "incident": {<as in the evidence file>}}
 
 `rank` is null and `ranks` lists them when several ranks share the incident; `ranks` is empty
-for an incident of the whole run. Numbers that are not finite are null, so the body is strict JSON.
+for an incident of the whole run. A number that is not finite is the string `"nan"`, `"inf"` or `"-inf"`,
+as the capture and the evidence file write it, so the body is strict JSON (it was null before Nov 19, 2026).
 
 **Failures never reach the watcher.** A try that fails is printed and made again on a later
 look, `ATTEMPTS` tries in all (the first and three more, as `mlflow` retries a webhook three
@@ -128,7 +133,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import signal
 import subprocess
@@ -140,7 +144,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from .evidence import ALL_RANKS_VIEW, INCIDENT_CLASSES, _group_line, _rank_ranges, incident_class
+from .evidence import (
+    ALL_RANKS_VIEW, INCIDENT_CLASSES, _group_line, _rank_ranges, incident_class, json_safe, replace_atomically,
+)
 
 STATE_VERSION = 1
 PAYLOAD_VERSION = 1
@@ -172,9 +178,10 @@ def state_path_for(evidence_path: str | Path) -> Path:
 
 
 def _strict(value: Any) -> Any:
-    """`value` with every NaN and Inf as None, for a body any JSON parser reads."""
+    """`value` with every NaN and Inf as the string the capture writes for it (`json_safe`), for a
+    body any JSON parser reads."""
     if isinstance(value, float):
-        return value if math.isfinite(value) else None
+        return json_safe(value)
     if isinstance(value, Mapping):
         return {str(k): _strict(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -186,10 +193,36 @@ def _step_key(step: Any) -> Any:
     return step if step is None or isinstance(step, (int, str)) else str(step)
 
 
-def _fired_key(rank: Any, kind: Any, step: Any) -> tuple[Any, ...]:
+def _fired_key(run: str | None, rank: Any, kind: Any, step: Any) -> tuple[Any, ...]:
     """What a firing of any incident but a stall holds back: the same kind at the same step on the
-    same rank. A stall is held back by its episode instead (`_Episodes`)."""
-    return (rank, kind, step)
+    same rank of the same run. A stall is held back by its episode instead (`_follow_episode`).
+    The run is part of it (lane U7, Nov 19, 2026): a second run written to the same evidence
+    path had its first incident held back by the first run's firing at that rank, kind and step."""
+    return (run, rank, kind, step)
+
+
+def _who_key(ranks: Iterable[Any]) -> str:
+    """The ranks part of a delivery id: `rank0`, `ranks0-3,7`, or `run` for the whole run."""
+    numbers = [r for r in ranks if isinstance(r, int)]
+    return f"rank{'s' if len(numbers) != 1 else ''}{_rank_ranges(numbers).replace(' ', '')}" if numbers else "run"
+
+
+def _delivery_run(delivery: Mapping[str, Any]) -> str | None:
+    """The run a saved firing is of: its `run_id`, or for a state file written before that was
+    kept, the start of its id, which is `<run_id>/<ranks>/<kind>/<step>` (and `/<n>` for a later
+    stall episode at the same step). None when the id is not one of those."""
+    run = delivery.get("run_id")
+    if isinstance(run, str):
+        return run
+    found = delivery.get("id")
+    if not isinstance(found, str):
+        return None
+    tail = f"/{_who_key(delivery.get('ranks') or ())}/{delivery.get('kind')}/{delivery.get('step')}"
+    head, slash, number = found.rpartition("/")
+    for candidate in (found, head if slash and number.isdecimal() else None):
+        if candidate is not None and candidate.endswith(tail) and len(candidate) > len(tail):
+            return candidate[: -len(tail)]
+    return None
 
 
 def _number(value: Any) -> int | None:
@@ -288,9 +321,10 @@ class Trigger:
         self._loaded = False
         self._deliveries: list[dict[str, Any]] = []
         self._fired: set[tuple[Any, ...]] = set()
-        # The stall episode that has fired and not ended (see the module's text), as the state
-        # file keeps it; None when a stall may fire.
-        self._episode: dict[str, Any] | None = None
+        # The stall episode that has fired and not ended (see the module's text), for each run, as
+        # the state file keeps them; a run with none may fire a stall. `_episode` is the run's
+        # the watcher looks at now.
+        self._episodes: dict[str, dict[str, Any]] = {}
         self._stalls: list[Mapping[str, Any]] = []
         # Set: the evidence written is the full file, and this writes the compact one beside it.
         self.compact_window = compact_window
@@ -310,9 +344,26 @@ class Trigger:
                 self._load()
             except Exception as error:  # a state file that cannot be read never stops the watcher
                 self._fired.clear()
-                self._episode, self._deliveries = None, []
+                self._episodes, self._deliveries = {}, []
                 self._log(f"trigger: {self._state_path} could not be read ({type(error).__name__}: {error}):"
                           " nothing counts as fired")
+
+    @property
+    def _episode(self) -> dict[str, Any] | None:
+        return self._episodes.get(self._run_id)
+
+    @_episode.setter
+    def _episode(self, episode: dict[str, Any] | None) -> None:
+        if episode is None:
+            self._episodes.pop(self._run_id, None)
+        else:
+            self._episodes[self._run_id] = episode
+
+    def _was_fired(self, rank: Any, kind: Any, step: Any) -> bool:
+        """This run's incident at that rank, kind and step has fired; or one from a state file
+        whose firing names no run that can be read, as such a file held it back before."""
+        return (_fired_key(self._run_id, rank, kind, step) in self._fired
+                or _fired_key(None, rank, kind, step) in self._fired)
 
     # --- What the watcher calls ------------------------------------------------------------
 
@@ -457,17 +508,15 @@ class Trigger:
                     continue  # the open episode's stall: fired already
                 new = list(unit["ranks"])
             else:
-                new = [r for r in unit["ranks"] if _fired_key(r, unit["kind"], unit["step"]) not in self._fired]
+                new = [r for r in unit["ranks"] if not self._was_fired(r, unit["kind"], unit["step"])]
                 if not new:
                     continue
-            numbers = [r for r in new if isinstance(r, int)]
-            who = f"rank{'s' if len(numbers) != 1 else ''}{_rank_ranges(numbers).replace(' ', '')}" if numbers else "run"
-            delivery_id = f"{self._run_id}/{who}/{unit['kind']}/{unit['step']}"
+            delivery_id = f"{self._run_id}/{_who_key(new)}/{unit['kind']}/{unit['step']}"
             taken = {d["id"] for d in self._deliveries}
             if delivery_id in taken:  # a later stall episode at the same step: its own id, for receivers that drop repeats
                 delivery_id = next(f"{delivery_id}/{n}" for n in range(2, len(taken) + 3) if f"{delivery_id}/{n}" not in taken)
             self._deliveries.append({
-                "id": delivery_id,
+                "id": delivery_id, "run_id": self._run_id,
                 "kind": unit["kind"], "step": unit["step"], "ranks": new,
                 **({"assessment": unit["assessment"]} if unit["assessment"] is not None else {}),
                 "first_seen_ms": int(time.time() * 1000),
@@ -476,7 +525,7 @@ class Trigger:
             if unit["kind"] in STALL_KINDS:
                 self._episode = self._open_episode(unit["incident"], delivery_id)
             else:
-                self._fired.update(_fired_key(r, unit["kind"], unit["step"]) for r in new)
+                self._fired.update(_fired_key(self._run_id, r, unit["kind"], unit["step"]) for r in new)
         self._save()
 
     # --- Stall episodes ----------------------------------------------------------------------
@@ -536,7 +585,10 @@ class Trigger:
         run has rolled it back, and then nothing is sent for it. A stall's firing is for its
         episode's stall as it reads now: a try still to make for a `rank_silent` that has become a
         `job_stalled` sends the `job_stalled` (under the firing's own id). A firing of an episode
-        that is over sends nothing more."""
+        that is over sends nothing more. A firing of another run than the one looked at sends
+        nothing either: its incident is not in this evidence, whatever this run's matches it."""
+        if _delivery_run(delivery) not in (self._run_id, None):
+            return None
         if delivery["kind"] in STALL_KINDS:
             # Only the open episode's firing has anything to send: an earlier episode is over.
             if self._episode is None or self._episode.get("delivery") != delivery["id"]:
@@ -721,14 +773,32 @@ class Trigger:
                 delivery["step"] = _step_key(delivery["step"])
                 if delivery["kind"] in STALL_KINDS:
                     continue
+                run = _delivery_run(delivery)  # a file written before the run was kept: from the id
                 for rank in delivery["ranks"]:
-                    self._fired.add(_fired_key(rank, delivery["kind"], delivery["step"]))
+                    self._fired.add(_fired_key(run, rank, delivery["kind"], delivery["step"]))
+            by_id = {d.get("id"): d for d in deliveries}
+
+            def run_of(episode: Mapping[str, Any]) -> str | None:
+                return _delivery_run(by_id[episode["delivery"]])
+
+            def readable(episode: Any) -> bool:
+                return isinstance(episode, dict) and isinstance(episode.get("ranks", {}), dict) \
+                    and episode.get("delivery") in by_id and run_of(episode) is not None
+
+            episodes = document.get("episodes")
             episode = document.get("episode")
             stalls = [d for d in deliveries if d["kind"] in STALL_KINDS]
-            ids = {d.get("id") for d in deliveries}
-            if isinstance(episode, dict) and isinstance(episode.get("ranks", {}), dict) \
-                    and episode.get("delivery") in ids:
-                self._episode = episode
+            if isinstance(episodes, dict):
+                # Each run's open episode (from Nov 19, 2026), filed under the run its firing is of.
+                for found in episodes.values():
+                    if readable(found):
+                        self._episodes[run_of(found)] = found
+                    else:
+                        self._log(f"trigger: {self._state_path}: the stall episode it lists has no firing in it, or"
+                                  " cannot be read; a stall may fire again")
+            elif readable(episode):
+                # One episode, written before the run was kept: the run of its firing's id.
+                self._episodes[run_of(episode)] = episode
             elif episode is not None:
                 # Its firing was removed from the file (to try a given-up stall again), or it is
                 # not an episode this version reads: no stall episode is open.
@@ -736,11 +806,12 @@ class Trigger:
                           " read; a stall may fire again")
             elif "episode" not in document and stalls:
                 # Written before episodes were kept (keyed by rank, kind and step, or by the run):
-                # its last stall is the open episode, with no baseline yet.
-                self._episode = {"legacy": True, "delivery": stalls[-1]["id"], "kind": stalls[-1]["kind"]}
+                # its last stall is the open episode of that stall's run, with no baseline yet.
+                legacy = {"legacy": True, "delivery": stalls[-1]["id"], "kind": stalls[-1]["kind"]}
+                self._episodes[_delivery_run(stalls[-1]) or ""] = legacy
         except (ValueError, KeyError, TypeError) as error:
             self._fired.clear()
-            self._episode = None
+            self._episodes = {}
             self._log(f"trigger: {self._state_path} is not a state file this version reads ({error}): nothing"
                       " counts as fired, so the incidents listed now fire again")
             return
@@ -751,16 +822,19 @@ class Trigger:
         # ended, and the file read at the start (a `state_path` given) is left as it was.
         if self._state_path is None or self._evidence_path is None:
             return
+        # `episodes`: each run's open episode, by run. `episode`, the one of the run looked at now,
+        # is still written for a trigger older than Nov 19, 2026 that reads the same version.
         document = {"version": STATE_VERSION, "evidence": str(self._evidence_path), "deliveries": self._deliveries,
-                    "episode": self._episode}
-        text = json.dumps(document, indent=1, default=str) + "\n"
+                    "episode": self._episode, "episodes": self._episodes}
+        text = json.dumps(json_safe(document), indent=1, default=str, allow_nan=False) + "\n"
         if text == getattr(self, "_saved", None):
             return
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._state_path.with_name(self._state_path.name + ".tmp")
-            tmp.write_text(text, encoding="utf-8")
-            os.replace(tmp, self._state_path)
+            # A temporary file of this writer's own: two watchers given one state path no longer
+            # take each other's `.tmp` (lane U7, Nov 19, 2026). The file still has one writer at
+            # a time in mind: the later save wins.
+            replace_atomically(self._state_path, text)
         except OSError as error:
             if not self._save_failed:
                 self._save_failed = True
@@ -779,7 +853,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--on-incident",
         metavar="COMMAND",
         help="with --watch: a shell command started once for each new incident (new: its rank, kind and step have "
-        "not fired before, and for a stall, once an episode: until the run steps past it or a new attempt; kept in <evidence>.fired.json beside the evidence, so a "
+        "not fired before in its run, and for a stall, once an episode: until the run steps past it or a new attempt; kept in <evidence>.fired.json beside the evidence, so a "
         "restarted watcher does not fire again). Turns on --compact: the full evidence is written as before and "
         "the compact file beside it is the one handed over. It gets the incident as JSON on standard input and "
         "TENSORQUILL_EVIDENCE (the compact evidence file), TENSORQUILL_INCIDENT_KIND, _CLASS, _STEP, _RANKS, "
