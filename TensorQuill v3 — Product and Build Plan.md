@@ -2409,6 +2409,22 @@ State as of Nov 16, 2026.
       - The trigger, with the options above.
       - What a streaming run should say after a stop.
       - Whether a stopped rank in a `replica_group` should go on paying for the drift check's gather. The other way is for every rank to stop together, which needs a collective of its own.
+  - *Item 8, the queue's size, decided by the author after the measurement above (logged on `main` at `148cecf`): "Sizing the queue in steps (~400, with a 2-ring floor)".* This replaces the trigger's "measure, do not choose".
+    - *Built.* `QUEUE_STEPS = 400` and `QUEUE_MIN_RINGS = 2` are the one place the size is set. `_queue_rings(every)` is `max(2, ceil(400 / every))`: 400 rings at `every=1`, 8 at 50, 4 at 100, 2 from 200 up. `_queue_blocks` keeps one queue entry per ring at `every=1` and two otherwise.
+      - The stop's warning now counts its steps from the real capacity.
+      - `WRITER_QUEUE` is gone. Its uses changed: in `capture.py`, the constant, `_queue_blocks` and `_put`'s message; in the tests, `test_capture.py`'s slow-sink test (it now monkeypatches `QUEUE_STEPS` to 2, giving 2 blocks at `every=1`) and two tests in the new file (they set `QUEUE_STEPS` to 8 and count with `_queue_blocks(1)`).
+    - *`close()` at the floor.* `close()`'s last flush may now wait for room in the queue, up to `close()`'s own deadline, `CLOSE_SECONDS` (60 s). Training only ever uses the put that does not wait.
+      - The bound: a wait inside `close()` pauses no training step. 60 s covers a slow network filesystem writing a few blocks, and it still lets a process with a sink that is truly stuck end within a minute, and then without an end marker.
+      - Test: `test_close_at_the_two_ring_floor_waits_for_a_slow_but_working_writer`, at `every=200` with the queue full at close. All 600 steps and the end marker are written.
+    - *`_flush` cannot leave the ring broken.* Lane U5 found that one raise inside `_flush` (the replica-unread warning under `-W error`, on the base) made every later step raise `IndexError`. `_flush` now turns any exception into a stop, which clears the ring. Test: `test_an_exception_part_way_through_a_flush_stops_capture_and_later_steps_run`. U5's own reproducer, `lane-u5-werror-flush.py`, runs every step on this branch.
+    - *Tests.* Also `test_the_writer_queue_holds_about_400_steps_with_a_floor_of_two_rings` (`every` 1, 3, 50, 100, 200 and 1000) and `test_the_stop_warning_names_the_real_capacity`. All fail on `0add73a`. The `every=50` case fails only by the new function's name: its size, 16 blocks, is unchanged. The two tests that now monkeypatch `QUEUE_STEPS` fail there only on that name.
+    - *Existing tests changed again.* The two NVML hang tests in `test_system.py` no longer stop: their 40 and 30 steps fit in a queue of 400. Each now asserts that every step is written and there is no stop.
+    - *The NVML wait, by the bounds and not run on a GPU.*
+      - A writer stall of T seconds stops capture when training runs faster than the queue's steps divided by T. The queue holds about 400 steps, plus the block being written; it holds 2 rings, so 2 × `every` steps, from `every=200` up.
+      - With `system=True`, a hung reading (`NVML_SLOW_SECONDS`, 2 s) stops capture above about 200 steps/s. The first reading, which opens NVML (`NVML_OPEN_SECONDS`, 10 s), stops it above about 40 steps/s, and only at the start of the run. At `every=1000` the same waits stop capture above 1000 and 200 steps/s.
+      - The fake NVML measured before the change stopped capture exactly where this count puts it: 3 steps written, 1 in the write and 8 queued.
+    - *Not changed.* What a streaming run reads after a stop, as measured above.
+    - *Notes from other lanes.* Lane U3's loader wrapper reads `session._closed` to pass batches through. A stopped session keeps `_closed` false, because `close()` must still run, but its `data()` returns at once, so the wrapper already does nothing harmful. The wrapper could read `_closed or _stopped` to skip hashing the indices. Lane U5's `tracker._say` and this lane's `capture._warn` do the same job; one could replace the other at the merge. U5 also asks for the replica-unread warning once per reason rather than once per parameter; that is not changed here.
 
 ## Sources
 
