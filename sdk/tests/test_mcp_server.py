@@ -664,16 +664,18 @@ def test_the_all_ranks_status_says_what_was_checked_for_the_run_and_never_counts
     assert "stalled_weights" in kinds["not_configured"]
     assert kinds["differs_by_rank"] == {"stalled_weights": {"checked": "0", "not_configured": "1"}}
     assert (kinds["judged_ranks"], kinds["ranks_not_counted"]) == ("0-1", "")
+    # Since E3 (lane V3), a kind that reports an incident (resume_lr_change here) is counted as checked.
     assert [row["kinds"] for row in status["per_rank"]] == [
-        {"checked": 4, "not_enough_history": 0, "not_configured": 22, "unavailable": 0},
-        {"checked": 3, "not_enough_history": 0, "not_configured": 23, "unavailable": 0},
+        {"checked": 5, "not_enough_history": 1, "not_configured": 21, "unavailable": 0},
+        {"checked": 4, "not_enough_history": 1, "not_configured": 22, "unavailable": 0},
     ]
     assert status["summary"].splitlines()[-1] == (
-        "5 of 33 kinds checked on both ranks, 28 not configured, 1 of them checked on some ranks only"
+        "6 of 33 kinds checked on both ranks, 1 of them without enough history yet (resume_lr_change 0 of 1 records"
+        " but reported by a faster rule), 27 not configured, 1 of them checked on some ranks only"
         " (stalled_weights on rank 0)"
     )
     assert client.call("list_incidents")["kinds"] == kinds
-    assert client.call("get_all_ranks_status", rank=0)["rank"]["kind_counts"]["checked"] == 4
+    assert client.call("get_all_ranks_status", rank=0)["rank"]["kind_counts"]["checked"] == 5
     # Rank 0, the one that recorded weights, stores a part its report does not cover.
     (store / "rank=0" / "attempt=1" / "part-60-79.parquet").write_bytes(b"")
     after = client.call("get_all_ranks_status")["kinds"]

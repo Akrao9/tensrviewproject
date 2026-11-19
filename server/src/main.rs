@@ -15,7 +15,7 @@ use tokio::net::TcpListener;
 /// It goes up by one whenever what `detect` reads, takes or prints changes in a way an SDK built
 /// for the old number would get wrong: a kind added or removed, a threshold or option added, a
 /// report key renamed or dropped. `PROTOCOL` in `sdk/src/tensorquill/server_detect.py` is the
-/// same number, and a test in `sdk/tests/test_protocol.py` holds the two together.
+/// same number, and a test in `sdk/tests/test_auto_detectors.py` holds the two together.
 const PROTOCOL: u32 = 2;
 
 /// Self-hosted TensorQuill ingest: Arrow Flight DoPut in, partitioned Parquet out.
@@ -49,31 +49,31 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_FLUSH_STEPS)]
     flush_steps: usize,
     /// Write a rank's Parquet part once its oldest step has waited this many seconds.
-    #[arg(long, default_value_t = 10.0)]
+    #[arg(long, default_value_t = 10.0, value_parser = seconds)]
     flush_seconds: f64,
     /// A rank with no new step for this long (or this many times its own usual time between
     /// batches, if that is longer) is reported silent in runs/<run_id>/watchdog.json. Set it
     /// above your longest evaluation or checkpoint pause; the default is not calibrated.
-    #[arg(long, default_value_t = 300.0)]
+    #[arg(long, default_value_t = 300.0, value_parser = seconds)]
     silent_seconds: f64,
     /// A rank quiet for longer than this is reported `critical`; between --silent-seconds and this it is a `warning`.
-    #[arg(long, default_value_t = 900.0)]
+    #[arg(long, default_value_t = 900.0, value_parser = seconds)]
     critical_seconds: f64,
     /// A phase other than training (evaluation, a checkpoint) that shows no sign of work is called a suspected hang after this long.
-    #[arg(long, default_value_t = 1800.0)]
+    #[arg(long, default_value_t = 1800.0, value_parser = seconds)]
     pause_seconds: f64,
     /// A rank that has stored no batch and shown no training step (it is compiling, loading data, in its
     /// first collective, or sends no heartbeat) is `starting` for this long since its last sign of work,
     /// then reported silent, and `critical` --critical-seconds later. Set it above your longest startup;
     /// the default is not calibrated. A rank whose heartbeats show it stepping is not limited by this.
-    #[arg(long, default_value_t = 1800.0)]
+    #[arg(long, default_value_t = 1800.0, value_parser = seconds)]
     start_seconds: f64,
     /// How many times a rank's usual time between batches it may stay quiet before it is silent.
     #[arg(long, default_value_t = 5.0)]
     silent_factor: f64,
     /// Look at each run's progress this often and rewrite runs/<run_id>/watchdog.json when its verdict
     /// changed, and every third look while the run is unfinished; 0 turns the file off.
-    #[arg(long, default_value_t = 10.0)]
+    #[arg(long, default_value_t = 10.0, value_parser = seconds)]
     watchdog_seconds: f64,
     /// Do not run the detectors over stored parts or write rank=<rank>/incidents.json.
     #[arg(long)]
@@ -89,12 +89,12 @@ struct Args {
     /// How long a failing request to S3 or GCS is retried before the stream is told the store is unavailable
     /// (the sender keeps its rows and tries again). Also bounds each wait for a failing store at SIGTERM:
     /// a write in progress, then the last parts, then the stopped status.
-    #[arg(long, default_value_t = 30.0)]
+    #[arg(long, default_value_t = 30.0, value_parser = seconds)]
     store_retry_seconds: f64,
     /// A run with no stream open, whose ranks have all been disconnected or finished for this many hours,
     /// is given up: its watchdog.json is no longer refreshed and a restarted server does not take it up
     /// again. 0 never gives a run up.
-    #[arg(long, default_value_t = 72.0)]
+    #[arg(long, default_value_t = 72.0, value_parser = hours)]
     abandon_hours: f64,
 }
 
@@ -125,6 +125,41 @@ enum Command {
     /// Print the protocol number and exit: one whole number on a line of its own. The Python SDK
     /// runs a binary only when this is the number it was built for.
     Protocol,
+}
+
+/// A number of seconds the server can hold as a duration: finite, zero or more, and not more
+/// than `Duration` holds. A flag that is not one is refused with its name, where it panicked
+/// with exit code 101 (RS15).
+fn seconds(text: &str) -> Result<f64, String> {
+    let value: f64 = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{text}` is not a number of seconds"))?;
+    duration(value).map(|_| value)
+}
+
+/// A number of hours that is a duration in seconds, as `seconds`.
+fn hours(text: &str) -> Result<f64, String> {
+    let value: f64 = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{text}` is not a number of hours"))?;
+    duration(value * 3600.0).map(|_| value)
+}
+
+fn duration(seconds: f64) -> Result<Duration, String> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(format!(
+            "{seconds} is not a duration: give a finite number, zero or more"
+        ));
+    }
+    Duration::try_from_secs_f64(seconds).map_err(|_| format!("{seconds} seconds is longer than the server can hold"))
+}
+
+/// A flag's value as a duration, named in the error. The parsers above have checked each flag;
+/// this also covers what is derived from one (the refresh time, three intervals).
+fn flag(name: &str, seconds: f64) -> Result<Duration, String> {
+    duration(seconds).map_err(|error| format!("{name}: {error}"))
 }
 
 /// `tensorquill-server detect`: the report goes to standard output as one line of JSON.
@@ -205,23 +240,28 @@ async fn run(args: Args) -> Result<(), Error> {
         _ => None,
     };
     let config = IngestConfig {
-        quota_bytes: args.quota_mib * 1024 * 1024,
+        quota_bytes: args.quota_mib.checked_mul(1024 * 1024).ok_or_else(|| {
+            format!(
+                "--quota-mib: {} MiB is more bytes than the server can count",
+                args.quota_mib
+            )
+        })?,
         flush_steps: args.flush_steps,
-        flush_interval: Duration::from_secs_f64(args.flush_seconds),
-        silent_floor: Duration::from_secs_f64(args.silent_seconds),
+        flush_interval: flag("--flush-seconds", args.flush_seconds)?,
+        silent_floor: flag("--silent-seconds", args.silent_seconds)?,
         silent_factor: args.silent_factor,
-        critical: Duration::from_secs_f64(args.critical_seconds),
-        pause_limit: Duration::from_secs_f64(args.pause_seconds),
-        start_limit: Duration::from_secs_f64(args.start_seconds),
-        watchdog_interval: Duration::from_secs_f64(args.watchdog_seconds),
-        status_refresh: Duration::from_secs_f64(args.watchdog_seconds * 3.0),
+        critical: flag("--critical-seconds", args.critical_seconds)?,
+        pause_limit: flag("--pause-seconds", args.pause_seconds)?,
+        start_limit: flag("--start-seconds", args.start_seconds)?,
+        watchdog_interval: flag("--watchdog-seconds", args.watchdog_seconds)?,
+        status_refresh: flag("--watchdog-seconds (three times it)", args.watchdog_seconds * 3.0)?,
         detect: !args.no_detect,
         thresholds: Arc::new(args.thresholds.unwrap_or_default()),
-        abandon_after: Duration::from_secs_f64(args.abandon_hours * 3600.0),
+        abandon_after: flag("--abandon-hours", args.abandon_hours * 3600.0)?,
         ..IngestConfig::default()
     };
     let options = StoreOptions {
-        retry_timeout: Duration::from_secs_f64(args.store_retry_seconds),
+        retry_timeout: flag("--store-retry-seconds", args.store_retry_seconds)?,
     };
     let ingest = Ingest::new(Storage::open(&store, std::env::vars(), &options)?, config);
     let listener = TcpListener::bind(args.listen).await?;
@@ -273,5 +313,29 @@ async fn main() -> ExitCode {
             eprintln!("tensorquill-server: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_duration_flag_takes_zero_and_refuses_what_is_not_a_duration() {
+        assert_eq!(seconds("0"), Ok(0.0));
+        assert_eq!(seconds("2.5"), Ok(2.5));
+        assert_eq!(hours("0"), Ok(0.0));
+        assert_eq!(hours("72"), Ok(72.0));
+        for bad in ["NaN", "nan", "inf", "-inf", "-1", "-0.5", "1e20", "ten", ""] {
+            assert!(seconds(bad).is_err(), "{bad}");
+        }
+        for bad in ["NaN", "-1", "1e300", "1e16"] {
+            assert!(hours(bad).is_err(), "{bad}");
+        }
+        // Valid alone, too long once three times it is taken (the status refresh).
+        assert_eq!(seconds("1e19"), Ok(1e19));
+        assert!(flag("--watchdog-seconds", 1e19 * 3.0)
+            .unwrap_err()
+            .starts_with("--watchdog-seconds"));
     }
 }

@@ -7,10 +7,10 @@
 //! the ranks of a run: for the run's status in the server, and in [`detect_run`] for
 //! `tensorquill-server detect --run`, which reads every rank's rows without a server.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, Int64Array, StringArray};
+use arrow::array::{Int32Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Map, Value};
 
@@ -38,6 +38,20 @@ fn number(value: &Value) -> Option<f64> {
         Value::Number(number) => number.as_f64().filter(|value| value.is_finite()),
         _ => None,
     }
+}
+
+/// A batch hash's kind: the text before its first `:` (`v2` for `v2:cd09ce7a08834a9e`), and
+/// `""` for a hash with none, which the writer before C16 made (lane V2, Nov 19, 2026). Two
+/// hashes are compared only when their kinds are equal, the same rule as `data_checks.py`:
+///
+/// - `data_stalled`: a hash of another kind than the one before it counts as a missing hash.
+/// - `epoch_order_repeated`: a position whose hashes differ in kind breaks the order, as a
+///   missing hash does (two hashes of different kinds are never equal, so no code is needed).
+/// - `duplicate_batches`: never a match across kinds (no code needed either), and
+///   [`ranks_compared`] lists a rank only when another rank wrote a hash of a kind it wrote.
+/// - `resume_data_mismatch`: [`ResumePass::compare_data`] keeps to the resumed hash's kind.
+fn hash_kind(hash: &str) -> &str {
+    hash.split_once(':').map_or("", |(kind, _)| kind)
 }
 
 /// One row's `data`, as `data_checks.py` reads it.
@@ -96,15 +110,22 @@ impl Stalled {
             self.previous = None;
             return false;
         };
+        // C16: a hash of another kind than the one before it is treated as a missing hash is:
+        // the stretch ends, and the next row has nothing to be compared with.
+        let hash = data.hash.as_ref().filter(|hash| {
+            self.previous
+                .as_deref()
+                .is_none_or(|previous| hash_kind(previous) == hash_kind(hash))
+        });
         let why = if data.batches == Some(0) {
             Some("no_batch")
-        } else if data.drew() && data.hash.is_some() && data.hash == self.previous {
+        } else if data.drew() && hash.is_some() && hash == self.previous.as_ref() {
             Some("same_batch")
         } else {
             None
         };
         if data.drew() {
-            self.previous = data.hash.clone();
+            self.previous = hash.cloned();
         }
         let Some(why) = why else {
             self.run = 0;
@@ -274,13 +295,31 @@ impl DataProgress {
     }
 }
 
-/// The ranks [`duplicate_batches`] compares: those with a hashed batch in their window, in
-/// rank order. The run's status and `detect --run` list them as `ranks_compared` whether or not
-/// a duplicate is found, so "compared, none found" can be told from "not compared".
+/// The ranks [`duplicate_batches`] compares, in rank order. The run's status and `detect
+/// --run` list them as `ranks_compared` whether or not a duplicate is found, so "compared, none
+/// found" can be told from "not compared".
+///
+/// - One rank with hashed batches: that rank, as always (whether a lone rank should read as
+///   compared is a question left to the author, not changed here).
+/// - Two or more: a rank is listed only when another rank's window holds a hash of a kind
+///   ([`hash_kind`]) its own holds (C16, lane V7, Nov 19, 2026). Until then any rank with a
+///   hashed batch was listed, which claimed a comparison across hash kinds that never happened.
 pub fn ranks_compared(ranks: &BTreeMap<i32, BTreeMap<i64, (Option<i64>, String)>>) -> Vec<i32> {
-    ranks
+    let kinds: Vec<(i32, BTreeSet<&str>)> = ranks
         .iter()
         .filter(|(_, window)| !window.is_empty())
+        .map(|(rank, window)| (*rank, window.values().map(|(_, hash)| hash_kind(hash)).collect()))
+        .collect();
+    if kinds.len() < 2 {
+        return kinds.into_iter().map(|(rank, _)| rank).collect();
+    }
+    kinds
+        .iter()
+        .filter(|(rank, own)| {
+            kinds
+                .iter()
+                .any(|(other, theirs)| other != rank && !own.is_disjoint(theirs))
+        })
         .map(|(rank, _)| *rank)
         .collect()
 }
@@ -348,7 +387,7 @@ pub fn read_batches(input: impl std::io::Read) -> Result<Vec<RecordBatch>, Strin
 /// alone, as `detect` judges one rank, and its [`report`] is in `reports`. Then the ranks'
 /// batch-hash windows are compared as the server compares them for a run's status
 /// ([`duplicate_batches`]): `duplicate_batches` is that finding or null, `incidents` holds it
-/// as an incident, and `ranks_compared` lists the ranks that had a hashed batch to compare,
+/// as an incident, and `ranks_compared` lists the ranks that had a hashed batch to compare with another rank's,
 /// found or not, so "no duplicates" can be told from "nothing to compare". Rows of a second
 /// run are refused.
 pub fn detect_run(batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Result<Value, String> {
@@ -358,15 +397,13 @@ pub fn detect_run(batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Resu
         if batch.num_rows() == 0 {
             continue;
         }
+        super::check_keys(batch)?;
         let (Some(run_ids), Some(ranks)) = (
             column::<StringArray>(batch, "run_id"),
             column::<Int32Array>(batch, "rank"),
         ) else {
-            return Err("the rows need a run_id (string) and a rank (int32) column".to_string());
+            unreachable!("check_keys found both columns");
         };
-        if column::<Int64Array>(batch, "step").is_none() {
-            return Err("the rows need a step (int64) column".to_string());
-        }
         // The batch cut where the rank changes, so every piece belongs to one rank.
         let mut start = 0;
         while start < batch.num_rows() {
@@ -435,16 +472,23 @@ pub(super) struct ResumeRow {
 impl ResumeRow {
     pub(super) fn read(columns: &Columns, row: usize, data: Option<DataRow>) -> Self {
         let scale = super::value(columns.grad_scale, row).filter(|scale| scale.is_finite());
-        let checkpoint = text(columns.checkpoint, row)
-            .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            .filter(Value::is_object);
         Self {
             data,
             scale,
             lr: columns.lr(row),
-            checkpoint,
+            checkpoint: checkpoint(columns, row),
         }
     }
+}
+
+/// A row's checkpoint manifest: its `checkpoint_json` when that is a JSON object, as Python's
+/// `isinstance(record["checkpoint"], Mapping)`. What the resume check reads and what
+/// `kind_checks` counts (RS11, lane V7, Nov 19, 2026: text that does not parse counted).
+pub(super) fn checkpoint(columns: &Columns, row: usize) -> Option<Value> {
+    text(columns.checkpoint, row)
+        .filter(|text| text.trim_start().starts_with('{')) // an object, if anything, and no parse for the rest
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .filter(Value::is_object)
 }
 
 /// What the resume checks found: kept with the rank, like `Attempts`.
@@ -590,7 +634,7 @@ impl ResumePass {
     }
 
     fn compare_data(&self, new: Option<&str>, resumed_at: i64) -> Result<Option<Value>, &'static str> {
-        let known: BTreeMap<i64, (Option<String>, i64)> = self
+        let mut known: BTreeMap<i64, (Option<String>, i64)> = self
             .hashes
             .iter()
             .filter(|(_, (hash, _))| hash.is_some())
@@ -605,6 +649,13 @@ impl ResumePass {
         };
         if known.is_empty() {
             return Err("no batch hash recorded in the earlier attempts");
+        }
+        // Only hashes of the resumed one's kind are compared with it (C16): the same batch
+        // hashed by two writers gives two hashes, which say neither "same" nor "different".
+        let kind = hash_kind(new);
+        known.retain(|_, (hash, _)| hash.as_deref().map(hash_kind) == Some(kind));
+        if known.is_empty() {
+            return Err("the batch hashes before and after the resume are of different kinds");
         }
         let expected = known.get(&resumed_at);
         if expected.is_some_and(|(hash, _)| hash.as_deref() == Some(new)) {
@@ -760,6 +811,7 @@ impl ResumePass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Int64Array;
 
     /// Rows as (rank, attempt, step, data), `data` the row's `data_json` or nothing.
     fn rows(run: &str, rows: &[(i32, i64, i64, Option<String>)]) -> RecordBatch {

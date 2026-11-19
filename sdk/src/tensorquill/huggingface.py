@@ -7,6 +7,7 @@ the same callback.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -124,7 +125,7 @@ class TensorQuillCallback(TrainerCallback):
 
 def _checkpoint_folder(args: Any, state: Any, given: Any = None) -> Path | None:
     """The folder the `Trainer` saved to or resumed from: `given`, else `<output_dir>/checkpoint-<global_step>`."""
-    if isinstance(given, str) and Path(given).is_dir():
+    if isinstance(given, (str, os.PathLike)) and Path(given).is_dir():
         return Path(given)
     output = getattr(args, "output_dir", None)
     step = getattr(state, "global_step", None)
