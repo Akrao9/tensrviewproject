@@ -1044,6 +1044,11 @@ class Session:
         self._weights_before: torch.Tensor | None = None
         self._not_exact_before: Any = None
         self._probe_owed = False
+        # The newest step of a full ring, kept back when the others were written (`_commit`,
+        # `_hold_newest`) until the next step ends or the ring is flushed (`_release_held`): its
+        # rows already on the CPU, and which of its device rows changed since (a follower's
+        # update, its weight check read again, a follower's loss).
+        self._held: dict[str, Any] | None = None
         self._step_depth = 0
         self._outer_frame: Any = None
         self._closed = False
@@ -1214,11 +1219,10 @@ class Session:
         self._stepped = True
         # An optimizer that steps after the lead ended the step (two optimizers on one model,
         # `opt1.step(); opt2.step()`: Muon and AdamW, a GAN's two halves in one module) belongs to
-        # that step: while it is still the newest in the ring, what it changes is written on that
-        # step's record, not the next one's. When that step filled the ring, it is already written
-        # (`_commit`), and the update is read as before lane R2, for the next record (review finding
-        # SDK-06, open there). Under a loss scaler, `scaler.update()` ends the step after every
-        # optimizer has stepped, so nothing follows there.
+        # that step, which is still the newest in the ring (when it filled the ring, `_commit` kept
+        # it back): what it changes is written on that step's record, not the next one's. Under a
+        # loss scaler, `scaler.update()` ends the step after every optimizer has stepped, so
+        # nothing follows there.
         follows = not self._leading and not self._commit_on_update and bool(self._steps)
         if self.updates:
             # Every optimizer that holds some of this model's parameters, not only the lead.
@@ -1257,6 +1261,7 @@ class Session:
         self._update.zero_()
         self._update_recorded = False
         self._ring_update_seen[-1] = True
+        self._mark_held("update")
 
     @torch.no_grad()
     def _follow(self) -> None:
@@ -1274,6 +1279,7 @@ class Session:
             self._record_weights()
             self._ring_grad[len(self._steps) - 1, :, 2:].copy_(self._grad[:, 2:])
             self._grad[:, 2:].zero_()
+            self._mark_held("grad")
             self._ring_weight_seen[-1] = {"ownership": self._optimizer_ownership(), "dtypes": self._weight_dtypes}
         if first and self._ring_probe[-1] is not None:
             # The probe ran when the lead ended the step, before any follower was known: it runs
@@ -1282,8 +1288,7 @@ class Session:
 
     def _run_owed_probe(self) -> None:
         """The newest step's probe, held until every optimizer of its iteration stepped: run at the
-        lead's next step, or when the next step ends, the ring is flushed or the session closes.
-        A step that fills the ring is probed at once (`_commit`), since it is written then."""
+        lead's next step, or when the next step ends, the ring is flushed or the session closes."""
         self._probe_owed = False
         if not self._steps:
             return
@@ -1302,8 +1307,7 @@ class Session:
 
     def _follows(self, optimizer: Any) -> bool:
         """Whether `optimizer` steps after the lead ended the step, so what it brings belongs to
-        the newest step in the ring (for the Lightning callback's loss). False once that step
-        has been written (it filled the ring): the loss then goes to the next step, as before."""
+        the newest step in the ring (for the Lightning callback's loss)."""
         lead = self._lead() if self._lead is not None else None
         return (
             lead is not None and optimizer is not lead and self.auto_step and not self._commit_on_update
@@ -1322,6 +1326,7 @@ class Session:
         row = dict(self._ring_scalars[-1])
         row[name] = new if row.get(name) is None else row[name] + new
         self._ring_scalars[-1] = row
+        self._mark_held("scalars")
 
     def _watch_scaler(self, scaler: Any) -> None:
         original = scaler.update
@@ -1743,11 +1748,12 @@ class Session:
         last = self._next_step - 1 if self._steps_committed else None
         if event == "save":
             manifest["after_step"] = last
-            # The step it follows is still in the ring: record it there. The ring is empty before
-            # the first step, after the step that filled it (`_commit` writes a full ring at once)
-            # and after an explicit `flush()`; the save then waits for the next step's record (its
-            # `after_step` still names the step it followed), and is not written if the session
-            # closes first: no record is invented (review finding SDK-07, open).
+            # The step it follows is still in the ring, also when it filled the ring (`_commit`
+            # keeps the newest step back until the next one ends): record it there. The ring is
+            # empty only before the first step, or after an explicit `flush()` with no step since;
+            # the save then waits for the next step's record (its `after_step` still names the
+            # step it followed), and is not written if the session closes first: no record is
+            # invented.
             if self._steps:
                 row = self._ring_checkpoint[-1] or {}
                 row["save"] = manifest
@@ -1851,6 +1857,8 @@ class Session:
         current = self._next_step if step is None else step
         if self._probe_owed:
             self._run_owed_probe()  # the previous step's, before this one becomes the newest
+        if self._held is not None:
+            self._release_held()  # the step kept back when the ring last filled: this one ends it
         self._say_router_problems(stacklevel=4)
         if (
             not self._spread_recorded
@@ -1970,22 +1978,22 @@ class Session:
             # A committed training step is training stepping: whatever pause was announced is over.
             # This also clears a phase left behind by a callback that missed its end.
             self.set_phase("train")
-        full = len(self._steps) == self.every
         if probe_due:
             # The step is complete before the probe runs, so a failing probe loses only
             # its own result, recorded against the step, and never the step.
-            if self._followers and not full:
+            if self._followers:
                 # Other optimizers step after the lead in this run: the probe waits until they
                 # have (`_run_owed_probe`), so it reads the model as the whole step left it.
                 self._probe_owed = True
             else:
                 self._ring_probe[-1] = self._probe()
-        if full:
-            # Written as soon as it fills, so a run that hangs or is killed in the next step has
-            # every step it took on disk. What arrives for this step after it ended (a save
-            # right after it, the update of an optimizer that steps after the lead) finds no row
-            # in the ring: as before lane R2, see `_record_manifest` and `_after_optimizer_step`.
-            self.flush()
+        if len(self._steps) == self.every:
+            # A full ring is written at once but for its newest step, kept back until the next
+            # step ends (or a flush, or close): what arrives for that step after it ended, a save
+            # right after it (`_record_manifest`) or the update of an optimizer that steps after
+            # the lead (`_after_optimizer_step`), is written on its own record. A run that hangs
+            # or is killed in the next step has one step fewer on disk, never a block.
+            self._flush(hold_newest=True)
 
     def _cadence_probe(self) -> bool:
         return self._probe_fn is not None and self._cadence(self.probe_every)
@@ -2006,26 +2014,37 @@ class Session:
 
     def flush(self) -> None:
         """Move the ring to the CPU and queue it for the sink."""
+        self._flush(hold_newest=False)
+
+    def _clear_ring_lists(self) -> None:
+        self._steps = []
+        self._ring_lr = []
+        self._ring_ts = []
+        self._ring_scalars = []
+        self._ring_amp = []
+        self._ring_probe = []
+        self._ring_grad_seen = []
+        self._ring_weight_seen = []
+        self._ring_clip_seen = []
+        self._ring_update_seen = []
+        self._ring_no_optimizer = []
+        self._ring_spread_seen = []
+        self._ring_data = []
+        self._ring_checkpoint = []
+        self._ring_wait = []
+
+    def _flush(self, *, hold_newest: bool) -> None:
         if self._error is not None:
-            self._steps = []
-            self._ring_lr = []
-            self._ring_ts = []
-            self._ring_scalars = []
-            self._ring_amp = []
-            self._ring_probe = []
-            self._ring_grad_seen = []
-            self._ring_weight_seen = []
-            self._ring_clip_seen = []
-            self._ring_update_seen = []
-            self._ring_no_optimizer = []
-            self._ring_spread_seen = []
-            self._ring_data = []
-            self._ring_checkpoint = []
-            self._ring_wait = []
+            self._clear_ring_lists()
             self._probe_owed = False
+            self._held = None
             self._raise_worker_error()
-        if self._probe_owed:
-            self._run_owed_probe()  # the newest step's, before it leaves the ring
+        if self._probe_owed and not hold_newest:
+            self._run_owed_probe()  # the newest step's, before it leaves the ring (a held one stays)
+        if self._held is not None:
+            # The ring holds only the step kept back when it last filled.
+            self._release_held()
+            return
         n = len(self._steps)
         if n == 0:
             return
@@ -2102,6 +2121,101 @@ class Session:
             spread_seen, scalars, probes, stamps, amps, data_rows, checkpoints, waits, system,
             refused, announce, updates, update_seen, update_why,
         )
+        if hold_newest:
+            first = self._hold_newest(dict(zip(_BLOCK_FIELDS, block)), act_size=self._act.numel() if has_act else 0,
+                                      originals=(steps, lrs, stamps, data_rows, waits, no_optimizer))
+            if first is None:
+                return
+            block = tuple(first[key] for key in _BLOCK_FIELDS)
+        self._put(block)
+
+    def _hold_newest(self, block: dict[str, Any], *, act_size: int, originals: tuple[Any, ...]) -> dict[str, Any] | None:
+        """Split a full ring's block, already on the CPU in one transfer: the steps but the newest,
+        returned to be queued now, and the newest, kept as `self._held` (`_release_held`). Its
+        rows stay in the ring too, as its only row, so what arrives for it after it ended is
+        recorded there as for any step in the ring; only a device row changed since is read
+        again when it is written. None when the ring held one step (`every=1`)."""
+        n = len(block["steps"])
+        first: dict[str, Any] = {}
+        held: dict[str, Any] = {}
+        for key in ("steps", "lrs", "clip_seen", "grad_seen", "weight_seen", "spread_seen", "scalars", "probes",
+                    "stamps", "amps", "data_rows", "checkpoints", "waits", "update_seen"):
+            first[key], held[key] = block[key][:-1], block[key][-1:]
+        for key in ("spreads", "clips", "updates"):
+            rows = block[key]
+            first[key], held[key] = (None, None) if rows is None else (rows[:-1], rows[-1:].clone())
+        floats = block["floats"]
+        if floats is None:
+            first["floats"] = held["floats"] = None
+        else:
+            act = floats[: n * act_size].view(n, act_size)
+            grad = floats[n * act_size :].view(n, (floats.numel() - n * act_size) // n)
+            first["floats"] = torch.cat([act[:-1].reshape(-1), grad[:-1].reshape(-1)])
+            held["floats"] = torch.cat([act[-1], grad[-1]])
+        counts = block["counts"]
+        if counts is None:
+            first["counts"] = held["counts"] = None
+        else:
+            parts, offset = [], 0
+            for ring in self._ring_counts.values():
+                width = ring[0].numel()
+                parts.append(counts[offset : offset + n * width].view(n, width))
+                offset += n * width
+            first["counts"] = torch.cat([part[:-1].reshape(-1) for part in parts])
+            held["counts"] = torch.cat([part[-1] for part in parts])
+        # What is said once for the block goes on its first record, written now (with one step, on
+        # that step); the system readings on its last, as for any block.
+        last = n == 1
+        for key in ("announce", "update_why"):
+            first[key], held[key] = (None, block[key]) if last else (block[key], {})
+        first["system"], held["system"] = None, block["system"]
+        first["refused"] = held["refused"] = block["refused"]
+        self._held = {"block": held, "act_size": act_size, "dirty": set()}
+        # The ring keeps the newest step as its only row, at row 0: its Python entries as they were
+        # (logged tensors still on the device), and its update row on the device for a follower's.
+        steps, lrs, stamps, data_rows, waits, no_optimizer = originals
+        self._steps, self._ring_lr, self._ring_ts = steps[-1:], lrs[-1:], stamps[-1:]
+        self._ring_data, self._ring_wait, self._ring_no_optimizer = data_rows[-1:], waits[-1:], no_optimizer[-1:]
+        self._ring_scalars, self._ring_amp = block["scalars"][-1:], block["amps"][-1:]  # on the CPU now
+        self._ring_probe, self._ring_checkpoint = block["probes"][-1:], block["checkpoints"][-1:]
+        self._ring_grad_seen, self._ring_weight_seen = block["grad_seen"][-1:], block["weight_seen"][-1:]
+        self._ring_clip_seen, self._ring_spread_seen = block["clip_seen"][-1:], block["spread_seen"][-1:]
+        self._ring_update_seen = block["update_seen"][-1:]
+        if self.updates and n > 1:
+            self._ring_update[0].copy_(self._ring_update[n - 1])
+        return None if last else first
+
+    def _release_held(self) -> None:
+        """Queue the step kept back when the ring last filled, with what arrived for it since:
+        a save, a probe, a follower's update, weight check or loss. Only what changed on the
+        device is read again (with a follower, once a block); otherwise no transfer."""
+        held, self._held = self._held, None
+        if held is None:
+            return
+        block, dirty = held["block"], held["dirty"]
+        block["checkpoints"] = _checkpoints_to_cpu(self._ring_checkpoint)
+        block["probes"] = self._ring_probe
+        block["weight_seen"] = self._ring_weight_seen
+        block["update_seen"] = self._ring_update_seen
+        if "scalars" in dirty:
+            block["scalars"] = _scalars_to_cpu(self._ring_scalars)
+        if "update" in dirty:
+            block["updates"] = _cpu_copy(self._ring_update[:1])
+        if "grad" in dirty and block["floats"] is not None:
+            weights = block["floats"][held["act_size"] :].view(-1, 4)
+            weights[:, 2:] = self._ring_grad[0, :, 2:].cpu()
+        update_why = {name: why for name, why in self._update_why.items() if name not in self._update_why_written}
+        self._update_why_written.update(update_why)
+        block["update_why"] = {**block["update_why"], **update_why}
+        self._clear_ring_lists()
+        self._put(tuple(block[key] for key in _BLOCK_FIELDS))
+
+    def _mark_held(self, part: str) -> None:
+        """The held step's device row `part` changed after it was read (`_release_held`)."""
+        if self._held is not None:
+            self._held["dirty"].add(part)
+
+    def _put(self, block: tuple[Any, ...]) -> None:
         try:
             self._queue.put_nowait(block)
         except queue.Full:
@@ -2366,6 +2480,14 @@ class Session:
         if system and records:
             records[-1]["system"] = system
         return records
+
+
+# The parts of a block queued for the writer, in `Session._decode`'s order.
+_BLOCK_FIELDS = (
+    "steps", "lrs", "floats", "counts", "spreads", "clips", "clip_seen", "grad_seen", "weight_seen",
+    "spread_seen", "scalars", "probes", "stamps", "amps", "data_rows", "checkpoints", "waits", "system",
+    "refused", "announce", "updates", "update_seen", "update_why",
+)
 
 
 def _checkpoints_to_cpu(rows: list[dict[str, Any] | None]) -> list[dict[str, Any] | None]:

@@ -179,13 +179,9 @@ def test_two_optimizers_on_one_model_are_each_read_and_the_one_that_is_not_adam_
     records = sink.records
     assert [r["step"] for r in records] == [0, 1, 2, 3]
     held = ["head.weight", "head.bias"]
-    if adam_leads:
-        assert all(list(r["update_rms"]) == held for r in records)
-    else:
-        # AdamW steps after the lead ended the step: its update is on that step's record while the
-        # step is still in the ring (SDK-06). Steps 1 and 3 each filled a block of two and were
-        # written before AdamW stepped; that is open (lane R2's Decisions entry).
-        assert [list(r.get("update_rms", {})) for r in records] == [held, [], held, []]
+    # Led or not, AdamW's update is on the record of the step it belongs to (SDK-06): one that
+    # steps after the lead ended the step is written on that step's record, still in the ring.
+    assert all(list(r["update_rms"]) == held for r in records)
     # Said once, on the first record of the block being written when it was known.
     assert [sorted(r.get("update_not_read", {})) for r in records] == [["SGD"], [], [], []]
     said = next(r["update_not_read"]["SGD"] for r in records if "update_not_read" in r)

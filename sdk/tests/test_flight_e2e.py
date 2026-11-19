@@ -324,7 +324,10 @@ def test_the_server_calls_a_job_that_goes_quiet_stalled_and_evidence_says_so(tmp
         session = tensorquill.init(
             toy_moe, run_id="hung", every=10, routers={"router": 4}, endpoint=server.endpoint,
         )
-        train(toy_moe, session, 40)  # then the job hangs: the session stays open and sends nothing
+        # Then the job hangs: the session stays open and sends nothing. A full ring's newest step
+        # waits for the next one to end (a save made after it is written on its record), so 41
+        # steps leave every step through 39 with the server; after 40, step 39 would wait.
+        train(toy_moe, session, 41)
         deadline = time.monotonic() + 15
         status = None
         while time.monotonic() < deadline:

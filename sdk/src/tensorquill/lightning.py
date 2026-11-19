@@ -29,9 +29,7 @@ class TensorQuillCallback(L.Callback):
       stays a tensor on the device, with no sync. `loss_name=None` turns this off. With
       several optimizers (manual optimization; Lightning allows no other), TensorQuill
       counts one step per batch, ended by the first optimizer, and the losses
-      back-propagated for the others in the same batch are added to that step's, except
-      on a step that fills a block of `every` steps, written as soon as it fills: there
-      the record has the first optimizer's loss only.
+      back-propagated for the others in the same batch are added to that step's.
     - **Data wait.** The host time spent in `next()` on the training `DataLoader`, which
       Lightning calls before it moves the batch to the device, is recorded as `data_wait`
       (`tensorquill.datawait`). `data_wait=False` turns it off.
@@ -75,9 +73,7 @@ class TensorQuillCallback(L.Callback):
         # Runs after the closure's backward and before the optimizer's update, so the loss
         # belongs to the step TensorQuill is about to record. With several optimizers (manual
         # optimization), one that steps after the first has ended the TensorQuill step: the loss
-        # back-propagated for it since is added to that step's while it is still the newest in the
-        # ring. Once it is written (it filled the ring), the loss is logged for the next step, as
-        # before, and that step's own first loss replaces it.
+        # back-propagated for it since is added to that step's, which is still the newest.
         if self.session is not None and self._loss is not None:
             if self.session._follows(optimizer):
                 self.session._add_to_newest(self.loss_name, self._loss)

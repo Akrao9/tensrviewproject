@@ -306,11 +306,11 @@ def test_each_flush_adds_one_reading_memory_on_the_training_thread_nvml_on_the_w
     session._system = SystemReadings(CUDA0)  # as on a CUDA model
     trainer_thread = threading.get_ident()
     cuda["calls"].clear()
-    _train(session, model, 5)
+    _train(session, model, 6)  # a full ring's newest step is written when the next step ends
     _written(sink, 5)
     nvml.ecc[0] = 2
     nvml.xid = [79]
-    _train(session, model, 6)
+    _train(session, model, 5)
     session.close()
     systems = [(r["step"], r["system"]) for r in sink.records if "system" in r]
     assert [step for step, _ in systems] == [4, 9, 10]  # each flush's last step, and the close
@@ -324,11 +324,11 @@ def test_each_flush_adds_one_reading_memory_on_the_training_thread_nvml_on_the_w
 def test_readings_that_fail_mid_run_never_stop_training(cuda, nvml, monkeypatch):
     session, model, sink = _session(system=True)
     session._system = SystemReadings(CUDA0)
-    _train(session, model, 5)
+    _train(session, model, 6)  # a full ring's newest step is written when the next step ends
     _written(sink, 5)
     cuda["stats"] = RuntimeError("allocator gone")
     monkeypatch.setattr(Nvml, "read", lambda self: (_ for _ in ()).throw(Exception("driver fell off the bus")))
-    _train(session, model, 10)
+    _train(session, model, 9)
     session.close()  # raises if the writer thread failed
     assert [r["step"] for r in sink.records] == list(range(15))
     notes = [r["system"] for r in sink.records if "system" in r]
