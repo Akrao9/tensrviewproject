@@ -390,8 +390,8 @@ fn c16_a_change_of_hash_kind_stalls_as_a_missing_hash_does() {
     assert_eq!(stall(Some(new)), Some(missing));
 }
 
-/// C16, `ranks_compared`: a rank is listed only when another rank wrote a hash of a kind it
-/// wrote too.
+/// C16, `ranks_compared`: with two or more hashed ranks, a rank is listed only when another
+/// rank wrote a hash of a kind it wrote too; a lone hashed rank is listed as always.
 #[test]
 fn c16_ranks_compared_lists_ranks_with_a_kind_in_common() {
     use std::collections::BTreeMap;
@@ -409,4 +409,10 @@ fn c16_ranks_compared_lists_ranks_with_a_kind_in_common() {
     assert_eq!(super::ranks_compared(&ranks), vec![0, 1, 2]);
     let ranks = BTreeMap::from([(0, window(&[b])), (1, window(&[a])), (3, window(&[b]))]);
     assert_eq!(super::ranks_compared(&ranks), vec![0, 3]);
+    let ranks = BTreeMap::from([(0, window(&[b])), (1, window(&[b])), (2, window(&[a]))]);
+    assert_eq!(super::ranks_compared(&ranks), vec![0, 1]);
+    // One rank with hashes, beside one without: listed, as before C16.
+    let ranks = BTreeMap::from([(0, window(&[a])), (1, window(&[]))]);
+    assert_eq!(super::ranks_compared(&ranks), vec![0]);
+    assert_eq!(super::ranks_compared(&BTreeMap::new()), Vec::<i32>::new());
 }

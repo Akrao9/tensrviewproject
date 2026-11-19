@@ -295,17 +295,24 @@ impl DataProgress {
     }
 }
 
-/// The ranks [`duplicate_batches`] compares: those with a hashed batch in their window of a
-/// kind ([`hash_kind`]) that another rank's window also holds, in rank order. The run's status
-/// and `detect --run` list them as `ranks_compared` whether or not a duplicate is found, so
-/// "compared, none found" can be told from "not compared". Until C16 (lane V7, Nov 19, 2026)
-/// any rank with a hashed batch was listed, which claimed a comparison across hash kinds that
-/// never happened.
+/// The ranks [`duplicate_batches`] compares, in rank order. The run's status and `detect
+/// --run` list them as `ranks_compared` whether or not a duplicate is found, so "compared, none
+/// found" can be told from "not compared".
+///
+/// - One rank with hashed batches: that rank, as always (whether a lone rank should read as
+///   compared is a question left to the author, not changed here).
+/// - Two or more: a rank is listed only when another rank's window holds a hash of a kind
+///   ([`hash_kind`]) its own holds (C16, lane V7, Nov 19, 2026). Until then any rank with a
+///   hashed batch was listed, which claimed a comparison across hash kinds that never happened.
 pub fn ranks_compared(ranks: &BTreeMap<i32, BTreeMap<i64, (Option<i64>, String)>>) -> Vec<i32> {
     let kinds: Vec<(i32, BTreeSet<&str>)> = ranks
         .iter()
+        .filter(|(_, window)| !window.is_empty())
         .map(|(rank, window)| (*rank, window.values().map(|(_, hash)| hash_kind(hash)).collect()))
         .collect();
+    if kinds.len() < 2 {
+        return kinds.into_iter().map(|(rank, _)| rank).collect();
+    }
     kinds
         .iter()
         .filter(|(rank, own)| {
@@ -912,12 +919,10 @@ mod tests {
             (&json!([]), &json!([0, 1]))
         );
         // One rank, and a rank that hashed nothing: no finding, and not "compared and clean".
-        // Neither lists a rank as compared: a rank is compared only with another rank's hashes
-        // of the same kind (C16, lane V7, Nov 19, 2026; until then a rank with any hash was).
         let alone = detect_run(&[rows("run", &rank(0, 0..5, 0..0))], &usual()).unwrap();
         assert_eq!(
             (&alone["duplicate_batches"], &alone["ranks_compared"]),
-            (&Value::Null, &json!([]))
+            (&Value::Null, &json!([0]))
         );
         let unhashed: Vec<_> = (0..5)
             .map(|step| (1, 1, step, Some(json!({"batches": 1}).to_string())))
@@ -925,7 +930,7 @@ mod tests {
         let document = detect_run(&[rows("run", &rank(0, 0..5, 0..0)), rows("run", &unhashed)], &usual()).unwrap();
         assert_eq!(
             (&document["ranks"], &document["ranks_compared"]),
-            (&json!([0, 1]), &json!([]))
+            (&json!([0, 1]), &json!([0]))
         );
         assert_eq!(document["duplicate_batches"], Value::Null);
     }

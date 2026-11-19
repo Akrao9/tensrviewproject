@@ -465,7 +465,7 @@ def test_the_report_takes_the_starved_window_it_was_given():
 # --- where the two paths differ, on purpose -------------------------------------------------
 
 
-def test_a_step_written_twice_in_one_attempt_is_reported_with_the_scalars_of_its_second_writing():
+def test_a_step_written_twice_in_one_attempt_is_reported_with_the_scalars_of_its_first_writing():
     def row(step, salt):
         return record(step, 1, grad_norm=wobble(step), scalars={"train/loss": 2.0 - step / 100 + salt})
 
@@ -474,11 +474,8 @@ def test_a_step_written_twice_in_one_attempt_is_reported_with_the_scalars_of_its
     rust = tensorquill.build_evidence(records, detectors="rust")["incidents"]
     assert [i["kind"] for i in python] == [i["kind"] for i in rust] == ["repeated_steps"]
     # The incident is the same: the server's own store never holds such rows, so only this path finds it.
-    assert {k: v for k, v in python[0].items() if k != "scalars"} == {k: v for k, v in rust[0].items() if k != "scalars"}
-    assert (python[0]["step"], python[0]["repeated"]) == (30, 10)
-    # Python gives what was logged when step 30 was first written, Rust when it was written again.
+    assert python[0] == rust[0]
     assert python[0]["scalars"]["train/loss"]["value"] == pytest.approx(1.7)
-    assert rust[0]["scalars"]["train/loss"]["value"] == pytest.approx(2.7)
 
 
 def test_attempts_out_of_order_in_the_input_are_read_oldest_first_as_a_store_holds_them():
