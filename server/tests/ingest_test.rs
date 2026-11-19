@@ -1116,6 +1116,9 @@ mod store {
         pub held_incidents: AtomicUsize,
         /// While set, every read of an object fails.
         pub fail_gets: AtomicBool,
+        /// Whole-object reads (a part read by a rebuild) in progress, and the most at once.
+        pub gets_in_flight: AtomicUsize,
+        pub max_gets_in_flight: AtomicUsize,
     }
 
     #[derive(Debug)]
@@ -1221,19 +1224,27 @@ mod store {
             Self: 'async_trait,
         {
             async move {
-                if matches!(options.range, Some(GetRange::Suffix(_) | GetRange::Bounded(_))) {
-                    self.knobs.range_gets.fetch_add(1, Ordering::SeqCst);
-                } else {
+                let whole = !matches!(options.range, Some(GetRange::Suffix(_) | GetRange::Bounded(_)));
+                if whole {
                     self.knobs.gets.fetch_add(1, Ordering::SeqCst);
+                    let now = self.knobs.gets_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.knobs.max_gets_in_flight.fetch_max(now, Ordering::SeqCst);
+                } else {
+                    self.knobs.range_gets.fetch_add(1, Ordering::SeqCst);
                 }
                 self.wait().await;
-                if self.knobs.fail_gets.load(Ordering::SeqCst) {
-                    return Err(object_store::Error::Generic {
+                let result = if self.knobs.fail_gets.load(Ordering::SeqCst) {
+                    Err(object_store::Error::Generic {
                         store: "TestStore",
                         source: "injected read failure".into(),
-                    });
+                    })
+                } else {
+                    self.inner.get_opts(location, options).await
+                };
+                if whole {
+                    self.knobs.gets_in_flight.fetch_sub(1, Ordering::SeqCst);
                 }
-                self.inner.get_opts(location, options).await
+                result
             }
             .boxed()
         }
@@ -2468,4 +2479,477 @@ async fn a_failed_rebuild_drops_the_ranks_batch_hashes_from_the_comparison() {
     assert!(!judged(&status), "{}", status["run_state"]);
     store.knobs.fail_gets.store(false, Ordering::SeqCst);
     put.finish().await;
+}
+
+// --- Lane V6 (Nov 19, 2026): the server's watchdog and ingest ----------------------------------
+
+/// L4. An offset is acknowledged only on the stream that sent it. A stream that ended in an error
+/// before its rows were stored left its offset held, and the next stream of the rank was told
+/// that offset (here 1,000, where it had sent 300). Two streams of one rank open at once are the
+/// same: each is told only its own offsets.
+#[tokio::test]
+async fn an_offset_is_acknowledged_only_on_the_stream_that_sent_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), manual(), None).await;
+    let mut dead = open(&server, 0).await;
+    dead.send(batch(0, 0..10), 1000).await; // buffered, not stored
+    dead.send_with_metadata(batch(0, 10..20), world_metadata(0, 1, 2000).replace(RUN, "another-run"))
+        .await;
+    assert_eq!(dead.ack().await, Err(Code::InvalidArgument));
+    let mut next = open(&server, 0).await;
+    next.send(batch(0, 10..15), 300).await;
+    assert_eq!(next.finish().await, [300]);
+    assert_eq!(stored_steps(dir.path())[&0], (0..15).collect::<Vec<_>>());
+
+    let mut first = open(&server, 1).await;
+    first.send(batch(1, 0..10), 1000).await;
+    until("rank 1's first rows taken", || {
+        server.ingest.watchdog_statuses()[RUN]["ranks"][1]["last_step"] == 9
+    })
+    .await;
+    let mut second = open(&server, 1).await;
+    second.send(batch(1, 10..15), 300).await;
+    assert_eq!(second.finish().await, [300]);
+    // The first stream's rows were stored with the second's; it is told so once it sends again
+    // (a resend of rows the server has is acknowledged at once).
+    first.send(batch(1, 0..10), 1000).await;
+    assert_eq!(first.ack().await, Ok(1000));
+    assert_eq!(first.finish().await, Vec::<i64>::new());
+    assert_eq!(stored_steps(dir.path())[&1], (0..15).collect::<Vec<_>>());
+}
+
+/// RS14. With the watchdog's interval at zero (the status file off), a stop writes and judges
+/// what is buffered and writes no status: it wrote one at shutdown.
+#[tokio::test]
+async fn with_the_status_file_off_a_stop_writes_no_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), watch_config(60_000), None).await;
+    let mut flight = client(&server).await;
+    flight
+        .do_action(Action::new(
+            "heartbeat",
+            format!("{{\"run_id\":\"{RUN}\",\"rank\":0,\"phase\":\"train\",\"interval_seconds\":15}}"),
+        ))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let mut put = open(&server, 1).await;
+    put.send(batch(1, 0..10), 50).await;
+    until("rank 1's rows taken", || {
+        server.ingest.watchdog_statuses()[RUN]["ranks"][1]["last_step"] == 9
+    })
+    .await;
+    server.ingest.stop([]).await.unwrap();
+    assert_eq!(stored_steps(dir.path())[&1], (0..10).collect::<Vec<_>>());
+    let run = dir.path().join("runs").join(RUN);
+    assert!(run.join("rank=1").join("incidents.json").exists());
+    assert!(!run.join("watchdog.json").exists());
+}
+
+/// RS15. A duration flag that is not a number of seconds the server can hold (NaN, negative,
+/// infinite, too large, or too large once turned into the refresh time or hours) and a quota whose
+/// bytes overflow are refused with a message naming the flag. They panicked with exit code 101.
+#[test]
+fn a_duration_flag_out_of_range_is_refused_with_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    for (flag, named) in [
+        ("--flush-seconds=NaN", "--flush-seconds"),
+        ("--store-retry-seconds=-1", "--store-retry-seconds"),
+        ("--silent-seconds=inf", "--silent-seconds"),
+        ("--critical-seconds=1e20", "--critical-seconds"),
+        ("--pause-seconds=-0.5", "--pause-seconds"),
+        ("--start-seconds=nan", "--start-seconds"),
+        ("--watchdog-seconds=1e19", "--watchdog-seconds"), // three times it is too long
+        ("--abandon-hours=1e300", "--abandon-hours"),
+        ("--quota-mib=18446744073709551615", "--quota-mib"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
+            .args(["--listen", "127.0.0.1:0", flag, "--store"])
+            .arg(dir.path())
+            .env_remove("TENSORQUILL_TOKEN")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            matches!(output.status.code(), Some(1 | 2)),
+            "{flag}: {:?} {stderr}",
+            output.status
+        );
+        assert!(
+            stderr.contains(named) && !stderr.contains("panicked"),
+            "{flag}: {stderr}"
+        );
+    }
+}
+
+/// RS15. Zero is a valid value of every duration flag: the server starts and stops cleanly.
+#[cfg(unix)]
+#[tokio::test]
+async fn zero_is_a_valid_duration_for_every_flag() {
+    use std::io::{BufRead, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
+        .args(["--listen", "127.0.0.1:0"])
+        .args([
+            "--flush-seconds=0",
+            "--silent-seconds=0",
+            "--critical-seconds=0",
+            "--pause-seconds=0",
+            "--start-seconds=0",
+            "--watchdog-seconds=0",
+            "--store-retry-seconds=0",
+            "--abandon-hours=0",
+        ])
+        .arg("--store")
+        .arg(dir.path())
+        .env_remove("TENSORQUILL_TOKEN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert!(line.starts_with("tensorquill-server listening on"), "{line:?}");
+    assert!(Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let output = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{:?} {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// RUST-16. A rebuild of a rank's detectors that fails is not tried again at every part: parts
+/// stored while the store cannot be read were each a whole replay of the rank.
+#[tokio::test]
+async fn a_failed_rebuild_is_not_tried_again_at_every_part() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let config = IngestConfig {
+        flush_steps: 10,
+        replay_backoff: Duration::from_secs(3600),
+        ..manual()
+    };
+    let server = start_on(store.clone(), config, None).await;
+    let mut put = open_with(&server.address, RUN, 0, None, data_attempt_schema()).await;
+    put.send(data_attempt_batch(1, 0..10), 1).await;
+    assert_eq!(put.ack().await, Ok(1));
+    status_until(&server, &store, "rank 0 judged", judged).await;
+    let before = store.knobs.gets.load(Ordering::SeqCst);
+    store.knobs.fail_gets.store(true, Ordering::SeqCst);
+    // A new attempt needs a rebuild from the store, which cannot be read.
+    put.send(data_attempt_batch(2, 0..10), 2).await;
+    assert_eq!(put.ack().await, Ok(2));
+    // The next part waits for that rebuild (the rank's buffer is held while it runs).
+    put.send(data_attempt_batch(2, 10..20), 3).await;
+    assert_eq!(put.ack().await, Ok(3));
+    let tried = store.knobs.gets.load(Ordering::SeqCst);
+    assert!(tried > before, "the rebuild read the store");
+    for (offset, first) in [(4, 20), (5, 30), (6, 40)] {
+        put.send(data_attempt_batch(2, first..first + 10), offset).await;
+        assert_eq!(put.ack().await, Ok(offset));
+    }
+    put.finish().await; // every part judged, or not, by now
+    assert_eq!(
+        store.knobs.gets.load(Ordering::SeqCst),
+        tried,
+        "each part replayed the rank again"
+    );
+    store.knobs.fail_gets.store(false, Ordering::SeqCst);
+}
+
+/// RUST-16. Once the wait after a failed rebuild has passed and the store reads again, the next
+/// part rebuilds the rank and it is judged again.
+#[tokio::test]
+async fn a_rank_whose_rebuild_failed_is_judged_again_once_the_store_reads() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let config = IngestConfig {
+        flush_steps: 10,
+        replay_backoff: Duration::from_millis(100),
+        ..manual()
+    };
+    let server = start_on(store.clone(), config, None).await;
+    let mut put = open_with(&server.address, RUN, 0, None, data_attempt_schema()).await;
+    put.send(data_attempt_batch(1, 0..10), 1).await;
+    assert_eq!(put.ack().await, Ok(1));
+    status_until(&server, &store, "rank 0 judged", judged).await;
+    store.knobs.fail_gets.store(true, Ordering::SeqCst);
+    put.send(data_attempt_batch(2, 0..10), 2).await;
+    assert_eq!(put.ack().await, Ok(2));
+    status_until(&server, &store, "rank 0 not judged", |status| !judged(status)).await;
+    store.knobs.fail_gets.store(false, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + SLOW_BOUND;
+    let mut first = 10;
+    loop {
+        put.send(data_attempt_batch(2, first..first + 10), first + 10).await;
+        assert_eq!(put.ack().await, Ok(first + 10));
+        first += 10;
+        if judged(&written_status(&server, &store).await) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never judged again");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    put.finish().await;
+}
+
+/// RUST-18. A stream that ends in an error is counted, and the binary says so on stderr with the
+/// run, rank and code, without the bytes the sender sent.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stream_error_is_counted_and_logged_without_its_payload() {
+    use std::io::{BufRead, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), manual(), None).await;
+    assert_eq!(server.ingest.stream_errors(), 0);
+    let mut put = open(&server, 0).await;
+    put.send_with_metadata(batch(0, 0..10), "{\"end_byte_offset\":\"SECRET-PAYLOAD\"}".into())
+        .await;
+    assert_eq!(put.ack().await, Err(Code::InvalidArgument));
+    assert_eq!(server.ingest.stream_errors(), 1);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
+        .args(["--listen", "127.0.0.1:0", "--watchdog-seconds", "0", "--store"])
+        .arg(dir.path())
+        .env_remove("TENSORQUILL_TOKEN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let address = line.trim().rsplit(' ').next().unwrap().to_string();
+    let mut put = open_at(&format!("http://{address}"), RUN, 3, None).await;
+    put.send_with_metadata(batch(3, 0..10), "{\"end_byte_offset\":\"SECRET-PAYLOAD\"}".into())
+        .await;
+    assert_eq!(put.ack().await, Err(Code::InvalidArgument));
+    assert!(Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let output = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let logged: Vec<&str> = stderr.lines().filter(|line| line.contains("stream")).collect();
+    assert_eq!(logged.len(), 1, "{stderr}");
+    assert!(
+        logged[0].contains("run-a rank 3") && logged[0].contains("code InvalidArgument"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("SECRET-PAYLOAD"), "{stderr}");
+}
+
+fn batch_of(run_id: &str, rank: i32, steps: std::ops::Range<i64>) -> RecordBatch {
+    let steps: Vec<i64> = steps.collect();
+    let n = steps.len();
+    RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1; n])),
+            Arc::new(StringArray::from(vec![run_id; n])),
+            Arc::new(Int32Array::from(vec![rank; n])),
+            Arc::new(Int64Array::from(steps.clone())),
+            Arc::new(Float64Array::from(vec![0.5; n])),
+            Arc::new(StringArray::from(vec!["{}"; n])),
+        ],
+    )
+    .unwrap()
+}
+
+fn metadata_of(run_id: &str, rank: i32, end: i64) -> String {
+    format!(
+        "{{\"schema_version\":1,\"run_id\":\"{run_id}\",\"rank\":{rank},\"end_byte_offset\":{end},\"world_size\":1}}"
+    )
+}
+
+/// One rank of `run_id` sends `steps` and closes its stream; the offsets it was told.
+async fn a_short_run(server: &TestServer, run_id: &str, steps: std::ops::Range<i64>) -> Vec<i64> {
+    let mut put = open_as(server, run_id, 0, None).await;
+    let end = steps.end;
+    put.send_with_metadata(batch_of(run_id, 0, steps), metadata_of(run_id, 0, end))
+        .await;
+    put.finish().await
+}
+
+/// RS13. A long-lived server lets a run go once its status reads finished, is written so, and
+/// the grace has passed: twenty short runs one after another leave nothing held. A rank of a run
+/// let go that comes back is taken as after a restart: its watermark from the store (a resend
+/// stores nothing twice) and its detectors rebuilt from the store.
+#[tokio::test]
+async fn finished_runs_are_let_go_and_one_that_comes_back_is_taken_as_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let held = IngestConfig {
+        evict_after: Duration::from_secs(3600),
+        ..watch_config(60_000)
+    };
+    let server = start(dir.path(), held, None).await;
+    assert_eq!(a_short_run(&server, "kept", 0..10).await, [10]);
+    server.ingest.write_watchdog().await;
+    assert_eq!(server.ingest.runs_held(), 1, "inside the grace a finished run is kept");
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        evict_after: Duration::ZERO,
+        ..watch_config(60_000)
+    };
+    let server = start(dir.path(), config, None).await;
+    for n in 0..20 {
+        let run_id = format!("run-{n}");
+        assert_eq!(a_short_run(&server, &run_id, 0..10).await, [10]);
+        // A pass that finds a buffer still in use leaves the run to the next one.
+        let deadline = tokio::time::Instant::now() + SLOW_BOUND;
+        loop {
+            server.ingest.write_watchdog().await;
+            if server.ingest.runs_held() == 0 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{run_id} never let go of");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let status = json_file(&dir.path().join("runs").join(&run_id).join("watchdog.json"));
+        assert_eq!(status["summary"], "finished", "{status}");
+    }
+    // A run that is not finished is kept.
+    let mut open_run = open_as(&server, "still-open", 0, None).await;
+    open_run
+        .send_with_metadata(batch_of("still-open", 0, 0..10), metadata_of("still-open", 0, 10))
+        .await;
+    until("the open run's rows taken", || {
+        server.ingest.watchdog_statuses()["still-open"]["ranks"][0]["last_step"] == 9
+    })
+    .await;
+    server.ingest.write_watchdog().await;
+    assert_eq!(server.ingest.runs_held(), 1);
+
+    // run-3 comes back: a resend of its rows and ten new ones.
+    assert_eq!(a_short_run(&server, "run-3", 0..20).await, [20]);
+    let steps: Vec<i64> = part_files(&dir.path().join("runs").join("run-3"))
+        .iter()
+        .flat_map(|path| {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).unwrap()).unwrap();
+            reader
+                .build()
+                .unwrap()
+                .flat_map(|batch| {
+                    let batch = batch.unwrap();
+                    let steps = batch.column_by_name("step").unwrap();
+                    steps.as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(steps, (0..20).collect::<Vec<_>>());
+    let incidents = json_file(
+        &dir.path()
+            .join("runs")
+            .join("run-3")
+            .join("rank=0")
+            .join("incidents.json"),
+    );
+    assert_eq!(incidents["last_step"], 19, "{incidents}");
+    server.ingest.write_watchdog().await;
+    let status = json_file(&dir.path().join("runs").join("run-3").join("watchdog.json"));
+    assert_eq!(status["summary"], "finished", "{status}");
+    assert_eq!(server.ingest.runs_held(), 1, "only the open run");
+    // A heartbeat for a rank let go of finds nothing: the rank is watched afresh, as after a
+    // restart (a rank first seen by a beat is `starting`). The SDK stops its heartbeat before it
+    // closes its stream, so only a job started again, or another sender, can send one this late.
+    let mut flight = client(&server).await;
+    flight
+        .do_action(Action::new(
+            "heartbeat",
+            "{\"run_id\":\"run-5\",\"rank\":0,\"phase\":\"train\",\"interval_seconds\":15}".to_string(),
+        ))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let rank = &server.ingest.watchdog_statuses()["run-5"]["ranks"][0];
+    assert_eq!(
+        (rank["state"].as_str(), rank["last_step"].as_i64()),
+        (Some("starting"), None),
+        "{rank}"
+    );
+    // A restarted server takes up the open run only.
+    drop(open_run);
+    let restarted = Ingest::new(
+        Storage::new(
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()),
+            "".into(),
+        ),
+        watch_config(60_000),
+    );
+    assert_eq!(restarted.restore_watchdog().await.unwrap(), 1);
+}
+
+/// RS13. With the status file off a settled run is let go of all the same, and no status is written.
+#[tokio::test]
+async fn with_the_status_file_off_a_finished_run_is_let_go_of() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        evict_after: Duration::ZERO,
+        ..watch_config(60_000)
+    };
+    let server = start(dir.path(), config, None).await;
+    assert_eq!(a_short_run(&server, "run-0", 0..10).await, [10]);
+    assert_eq!(server.ingest.runs_held(), 1);
+    let task = server.ingest.spawn_watchdog(); // its first round is at once
+    until("the finished run let go of", || server.ingest.runs_held() == 0).await;
+    server.ingest.stop([task]).await.unwrap();
+    assert!(!dir.path().join("runs").join("run-0").join("watchdog.json").exists());
+    assert!(dir
+        .path()
+        .join("runs")
+        .join("run-0")
+        .join("rank=0")
+        .join("incidents.json")
+        .exists());
+}
+
+/// RUST-17. After a restart the first part of each rank rebuilds its detectors from the store,
+/// and parts written by the streams themselves (not the timed flush) had no shared bound: forty
+/// ranks coming back at once read forty ranks at once. The rebuilds are bounded across streams.
+#[tokio::test]
+async fn rebuilds_from_the_streams_after_a_restart_are_bounded() {
+    use std::sync::atomic::Ordering;
+    const RANKS: i32 = 40;
+    let store = TestStore::new();
+    {
+        let server = start_on(store.clone(), manual(), None).await;
+        for rank in 0..RANKS {
+            let mut put = open(&server, rank).await;
+            put.send(batch(rank, 0..10), 10).await;
+            assert_eq!(put.finish().await, [10]);
+        }
+    }
+    store.knobs.delay_ms.store(20, Ordering::SeqCst);
+    store.knobs.max_gets_in_flight.store(0, Ordering::SeqCst);
+    let server = start_on(store.clone(), manual(), None).await;
+    let mut puts = Vec::new();
+    for rank in 0..RANKS {
+        let mut put = open(&server, rank).await;
+        put.send(batch(rank, 10..20), 20).await;
+        puts.push(put);
+    }
+    let acks = futures::future::join_all(puts.into_iter().map(Put::finish)).await;
+    assert!(acks.iter().all(|acks| acks == &[20]), "{acks:?}");
+    let most = store.knobs.max_gets_in_flight.load(Ordering::SeqCst);
+    assert!(most <= 16, "{most} parts read at once");
 }

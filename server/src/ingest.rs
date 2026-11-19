@@ -52,10 +52,50 @@ pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a rank's report may stay behind the parts stored for it and still judge the rank:
 /// Python's `REPORT_GRACE_SECONDS` (see `IngestConfig::report_grace`).
 pub const DEFAULT_REPORT_GRACE: Duration = Duration::from_secs(30);
+/// The first wait after a failed rebuild of a rank's detectors (see `IngestConfig::replay_backoff`).
+pub const DEFAULT_REPLAY_BACKOFF: Duration = Duration::from_secs(10);
+/// How long a finished or abandoned run is kept after its status was written so (see
+/// `IngestConfig::evict_after`).
+pub const DEFAULT_EVICT_AFTER: Duration = Duration::from_secs(3600);
 /// Parts written at once by the timed flush and at shutdown.
 const FLUSH_CONCURRENCY: usize = 16;
 /// Runs whose status is read at startup at once (see `restore_watchdog`).
 const RESTORE_CONCURRENCY: usize = 32;
+/// Ranks whose detectors are rebuilt from the store at once, from any path (see `detect`).
+const REPLAY_CONCURRENCY: usize = 16;
+/// The wait after failed rebuilds stops doubling at this many times `replay_backoff`.
+const REPLAY_BACKOFF_MAX_DOUBLINGS: u32 = 6;
+/// A stream error is written to stderr at most this often; the ones between are counted in the next line.
+const STREAM_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The wait after `failures` failed rebuilds in a row: `base`, doubled for each failure after the
+/// first, at most 64 times `base`.
+fn replay_wait(base: Duration, failures: u32) -> Duration {
+    base.saturating_mul(1 << failures.saturating_sub(1).min(REPLAY_BACKOFF_MAX_DOUBLINGS))
+}
+
+/// Holds the stream-error lines on stderr to one per `STREAM_ERROR_LOG_INTERVAL` (RUST-18).
+#[derive(Default)]
+struct ErrorLog {
+    last: Option<Instant>,
+    /// Errors not written since the last line.
+    held: u64,
+}
+
+impl ErrorLog {
+    /// `Some(n)` when a line is due now, `n` being the errors held back since the last line.
+    fn due(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < STREAM_ERROR_LOG_INTERVAL)
+        {
+            self.held += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.held))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct IngestConfig {
@@ -93,6 +133,12 @@ pub struct IngestConfig {
     /// rank in the run state; after it, the rank is unknown until the report catches up. As
     /// Python's watchers wait `report_grace` (decided Nov 19, 2026).
     pub report_grace: Duration,
+    /// After a rebuild of a rank's detectors from the store fails, the wait before the next part
+    /// may try again; it doubles with each failure in a row (see `Ingest::detect`).
+    pub replay_backoff: Duration,
+    /// A run whose status has read finished or abandoned, and been written so, for this long is
+    /// let go of: nothing of it is held in memory (see `Ingest::evict_settled`).
+    pub evict_after: Duration,
 }
 
 impl Default for IngestConfig {
@@ -112,6 +158,8 @@ impl Default for IngestConfig {
             thresholds: Arc::default(),
             abandon_after: crate::watchdog::DEFAULT_ABANDON,
             report_grace: DEFAULT_REPORT_GRACE,
+            replay_backoff: DEFAULT_REPLAY_BACKOFF,
+            evict_after: DEFAULT_EVICT_AFTER,
         }
     }
 }
@@ -198,6 +246,9 @@ struct RankBuffer {
     /// Set when a rebuild panicked: the same rows would panic again at every part, each
     /// time after reading the whole rank, so this rank is left alone until a restart.
     detect_off: bool,
+    /// Rebuilds that failed in a row, and the time before which none is tried again (RUST-16).
+    replay_failures: u32,
+    replay_after: Option<Instant>,
     /// Set when writing the buffer as a part failed. A `PUT` that reports failure may have
     /// stored the object (a timeout after the store committed it), so the buffer takes no more
     /// rows until a write of it succeeds: the retry is then the same part under the same name,
@@ -244,6 +295,14 @@ pub struct Ingest {
     stored: Mutex<HashMap<Key, Stored>>,
     /// The manifest last written per run, as JSON text, so the same one is written once.
     manifests: Mutex<HashMap<String, String>>,
+    /// Rebuilds of a rank's detectors from the store in progress (see `detect`).
+    replays: tokio::sync::Semaphore,
+    /// Streams that ended in an error, and the lines written about them (RUST-18).
+    stream_errors: std::sync::atomic::AtomicU64,
+    error_log: Mutex<ErrorLog>,
+    /// Runs whose status has read finished or abandoned, and been written so (or, with the file
+    /// off, has read so), since when: let go of after `evict_after` (see `evict_settled`).
+    settled: Mutex<HashMap<String, Instant>>,
 }
 
 impl Ingest {
@@ -265,11 +324,63 @@ impl Ingest {
             reports: Mutex::new(HashMap::new()),
             stored: Mutex::new(HashMap::new()),
             manifests: Mutex::new(HashMap::new()),
+            replays: tokio::sync::Semaphore::new(REPLAY_CONCURRENCY),
+            stream_errors: std::sync::atomic::AtomicU64::new(0),
+            error_log: Mutex::new(ErrorLog::default()),
+            settled: Mutex::new(HashMap::new()),
             used: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             stopping: tokio::sync::watch::Sender::new(false),
             buffers: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Streams that ended in an error since the server started.
+    pub fn stream_errors(&self) -> u64 {
+        self.stream_errors.load(Ordering::SeqCst)
+    }
+
+    /// A stream ended in an error, which its sender is told. Counted, and written to stderr at most
+    /// once per `STREAM_ERROR_LOG_INTERVAL` with the run, rank and code: the message of a refused
+    /// request only up to its first `: `, after which a decoder's or JSON parser's words can quote
+    /// the bytes the sender sent (RUST-18; until Nov 19, 2026 the server said nothing).
+    fn stream_failed(&self, key: Option<&Key>, status: &Status) {
+        self.stream_errors.fetch_add(1, Ordering::SeqCst);
+        let Some(held) = self.error_log.lock().unwrap().due(Instant::now()) else {
+            return;
+        };
+        let stream = key.map_or_else(
+            || "a stream".to_string(),
+            |(run_id, rank)| format!("the stream of {run_id} rank {rank}"),
+        );
+        let message = status.message();
+        let message = if status.code() == tonic::Code::InvalidArgument {
+            message.split(": ").next().unwrap_or_default()
+        } else {
+            message
+        };
+        let message: String = message.chars().take(200).collect();
+        let held = if held > 0 {
+            format!(" ({held} more stream errors since the last line)")
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "tensorquill-server: {stream} ended in an error (code {:?}): {message}{held}",
+            status.code()
+        );
+    }
+
+    /// How many runs anything is held in memory for.
+    pub fn runs_held(&self) -> usize {
+        let mut runs: std::collections::BTreeSet<String> = self.watchdog.run_ids();
+        runs.extend(self.buffers.lock().unwrap().keys().map(|key| key.0.clone()));
+        runs.extend(self.reports.lock().unwrap().keys().map(|key| key.0.clone()));
+        runs.extend(self.stored.lock().unwrap().keys().map(|key| key.0.clone()));
+        runs.extend(self.data_windows.lock().unwrap().keys().cloned());
+        runs.extend(self.manifests.lock().unwrap().keys().cloned());
+        runs.extend(self.written.lock().unwrap().keys().cloned());
+        runs.len()
     }
 
     /// Arrow bytes waiting in memory across all ranks.
@@ -328,6 +439,13 @@ impl Ingest {
             world_size,
             Instant::now(),
         );
+        // An offset is acknowledged only on the stream that sent it. One held for another stream
+        // (one that ended before its rows were stored, or one of the same rank still open) is not
+        // this stream's to be told: its rows are stored all the same, and that sender learns of
+        // them when it sends again (L4; until Nov 19, 2026 the highest of both was sent here).
+        if !buffer.ack.as_ref().is_some_and(|held| held.same_channel(ack)) {
+            buffer.pending_offset = None;
+        }
         buffer.ack = Some(ack.clone());
         buffer.pending_offset = Some(end_byte_offset.max(buffer.pending_offset.unwrap_or(0)));
         if buffer.batches.is_empty() || buffer.rows >= self.config.flush_steps {
@@ -466,22 +584,46 @@ impl Ingest {
             _ => false,
         };
         if !appended {
+            // A rebuild that failed is not tried again at every part, each a read of the whole
+            // rank, but after a wait that doubles with each failure in a row (RUST-16; until
+            // Nov 19, 2026 every part tried). Meanwhile the rank has no report.
+            if buffer.replay_after.is_some_and(|after| Instant::now() < after) {
+                self.forget_report(key);
+                return;
+            }
             // The first part since this server started, or rows that are not a plain
             // continuation (a new attempt, an older attempt's rows sent late): rebuild
-            // from everything stored, which includes this part.
-            let replayed = std::panic::AssertUnwindSafe(crate::detect::replay(
-                &self.storage,
-                &key.0,
-                key.1,
-                &self.config.thresholds,
-            ))
-            .catch_unwind()
-            .await;
+            // from everything stored, which includes this part. At most `REPLAY_CONCURRENCY`
+            // ranks at once, whichever path flushed them (RUST-17): after a restart every
+            // rank's first part rebuilds, and the streams' own flushes had no bound.
+            let replayed = {
+                let _permit = self.replays.acquire().await;
+                std::panic::AssertUnwindSafe(crate::detect::replay(
+                    &self.storage,
+                    &key.0,
+                    key.1,
+                    &self.config.thresholds,
+                ))
+                .catch_unwind()
+                .await
+            };
             buffer.rebuilds += 1;
+            if matches!(replayed, Ok(Ok(_))) {
+                buffer.replay_failures = 0;
+                buffer.replay_after = None;
+            }
             buffer.detectors = match replayed {
                 Ok(Ok(detectors)) => Some(detectors),
                 Ok(Err(error)) => {
-                    eprintln!("tensorquill-server: detectors for {} rank {}: {error}", key.0, key.1);
+                    buffer.replay_failures = buffer.replay_failures.saturating_add(1);
+                    let wait = replay_wait(self.config.replay_backoff, buffer.replay_failures);
+                    buffer.replay_after = Instant::now().checked_add(wait);
+                    eprintln!(
+                        "tensorquill-server: detectors for {} rank {}: {error} (tried again after {:.0} s, at a later part)",
+                        key.0,
+                        key.1,
+                        wait.as_secs_f64()
+                    );
                     None
                 }
                 Err(_) => {
@@ -631,7 +773,8 @@ impl Ingest {
     /// `incidents.json` behind its parts. Then every buffer is written and judged (`shutdown`),
     /// and only then is each run's status written to say the server stopped, so the last
     /// `watchdog.json` comes after the last part and its `incidents.json`. The status is written
-    /// even when a buffer could not be, and that error is returned after it.
+    /// even when a buffer could not be, and that error is returned after it; with the file off
+    /// (`watchdog_interval` zero) none is written.
     pub async fn stop(&self, tasks: impl IntoIterator<Item = tokio::task::JoinHandle<()>>) -> Result<(), Status> {
         self.closed.store(true, Ordering::SeqCst);
         self.stopping.send_replace(true);
@@ -639,16 +782,21 @@ impl Ingest {
             let _ = task.await;
         }
         let flushed = self.shutdown().await;
-        self.write_watchdog_stopped().await;
+        // A zero interval turns the status file off, at shutdown too (RS14).
+        if !self.config.watchdog_interval.is_zero() {
+            self.write_watchdog_stopped().await;
+        }
         flushed
     }
 
-    /// Stops acknowledging on a stream that has ended, which also lets its response end.
+    /// Stops acknowledging on a stream that has ended, which also lets its response end. The
+    /// offset it was owed goes with it: the next stream is told only its own (L4).
     async fn detach(&self, key: &Key, ack: &AckSender) {
         let buffer = self.buffer(key);
         let mut buffer = buffer.lock().await;
         if buffer.ack.as_ref().is_some_and(|held| held.same_channel(ack)) {
             buffer.ack = None;
+            buffer.pending_offset = None;
         }
     }
 
@@ -835,6 +983,79 @@ impl Ingest {
     /// only this file to tell that the server is still watching a run in which nothing moves.
     pub async fn write_watchdog(&self) {
         self.write_statuses(self.watchdog_statuses()).await;
+        self.evict_settled();
+    }
+
+    /// Notes whether a run's status, written (or with the file off, read) as of `now`, is settled:
+    /// finished or abandoned, with the server running.
+    fn note_settled(&self, run_id: &str, status: &serde_json::Value, now: Instant) {
+        let mut settled = self.settled.lock().unwrap();
+        if status["server_running"] == true && (status["summary"] == "finished" || status["abandoned"] == true) {
+            settled.entry(run_id.to_string()).or_insert(now);
+        } else {
+            settled.remove(run_id);
+        }
+    }
+
+    /// Lets go of every run that has been settled for `evict_after` (RS13). Until Nov 19, 2026 a
+    /// long-lived server kept every run it had seen: each rank's buffer and detectors, its
+    /// report, the batch hashes, the manifest, the watchdog's clocks, and rebuilt every run's status
+    /// at every pass. A run is let go of as a restart lets it go: a restarted server does not take
+    /// up a finished or abandoned run either, and a rank of it that comes back is taken as after a
+    /// restart (its watermark read from the store, its detectors rebuilt from the store, the
+    /// watchdog watching it afresh). What that loses is the same as after a restart: a finished
+    /// rank whose job starts again is not seen as reopened, and the run's ranks that do not come
+    /// back are not in its new status.
+    fn evict_settled(&self) {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .settled
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) >= self.config.evict_after)
+            .map(|(run_id, _)| run_id.clone())
+            .collect();
+        for run_id in due {
+            if self.evict_run(&run_id, now) {
+                self.settled.lock().unwrap().remove(&run_id);
+            }
+        }
+    }
+
+    /// Lets go of one run, if every buffer of it is idle and the watchdog finds it still settled;
+    /// false (try again at the next pass) otherwise. A buffer is taken out of the map only while
+    /// the map holds the one handle to it: a stream that holds another could write rows into a
+    /// buffer no flush would ever find. The map stays locked until every trace of the run is gone,
+    /// so a stream of it that starts meanwhile finds nothing and starts afresh.
+    fn evict_run(&self, run_id: &str, now: Instant) -> bool {
+        let mut buffers = self.buffers.lock().unwrap();
+        let keys: Vec<Key> = buffers.keys().filter(|key| key.0 == run_id).cloned().collect();
+        for key in &keys {
+            let buffer = &buffers[key];
+            if Arc::strong_count(buffer) > 1 {
+                return false;
+            }
+            let Ok(held) = buffer.try_lock() else {
+                return false;
+            };
+            if !held.batches.is_empty() || held.pending_offset.is_some() || held.ack.is_some() || held.sealed {
+                return false;
+            }
+        }
+        if !self.watchdog.evict(run_id, now) {
+            return false;
+        }
+        for key in &keys {
+            buffers.remove(key);
+        }
+        self.reports.lock().unwrap().retain(|key, _| key.0 != run_id);
+        self.stored.lock().unwrap().retain(|key, _| key.0 != run_id);
+        self.data_windows.lock().unwrap().remove(run_id);
+        self.manifests.lock().unwrap().remove(run_id);
+        self.written.lock().unwrap().remove(run_id);
+        drop(buffers);
+        true
     }
 
     /// The last write before the server stops. A finished run keeps its verdict, which does not
@@ -901,11 +1122,13 @@ impl Ingest {
                         || !status_refresh_due(now.saturating_duration_since(*at), self.config.status_refresh))
             });
             if fresh {
+                self.note_settled(&run_id, &status, now);
                 continue;
             }
             let started = Instant::now();
             match self.storage.write_status(&run_id, &status).await {
                 Ok(()) => {
+                    self.note_settled(&run_id, &status, started);
                     self.written.lock().unwrap().insert(run_id, (signature, started));
                 }
                 Err(error) => eprintln!("tensorquill-server: cannot write the watchdog status of {run_id}: {error}"),
@@ -915,23 +1138,33 @@ impl Ingest {
 
     /// Runs `write_watchdog` every `watchdog_interval` until `stop`, which lets a write in
     /// progress finish, so no live status can land after the stopped one. With an interval of
-    /// zero no file is written and the task ends at once.
+    /// zero no file is written: every `DEFAULT_WATCHDOG_INTERVAL` the runs settled in memory are
+    /// let go of (`evict_settled`), and nothing else.
     pub fn spawn_watchdog(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let ingest = self.clone();
         let mut stopping = self.stopping.subscribe();
         tokio::spawn(async move {
             let period = ingest.config.watchdog_interval;
-            if period.is_zero() {
-                return;
-            }
-            let mut ticker = tokio::time::interval(period);
+            let mut ticker = tokio::time::interval(if period.is_zero() {
+                DEFAULT_WATCHDOG_INTERVAL
+            } else {
+                period
+            });
             loop {
                 tokio::select! {
                     biased;
                     _ = stopping.wait_for(|stop| *stop) => return,
                     _ = ticker.tick() => {}
                 }
-                ingest.write_watchdog().await;
+                if period.is_zero() {
+                    let now = Instant::now();
+                    for (run_id, status) in ingest.watchdog.statuses(now, true) {
+                        ingest.note_settled(&run_id, &status, now);
+                    }
+                    ingest.evict_settled();
+                } else {
+                    ingest.write_watchdog().await;
+                }
             }
         })
     }
@@ -1086,6 +1319,7 @@ impl FlightService for IngestService {
                 ingest.detach(key, &ack).await;
             }
             if let Err(status) = result {
+                ingest.stream_failed(key.as_ref(), &status);
                 let _ = ack.send(Err(status));
             }
         });
@@ -1177,6 +1411,30 @@ mod tests {
         assert_eq!(kept_stack(Some(stack), MAX_HEARTBEAT_STACK_BYTES + 1), None);
         assert_eq!(kept_stack(Some(serde_json::json!("x".repeat(10))), 100), None);
         assert_eq!(kept_stack(None, 100), None);
+    }
+
+    /// RUST-18. One stream-error line per interval; the errors between are counted in the next.
+    #[test]
+    fn stream_error_lines_are_held_to_one_per_interval() {
+        let t0 = Instant::now();
+        let mut log = ErrorLog::default();
+        assert_eq!(log.due(t0), Some(0));
+        assert_eq!(log.due(t0 + Duration::from_secs(1)), None);
+        assert_eq!(log.due(t0 + Duration::from_secs(9)), None);
+        assert_eq!(log.due(t0 + STREAM_ERROR_LOG_INTERVAL), Some(2));
+        assert_eq!(log.due(t0 + STREAM_ERROR_LOG_INTERVAL * 3), Some(0));
+    }
+
+    /// RUST-16. The wait after failed rebuilds doubles, up to 64 times the first.
+    #[test]
+    fn the_wait_after_failed_rebuilds_doubles_and_is_bounded() {
+        let base = Duration::from_secs(10);
+        let waits: Vec<u64> = [1, 2, 3, 7, 8, 1000]
+            .iter()
+            .map(|n| replay_wait(base, *n).as_secs())
+            .collect();
+        assert_eq!(waits, [10, 20, 40, 640, 640, 640]);
+        assert_eq!(replay_wait(Duration::MAX, 5), Duration::MAX);
     }
 
     #[test]
