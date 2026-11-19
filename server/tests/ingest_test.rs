@@ -2812,10 +2812,18 @@ async fn finished_runs_are_let_go_and_one_that_comes_back_is_taken_as_after_a_re
     for n in 0..20 {
         let run_id = format!("run-{n}");
         assert_eq!(a_short_run(&server, &run_id, 0..10).await, [10]);
-        server.ingest.write_watchdog().await;
+        // A pass that finds a buffer still in use leaves the run to the next one.
+        let deadline = tokio::time::Instant::now() + SLOW_BOUND;
+        loop {
+            server.ingest.write_watchdog().await;
+            if server.ingest.runs_held() == 0 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{run_id} never let go of");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let status = json_file(&dir.path().join("runs").join(&run_id).join("watchdog.json"));
         assert_eq!(status["summary"], "finished", "{status}");
-        assert_eq!(server.ingest.runs_held(), 0, "after {run_id}");
     }
     // A run that is not finished is kept.
     let mut open_run = open_as(&server, "still-open", 0, None).await;
@@ -2859,6 +2867,26 @@ async fn finished_runs_are_let_go_and_one_that_comes_back_is_taken_as_after_a_re
     let status = json_file(&dir.path().join("runs").join("run-3").join("watchdog.json"));
     assert_eq!(status["summary"], "finished", "{status}");
     assert_eq!(server.ingest.runs_held(), 1, "only the open run");
+    // A heartbeat for a rank let go of finds nothing: the rank is watched afresh, as after a
+    // restart (a rank first seen by a beat is `starting`). The SDK stops its heartbeat before it
+    // closes its stream, so only a job started again, or another sender, can send one this late.
+    let mut flight = client(&server).await;
+    flight
+        .do_action(Action::new(
+            "heartbeat",
+            "{\"run_id\":\"run-5\",\"rank\":0,\"phase\":\"train\",\"interval_seconds\":15}".to_string(),
+        ))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let rank = &server.ingest.watchdog_statuses()["run-5"]["ranks"][0];
+    assert_eq!(
+        (rank["state"].as_str(), rank["last_step"].as_i64()),
+        (Some("starting"), None),
+        "{rank}"
+    );
     // A restarted server takes up the open run only.
     drop(open_run);
     let restarted = Ingest::new(
