@@ -59,6 +59,72 @@ def recompiled_frames(metrics) -> tuple[int, list[str]]:
     return sum(frames.values()), lines
 
 
+NONFINITE = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}  # as the sink writes them
+
+
+def recorded(value) -> bool:
+    """A value was recorded: a number, or the string the sink writes for a non-finite one."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)) or value in NONFINITE
+
+
+def _number(value) -> float | None:
+    if isinstance(value, str):
+        return NONFINITE.get(value)
+    return float(value) if recorded(value) else None
+
+
+def _same(ours: float, theirs: float) -> tuple[bool, float]:
+    """Whether two values agree, and their relative difference when both are finite. A
+    non-finite value agrees only with the same one: NaN with NaN, +inf with +inf."""
+    if math.isfinite(ours) and math.isfinite(theirs):
+        off = abs(ours - theirs) / max(abs(theirs), 1e-8)
+        return True, off
+    same = (math.isnan(ours) and math.isnan(theirs)) or ours == theirs
+    return same, 0.0
+
+
+def trainer_agreement(losses: list, norms: list, history: list[dict], log_every: int) -> dict[str, dict]:
+    """Each of Trainer's logged values beside what TensorQuill recorded for the same steps.
+
+    For every entry of `history` (Trainer's `log_history` with a loss and a grad_norm): the mean
+    of the recorded `train/loss` over the interval it averages, and the recorded `clip_grad_norm`
+    of its last step. Returns, for "loss" and "grad_norm", how many pairs were compared, the
+    largest relative difference between finite pairs, and a line for each pair that does not
+    agree: a value not recorded, or a non-finite value on one side only (or of another kind).
+    """
+    result = {name: {"pairs": 0, "worst": 0.0, "problems": []} for name in ("loss", "grad_norm")}
+    for entry in history:
+        end = entry["step"]
+        start = max(0, end - log_every)
+        pairs = {"loss": None, "grad_norm": None}
+        window = [_number(v) for v in losses[start:end]]
+        if window and None not in window:
+            pairs["loss"] = (sum(window) / len(window), f"steps {start} to {end - 1}")
+        else:
+            result["loss"]["problems"].append(f"steps {start} to {end - 1}: train/loss not recorded on every step")
+        norm = _number(norms[end - 1]) if 0 < end <= len(norms) else None
+        if norm is not None:
+            pairs["grad_norm"] = (norm, f"step {end - 1}")
+        else:
+            result["grad_norm"]["problems"].append(f"step {end - 1}: no clip_grad_norm recorded")
+        for name, pair in pairs.items():
+            if pair is None:
+                continue
+            ours, where = pair
+            theirs = float(entry[name])
+            same, off = _same(ours, theirs)
+            result[name]["pairs"] += 1
+            result[name]["worst"] = max(result[name]["worst"], off)
+            if not same:
+                result[name]["problems"].append(f"{where}: recorded {ours}, Trainer logged {theirs}")
+    return result
+
+
+def agrees(compared: dict, tolerance: float = 0.01) -> bool:
+    """At least one pair compared, every pair agreeing, finite ones within `tolerance`."""
+    return compared["pairs"] > 0 and not compared["problems"] and compared["worst"] < tolerance
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", type=Path, required=True, help="new directory for the run")
@@ -147,6 +213,9 @@ def main() -> None:
         fp16=precision == "fp16", bf16=precision == "bf16", use_cpu=not cuda,
         torch_compile=not args.eager, torch_compile_backend=None if args.eager else args.backend,
         dataloader_drop_last=True,
+        # Trainer's default replaces a NaN or infinite step loss with its running average before
+        # logging; off, the logged loss is the plain interval mean that `trainer_agreement` compares.
+        logging_nan_inf_filter=False,
     )
 
     class InOrder(Trainer):
@@ -187,21 +256,15 @@ def main() -> None:
           f"{len(records)} records, steps 0 to {args.steps - 1}, matching Trainer's global_step")
     losses = [r.get("scalars", {}).get("train/loss") for r in records]
     norms = [r.get("clip_grad_norm") for r in records]
-    check(all(isinstance(v, float) for v in losses), "train/loss recorded on every step")
-    check(all(isinstance(v, (float, str)) for v in norms), "clip_grad_norm recorded on every step")
-    loss_off = norm_off = 0.0
-    for entry in history:
-        end = entry["step"]
-        window = [v for v in losses[end - args.log_every : end] if isinstance(v, float)]
-        if window and math.isfinite(entry["loss"]):
-            loss_off = max(loss_off, abs(sum(window) / len(window) - entry["loss"]) / max(abs(entry["loss"]), 1e-8))
-        norm = norms[end - 1]
-        if isinstance(norm, float) and math.isfinite(entry["grad_norm"]):
-            norm_off = max(norm_off, abs(norm - entry["grad_norm"]) / max(abs(entry["grad_norm"]), 1e-8))
-    check(bool(history) and loss_off < 0.01,
-          f"interval mean of train/loss agrees with Trainer's logged loss (largest difference {100 * loss_off:.3f}%)")
-    check(bool(history) and norm_off < 0.01,
-          f"clip_grad_norm agrees with Trainer's logged grad_norm (largest difference {100 * norm_off:.3f}%)")
+    check(all(recorded(v) for v in losses), "train/loss recorded on every step")
+    check(all(recorded(v) for v in norms), "clip_grad_norm recorded on every step")
+    agreement = trainer_agreement(losses, norms, history, args.log_every)
+    for name, label in (("loss", "interval mean of train/loss"), ("grad_norm", "clip_grad_norm")):
+        compared = agreement[name]
+        check(agrees(compared), f"{label} agrees with Trainer's logged {name} on {compared['pairs']} of "
+                                f"{len(history)} logged steps (largest difference {100 * compared['worst']:.3f}%)")
+        for problem in compared["problems"][:5]:
+            print(f"  {problem}")
     if precision == "fp16":
         skipped = sum(1 for r in records if r.get("step_skipped"))
         check(all("grad_scale" in r for r in records), f"grad_scale recorded on every step ({skipped} steps skipped)")

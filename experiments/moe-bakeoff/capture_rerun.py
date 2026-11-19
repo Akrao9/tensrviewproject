@@ -8,8 +8,6 @@ import signal
 import subprocess
 import time
 
-from rerun.experimental import ViewerClient
-
 
 VIEWS = {"Training incidents", "Routing status by layer and expert", "Router diversity by layer"}
 
@@ -23,7 +21,19 @@ def loaded(state, last_step):
             and not state.loading and any(timeline.end == last_step for timeline in timelines))
 
 
+def selected_steps(evidence, step=None, last_step=None):
+    """The step to show and the recording's last step: the ones given, where given (0 included),
+    else the first `moe_imbalance` incident's step and the last sample's step."""
+    if last_step is None:
+        last_step = max(sample["step"] for sample in evidence["samples"])
+    if step is None:
+        step = next(i for i in evidence["incidents"] if i["kind"] == "moe_imbalance")["step"]
+    return step, last_step
+
+
 def main():
+    from rerun.experimental import ViewerClient  # here, so selected_steps can be tested without rerun-sdk
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--executable", default="rerun")
     parser.add_argument("--port", type=int, default=9887)
@@ -35,8 +45,7 @@ def main():
     evidence = json.loads((output / f"{args.fixture}.evidence.json").read_text(encoding="utf-8"))
     if not evidence["samples"]:
         parser.error(f"{args.fixture} has no MoE samples, and this capture shows the MoE views")
-    last_step = args.last_step or max(sample["step"] for sample in evidence["samples"])
-    step = args.step or next(i for i in evidence["incidents"] if i["kind"] == "moe_imbalance")["step"]
+    step, last_step = selected_steps(evidence, args.step, args.last_step)
     with subprocess.Popen([
         args.executable, "--headless", "--integration-test", "--bind", "127.0.0.1",
         "--port", str(args.port), "--window-size", "1160x720", str(output / f"{args.fixture}.rrd"),

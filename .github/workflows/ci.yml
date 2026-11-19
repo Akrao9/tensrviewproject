@@ -41,6 +41,14 @@ jobs:
             torch: "2.15"
           - python: "3.14"
             torch: "2.15"
+          # The declared floor on both axes (`requires-python = ">=3.10"`, `torch>=2.6`).
+          - python: "3.10"
+            torch: "2.6"
+          # PyTorch 2.9: capture.py (`_NotRecomputed`) names it as no longer saving for backward an input
+          # that backward does not use, the router hook's buffer in a checkpointed block among them,
+          # where 2.6 saves it. 2.7 and 2.8 have not been checked.
+          - python: "3.12"
+            torch: "2.9"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -51,6 +59,8 @@ jobs:
       - name: Install
         run: |
           pip install "torch==${{ matrix.torch }}.*" --index-url https://download.pytorch.org/whl/cpu
+          # Python 3.10 has no tomllib: packaging/requirements.py then reads pyproject.toml with tomli.
+          python -c "import tomllib" 2>/dev/null || pip install tomli
           # tensorquill-server is not on PyPI before the first release, so pip cannot resolve it yet:
           # everything else tensorquill requires, then tensorquill alone (packaging/requirements.py).
           pip install -r <(python packaging/requirements.py dev)
@@ -108,6 +118,8 @@ jobs:
           cache-dependency-path: sdk/pyproject.toml
       - name: Server tests
         run: cargo test --manifest-path ../server/Cargo.toml
+      - name: Lint the default build, with the S3 and GCS stores
+        run: cargo clippy --manifest-path ../server/Cargo.toml --all-targets --all-features -- -D warnings
       - name: Local-only build (no S3 or GCS) still lints and passes
         run: |
           cargo clippy --manifest-path ../server/Cargo.toml --all-targets --no-default-features -- -D warnings

@@ -440,7 +440,7 @@ def seeded(tmp_path_factory) -> Path:
 
 @pytest.mark.parametrize("case, step", [("grad_spike", 250), ("stalled_weights", 249)])
 def test_a_healthy_run_and_a_seeded_run_compare_as_one_incident_in_the_second_only_on_the_seeded_parameter(seeded, case, step):
-    healthy, planted = seeded / "healthy" / "healthy.jsonl", seeded / case / f"{case}.jsonl"
+    healthy, planted = seeded / "healthy.jsonl", seeded / f"{case}.jsonl"
     result = tensorquill.compare_runs(healthy, planted)
     assert [(run["name"], run["run_id"], run["project"], run["incidents"]) for run in result["runs"]] == [
         ("healthy", "seeded-healthy", "seeded-failures", 0), (case, f"seeded-{case}", "seeded-failures", 1)]
@@ -463,8 +463,8 @@ def test_the_seeded_runs_are_found_by_name_in_one_folder_and_the_command_writes_
     folder = tmp_path / "together"
     folder.mkdir()
     for case in ("healthy", "grad_spike", "stalled_weights"):
-        (folder / f"seeded-{case}.rank0.jsonl").write_bytes((seeded / case / f"{case}.jsonl").read_bytes())
-        (folder / f"seeded-{case}.run.json").write_bytes((seeded / case / f"seeded-{case}.run.json").read_bytes())
+        (folder / f"seeded-{case}.rank0.jsonl").write_bytes((seeded / f"{case}.jsonl").read_bytes())
+        (folder / f"seeded-{case}.run.json").write_bytes((seeded / f"seeded-{case}.run.json").read_bytes())
     rows = tensorquill.list_runs(folder, project="seeded-failures")
     assert [row["name"] for row in rows] == ["healthy", "grad_spike", "stalled_weights"]
     done = cli("compare", "healthy", "grad_spike", "stalled_weights", "--source", str(folder), "--project",
