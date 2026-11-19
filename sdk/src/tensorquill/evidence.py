@@ -1619,6 +1619,20 @@ def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def check_one_run(records: Iterable[Mapping[str, Any]]) -> None:
+    """Raise `ValueError` when `records` are of more than one run. Checked before attempts are
+    resolved or any rule runs (lane U7, Nov 19, 2026): two jobs appending to one file gave evidence
+    for the first run showing the second's incidents. The Rust detectors refuse the same rows
+    (`detect_rows` in detect.rs)."""
+    runs = sorted({_run_of(r) for r in records})
+    if len(runs) > 1:
+        raise ValueError(
+            f"these records come from more than one run ({', '.join(repr(run) if run else 'no run_id' for run in runs)}):"
+            " evidence is of one rank of one run, so read each run's records on their own. A record with no run_id"
+            " (written before it existed) is of no named run, and joins only records that have none either"
+        )
+
+
 def _run_of(record: Mapping[str, Any]) -> str:
     """A record's run ID, with "" for a record that names none (written before `run_id` existed,
     or not a string): as the Rust detectors read it (`server_detect.records_stream`), so rows
@@ -4549,16 +4563,7 @@ def build_evidence(
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
         raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
-    # One run, checked before attempts are resolved or any rule runs (lane U7, Nov 19, 2026): two
-    # jobs appending to one file gave evidence for the first run showing the second's incidents.
-    # The Rust detectors refuse the same rows (`detect_rows` in detect.rs).
-    runs = sorted({_run_of(r) for r in every_attempt})
-    if len(runs) > 1:
-        raise ValueError(
-            f"these records come from more than one run ({', '.join(repr(run) if run else 'no run_id' for run in runs)}):"
-            " evidence is of one rank of one run, so read each run's records on their own. A record with no run_id"
-            " (written before it existed) is of no named run, and joins only records that have none either"
-        )
+    check_one_run(every_attempt)
     records = resolve_attempts(every_attempt)
     router_sizes = _router_sizes(records)
     routers = list(router_sizes)
@@ -6096,6 +6101,10 @@ def main() -> None:
         print(f"tensorquill: warning: {fallback}. `--detectors python` asks for the Python detectors without this "
               "warning", file=sys.stderr)
     records, left_out = _load_counted(args.input, rank)
+    try:
+        check_one_run(records)  # a usage error with either detectors, as the Rust path gives it
+    except ValueError as error:
+        parser.error(str(error))
     try:
         evidence = build_evidence(
             records, **args.thresholds, watchdog=_watchdog_beside(args.input),

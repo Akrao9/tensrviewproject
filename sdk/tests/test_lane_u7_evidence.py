@@ -108,6 +108,16 @@ def test_records_of_two_runs_are_refused_before_any_rule_runs(tmp_path, rows):
         tensorquill.build_evidence(shared)
 
 
+def test_the_command_line_refuses_a_file_of_two_runs_with_a_usage_error(tmp_path, monkeypatch, capsys):
+    # As the Rust detectors' refusal reaches the user (parser.error), not as a traceback.
+    shared = _capture(tmp_path / "shared.jsonl", [{**r, "grad_norm": "nan"} if r["step"] else r for r in TWO_RUNS])
+    monkeypatch.setattr("sys.argv", ["tensorquill", str(shared), "--detectors", "python", "-o", str(tmp_path / "o.json")])
+    with pytest.raises(SystemExit) as stopped:
+        ev.main()
+    assert stopped.value.code == 2 and "more than one run" in capsys.readouterr().err
+    assert not (tmp_path / "o.json").exists()
+
+
 @RUST
 def test_the_rust_detectors_refuse_the_same_rows():
     # The Rust side's own refusal (detect.rs `detect_rows`), unchanged here: both engines refuse.
