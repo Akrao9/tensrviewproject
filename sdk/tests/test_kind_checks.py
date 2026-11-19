@@ -733,9 +733,11 @@ def hand_report(rank: int, records: list[dict], not_checked: list[dict] = (), in
 
 
 def hand_store(tmp_path: Path, ranks: dict[int, list[dict]], *, status: str | None = FINISHED,
-               not_checked: dict[int, list[dict]] | None = None, incidents: dict[int, list[dict]] | None = None) -> Path:
+               not_checked: dict[int, list[dict]] | None = None, incidents: dict[int, list[dict]] | None = None,
+               ranks_compared: object = None) -> Path:
     """A run folder as `tensorquill-server` leaves it: for each rank a current report and one
-    part (only its name is read), and the run's status unless `status` is None."""
+    part (only its name is read), and the run's status unless `status` is None. The status
+    has `ranks_compared` only when it is given, as a server before Nov 18, 2026 left it out."""
     folder = tmp_path / "store" / "runs" / HAND_RUN
     for rank, records in ranks.items():
         parts = folder / f"rank={rank}" / "attempt=1"
@@ -749,6 +751,7 @@ def hand_store(tmp_path: Path, ranks: dict[int, list[dict]], *, status: str | No
         (folder / "watchdog.json").write_text(json.dumps({
             "schema_version": 1, "summary": status, "world_size": len(ranks),
             "ranks": [{"rank": rank, "state": status, "last_step": records[-1]["step"]} for rank, records in ranks.items()],
+            **({"ranks_compared": ranks_compared} if ranks_compared is not None else {}),
         }), encoding="utf-8")
     return folder
 
@@ -1069,6 +1072,57 @@ def test_duplicate_batches_needs_data_on_every_judged_rank_and_the_servers_statu
     alone = hand_store(tmp_path / "alone", {0: steps(60, **data)})
     evidence, _, _ = three_ways(alone, tmp_path)
     assert evidence["kind_checks"]["duplicate_batches"]["value"] == "not_configured"
+
+
+def test_duplicate_batches_is_checked_on_the_ranks_the_servers_status_says_it_compared(tmp_path):
+    # Since Nov 18, 2026 the status always lists the ranks whose batch hashes the server compared
+    # (`ranks_compared`), found or not. The entry reads that, not what the ranks recorded: after a
+    # restart, "compared, none found" and "not compared" no longer look the same.
+    data = {"data": lambda step: {"batch_hash": f"h{step}", "epoch": 0, "batch": step}}
+    needs = "data (session.watch_loader) on every judged rank, at least two ranks, and the server's progress status (watchdog.json)"
+    both = hand_store(tmp_path / "both", {0: steps(60, **data), 1: steps(60, **data)}, ranks_compared=[0, 1])
+    evidence, compared_summary, _ = three_ways(both, tmp_path)
+    assert evidence["kind_checks"]["duplicate_batches"] == {"value": "checked", "enough_history": True, "needs": needs}
+    assert count_line(compared_summary) == "10 of 33 kinds checked on both ranks, 23 not configured"
+    # Right after a restart the server has read no rank's store: nothing was compared, so nothing
+    # is checked, and the ranks that recorded data are named. It degrades nothing.
+    restarted = hand_store(tmp_path / "restarted", {0: steps(60, **data), 1: steps(60, **data)}, ranks_compared=[])
+    evidence, summary, _ = three_ways(restarted, tmp_path)
+    assert evidence["kind_checks"]["duplicate_batches"] == {
+        "value": "not_configured", "enough_history": False, "needs": needs, "not_compared_ranks": [0, 1],
+        "note": "ranks 0-1 recorded data and are not in the server's `ranks_compared`: it compares the ranks whose"
+                " stores it has read since it started (none right after a restart), and only batches with a batch hash",
+    }
+    assert evidence["run_state"]["state"] == "healthy"
+    assert count_line(summary) == "9 of 33 kinds checked on both ranks, 24 not configured"
+    # One rank not compared yet: the worst rank's value, with the ranks by value and the one named.
+    some = hand_store(tmp_path / "some", {n: steps(60, **data) for n in range(3)}, ranks_compared=[0, 1])
+    evidence, summary, status = three_ways(some, tmp_path)
+    check = evidence["kind_checks"]["duplicate_batches"]
+    assert (check["value"], check["ranks"], check["not_compared_ranks"]) == (
+        "not_configured", {"checked": [0, 1], "not_configured": [2]}, [2])
+    assert check["note"].startswith("rank 2 recorded data and is not in the server's `ranks_compared`")
+    assert "duplicate_batches on ranks 0-1" in count_line(summary)
+    assert status["kinds"]["differs_by_rank"]["duplicate_batches"] == {"checked": "0-1", "not_configured": "2"}
+    # A rank without data that the server did not list is not configured, and not named as missed.
+    plain = hand_store(tmp_path / "plain", {0: steps(60, **data), 1: steps(60, **data), 2: steps(60)},
+                       ranks_compared=[0, 1])
+    evidence, _, _ = three_ways(plain, tmp_path)
+    check = evidence["kind_checks"]["duplicate_batches"]
+    assert (check["value"], check["ranks"]) == ("not_configured", {"checked": [0, 1], "not_configured": [2]})
+    assert "not_compared_ranks" not in check and "note" not in check
+    # One rank listed compared with nothing.
+    one = hand_store(tmp_path / "one", {0: steps(60, **data), 1: steps(60)}, ranks_compared=[0])
+    evidence, _, _ = three_ways(one, tmp_path)
+    assert evidence["kind_checks"]["duplicate_batches"] == {"value": "not_configured", "enough_history": False, "needs": needs}
+    # A status that does not say which ranks, or says it in another shape, is read as one from a
+    # server before the key: what the ranks recorded, with the note (the test above).
+    for odd in ("0,1", [0, "1"], {"0": True}):
+        older = hand_store(tmp_path / f"odd-{len(list(tmp_path.glob('odd-*')))}",
+                           {0: steps(60, **data), 1: steps(60, **data)}, ranks_compared=odd)
+        evidence, _, _ = three_ways(older, tmp_path)
+        check = evidence["kind_checks"]["duplicate_batches"]
+        assert check["value"] == "checked" and "only when it finds a duplicate" in check["note"], odd
 
 
 def test_the_count_line_stays_short_with_many_ranks_and_many_kinds(tmp_path):

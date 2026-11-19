@@ -3318,9 +3318,14 @@ def _group_incidents(looks: Mapping[int, Mapping[str, Any]], judged: list[int]) 
 #   5. The two cross-rank kinds are judged for the run, by rule 2 over what each judged rank
 #      brings to the comparison, and need two ranks: `memory_imbalance` is `checked` when
 #      every judged rank's report has a peak memory reading and there are at least two;
-#      `duplicate_batches`, which the server compares and puts in its status, when every
-#      judged rank recorded `data` on some step, there are at least two, and a status was
-#      read (`unavailable` without one).
+#      `duplicate_batches`, which the server compares and puts in its status, when the
+#      status's `ranks_compared` lists every judged rank and at least two ranks
+#      (`unavailable` without a status). A judged rank it does not list is `not_configured`
+#      for the comparison, unless its own report says its data could not be read, and is
+#      named under `not_compared_ranks` when it recorded `data`: the server compares the
+#      ranks whose stores it has read since it started, and only hashed batches. A status
+#      from a server before `ranks_compared` (Nov 18, 2026) does not say which ranks it
+#      compared, so then the ranks that recorded `data` count, with a `note` that says so.
 #   6. When no rank is judged, or a judged rank's report has no usable `kind_checks` (a
 #      server older than the key wrote it), there is no run-level object and no count:
 #      `kind_checks_not_stated` says why and names the ranks. A count over the ranks that do
@@ -3443,19 +3448,43 @@ def run_kind_checks(
         return isinstance(reading, Mapping) and _finite_number(reading.get("peak_allocated")) is not None
 
     checks["memory_imbalance"] = _cross_rank_check("memory_imbalance", brings(peak, _MEMORY_KIND))
-    duplicates = _cross_rank_check(
-        "duplicate_batches", brings(lambda rank: bool(rank_checks[rank][_DATA_KIND].get("records")), _DATA_KIND))
-    if duplicates["value"] == "checked":
-        if status is None:
-            duplicates = {**_unavailable({"check": "status", "reason": _NO_STATUS}, enough_history=False,
-                                         needs=duplicates["needs"])}
-        else:
-            # The status carries the comparison only when it finds a duplicate, so this is what
-            # the ranks recorded, not proof that the server held every rank's batches.
-            duplicates["note"] = ("the server compares the ranks whose stores it has read since it started, and its"
-                                  " status names them only when it finds a duplicate")
+    recorded = [rank for rank in rank_checks if rank_checks[rank][_DATA_KIND].get("records")]
+    compared = _ranks_compared(status)
+    if compared is None:
+        duplicates = _cross_rank_check("duplicate_batches", brings(lambda rank: rank in recorded, _DATA_KIND))
+        if duplicates["value"] == "checked":
+            if status is None:
+                duplicates = {**_unavailable({"check": "status", "reason": _NO_STATUS}, enough_history=False,
+                                             needs=duplicates["needs"])}
+            else:
+                # A server before `ranks_compared` names the ranks it compared only in a finding, so this
+                # is what the ranks recorded, not proof that the server held every rank's batches.
+                duplicates["note"] = ("the server compares the ranks whose stores it has read since it started, and"
+                                      " its status names them only when it finds a duplicate")
+    else:
+        # What the server compared: one rank alone compared with nothing.
+        listed = set(compared) if len(set(compared)) >= 2 else set()
+        duplicates = _cross_rank_check("duplicate_batches", brings(lambda rank: rank in listed, _DATA_KIND))
+        missed = sorted(rank for rank in recorded if rank not in compared)
+        if missed:
+            duplicates["not_compared_ranks"] = missed
+            many = len(missed) != 1
+            duplicates["note"] = (
+                f"rank{'s' if many else ''} {_rank_ranges(missed, 8)} recorded data and {'are' if many else 'is'} not"
+                " in the server's `ranks_compared`: it compares the ranks whose stores it has read since it started"
+                " (none right after a restart), and only batches with a batch hash")
     checks["duplicate_batches"] = duplicates
     return {kind: checks[kind] for kind in INCIDENT_CLASSES}
+
+
+def _ranks_compared(status: Mapping[str, Any] | None) -> list[int] | None:
+    """The ranks whose batch hashes the server compared, from its status (`ranks_compared`,
+    written whether or not a duplicate is found); None when the status does not say: none was
+    read, or a server before the key wrote it."""
+    found = status.get("ranks_compared") if isinstance(status, Mapping) else None
+    if isinstance(found, list) and all(isinstance(rank, int) and not isinstance(rank, bool) for rank in found):
+        return found
+    return None
 
 
 def _all_ranks_kind_checks(

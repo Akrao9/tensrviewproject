@@ -67,7 +67,7 @@ use serde_json::{json, Value};
 use crate::storage::{Error, Storage};
 
 mod data;
-pub use data::{detect_run, duplicate_batches, read_batches};
+pub use data::{detect_run, duplicate_batches, ranks_compared, read_batches};
 use data::{DataProgress, DataRow, ResumeFound, ResumePass, ResumeRow};
 mod system;
 use system::{System, SystemColumns};
@@ -2876,7 +2876,7 @@ impl Attempts {
 /// Python's `_compare_resume`: a change to report, nothing when the resumed learning rate
 /// continues the history, or the reason the two cannot be compared.
 fn compare_resume(
-    history: &[(i64, i64, Vec<f64>)],
+    history: &BTreeMap<i64, (i64, Vec<f64>)>,
     new: Option<&[f64]>,
     resumed_at: i64,
     first_lr: Option<&[f64]>,
@@ -2885,19 +2885,18 @@ fn compare_resume(
     if history.is_empty() {
         return Err("no learning rate recorded in the earlier attempts");
     }
-    let at = history.partition_point(|(step, _, _)| *step < resumed_at);
-    let (basis, expected, source, slope_tolerance) = match history.get(at) {
-        Some((step, attempt, lr)) if *step == resumed_at => ("same_step", lr.clone(), *attempt, 0.0),
-        _ => {
-            let recent = &history[at.saturating_sub(10)..at];
-            let (last, source, latest) = recent
-                .last()
+    let (basis, expected, source, slope_tolerance) = match history.get(&resumed_at) {
+        Some((attempt, lr)) => ("same_step", lr.clone(), *attempt, 0.0),
+        None => {
+            // The history's last ten steps before the resume, newest first.
+            let mut recent = history.range(..resumed_at).rev().take(10);
+            let (last, (source, latest)) = recent
+                .next()
                 .ok_or("the earlier attempts recorded no learning rate before the resume step")?;
             let ahead = (resumed_at - last) as f64;
             let mut expected = latest.clone();
             let mut steepest = 0.0_f64;
-            let (oldest, _, oldest_lr) = &recent[0];
-            if recent.len() > 1 && oldest_lr.len() == latest.len() {
+            if let Some((oldest, (_, oldest_lr))) = recent.last().filter(|(_, (_, lr))| lr.len() == latest.len()) {
                 // Continue the history's last values along their recent slope.
                 let span = (last - oldest) as f64;
                 for (expected, before) in expected.iter_mut().zip(oldest_lr) {
@@ -2963,9 +2962,11 @@ struct AttemptPass {
     /// The steps of the attempts before the current one, in order and without repeats.
     earlier: Vec<i64>,
     repeated: std::collections::BTreeSet<i64>,
-    /// The run as it stood before the current row: (step, attempt, learning rate) in step
-    /// order, with each rollback applied.
-    history: Vec<(i64, i64, Vec<f64>)>,
+    /// The run as it stood before the current row: each step's (attempt, learning rate), with
+    /// each rollback applied. By step, the last writing of a step winning, as Python's dict:
+    /// rows whose steps go back within an attempt (only rows from outside a store) must not
+    /// leave it out of order (RUST-05).
+    history: BTreeMap<i64, (i64, Vec<f64>)>,
     first_lr: Option<Vec<f64>>,
     /// The same history for the data and checkpoint checks.
     resume: ResumePass,
@@ -2984,7 +2985,7 @@ impl AttemptPass {
             current_max: None,
             earlier: Vec::new(),
             repeated: Default::default(),
-            history: Vec::new(),
+            history: BTreeMap::new(),
             first_lr: None,
             resume: ResumePass::default(),
         }
@@ -3010,8 +3011,7 @@ impl AttemptPass {
                     .resumed(self.rank, attempt, step, self.run_start, &resume_row, resumes);
             }
             // This attempt rolls back what earlier ones recorded from its first step on.
-            self.history
-                .truncate(self.history.partition_point(|(known, _, _)| *known < step));
+            self.history.split_off(&step);
             self.resume.roll_back(step);
         }
         self.resume.add(attempt, step, resume_row, first_attempt);
@@ -3022,8 +3022,14 @@ impl AttemptPass {
         }
         self.current_steps.push(step);
         self.current_max = Some(self.current_max.map_or(step, |max| max.max(step)));
-        if let Some(lr) = lr {
-            self.history.push((step, attempt, lr));
+        match lr {
+            Some(lr) => {
+                self.history.insert(step, (attempt, lr));
+            }
+            // A step written again without one: Python's history holds the last writing only.
+            None => {
+                self.history.remove(&step);
+            }
         }
     }
 
@@ -3952,6 +3958,115 @@ mod tests {
         // An older attempt after a newer one is refused, not read in the wrong order.
         let error = judge(0, &[key_rows(&rest), first], &usual()).err().unwrap();
         assert!(error.contains("group the rows by attempt"), "{error}");
+    }
+
+    /// One rank's rows as (attempt, step, learning rate): one group, or none for a null `lr`.
+    fn lr_rows(rows: &[(i64, i64, Option<f64>)]) -> RecordBatch {
+        use arrow::array::{Float64Builder, ListBuilder};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let mut lr = ListBuilder::new(Float64Builder::new());
+        for (_, _, value) in rows {
+            match value {
+                Some(value) => {
+                    lr.values().append_value(*value);
+                    lr.append(true);
+                }
+                None => lr.append(false),
+            }
+        }
+        let lr = lr.finish();
+        let schema = Schema::new(vec![
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("rank", DataType::Int32, false),
+            Field::new("attempt", DataType::Int64, false),
+            Field::new("step", DataType::Int64, false),
+            Field::new("lr", lr.data_type().clone(), true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|_| "run"))),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|_| 0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
+                Arc::new(lr),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_resume_is_compared_with_the_last_writing_of_each_step_when_an_attempt_went_back() {
+        // RUST-05 of the review of Nov 18, 2026: the history a resume is compared with was kept
+        // in the order the rows came and binary-searched, so `detect` over rows whose steps
+        // went back within one attempt read it wrongly. Python's history is by step, the last
+        // writing of a step winning (`detect_resume_lr_changes`); the numbers below are its
+        // answers on the same rows. A store never holds such rows: only offline `detect` can.
+        let lr = |step: i64| 1e-3 - 1e-5 * step as f64; // a linear decay
+        let resume_lr = |detectors: &RankDetectors| {
+            let incidents = detectors.incidents();
+            let changes: Vec<Value> = incidents
+                .iter()
+                .filter(|i| i["kind"] == "resume_lr_change")
+                .flat_map(|i| i["changes"].as_array().unwrap().clone())
+                .collect();
+            let skipped: Vec<Value> = detectors
+                .not_checked()
+                .into_iter()
+                .filter(|n| n["check"] == "resume_lr")
+                .collect();
+            (changes, skipped)
+        };
+
+        // Within attempt 0 the step counter went back to 5..8 while the scheduler went on;
+        // attempt 1 resumes at 7, which the history holds: compared with its second writing.
+        let mut rows: Vec<(i64, i64, Option<f64>)> = (0..21).map(|s| (0, s, Some(lr(s)))).collect();
+        rows.extend((5..9).map(|s| (0, s, Some(lr(s + 21)))));
+        rows.extend((7..15).map(|s| (1, s, Some(lr(s + 4)))));
+        let (changes, skipped) = resume_lr(&judge(0, &[lr_rows(&rows)], &usual()).unwrap());
+        assert_eq!(skipped, Vec::<Value>::new());
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(
+            (
+                &changes[0]["basis"],
+                &changes[0]["step"],
+                &changes[0]["previous_attempt"]
+            ),
+            (&json!("same_step"), &json!(7), &json!(0))
+        );
+        assert_eq!(changes[0]["expected_lr"], json!([0.0007199999999999999])); // lr(28), Python's
+        assert_eq!(changes[0]["resumed_lr"], json!([lr(11)]));
+
+        // Steps 3..5 written again within attempt 0, and attempt 1 resumes past the history's
+        // end: the slope is taken over the history's last ten steps, 1 to 10, as in Python.
+        let mut rows: Vec<(i64, i64, Option<f64>)> = (0..11).map(|s| (0, s, Some(lr(s)))).collect();
+        rows.extend([(0, 3, Some(lr(11))), (0, 4, Some(lr(12))), (0, 5, Some(lr(13)))]);
+        rows.extend((12..20).map(|s| (1, s, Some(lr(s + 3)))));
+        let (changes, skipped) = resume_lr(&judge(0, &[lr_rows(&rows)], &usual()).unwrap());
+        assert_eq!(changes, Vec::<Value>::new());
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0]["step"], 12);
+        assert_eq!(skipped[0]["expected_lr"], json!([0.0008799999999999999])); // Python's
+        assert_eq!(skipped[0]["resumed_lr"], json!([lr(15)]));
+
+        // A step written again without a learning rate leaves the history without it, as
+        // Python's last writing does: the resume at 7 is extrapolated from steps 0 to 6.
+        let mut rows: Vec<(i64, i64, Option<f64>)> = (0..21).map(|s| (0, s, Some(lr(s)))).collect();
+        rows.push((0, 7, None));
+        rows.extend((7..15).map(|s| (1, s, Some(lr(0)))));
+        let (changes, skipped) = resume_lr(&judge(0, &[lr_rows(&rows)], &usual()).unwrap());
+        assert_eq!(skipped, Vec::<Value>::new());
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(
+            (&changes[0]["basis"], &changes[0]["equals_first_lr"]),
+            (&json!("extrapolated"), &json!(true))
+        );
+
+        // Rows in step order, as a store holds them, are read as before.
+        let mut rows: Vec<(i64, i64, Option<f64>)> = (0..21).map(|s| (0, s, Some(lr(s)))).collect();
+        rows.extend((7..15).map(|s| (1, s, Some(lr(s + 4)))));
+        let (changes, _) = resume_lr(&judge(0, &[lr_rows(&rows)], &usual()).unwrap());
+        assert_eq!(changes[0]["expected_lr"], json!([lr(7)]));
     }
 
     #[test]

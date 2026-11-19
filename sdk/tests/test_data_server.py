@@ -212,6 +212,11 @@ def test_ranks_drawing_the_same_batch_show_in_the_runs_status(tmp_path):
             pass
         assert time.monotonic() < deadline, "the status never compared every rank"
         time.sleep(0.1)
+    # The status lists the ranks it compared beside the finding too, as it does when there is none,
+    # and the all-ranks view's entry reads it: checked, with no note that it might not be.
+    assert status["ranks_compared"] == [0, 1, 2, 3]
+    check = tensorquill.evidence.all_ranks_evidence(store / "runs" / run_id)["kind_checks"]["duplicate_batches"]
+    assert (check["value"], "note" in check) == ("checked", False), check
     [python] = [i for i in detect_watchdog_incidents(status) if i["kind"] == "duplicate_batches"]
     assert differences({**expected, "class": "invariant"}, python) == []  # the status's incidents carry their class
     assert [i for i in status["incidents"] if i["kind"] == "duplicate_batches"] == [python]
