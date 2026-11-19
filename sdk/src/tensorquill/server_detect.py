@@ -34,7 +34,9 @@ BINARY_NAME = "tensorquill-server"
 # takes or prints changes in a way the other side would get wrong (a kind added or removed, a
 # threshold or option added, a report key renamed or dropped). Only the same number is taken:
 # a larger one is a newer binary whose reports this module was not written for.
-PROTOCOL = 2
+# 3 (lanes W2 and W3, Nov 19, 2026): attempts ordered by first appearance (contract 1), the
+# capture-stopped state (contract 3), and the detector rules of lane W3.
+PROTOCOL = 3
 INSTALL_HINT = "pip install tensorquill-server"
 DETECTOR_CHOICES = ("auto", "python", "rust")
 _BATCH_ROWS = 500
