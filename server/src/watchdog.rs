@@ -902,6 +902,31 @@ impl Watchdog {
         });
     }
 
+    /// Lets go of every rank of `run_id` if the run is settled as of `now`: no stream of it open,
+    /// and its status reads finished or abandoned (see `Ingest::evict_settled`). Decided under the
+    /// lock a stream takes to open, so a rank that comes back meanwhile keeps the run. True when
+    /// it was let go of, or nothing of it was held.
+    pub fn evict(&self, run_id: &str, now: Instant) -> bool {
+        let mut ranks = self.ranks.lock().unwrap();
+        let settled = {
+            let mut members: Vec<(i32, &Progress)> = ranks
+                .iter()
+                .filter(|((run, _), _)| run == run_id)
+                .map(|((_, rank), progress)| (*rank, progress))
+                .collect();
+            members.sort_by_key(|(rank, _)| *rank);
+            members.is_empty()
+                || members.iter().all(|(_, progress)| progress.open_streams == 0) && {
+                    let status = run_status(run_id, &members, now, 0, &self.config, true);
+                    status["summary"] == "finished" || status["abandoned"] == true
+                }
+        };
+        if settled {
+            ranks.retain(|(run, _), _| run != run_id);
+        }
+        settled
+    }
+
     /// The runs any rank is held for.
     pub fn run_ids(&self) -> std::collections::BTreeSet<String> {
         self.ranks
@@ -3349,6 +3374,33 @@ mod tests {
         assert_eq!(rank_field(&dog, at(t0, 1100), "severity"), "warning");
         assert_eq!(rank_field(&dog, at(t0, 1045 + 899), "severity"), "warning");
         assert_eq!(rank_field(&dog, at(t0, 1045 + 901), "severity"), "critical");
+    }
+
+    /// RS13. A run is let go of only when it is settled: every rank finished (and the whole world
+    /// seen), or the run abandoned; never with a stream open.
+    #[test]
+    fn a_run_is_let_go_of_only_once_it_is_finished_or_abandoned() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60)); // abandoned after 6,000 s
+        for rank in 0..2 {
+            dog.stream_opened(&key(rank), t0);
+            dog.batch(&key(rank), 1, Some(9), Some(2), at(t0, 1));
+        }
+        dog.stream_ended(&key(0), true, at(t0, 2));
+        assert!(!dog.evict("run", at(t0, 3)), "rank 1's stream is open");
+        dog.stream_ended(&key(1), false, at(t0, 3));
+        assert!(!dog.evict("run", at(t0, 100)), "lost, not abandoned");
+        assert_eq!(dog.run_ids().len(), 1);
+        assert!(dog.evict("run", at(t0, 6004)), "abandoned");
+        assert!(dog.run_ids().is_empty());
+        assert!(dog.evict("run", at(t0, 6005)), "nothing held");
+        for rank in 0..2 {
+            dog.stream_opened(&key(rank), at(t0, 7000));
+            dog.batch(&key(rank), 1, Some(19), Some(2), at(t0, 7001));
+            dog.stream_ended(&key(rank), true, at(t0, 7002));
+        }
+        assert!(dog.evict("run", at(t0, 7003)), "finished");
+        assert!(dog.run_ids().is_empty());
     }
 
     /// RUST-13. The merged pauses' `last_seconds` is the pause that ended last, of any rank; it was

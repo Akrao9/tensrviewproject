@@ -2871,6 +2871,30 @@ async fn finished_runs_are_let_go_and_one_that_comes_back_is_taken_as_after_a_re
     assert_eq!(restarted.restore_watchdog().await.unwrap(), 1);
 }
 
+/// RS13. With the status file off a settled run is let go of all the same, and no status is written.
+#[tokio::test]
+async fn with_the_status_file_off_a_finished_run_is_let_go_of() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        evict_after: Duration::ZERO,
+        ..watch_config(60_000)
+    };
+    let server = start(dir.path(), config, None).await;
+    assert_eq!(a_short_run(&server, "run-0", 0..10).await, [10]);
+    assert_eq!(server.ingest.runs_held(), 1);
+    let task = server.ingest.spawn_watchdog(); // its first round is at once
+    until("the finished run let go of", || server.ingest.runs_held() == 0).await;
+    server.ingest.stop([task]).await.unwrap();
+    assert!(!dir.path().join("runs").join("run-0").join("watchdog.json").exists());
+    assert!(dir
+        .path()
+        .join("runs")
+        .join("run-0")
+        .join("rank=0")
+        .join("incidents.json")
+        .exists());
+}
+
 /// RUST-17. After a restart the first part of each rank rebuilds its detectors from the store,
 /// and parts written by the streams themselves (not the timed flush) had no shared bound: forty
 /// ranks coming back at once read forty ranks at once. The rebuilds are bounded across streams.

@@ -300,6 +300,9 @@ pub struct Ingest {
     /// Streams that ended in an error, and the lines written about them (RUST-18).
     stream_errors: std::sync::atomic::AtomicU64,
     error_log: Mutex<ErrorLog>,
+    /// Runs whose status has read finished or abandoned, and been written so (or, with the file
+    /// off, has read so), since when: let go of after `evict_after` (see `evict_settled`).
+    settled: Mutex<HashMap<String, Instant>>,
 }
 
 impl Ingest {
@@ -324,6 +327,7 @@ impl Ingest {
             replays: tokio::sync::Semaphore::new(REPLAY_CONCURRENCY),
             stream_errors: std::sync::atomic::AtomicU64::new(0),
             error_log: Mutex::new(ErrorLog::default()),
+            settled: Mutex::new(HashMap::new()),
             used: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             stopping: tokio::sync::watch::Sender::new(false),
@@ -979,6 +983,79 @@ impl Ingest {
     /// only this file to tell that the server is still watching a run in which nothing moves.
     pub async fn write_watchdog(&self) {
         self.write_statuses(self.watchdog_statuses()).await;
+        self.evict_settled();
+    }
+
+    /// Notes whether a run's status, written (or with the file off, read) as of `now`, is settled:
+    /// finished or abandoned, with the server running.
+    fn note_settled(&self, run_id: &str, status: &serde_json::Value, now: Instant) {
+        let mut settled = self.settled.lock().unwrap();
+        if status["server_running"] == true && (status["summary"] == "finished" || status["abandoned"] == true) {
+            settled.entry(run_id.to_string()).or_insert(now);
+        } else {
+            settled.remove(run_id);
+        }
+    }
+
+    /// Lets go of every run that has been settled for `evict_after` (RS13). Until Nov 19, 2026 a
+    /// long-lived server kept every run it had seen: each rank's buffer and detectors, its
+    /// report, the batch hashes, the manifest, the watchdog's clocks, and rebuilt every run's status
+    /// at every pass. A run is let go of as a restart lets it go: a restarted server does not take
+    /// up a finished or abandoned run either, and a rank of it that comes back is taken as after a
+    /// restart (its watermark read from the store, its detectors rebuilt from the store, the
+    /// watchdog watching it afresh). What that loses is the same as after a restart: a finished
+    /// rank whose job starts again is not seen as reopened, and the run's ranks that do not come
+    /// back are not in its new status.
+    fn evict_settled(&self) {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .settled
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) >= self.config.evict_after)
+            .map(|(run_id, _)| run_id.clone())
+            .collect();
+        for run_id in due {
+            if self.evict_run(&run_id, now) {
+                self.settled.lock().unwrap().remove(&run_id);
+            }
+        }
+    }
+
+    /// Lets go of one run, if every buffer of it is idle and the watchdog finds it still settled;
+    /// false (try again at the next pass) otherwise. A buffer is taken out of the map only while
+    /// the map holds the one handle to it: a stream that holds another could write rows into a
+    /// buffer no flush would ever find. The map stays locked until every trace of the run is gone,
+    /// so a stream of it that starts meanwhile finds nothing and starts afresh.
+    fn evict_run(&self, run_id: &str, now: Instant) -> bool {
+        let mut buffers = self.buffers.lock().unwrap();
+        let keys: Vec<Key> = buffers.keys().filter(|key| key.0 == run_id).cloned().collect();
+        for key in &keys {
+            let buffer = &buffers[key];
+            if Arc::strong_count(buffer) > 1 {
+                return false;
+            }
+            let Ok(held) = buffer.try_lock() else {
+                return false;
+            };
+            if !held.batches.is_empty() || held.pending_offset.is_some() || held.ack.is_some() || held.sealed {
+                return false;
+            }
+        }
+        if !self.watchdog.evict(run_id, now) {
+            return false;
+        }
+        for key in &keys {
+            buffers.remove(key);
+        }
+        self.reports.lock().unwrap().retain(|key, _| key.0 != run_id);
+        self.stored.lock().unwrap().retain(|key, _| key.0 != run_id);
+        self.data_windows.lock().unwrap().remove(run_id);
+        self.manifests.lock().unwrap().remove(run_id);
+        self.written.lock().unwrap().remove(run_id);
+        drop(buffers);
+        true
     }
 
     /// The last write before the server stops. A finished run keeps its verdict, which does not
@@ -1045,11 +1122,13 @@ impl Ingest {
                         || !status_refresh_due(now.saturating_duration_since(*at), self.config.status_refresh))
             });
             if fresh {
+                self.note_settled(&run_id, &status, now);
                 continue;
             }
             let started = Instant::now();
             match self.storage.write_status(&run_id, &status).await {
                 Ok(()) => {
+                    self.note_settled(&run_id, &status, started);
                     self.written.lock().unwrap().insert(run_id, (signature, started));
                 }
                 Err(error) => eprintln!("tensorquill-server: cannot write the watchdog status of {run_id}: {error}"),
@@ -1059,23 +1138,33 @@ impl Ingest {
 
     /// Runs `write_watchdog` every `watchdog_interval` until `stop`, which lets a write in
     /// progress finish, so no live status can land after the stopped one. With an interval of
-    /// zero no file is written and the task ends at once.
+    /// zero no file is written: every `DEFAULT_WATCHDOG_INTERVAL` the runs settled in memory are
+    /// let go of (`evict_settled`), and nothing else.
     pub fn spawn_watchdog(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let ingest = self.clone();
         let mut stopping = self.stopping.subscribe();
         tokio::spawn(async move {
             let period = ingest.config.watchdog_interval;
-            if period.is_zero() {
-                return;
-            }
-            let mut ticker = tokio::time::interval(period);
+            let mut ticker = tokio::time::interval(if period.is_zero() {
+                DEFAULT_WATCHDOG_INTERVAL
+            } else {
+                period
+            });
             loop {
                 tokio::select! {
                     biased;
                     _ = stopping.wait_for(|stop| *stop) => return,
                     _ = ticker.tick() => {}
                 }
-                ingest.write_watchdog().await;
+                if period.is_zero() {
+                    let now = Instant::now();
+                    for (run_id, status) in ingest.watchdog.statuses(now, true) {
+                        ingest.note_settled(&run_id, &status, now);
+                    }
+                    ingest.evict_settled();
+                } else {
+                    ingest.write_watchdog().await;
+                }
             }
         })
     }
