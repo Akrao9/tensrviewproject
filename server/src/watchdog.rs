@@ -902,6 +902,16 @@ impl Watchdog {
         });
     }
 
+    /// The runs any rank is held for.
+    pub fn run_ids(&self) -> std::collections::BTreeSet<String> {
+        self.ranks
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|(run_id, _)| run_id.clone())
+            .collect()
+    }
+
     /// One status document per run, as of `now`. `running` is false for the last write at
     /// shutdown, which says the server stopped: the verdicts it holds would otherwise stay on
     /// disk as if they were current.
