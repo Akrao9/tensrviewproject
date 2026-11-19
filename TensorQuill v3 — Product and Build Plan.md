@@ -2287,6 +2287,55 @@ State as of Nov 16, 2026.
     - T2's item 3: option (a), (b) or (c) in its entry.
     - F1: read the routing map, or refuse such a router until that is built.
   - *Not run.* A GPU, NCCL, Linux, PyTorch 2.6. Nothing is pushed: `main` is ahead of `origin/main` (`e693e2f`), whose CI is red on the two PyTorch 2.6 jobs until the fix above is pushed.
+- [ ] **Lane U1: capture paths that could still raise into or block training, no decision needed (Nov 19, 2026, lane U1, branch `claude/lane-u1-capture-65695e`; not merged).** Cut from `main` at `1767a4a`. The code is in `capture.py`. The tests are in the new `sdk/tests/test_lane_u1_capture.py`, which needs no server binary. Two lines of `sdk/tests/test_capture.py` changed too; see below. The hand-over note, `lane-u1.md` in the session notes, lists every function touched, with the scripts.
+  - *Found on the base, before any change* (macOS, CPU, PyTorch 2.15).
+    - C01: `c01.py` gives 0.5 with capture off and raises `NotImplementedError` with it on. This lane also found three more cases in the same read. CSR, CSC, BSR and BSC gradients raised. A float8 gradient raised. A sparse gradient on `meta` was dropped with nothing said.
+    - C04: `c04.py` commits 8 steps after `close()`, then blocks; it had not finished after 20 s.
+    - B8: the experiment's buggy variant, run on a scratch copy, exits 1 with "Attempt to trace forbidden callable `mark_static_address`". A compiled loop that calls `optimizer.step()` also raised under `-W error`, even with `init` called outside it: Dynamo warned while tracing the session's optimizer hook (`sys._getframe`).
+    - C10: `probe_head="nope"` raised its `ValueError`. It left 6 hooks on the model, which had none before, and wrote the run manifest.
+    - C19: a `scaler.update` installed before `init` was gone after `close()`. With two sessions on one scaler, the second session's hook was gone once the first closed.
+    - The probe: under `-W error`, `optimizer.step()` raised "TensorQuill probe failed and was skipped".
+    - The docstring said 24 bytes. The gather is 32 (`distributed.py:236`).
+  - *Fixed, each with tests that fail on the base.* 28 of the file's 36 tests fail when run on the base's code; the other 8 check behaviour that must stay as it was.
+    - **Gradients (C01).** An unreadable gradient is now left out on its own.
+      - `meta` and nested gradients are judged from device and layout alone.
+      - Sparse gradients are read from their stored values, as the weight check reads sparse weights.
+      - A group whose norm raises is read again one tensor at a time.
+      - The step runs as it does without TensorQuill. The other gradients keep their norms, and `grad_norm` sums only the gradients that were read.
+      - Each unread parameter is named once, under a new record field `grads_not_read: {name: why}`, on the first record written after it was found. It is carried the way `update_not_read` is. The server keeps it in `extra_json`, and the evidence ignores it.
+      - Tests: `test_a_gradient_on_meta_is_left_out_on_its_own_and_the_step_runs_as_without_tensorquill`, `test_a_sparse_gradient_is_read_from_its_stored_values` (5 layouts), `test_an_unreadable_gradient_is_named_and_the_others_keep_their_norms` (3 kinds).
+    - **A closed session (C04).** Every public entry point returns at once when the session is closed: no raise, nothing queued, and one warning per session.
+      - `watch_loader` and `time_data` hand back what they were given.
+      - `close()` flushes through the private path.
+      - The four `RuntimeError("the session is closed")` raises are gone.
+      - Tests: `test_every_public_call_on_a_closed_session_returns_at_once_and_queues_nothing`, which runs 24 rounds of every public call (three times the writer queue's size) under a 20 s deadline; `test_a_closed_session_does_not_raise_under_warnings_as_errors`.
+    - **`init` under tracing (B8).** `init` is now `@torch.compiler.disable`. The optimizer hooks and the scaler's wrapper are registered through it too, so a traced `optimizer.step()` runs them eagerly. Behind that wrapper the pre-hook finds the optimizer's frame by skipping `torch/_dynamo/` frames.
+      - Tests: `test_init_inside_a_compiled_function_runs_and_captures`, which is B8's loop (counter 1, 2, 3, 3, 4, 5, and six records); `test_init_then_compile_the_model_still_captures`; `test_the_optimizer_hooks_do_not_raise_when_optimizer_step_is_traced_under_warnings_as_errors`.
+      - `test_compile.py`: 4 passed, so 0 graph breaks and 0 recompiles.
+    - **A rejected `init` (C10).** `_plan_session` now makes every check of the model and the options, with nothing changed. `init` runs it before it resolves the run.
+      - `Session` then makes its effects in `_install`. Each effect registers its undo as it is made: hooks, the heartbeat counter, the writer thread, clipping, the scaler, the optimizer hooks and the loader timer.
+      - `init` undoes its own effects: the default sink with its file and folders, the run manifest (the earlier bytes or no file), and the stream's heartbeat and sender. It never closes a sink the caller passed in.
+      - Removing an earlier run's end marker is now the last step.
+      - Tests: `test_a_rejected_init_leaves_hooks_threads_globals_and_files_as_they_were` (7 rejections), `test_a_later_failure_undoes_every_effect_made_before_it`, `test_a_later_failure_puts_an_earlier_runs_manifest_and_end_marker_back`.
+    - **The scaler (C19).** Each scaler now has one `update` wrapper, shared by every session that watches it. When the last session leaves, the wrapper is taken out, but only while it is still the instance attribute. A wrapper someone installed on top after `init` is left in place, and ours under it passes calls through. `_scaler_original` is gone.
+      - Tests: `test_closing_puts_back_an_update_someone_installed_before_init`, `test_two_sessions_on_one_scaler_keep_counting_whichever_closes_first` (both orders), `test_a_wrapper_installed_on_top_after_init_is_left_in_place`, `test_closing_leaves_a_scaler_with_its_class_method`.
+    - **Warnings (the probe's, and the others training reaches).** `_warn` calls `warnings.warn`. Where a filter turns the warning into an error, it logs the message on the `tensorquill` logger instead.
+      - It is used for the probe's warning, the foreign-step warning, the router refusal, the replica-unread warning and the new closed-session warning.
+      - The backpressure warning in `_put` is left as it is (C03).
+      - The probe's failure is still in its record as `{"error": ...}`.
+      - Tests: `test_a_failed_probe_does_not_raise_out_of_the_step_under_warnings_as_errors`, `test_a_refused_router_and_steps_of_another_model_do_not_raise_under_warnings_as_errors`.
+    - **The docstring.** It now says 32 bytes per parameter tensor, or 24 without the projection, with the flag named. Test: `test_init_says_how_many_bytes_the_drift_check_gathers`.
+  - *Existing test changed.* `test_capture.py`'s `test_log_records_scalars_for_the_step_in_progress` asserted that `log()` raises after `close()`. That is the contract C04 replaces, so its last two lines now assert that the call returns and writes nothing.
+  - *Run.* The new file: 36 passed. `test_compile.py`: 4 passed. The full `sdk/tests` with this worktree on `PYTHONPATH`: 1254 passed, 619 skipped, 1 failed. The failure was `test_capture.py`'s old contract, in a run that started before that test was changed. After the change, `test_capture.py`, the new file and `test_compile.py` were run again: 77 passed. `test_update_size.py`'s `test_a_subclass_that_leaves_the_step_alone_is_read` fails when run alone, on the base too, and passes in its file's order. That order dependency is older than this lane.
+  - *Not run.* PyTorch 2.6, which is the minimum: `torch.compiler.disable` exists there, but the frame skip and the tests have not run on it, and CI is the check. Also not run: Linux, a GPU, NCCL.
+  - *Left, with why.*
+    - B8 under `-W error`, with `init` inside the traced function: Dynamo warns while tracing any forward hook on a model built there, and `-W error` raises that warning. A user's hook that only calls `isinstance(output, torch.Tensor)` does the same with no TensorQuill. Under the default filters it is fixed.
+    - If `init` fails after the stream started, the sender may already have sent the manifest. That cannot be undone. Validation errors now come before the sender starts.
+  - *Stale, not edited.* B8's recorded result in `experiments/traincheck-bugs/` (U8's tree): the buggy variant now runs to the end, with counter 1, 2, 3, 3, 4, 5 and no `--disable`. The B8 docstring there says Dynamo fails on `init`.
+  - *Open, for the author.*
+    - The new field `grads_not_read`: its name and shape (said once per parameter, as `update_not_read` is). It has no reader yet: no not-checked entry in the evidence and none in the server.
+    - Tests that assert "no warning" with `simplefilter("error", RuntimeWarning)`: four in `test_router_guard.py` and one in `test_eval_forwards.py`. They would no longer catch one of the converted warnings, which is logged instead. Their other assertions still hold.
+    - Under `-W error`, the foreign-step and replica-unread messages reach only the log. Neither has a record field.
 
 ## Sources
 
