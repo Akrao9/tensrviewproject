@@ -1119,6 +1119,13 @@ mod store {
         /// Whole-object reads (a part read by a rebuild) in progress, and the most at once.
         pub gets_in_flight: AtomicUsize,
         pub max_gets_in_flight: AtomicUsize,
+        /// Reads and writes of a rank's `attempts.json` (contract 1), kept apart from the counts and
+        /// knobs above, which are about parts, statuses and reports: the order is written once per
+        /// new attempt and read once per rank a server takes up.
+        pub order_gets: AtomicUsize,
+        pub order_puts: AtomicUsize,
+        /// The next this-many writes of an `attempts.json` fail (and are not stored).
+        pub fail_order_puts: AtomicUsize,
     }
 
     #[derive(Debug)]
@@ -1168,6 +1175,23 @@ mod store {
             Self: 'async_trait,
         {
             async move {
+                if location.as_ref().ends_with("attempts.json") {
+                    self.knobs.order_puts.fetch_add(1, Ordering::SeqCst);
+                    self.wait().await;
+                    let fail = self
+                        .knobs
+                        .fail_order_puts
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                        .is_ok();
+                    return if fail {
+                        Err(object_store::Error::Generic {
+                            store: "TestStore",
+                            source: "injected failure of the attempt order".into(),
+                        })
+                    } else {
+                        self.inner.put_opts(location, payload, opts).await
+                    };
+                }
                 self.knobs.puts.fetch_add(1, Ordering::SeqCst);
                 let now = self.knobs.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.knobs.max_in_flight.fetch_max(now, Ordering::SeqCst);
@@ -1224,6 +1248,11 @@ mod store {
             Self: 'async_trait,
         {
             async move {
+                if location.as_ref().ends_with("attempts.json") {
+                    self.knobs.order_gets.fetch_add(1, Ordering::SeqCst);
+                    self.wait().await;
+                    return self.inner.get_opts(location, options).await;
+                }
                 let whole = !matches!(options.range, Some(GetRange::Suffix(_) | GetRange::Bounded(_)));
                 if whole {
                     self.knobs.gets.fetch_add(1, Ordering::SeqCst);
@@ -1569,6 +1598,7 @@ async fn a_restart_costs_one_listing_and_one_footer_read_per_rank() {
     lists.store(0, Ordering::SeqCst);
     range_gets.store(0, Ordering::SeqCst);
     gets.store(0, Ordering::SeqCst);
+    store.knobs.order_gets.store(0, Ordering::SeqCst);
     let server = start_on(store.clone(), config, None).await;
     for rank in 0..64 {
         let mut put = open(&server, rank).await;
@@ -1582,6 +1612,9 @@ async fn a_restart_costs_one_listing_and_one_footer_read_per_rank() {
         "one suffix read of the newest part per rank"
     );
     assert_eq!(gets.load(Ordering::SeqCst), 0, "no part is read whole");
+    // And one small read of each rank's `attempts.json`, which the first server wrote (contract 1):
+    // the rank's order is known, so nothing is listed for it.
+    assert_eq!(store.knobs.order_gets.load(Ordering::SeqCst), 64);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2057,8 +2090,11 @@ async fn restoring_many_runs_is_one_listing_and_concurrent_small_reads() {
         160,
         "one read of one status per run, no part"
     );
-    // 160 reads of 25 ms one after another would take 4 s.
-    assert!(took < Duration::from_millis(1500), "{took:?}");
+    // And one small read per rank taken up, of its `attempts.json` (contract 1): none of these
+    // ranks has one, so none is listed now; that waits for the rank's first beat or batch.
+    assert_eq!(store.knobs.order_gets.load(Ordering::SeqCst), 160 * 8);
+    // 160 + 1,280 reads of 25 ms one after another would take 36 s; 32 at a time, about 1.1 s.
+    assert!(took < Duration::from_millis(3000), "{took:?}");
     assert_eq!(ingest.watchdog_statuses().len(), 160);
 }
 
@@ -2952,4 +2988,133 @@ async fn rebuilds_from_the_streams_after_a_restart_are_bounded() {
     assert!(acks.iter().all(|acks| acks == &[20]), "{acks:?}");
     let most = store.knobs.max_gets_in_flight.load(Ordering::SeqCst);
     assert!(most <= 16, "{most} parts read at once");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Contract 1 (RS05, decided Nov 19, 2026): the order of a rank's attempts, through Flight.
+
+async fn beat_attempt(server: &TestServer, attempt: i64) -> Result<(), tonic::Status> {
+    let mut flight = client(server).await;
+    let body =
+        format!("{{\"run_id\":\"{RUN}\",\"rank\":0,\"phase\":\"train\",\"interval_seconds\":5,\"attempt\":{attempt}}}");
+    match flight.do_action(Action::new("heartbeat", body)).await {
+        Ok(replies) => {
+            replies.try_collect::<Vec<_>>().await.unwrap();
+            Ok(())
+        }
+        Err(FlightError::Tonic(status)) => Err(*status),
+        Err(other) => panic!("{other}"),
+    }
+}
+
+fn sender_metadata(sender_attempt: i64, end: i64) -> String {
+    format!(
+        "{{\"schema_version\":1,\"run_id\":\"{RUN}\",\"rank\":0,\"min_step\":null,\"max_step\":null,\"end_byte_offset\":{end},\"sender_attempt\":{sender_attempt}}}"
+    )
+}
+
+#[tokio::test]
+async fn w2_a_claim_whose_order_cannot_be_stored_is_refused_and_leaves_nothing_behind() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    store.knobs.fail_order_puts.store(1, Ordering::SeqCst);
+    let server = start_on(store.clone(), watch_config(60_000), None).await;
+    let refused = beat_attempt(&server, 7).await.unwrap_err();
+    assert_eq!(refused.code(), Code::Unavailable, "{refused:?}");
+    assert!(
+        !server.ingest.watchdog_statuses().contains_key(RUN),
+        "a refused beat places nothing and leaves no rank"
+    );
+    // The sender's next beat goes through: the order is stored, then the attempt owns the rank.
+    beat_attempt(&server, 7).await.unwrap();
+    assert_eq!(server.ingest.watchdog_statuses()[RUN]["ranks"][0]["attempt"], 7);
+    assert_eq!(store.knobs.order_puts.load(Ordering::SeqCst), 2);
+    // A batch that would place a new attempt is refused the same way, and its rows are not taken.
+    store.knobs.fail_order_puts.store(1, Ordering::SeqCst);
+    let mut put = open_attempts(&server).await;
+    put.send_with_metadata(attempt_batch(&rows(9, 0..5)), sender_metadata(9, 100))
+        .await;
+    assert_eq!(put.ack().await, Err(Code::Unavailable));
+    assert_eq!(server.ingest.buffered_bytes(), 0);
+    assert_eq!(server.ingest.watchdog_statuses()[RUN]["ranks"][0]["attempt"], 7);
+}
+
+#[tokio::test]
+async fn w2_an_earlier_attempts_stream_that_ends_cleanly_after_a_new_claim_does_not_finish_the_rank() {
+    // RS01's open case: attempt 1's stream is open when attempt 2's first beat comes, then it
+    // closes cleanly. Until Nov 19, 2026 the rank read finished.
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        flush_steps: 1,
+        ..watch_config(60_000)
+    };
+    let server = start(dir.path(), config, None).await;
+    beat_attempt(&server, 1).await.unwrap();
+    let mut put = open_attempts(&server).await;
+    put.send_with_metadata(attempt_batch(&rows(1, 0..10)), sender_metadata(1, 100))
+        .await;
+    assert_eq!(put.ack().await, Ok(100));
+    beat_attempt(&server, 2).await.unwrap();
+    assert_eq!(put.finish().await, Vec::<i64>::new());
+    let mut entry = serde_json::Value::Null;
+    until("the earlier stream's end to be seen", || {
+        entry = server.ingest.watchdog_statuses()[RUN]["ranks"][0].clone();
+        entry["stream"] != "open"
+    })
+    .await;
+    assert_eq!(
+        (
+            entry["attempt"].as_i64(),
+            entry["state"].as_str(),
+            entry["last_step"].clone()
+        ),
+        (Some(2), Some("reconnecting"), serde_json::Value::Null),
+        "{entry}"
+    );
+    // A late row of attempt 1 is stored and counted, and not progress.
+    let mut late = open_attempts(&server).await;
+    late.send_with_metadata(attempt_batch(&rows(1, 10..11)), sender_metadata(1, 200))
+        .await;
+    assert_eq!(late.ack().await, Ok(200));
+    let entry = &server.ingest.watchdog_statuses()[RUN]["ranks"][0];
+    assert_eq!(
+        (entry["attempt"].as_i64(), entry["superseded_rows"].as_i64()),
+        (Some(2), Some(1)),
+        "{entry}"
+    );
+    let order: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join("runs").join(RUN).join("rank=0").join("attempts.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(order["attempts"][0]["attempt"], 1);
+    assert_eq!(order["attempts"][1]["attempt"], 2);
+}
+
+#[tokio::test]
+async fn w2_a_new_attempt_whose_rows_beat_its_first_heartbeat_owns_the_rank_with_a_sender_that_names_none() {
+    // Every SDK before Nov 19, 2026 names no `sender_attempt`. Attempt 1 is claimed and steps; the
+    // job starts again as attempt 2, whose rows reach the server before any beat naming it.
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        flush_steps: 1,
+        ..watch_config(60_000)
+    };
+    let server = start(dir.path(), config, None).await;
+    beat_attempt(&server, 1).await.unwrap();
+    let mut put = open_attempts(&server).await;
+    put.send(attempt_batch(&rows(1, 0..10)), 100).await;
+    assert_eq!(put.ack().await, Ok(100));
+    put.send(attempt_batch(&rows(2, 5..8)), 200).await;
+    assert_eq!(put.ack().await, Ok(200));
+    beat_attempt(&server, 2).await.unwrap();
+    let entry = &server.ingest.watchdog_statuses()[RUN]["ranks"][0];
+    assert_eq!(
+        (
+            entry["attempt"].as_i64(),
+            entry["last_step"].as_i64(),
+            entry["state"].as_str()
+        ),
+        (Some(2), Some(7), Some("active")),
+        "{entry}"
+    );
 }

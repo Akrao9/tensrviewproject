@@ -76,39 +76,57 @@
 //! A status without `restart` (an older server's) is not restored, and the run is watched
 //! afresh when a rank connects.
 //!
-//! # A job started again
+//! # A job started again: which attempt owns a rank
 //!
-//! Each heartbeat names the session's attempt (from Nov 17, 2026; `attempt_seen`). A higher one
-//! than the rank's is the job started again, seen before the new attempt stores a step: the
-//! status shows the attempt at once and marks the rank `attempt_without_steps`, and the rank is
+//! Each heartbeat names the session's attempt (from Nov 17, 2026; `attempt_seen`), and each
+//! stream's batches name the attempt of the process that sends them (`sender_attempt`, from
+//! Nov 19, 2026). Both are claims. A rank's attempts have one order, oldest first, kept in the
+//! store's `runs/<run_id>/rank=<rank>/attempts.json` and read back at a restart (contract 1,
+//! decided Nov 19, 2026; until then attempts were ordered by number, and a late row of an earlier
+//! process took the rank back: RS05). An attempt first met in a claim goes after every attempt
+//! known; one first met only in rows goes just before the attempt that sent them. The newest owns
+//! the rank. Attempt numbers order nothing: a replacement given a lower number by a host whose
+//! clock is behind owns the rank because it was claimed later.
+//!
+//! A new owner is the job started again, seen before the new attempt stores a step: the status
+//! shows the attempt at once with `last_step` null and `attempt_without_steps`, and the rank is
 //! judged as one before its first step, from that beat (`starting` for `--start-seconds`, then
 //! `silent`, critical `--critical-seconds` later; `reconnecting` for that window while its stream
-//! is not open), not from the earlier attempt's last batch. `last_step` stays the highest stored,
-//! of any attempt. The attempt's first batch ends that, and its first gap is measured from the
-//! beat. From that batch on, `last_step` is the new attempt's own, also when it resumed from a
-//! checkpoint below the steps the earlier attempt reached (until Nov 18, 2026 it stayed the
-//! highest of any attempt until the new one passed it). A beat of the same attempt (a reconnect)
-//! changes nothing. While the new attempt has stored nothing, a beat of a lower attempt (a
-//! process of an earlier attempt still alive) is ignored and an earlier attempt's rows sent late
-//! raise `last_step` without being progress; at other times a lower attempt is taken as before (a
-//! restart on a host whose clock is behind), and its step is the rank's. A beat that names no
-//! attempt (an older sender) is taken as before, and its new attempt is known from its first
-//! stored batch.
+//! is not open), not from the earlier attempt's last batch. The attempt's first batch ends that,
+//! and its first gap is measured from the beat; from then on `last_step` is its own, also below
+//! the steps the earlier attempt reached. A beat of the owner (a reconnect) changes nothing. A
+//! beat of an earlier attempt (a process still alive) is not taken, and its rows are stored,
+//! counted as `superseded_rows`, and never progress. A beat that names no attempt (an older
+//! sender) is taken as before, and that sender's attempts are known from their rows, in the order
+//! they arrive.
 //!
-//! A higher attempt on a rank whose stream had finished is the job started again after a clean
-//! end: the rank is no longer finished, but a stream not open yet, `reconnecting` for the start
-//! window from that beat and then `lost`, until the new attempt opens its stream (decided Nov 19,
-//! 2026; until then the rank read finished for good, the new attempt shown beside it). A stream
-//! the new attempt opens and closes cleanly finishes the rank again, whether or not it stored
-//! anything. A clean end of a stream that was open before the new attempt's first beat finishes it
-//! too: the server cannot tell the earlier attempt's process closing from the new attempt's
-//! (a sender that waited longer than its hold opens its stream before its first beat).
+//! A new owner on a rank whose stream had finished is the job started again after a clean end:
+//! the rank is no longer finished, but a stream not open yet, `reconnecting` for the start window
+//! from that beat and then `lost`, until the new attempt opens its stream (decided Nov 19, 2026).
+//! A stream counts for the rank until its first batch names an attempt that does not own it, or
+//! until a newer attempt is claimed while it is open; from then its end, clean or not, changes
+//! nothing (`stream_superseded`). A stream that ends before sending any batch names no attempt,
+//! and its clean end finishes the rank, as before: the server cannot tell it from the new
+//! attempt's own (a sender that waited longer than its hold opens its stream before its first beat).
+//!
+//! # Capture stopped
+//!
+//! A heartbeat of the owner attempt that carries `capture_stopped` (contract 3, decided Nov 19,
+//! 2026) says the session stopped capturing while training may go on: its work counter stands
+//! still from then on. The rank reads `capture_stopped`, with no severity and no progress
+//! incident, while its beats are fresh or after its stream closed cleanly; it is never `finished`.
+//! Beats that stop with the stream open are `unresponsive`, and a dropped stream with no beat since
+//! is `reconnecting`, then `lost`, as for any rank. The stop and its reason are in the rank's entry
+//! in every state, survive a restart, and go only when a newer attempt owns the rank. A run whose
+//! ranks are all stopped or finished reads `capture_stopped`; with another rank active, `degraded`.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+
+use crate::storage::AttemptOrder;
 
 pub const DEFAULT_SILENT_FLOOR: Duration = Duration::from_secs(300);
 pub const DEFAULT_SILENT_FACTOR: f64 = 5.0;
@@ -128,6 +146,15 @@ pub const TRAIN: &str = "train";
 const HEARTBEAT_STALE_INTERVALS: f64 = 3.0;
 const HEARTBEAT_MIN_STALE: f64 = 30.0;
 const GAPS_KEPT: usize = 8;
+/// The longest reason a capture-stopped heartbeat keeps, as `phase`.
+const CAPTURE_REASON_CHARS: usize = 40;
+
+/// This host's clock in Unix milliseconds, for `first_seen_ms` (read by people, never ordered by).
+fn epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64)
+}
 /// The most a restored phase age and a restored counter age can differ by when they were one
 /// instant: half a tenth (the phase's rounding) and half a thousandth (the counter's).
 const PHASE_ROUNDING: f64 = 0.051;
@@ -189,6 +216,10 @@ pub enum RankState {
     Reconnecting,
     Lost,
     Finished,
+    /// The owner attempt's capture stopped (contract 3) and its process is alive (fresh heartbeats)
+    /// or closed its stream cleanly: training may go on, and nothing is watched. Not a hang, not
+    /// finished.
+    CaptureStopped,
 }
 
 impl RankState {
@@ -202,6 +233,7 @@ impl RankState {
             RankState::Reconnecting => "reconnecting",
             RankState::Lost => "lost",
             RankState::Finished => "finished",
+            RankState::CaptureStopped => "capture_stopped",
         }
     }
 }
@@ -262,6 +294,18 @@ pub struct Progress {
     /// since when. Until its first batch the rank is judged as one before its first step (the
     /// start window), not from the earlier attempt's last batch.
     attempt_since: Option<Instant>,
+    /// The order of the rank's attempts, oldest first (contract 1): the newest owns the rank. Set
+    /// by `Ingest` from the store's `attempts.json` (`load_order`, `set_order`) before it hands
+    /// the watchdog a beat or batch that places a new attempt; an attempt the watchdog meets
+    /// without it is placed by the same rule.
+    order: AttemptOrder,
+    /// `order` has been read from the store since this server took the rank up.
+    order_loaded: bool,
+    /// Rows of an attempt that does not own the rank, received since the server took it up.
+    superseded_rows: u64,
+    /// The owner attempt's capture stopped (contract 3), its reason and since when the server saw
+    /// it. Kept whatever state the rank reads, until a newer attempt owns the rank.
+    capture_stopped: Option<(String, Instant)>,
 }
 
 impl Progress {
@@ -289,6 +333,56 @@ impl Progress {
             restarted: None,
             fresh: None,
             attempt_since: None,
+            order: AttemptOrder::default(),
+            order_loaded: false,
+            superseded_rows: 0,
+            capture_stopped: None,
+        }
+    }
+
+    /// The attempt that owns the rank: the newest in its order (`attempt` while none is known).
+    fn owner(&self) -> i64 {
+        self.order.newest().unwrap_or(self.attempt)
+    }
+
+    /// `attempt` owns the rank from `now`: the job was started again. The status shows it at once
+    /// with no step (`last_step` null and `attempt_without_steps`, decided Nov 19, 2026; until then
+    /// the earlier attempt's last step stayed and its late rows raised it), and the rank is judged
+    /// as one before its first step, from now, until the attempt stores a batch. A rank the server
+    /// knew nothing of yet just takes the attempt.
+    fn take_attempt(&mut self, attempt: i64, now: Instant, window: Duration) {
+        let known = self.attempt != 0 || self.last_step.is_some() || self.attempt_since.is_some();
+        self.attempt = attempt;
+        self.capture_stopped = None;
+        // A rank whose stream had finished: the job was started again, and the new process
+        // has not opened its stream. It is a stream not open yet from this beat, under the start
+        // window, and not finished (decided Nov 19, 2026; until then it read finished for good,
+        // with the new attempt shown beside it). The time it had been finished is not time
+        // disconnected, which would give the run up at once after a long gap.
+        let reopened = self.stream == Stream::Finished;
+        if reopened {
+            self.stream = Stream::Dropped;
+            self.last_change = now;
+        }
+        if known || reopened {
+            self.attempt_since = Some(now);
+            self.last_step = None;
+            self.restarted = Some(now);
+            // Only a stream that is not open yet waits for this window; one already open is
+            // judged by the rules for an open stream, and a later drop by those for a drop.
+            self.fresh =
+                (self.stream == Stream::Dropped).then(|| (now.checked_add(window).unwrap_or(now), RankState::Lost));
+            self.stepped = false;
+            self.step_seconds.clear();
+            self.work = None;
+            self.work_moved = now;
+            self.stack = None;
+            // The earlier attempt's phase ended with its process: the new one is training from
+            // this beat until it says otherwise, and the time between is not a pause of either
+            // (RS06; until Nov 19, 2026 its first beat closed a dead attempt's evaluation over
+            // the whole downtime, and `recommended_silent_seconds` was twice that).
+            self.phase = TRAIN.to_string();
+            self.phase_since = now;
         }
     }
 
@@ -349,6 +443,21 @@ impl Progress {
     }
 
     pub fn state(&self, now: Instant, config: &WatchdogConfig) -> RankState {
+        if self.capture_stopped.is_some() {
+            // The work counter stands still once capture stops, whatever training does, so a
+            // stopped capture is never read as a hang. What the stream and the beats say of the
+            // process still holds: beats that stop with the stream open are a frozen process, and a
+            // stream that dropped with no beat since is a lost connection.
+            let beating = self
+                .heartbeat_age(now)
+                .is_some_and(|age| age <= self.stale_after(config));
+            match self.stream {
+                Stream::Finished => return RankState::CaptureStopped,
+                _ if beating => return RankState::CaptureStopped,
+                Stream::Open => return RankState::Unresponsive,
+                Stream::Dropped => {}
+            }
+        }
         match self.stream {
             Stream::Finished => RankState::Finished,
             Stream::Dropped => {
@@ -493,6 +602,7 @@ impl Progress {
             "work_still_seconds": before(self.work_moved),
             "stepped": self.stepped,
             "attempt_without_steps": self.attempt_since.is_some(),
+            "superseded_rows": self.superseded_rows,
             "step_seconds": self.step_seconds.iter().copied().map(round3).collect::<Vec<_>>(),
             "gaps_seconds": self.gaps.iter().copied().map(round3).collect::<Vec<_>>(),
             "pauses": self.pauses.iter().map(|(phase, stats)| (phase.clone(), json!({
@@ -600,6 +710,22 @@ impl Progress {
             fresh: None,
             // Absent from a status written before it was kept: the attempt has stored steps.
             attempt_since: carry["attempt_without_steps"].as_bool().unwrap_or(false).then_some(now),
+            // The order is the store's (`attempts.json`), read by `Ingest` for every rank it takes up.
+            order: AttemptOrder::default(),
+            order_loaded: false,
+            superseded_rows: carry["superseded_rows"].as_u64().unwrap_or(0),
+            // Kept in the entry in every state once seen (contract 3), so a restart keeps it.
+            capture_stopped: entry["capture_stopped"].as_object().map(|stopped| {
+                let reason = stopped
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .chars()
+                    .take(CAPTURE_REASON_CHARS)
+                    .collect();
+                let since = stopped.get("seconds").and_then(seconds).unwrap_or(0.0);
+                (reason, ago(now, since))
+            }),
         })
         .map(|mut progress| {
             // A fresh window from the restart for every rank that was not finished (decided Nov 17,
@@ -666,6 +792,10 @@ type Key = (String, i32);
 pub struct Watchdog {
     config: WatchdogConfig,
     ranks: Mutex<HashMap<Key, Progress>>,
+    /// Orders read from the store for ranks not held yet: taken up when the rank is (a beat that
+    /// was refused, or a read before the rank's first event, leaves no rank behind). Locked after
+    /// `ranks`, never before.
+    pending_orders: Mutex<HashMap<Key, AttemptOrder>>,
 }
 
 impl Watchdog {
@@ -673,6 +803,7 @@ impl Watchdog {
         Self {
             config,
             ranks: Mutex::new(HashMap::new()),
+            pending_orders: Mutex::new(HashMap::new()),
         }
     }
 
@@ -720,7 +851,15 @@ impl Watchdog {
 
     fn with<R>(&self, key: &Key, now: Instant, f: impl FnOnce(&mut Progress) -> R) -> R {
         let mut ranks = self.ranks.lock().unwrap();
-        f(ranks.entry(key.clone()).or_insert_with(|| Progress::new(now)))
+        f(ranks.entry(key.clone()).or_insert_with(|| {
+            let mut progress = Progress::new(now);
+            if let Some(order) = self.pending_orders.lock().unwrap().remove(key) {
+                progress.attempt = order.newest().unwrap_or(0);
+                progress.order = order;
+                progress.order_loaded = true;
+            }
+            progress
+        }))
     }
 
     pub fn stream_opened(&self, key: &Key, now: Instant) {
@@ -743,62 +882,160 @@ impl Watchdog {
         });
     }
 
-    /// The attempt a heartbeat names (a sender from before Nov 17, 2026 names none). A higher
-    /// attempt than the rank's is the job started again: the status shows it at once, and the
-    /// rank gets the start window of a new rank from now (`start_limit`, then a warning, critical
+    /// The attempt a heartbeat names (a sender from before Nov 17, 2026 names none): a claim, under
+    /// contract 1 (decided Nov 19, 2026). An attempt not known yet is placed after every attempt
+    /// known and owns the rank from now (`take_attempt`): the status shows it at once with no step,
+    /// and the rank gets the start window of a new rank (`start_limit`, then a warning, critical
     /// `critical` later) until the attempt stores a batch, instead of reading silent and critical
-    /// from the earlier attempt's last batch. Its clocks start now (`restarted`), and a stream
-    /// still dropped is `reconnecting` for that window. The same attempt is a beat as any other,
-    /// whatever the stream did (a reconnect is not a new attempt). A lower one, while the new
-    /// attempt has stored nothing, is a process of an earlier attempt still beating: false, and the
-    /// beat is not taken; at any other time it is taken as a beat that names no attempt. The SDK sends this beat
-    /// before its stream's first connection; a stream opened before it (a sender that waited
-    /// longer than its hold) is judged from the earlier attempt's last batch until it comes.
+    /// from the earlier attempt's last batch. The owner's own attempt is a beat as any other,
+    /// whatever the stream did (a reconnect is not a new attempt). An attempt placed before the
+    /// owner is a process of an earlier attempt still alive: false, and the beat is not taken,
+    /// whatever its number (until Nov 19, 2026 a lower number was ignored only until the new
+    /// attempt's first batch, and a higher one always took the rank: RS05).
     pub fn attempt_seen(&self, key: &Key, attempt: i64, now: Instant) -> bool {
         let window = self.config.start_limit;
         self.with(key, now, |p| {
-            if attempt < p.attempt {
-                // While a new attempt has stored nothing, a lower one is a process of an earlier
-                // attempt still beating: not taken. Otherwise it is taken as a beat with no attempt
-                // was before (a host whose clock is behind gives a restart a lower number).
-                return p.attempt_since.is_none();
+            p.order.place_claim(attempt, epoch_ms());
+            if attempt != p.owner() {
+                return false;
             }
-            if attempt == p.attempt {
-                return true;
-            }
-            let known = p.attempt != 0 || p.last_step.is_some();
-            p.attempt = attempt;
-            // A rank whose stream had finished: the job was started again, and the new process
-            // has not opened its stream. It is a stream not open yet from this beat, under the start
-            // window, and not finished (decided Nov 19, 2026; until then it read finished for good,
-            // with the new attempt shown beside it). The time it had been finished is not time
-            // disconnected, which would give the run up at once after a long gap.
-            let reopened = p.stream == Stream::Finished;
-            if reopened {
-                p.stream = Stream::Dropped;
-                p.last_change = now;
-            }
-            if known || reopened {
-                p.attempt_since = Some(now);
-                p.restarted = Some(now);
-                // Only a stream that is not open yet waits for this window; one already open is
-                // judged by the rules for an open stream, and a later drop by those for a drop.
-                p.fresh =
-                    (p.stream == Stream::Dropped).then(|| (now.checked_add(window).unwrap_or(now), RankState::Lost));
-                p.stepped = false;
-                p.step_seconds.clear();
-                p.work = None;
-                p.work_moved = now;
-                p.stack = None;
-                // The earlier attempt's phase ended with its process: the new one is training from
-                // this beat until it says otherwise, and the time between is not a pause of either
-                // (RS06; until Nov 19, 2026 its first beat closed a dead attempt's evaluation over
-                // the whole downtime, and `recommended_silent_seconds` was twice that).
-                p.phase = TRAIN.to_string();
-                p.phase_since = now;
+            if attempt != p.attempt {
+                p.take_attempt(attempt, now, window);
             }
             true
         })
+    }
+
+    /// Whether the rank's order has been read from the store since this server took it up.
+    pub fn order_loaded(&self, key: &Key) -> bool {
+        let ranks = self.ranks.lock().unwrap();
+        match ranks.get(key) {
+            Some(p) => p.order_loaded,
+            None => self.pending_orders.lock().unwrap().contains_key(key),
+        }
+    }
+
+    /// The rank's order of attempts, as the watchdog holds it (empty for a rank it does not hold).
+    pub fn order(&self, key: &Key) -> AttemptOrder {
+        let ranks = self.ranks.lock().unwrap();
+        match ranks.get(key) {
+            Some(p) => p.order.clone(),
+            None => self
+                .pending_orders
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The attempt a held rank shows, when it has shown one (to read a store kept before contract 1).
+    pub fn shown_attempt(&self, key: &Key) -> Option<i64> {
+        self.ranks
+            .lock()
+            .unwrap()
+            .get(key)
+            .filter(|p| p.attempt != 0 || p.last_step.is_some() || p.attempt_since.is_some())
+            .map(|p| p.attempt)
+    }
+
+    /// The attempt that owns the rank, none for a rank not held or with no attempt known.
+    pub fn owner(&self, key: &Key) -> Option<i64> {
+        self.ranks.lock().unwrap().get(key).and_then(|p| {
+            p.order
+                .newest()
+                .or((p.attempt != 0 || p.last_step.is_some()).then_some(p.attempt))
+        })
+    }
+
+    /// The order the store holds for the rank, read since this server took it up (at a restart, or
+    /// at the rank's first heartbeat or batch). Its newest attempt owns the rank, whatever the
+    /// status this server restored said: a claim the store kept, and a status written before it,
+    /// is the new attempt's (the store is written before the claim is acknowledged; the status
+    /// every few seconds).
+    pub fn load_order(&self, key: &Key, order: AttemptOrder, now: Instant) {
+        let window = self.config.start_limit;
+        let mut ranks = self.ranks.lock().unwrap();
+        let Some(p) = ranks.get_mut(key) else {
+            self.pending_orders.lock().unwrap().insert(key.clone(), order);
+            return;
+        };
+        {
+            p.order = order;
+            p.order_loaded = true;
+            if let Some(newest) = p.order.newest() {
+                if newest != p.attempt && (p.order.on_disk || p.attempt == 0) {
+                    p.take_attempt(newest, now, window);
+                }
+            }
+        }
+    }
+
+    /// The rank's order after `Ingest` stored it with a new attempt placed. Who owns the rank
+    /// changes at the claim (`attempt_seen`) or the owner's rows (`batch`), not here.
+    pub fn set_order(&self, key: &Key, order: AttemptOrder, _now: Instant) {
+        let mut ranks = self.ranks.lock().unwrap();
+        match ranks.get_mut(key) {
+            Some(p) => {
+                p.order = order;
+                p.order_loaded = true;
+            }
+            None => {
+                self.pending_orders.lock().unwrap().insert(key.clone(), order);
+            }
+        }
+    }
+
+    /// `rows` rows of an attempt that does not own the rank were kept: stored, and counted.
+    pub fn superseded(&self, key: &Key, rows: u64, now: Instant) {
+        if rows > 0 {
+            self.with(key, now, |p| p.superseded_rows = p.superseded_rows.saturating_add(rows));
+        }
+    }
+
+    /// A stream counted as the rank's turned out to belong to an attempt that does not own the rank
+    /// (its first batch named it, or a newer attempt was claimed while it was open): it no longer
+    /// counts. Its open is undone, and when no other stream of the rank is open, the rank is a
+    /// stream not open yet: `reconnecting` and then `lost` as a drop is, and while the owner has
+    /// stored nothing, under the start window from now (RS01's open case; until Nov 19, 2026 the
+    /// earlier attempt's clean close finished the rank).
+    pub fn stream_superseded(&self, key: &Key, now: Instant) {
+        let window = self.config.start_limit;
+        self.with(key, now, |p| {
+            p.open_streams = p.open_streams.saturating_sub(1);
+            if p.open_streams == 0 && p.stream == Stream::Open {
+                p.stream = Stream::Dropped;
+                p.last_change = now;
+                if p.attempt_since.is_some() {
+                    p.fresh = Some((now.checked_add(window).unwrap_or(now), RankState::Lost));
+                }
+            }
+        });
+    }
+
+    /// A heartbeat of the owner attempt says its capture stopped (contract 3), for `reason`. The
+    /// first reason seen is kept, and the stop stays with the attempt: a session never resumes
+    /// capture. The stack it kept is dropped: once capture stops, a work counter that stands still
+    /// says nothing of where training is.
+    pub fn capture_stopped(&self, key: &Key, reason: &str, now: Instant) {
+        self.with(key, now, |p| {
+            if p.capture_stopped.is_none() {
+                p.capture_stopped = Some((reason.chars().take(CAPTURE_REASON_CHARS).collect(), now));
+            }
+            p.stack = None;
+        });
+    }
+
+    /// The ranks of `run_id` held.
+    pub fn rank_keys(&self, run_id: &str) -> Vec<Key> {
+        self.ranks
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(run, _)| run == run_id)
+            .cloned()
+            .collect()
     }
 
     /// A heartbeat from the rank's own process: it is alive, in `phase`. Leaving a phase other
@@ -832,8 +1069,9 @@ impl Watchdog {
                 }
                 p.work_moved = now;
             }
-            // The newest word wins: a beat with no stack says the rank is working again.
-            p.stack = stack;
+            // The newest word wins: a beat with no stack says the rank is working again. None is kept
+            // once capture stopped (contract 3).
+            p.stack = if p.capture_stopped.is_some() { None } else { stack };
             if work.is_some() {
                 p.work = work;
             }
@@ -863,12 +1101,13 @@ impl Watchdog {
             if world_size.is_some() {
                 p.world_size = world_size;
             }
-            if attempt < p.attempt && p.attempt_since.is_some() {
-                // An earlier attempt's rows, sent late (by the process of a later attempt that found
-                // them unsent, before that attempt stores any): kept, and not its progress.
-                if let Some(step) = new_last {
-                    p.last_step = Some(p.last_step.map_or(step, |last| last.max(step)));
-                }
+            if new_last.is_some() {
+                p.order.place_rows(attempt, None, epoch_ms());
+            }
+            if attempt != p.owner() {
+                // Rows of an attempt that does not own the rank (contract 1): a backlog, or a
+                // process of an earlier attempt still alive. Stored, counted by the caller, and
+                // never progress: `last_step` and the clocks stay the owner's (RS05).
                 return;
             }
             if let Some(step) = new_last {
@@ -886,6 +1125,9 @@ impl Watchdog {
                 // stores steps below the earlier attempt's): its step is the rank's from here on.
                 // Decided before `attempt` is taken, which a heartbeat may already have raised.
                 let new_attempt = attempt != p.attempt || p.attempt_since.is_some();
+                if attempt != p.attempt {
+                    p.capture_stopped = None;
+                }
                 p.attempt_since = None;
                 let gap = now.saturating_duration_since(from).as_secs_f64();
                 p.gaps.push_back(gap);
@@ -923,6 +1165,7 @@ impl Watchdog {
         };
         if settled {
             ranks.retain(|(run, _), _| run != run_id);
+            self.pending_orders.lock().unwrap().retain(|(run, _), _| run != run_id);
         }
         settled
     }
@@ -994,6 +1237,7 @@ pub fn run_status(
     ]);
     let stopped = count(&[RankState::Silent, RankState::Lost, RankState::Unresponsive]);
     let all_finished = !members.is_empty() && count(&[RankState::Finished]) == members.len();
+    let capture_stopped = count(&[RankState::CaptureStopped]);
     let summary = if !running {
         "server_stopped"
     } else if all_finished && unseen.is_empty() {
@@ -1004,8 +1248,13 @@ pub fn run_status(
         "active" // inside the grace, waiting for the ranks not seen yet
     } else if active == 0 && stopped > 0 {
         "stalled"
-    } else if stopped > 0 || !missing.is_empty() {
+    } else if stopped > 0 || !missing.is_empty() || (capture_stopped > 0 && active > 0) {
         "degraded"
+    } else if active == 0 && capture_stopped > 0 {
+        // Every rank's capture stopped or finished, and one at least stopped (contract 3): the
+        // run is not finished, and nothing in it is watched. Until Nov 19, 2026 such a run read a
+        // suspected hang, or `finished` once its sessions closed.
+        "capture_stopped"
     } else {
         "active"
     };
@@ -1039,9 +1288,19 @@ pub fn run_status(
                 "state": state.as_str(),
             });
             if p.attempt_since.is_some() {
-                // `attempt` is a new one, seen in its heartbeats; `last_step` and the time since
-                // progress are still the earlier attempt's.
+                // `attempt` is a new one, seen in its heartbeats, that has stored no step: `last_step`
+                // is null (the earlier attempt's steps are not its own), and the time since progress
+                // is still the earlier attempt's.
                 entry["attempt_without_steps"] = json!(true);
+            }
+            if p.superseded_rows > 0 {
+                entry["superseded_rows"] = json!(p.superseded_rows);
+            }
+            if let Some((reason, since)) = &p.capture_stopped {
+                entry["capture_stopped"] = json!({
+                    "reason": reason,
+                    "seconds": (now.saturating_duration_since(*since).as_secs_f64() * 10.0).round() / 10.0,
+                });
             }
             if let Some(stack) = &p.stack {
                 entry["stack"] = stack.clone();
@@ -1154,9 +1413,24 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
             .iter()
             .find(|entry| entry["rank"].as_i64() == Some(i64::from(*rank)))
             .is_some_and(|entry| {
-                entry["attempt"].as_i64().unwrap_or(0) == report.attempt && entry["attempt_without_steps"] != true
+                entry["attempt"].as_i64().unwrap_or(0) == report.attempt
+                    && entry["attempt_without_steps"] != true
+                    && entry.get("capture_stopped").is_none_or(Value::is_null)
             })
     };
+    // Ranks whose owner attempt stopped capturing (contract 3): never judged, whatever state they read.
+    let capture_stopped: Vec<i32> = entries
+        .iter()
+        .filter(|entry| entry.get("capture_stopped").is_some_and(Value::is_object))
+        .filter_map(|entry| entry["rank"].as_i64().and_then(|rank| i32::try_from(rank).ok()))
+        .collect();
+    if !capture_stopped.is_empty() {
+        reasons.push(json!({
+            "state": "unknown", "code": "capture_stopped", "ranks": capture_stopped,
+            "detail": format!("capture stopped on {} rank{}: training there is not watched",
+                capture_stopped.len(), if capture_stopped.len() == 1 { "" } else { "s" }),
+        }));
+    }
     let stream = status["incidents"].as_array().map_or(&[][..], Vec::as_slice);
     let mut listed: Vec<String> = Vec::new();
     for rank in &ranks {
@@ -1358,6 +1632,13 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
         .filter(|rank| state(rank) == "lost")
         .map(|rank| rank["rank"].clone())
         .collect();
+    let missing = status["missing_ranks"]
+        .as_array()
+        .is_some_and(|missing| !missing.is_empty());
+    if stopped.is_empty() && !missing {
+        // Degraded by a rank whose capture stopped (contract 3): not a progress incident.
+        return Vec::new();
+    }
     let assessment =
         if !stopped.is_empty() && (lost.len() == stopped.len() || (!lost.is_empty() && summary == "stalled")) {
             "lost_connection"
@@ -1418,6 +1699,7 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::AttemptOrder;
 
     #[test]
     fn a_stopped_ranks_stack_becomes_stuck_at_the_way_python_reads_it() {
@@ -2306,7 +2588,9 @@ mod tests {
             (&json!(2), &json!(true))
         );
         assert_eq!(status["ranks"][0]["state"], "reconnecting");
-        assert_eq!(status["ranks"][0]["last_step"], 99); // the earlier attempt's, as stored
+        // No step of its own yet: the earlier attempt's 99 is not shown as this one's (contract 1,
+        // decided Nov 19, 2026; until then `last_step` stayed 99).
+        assert_eq!(status["ranks"][0]["last_step"], json!(null));
         assert!(status["incidents"].as_array().unwrap().is_empty());
         // Its stream opens; it beats and takes no step: starting for the start limit from its first
         // beat, a warning after it, critical 180 s later.
@@ -2332,7 +2616,8 @@ mod tests {
                 &status["ranks"][0]["attempt_without_steps"],
                 &status["ranks"][0]["last_step"]
             ),
-            (&json!(2), &json!(true), &json!(120))
+            // The late rows do not raise `last_step` either (contract 1; until Nov 19, 2026 it read 120).
+            (&json!(2), &json!(true), &json!(null))
         );
         assert_eq!(status["ranks"][0]["severity"], "critical");
         // Its first batch, below the old highest step: active, and judged by its batches from now;
@@ -2374,17 +2659,18 @@ mod tests {
         // A resend of rows already stored (no step kept) changes nothing.
         dog.batch(&key(0), 2, None, Some(1), at(t0, 230));
         assert_eq!(rank_field(&dog, at(t0, 231), "last_step"), 109);
-        // A lower attempt once the newer one has stored rows is taken as a job started again
-        // (a host whose clock is behind), as it was before: its step is the rank's.
+        // A late row of the earlier attempt, once the newer one owns the rank, is not progress,
+        // whatever its number (contract 1, decided Nov 19, 2026; until then a lower attempt with
+        // rows stored after the newer one's took the rank back: RS05).
         dog.batch(&key(0), 1, Some(5), Some(1), at(t0, 240));
         assert_eq!(
             (
                 rank_field(&dog, at(t0, 241), "attempt"),
                 rank_field(&dog, at(t0, 241), "last_step")
             ),
-            (json!(1), json!(5))
+            (json!(2), json!(109))
         );
-        assert_eq!(states(&dog, at(t0, 241)), ["active"]);
+        assert_eq!(states(&dog, at(t0, 241)), ["silent"]);
     }
 
     #[test]
@@ -3425,5 +3711,178 @@ mod tests {
                 "rank {newer}'s pause ended last"
             );
         }
+    }
+
+    // Contract 3 (C03, decided Nov 19, 2026): capture stopped, on a streaming run.
+
+    #[test]
+    fn w2_a_stopped_capture_is_its_own_state_in_every_stream_state_and_over_a_restart() {
+        // config(60): floor 60 s; beats every 5 s are stale after 30 s.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        assert!(dog.attempt_seen(&key(0), 1, t0));
+        dog.heartbeat(&key(0), "train", 5.0, Some(0), None, t0);
+        dog.batch(&key(0), 1, Some(9), Some(1), at(t0, 1));
+        dog.capture_stopped(&key(0), "sink_error", at(t0, 2));
+        // The work counter stands still while training goes on; a stack sent now is not kept.
+        for second in (2..=400).step_by(5) {
+            dog.heartbeat(
+                &key(0),
+                "train",
+                5.0,
+                Some(10),
+                Some(json!({"threads": []})),
+                at(t0, second),
+            );
+        }
+        let status = &dog.statuses(at(t0, 400), true)["run"];
+        let entry = &status["ranks"][0];
+        assert_eq!(
+            (entry["state"].as_str(), &entry["severity"]),
+            (Some("capture_stopped"), &json!(null))
+        );
+        assert_eq!(entry["capture_stopped"]["reason"], "sink_error");
+        assert_eq!(entry["capture_stopped"]["seconds"], 398.0);
+        assert!(entry.get("stack").is_none());
+        assert_eq!(status["summary"], "capture_stopped");
+        assert!(status["incidents"].as_array().unwrap().is_empty(), "{status}");
+        let state = run_state(status, &BTreeMap::new(), true);
+        assert_eq!(state["state"], "unknown");
+        assert!(state["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["code"] == "capture_stopped" && r["ranks"] == json!([0])));
+        // Beats stop with the stream open: a frozen process, and the stop is still on record.
+        let entry = &dog.statuses(at(t0, 431), true)["run"]["ranks"][0];
+        assert_eq!(entry["state"], "unresponsive");
+        assert_eq!(entry["capture_stopped"]["reason"], "sink_error");
+        // A restart then keeps the reason; the rank reads capture_stopped again once it beats.
+        let status = dog.statuses(at(t0, 431), true)["run"].clone();
+        let now = Instant::now();
+        let again = restarted(&status, 60, now);
+        let entry = &again.statuses(now, true)["run"]["ranks"][0];
+        assert_eq!(entry["capture_stopped"]["reason"], "sink_error");
+        assert_ne!(again.statuses(now, true)["run"]["summary"], "finished");
+        again.heartbeat(&key(0), "train", 5.0, Some(10), None, now);
+        assert_eq!(states(&again, now), ["capture_stopped"]);
+        // A clean close: still not finished.
+        dog.heartbeat(&key(0), "train", 5.0, Some(10), None, at(t0, 440));
+        dog.stream_ended(&key(0), true, at(t0, 441));
+        let status = &dog.statuses(at(t0, 5000), true)["run"];
+        assert_eq!(
+            (
+                status["ranks"][0]["stream"].as_str(),
+                status["ranks"][0]["state"].as_str(),
+                status["summary"].as_str()
+            ),
+            (Some("finished"), Some("capture_stopped"), Some("capture_stopped"))
+        );
+        // A new attempt takes the rank and is watched again.
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 5001)));
+        dog.stream_opened(&key(0), at(t0, 5002));
+        dog.batch(&key(0), 2, Some(0), Some(1), at(t0, 5003));
+        let entry = &dog.statuses(at(t0, 5004), true)["run"]["ranks"][0];
+        assert_eq!(entry["state"], "active");
+        assert!(entry.get("capture_stopped").is_none());
+    }
+
+    #[test]
+    fn w2_a_stopped_capture_beside_an_active_rank_is_degraded_with_no_progress_incident() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        for rank in [0, 1] {
+            dog.stream_opened(&key(rank), t0);
+            dog.heartbeat(&key(rank), "train", 5.0, Some(0), None, t0);
+            dog.batch(&key(rank), 0, Some(9), Some(2), at(t0, 1));
+        }
+        dog.capture_stopped(&key(1), "writer_behind", at(t0, 2));
+        dog.heartbeat(&key(1), "train", 5.0, Some(10), None, at(t0, 20));
+        dog.batch(&key(0), 0, Some(19), Some(2), at(t0, 20));
+        let status = &dog.statuses(at(t0, 21), true)["run"];
+        assert_eq!(status["summary"], "degraded");
+        assert!(status["incidents"].as_array().unwrap().is_empty(), "{status}");
+    }
+
+    // Contract 1 (RS05): ownership by the order, not by number.
+
+    #[test]
+    fn w2_the_stores_order_owns_the_rank_over_a_restored_status_and_late_rows_are_counted() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        assert!(dog.attempt_seen(&key(0), 900, t0));
+        dog.batch(&key(0), 900, Some(100), Some(1), at(t0, 10));
+        let before_b = dog.statuses(at(t0, 11), true)["run"].clone();
+        // A restart from a status written before B's claim, with the store's order [900, 2].
+        let now = Instant::now();
+        let again = restarted(&before_b, 60, now);
+        let mut order = AttemptOrder::default();
+        order.place_claim(900, 0);
+        order.place_claim(2, 0);
+        order.on_disk = true;
+        again.load_order(&key(0), order, now);
+        let entry = &again.statuses(now, true)["run"]["ranks"][0];
+        assert_eq!(
+            (&entry["attempt"], &entry["last_step"], &entry["attempt_without_steps"]),
+            (&json!(2), &json!(null), &json!(true))
+        );
+        assert_eq!(entry["severity"], json!(null));
+        // A's late step: stored, counted, not progress; A's beat is not taken.
+        assert!(!again.attempt_seen(&key(0), 900, now));
+        again.superseded(&key(0), 1, now);
+        again.batch(&key(0), 900, Some(101), Some(1), now);
+        let entry = &again.statuses(now, true)["run"]["ranks"][0];
+        assert_eq!(
+            (&entry["attempt"], &entry["last_step"], &entry["superseded_rows"]),
+            (&json!(2), &json!(null), &json!(1))
+        );
+        // B's first row.
+        again.stream_opened(&key(0), now);
+        again.batch(&key(0), 2, Some(30), Some(1), now);
+        let entry = &again.statuses(now, true)["run"]["ranks"][0];
+        assert_eq!(
+            (&entry["attempt"], &entry["last_step"], entry["state"].as_str()),
+            (&json!(2), &json!(30), Some("active"))
+        );
+        assert_eq!(again.statuses(now, true)["run"]["restart"][0]["superseded_rows"], 1);
+    }
+
+    #[test]
+    fn w2_a_stream_of_an_earlier_attempt_that_closes_cleanly_does_not_finish_the_rank() {
+        // RS01's open case: B's first beat while A's stream is still open, then A's clean close.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        assert!(dog.attempt_seen(&key(0), 1, t0));
+        dog.batch(&key(0), 1, Some(9), Some(1), at(t0, 1));
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 10)));
+        // `Ingest` finds the open stream named attempt 1, which no longer owns the rank.
+        dog.stream_superseded(&key(0), at(t0, 10));
+        assert_eq!(states(&dog, at(t0, 11)), ["reconnecting"]);
+        // The start window (600 s with config(60)) from the beat at 10 s, then lost.
+        assert_eq!(states(&dog, at(t0, 609)), ["reconnecting"], "under the start window");
+        assert_eq!(states(&dog, at(t0, 611)), ["lost"]);
+    }
+
+    #[test]
+    fn w2_a_new_attempt_whose_rows_come_before_its_first_beat_still_owns_the_rank() {
+        // A sender that names no `sender_attempt` (every SDK before Nov 19, 2026): attempt 1 is
+        // claimed and steps; the job starts again as attempt 2, and its rows reach the server before
+        // any beat naming it (its first beat was lost in an outage the stream outlived). On
+        // `66b52d7` attempt 2 owned the rank; it must still.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        assert!(dog.attempt_seen(&key(0), 1, t0));
+        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 10));
+        dog.batch(&key(0), 2, Some(30), Some(1), at(t0, 20));
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 21)));
+        let entry = &dog.statuses(at(t0, 22), true)["run"]["ranks"][0];
+        assert_eq!(
+            (&entry["attempt"], &entry["last_step"], entry["state"].as_str()),
+            (&json!(2), &json!(30), Some("active"))
+        );
     }
 }
