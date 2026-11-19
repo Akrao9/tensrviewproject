@@ -1,0 +1,4648 @@
+{
+ "B1||buggy": {
+  "script": "b01_pt84911.py",
+  "variant": "buggy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B01-PT-84911-buggy",
+  "result": {
+   "bug": "B01-PT-84911",
+   "variant": "buggy",
+   "run_id": "B01-PT-84911-buggy",
+   "torch": "2.15.0",
+   "settings": {
+    "epochs": 2,
+    "batches_per_epoch": 11,
+    "optimizer": "Adadelta(lr=1)",
+    "weights": "default (50)",
+    "init_at": "to",
+    "source": "TrainCheck 84911.py, model and data swapped"
+   },
+   "symptom": {
+    "steps": 22,
+    "parameters": 20,
+    "parameters_changed": 0,
+    "parameters_with_requires_grad": 12,
+    "of_those_held_by_optimizer": 0,
+    "loss_first_last": [
+     2.2981,
+     2.3434
+    ],
+    "bug_present": true
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "degraded",
+     "incidents": [],
+     "kinds_checked": [
+      "data_stalled",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change"
+     ],
+     "kinds_unavailable": [
+      "update_spike"
+     ],
+     "checked_without_enough_history": [],
+     "not_checked": [
+      {
+       "check": "update_size",
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have",
+       "step": 0
+      }
+     ],
+     "relevant_kinds": {
+      "stalled_weights": {
+       "value": "not_configured",
+       "records": 0,
+       "records_needed": 3,
+       "enough_history": false
+      },
+      "update_spike": {
+       "value": "unavailable",
+       "records": 0,
+       "records_needed": 102,
+       "enough_history": false,
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have"
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "stalled_weights",
+    "update_spike"
+   ]
+  }
+ },
+ "B1||healthy": {
+  "script": "b01_pt84911.py",
+  "variant": "healthy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B01-PT-84911-healthy",
+  "result": {
+   "bug": "B01-PT-84911",
+   "variant": "healthy",
+   "run_id": "B01-PT-84911-healthy",
+   "torch": "2.15.0",
+   "settings": {
+    "epochs": 2,
+    "batches_per_epoch": 11,
+    "optimizer": "Adadelta(lr=1)",
+    "weights": "default (50)",
+    "init_at": "to",
+    "source": "TrainCheck 84911.py, model and data swapped"
+   },
+   "symptom": {
+    "steps": 22,
+    "parameters": 20,
+    "parameters_changed": 20,
+    "parameters_with_requires_grad": 20,
+    "of_those_held_by_optimizer": 20,
+    "loss_first_last": [
+     2.2981,
+     2.2762
+    ],
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "degraded",
+     "incidents": [],
+     "kinds_checked": [
+      "data_stalled",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change"
+     ],
+     "kinds_unavailable": [
+      "update_spike"
+     ],
+     "checked_without_enough_history": [],
+     "not_checked": [
+      {
+       "check": "update_size",
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have",
+       "step": 0
+      }
+     ],
+     "relevant_kinds": {
+      "stalled_weights": {
+       "value": "not_configured",
+       "records": 0,
+       "records_needed": 3,
+       "enough_history": false
+      },
+      "update_spike": {
+       "value": "unavailable",
+       "records": 0,
+       "records_needed": 102,
+       "enough_history": false,
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have"
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "stalled_weights",
+    "update_spike"
+   ]
+  }
+ },
+ "B1|w5|buggy": {
+  "script": "b01_pt84911.py",
+  "variant": "buggy",
+  "tag": "w5",
+  "args": [
+   "--weights",
+   "5"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B01-PT-84911-buggy-w5",
+  "result": {
+   "bug": "B01-PT-84911",
+   "variant": "buggy",
+   "run_id": "B01-PT-84911-buggy-w5",
+   "torch": "2.15.0",
+   "settings": {
+    "epochs": 2,
+    "batches_per_epoch": 11,
+    "optimizer": "Adadelta(lr=1)",
+    "weights": 5,
+    "init_at": "to",
+    "source": "TrainCheck 84911.py, model and data swapped"
+   },
+   "symptom": {
+    "steps": 22,
+    "parameters": 20,
+    "parameters_changed": 0,
+    "parameters_with_requires_grad": 12,
+    "of_those_held_by_optimizer": 0,
+    "loss_first_last": [
+     2.2981,
+     2.3434
+    ],
+    "bug_present": true
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "stalled_weights",
+       "class": "invariant",
+       "step": 19,
+       "detail": {
+        "parameters": [
+         "_bn0.weight",
+         "_bn0.bias",
+         "_blocks.0._bn1.weight",
+         "_blocks.0._bn1.bias",
+         "... 8 more"
+        ],
+        "stalled": 12,
+        "with_gradients": 12,
+        "consecutive": 3,
+        "optimizer": {
+         "state": "known",
+         "not_held": [
+          "_bn0.weight",
+          "_bn0.bias",
+          "_blocks.0._bn1.weight",
+          "_blocks.0._bn1.bias",
+          "... 8 more"
+         ],
+         "not_held_count": 12,
+         "held_count": 0
+        },
+        "weight_dtypes": {
+         "float32": 20
+        },
+        "stalled_steps": 1,
+        "stalled_total": 12,
+        "onsets": [
+         {
+          "parameters": [
+           "_bn0.weight",
+           "_bn0.bias",
+           "_blocks.0._bn1.weight",
+           "_blocks.0._bn1.bias",
+           "... 8 more"
+          ],
+          "stalled": 12,
+          "trained_before": 0,
+          "optimizer": {
+           "state": "known",
+           "not_held": [
+            "_bn0.weight",
+            "_bn0.bias",
+            "_blocks.0._bn1.weight",
+            "_blocks.0._bn1.bias",
+            "... 8 more"
+           ],
+           "not_held_count": 12,
+           "held_count": 0
+          }
+         }
+        ],
+        "onsets_omitted": 0
+       }
+      }
+     ],
+     "kinds_checked": [
+      "data_stalled",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights"
+     ],
+     "kinds_unavailable": [
+      "update_spike"
+     ],
+     "checked_without_enough_history": [],
+     "not_checked": [
+      {
+       "check": "update_size",
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have",
+       "step": 0
+      }
+     ],
+     "relevant_kinds": {
+      "stalled_weights": {
+       "value": "checked",
+       "records": 3,
+       "records_needed": 3,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "unavailable",
+       "records": 0,
+       "records_needed": 102,
+       "enough_history": false,
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have"
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "stalled_weights",
+    "update_spike"
+   ]
+  }
+ },
+ "B1|w5|healthy": {
+  "script": "b01_pt84911.py",
+  "variant": "healthy",
+  "tag": "w5",
+  "args": [
+   "--weights",
+   "5"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B01-PT-84911-healthy-w5",
+  "result": {
+   "bug": "B01-PT-84911",
+   "variant": "healthy",
+   "run_id": "B01-PT-84911-healthy-w5",
+   "torch": "2.15.0",
+   "settings": {
+    "epochs": 2,
+    "batches_per_epoch": 11,
+    "optimizer": "Adadelta(lr=1)",
+    "weights": 5,
+    "init_at": "to",
+    "source": "TrainCheck 84911.py, model and data swapped"
+   },
+   "symptom": {
+    "steps": 22,
+    "parameters": 20,
+    "parameters_changed": 20,
+    "parameters_with_requires_grad": 20,
+    "of_those_held_by_optimizer": 20,
+    "loss_first_last": [
+     2.2981,
+     2.2762
+    ],
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "degraded",
+     "incidents": [],
+     "kinds_checked": [
+      "data_stalled",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights"
+     ],
+     "kinds_unavailable": [
+      "update_spike"
+     ],
+     "checked_without_enough_history": [],
+     "not_checked": [
+      {
+       "check": "update_size",
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have",
+       "step": 0
+      }
+     ],
+     "relevant_kinds": {
+      "stalled_weights": {
+       "value": "checked",
+       "records": 3,
+       "records_needed": 3,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "unavailable",
+       "records": 0,
+       "records_needed": 102,
+       "enough_history": false,
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have"
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "stalled_weights",
+    "update_spike"
+   ]
+  }
+ },
+ "B1|long|buggy": {
+  "script": "b01_pt84911.py",
+  "variant": "buggy",
+  "tag": "long",
+  "args": [
+   "--batches",
+   "100"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B01-PT-84911-buggy-long",
+  "result": {
+   "bug": "B01-PT-84911",
+   "variant": "buggy",
+   "run_id": "B01-PT-84911-buggy-long",
+   "torch": "2.15.0",
+   "settings": {
+    "epochs": 2,
+    "batches_per_epoch": 100,
+    "optimizer": "Adadelta(lr=1)",
+    "weights": "default (50)",
+    "init_at": "to",
+    "source": "TrainCheck 84911.py, model and data swapped"
+   },
+   "symptom": {
+    "steps": 200,
+    "parameters": 20,
+    "parameters_changed": 0,
+    "parameters_with_requires_grad": 12,
+    "of_those_held_by_optimizer": 0,
+    "loss_first_last": [
+     2.2998,
+     2.3225
+    ],
+    "bug_present": true
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "stalled_weights",
+       "class": "invariant",
+       "step": 199,
+       "detail": {
+        "parameters": [
+         "_bn0.weight",
+         "_bn0.bias",
+         "_blocks.0._bn1.weight",
+         "_blocks.0._bn1.bias",
+         "... 8 more"
+        ],
+        "stalled": 12,
+        "with_gradients": 12,
+        "consecutive": 3,
+        "optimizer": {
+         "state": "known",
+         "not_held": [
+          "_bn0.weight",
+          "_bn0.bias",
+          "_blocks.0._bn1.weight",
+          "_blocks.0._bn1.bias",
+          "... 8 more"
+         ],
+         "not_held_count": 12,
+         "held_count": 0
+        },
+        "weight_dtypes": {
+         "float32": 20
+        },
+        "stalled_steps": 1,
+        "stalled_total": 12,
+        "onsets": [
+         {
+          "parameters": [
+           "_bn0.weight",
+           "_bn0.bias",
+           "_blocks.0._bn1.weight",
+           "_blocks.0._bn1.bias",
+           "... 8 more"
+          ],
+          "stalled": 12,
+          "trained_before": 0,
+          "optimizer": {
+           "state": "known",
+           "not_held": [
+            "_bn0.weight",
+            "_bn0.bias",
+            "_blocks.0._bn1.weight",
+            "_blocks.0._bn1.bias",
+            "... 8 more"
+           ],
+           "not_held_count": 12,
+           "held_count": 0
+          }
+         }
+        ],
+        "onsets_omitted": 0
+       }
+      }
+     ],
+     "kinds_checked": [
+      "data_stalled",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights"
+     ],
+     "kinds_unavailable": [
+      "update_spike"
+     ],
+     "checked_without_enough_history": [],
+     "not_checked": [
+      {
+       "check": "update_size",
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have",
+       "step": 0
+      }
+     ],
+     "relevant_kinds": {
+      "stalled_weights": {
+       "value": "checked",
+       "records": 3,
+       "records_needed": 3,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "unavailable",
+       "records": 0,
+       "records_needed": 102,
+       "enough_history": false,
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have"
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "stalled_weights",
+    "update_spike"
+   ]
+  }
+ },
+ "B1|long|healthy": {
+  "script": "b01_pt84911.py",
+  "variant": "healthy",
+  "tag": "long",
+  "args": [
+   "--batches",
+   "100"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B01-PT-84911-healthy-long",
+  "result": {
+   "bug": "B01-PT-84911",
+   "variant": "healthy",
+   "run_id": "B01-PT-84911-healthy-long",
+   "torch": "2.15.0",
+   "settings": {
+    "epochs": 2,
+    "batches_per_epoch": 100,
+    "optimizer": "Adadelta(lr=1)",
+    "weights": "default (50)",
+    "init_at": "to",
+    "source": "TrainCheck 84911.py, model and data swapped"
+   },
+   "symptom": {
+    "steps": 200,
+    "parameters": 20,
+    "parameters_changed": 20,
+    "parameters_with_requires_grad": 20,
+    "of_those_held_by_optimizer": 20,
+    "loss_first_last": [
+     2.2998,
+     0.261
+    ],
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "degraded",
+     "incidents": [],
+     "kinds_checked": [
+      "data_stalled",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights"
+     ],
+     "kinds_unavailable": [
+      "update_spike"
+     ],
+     "checked_without_enough_history": [],
+     "not_checked": [
+      {
+       "check": "update_size",
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have",
+       "step": 0
+      }
+     ],
+     "relevant_kinds": {
+      "stalled_weights": {
+       "value": "checked",
+       "records": 3,
+       "records_needed": 3,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "unavailable",
+       "records": 0,
+       "records_needed": 102,
+       "enough_history": false,
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have"
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "stalled_weights",
+    "update_spike"
+   ]
+  }
+ },
+ "B1|initloop|buggy": {
+  "script": "b01_pt84911.py",
+  "variant": "buggy",
+  "tag": "initloop",
+  "args": [
+   "--init-at",
+   "loop"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B01-PT-84911-buggy-initloop",
+  "result": {
+   "bug": "B01-PT-84911",
+   "variant": "buggy",
+   "run_id": "B01-PT-84911-buggy-initloop",
+   "torch": "2.15.0",
+   "settings": {
+    "epochs": 2,
+    "batches_per_epoch": 11,
+    "optimizer": "Adadelta(lr=1)",
+    "weights": "default (50)",
+    "init_at": "loop",
+    "source": "TrainCheck 84911.py, model and data swapped"
+   },
+   "symptom": {
+    "steps": 22,
+    "parameters": 20,
+    "parameters_changed": 0,
+    "parameters_with_requires_grad": 12,
+    "of_those_held_by_optimizer": 0,
+    "loss_first_last": [
+     2.2981,
+     2.3434
+    ],
+    "bug_present": true
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unknown",
+     "incidents": [],
+     "kinds_checked": [],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "stalled_weights": {
+       "value": "not_configured",
+       "records": 0,
+       "records_needed": 3,
+       "enough_history": false
+      },
+      "update_spike": {
+       "value": "not_configured",
+       "records": 0,
+       "records_needed": 102,
+       "enough_history": false
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "stalled_weights",
+    "update_spike"
+   ]
+  }
+ },
+ "B1|initloop|healthy": {
+  "script": "b01_pt84911.py",
+  "variant": "healthy",
+  "tag": "initloop",
+  "args": [
+   "--init-at",
+   "loop"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B01-PT-84911-healthy-initloop",
+  "result": {
+   "bug": "B01-PT-84911",
+   "variant": "healthy",
+   "run_id": "B01-PT-84911-healthy-initloop",
+   "torch": "2.15.0",
+   "settings": {
+    "epochs": 2,
+    "batches_per_epoch": 11,
+    "optimizer": "Adadelta(lr=1)",
+    "weights": "default (50)",
+    "init_at": "loop",
+    "source": "TrainCheck 84911.py, model and data swapped"
+   },
+   "symptom": {
+    "steps": 22,
+    "parameters": 20,
+    "parameters_changed": 20,
+    "parameters_with_requires_grad": 20,
+    "of_those_held_by_optimizer": 20,
+    "loss_first_last": [
+     2.2981,
+     2.2762
+    ],
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "degraded",
+     "incidents": [],
+     "kinds_checked": [
+      "data_stalled",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change"
+     ],
+     "kinds_unavailable": [
+      "update_spike"
+     ],
+     "checked_without_enough_history": [],
+     "not_checked": [
+      {
+       "check": "update_size",
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have",
+       "step": 0
+      }
+     ],
+     "relevant_kinds": {
+      "stalled_weights": {
+       "value": "not_configured",
+       "records": 0,
+       "records_needed": 3,
+       "enough_history": false
+      },
+      "update_spike": {
+       "value": "unavailable",
+       "records": 0,
+       "records_needed": 102,
+       "enough_history": false,
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have"
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "stalled_weights",
+    "update_spike"
+   ]
+  }
+ },
+ "B2||buggy": {
+  "script": "hw_p2p_sim.py",
+  "variant": "buggy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "HW-P2P-SIM-buggy",
+  "result": {
+   "bug": "HW-P2P-SIM",
+   "variant": "buggy",
+   "run_id": "HW-P2P-SIM-buggy",
+   "torch": "2.15.0",
+   "settings": {
+    "world_size": 2,
+    "steps": 200,
+    "optimizer": "AdamW(lr=1e-3)",
+    "replica_every": "default (50)",
+    "weights": "default (50)",
+    "source": "simulated effect (TrainCheck reuses the PT-104336 trace for these three)"
+   },
+   "symptom": {
+    "steps": 200,
+    "corrupted_at_step": 75,
+    "replica_max_abs_diff": 0.17661513108760118,
+    "bug_present": true,
+    "rank0_loss_first_last": [
+     2.2575,
+     0.6355
+    ]
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 64,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.642965,
+          "recent": 1.95542,
+          "ratio": 3.04125
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 136
+       }
+      },
+      {
+       "kind": "replica_drift",
+       "class": "invariant",
+       "step": 99,
+       "detail": {
+        "tolerance": 1e-06,
+        "parameters": {
+         "0.weight": {
+          "norm_spread": 0.0557494,
+          "sum_spread": 0.146001,
+          "projection_spread": 0.15838
+         }
+        }
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "activation_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 11,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    },
+    "rank1": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 61,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.620392,
+          "recent": 1.86706,
+          "ratio": 3.00948
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 139
+       }
+      },
+      {
+       "kind": "replica_drift",
+       "class": "invariant",
+       "step": 99,
+       "detail": {
+        "tolerance": 1e-06,
+        "parameters": {
+         "0.weight": {
+          "norm_spread": 0.0557494,
+          "sum_spread": 0.146001,
+          "projection_spread": 0.15838
+         }
+        }
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "activation_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 11,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 2,
+   "relevant": [
+    "replica_drift",
+    "activation_spike",
+    "grad_spike"
+   ]
+  }
+ },
+ "B2||healthy": {
+  "script": "hw_p2p_sim.py",
+  "variant": "healthy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "HW-P2P-SIM-healthy",
+  "result": {
+   "bug": "HW-P2P-SIM",
+   "variant": "healthy",
+   "run_id": "HW-P2P-SIM-healthy",
+   "torch": "2.15.0",
+   "settings": {
+    "world_size": 2,
+    "steps": 200,
+    "optimizer": "AdamW(lr=1e-3)",
+    "replica_every": "default (50)",
+    "weights": "default (50)",
+    "source": "simulated effect (TrainCheck reuses the PT-104336 trace for these three)"
+   },
+   "symptom": {
+    "steps": 200,
+    "corrupted_at_step": null,
+    "replica_max_abs_diff": 0.0,
+    "bug_present": false,
+    "rank0_loss_first_last": [
+     2.2575,
+     0.6193
+    ]
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 64,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.642965,
+          "recent": 1.95542,
+          "ratio": 3.04125
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 136
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "activation_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 11,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    },
+    "rank1": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 61,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.620392,
+          "recent": 1.86706,
+          "ratio": 3.00948
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 139
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "activation_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 11,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 2,
+   "relevant": [
+    "replica_drift",
+    "activation_spike",
+    "grad_spike"
+   ]
+  }
+ },
+ "B3||buggy": {
+  "script": "b03_ds1801_sim.py",
+  "variant": "buggy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B03-DS-1801-buggy",
+  "result": {
+   "bug": "B03-DS-1801",
+   "variant": "buggy",
+   "run_id": "B03-DS-1801-buggy",
+   "torch": "2.15.0",
+   "settings": {
+    "world_size": 2,
+    "steps": 200,
+    "optimizer": "AdamW(lr=1e-3)",
+    "max_norm": 1.0,
+    "replica_every": "default (50)",
+    "weights": "default (50)",
+    "source": "simulated mechanism (BLOOM-176B account); DeepSpeed not installed"
+   },
+   "symptom": {
+    "steps": 200,
+    "steps_clipped": 148,
+    "replicated_max_abs_diff": 0.0020192861557006836,
+    "layernorm_weight_max_abs_diff": 0.0020192861557006836,
+    "bug_present": true,
+    "rank0_loss_first_last": [
+     2.3601,
+     0.6791
+    ]
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 122,
+       "detail": {
+        "modules": [
+         {
+          "module": "fc2",
+          "stat": "std",
+          "baseline": 0.223565,
+          "recent": 0.672408,
+          "ratio": 3.00766
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 78
+       }
+      },
+      {
+       "kind": "replica_drift",
+       "class": "invariant",
+       "step": 49,
+       "detail": {
+        "tolerance": 1e-06,
+        "parameters": {
+         "out_bias": {
+          "norm_spread": 0.00845107,
+          "sum_spread": 0.0171127,
+          "projection_spread": 0.0318994
+         },
+         "ln.weight": {
+          "norm_spread": 2.58138e-05,
+          "sum_spread": 0.000200339,
+          "projection_spread": 7.13341e-06
+         },
+         "ln.bias": {
+          "norm_spread": 0.00200446,
+          "sum_spread": 0.0187101,
+          "projection_spread": 0.00176805
+         }
+        }
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      }
+     }
+    },
+    "rank1": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 121,
+       "detail": {
+        "modules": [
+         {
+          "module": "fc2",
+          "stat": "std",
+          "baseline": 0.241632,
+          "recent": 0.732942,
+          "ratio": 3.0333
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 79
+       }
+      },
+      {
+       "kind": "replica_drift",
+       "class": "invariant",
+       "step": 49,
+       "detail": {
+        "tolerance": 1e-06,
+        "parameters": {
+         "out_bias": {
+          "norm_spread": 0.00845107,
+          "sum_spread": 0.0171127,
+          "projection_spread": 0.0318994
+         },
+         "ln.weight": {
+          "norm_spread": 2.58138e-05,
+          "sum_spread": 0.000200339,
+          "projection_spread": 7.13341e-06
+         },
+         "ln.bias": {
+          "norm_spread": 0.00200446,
+          "sum_spread": 0.0187101,
+          "projection_spread": 0.00176805
+         }
+        }
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 2,
+   "relevant": [
+    "replica_drift",
+    "grad_spike",
+    "update_spike"
+   ]
+  }
+ },
+ "B3||healthy": {
+  "script": "b03_ds1801_sim.py",
+  "variant": "healthy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B03-DS-1801-healthy",
+  "result": {
+   "bug": "B03-DS-1801",
+   "variant": "healthy",
+   "run_id": "B03-DS-1801-healthy",
+   "torch": "2.15.0",
+   "settings": {
+    "world_size": 2,
+    "steps": 200,
+    "optimizer": "AdamW(lr=1e-3)",
+    "max_norm": 1.0,
+    "replica_every": "default (50)",
+    "weights": "default (50)",
+    "source": "simulated mechanism (BLOOM-176B account); DeepSpeed not installed"
+   },
+   "symptom": {
+    "steps": 200,
+    "steps_clipped": 148,
+    "replicated_max_abs_diff": 0.0,
+    "layernorm_weight_max_abs_diff": 0.0,
+    "bug_present": false,
+    "rank0_loss_first_last": [
+     2.3601,
+     0.6794
+    ]
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 122,
+       "detail": {
+        "modules": [
+         {
+          "module": "fc2",
+          "stat": "std",
+          "baseline": 0.223568,
+          "recent": 0.673099,
+          "ratio": 3.01072
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 78
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      }
+     }
+    },
+    "rank1": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 121,
+       "detail": {
+        "modules": [
+         {
+          "module": "fc2",
+          "stat": "std",
+          "baseline": 0.241733,
+          "recent": 0.728337,
+          "ratio": 3.01298
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 79
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 2,
+   "relevant": [
+    "replica_drift",
+    "grad_spike",
+    "update_spike"
+   ]
+  }
+ },
+ "B3|every1|buggy": {
+  "script": "b03_ds1801_sim.py",
+  "variant": "buggy",
+  "tag": "every1",
+  "args": [
+   "--replica-every",
+   "1"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B03-DS-1801-buggy-every1",
+  "result": {
+   "bug": "B03-DS-1801",
+   "variant": "buggy",
+   "run_id": "B03-DS-1801-buggy-every1",
+   "torch": "2.15.0",
+   "settings": {
+    "world_size": 2,
+    "steps": 200,
+    "optimizer": "AdamW(lr=1e-3)",
+    "max_norm": 1.0,
+    "replica_every": 1,
+    "weights": "default (50)",
+    "source": "simulated mechanism (BLOOM-176B account); DeepSpeed not installed"
+   },
+   "symptom": {
+    "steps": 200,
+    "steps_clipped": 148,
+    "replicated_max_abs_diff": 0.0020192861557006836,
+    "layernorm_weight_max_abs_diff": 0.0020192861557006836,
+    "bug_present": true,
+    "rank0_loss_first_last": [
+     2.3601,
+     0.6791
+    ]
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 122,
+       "detail": {
+        "modules": [
+         {
+          "module": "fc2",
+          "stat": "std",
+          "baseline": 0.223565,
+          "recent": 0.672408,
+          "ratio": 3.00766
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 78
+       }
+      },
+      {
+       "kind": "replica_drift",
+       "class": "invariant",
+       "step": 1,
+       "detail": {
+        "tolerance": 1e-06,
+        "parameters": {
+         "out_bias": {
+          "norm_spread": 0.000864987,
+          "sum_spread": 0.00155563,
+          "projection_spread": 0.000862984
+         },
+         "ln.weight": {
+          "norm_spread": 1.4395e-07,
+          "sum_spread": 1.14051e-06,
+          "projection_spread": 1.1066e-06
+         },
+         "ln.bias": {
+          "norm_spread": 0.00101738,
+          "sum_spread": 0.00382448,
+          "projection_spread": 0.00028581
+         }
+        }
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      }
+     }
+    },
+    "rank1": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 121,
+       "detail": {
+        "modules": [
+         {
+          "module": "fc2",
+          "stat": "std",
+          "baseline": 0.241632,
+          "recent": 0.732942,
+          "ratio": 3.0333
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 79
+       }
+      },
+      {
+       "kind": "replica_drift",
+       "class": "invariant",
+       "step": 1,
+       "detail": {
+        "tolerance": 1e-06,
+        "parameters": {
+         "out_bias": {
+          "norm_spread": 0.000864987,
+          "sum_spread": 0.00155563,
+          "projection_spread": 0.000862984
+         },
+         "ln.weight": {
+          "norm_spread": 1.4395e-07,
+          "sum_spread": 1.14051e-06,
+          "projection_spread": 1.1066e-06
+         },
+         "ln.bias": {
+          "norm_spread": 0.00101738,
+          "sum_spread": 0.00382448,
+          "projection_spread": 0.00028581
+         }
+        }
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 2,
+   "relevant": [
+    "replica_drift",
+    "grad_spike",
+    "update_spike"
+   ]
+  }
+ },
+ "B3|every1|healthy": {
+  "script": "b03_ds1801_sim.py",
+  "variant": "healthy",
+  "tag": "every1",
+  "args": [
+   "--replica-every",
+   "1"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B03-DS-1801-healthy-every1",
+  "result": {
+   "bug": "B03-DS-1801",
+   "variant": "healthy",
+   "run_id": "B03-DS-1801-healthy-every1",
+   "torch": "2.15.0",
+   "settings": {
+    "world_size": 2,
+    "steps": 200,
+    "optimizer": "AdamW(lr=1e-3)",
+    "max_norm": 1.0,
+    "replica_every": 1,
+    "weights": "default (50)",
+    "source": "simulated mechanism (BLOOM-176B account); DeepSpeed not installed"
+   },
+   "symptom": {
+    "steps": 200,
+    "steps_clipped": 148,
+    "replicated_max_abs_diff": 0.0,
+    "layernorm_weight_max_abs_diff": 0.0,
+    "bug_present": false,
+    "rank0_loss_first_last": [
+     2.3601,
+     0.6794
+    ]
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 122,
+       "detail": {
+        "modules": [
+         {
+          "module": "fc2",
+          "stat": "std",
+          "baseline": 0.223568,
+          "recent": 0.673099,
+          "ratio": 3.01072
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 78
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      }
+     }
+    },
+    "rank1": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 121,
+       "detail": {
+        "modules": [
+         {
+          "module": "fc2",
+          "stat": "std",
+          "baseline": 0.241733,
+          "recent": 0.728337,
+          "ratio": 3.01298
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 79
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 2,
+   "relevant": [
+    "replica_drift",
+    "grad_spike",
+    "update_spike"
+   ]
+  }
+ },
+ "B4||buggy": {
+  "script": "b04_so60335387.py",
+  "variant": "buggy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B04-SO-60335387-buggy",
+  "result": {
+   "bug": "B04-SO-60335387",
+   "variant": "buggy",
+   "run_id": "B04-SO-60335387-buggy",
+   "torch": "2.15.0",
+   "settings": {
+    "epochs": 2,
+    "batches_per_epoch": 51,
+    "optimizer": "Adadelta(lr=1.0), StepLR(gamma=0.7)",
+    "weights": "default (50)",
+    "source": "re-created on TrainCheck mnist.py"
+   },
+   "symptom": {
+    "steps": 102,
+    "grad_norm_first_last": [
+     5.2147,
+     38.4506
+    ],
+    "grad_norm_last_over_one_batch": 359.5,
+    "loss_first_tenth_mean": 2.8016,
+    "loss_last_tenth_mean": 2.317,
+    "test_accuracy": 0.103,
+    "bug_present": true
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 60,
+       "detail": {
+        "modules": [
+         {
+          "module": "conv2",
+          "stat": "std",
+          "baseline": 2.19108,
+          "recent": 6.57881,
+          "ratio": 3.00254
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 42
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights"
+     ],
+     "kinds_unavailable": [
+      "update_spike"
+     ],
+     "checked_without_enough_history": [
+      "stalled_weights (1 of 3 records)"
+     ],
+     "not_checked": [
+      {
+       "check": "update_size",
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have",
+       "step": 0
+      }
+     ],
+     "relevant_kinds": {
+      "grad_spike": {
+       "value": "checked",
+       "records": 102,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "unavailable",
+       "records": 0,
+       "records_needed": 102,
+       "enough_history": false,
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have"
+      },
+      "non_finite": {
+       "value": "checked",
+       "records": 102,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "activation_spike": {
+       "value": "checked",
+       "records": 102,
+       "records_needed": 11,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "grad_spike",
+    "update_spike",
+    "non_finite",
+    "activation_spike"
+   ]
+  }
+ },
+ "B4||healthy": {
+  "script": "b04_so60335387.py",
+  "variant": "healthy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B04-SO-60335387-healthy",
+  "result": {
+   "bug": "B04-SO-60335387",
+   "variant": "healthy",
+   "run_id": "B04-SO-60335387-healthy",
+   "torch": "2.15.0",
+   "settings": {
+    "epochs": 2,
+    "batches_per_epoch": 51,
+    "optimizer": "Adadelta(lr=1.0), StepLR(gamma=0.7)",
+    "weights": "default (50)",
+    "source": "re-created on TrainCheck mnist.py"
+   },
+   "symptom": {
+    "steps": 102,
+    "grad_norm_first_last": [
+     5.2147,
+     0.9877
+    ],
+    "grad_norm_last_over_one_batch": 1.83,
+    "loss_first_tenth_mean": 2.7952,
+    "loss_last_tenth_mean": 0.1177,
+    "test_accuracy": 1.0,
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_spike",
+       "class": "anomaly",
+       "step": 23,
+       "detail": {
+        "modules": [
+         {
+          "module": "fc1",
+          "stat": "abs_max",
+          "value": 5.42681,
+          "baseline": 1.0555,
+          "ratio": 5.14148
+         },
+         {
+          "module": "fc2",
+          "stat": "abs_max",
+          "value": 3.42112,
+          "baseline": 0.502747,
+          "ratio": 6.80485
+         }
+        ],
+        "affected": 2,
+        "affected_steps": 11
+       }
+      },
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 59,
+       "detail": {
+        "modules": [
+         {
+          "module": "fc1",
+          "stat": "std",
+          "baseline": 1.1971,
+          "recent": 3.84065,
+          "ratio": 3.2083
+         },
+         {
+          "module": "fc2",
+          "stat": "std",
+          "baseline": 0.917861,
+          "recent": 3.97566,
+          "ratio": 4.33144
+         }
+        ],
+        "affected": 2,
+        "affected_steps": 43
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights"
+     ],
+     "kinds_unavailable": [
+      "update_spike"
+     ],
+     "checked_without_enough_history": [
+      "stalled_weights (1 of 3 records)"
+     ],
+     "not_checked": [
+      {
+       "check": "update_size",
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have",
+       "step": 0
+      }
+     ],
+     "relevant_kinds": {
+      "grad_spike": {
+       "value": "checked",
+       "records": 102,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "unavailable",
+       "records": 0,
+       "records_needed": 102,
+       "enough_history": false,
+       "reason": "Adadelta: Adadelta is not Adam or AdamW: the update size is worked out from the two moments Adam keeps (exp_avg and exp_avg_sq), which this optimizer does not have"
+      },
+      "non_finite": {
+       "value": "checked",
+       "records": 102,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "activation_spike": {
+       "value": "checked",
+       "records": 102,
+       "records_needed": 11,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "grad_spike",
+    "update_spike",
+    "non_finite",
+    "activation_spike"
+   ]
+  }
+ },
+ "B6||buggy": {
+  "script": "b06_so67180955_sim.py",
+  "variant": "buggy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B06-SO-67180955-buggy",
+  "result": {
+   "bug": "B06-SO-67180955",
+   "variant": "buggy",
+   "run_id": "B06-SO-67180955-buggy",
+   "torch": "2.15.0",
+   "settings": {
+    "steps": 200,
+    "workers": 4,
+    "optimizer": "Adam(lr=1e-3)",
+    "weights": "default (50)",
+    "source": "simulated pre-1.9 worker seeding through worker_init_fn"
+   },
+   "symptom": {
+    "steps": 200,
+    "samples": 6400,
+    "distinct_augmentations": 1600,
+    "repeated_augmentation_share": 0.75,
+    "train_loss_first_last": [
+     2.3823,
+     0.0408
+    ],
+    "bug_present": true
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 98,
+       "detail": {
+        "modules": [
+         {
+          "module": "2",
+          "stat": "std",
+          "baseline": 0.638051,
+          "recent": 1.9318,
+          "ratio": 3.02765
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 102
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "data_stalled": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 4,
+       "enough_history": true
+      },
+      "epoch_order_repeated": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 4,
+       "enough_history": true
+      },
+      "duplicate_batches": {
+       "value": "not_configured",
+       "enough_history": false
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "data_stalled",
+    "epoch_order_repeated",
+    "duplicate_batches"
+   ]
+  }
+ },
+ "B6||healthy": {
+  "script": "b06_so67180955_sim.py",
+  "variant": "healthy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B06-SO-67180955-healthy",
+  "result": {
+   "bug": "B06-SO-67180955",
+   "variant": "healthy",
+   "run_id": "B06-SO-67180955-healthy",
+   "torch": "2.15.0",
+   "settings": {
+    "steps": 200,
+    "workers": 4,
+    "optimizer": "Adam(lr=1e-3)",
+    "weights": "default (50)",
+    "source": "simulated pre-1.9 worker seeding through worker_init_fn"
+   },
+   "symptom": {
+    "steps": 200,
+    "samples": 6400,
+    "distinct_augmentations": 6400,
+    "repeated_augmentation_share": 0.0,
+    "train_loss_first_last": [
+     2.3736,
+     0.0249
+    ],
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 102,
+       "detail": {
+        "modules": [
+         {
+          "module": "2",
+          "stat": "std",
+          "baseline": 0.663643,
+          "recent": 2.01019,
+          "ratio": 3.02903
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 98
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "data_stalled": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 4,
+       "enough_history": true
+      },
+      "epoch_order_repeated": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 4,
+       "enough_history": true
+      },
+      "duplicate_batches": {
+       "value": "not_configured",
+       "enough_history": false
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "data_stalled",
+    "epoch_order_repeated",
+    "duplicate_batches"
+   ]
+  }
+ },
+ "B8||buggy": {
+  "script": "b08_pt115607.py",
+  "variant": "buggy",
+  "tag": "",
+  "args": [
+   "--disable"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B08-PT-115607-buggy",
+  "result": {
+   "bug": "B08-PT-115607",
+   "variant": "buggy",
+   "run_id": "B08-PT-115607-buggy",
+   "torch": "2.15.0",
+   "settings": {
+    "iterations": 6,
+    "optimizer": "Adam(lr=1e-3)",
+    "compiled": true,
+    "tensorquill_calls_under_compiler_disable": true,
+    "source": "TrainCheck 115607_bug.py from the clone's history; save_config dropped"
+   },
+   "symptom": {
+    "adam_step_counter": [
+     1.0,
+     2.0,
+     3.0,
+     3.0,
+     4.0,
+     5.0
+    ],
+    "expected_in_eager": [
+     1.0,
+     2.0,
+     3.0,
+     3.0,
+     4.0,
+     5.0
+    ],
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "healthy",
+     "incidents": [],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "dead_activations",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_lr_change",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [
+      "activation_drift (5 of 60 records)",
+      "activation_spike (5 of 11 records)",
+      "dead_activations (5 of 60 records)",
+      "grad_spike (5 of 13 records)",
+      "update_spike (5 of 102 records)"
+     ],
+     "not_checked": [],
+     "relevant_kinds": {
+      "stalled_weights": {
+       "value": "not_configured",
+       "records": 0,
+       "records_needed": 3,
+       "enough_history": false
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 5,
+       "records_needed": 102,
+       "enough_history": false
+      },
+      "repeated_steps": {
+       "value": "checked",
+       "records": 6,
+       "records_needed": 1,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "stalled_weights",
+    "update_spike",
+    "repeated_steps"
+   ]
+  }
+ },
+ "B8||healthy": {
+  "script": "b08_pt115607.py",
+  "variant": "healthy",
+  "tag": "",
+  "args": [
+   "--disable"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B08-PT-115607-healthy",
+  "result": {
+   "bug": "B08-PT-115607",
+   "variant": "healthy",
+   "run_id": "B08-PT-115607-healthy",
+   "torch": "2.15.0",
+   "settings": {
+    "iterations": 6,
+    "optimizer": "Adam(lr=1e-3)",
+    "compiled": false,
+    "tensorquill_calls_under_compiler_disable": true,
+    "source": "TrainCheck 115607_bug.py from the clone's history; save_config dropped"
+   },
+   "symptom": {
+    "adam_step_counter": [
+     1.0,
+     2.0,
+     3.0,
+     3.0,
+     4.0,
+     5.0
+    ],
+    "expected_in_eager": [
+     1.0,
+     2.0,
+     3.0,
+     3.0,
+     4.0,
+     5.0
+    ],
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "healthy",
+     "incidents": [],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "dead_activations",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_lr_change",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [
+      "activation_drift (5 of 60 records)",
+      "activation_spike (5 of 11 records)",
+      "dead_activations (5 of 60 records)",
+      "grad_spike (5 of 13 records)",
+      "update_spike (5 of 102 records)"
+     ],
+     "not_checked": [],
+     "relevant_kinds": {
+      "stalled_weights": {
+       "value": "not_configured",
+       "records": 0,
+       "records_needed": 3,
+       "enough_history": false
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 5,
+       "records_needed": 102,
+       "enough_history": false
+      },
+      "repeated_steps": {
+       "value": "checked",
+       "records": 6,
+       "records_needed": 1,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "stalled_weights",
+    "update_spike",
+    "repeated_steps"
+   ]
+  }
+ },
+ "B8|nodisable|buggy": {
+  "script": "b08_pt115607.py",
+  "variant": "buggy",
+  "tag": "nodisable",
+  "args": [],
+  "returncode": 1,
+  "ok": false,
+  "error": "AssertionError: Attempt to trace forbidden callable <function mark_static_address at 0x121580c20>"
+ },
+ "B8|nodisable|healthy": {
+  "script": "b08_pt115607.py",
+  "variant": "healthy",
+  "tag": "nodisable",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B08-PT-115607-healthy-nodisable",
+  "result": {
+   "bug": "B08-PT-115607",
+   "variant": "healthy",
+   "run_id": "B08-PT-115607-healthy-nodisable",
+   "torch": "2.15.0",
+   "settings": {
+    "iterations": 6,
+    "optimizer": "Adam(lr=1e-3)",
+    "compiled": false,
+    "tensorquill_calls_under_compiler_disable": false,
+    "source": "TrainCheck 115607_bug.py from the clone's history; save_config dropped"
+   },
+   "symptom": {
+    "adam_step_counter": [
+     1.0,
+     2.0,
+     3.0,
+     3.0,
+     4.0,
+     5.0
+    ],
+    "expected_in_eager": [
+     1.0,
+     2.0,
+     3.0,
+     3.0,
+     4.0,
+     5.0
+    ],
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "healthy",
+     "incidents": [],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "dead_activations",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_lr_change",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [
+      "activation_drift (5 of 60 records)",
+      "activation_spike (5 of 11 records)",
+      "dead_activations (5 of 60 records)",
+      "grad_spike (5 of 13 records)",
+      "update_spike (5 of 102 records)"
+     ],
+     "not_checked": [],
+     "relevant_kinds": {
+      "stalled_weights": {
+       "value": "not_configured",
+       "records": 0,
+       "records_needed": 3,
+       "enough_history": false
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 5,
+       "records_needed": 102,
+       "enough_history": false
+      },
+      "repeated_steps": {
+       "value": "checked",
+       "records": 6,
+       "records_needed": 1,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "stalled_weights",
+    "update_spike",
+    "repeated_steps"
+   ]
+  }
+ },
+ "B9||buggy": {
+  "script": "b09_pt104336.py",
+  "variant": "buggy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B09-PT-104336-buggy",
+  "result": {
+   "bug": "B09-PT-104336",
+   "variant": "buggy",
+   "run_id": "B09-PT-104336-buggy",
+   "torch": "2.15.0",
+   "settings": {
+    "world_size": 2,
+    "steps": 200,
+    "optimizer": "AdamW(lr=1e-3)",
+    "replica_every": "default (50)",
+    "weights": "default (50)",
+    "source": "re-created from synopsis; trigger: overwrite_module_params_on_conversion"
+   },
+   "symptom": {
+    "steps": 200,
+    "parameters_replaced_by_to": 6,
+    "replica_max_abs_diff": 0.110737144947052,
+    "bug_present": true,
+    "rank0_loss_first_last": [
+     2.2575,
+     0.7815
+    ]
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 66,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.538533,
+          "recent": 1.64684,
+          "ratio": 3.05802
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 134
+       }
+      },
+      {
+       "kind": "replica_drift",
+       "class": "invariant",
+       "step": 49,
+       "detail": {
+        "tolerance": 1e-06,
+        "parameters": {
+         "0.weight": {
+          "norm_spread": 0.000868125,
+          "sum_spread": 0.115434,
+          "projection_spread": 0.0756852
+         },
+         "0.bias": {
+          "norm_spread": 0.0155296,
+          "sum_spread": 0.141883,
+          "projection_spread": 0.0277313
+         },
+         "2.weight": {
+          "norm_spread": 0.0023436,
+          "sum_spread": 0.723074,
+          "projection_spread": 0.0991907
+         },
+         "2.bias": {
+          "norm_spread": 0.00580389,
+          "sum_spread": 0.160604,
+          "projection_spread": 0.00381307
+         },
+         "4.weight": {
+          "norm_spread": 0.0101987,
+          "sum_spread": 0.021306,
+          "projection_spread": 0.0729805
+         },
+         "4.bias": {
+          "norm_spread": 0.0257104,
+          "sum_spread": 0.00161155,
+          "projection_spread": 0.0445421
+         }
+        }
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    },
+    "rank1": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 63,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.482689,
+          "recent": 1.46864,
+          "ratio": 3.04262
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 137
+       }
+      },
+      {
+       "kind": "replica_drift",
+       "class": "invariant",
+       "step": 49,
+       "detail": {
+        "tolerance": 1e-06,
+        "parameters": {
+         "0.weight": {
+          "norm_spread": 0.000868125,
+          "sum_spread": 0.115434,
+          "projection_spread": 0.0756852
+         },
+         "0.bias": {
+          "norm_spread": 0.0155296,
+          "sum_spread": 0.141883,
+          "projection_spread": 0.0277313
+         },
+         "2.weight": {
+          "norm_spread": 0.0023436,
+          "sum_spread": 0.723074,
+          "projection_spread": 0.0991907
+         },
+         "2.bias": {
+          "norm_spread": 0.00580389,
+          "sum_spread": 0.160604,
+          "projection_spread": 0.00381307
+         },
+         "4.weight": {
+          "norm_spread": 0.0101987,
+          "sum_spread": 0.021306,
+          "projection_spread": 0.0729805
+         },
+         "4.bias": {
+          "norm_spread": 0.0257104,
+          "sum_spread": 0.00161155,
+          "projection_spread": 0.0445421
+         }
+        }
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 2,
+   "relevant": [
+    "replica_drift",
+    "update_spike",
+    "grad_spike"
+   ]
+  }
+ },
+ "B9||healthy": {
+  "script": "b09_pt104336.py",
+  "variant": "healthy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B09-PT-104336-healthy",
+  "result": {
+   "bug": "B09-PT-104336",
+   "variant": "healthy",
+   "run_id": "B09-PT-104336-healthy",
+   "torch": "2.15.0",
+   "settings": {
+    "world_size": 2,
+    "steps": 200,
+    "optimizer": "AdamW(lr=1e-3)",
+    "replica_every": "default (50)",
+    "weights": "default (50)",
+    "source": "re-created from synopsis; trigger: overwrite_module_params_on_conversion"
+   },
+   "symptom": {
+    "steps": 200,
+    "parameters_replaced_by_to": 0,
+    "replica_max_abs_diff": 0.0,
+    "bug_present": false,
+    "rank0_loss_first_last": [
+     2.2575,
+     0.6193
+    ]
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 64,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.642965,
+          "recent": 1.95542,
+          "ratio": 3.04125
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 136
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    },
+    "rank1": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 61,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.620392,
+          "recent": 1.86706,
+          "ratio": 3.00948
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 139
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 2,
+   "relevant": [
+    "replica_drift",
+    "update_spike",
+    "grad_spike"
+   ]
+  }
+ },
+ "B10||buggy": {
+  "script": "b10_x_ddp.py",
+  "variant": "buggy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B10-X-DDP-buggy",
+  "result": {
+   "bug": "B10-X-DDP",
+   "variant": "buggy",
+   "run_id": "B10-X-DDP-buggy",
+   "torch": "2.15.0",
+   "settings": {
+    "world_size": 2,
+    "steps": 200,
+    "optimizer": "AdamW(lr=1e-3)",
+    "replica_every": "default (50)",
+    "weights": "default (50)",
+    "source": "re-created from synopsis and TrainCheck's blog post"
+   },
+   "symptom": {
+    "steps": 200,
+    "replica_max_abs_diff": 0.110737144947052,
+    "bug_present": true,
+    "rank0_loss_first_last": [
+     2.2575,
+     0.7815
+    ]
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 66,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.538533,
+          "recent": 1.64684,
+          "ratio": 3.05802
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 134
+       }
+      },
+      {
+       "kind": "replica_drift",
+       "class": "invariant",
+       "step": 49,
+       "detail": {
+        "tolerance": 1e-06,
+        "parameters": {
+         "0.weight": {
+          "norm_spread": 0.000868125,
+          "sum_spread": 0.115434,
+          "projection_spread": 0.0756852
+         },
+         "0.bias": {
+          "norm_spread": 0.0155296,
+          "sum_spread": 0.141883,
+          "projection_spread": 0.0277313
+         },
+         "2.weight": {
+          "norm_spread": 0.0023436,
+          "sum_spread": 0.723074,
+          "projection_spread": 0.0991907
+         },
+         "2.bias": {
+          "norm_spread": 0.00580389,
+          "sum_spread": 0.160604,
+          "projection_spread": 0.00381307
+         },
+         "4.weight": {
+          "norm_spread": 0.0101987,
+          "sum_spread": 0.021306,
+          "projection_spread": 0.0729805
+         },
+         "4.bias": {
+          "norm_spread": 0.0257104,
+          "sum_spread": 0.00161155,
+          "projection_spread": 0.0445421
+         }
+        }
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    },
+    "rank1": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 63,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.482689,
+          "recent": 1.46864,
+          "ratio": 3.04262
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 137
+       }
+      },
+      {
+       "kind": "replica_drift",
+       "class": "invariant",
+       "step": 49,
+       "detail": {
+        "tolerance": 1e-06,
+        "parameters": {
+         "0.weight": {
+          "norm_spread": 0.000868125,
+          "sum_spread": 0.115434,
+          "projection_spread": 0.0756852
+         },
+         "0.bias": {
+          "norm_spread": 0.0155296,
+          "sum_spread": 0.141883,
+          "projection_spread": 0.0277313
+         },
+         "2.weight": {
+          "norm_spread": 0.0023436,
+          "sum_spread": 0.723074,
+          "projection_spread": 0.0991907
+         },
+         "2.bias": {
+          "norm_spread": 0.00580389,
+          "sum_spread": 0.160604,
+          "projection_spread": 0.00381307
+         },
+         "4.weight": {
+          "norm_spread": 0.0101987,
+          "sum_spread": 0.021306,
+          "projection_spread": 0.0729805
+         },
+         "4.bias": {
+          "norm_spread": 0.0257104,
+          "sum_spread": 0.00161155,
+          "projection_spread": 0.0445421
+         }
+        }
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 2,
+   "relevant": [
+    "replica_drift",
+    "update_spike",
+    "grad_spike"
+   ]
+  }
+ },
+ "B10||healthy": {
+  "script": "b10_x_ddp.py",
+  "variant": "healthy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B10-X-DDP-healthy",
+  "result": {
+   "bug": "B10-X-DDP",
+   "variant": "healthy",
+   "run_id": "B10-X-DDP-healthy",
+   "torch": "2.15.0",
+   "settings": {
+    "world_size": 2,
+    "steps": 200,
+    "optimizer": "AdamW(lr=1e-3)",
+    "replica_every": "default (50)",
+    "weights": "default (50)",
+    "source": "re-created from synopsis and TrainCheck's blog post"
+   },
+   "symptom": {
+    "steps": 200,
+    "replica_max_abs_diff": 0.0,
+    "bug_present": false,
+    "rank0_loss_first_last": [
+     2.2575,
+     0.6193
+    ]
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 64,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.642965,
+          "recent": 1.95542,
+          "ratio": 3.04125
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 136
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    },
+    "rank1": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 61,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.620392,
+          "recent": 1.86706,
+          "ratio": 3.00948
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 139
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 4,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 2,
+   "relevant": [
+    "replica_drift",
+    "update_spike",
+    "grad_spike"
+   ]
+  }
+ },
+ "B10|every1|buggy": {
+  "script": "b10_x_ddp.py",
+  "variant": "buggy",
+  "tag": "every1",
+  "args": [
+   "--replica-every",
+   "1"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B10-X-DDP-buggy-every1",
+  "result": {
+   "bug": "B10-X-DDP",
+   "variant": "buggy",
+   "run_id": "B10-X-DDP-buggy-every1",
+   "torch": "2.15.0",
+   "settings": {
+    "world_size": 2,
+    "steps": 200,
+    "optimizer": "AdamW(lr=1e-3)",
+    "replica_every": 1,
+    "weights": "default (50)",
+    "source": "re-created from synopsis and TrainCheck's blog post"
+   },
+   "symptom": {
+    "steps": 200,
+    "replica_max_abs_diff": 0.110737144947052,
+    "bug_present": true,
+    "rank0_loss_first_last": [
+     2.2575,
+     0.7815
+    ]
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 66,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.538533,
+          "recent": 1.64684,
+          "ratio": 3.05802
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 134
+       }
+      },
+      {
+       "kind": "replica_drift",
+       "class": "invariant",
+       "step": 0,
+       "detail": {
+        "tolerance": 1e-06,
+        "parameters": {
+         "0.weight": {
+          "norm_spread": 0.000169106,
+          "sum_spread": 0.0122924,
+          "projection_spread": 0.00646729
+         },
+         "0.bias": {
+          "norm_spread": 0.00155296,
+          "sum_spread": 0.0151942,
+          "projection_spread": 0.00505019
+         },
+         "2.weight": {
+          "norm_spread": 6.01014e-05,
+          "sum_spread": 0.13621,
+          "projection_spread": 0.00343311
+         },
+         "2.bias": {
+          "norm_spread": 0.00247489,
+          "sum_spread": 0.00359669,
+          "projection_spread": 0.00362955
+         },
+         "4.weight": {
+          "norm_spread": 0.0010244,
+          "sum_spread": 0.0033536,
+          "projection_spread": 0.0187222
+         },
+         "4.bias": {
+          "norm_spread": 0.00317677,
+          "sum_spread": 0.0122291,
+          "projection_spread": 0.0144307
+         }
+        }
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    },
+    "rank1": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 63,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.482689,
+          "recent": 1.46864,
+          "ratio": 3.04262
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 137
+       }
+      },
+      {
+       "kind": "replica_drift",
+       "class": "invariant",
+       "step": 0,
+       "detail": {
+        "tolerance": 1e-06,
+        "parameters": {
+         "0.weight": {
+          "norm_spread": 0.000169106,
+          "sum_spread": 0.0122924,
+          "projection_spread": 0.00646729
+         },
+         "0.bias": {
+          "norm_spread": 0.00155296,
+          "sum_spread": 0.0151942,
+          "projection_spread": 0.00505019
+         },
+         "2.weight": {
+          "norm_spread": 6.01014e-05,
+          "sum_spread": 0.13621,
+          "projection_spread": 0.00343311
+         },
+         "2.bias": {
+          "norm_spread": 0.00247489,
+          "sum_spread": 0.00359669,
+          "projection_spread": 0.00362955
+         },
+         "4.weight": {
+          "norm_spread": 0.0010244,
+          "sum_spread": 0.0033536,
+          "projection_spread": 0.0187222
+         },
+         "4.bias": {
+          "norm_spread": 0.00317677,
+          "sum_spread": 0.0122291,
+          "projection_spread": 0.0144307
+         }
+        }
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 2,
+   "relevant": [
+    "replica_drift",
+    "update_spike",
+    "grad_spike"
+   ]
+  }
+ },
+ "B10|every1|healthy": {
+  "script": "b10_x_ddp.py",
+  "variant": "healthy",
+  "tag": "every1",
+  "args": [
+   "--replica-every",
+   "1"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B10-X-DDP-healthy-every1",
+  "result": {
+   "bug": "B10-X-DDP",
+   "variant": "healthy",
+   "run_id": "B10-X-DDP-healthy-every1",
+   "torch": "2.15.0",
+   "settings": {
+    "world_size": 2,
+    "steps": 200,
+    "optimizer": "AdamW(lr=1e-3)",
+    "replica_every": 1,
+    "weights": "default (50)",
+    "source": "re-created from synopsis and TrainCheck's blog post"
+   },
+   "symptom": {
+    "steps": 200,
+    "replica_max_abs_diff": 0.0,
+    "bug_present": false,
+    "rank0_loss_first_last": [
+     2.2575,
+     0.6193
+    ]
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 64,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.642965,
+          "recent": 1.95542,
+          "ratio": 3.04125
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 136
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    },
+    "rank1": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 61,
+       "detail": {
+        "modules": [
+         {
+          "module": "4",
+          "stat": "std",
+          "baseline": 0.620392,
+          "recent": 1.86706,
+          "ratio": 3.00948
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 139
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "replica_drift",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "replica_drift": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 2,
+   "relevant": [
+    "replica_drift",
+    "update_spike",
+    "grad_spike"
+   ]
+  }
+ },
+ "B14||buggy": {
+  "script": "b14_tf29903.py",
+  "variant": "buggy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B14-TF-29903-buggy",
+  "result": {
+   "bug": "B14-TF-29903",
+   "variant": "buggy",
+   "run_id": "B14-TF-29903-buggy",
+   "torch": "2.15.0",
+   "settings": {
+    "steps_per_attempt": 100,
+    "checkpoint": "full",
+    "optimizer": "AdamW(lr=1e-3)",
+    "weights": "default (50)",
+    "source": "re-created from synopsis"
+   },
+   "symptom": {
+    "steps": 200,
+    "missing_keys_at_load": [
+     "lstm.weight_hh_l0",
+     "lstm.bias_hh_l0"
+    ],
+    "lstm_weight_hh_max_abs_change_across_resume": 0.4144,
+    "loss_last_before_first_after_resume": [
+     2.0589,
+     2.1313
+    ],
+    "loss_last": 1.7632,
+    "bug_present": true
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 171,
+       "detail": {
+        "modules": [
+         {
+          "module": "head",
+          "stat": "std",
+          "baseline": 0.153973,
+          "recent": 0.468686,
+          "ratio": 3.04396
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 29
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "dead_activations",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_incomplete",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [
+      "stalled_weights (2 of 3 records)"
+     ],
+     "not_checked": [],
+     "relevant_kinds": {
+      "resume_incomplete": {
+       "value": "checked",
+       "records": 2,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "resume_lr_change": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "activation_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 11,
+       "enough_history": true
+      },
+      "repeated_steps": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "resume_incomplete",
+    "resume_lr_change",
+    "grad_spike",
+    "update_spike",
+    "activation_spike",
+    "repeated_steps"
+   ]
+  }
+ },
+ "B14||healthy": {
+  "script": "b14_tf29903.py",
+  "variant": "healthy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B14-TF-29903-healthy",
+  "result": {
+   "bug": "B14-TF-29903",
+   "variant": "healthy",
+   "run_id": "B14-TF-29903-healthy",
+   "torch": "2.15.0",
+   "settings": {
+    "steps_per_attempt": 100,
+    "checkpoint": "full",
+    "optimizer": "AdamW(lr=1e-3)",
+    "weights": "default (50)",
+    "source": "re-created from synopsis"
+   },
+   "symptom": {
+    "steps": 200,
+    "missing_keys_at_load": [],
+    "lstm_weight_hh_max_abs_change_across_resume": 0.0,
+    "loss_last_before_first_after_resume": [
+     2.0589,
+     2.0416
+    ],
+    "loss_last": 1.3493,
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 132,
+       "detail": {
+        "modules": [
+         {
+          "module": "head",
+          "stat": "std",
+          "baseline": 0.153973,
+          "recent": 0.476717,
+          "ratio": 3.09612
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 68
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "dead_activations",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_incomplete",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [
+      "stalled_weights (2 of 3 records)"
+     ],
+     "not_checked": [],
+     "relevant_kinds": {
+      "resume_incomplete": {
+       "value": "checked",
+       "records": 2,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "resume_lr_change": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "activation_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 11,
+       "enough_history": true
+      },
+      "repeated_steps": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "resume_incomplete",
+    "resume_lr_change",
+    "grad_spike",
+    "update_spike",
+    "activation_spike",
+    "repeated_steps"
+   ]
+  }
+ },
+ "B14|minimal|buggy": {
+  "script": "b14_tf29903.py",
+  "variant": "buggy",
+  "tag": "minimal",
+  "args": [
+   "--checkpoint",
+   "minimal"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B14-TF-29903-buggy-minimal",
+  "result": {
+   "bug": "B14-TF-29903",
+   "variant": "buggy",
+   "run_id": "B14-TF-29903-buggy-minimal",
+   "torch": "2.15.0",
+   "settings": {
+    "steps_per_attempt": 100,
+    "checkpoint": "minimal",
+    "optimizer": "AdamW(lr=1e-3)",
+    "weights": "default (50)",
+    "source": "re-created from synopsis"
+   },
+   "symptom": {
+    "steps": 200,
+    "missing_keys_at_load": [
+     "lstm.weight_hh_l0",
+     "lstm.bias_hh_l0"
+    ],
+    "lstm_weight_hh_max_abs_change_across_resume": 0.4144,
+    "loss_last_before_first_after_resume": [
+     2.0589,
+     2.1313
+    ],
+    "loss_last": 1.7632,
+    "bug_present": true
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "resume_incomplete",
+       "class": "observation",
+       "step": 100,
+       "detail": {
+        "resumes": 1,
+        "changes": [
+         {
+          "rank": 0,
+          "attempt": 1795060577009,
+          "source": "load",
+          "findings": [
+           {
+            "component": "rng",
+            "finding": "missing"
+           },
+           {
+            "component": "data",
+            "finding": "missing"
+           }
+          ]
+         }
+        ]
+       }
+      },
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 171,
+       "detail": {
+        "modules": [
+         {
+          "module": "head",
+          "stat": "std",
+          "baseline": 0.153973,
+          "recent": 0.468686,
+          "ratio": 3.04396
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 29
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "dead_activations",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_incomplete",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [
+      "stalled_weights (2 of 3 records)"
+     ],
+     "not_checked": [],
+     "relevant_kinds": {
+      "resume_incomplete": {
+       "value": "checked",
+       "records": 2,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "resume_lr_change": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "activation_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 11,
+       "enough_history": true
+      },
+      "repeated_steps": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "resume_incomplete",
+    "resume_lr_change",
+    "grad_spike",
+    "update_spike",
+    "activation_spike",
+    "repeated_steps"
+   ]
+  }
+ },
+ "B14|minimal|healthy": {
+  "script": "b14_tf29903.py",
+  "variant": "healthy",
+  "tag": "minimal",
+  "args": [
+   "--checkpoint",
+   "minimal"
+  ],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B14-TF-29903-healthy-minimal",
+  "result": {
+   "bug": "B14-TF-29903",
+   "variant": "healthy",
+   "run_id": "B14-TF-29903-healthy-minimal",
+   "torch": "2.15.0",
+   "settings": {
+    "steps_per_attempt": 100,
+    "checkpoint": "minimal",
+    "optimizer": "AdamW(lr=1e-3)",
+    "weights": "default (50)",
+    "source": "re-created from synopsis"
+   },
+   "symptom": {
+    "steps": 200,
+    "missing_keys_at_load": [],
+    "lstm_weight_hh_max_abs_change_across_resume": 0.0,
+    "loss_last_before_first_after_resume": [
+     2.0589,
+     2.0416
+    ],
+    "loss_last": 1.3493,
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "resume_incomplete",
+       "class": "observation",
+       "step": 100,
+       "detail": {
+        "resumes": 1,
+        "changes": [
+         {
+          "rank": 0,
+          "attempt": 1795060579970,
+          "source": "load",
+          "findings": [
+           {
+            "component": "rng",
+            "finding": "missing"
+           },
+           {
+            "component": "data",
+            "finding": "missing"
+           }
+          ]
+         }
+        ]
+       }
+      },
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 132,
+       "detail": {
+        "modules": [
+         {
+          "module": "head",
+          "stat": "std",
+          "baseline": 0.153973,
+          "recent": 0.476717,
+          "ratio": 3.09612
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 68
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "dead_activations",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_incomplete",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [
+      "stalled_weights (2 of 3 records)"
+     ],
+     "not_checked": [],
+     "relevant_kinds": {
+      "resume_incomplete": {
+       "value": "checked",
+       "records": 2,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "resume_lr_change": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      },
+      "activation_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 11,
+       "enough_history": true
+      },
+      "repeated_steps": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 1,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "resume_incomplete",
+    "resume_lr_change",
+    "grad_spike",
+    "update_spike",
+    "activation_spike",
+    "repeated_steps"
+   ]
+  }
+ },
+ "B19||buggy": {
+  "script": "b19_pt51800.py",
+  "variant": "buggy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B19-PT-51800-buggy",
+  "result": {
+   "bug": "B19-PT-51800",
+   "variant": "buggy",
+   "run_id": "B19-PT-51800-buggy",
+   "torch": "2.15.0",
+   "settings": {
+    "steps": 200,
+    "optimizer": "Adam(lr=1e-3)",
+    "weights": "default (50)",
+    "source": "re-created from synopsis"
+   },
+   "symptom": {
+    "steps": 200,
+    "sigma_used_over_true_at_first_eval": [
+     -0.0377,
+     -0.0203
+    ],
+    "valid_loss_before_training": 1517.3994,
+    "valid_accuracy_before_training": 0.064,
+    "valid_loss_after_training": 0.6996,
+    "train_loss_first_last": [
+     3.0504,
+     0.6179
+    ],
+    "bug_present": true
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "healthy",
+     "incidents": [],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "activation_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 11,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "activation_spike",
+    "grad_spike",
+    "update_spike"
+   ]
+  }
+ },
+ "B19||healthy": {
+  "script": "b19_pt51800.py",
+  "variant": "healthy",
+  "tag": "",
+  "args": [],
+  "returncode": 0,
+  "ok": true,
+  "run_id": "B19-PT-51800-healthy",
+  "result": {
+   "bug": "B19-PT-51800",
+   "variant": "healthy",
+   "run_id": "B19-PT-51800-healthy",
+   "torch": "2.15.0",
+   "settings": {
+    "steps": 200,
+    "optimizer": "Adam(lr=1e-3)",
+    "weights": "default (50)",
+    "source": "re-created from synopsis"
+   },
+   "symptom": {
+    "steps": 200,
+    "sigma_used_over_true_at_first_eval": [
+     0.7871,
+     0.8164
+    ],
+    "valid_loss_before_training": 3.065,
+    "valid_accuracy_before_training": 0.109,
+    "valid_loss_after_training": 0.6743,
+    "train_loss_first_last": [
+     2.8092,
+     0.6025
+    ],
+    "bug_present": false
+   },
+   "ranks": {
+    "rank0": {
+     "run_state": "unhealthy",
+     "incidents": [
+      {
+       "kind": "activation_drift",
+       "class": "anomaly",
+       "step": 190,
+       "detail": {
+        "modules": [
+         {
+          "module": "2",
+          "stat": "std",
+          "baseline": 0.613244,
+          "recent": 1.84442,
+          "ratio": 3.00765
+         }
+        ],
+        "affected": 1,
+        "affected_steps": 10
+       }
+      }
+     ],
+     "kinds_checked": [
+      "activation_drift",
+      "activation_spike",
+      "data_stalled",
+      "dead_activations",
+      "epoch_order_repeated",
+      "grad_spike",
+      "non_finite",
+      "repeated_steps",
+      "resume_data_mismatch",
+      "resume_lr_change",
+      "stalled_weights",
+      "update_spike"
+     ],
+     "kinds_unavailable": [],
+     "checked_without_enough_history": [],
+     "not_checked": [],
+     "relevant_kinds": {
+      "activation_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 11,
+       "enough_history": true
+      },
+      "grad_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 13,
+       "enough_history": true
+      },
+      "update_spike": {
+       "value": "checked",
+       "records": 200,
+       "records_needed": 102,
+       "enough_history": true
+      }
+     }
+    }
+   },
+   "cross_rank": [],
+   "world_size": 1,
+   "relevant": [
+    "activation_spike",
+    "grad_spike",
+    "update_spike"
+   ]
+  }
+ }
+}
