@@ -2354,13 +2354,15 @@ State as of Nov 16, 2026.
       - The optimizer hooks become a no-op in PyTorch's hook dictionary, and `close()` removes them. Removing them at the stop would raise: the stop is reached inside PyTorch's loop over those hooks, and an `OrderedDict` changed in size during iteration raises (run here). `RemovableHandle.hooks_dict_ref` and `.id` exist at PyTorch v2.6.0 (read in the clone).
       - The scaler's wrapper comes off, as `close()` takes it off.
       - With a `replica_group`, the stopped rank keeps its optimizer and scaler hooks. It counts steps and enters the drift check's `all_gather` on the same steps as the other ranks, and drops the result. Without that, the other ranks wait in the collective. That costs one float64 pass over the replicated weights per check on the stopped rank. It is a third point the decision did not settle; see "Open" below.
+    - *After a stop.* The forward hooks keep their cost on every forward, since they stay on the model. Their buffers are no longer read.
     - *`close()`.* It never raises and never waits without bound.
+      - On a streaming run with a stuck sink, `close()` after a stop waits about 8 s at most: 1 s for the writer, then the heartbeat's join (2 s) and the sender's `close` (`CLOSE_TIMEOUT`, 5 s). Both bounds were read in `flight.py`; this path was not run.
       - Its own flush, the sentinel put and the join share one deadline, `CLOSE_SECONDS` (60 s). Past it, capture is taken as stopped.
       - After a stop it waits `STOPPED_CLOSE_SECONDS` (1 s) for the writer. A sink still in a write is not closed under it; only a stream's heartbeat and sender are stopped. The writer is a daemon thread and does not hold the process.
       - No `<name>.end.json` after a stop, so the file reads as cut off.
       - A failing `write_end_marker` is caught.
       - Inside `with session:` the user's exception comes out as the same object, with no context from TensorQuill.
-    - *Tests* (`test_lane_u1_capture.py`, 13 new; all 13 fail on `a037441`, and the file's other 36 pass there):
+    - *Tests* (`test_lane_u1_capture.py`, 14 new; all 14 fail on `a037441`, and the file's other 36 pass there):
       - `test_a_failing_sink_stops_capture_and_every_step_runs_as_without_tensorquill`: `every` 1 and 4, plain and under `-W error`; the final weights equal a run without TensorQuill, with one warning or one log line.
       - `test_the_users_own_exception_comes_out_unchanged_after_the_sink_failed`
       - `test_a_sink_that_never_returns_holds_neither_training_nor_close`
@@ -2369,17 +2371,22 @@ State as of Nov 16, 2026.
       - `test_what_the_heartbeat_reads_stays_live_after_a_stop`
       - `test_close_returns_within_its_bound_when_the_last_write_is_slow`
       - `test_a_stop_causes_no_graph_break_and_no_recompile`, under `eager` and `aot_eager`: `error_on_recompile`, with no graph-break counters.
+      - `test_a_stopped_rank_counts_the_steps_a_scaler_ends_as_a_live_one_does`: under a GradScaler, a step the scaler skipped (an inf gradient) ends a live session's step at `scaler.update()`. A stopped rank's count now matches, 4 steps and 4 gathers; before this, it read 3 and 3, which would leave its gather a step behind the other ranks'.
       - `test_a_stopped_rank_keeps_entering_the_drift_checks_gather`: two gloo ranks, with rank 0's sink failing. With the schedule-keeping turned off for one run, rank 1 waited in the `all_gather` until gloo's 60 s timeout and the test failed.
     - *Existing tests changed.* All are outside this lane's two files and need the author's yes.
       - `test_capture.py::test_a_failing_sink_is_reported_on_close` is now `test_a_failing_sink_stops_capture_and_close_returns`.
       - `test_capture.py::test_a_slow_sink_makes_training_wait_instead_of_growing_memory` is now `test_a_slow_sink_stops_capture_instead_of_making_training_wait`. It expects steps 0 to 2 and one warning.
       - `test_system.py::test_a_hung_nvml_call_never_holds_training` now expects steps 0 to 10 and a stop naming NVML. It also accepts all 43 steps with no stop, on a machine too slow to fill the queue in 0.5 s.
-      - The comment at `test_system.py:341` now asserts no stop. `test_a_hung_nvml_open_never_holds_training` passes unchanged.
+      - `test_system.py::test_a_hung_nvml_open_never_holds_training` passed unchanged, but it stopped capture after step 8 of 30 (the same in three runs) without checking records. It now says so: steps 0 to 8 and a stop naming NVML, or all 30 on a machine too slow to fill the queue.
+      - The comment at `test_system.py:341` now asserts no stop.
+      - In the full run, these two NVML tests are the only existing tests that emitted the stop's warning.
     - *The trigger, measured and not chosen.* The queue holds `WRITER_QUEUE` rings, 8: 8 steps at `every=1` and 400 steps at `every=50`, plus the block being written.
       - A writer stall of T seconds stops capture when training runs faster than the capacity divided by T.
       - The bounded wait for NVML (`system=True`) can be such a stall. At `every=1` a 2 s wait (`NVML_SLOW_SECONDS`) stops capture above 4 steps/s, and the 10 s wait for the first reading, which opens NVML (`NVML_OPEN_SECONDS`), stops it above 0.8 steps/s. At `every=50` the same waits stop it above 200 and 40 steps/s.
       - Measured with the fake NVML at a 0.5 s bound: 40 fast steps at `every=1` stopped capture after step 10, the same in three runs.
+      - Measured with the fake NVML at its 1 s open bound: 30 fast steps at `every=1` stopped capture after step 8.
       - A short disk pause fills 8 steps at the same rates.
+      - `close()`'s last flush goes through the same `_put`, which does not wait. So a writer that is healthy but still busy with the queued blocks can lose the last block and, with it, the end marker.
       - Options:
         - (a) A capacity counted in steps, for example at least 256 steps whatever `every` is. A block holds only the CPU copy of a few numbers per layer and parameter, so this costs little memory.
         - (b) A writer that skips the system reading while it is behind.
@@ -2397,6 +2404,7 @@ State as of Nov 16, 2026.
       - `sdk/README.md` line 331, "Nothing raises once training runs": the earlier note that this was not true of the local sink can now be dropped.
       - The Focused Plan's row on TensorQuill stopping a run.
       - `_put`'s own text ("training now waits for it") is rewritten here; it now names the stop.
+    - *A compiled loop that calls `optimizer.step()`.* A stop while compiled made no recompile, with `error_on_recompile`. With `clip_grad_norm_` inside the compiled function, TensorQuill recompiles at step 1, before any stop, and does so on the base `1767a4a` too. Without TensorQuill it does not recompile. That is older than this lane and is left open.
     - *Open, for the author.*
       - The trigger, with the options above.
       - What a streaming run should say after a stop.
