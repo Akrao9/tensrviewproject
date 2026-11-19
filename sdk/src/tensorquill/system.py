@@ -209,7 +209,8 @@ class Nvml:
             self._fail(metric, error)
 
     def read(self) -> dict[str, Any] | None:
-        """The reading, `{"unavailable": reason}` the first time NVML cannot be used, then None."""
+        """The reading, `{"unavailable": reason}` the first time NVML cannot be used, then None.
+        None too once every metric has failed: the reading that saw them fail listed them."""
         self._failed: dict[str, str] = {}
         if not self._opened:
             self._open()
@@ -239,7 +240,8 @@ class Nvml:
         if time.monotonic() - started > NVML_SLOW_SECONDS:
             self.unavailable = f"an NVML reading took over {NVML_SLOW_SECONDS:g} s; NVML is off for this session"
             self.close()
-        return out
+        # Empty once every metric failed in an earlier reading, which said why: nothing to add.
+        return out or None
 
     @staticmethod
     def _reasons(nvml: Any, handle: Any) -> int:

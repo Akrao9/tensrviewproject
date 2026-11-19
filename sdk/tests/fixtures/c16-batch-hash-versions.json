@@ -1,0 +1,1331 @@
+{
+ "about": "C16, lane V2: identical batches hashed by the writer before C16 (`legacy`) and by the one after it (`v2`). Shared by the batch-hash writer (sdk/src/tensorquill/data.py, lane V2), the Python reader (sdk/src/tensorquill/data_checks.py, lane V3) and the Rust reader (server/src/detect/data.rs, lane V7). Written by lane V2 only.",
+ "kind_rule": "A batch_hash's kind is the text before its first ':'; a hash with no ':' is of the old writer (kind ''). Two hashes are compared only when their kinds are equal; a pair of two kinds is not compared: never a match, never a difference.",
+ "writers": {
+  "legacy": "16 hex digits: BLAKE2b-64 over each batch's byte length (int64 LE) and bytes, the bytes int64 LE indices or the ids' text joined by NUL. Frozen from data.py at commit 66b52d7.",
+  "v2": "'v2:' and 16 hex digits: BLAKE2b-64 over each batch's byte length and bytes, the bytes a tag ('i') and int64 LE indices, or a tag ('t') and each id's type, byte length and bytes. tensorquill.batch_hash(ids) gives it."
+ },
+ "verdicts": "Per case: `detector` is the one the case is about; `compared` says whether its hashes may be compared; `incident` is null for no incident of that kind, else keys the incident must have with these values. How a reader says 'not compared' (a not_checked entry, a note, nothing) is the reader's: the fixture pins the verdict only. Records are as `load_records(..., all_attempts=True)` gives them; resolve attempts as the detector does.",
+ "batches": {
+  "I0": {
+   "ids": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "legacy": "5330bfb822ed0aaf",
+   "v2": "v2:cd09ce7a08834a9e"
+  },
+  "I1": {
+   "ids": [
+    4,
+    5,
+    6,
+    7
+   ],
+   "legacy": "cbfa972bd31669cd",
+   "v2": "v2:a509725585dcb271"
+  },
+  "I2": {
+   "ids": [
+    8,
+    9,
+    10,
+    11
+   ],
+   "legacy": "a7e6d0df2f96711a",
+   "v2": "v2:725ba8bc00013ae4"
+  },
+  "I3": {
+   "ids": [
+    12,
+    13,
+    14,
+    15
+   ],
+   "legacy": "59c8f2777acde814",
+   "v2": "v2:cfe42ca68a54dd5a"
+  },
+  "I4": {
+   "ids": [
+    16,
+    17,
+    18,
+    19
+   ],
+   "legacy": "532459a716ae5134",
+   "v2": "v2:d547b7bb4c4d0e14"
+  },
+  "I5": {
+   "ids": [
+    20,
+    21,
+    22,
+    23
+   ],
+   "legacy": "01ecfdd7d5aceb8e",
+   "v2": "v2:235f294e1bb20aad"
+  },
+  "S0": {
+   "ids": [
+    "doc-0",
+    "doc-1"
+   ],
+   "legacy": "fdf2f4dce1096ff1",
+   "v2": "v2:26478a67c28119f0"
+  },
+  "S1": {
+   "ids": [
+    "doc-2",
+    "doc-3"
+   ],
+   "legacy": "3e98993bf65153d4",
+   "v2": "v2:d5f94ac8a490a35e"
+  },
+  "S2": {
+   "ids": [
+    "doc-4",
+    "doc-5"
+   ],
+   "legacy": "5c339d50a70f6d85",
+   "v2": "v2:56f29dbb774eaf06"
+  },
+  "S3": {
+   "ids": [
+    "doc-6",
+    "doc-7"
+   ],
+   "legacy": "072d16d34301b145",
+   "v2": "v2:82a276e1476e4eae"
+  }
+ },
+ "cases": [
+  {
+   "name": "resume-across-versions",
+   "detector": "resume_data_mismatch",
+   "compared": false,
+   "incident": null,
+   "about": "Attempt 0 (old writer) draws I0..I5 at steps 0..5; attempt 1 (new writer) resumes at step 3 and draws I3..I5, the batches attempt 0 drew there. The resume's batch cannot be compared: not an incident, not a match.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "5330bfb822ed0aaf"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "cbfa972bd31669cd"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "a7e6d0df2f96711a"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "59c8f2777acde814"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 4,
+     "ts": 4.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "532459a716ae5134"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 5,
+     "ts": 5.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "01ecfdd7d5aceb8e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-across-versions",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cfe42ca68a54dd5a"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-across-versions",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:d547b7bb4c4d0e14"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-across-versions",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:235f294e1bb20aad"
+     }
+    }
+   ]
+  },
+  {
+   "name": "resume-v2-same-batch",
+   "detector": "resume_data_mismatch",
+   "compared": true,
+   "incident": null,
+   "about": "Control: both attempts by the new writer, the resume draws the batch drawn at step 3 before: compared, a match.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-same-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-same-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:a509725585dcb271"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-same-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:725ba8bc00013ae4"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-same-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cfe42ca68a54dd5a"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-same-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 4,
+     "ts": 4.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:d547b7bb4c4d0e14"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-same-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 5,
+     "ts": 5.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:235f294e1bb20aad"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-same-batch",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cfe42ca68a54dd5a"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-same-batch",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:d547b7bb4c4d0e14"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-same-batch",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:235f294e1bb20aad"
+     }
+    }
+   ]
+  },
+  {
+   "name": "resume-legacy-same-batch",
+   "detector": "resume_data_mismatch",
+   "compared": true,
+   "incident": null,
+   "about": "Control: both attempts by the old writer, the same batches: compared, a match (old stores keep working).",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-legacy-same-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "5330bfb822ed0aaf"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-legacy-same-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "cbfa972bd31669cd"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-legacy-same-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "a7e6d0df2f96711a"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-legacy-same-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "59c8f2777acde814"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-legacy-same-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 4,
+     "ts": 4.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "532459a716ae5134"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-legacy-same-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 5,
+     "ts": 5.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "01ecfdd7d5aceb8e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-legacy-same-batch",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "59c8f2777acde814"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-legacy-same-batch",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "532459a716ae5134"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-legacy-same-batch",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "01ecfdd7d5aceb8e"
+     }
+    }
+   ]
+  },
+  {
+   "name": "resume-v2-new-batch",
+   "detector": "resume_data_mismatch",
+   "compared": true,
+   "incident": {
+    "kind": "resume_data_mismatch",
+    "step": 3,
+    "finding": "differs"
+   },
+   "about": "Control: both attempts by the new writer, the resume draws S0, drawn nowhere before: compared, it differs (`finding` is of the first entry of `changes`).",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-new-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-new-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:a509725585dcb271"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-new-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:725ba8bc00013ae4"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-new-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cfe42ca68a54dd5a"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-new-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 4,
+     "ts": 4.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:d547b7bb4c4d0e14"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-new-batch",
+     "rank": 0,
+     "attempt": 0,
+     "step": 5,
+     "ts": 5.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:235f294e1bb20aad"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-new-batch",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:26478a67c28119f0"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-new-batch",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:d547b7bb4c4d0e14"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-resume-v2-new-batch",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:235f294e1bb20aad"
+     }
+    }
+   ]
+  },
+  {
+   "name": "duplicate-across-versions",
+   "detector": "duplicate_batches",
+   "compared": false,
+   "incident": null,
+   "about": "Rank 0 (old writer) and rank 1 (new writer) draw I0..I3 at steps 0..3: not compared, not a duplicate.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "5330bfb822ed0aaf"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "cbfa972bd31669cd"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "a7e6d0df2f96711a"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "59c8f2777acde814"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions",
+     "rank": 1,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions",
+     "rank": 1,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:a509725585dcb271"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions",
+     "rank": 1,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:725ba8bc00013ae4"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions",
+     "rank": 1,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cfe42ca68a54dd5a"
+     }
+    }
+   ]
+  },
+  {
+   "name": "duplicate-across-versions-text-ids",
+   "detector": "duplicate_batches",
+   "compared": false,
+   "incident": null,
+   "about": "As above with text ids S0..S3.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions-text-ids",
+     "rank": 0,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "fdf2f4dce1096ff1"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions-text-ids",
+     "rank": 0,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "3e98993bf65153d4"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions-text-ids",
+     "rank": 0,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "5c339d50a70f6d85"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions-text-ids",
+     "rank": 0,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "072d16d34301b145"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions-text-ids",
+     "rank": 1,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:26478a67c28119f0"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions-text-ids",
+     "rank": 1,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:d5f94ac8a490a35e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions-text-ids",
+     "rank": 1,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:56f29dbb774eaf06"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-across-versions-text-ids",
+     "rank": 1,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:82a276e1476e4eae"
+     }
+    }
+   ]
+  },
+  {
+   "name": "duplicate-v2",
+   "detector": "duplicate_batches",
+   "compared": true,
+   "incident": {
+    "kind": "duplicate_batches",
+    "step": 0,
+    "ranks": [
+     0,
+     1
+    ],
+    "duplicated_steps": 4
+   },
+   "about": "Control: both ranks by the new writer: compared, a duplicate at every step.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:a509725585dcb271"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:725ba8bc00013ae4"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cfe42ca68a54dd5a"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-v2",
+     "rank": 1,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-v2",
+     "rank": 1,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:a509725585dcb271"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-v2",
+     "rank": 1,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:725ba8bc00013ae4"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-duplicate-v2",
+     "rank": 1,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cfe42ca68a54dd5a"
+     }
+    }
+   ]
+  },
+  {
+   "name": "stall-across-versions",
+   "detector": "data_stalled",
+   "compared": false,
+   "incident": null,
+   "about": "Attempt 0 (old writer) draws I0 at steps 0..2, attempt 1 (new writer) resumes at step 3 and draws I0 at steps 3..5. The pair at steps 2 and 3 is not compared and ends the stretch, as a step without a hash does, so neither side reaches three steps: no incident.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "c16-stall-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "5330bfb822ed0aaf"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-stall-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "5330bfb822ed0aaf"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-stall-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "5330bfb822ed0aaf"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-stall-across-versions",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-stall-across-versions",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-stall-across-versions",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    }
+   ]
+  },
+  {
+   "name": "stall-v2",
+   "detector": "data_stalled",
+   "compared": true,
+   "incident": {
+    "kind": "data_stalled",
+    "step": 1,
+    "reason": "same_batch",
+    "through_step": 3,
+    "batch_hash": "v2:cd09ce7a08834a9e"
+   },
+   "about": "Control: one attempt by the new writer draws I0 at steps 0..5: compared, a stall.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "c16-stall-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-stall-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-stall-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-stall-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-stall-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 4,
+     "ts": 4.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-stall-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 5,
+     "ts": 5.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e"
+     }
+    }
+   ]
+  },
+  {
+   "name": "epoch-order-across-versions",
+   "detector": "epoch_order_repeated",
+   "compared": false,
+   "incident": null,
+   "about": "Epoch 0 (attempt 0, old writer) draws I0..I3 at steps 0..3; epoch 1 (attempt 1, new writer) draws I0..I3 in the same order at steps 4..7: not compared, no incident.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "5330bfb822ed0aaf",
+      "epoch": 0,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "cbfa972bd31669cd",
+      "epoch": 0,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "a7e6d0df2f96711a",
+      "epoch": 0,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-across-versions",
+     "rank": 0,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "59c8f2777acde814",
+      "epoch": 0,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-across-versions",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e",
+      "epoch": 1,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-across-versions",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:a509725585dcb271",
+      "epoch": 1,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-across-versions",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:725ba8bc00013ae4",
+      "epoch": 1,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-across-versions",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cfe42ca68a54dd5a",
+      "epoch": 1,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    }
+   ]
+  },
+  {
+   "name": "epoch-order-v2",
+   "detector": "epoch_order_repeated",
+   "compared": true,
+   "incident": {
+    "kind": "epoch_order_repeated",
+    "step": 4,
+    "epoch": 1,
+    "previous_epoch": 0
+   },
+   "about": "Control: both passes by the new writer, one attempt: compared, the order repeats.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 0,
+     "ts": 0.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e",
+      "epoch": 0,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 1,
+     "ts": 1.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:a509725585dcb271",
+      "epoch": 0,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 2,
+     "ts": 2.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:725ba8bc00013ae4",
+      "epoch": 0,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 3,
+     "ts": 3.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cfe42ca68a54dd5a",
+      "epoch": 0,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 4,
+     "ts": 4.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cd09ce7a08834a9e",
+      "epoch": 1,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 5,
+     "ts": 5.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:a509725585dcb271",
+      "epoch": 1,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 6,
+     "ts": 6.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:725ba8bc00013ae4",
+      "epoch": 1,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "c16-epoch-order-v2",
+     "rank": 0,
+     "attempt": 0,
+     "step": 7,
+     "ts": 7.0,
+     "data": {
+      "batches": 1,
+      "batch_hash": "v2:cfe42ca68a54dd5a",
+      "epoch": 1,
+      "sampler_epoch": 0,
+      "shuffle": true
+     }
+    }
+   ]
+  }
+ ]
+}

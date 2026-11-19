@@ -166,7 +166,9 @@ impl System {
                 let (first_step, first) = self.growth[0];
                 let rise = allocated - first;
                 if rise >= MEMORY_GROWTH_BYTES && rise as f64 >= MEMORY_GROWTH_FRACTION * first as f64 {
-                    let per_step = rise as f64 / (step - first_step) as f64;
+                    // Python's `per_step`: none when every reading was at one step (rows
+                    // written again), and so no steps to the total either (L7, lane V7).
+                    let per_step = (step > first_step).then(|| rise as f64 / (step - first_step) as f64);
                     self.found[0] = Some(json!({
                         "kind": "memory_growth",
                         "step": step,
@@ -174,9 +176,13 @@ impl System {
                         "allocated_first": first,
                         "allocated": allocated,
                         "readings": MEMORY_GROWTH_READINGS,
-                        "bytes_per_step": per_step,
+                        "bytes_per_step": or_null(per_step),
                         "total": or_null(total),
-                        "steps_to_total": or_null(total.map(|total| (total - allocated).max(0) as f64 / per_step)),
+                        "steps_to_total": or_null(
+                            total
+                                .zip(per_step)
+                                .map(|(total, per_step)| (total - allocated).max(0) as f64 / per_step)
+                        ),
                     }));
                 }
             }
@@ -406,6 +412,43 @@ mod tests {
             system.row(if row < 3 { 1 } else { 2 }, row as i64, &columns, row);
         }
         assert!(system.found[0].is_none());
+    }
+
+    #[test]
+    fn l7_growth_at_one_repeated_step_has_no_rate_and_no_steps_to_total() {
+        // Lane V7, Nov 19, 2026. Python: `per_step` is None when the step did not move, and so
+        // is `steps_to_total`; Rust divided by zero and wrote 0.0 steps to the total.
+        let gib = 1i64 << 30;
+        let rising: Vec<String> = (0..6)
+            .map(|k| {
+                format!(
+                    r#"{{"cuda":{{"allocated":{},"total":{}}}}}"#,
+                    gib + k * 100 * (1 << 20),
+                    16 * gib
+                )
+            })
+            .collect();
+        let rows = batch(
+            &[None; 6],
+            &[None; 6],
+            &rising.iter().map(|s| Some(s.as_str())).collect::<Vec<_>>(),
+        );
+        let mut system = System::default();
+        let columns = SystemColumns::new(&rows);
+        for row in 0..6 {
+            system.row(1, 7, &columns, row);
+        }
+        let found = system.found[0].as_ref().expect("memory_growth");
+        assert_eq!(found["bytes_per_step"], Value::Null, "{found}");
+        assert_eq!(found["steps_to_total"], Value::Null, "{found}");
+        // Over moving steps the rate and the steps left are numbers.
+        let mut system = System::default();
+        run(&mut system, 1, 0, &rows);
+        let found = system.found[0].as_ref().expect("memory_growth");
+        assert!(
+            found["bytes_per_step"].is_f64() && found["steps_to_total"].is_f64(),
+            "{found}"
+        );
     }
 
     #[test]

@@ -465,7 +465,7 @@ def test_the_report_takes_the_starved_window_it_was_given():
 # --- where the two paths differ, on purpose -------------------------------------------------
 
 
-def test_a_step_written_twice_in_one_attempt_is_reported_with_the_scalars_of_its_second_writing():
+def test_a_step_written_twice_in_one_attempt_is_reported_with_the_scalars_of_its_first_writing():
     def row(step, salt):
         return record(step, 1, grad_norm=wobble(step), scalars={"train/loss": 2.0 - step / 100 + salt})
 
@@ -474,11 +474,8 @@ def test_a_step_written_twice_in_one_attempt_is_reported_with_the_scalars_of_its
     rust = tensorquill.build_evidence(records, detectors="rust")["incidents"]
     assert [i["kind"] for i in python] == [i["kind"] for i in rust] == ["repeated_steps"]
     # The incident is the same: the server's own store never holds such rows, so only this path finds it.
-    assert {k: v for k, v in python[0].items() if k != "scalars"} == {k: v for k, v in rust[0].items() if k != "scalars"}
-    assert (python[0]["step"], python[0]["repeated"]) == (30, 10)
-    # Python gives what was logged when step 30 was first written, Rust when it was written again.
+    assert python[0] == rust[0]
     assert python[0]["scalars"]["train/loss"]["value"] == pytest.approx(1.7)
-    assert rust[0]["scalars"]["train/loss"]["value"] == pytest.approx(2.7)
 
 
 def test_attempts_out_of_order_in_the_input_are_read_oldest_first_as_a_store_holds_them():
@@ -609,8 +606,10 @@ def test_the_report_lists_the_thresholds_it_applied():
     ({"top_k": {"r1": 0}}, "top_k must be at least 1"),
     ({"overload_threshold": -0.1}, "overload_threshold must be a finite number of at least 0"),
     ({"drift_tolerance": -1.0}, "drift_tolerance must be"),
-    ({"starve_ratio": float("nan")}, "cannot be sent as JSON"),
-    ({"overload_threshold": float("inf")}, "cannot be sent as JSON"),
+    # Refused by `check_thresholds` before they are sent, in the Rust rules' words (lane V3, E6).
+    ({"starve_ratio": float("nan")}, "starve_ratio must be a finite number of at least 0"),
+    ({"overload_threshold": float("inf")}, "overload_threshold must be a finite number of at least 0"),
+    ({"top_k": 2.5}, "top_k must be a whole number"),  # was an AttributeError
 ])
 def test_values_the_rust_rules_refuse_raise_value_error_with_the_reason(option, reason):
     with pytest.raises(ValueError, match=reason):
