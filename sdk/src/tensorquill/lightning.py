@@ -10,6 +10,7 @@ from typing import Any
 import lightning.pytorch as L
 
 from .capture import Session, init
+from .tracker import _brief, _say
 
 
 class TensorQuillCallback(L.Callback):
@@ -127,11 +128,38 @@ class TensorQuillCallback(L.Callback):
 
 
 def _logger_run_id(trainer: L.Trainer) -> str | None:
-    """The tracker run of the trainer's first logger that has one: MLflow or W&B."""
-    for logger in trainer.loggers:
-        run_id = getattr(logger, "run_id", None)  # MLFlowLogger
-        if run_id:
-            return str(run_id)
-        if type(logger).__name__ == "WandbLogger" and logger.version:
-            return str(logger.version)  # the W&B run ID
+    """The tracker run of the trainer's first logger that has one: MLflow or W&B.
+
+    Never raises. It runs on rank 0 before `init` shares rank 0's run ID, so a raise here would
+    leave the other ranks without it: a logger whose `run_id` or `version` raises (`MLFlowLogger`
+    creates its run on first use, `WandbLogger.version` may start W&B) is passed over with one
+    warning, and the next logger is read. With none left, `init` resolves the ID by its order
+    (a tracker's run, the launcher's job ID or a generated one) and shares it."""
+    try:
+        loggers = list(trainer.loggers)
+    except Exception as error:  # noqa: BLE001  nothing here may stop the fit
+        _say(
+            f"TensorQuillCallback could not list the trainer's loggers ({_brief(error)}), {_PASSED_OVER}",
+            stacklevel=3,
+        )
+        return None
+    for logger in loggers:
+        try:
+            run_id = getattr(logger, "run_id", None)  # MLFlowLogger
+            if run_id:
+                return str(run_id)
+            if type(logger).__name__ == "WandbLogger" and logger.version:
+                return str(logger.version)  # the W&B run ID
+        except Exception as error:  # noqa: BLE001  nothing here may stop the fit
+            _say(
+                f"TensorQuillCallback could not read the run ID of the trainer's logger {type(logger).__name__} "
+                f"({_brief(error)}), {_PASSED_OVER}",
+                stacklevel=3,
+            )
     return None
+
+
+_PASSED_OVER = (
+    "so it is passed over: the run ID is the next logger's, or else what tensorquill.init resolves (a tracker's "
+    "run, the launcher's job ID or a generated one), shared with every rank. Pass run_id= to name the run."
+)

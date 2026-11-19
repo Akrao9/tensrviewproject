@@ -2681,6 +2681,100 @@ State as of Nov 16, 2026.
       - The audit's C06 integer case, `[-1, 8]` for 4 experts recorded as `[0, 0, 0, 0]`, is still open and undecided; not touched here.
     - *Not run.* Megatron itself is not installed; the stand-in follows the reference clone. Also not run: a GPU, inductor, PyTorch 2.6.
 
+- [ ] **Lane U5: a tracker or logger that raises no longer fails `init`, and a drift-check gather that cannot run is skipped on every rank (Nov 19, 2026, lane U5, branch `claude/lane-u5-tracker-gather-9170fa`; not merged).** These are the three items Wave U gave this lane: C05, SDK-22's gather, and a Lightning logger property that raises. Each was reproduced on `1767a4a` before any change. The code is in `tracker.py`, `distributed.py` and `lightning.py`. The tests are in a new file, `sdk/tests/test_lane_u5_tracker_gather.py`: 20 tests, none of which needs the server binary. `capture.py`, the record fields, the detectors, the golden files, everything under `server/` and the protocol number are unchanged. The hand-over note is `lane-u5.md` in the session notes, with the scripts `lane-u5-*.py`.
+  - *Outcomes.*
+    - C05: fixed.
+    - SDK-22: fixed where every rank would fail alike, before anything is sent. A gather that fails once it is issued still raises. A catch there was measured to make things worse, so no catch ships; the design for the rest is below.
+    - The Lightning logger: fixed.
+    - **Merge dependency.** SDK-22's skip leaves `optimizer.step()` free of a raise only once `capture.py`'s warning for a parameter it is not comparing cannot raise. On this branch alone, under `-W error`, that warning still raises out of `optimizer.step()` at the next flush, and every later step then raises `IndexError` (`lane-u5-werror-flush.py`, the same on the base through T2's `meta` path). U1's `_warn` covers it; merge U1 with or before this lane.
+  - *Reproduced on the base* (macOS, CPU, PyTorch 2.15, Lightning 2.6.6, Gloo).
+    - **C05.** The audit's `c05.py` gave `init raised RuntimeError tracker temporarily down`. A W&B run whose `id` raises, and a `wandb` module whose `run` raises, made `init` raise the same way.
+    - **SDK-22, injected.** T6's script, adapted by T2, still raised out of `optimizer.step()` at the scheduled step.
+    - **SDK-22, two real cases on CPU** (nothing injected):
+      - A group with Gloo registered for CUDA tensors only (`init_process_group("cuda:gloo")`), standing in for NCCL given CPU tensors. Both ranks raised `No backend type associated with device type cpu` out of `optimizer.step()` at the first scheduled check.
+      - A rank outside the replica group: three ranks, with the group made of ranks 0 and 1. On rank 2, PyTorch's `all_gather` warned that the rank does not belong to the group, returned nothing, and `torch.stack([])` raised out of `optimizer.step()`. Rank 2 then stopped issuing the training run's all-reduce, so ranks 0 and 1 timed out in it.
+    - **Lightning.** With a logger whose `run_id` raises, `trainer.fit` raised `RuntimeError` from `on_fit_start`.
+  - *C05, fixed.*
+    - **One lookup for every path.** On one process, or on several ranks with no process group, `resolve_run` now calls `_resolve_here`, the guarded lookup rank 0 already used. A tracker that raises anywhere in reading its run's ID is passed over with one warning ("could not read the tracker's run"). The order then goes on: the launcher's ID, else a generated one.
+    - **The several-ranks warnings are kept.** `_warn_tracker_unshared` and the warning for a generated ID (now `_warn_generated_unshared`, which replaces `_unshared_generated_id`) are kept.
+    - **The project and run names.** `tracker_labels` now also guards reading `wandb.run`. Each label was already guarded.
+    - **No warning can raise.** Every warning in `tracker.py` now goes through `_say`. When a filter makes the warning an error (`python -W error`), the message is logged on the `tensorquill` logger instead, as U1's `_warn` does in `capture.py`.
+    - **Found while testing, on two ranks under `-W error`.** Rank 0's own warning about the tracker raised before rank 0 put its ID in the store. So rank 0's `init` failed, and rank 1 waited until the test's 90 s limit.
+    - **Tests:**
+      - `test_c05_a_tracker_that_raises_gives_a_generated_run_id_and_one_warning`, four cases;
+      - `test_c05_a_tracker_that_raises_falls_through_to_the_launchers_id`;
+      - `test_c05_a_project_or_name_that_raises_is_left_out` (this one passed before too);
+      - `test_c05_tracker_labels_never_raises`;
+      - `test_c05_under_warnings_as_errors_init_still_returns`;
+      - `test_c05_the_several_ranks_warnings_are_kept`;
+      - `test_c05_the_single_process_path_takes_the_guarded_lookup`;
+      - `test_c05_two_ranks_under_warnings_as_errors_share_rank_zeros_generated_id`.
+  - *SDK-22: a catch around the gather was tried first, and does not ship.*
+    - **The prototype.** A catch around the session's gather returned every row flagged and kept the schedule. It ran on two Gloo ranks with a 10 s group timeout. `dist.all_gather` raised on rank 1 only, once and then at every scheduled check. Each step also ran an all-reduce, standing in for DDP's. The script is `lane-u5-catch-one-rank.py`.
+    - **What happened.**
+      - Rank 0's step sat 10.0 s, the whole group timeout, in a gather rank 1 never entered.
+      - Rank 1's next training all-reduce then failed after 10.0 s.
+      - With the failure at every check, both ranks' training all-reduces raised by step 4.
+      - In PyTorch 2.6 the default timeout is 30 minutes for Gloo and 10 minutes for NCCL (`kBackendDefaultTimeout`, `kProcessGroupNCCLDefaultTimeout`, read in the source). What NCCL's watchdog then does to the job was not run here.
+    - **The cause.** A rank cannot tell from its own error whether its peers failed too. A rank that catches and goes on issues the training run's next collective while its peers wait in this one. That is the hazard the brief named, so there is no catch around the collective.
+  - *SDK-22: what ships, a check every rank decides alike, with no collective.*
+    - **The check.** `distributed._gather_problem(group, device)` runs on the host before the gather, from what every rank of a data-parallel job shares, and skips the gather when:
+      - the group has no backend for the table's device type (`ProcessGroup._get_backend` raises, as for NCCL, which serves CUDA only, given a CPU table, for example under FSDP's CPU offload);
+      - there is no default process group (destroyed, or never made);
+      - the rank is not a member of the group. PyTorch's own collectives return at once on such a rank, so its peers never wait for it.
+    - **Where it decides nothing.** A group that is not a `ProcessGroup` (the stand-ins tests pass with their own `all_gather`) is still gathered. So is anything the check cannot read.
+    - **What a skip gives.** `_spread_and_unread` issues no collective. It returns zeros, the new code `_NOT_GATHERED` on every row, and the reason. The session then leaves every parameter out of `replica_spread` and names each once, by T2's path, with no change to `capture.py`.
+    - **The codes.** The code is 10, added at the end, so the codes T2 numbered keep their numbers between ranks. `_RAISED` is still 9. An unknown code still reads "reading it raised an error".
+    - **The parameters are no longer read when skipping.** The device is decided first, and the fingerprints are not computed.
+    - **Tests:**
+      - `test_sdk22_a_group_with_no_backend_for_the_tables_device_skips_on_every_rank` (two processes over `cuda:gloo`);
+      - `test_sdk22_a_rank_outside_the_replica_group_skips_and_its_peers_are_not_left_waiting` (three processes; every step runs an all-reduce over all three, so a rank that skipped or added a collective would break it; ranks 0 and 1 still compare);
+      - `test_sdk22_the_check_is_decided_without_a_collective`;
+      - `test_sdk22_existing_codes_keep_their_numbers`;
+      - `test_sdk22_a_stand_in_group_is_still_gathered` (this one passed before too).
+  - *SDK-22: what is not covered.*
+    - **Failures once the gather is issued still raise out of `optimizer.step()`.** Examples: a process group that failed or was aborted on one rank, a device bound with `device_id` other than the table's, a timeout. In each, the training run's own collectives on that group fail too.
+    - **Ranks whose sessions have different device types.** The check trusts that every replica's session is on the same kind of device. Ranks that differ would decide differently: one would skip while its peers gather, which is the hazard of the catch above and worse than today's raise. The store agreement in the design below closes it.
+    - **The verdict.** A drift check that never gathered reads `not_configured`, not `unavailable`, because no record carries the reason. That needs a record field, a schema change, as T2 noted.
+    - **Warnings.** The session warns once for each parameter, so a skipped check gives one warning per replicated parameter. One warning per reason would do; that is in `capture.py`.
+  - *SDK-22: the design for the rest (not built).*
+    - **At `init`, before the first scheduled check** (`capture.py`, U1's file), each rank runs `_gather_problem` and writes its verdict to the default store under a key for that `init`, as T1 shares the run ID.
+    - **One verdict for all.** Each rank waits a bounded time, at `init`, never inside `optimizer.step()`, for every rank's verdict. It then puts "on" (every rank said yes) or "off" (any said no, or the wait ran out) under one key with `compare_set`, first writer wins. `compare_set` is in PyTorch 2.6 for TCPStore and FileStore. Every rank then takes the value the store holds, so all switch the check on or off together, even a rank whose wait ran out.
+    - **What it cannot cover.** A failure inside an issued collective. That is a failed group, which the training run's own collectives meet too.
+  - *The public `replica_spread`: options, nothing changed.* It still raises on a parameter on `meta` or sparse (through `parameter_fingerprints`), and a gather that fails raises from it.
+    - (a) Leave it. It is the caller's own call, outside TensorQuill's hooks; say so in its docstring.
+    - (b) Build it on `_gather_problem` and `_fingerprint_table`, as the session is. Every rank enters the same gather and none waits. But it gathers 32 bytes per parameter, not 24, and it must say which rows were not read: a NaN row would read as drift, and a shorter result breaks `[n_params, 3]`.
+    - (c) Raise a `ValueError` before the gather for a parameter that cannot be read. This is safe only when every rank raises alike: a parameter on `meta` on one rank only leaves the others waiting, which is T2's finding again.
+  - *Lightning, fixed.*
+    - **What changed.** `_logger_run_id` lists the trainer's loggers and reads each one's `run_id` or `version` inside a `try`. A logger that raises is passed over with one warning (through `_say`), and the next is read. With none left, `init` resolves rank 0's ID by its order and shares it with every rank.
+    - **Tests:**
+      - `test_lightning_a_logger_that_raises_does_not_abort_the_fit`;
+      - `test_lightning_a_logger_that_raises_is_passed_over_for_the_next`;
+      - `test_lightning_loggers_that_cannot_be_listed_or_read_give_none`;
+      - `test_lightning_a_logger_that_raises_on_rank_zero_still_gives_every_rank_its_id` (two processes, `ddp_spawn` over Gloo; both rank files share one generated ID).
+  - *T1's open choices, reported only.*
+    - **`RUN_ID_WAIT_SECONDS`, 300 s.** The bound is the store's own timeout when shorter. Under `env://` and torchrun that is the group's timeout. A store passed to `init_process_group(store=...)` keeps its own timeout, though: a FileStore's is 300 s. So on the base, the two-rank test with a 15 s group timeout ran into the test's 90 s limit.
+    - **A rank given its own `run_id`** still waits for rank 0's. Unchanged.
+    - **Lightning's XLA strategy.** Not checked: there is no XLA here.
+    - **`MLFlowLogger`'s names.** The callback passes only the run ID. The project and name come from `MLFLOW_EXPERIMENT_NAME` and the active run, which `MLFlowLogger` does not set. Unchanged.
+  - *Seen outside this lane's files, not edited.*
+    - **For U1, under `-W error` (`lane-u5-werror-flush.py`).** On the base, the session's warning for a parameter it is not comparing (`capture.py:1836`, reached by T2's `meta` path) raised out of `optimizer.step()` at the flush. Every later step then raised `IndexError: index 2 is out of bounds`. U1's notes say `_warn` now covers that warning. The `IndexError` after a raise inside `_flush` means the flush leaves its state broken when anything in it raises.
+    - **C15.** `record_replica_spread` copies a precomputed spread with `spread_buf[:, :width].copy_(spread)` (`capture.py:1817`), so a `[1, 3]` table is broadcast to every parameter.
+  - *Wording that no longer matches (listed, not edited).*
+    - **The Focused Plan's row on TensorQuill stopping a run** says "a drift-check gather that fails, such as NCCL given CPU tensors" can still raise. NCCL given CPU tensors is now skipped; a gather that fails once issued still raises.
+    - **`sdk/README.md`, the drift-check paragraph (:271) and the limits list (:838)** do not say that the check is skipped, on every rank, where its gather cannot run.
+    - **`init`'s docstring (`capture.py:2782`)** still says 24 bytes. That is U1's item.
+  - *Run.*
+    - The new file: 20 passed; 18 of them fail on the base.
+    - `test_tracker.py`, `test_run_id_ranks.py`, `test_lightning.py`, `test_distributed.py`, `test_capture_raises.py` and `test_compile.py` (still 0 graph breaks and 0 recompiles): 80 passed with the new file.
+    - The full `sdk/tests` with this worktree on `PYTHONPATH`, at `38436bd`: 1239 passed, 619 skipped, 0 failed; the skips were not sorted by cause here.
+    - The PyTorch APIs used were read in the `v2.6.0` source: `_rank_not_in_group`, `GroupMember.NON_GROUP_MEMBER`, `get_backend`, and `Store.compare_set` for the design. `ProcessGroup._get_backend` is bound there, and its `getBackend` raises "No backend type associated with device type" for a type with no backend, as on 2.15. A `device:backend` string registers only the types it names, so the `cuda:gloo` test should behave the same on 2.6; it was not run there.
+  - *Not run.* NCCL, a GPU, MPI, Linux, PyTorch 2.6 itself, XLA.
+  - *Open, for the author.*
+    - Whether to build the store agreement at `init` for the rest of SDK-22. It is in `capture.py`.
+    - Option (a), (b) or (c) for the public `replica_spread`.
+    - Whether a drift check that never gathered should read `unavailable` with its reason, which needs a record field.
+
 ## Sources
 
 - [TechInformed: OpenAI buying Neptune](https://techinformed.com/openai-buying-neptune-ai-in-all-stock-deal-what-it-means-for-ai-architecture/)

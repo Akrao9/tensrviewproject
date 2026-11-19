@@ -141,8 +141,9 @@ def parameter_fingerprints(params: Iterable[torch.Tensor], *, projection: bool =
 
 
 # Why a parameter's fingerprints are not read, by the code `_fingerprint_table` puts in its last
-# column (0: read; code `i` is `_UNREAD[i - 1]`). All but the last are judged from the tensor's
-# device, layout and type alone, which hold no values, so no rank reads data to decide them.
+# column (0: read; code `i` is `_UNREAD[i - 1]`). All but the last two are judged from the
+# tensor's device, layout and type alone, which hold no values, so no rank reads data to decide
+# them. The codes travel between ranks, so a new one is only ever added at the end.
 _SPARSE = ("sparse_coo", "sparse_csr", "sparse_csc", "sparse_bsr", "sparse_bsc")
 _UNREAD = (
     "it is on meta, which holds no values",
@@ -150,8 +151,10 @@ _UNREAD = (
     *(f"it is a {layout} tensor, not a dense one" for layout in _SPARSE),
     "it is not a dense tensor",
     "reading it raised an error",
+    "the drift check's gather cannot run on this rank's replica group",
 )
-_RAISED = len(_UNREAD)
+_RAISED = _UNREAD.index("reading it raised an error") + 1
+_NOT_GATHERED = len(_UNREAD)  # set by `_spread_and_unread` on every row, never gathered
 
 
 def _unread_code(p: torch.Tensor) -> int:
@@ -168,7 +171,7 @@ def _unread_code(p: torch.Tensor) -> int:
 def _unread_reason(code: float) -> str:
     """The reason a code in the last column of `_fingerprint_table` stands for."""
     index = int(code) - 1
-    return _UNREAD[index] if 0 <= index < len(_UNREAD) else _UNREAD[-1]
+    return _UNREAD[index] if 0 <= index < len(_UNREAD) else _UNREAD[_RAISED - 1]
 
 
 @torch.no_grad()
@@ -220,6 +223,48 @@ def _fingerprint_table(
     return table, reasons
 
 
+def _gather_problem(group: object, device: torch.device) -> str | None:
+    """Why the drift check's `all_gather` of a table on `device` cannot run on `group`, or None.
+
+    Judged on the host, with no communication, from what every rank of the group sees alike in
+    a data-parallel job: whether a default process group exists, the group's backends (the same
+    on every rank) and the type of the session's device (the same kind of device on every
+    replica). So every rank that would fail here skips, no rank enters a gather its peers skip,
+    and none is left waiting. The two failures this catches raise at the call, before anything
+    is sent: a group with no backend for the device's type (NCCL serves CUDA only, so a CPU
+    table under NCCL, as with FSDP's CPU offload), and a destroyed process group. A rank
+    outside `group` skips too: PyTorch's own collectives return at once on such a rank, so its
+    peers in the group never wait for it.
+
+    A group that is not a `ProcessGroup` (a stand-in some tests and tools pass with their own
+    `all_gather`) is not judged, and anything that cannot be read here leaves the gather as it
+    was: this never decides from something that might differ between ranks."""
+    try:
+        if dist.distributed_c10d._rank_not_in_group(group):  # GroupMember.NON_GROUP_MEMBER
+            return "this rank is not a member of the replica group, so it has no replica to compare with"
+        if not isinstance(group, dist.ProcessGroup):
+            return None
+        if not dist.is_initialized():
+            return "torch.distributed has no default process group (it was destroyed, or never initialized)"
+    except Exception:  # noqa: BLE001  an API this PyTorch does not have: decide nothing
+        return None
+    try:
+        group._get_backend(device)
+    except Exception as error:  # noqa: BLE001  "No backend type associated with device type cpu"
+        if not hasattr(group, "_get_backend"):
+            return None
+        try:
+            name = str(dist.get_backend(group))
+        except Exception:  # noqa: BLE001
+            name = "?"
+        text = " ".join(f"{type(error).__name__}: {error}".split())[:160]
+        return (
+            f"the replica group (backend {name!r}) has no backend for {device.type} tensors, where the session "
+            f"builds the check's table ({text}); under NCCL that is a session whose parameters are not on CUDA"
+        )
+    return None
+
+
 @torch.no_grad()
 def _spread_and_unread(
     params: Iterable[torch.Tensor], group: dist.ProcessGroup, *, projection: bool, device: torch.device | None = None
@@ -230,7 +275,29 @@ def _spread_and_unread(
     largest code any rank gave (the same on every rank, since all see every rank's codes, so all
     leave out the same rows), and this rank's own reasons. The spread of a row not read on some
     rank means nothing: it is left out by its code, never by its value, so a NaN still reads
-    as drift and a zero as agreement only where the weights were read. Both stay on the device."""
+    as drift and a zero as agreement only where the weights were read. Both stay on the device.
+
+    Where the gather cannot run (`_gather_problem`: no backend for the table's device, no
+    process group, a rank outside the group), no collective is issued: every row comes back
+    with the code `_NOT_GATHERED`, zeros for its spread and the reason, so the session leaves
+    every parameter out of `replica_spread` and names each once, as for a parameter that could
+    not be read. Every rank of the group decides this alike, so none waits for another. A gather
+    that raises once issued is not caught: a rank that caught it and went on would issue its
+    next collective (the training run's own) while its peers still wait in this one."""
+    params = list(params)
+    if device is None:
+        locals_ = [unwrap_local(p) for p in params]
+        device = next(
+            (torch.device("cpu") if p.device.type == "mps" else p.device for p in locals_ if not _unread_code(p)),
+            torch.device("cpu"),
+        )
+    why = _gather_problem(group, device)
+    if why is not None:
+        width = FINGERPRINT_WIDTH if projection else 2
+        n = len(params)
+        spread = torch.zeros(n, width, dtype=F64, device=device)
+        unread = torch.full((n,), float(_NOT_GATHERED), dtype=F64, device=device)
+        return spread, unread, [f"the drift check's gather cannot run: {why}"] * n
     table, reasons = _fingerprint_table(params, projection=projection, device=device)
     out = [torch.empty_like(table) for _ in range(dist.get_world_size(group))]
     dist.all_gather(out, table, group=group)  # 32 bytes per tensor per rank (24 without the projection)
