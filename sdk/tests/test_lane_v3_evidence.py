@@ -128,14 +128,17 @@ def test_e6_the_smallest_values_the_rust_rules_take_are_taken(option):
 @needs_rust
 @pytest.mark.parametrize("option, reason", REFUSED)
 def test_e6_the_rust_detectors_refuse_every_value_the_python_ones_refuse(option, reason):
-    # The other half of the contract: nothing Python refuses is taken by Rust.
-    with pytest.raises(ValueError):
-        tensorquill.build_evidence(moe_records(), detectors="rust", server_binary=REAL, **option)
+    # The other half of the contract: nothing Python refuses is taken by Rust. Sent straight to the
+    # binary (`server_report`), past `check_thresholds`, which `build_evidence` applies first.
+    with pytest.raises(ValueError, match="the Rust detectors refuse these thresholds|cannot be sent as JSON"):
+        sd.server_report(moe_records(), thresholds=option, binary=REAL)
 
 
 @needs_rust
 @pytest.mark.parametrize("option", ACCEPTED)
 def test_e6_the_rust_detectors_take_every_value_the_python_ones_take(option):
+    applied = sd.server_report(moe_records(), thresholds=option, binary=REAL)["thresholds"]
+    assert all(ev._same_threshold(value, applied[name]) for name, value in option.items())
     tensorquill.build_evidence(moe_records(), detectors="rust", server_binary=REAL, **option)
 
 
@@ -192,6 +195,26 @@ def test_e3_a_resume_judged_from_the_loss_scale_is_checked_under_the_rust_detect
 def test_e3_a_kind_without_its_input_and_without_an_incident_stays_not_configured():
     checks = tensorquill.build_evidence(moe_records(), detectors="python")["kind_checks"]
     assert checks["resume_incomplete"]["value"] == "not_configured"
+
+
+def test_e3_the_lifted_entry_keeps_its_count_and_says_why():
+    evidence = tensorquill.build_evidence(scaler_reset(), detectors="python")
+    check = evidence["kind_checks"]["resume_incomplete"]
+    assert (check["records"], check["records_needed"], check["enough_history"]) == (0, 1, False)
+    assert "loss scale" in check["note"]
+    assert ev.kinds_by_value(evidence)["not_enough_history"]["resume_incomplete"] == {
+        "records": 0, "records_needed": 1, "reported": True}
+    assert "resume_incomplete 0 of 1 records but reported by a faster rule" in ev.checked_line(evidence)
+
+
+def test_e3_a_cross_rank_kind_on_one_ranks_evidence_is_left_as_it_was():
+    # The server's status lists duplicate_batches; one rank's evidence cannot compare ranks and
+    # keeps calling it not_configured (README, "What was checked"), with the incident listed.
+    status = {"schema_version": 1, "summary": "active", "ranks": [{"rank": 0, "state": "active", "last_step": 9}],
+              "missing_ranks": [], "duplicate_batches": {"step": 3, "ranks": [0, 1], "duplicated_steps": 1}}
+    evidence = tensorquill.build_evidence(moe_records(10), watchdog=status, detectors="python")
+    assert "duplicate_batches" in [i["kind"] for i in evidence["incidents"]]
+    assert evidence["kind_checks"]["duplicate_batches"]["value"] == "not_configured"
 
 
 # --- DET-17: one reading of `rank=<n>` -----------------------------------------------------------

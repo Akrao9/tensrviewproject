@@ -2141,26 +2141,29 @@ REPORTED_NOTES: dict[str, str] = {
         "reported from the loss scale (grad_scale), which this kind's records count leaves out: it counts"
         " checkpoint records only"
     ),
-    "duplicate_batches": "reported by the server, which compares every rank's batches (its status lists it)",
 }
-REPORTED_NOTE = "reported from input this entry does not count"
+REPORTED_NOTE = "reported from input this entry's records count leaves out"
 
 
 def checked_where_reported(
     checks: Mapping[str, Any], incidents: Iterable[Mapping[str, Any]]
 ) -> dict[str, Any]:
-    """`checks` (a `kind_checks` object) with every kind among `incidents` that it calls
-    `not_configured` made `checked`, with a `note` on where the incident came from
-    (`REPORTED_NOTES`): a kind that reported an incident was checked. `resume_incomplete` is judged from a checkpoint record and also from the loss scale
-    alone, and its count is of checkpoint records only, so a resume that reset the loss scale was
-    reported beside "never configured" (E3, Nov 19, 2026; both detectors). `records` and
-    `enough_history` stay as counted, the same in both detectors; counting the loss scale for
-    the kind needs `KIND_INPUTS` changed in both, which is left open."""
+    """`checks` (a `kind_checks` object) with every one of the server's kinds (`SERVER_KINDS`)
+    among `incidents` that it calls `not_configured` made `checked`, with a `note` on where the
+    incident came from (`REPORTED_NOTES`): a kind judged from a rank's records that reported an
+    incident was checked. `resume_incomplete` is judged from a checkpoint record and also from
+    the loss scale alone, and its count is of checkpoint records only, so a resume that reset
+    the loss scale was reported beside "never configured" (E3, Nov 19, 2026; both detectors).
+    `records` and `enough_history` stay as counted (`enough_history` is `records >=
+    records_needed`), the same in both detectors; counting the loss scale for the kind needs
+    `KIND_INPUTS` changed in both, which is left open. The kinds that are not read from a rank's
+    records (`other_kind_checks`) are left as they are: a rank's evidence calls the cross-rank
+    `duplicate_batches` `not_configured` even when the server's status lists it."""
     reported = {i.get("kind") for i in incidents if isinstance(i, Mapping)}
     out = dict(checks)
     for kind in reported:
         check = out.get(kind)
-        if isinstance(check, Mapping) and check.get("value") == "not_configured":
+        if kind in SERVER_KINDS and isinstance(check, Mapping) and check.get("value") == "not_configured":
             out[kind] = {**check, "value": "checked", "note": REPORTED_NOTES.get(str(kind), REPORTED_NOTE)}
     return out
 
