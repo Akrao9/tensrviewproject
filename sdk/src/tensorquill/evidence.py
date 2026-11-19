@@ -1620,18 +1620,6 @@ def lines_left_out_line(evidence: Mapping[str, Any]) -> str | None:
             " written) and were skipped; the steps after them are read.")
 
 
-def _store_attempt_order(source: Any, rank: int | None) -> str | None:
-    """For evidence read from a server's store, how its attempts were ordered
-    (`stored_attempt_order`: `first_seen`, `numeric_then_first_seen` or `numeric`); None for
-    any other source, whose order is the order its records were written in (contract 1)."""
-    if not isinstance(source, (str, Path)) or not Path(source).is_dir():
-        return None
-    folder = Path(source)
-    if rank is not None and folder.name != f"rank={rank}":
-        folder = folder / f"rank={rank}"
-    return stored_attempt_order(folder)[1] if folder.is_dir() else None
-
-
 def resolve_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Leave out the records a later attempt replaced.
 
@@ -2696,9 +2684,10 @@ def read_server_report(
     """
     folder = Path(folder)
     stored, _, unknown = _newest_part(folder)
+    order, attempt_order = stored_attempt_order(folder)
 
     def result(state: str, reason: str, report: dict[str, Any] | None = None) -> dict[str, Any]:
-        return {"state": state, "reason": reason, "stored": stored, "report": report}
+        return {"state": state, "reason": reason, "stored": stored, "report": report, "attempt_order": attempt_order}
 
     try:
         text = (folder / "incidents.json").read_text(encoding="utf-8")
@@ -2748,7 +2737,8 @@ def read_server_report(
     where = f"step {last_step} of attempt {report['attempt']}"
     if reported == stored:
         return result("current", f"the server's report is current through {where}", report)
-    if reported < stored:
+    # Attempts compared by their place in the rank's stored order (contract 1), not by number.
+    if (_attempt_place(order, reported[0]), reported[1]) < (_attempt_place(order, stored[0]), stored[1]):
         return result("behind", f"the server's report stops at {where} and the store holds step {stored[1]} of"
                       f" attempt {stored[0]}", report)
     return result("unusable", f"the server's report reaches {where}, past the stored step {stored[1]} of"
@@ -2765,6 +2755,9 @@ def _detection(look: Mapping[str, Any], source: str, rank: int | None) -> dict[s
         "rank": report.get("rank", rank),
         **({"stored_attempt": stored[0], "stored_last_step": stored[1]} if stored else {}),
         **({f"report_{key}": report[key] for key in ("attempt", "last_step", "steps", "rebuilds") if key in report}),
+        # How the store's attempts were ordered (contract 1): `first_seen`, `numeric_then_first_seen`
+        # or `numeric` for a store written before the order was kept.
+        **({"attempt_order": look["attempt_order"]} if look.get("attempt_order") else {}),
     }
 
 
@@ -5054,7 +5047,6 @@ def build_evidence(
         **({"run_end": read_end_marker(ended)} if (ended := _records_file(source, records_file)) else {}),
         **({"not_checked": not_checked} if not_checked else {}),
         **({"lines_left_out": left_out} if left_out else {}),
-        **({"attempt_order": order} if (order := _store_attempt_order(source, ranks[0] if ranks else rank)) else {}),
         **({"weight_trends": trends} if trends else {}),
         **({"head_trends": head_trends} if head_trends else {}),
         **({"memory": memory} if memory else {}),
