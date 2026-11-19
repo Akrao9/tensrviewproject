@@ -2912,7 +2912,8 @@ State as of Nov 16, 2026.
     - Lane V8 edits four lines in V4's test files that read the nested output folders of `seeded_failures.py`, which its CLI-19 fix makes flat.
     - C16: lane V2's fixture is shared by byte-identical copies. Across the encoding change a resume is reported through the existing `not_checked` entry with one reason text in both engines; the other three detectors give no incident and nothing new.
     - Lane W1's three fields are approved in `extra_json` and `system_json`, no column: `moe_unassigned`, `moe_left_out`, `read_at`.
-  - *Still the author's.* A public `skipped=` on `session.step()` for the Megatron example (X09's detector half), which the author said can wait; whether W1's fields are written only when nonzero or always.
+  - *W1's two MoE fields are written as explicit zeros (decided by the author the same day).* `moe_unassigned` is 0 when a router's IDs were checked and none were unassigned; `moe_left_out` is an all-zero per-expert vector when its routing map was checked and nothing was left out. The field is omitted for a router when the check did not run or did not apply, and readers treat a missing value, older records included, as unknown. "We checked and found zero" is a result and must read differently from "this writer did not measure that". The storage cost of the per-expert vector is accepted for v1, so each expert's routing-map count is `moe[e] + moe_left_out[e]` without guessing.
+  - *Still the author's.* A public `skipped=` on `session.step()` for the Megatron example (X09's detector half), which the author said can wait.
 
 ## Sources
 
