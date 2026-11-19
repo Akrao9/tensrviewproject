@@ -128,6 +128,9 @@ pub const TRAIN: &str = "train";
 const HEARTBEAT_STALE_INTERVALS: f64 = 3.0;
 const HEARTBEAT_MIN_STALE: f64 = 30.0;
 const GAPS_KEPT: usize = 8;
+/// The most a restored phase age and a restored counter age can differ by when they were one
+/// instant: half a tenth (the phase's rounding) and half a thousandth (the counter's).
+const PHASE_ROUNDING: f64 = 0.051;
 
 #[derive(Clone, Copy, Debug)]
 pub struct WatchdogConfig {
@@ -210,6 +213,10 @@ pub struct Pauses {
     pub total: f64,
     pub max: f64,
     pub last: f64,
+    /// When the last one ended, so the run's `last_seconds` is the pause that ended last of any
+    /// rank (RUST-13). Not in the status: a rank taken up after a restart has none, and its
+    /// pauses count as older than any this server saw end.
+    pub ended: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -431,12 +438,14 @@ impl Progress {
 
     /// Seconds the rank has gone without what makes it `state`: for a stopped rank, the time
     /// since it last made progress (or, if its stream dropped, since it dropped). A rank called
-    /// silent before its first stored batch has made none: the time since its counter last
-    /// moved, or since its last sign of work if it has not taken a training step.
+    /// silent or unresponsive before its first stored batch has made none: the time since its
+    /// counter last moved, or since its last sign of work if it has not taken a training step.
+    /// (Until Nov 19, 2026 an unresponsive one counted from when the rank was first seen, and
+    /// went from `starting` to `critical` with no warning: RS08.)
     fn quiet_seconds(&self, state: RankState, now: Instant) -> f64 {
         let since = match self.stream {
             Stream::Dropped => self.last_change,
-            Stream::Open if state == RankState::Silent && self.no_batch() => {
+            Stream::Open if matches!(state, RankState::Silent | RankState::Unresponsive) && self.no_batch() => {
                 if self.stepped {
                     self.work_moved
                 } else {
@@ -450,14 +459,15 @@ impl Progress {
 
     /// The quiet time after which a stopped rank is critical: the configured time, or three
     /// silence thresholds of this rank if that is longer, so a rank that is slow by nature still
-    /// gets a warning first. A rank called silent before its first training step was given
-    /// `start_limit` first, and is critical the configured time after that; so is one that had
-    /// shown no step when a restart dropped its stream and that has not come back since.
+    /// gets a warning first. A rank called silent or unresponsive before its first training step
+    /// was given `start_limit` first, and is critical the configured time after that; so is one
+    /// that had shown no step when a restart dropped its stream and that has not come back since.
     fn critical_after(&self, state: RankState, config: &WatchdogConfig) -> f64 {
         let critical = config.critical.as_secs_f64();
         let dropped_by_the_restart =
             self.stream == Stream::Dropped && self.restarted.is_some_and(|restart| self.last_change <= restart);
-        if self.before_its_first_step() && (state == RankState::Silent || dropped_by_the_restart) {
+        let stopped = matches!(state, RankState::Silent | RankState::Unresponsive);
+        if self.before_its_first_step() && (stopped || dropped_by_the_restart) {
             return config.start_limit.as_secs_f64() + critical;
         }
         critical.max(CRITICAL_THRESHOLDS * self.threshold(config))
@@ -521,6 +531,18 @@ impl Progress {
         } else {
             0.0
         };
+        let phase_since = ago(now, phase_seconds);
+        // A beat that opens a phase and brings a rise of the counter sets both clocks to one
+        // instant, and `pause_is_alive` asks which came first. The status keeps the phase's age to
+        // the tenth and the counter's to the thousandth, so an age that rounded up made the counter
+        // look as if it moved inside the pause, and a pause read `silent` after a restart that
+        // read `paused` without one (RS07). A counter younger than the phase by no more than that
+        // rounding moved with it: two beats are seconds apart, never 51 ms.
+        let work_moved = if (0.0..=PHASE_ROUNDING).contains(&(phase_seconds - work_still)) {
+            phase_since
+        } else {
+            ago(now, work_still)
+        };
         let mut pauses = HashMap::new();
         for (phase, stats) in carry["pauses"].as_object()? {
             pauses.insert(
@@ -530,6 +552,7 @@ impl Progress {
                     total: seconds(&stats["total_seconds"])?,
                     max: seconds(&stats["max_seconds"])?,
                     last: seconds(&stats["last_seconds"])?,
+                    ended: None,
                 },
             );
         }
@@ -542,14 +565,14 @@ impl Progress {
         }
         Some(Self {
             phase: entry["phase"].as_str()?.chars().take(40).collect(),
-            phase_since: ago(now, phase_seconds),
+            phase_since,
             last_heartbeat: match &entry["heartbeat_age_seconds"] {
                 Value::Null => None,
                 age => Some(ago(now, seconds(age)?)),
             },
             heartbeat_interval: seconds(&carry["heartbeat_interval_seconds"])?.clamp(0.0, 3600.0),
             work: carry["work"].as_i64(),
-            work_moved: ago(now, work_still),
+            work_moved,
             stepped,
             step_seconds: carry["step_seconds"]
                 .as_array()
@@ -767,6 +790,12 @@ impl Watchdog {
                 p.work = None;
                 p.work_moved = now;
                 p.stack = None;
+                // The earlier attempt's phase ended with its process: the new one is training from
+                // this beat until it says otherwise, and the time between is not a pause of either
+                // (RS06; until Nov 19, 2026 its first beat closed a dead attempt's evaluation over
+                // the whole downtime, and `recommended_silent_seconds` was twice that).
+                p.phase = TRAIN.to_string();
+                p.phase_since = now;
             }
             true
         })
@@ -818,6 +847,7 @@ impl Watchdog {
                     stats.total += seconds;
                     stats.max = stats.max.max(seconds);
                     stats.last = seconds;
+                    stats.ended = Some(now);
                 }
                 p.phase = phase.to_string();
                 p.phase_since = now;
@@ -992,7 +1022,11 @@ pub fn run_status(
             merged.count += stats.count;
             merged.total += stats.total;
             merged.max = merged.max.max(stats.max);
-            merged.last = stats.last;
+            // The pause that ended last, of any rank (until Nov 19, 2026, the highest rank's).
+            if stats.ended >= merged.ended {
+                merged.last = stats.last;
+                merged.ended = stats.ended;
+            }
         }
     }
     let longest = pauses.values().map(|stats| stats.max).fold(0.0_f64, f64::max);
@@ -3143,5 +3177,191 @@ mod tests {
             (&json!("unhealthy"), &json!([0])),
             "{found}"
         );
+    }
+
+    /// RS06 (RUST-07). An attempt that died in an evaluation, and the job started again three
+    /// hours later: the new attempt's first beat in `train` does not close the dead attempt's
+    /// pause over the whole downtime, which made `recommended_silent_seconds` 21,600.
+    #[test]
+    fn a_new_attempt_does_not_measure_the_downtime_as_the_dead_attempts_pause() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(WatchdogConfig::default());
+        dog.stream_opened(&key(0), t0);
+        assert!(dog.attempt_seen(&key(0), 1, t0));
+        dog.heartbeat(&key(0), "train", 15.0, Some(0), None, t0);
+        dog.batch(&key(0), 1, Some(49), Some(1), at(t0, 1));
+        dog.heartbeat(&key(0), "eval", 15.0, Some(50), None, at(t0, 2)); // an evaluation starts
+        dog.stream_ended(&key(0), false, at(t0, 60)); // and the process dies in it
+        let t1 = at(t0, 3 * 3600);
+        dog.stream_opened(&key(0), t1);
+        assert!(dog.attempt_seen(&key(0), 2, t1));
+        // The new attempt is in training from its first beat, until it says otherwise.
+        assert_eq!(rank_field(&dog, at(t1, 1), "phase"), "train");
+        assert_eq!(rank_field(&dog, at(t1, 1), "phase_seconds"), 1.0);
+        dog.heartbeat(&key(0), "train", 15.0, Some(0), None, t1);
+        dog.batch(&key(0), 2, Some(9), Some(1), at(t1, 5));
+        let status = &dog.statuses(at(t1, 6), true)["run"];
+        assert_eq!(status["pauses"], json!({}), "{status}");
+        assert_eq!(status["recommended_silent_seconds"], Value::Null);
+        // The new attempt's own pauses are measured as before.
+        dog.heartbeat(&key(0), "eval", 15.0, Some(10), None, at(t1, 10));
+        dog.heartbeat(&key(0), "train", 15.0, Some(10), None, at(t1, 70));
+        let status = &dog.statuses(at(t1, 71), true)["run"];
+        assert_eq!(
+            (
+                &status["pauses"]["eval"]["count"],
+                &status["pauses"]["eval"]["max_seconds"]
+            ),
+            (&json!(1), &json!(60.0))
+        );
+        assert_eq!(status["recommended_silent_seconds"], 300.0); // the floor
+    }
+
+    /// A rank that trains, then enters `eval` with a beat that also carries the counter's last
+    /// rise (or, with `moved_after`, whose counter rises that many seconds into the pause), and
+    /// beats on in `eval` with no more work. The status is written `age` seconds into the pause;
+    /// the same pause then goes on for 360 s more, once on this server and once on a server
+    /// restarted from that status at the moment it was written. Their rank entries, in that order.
+    fn a_pause_over_a_restart(age: f64, moved_after: Option<u64>) -> (Value, Value) {
+        let t0 = Instant::now();
+        let config = WatchdogConfig::default();
+        let dog = Watchdog::new(config);
+        dog.stream_opened(&key(0), t0);
+        assert!(dog.attempt_seen(&key(0), 1, t0));
+        dog.heartbeat(&key(0), "train", 15.0, Some(0), None, t0);
+        for i in 1..=10u64 {
+            dog.batch(&key(0), 1, Some(i as i64 * 10 - 1), Some(1), at(t0, i));
+            dog.heartbeat(&key(0), "train", 15.0, Some(i as i64 * 10), None, at(t0, i));
+        }
+        let pause = at(t0, 11);
+        let work = |second: f64| {
+            if moved_after.is_some_and(|after| second >= after as f64) {
+                106
+            } else {
+                105
+            }
+        };
+        dog.heartbeat(&key(0), "eval", 15.0, Some(105), None, pause);
+        let mut beats: Vec<f64> = (1..)
+            .map(|n| n as f64 * 15.0)
+            .take_while(|second| *second < age)
+            .collect();
+        beats.extend(moved_after.map(|after| after as f64));
+        beats.sort_by(f64::total_cmp);
+        for second in beats {
+            dog.heartbeat(
+                &key(0),
+                "eval",
+                15.0,
+                Some(work(second)),
+                None,
+                pause + Duration::from_secs_f64(second),
+            );
+        }
+        let written = pause + Duration::from_secs_f64(age);
+        let status = dog.statuses(written, true)["run"].clone();
+        let fresh = Watchdog::new(config);
+        assert!(fresh.restore("run", &status, written).unwrap());
+        fresh.stream_opened(&key(0), at(written, 1));
+        for second in (15..=360).step_by(15) {
+            for server in [&dog, &fresh] {
+                server.heartbeat(
+                    &key(0),
+                    "eval",
+                    15.0,
+                    Some(work(age + 360.0)),
+                    None,
+                    at(written, second),
+                );
+            }
+        }
+        let later = at(written, 361);
+        (
+            dog.statuses(later, true)["run"]["ranks"][0].clone(),
+            fresh.statuses(later, true)["run"]["ranks"][0].clone(),
+        )
+    }
+
+    /// RS07 (RUST-08). The time since the counter moved is kept to the millisecond and the
+    /// phase's age to the tenth, so a pause that began with the counter's last rise, written when
+    /// its age rounds up, read after a restart as if the counter had moved inside it: `silent`,
+    /// although without the restart it is `paused`. Both rounding directions, and a counter that
+    /// did move inside the pause, which is a stuck pause on either side of a restart.
+    #[test]
+    fn a_pause_that_began_with_the_counters_last_rise_is_still_a_pause_after_a_restart() {
+        for age in [400.04, 400.06, 0.24, 0.266, 0.05, 12.35] {
+            let (kept, restarted) = a_pause_over_a_restart(age, None);
+            assert_eq!(
+                (kept["state"].as_str(), restarted["state"].as_str()),
+                (Some("paused"), Some("paused")),
+                "written {age} s into the pause: {kept} / {restarted}"
+            );
+        }
+        let (kept, restarted) = a_pause_over_a_restart(400.06, Some(20));
+        assert_eq!(
+            (kept["state"].as_str(), restarted["state"].as_str()),
+            (Some("silent"), Some("silent")),
+            "{kept} / {restarted}"
+        );
+    }
+
+    /// RS08 (RUST-09). Before its first stored batch an unresponsive rank's quiet time was counted
+    /// from the rank's creation, so a rank whose heartbeats stopped after a long compile went from
+    /// `starting` to `critical` with no warning. It is counted as a silent rank's is: from the
+    /// counter's last rise once it has stepped, and otherwise from its last sign of work with the
+    /// start limit before it is critical.
+    #[test]
+    fn an_unresponsive_rank_before_its_first_batch_is_warned_of_first() {
+        let defaults = WatchdogConfig::default(); // start 1,800 s, critical 900 s
+        let t0 = Instant::now();
+        // A compile of 1,000 s (heartbeats every 15 s, the counter at 0), then the beats stop.
+        let dog = Watchdog::new(defaults);
+        dog.stream_opened(&key(0), t0);
+        for second in (0..=1000).step_by(10) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, second));
+        }
+        assert_eq!(states(&dog, at(t0, 1030)), ["starting"]);
+        assert_eq!(states(&dog, at(t0, 1060)), ["unresponsive"]);
+        assert_eq!(rank_field(&dog, at(t0, 1060), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 2699), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 2701), "severity"), "critical");
+
+        // The same compile, then four training steps on the counter, then the beats stop.
+        let dog = Watchdog::new(defaults);
+        dog.stream_opened(&key(0), t0);
+        for second in (0..=990).step_by(15) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, second));
+        }
+        for (step, second) in [1000, 1015, 1030, 1045].into_iter().enumerate() {
+            dog.heartbeat(&key(0), "train", 15.0, Some(step as i64 + 1), None, at(t0, second));
+        }
+        assert_eq!(states(&dog, at(t0, 1100)), ["unresponsive"]);
+        assert_eq!(rank_field(&dog, at(t0, 1100), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 1045 + 899), "severity"), "warning");
+        assert_eq!(rank_field(&dog, at(t0, 1045 + 901), "severity"), "critical");
+    }
+
+    /// RUST-13. The merged pauses' `last_seconds` is the pause that ended last, of any rank; it was
+    /// the highest rank's.
+    #[test]
+    fn the_merged_pauses_last_is_the_one_that_ended_last() {
+        for (earlier, newer) in [(1, 0), (0, 1)] {
+            let t0 = Instant::now();
+            let dog = Watchdog::new(config(60));
+            for rank in [0, 1] {
+                dog.stream_opened(&key(rank), t0);
+                dog.heartbeat(&key(rank), "train", 15.0, None, None, t0);
+            }
+            dog.heartbeat(&key(earlier), "eval", 15.0, None, None, at(t0, 10));
+            dog.heartbeat(&key(earlier), "train", 15.0, None, None, at(t0, 70)); // 60 s, ended at 70 s
+            dog.heartbeat(&key(newer), "eval", 15.0, None, None, at(t0, 100));
+            dog.heartbeat(&key(newer), "train", 15.0, None, None, at(t0, 120)); // 20 s, ended at 120 s
+            let eval = &dog.statuses(at(t0, 130), true)["run"]["pauses"]["eval"];
+            assert_eq!(
+                (&eval["count"], &eval["max_seconds"], &eval["last_seconds"]),
+                (&json!(2), &json!(60.0), &json!(20.0)),
+                "rank {newer}'s pause ended last"
+            );
+        }
     }
 }
