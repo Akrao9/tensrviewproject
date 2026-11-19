@@ -73,6 +73,8 @@ mod system;
 use system::{System, SystemColumns};
 #[cfg(test)]
 mod lane_v7_tests;
+#[cfg(test)]
+mod lane_w3_tests;
 
 // The same values as the constants of the same names in evidence.py.
 pub const OVERLOAD_THRESHOLD: f64 = 0.35;
@@ -3227,8 +3229,8 @@ impl Inputs {
             .is_some_and(|spread| !spread.row(row).is_empty());
         // `resume_incomplete` judges a resume from a checkpoint manifest or from the loss scale
         // (E3): either is its input.
-        let checkpoint = data::checkpoint(columns, row).is_some()
-            || value(columns.grad_scale, row).is_some_and(f64::is_finite);
+        let checkpoint =
+            data::checkpoint(columns, row).is_some() || value(columns.grad_scale, row).is_some_and(f64::is_finite);
         self.grad_total += u64::from(total);
         self.weight_check += u64::from(weights && norms);
         self.lr += u64::from(columns.lr(row).is_some());
@@ -4983,7 +4985,10 @@ mod tests {
             BTreeMap::from([(1, Some(i64::MAX)), (2, None)])
         );
         // The order given, not the numbers (contract 1): 900 first, then 2 resumed at 30.
-        assert_eq!(resolve(&[(900, 0), (2, 30)]), BTreeMap::from([(900, Some(30)), (2, None)]));
+        assert_eq!(
+            resolve(&[(900, 0), (2, 30)]),
+            BTreeMap::from([(900, Some(30)), (2, None)])
+        );
     }
 
     #[test]
@@ -5026,8 +5031,9 @@ mod tests {
             ["z", "a", "m"]
         );
         let z = &attention[0].1;
-        // NaN left out; true reads as 1 as Python's `_finite` reads it: (0.25 + 0.75 + 1) / 3.
-        assert_eq!((z.share, z.logit, z.heads), (Some(2.0 / 3.0), Some(3.0), 3));
+        // NaN and `true` left out, as Python's `_finite` reads them (a bool is not a number,
+        // DET-16): (0.25 + 0.75) / 2.
+        assert_eq!((z.share, z.logit, z.heads), (Some(0.5), Some(3.0), 2));
         assert_eq!(
             (attention[1].1.share, attention[1].1.logit, attention[2].1.heads),
             (None, None, 0)

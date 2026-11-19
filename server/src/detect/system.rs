@@ -378,7 +378,7 @@ mod tests {
         );
         assert_eq!(
             items.iter().map(|v| number(*v)).collect::<Vec<_>>(),
-            [Some(5.0), Some(5.0), Some(1.0), None, None]
+            [Some(5.0), Some(5.0), None, None, None] // a bool is not a number (DET-16)
         );
     }
 
