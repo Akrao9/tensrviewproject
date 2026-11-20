@@ -18,8 +18,14 @@ reference as committed in `89bef4e`, and each read wrongly there:
 - `explicit_spread_without_a_scope_and_both_drift`: one entry where two are due.
 - `every_parameter_unread`, `group_of_one`: fingerprints and signatures "agree" with nothing compared.
 - `signature_method_differs`: no word on signatures at all.
-- `two_launches_with_one_attempt_number`: with the launch written as rank 0's attempt, as the
-  first draft had it, drift on `w` between a new row and an old one.
+- `two_launches_with_one_attempt_number`: read rightly by that reference as the case is written;
+  with the launch written as rank 0's attempt, as the first draft had it, the same rows read as
+  drift on `w` between a new row and an old one.
+
+`launch_read_from_an_earlier_start` came after that, from a run: under torchrun a restarted rank
+found the earlier start's entry in the store. The reference of `511cff8` paired that rank's new
+row with the earlier start's and raised drift on `w`. `rank_outside_its_own_group` and
+`overlapping_groups_beside_a_third` pin two rules that had no case.
 """
 
 from __future__ import annotations
@@ -141,10 +147,17 @@ def reference(records: list[dict], tolerance: float) -> dict:
             held["covered"] |= set(record["replica_spread"])
             held["over"] |= set(_legacy(record, tolerance).get("parameters", ()))
     by_step: dict[tuple, dict[int, dict]] = defaultdict(dict)
-    for record in records:
+    owner: dict[tuple, int] = {}  # (launch, rank) -> the attempt that keeps the launch: the first one
+    aside: dict[tuple, set] = defaultdict(set)
+    for record in records:  # in contract 1's order
         if "replica" in record:
-            # one rank's newest attempt of a launch: later in the file wins (contract 1's order)
-            by_step[(record["replica"]["launch"], record["step"])][record["rank"]] = record["replica"]
+            launch, rank = record["replica"]["launch"], record["rank"]
+            if launch is not None and owner.setdefault((launch, rank), record["attempt"]) != record["attempt"]:
+                # A second attempt of one rank under one launch: the launch was read from what
+                # an earlier start left in the store (contract 2). Its rows are set aside.
+                aside[(launch, tuple(record["replica"]["group"]), record["step"])].add(rank)
+                continue
+            by_step[(launch, record["step"])][rank] = record["replica"]
     # Contract 4's order: by step, then the rows that name no launch, then by launch, then by group.
     for (launch, step), seen in sorted(by_step.items(), key=lambda item: (item[0][1], item[0][0] is not None, item[0][0] or "")):
         groups = sorted({tuple(o["group"]) for o in seen.values()})
@@ -173,6 +186,12 @@ def reference(records: list[dict], tolerance: float) -> dict:
             raised = [name for name in verdict.get("drift_parameters", ()) if name not in covered]
             if raised:
                 incidents.append({"step": step, "parameters": raised, "source": "replica", "launch": launch, "group": list(group)})
+    for (launch, group, step), ranks in aside.items():
+        steps.append({"launch": launch, "group": list(group), "step": step, "coverage": "not_established",
+                      "why": "attempt", "ranks": sorted(ranks)})
+    # the whole list in contract 4's order; a step's own entry before the rows set aside from it
+    steps.sort(key=lambda e: (e["step"], e["launch"] is not None, e["launch"] or "", e["group"] is not None,
+                              e["group"] or [], e.get("why") == "attempt"))
     for (scope, step), held in gathered.items():
         if held["over"]:
             named = {} if scope is None else {"launch": scope[0], "group": list(scope[1])}
@@ -200,7 +219,9 @@ def test_the_files_hold_the_cases_the_contract_names():
             "explicit_spread_clean_and_observations_drift", "two_launches_with_one_attempt_number",
             "explicit_spread_in_another_launch", "explicit_spread_of_another_group", "explicit_spread_without_a_scope",
             "explicit_spread_covers_one_parameter", "explicit_spread_without_a_scope_and_both_drift",
-            "every_parameter_unread", "group_of_one", "signature_method_differs"} <= names
+            "every_parameter_unread", "group_of_one", "signature_method_differs",
+            "launch_read_from_an_earlier_start", "rank_outside_its_own_group",
+            "overlapping_groups_beside_a_third"} <= names
     # Every no-incident case raises nothing, and every incident case raises exactly one incident,
     # but for the one case whose point is two comparisons that cannot be shown to be the same one.
     two = {"explicit_spread_without_a_scope_and_both_drift"}
@@ -256,6 +277,17 @@ def test_a_launch_named_by_rank_0s_attempt_would_pair_two_launches():
     assert reference(body["records"], tolerance)["replica_drift"] == []
 
 
+def test_a_stale_launch_never_pairs_a_new_row_with_an_old_one():
+    """One attempt of a rank in a launch. Without that rule the rows below read as drift."""
+    [(body, tolerance)] = [(b, t) for _, c, b, t in ALL if c == "launch_read_from_an_earlier_start"]
+    old0, old1, new0, new1 = body["records"]
+    assert new1["replica"]["launch"] == old1["replica"]["launch"] != new0["replica"]["launch"]  # rank 1 read the old one
+    assert new1["attempt"] != old1["attempt"]
+    assert _compare({0: old0["replica"], 1: new1["replica"]}, tolerance)["fingerprints"] == "drift"
+    assert _compare({0: new0["replica"], 1: new1["replica"]}, tolerance)["fingerprints"] == "agree"
+    assert body["expected"]["replica_drift"] == []
+
+
 def test_a_gathered_spread_decides_only_what_it_covers():
     """The four ways a gathered spread can be of something else: each leaves the drift raised."""
     for case in ("explicit_spread_in_another_launch", "explicit_spread_of_another_group",
@@ -287,6 +319,24 @@ def test_old_records_get_the_verdict_the_reader_gives_them_today():
                 assert found["step"] == wanted["step"] and sorted(found["parameters"]) == wanted["parameters"], case
             seen += 1
     assert seen == 2
+
+
+def test_every_gathered_spread_keeps_the_verdict_of_its_own_record():
+    """Contract 5: whatever else a step holds, a `replica_spread` is judged on its own record.
+    The real rule on every record here that holds one, with a scope, without, beside observations."""
+    from tensorquill.evidence import detect_replica_drift
+
+    seen = set()
+    for _, case, body, tolerance in ALL:
+        for record in body["records"]:
+            if "replica_spread" not in record:
+                continue
+            wanted, found = _legacy(record, tolerance), detect_replica_drift([record], tolerance=tolerance)
+            assert (found is not None) is wanted["drift"], case
+            if found is not None:
+                assert found["step"] == record["step"] and sorted(found["parameters"]) == wanted["parameters"], case
+            seen.add(("replica_spread_scope" in record, "replica" in record, wanted["drift"]))
+    assert seen >= {(True, True, False), (True, True, True), (False, True, False), (False, True, True), (False, False, True)}
 
 
 def test_a_launch_is_a_nonce_and_holds_no_attempt_or_count():
@@ -335,19 +385,29 @@ def test_todays_weight_function_takes_a_seed_of_full_width():
     for seed in (name_v1_seed("layers.0.weight"), 0, 0x80000000, 0xFFFFFFFF):
         real = _projection_weights(0, 6, seed, torch.device("cpu")).tolist()
         assert real == [name_v1_weight(i, seed) for i in range(6)], hex(seed)
+    # Far into a large tensor the sum inside passes 64 bits and wraps; the low 32 bits, which
+    # are all the weight uses, must still be the ones the definition gives.
+    for start in (20_000_000, 5_000_000_000):
+        real = _projection_weights(start, 4, 0xFFFFFFFF, torch.device("cpu")).tolist()
+        assert real == [name_v1_weight(start + i, 0xFFFFFFFF) for i in range(4)], start
     got = float(_projection_f64(torch.tensor([1.0, 2.0, 3.0, 4.0]), name_v1_seed("layers.0.weight")))
     assert got == pytest.approx(-0.5220147273503244, rel=1e-12)
 
 
 def _observation() -> dict:
     [body] = [b for _, c, b, _ in ALL if c == "not_finite_on_one_rank"]
-    return body["records"][1]  # a signature near the edge of 64 bits beside it, and "nan" fingerprints
+    [scoped] = [b for _, c, b, _ in ALL if c == "explicit_spread_and_observations_on_one_step"]
+    # A signature near the edge of 64 bits, "nan" fingerprints, and beside them a gathered
+    # spread with what it covers, as an explicit call on a scheduled step would leave them.
+    gathered = {key: scoped["records"][1][key] for key in ("replica_spread", "replica_spread_scope")}
+    return {**body["records"][1], **gathered}
 
 
 def test_an_observation_survives_a_jsonl_line():
     record = _observation()
     line = json.dumps(record, separators=(",", ":"), allow_nan=False)
     assert json.loads(line) == record
+    assert record["replica_spread_scope"]["group"] == [0, 1] and len(record["replica_spread_scope"]["launch"]) == 32
     assert isinstance(record["replica"]["params"]["b"]["sig"], str) and int(record["replica"]["params"]["b"]["sig"]) > 2**53
 
 
@@ -357,7 +417,9 @@ def test_an_observation_survives_the_flight_row_and_parquet(tmp_path):
     record = {**_observation(), "ts": 1.0, "grad_norm": 0.5}
     row = record_to_row(record)
     assert "replica" in json.loads(row["extra_json"])  # no column of its own: it travels with the other extra keys
-    assert row_to_record(row)["replica"] == record["replica"]
+    assert "replica_spread_scope" in json.loads(row["extra_json"])
+    for key in ("replica", "replica_spread", "replica_spread_scope"):
+        assert row_to_record(row)[key] == record[key], key
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     from tensorquill.flight import flight_schema
@@ -365,4 +427,5 @@ def test_an_observation_survives_the_flight_row_and_parquet(tmp_path):
     table = pa.Table.from_pylist([row], schema=flight_schema())
     pq.write_table(table, tmp_path / "part.parquet")
     [back] = pq.read_table(tmp_path / "part.parquet").to_pylist()
-    assert row_to_record(back)["replica"] == record["replica"]
+    for key in ("replica", "replica_spread", "replica_spread_scope"):
+        assert row_to_record(back)[key] == record[key], key

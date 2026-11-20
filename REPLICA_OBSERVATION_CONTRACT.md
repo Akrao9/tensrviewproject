@@ -60,7 +60,12 @@ Old records keep `replica_spread` alone. A reader gives such a record the verdic
 
 Each process makes its own `attempt` from its own clock, so healthy ranks of one start have different attempts. Attempts are therefore not matched between ranks. `launch` is.
 
-`launch` has one source: **a nonce that rank 0's process makes once**, before its first `init` exchange: 128 bits from the operating system's entropy (`uuid.uuid4().hex`), never from a random number generator the training uses. Rank 0 shares it through the process group's store beside the run ID, under a key of its own that it sets before the run ID's. A rank that has read the run ID then looks for that key once and does not wait for it, so the exchange has no new wait, the run ID's entry keeps its two items, and a rank on an older SDK still reads the run ID. Rank 0 never waits. A rank whose store failed, whose wait for the run ID ran out, or that found no launch beside the run ID records `launch` as null. A job of one rank makes its own nonce.
+`launch` has one source: **a nonce that rank 0 makes at each `init`**: 128 bits from the operating system's entropy (`secrets.token_hex(16)`), never from a random number generator the training uses. Rank 0 shares it through the process group's store beside the run ID, under a key of its own that it sets before the run ID's. A rank that has read the run ID then looks for that key once and does not wait for it, so the exchange has no new wait, the run ID's entry keeps its two items, and a rank on an older SDK still reads the run ID. Rank 0 never waits. A rank whose store failed, whose wait for the run ID ran out, or that found no launch beside the run ID records `launch` as null. A job of one rank makes its own nonce.
+
+**A fresh nonce can still be read stale, so a rank confirms it.** torchrun keeps one store across a restart of its workers, and the exchange's key is the same in every start. Run on Nov 20, 2026 (PyTorch 2.15, torchrun with two workers on the loopback address, one restart): the restarted rank 1 found the earlier start's entry in the store before rank 0 had set the new one. Two rules follow.
+
+- **The writer reads the launch a second time before it uses it.** What a rank read at `init` is provisional. Before it writes its first observation, a rank other than rank 0 reads the key once more, without waiting, and records what that second read gives; if it fails, null. By then the rank has finished at least one training step since `init`, and in a replicated job rank 0 of the same start has long passed its own `init` and set the key. The writer lane says which thread does the read and what it costs.
+- **The reader allows a rank one attempt in a launch.** Rank 0 makes a new nonce at each `init`, so one start never gives a rank two attempts under one launch. When a file holds them, the first attempt (by contract 1's order) keeps the launch, and the rows of any later attempt are set aside as `not_established`: they are never paired with the earlier start's rows.
 
 It has to be a value that is new at every start of the job, and two candidates are not:
 
@@ -71,7 +76,7 @@ One source also means two ranks of one start can never disagree about which sour
 
 A reader's input is one run's records. Two records can be compared only when they name the same run, the same `launch` (not null) and the same `group`. A reader never pairs records across launches: after a restart, an earlier launch's row at step 50 is not compared with the new launch's row at step 50.
 
-Within one rank, when several attempts carry the same `launch` (which the SDK does not produce, but a file can hold), the newest attempt is used, by contract 1's order.
+What the two stale-launch rules above do not cover is in section 9.
 
 ## 3. What can be compared
 
@@ -89,12 +94,12 @@ A parameter that is not compared is listed with its reason. It is never counted 
 
 ## 4. The four facts a reader reports
 
-They are separate, and a reader gives each one for each compared step. The steps are listed by step, then the rows that name no launch, then by launch, then by group, so both engines give the same list.
+They are separate, and a reader gives each one for each compared step. The steps are listed by step, then the rows that name no launch, then by launch, then by group, and a step's own entry before the rows set aside from it, so both engines give the same list.
 
 **Coverage.**
 - `complete`: every rank in `group` has an observation for this launch and step.
 - `insufficient`: some do not. The reader names the missing ranks. This is not a clean result and not an incident.
-- `not_established`: the records cannot say whether they belong to one start, or who is compared with whom: a `launch` is null, or two ranks of one launch and step name groups that overlap and are not the same, or a rank names a group it is not in. The reader says which. When some ranks of a step name a launch and one names none, both are said: the launch's step is `insufficient` without that rank, and that rank's row is `not_established`.
+- `not_established`: the records cannot say whether they belong to one start, or who is compared with whom: a `launch` is null; or two ranks of one launch and step name groups that overlap and are not the same, or a rank names a group it is not in, which leaves the whole launch and step not established, a group apart from the faulty ones too; or the row is a rank's later attempt under a launch (section 2). The reader says which. When some ranks of a step name a launch and one names none, both are said: the launch's step is `insufficient` without that rank, and that rank's row is `not_established`.
 
 Coverage says who sent a record. It does not say anything was compared. Only a step with `complete` coverage can agree or drift, and a lone rank's file is `insufficient` for a group of more than one rank.
 
@@ -124,6 +129,21 @@ One rule for v1: **`replica_drift` is raised when coverage is `complete` and fin
 
 Incidents are listed by step, then by source, then by launch and group.
 
+**The words in a result.** The fixtures spell each fact this way, and both engines use the same words.
+
+| Where | Key | Values |
+|---|---|---|
+| Every entry | `coverage` | `complete`, `insufficient` (with `missing`, the ranks), `not_established` (with `why`) |
+| A `not_established` entry | `why` | `launch`, `group`, `attempt` (with `ranks`, whose rows were set aside) |
+| A `complete` entry | `fingerprints` | `agree`, `drift` (with `drift_parameters`), `not_compared` (with `fingerprints_why`) |
+| | `fingerprints_why` | `device`, `no_parameters`, `one_rank` |
+| | `signatures` | `agree`, `differ` (with `signature_parameters`), `not_compared` (with `signatures_why`) |
+| | `signatures_why` | `method`, `no_parameters`, `one_rank` |
+| | `not_compared` | Each parameter left out, with `unread`, `not_recorded` or `shape_dtype` |
+| | `projection_compared` | `false` when the ranks' projection settings differ; absent otherwise |
+| | `gathered` | The parameters a gathered spread of this launch, group and step decides |
+| An incident | `source` | `replica` (with `launch` and `group`) or `replica_spread` (with them when it has a scope) |
+
 ## 6. Old captures
 
 A record with `replica_spread` and no `replica` is judged as before: drift when a spread is above the tolerance, on that rank's record alone. Its verdict does not change, and it is not mixed with observations.
@@ -150,3 +170,5 @@ The proof for this uses a rank that is alive and training while its telemetry is
 - D1's wording and acceptance test (held by the author).
 - SDK-06: whether to record again after a second optimizer steps. Its cost is hashing, device synchronisation and record size, to be measured, not assumed free.
 - How a reader that shows one incident for a kind presents two sources on one step.
+- **What the two stale-launch rules leave.** A rank whose second read is still stale (rank 0 of its start had not reached `init` by the rank's first observation, which needs a job whose ranks do not step together), under a launch in which the earlier start's same rank never reported: its rows would be the first attempt under the old launch and could pair with the earlier start's other ranks. A store left on disk by a crashed job (a `FileStore` file) is the same exposure from the first read on. Closing it for certain needs rank 0 to wait for the others or a collective at `init`, and this wave took both out of the training path. The same store entry also carries the run ID, which is read the same way today (bug list, L25).
+- Whether a restarted torchrun job completes on the setup the probe ran on: in the probe's second start rank 0 printed nothing before the run was stopped. Not looked into.
