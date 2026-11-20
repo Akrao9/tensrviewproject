@@ -4,7 +4,7 @@ Step 0 of the SDK-22 wave (Nov 20, 2026), revised the same day after the author'
 
 This page is what the writer, the Python reader, the server and the driver build against. The cases in `sdk/tests/fixtures/replica/` are its examples, and `sdk/tests/test_replica_contract.py` holds a small reference reading of the rules that every case is checked with. Where this page and a case disagree, that is a fault in one of them, to be fixed before a lane builds on either.
 
-The author released the four lanes that build against this page on Nov 20, 2026 ("Release lanes 1–4"): Z1 the writer, Z2 the Python reader, Z3 the server, Z4 the driver. The four were merged into `main` on Nov 20, 2026 (at `8c45fb8`), with lanes Z5 and Z6: the writer, both readers and the driver now use the keys below.
+The author released the four lanes that build against this page on Nov 20, 2026 ("Release lanes 1–4"): Z1 the writer, Z2 the Python reader, Z3 the server, Z4 the driver. The four were merged into `main` on Nov 20, 2026 (at `8c45fb8`), with lanes Z5 and Z6: the writer, both readers and the driver now use the keys below. The author signed off this page's six calls beyond the review the same day: a nonce at each `init`, a group of one rank not compared, the rule for overlapping groups, two entries when an unscoped spread and the observations both drift, incidents that name launch and group, and the second read of the launch.
 
 ## 1. What a rank writes
 
@@ -124,7 +124,7 @@ Coverage says who sent a record. It does not say anything was compared. Only a s
 - `agree` when none differs and at least one parameter's signatures were compared. It means no difference was found, not that the bytes were proved equal.
 - `not_compared` when none was, with why: the methods differ or a rank records none, no parameter could be compared, or the group has one rank.
 
-**Attribution (D1, held).** Not part of this wave. When released it is computed from these same records: `agree`, `attributed` when a strict majority of the ranks hold one value and the others are named, `inconclusive` otherwise. Two ranks that differ are inconclusive.
+**Attribution (D1, released by the author on Nov 20, 2026; not built).** Not part of the wave that built this page, and built only after its own cases are written here. It is computed from these same records: `agree`, `attributed` when a strict majority of the ranks hold one value and the others are named, `inconclusive` otherwise. Two ranks that differ are inconclusive: they establish that the replicas diverge and name no rank. Three equivalent replicas split two to one name the one. A rank with no peer is never said to agree: one rank observed, zero peers compared (section 3), and the same words hold for batch hashes.
 
 ## 5. What raises `replica_drift`
 
@@ -177,13 +177,17 @@ The proof for this uses a rank that is alive and training while its telemetry is
 
 **Where the server's result is carried.** The server writes the result of sections 2 to 6 for a run as one object under the key `replica` at the top level of that run's `watchdog.json`, beside `ranks_compared`: `{"v": 1, "tolerance": <number>, "steps": [...], "replica_drift": [...]}`, with `legacy` when there is one, each list spelled as the fixtures spell it. The Python all-ranks reader, which opens no part and runs no detector, takes the result from there; a reader of local rank files computes the same object from the records. The driver's clock (section 7) stops at the first `watchdog.json` whose `replica` object holds the step's verdict. How many steps the object lists, and what the server holds for steps that stay `insufficient`, is the server lane's to bound and to say.
 
+**What a bound drops.** The server lists at most 256 steps and 1 MiB of their entries, holds at most 32 MiB of observation JSON for a run, and keeps the first 64 incidents of steps it no longer lists. Only when one of these dropped something, the object carries one more key, `omitted`: `steps` (how many step numbers are no longer listed), `late_rows` (rows that arrived for a step no longer listed: counted, never listed again), `replica_drift` (incidents no longer listed), and `frozen`, a list of `{"launch", "step", "why", "rows_not_compared"}` for each launch and step whose entry no longer changes, with `frozen_more` counting those past 64. `why` is `held_bytes` (the unfinished observations were let go), `restart` (taken up from the last status after a restart, then met by a row that was not compared) or `re_pair` (an earlier attempt's backlog arrived after the others' observations were let go). A frozen entry keeps reading as it did and never becomes `complete`. A reader comparing the server's object with its own leaves `omitted` out. A server started with `--no-detect` writes no `replica` key at all, which a reader must not call an older server.
+
+**Stored and shown.** Where two sources drift on one step, the result keeps two entries, each with its own scope, as section 5 has it. A reader may show them as one incident, and then shows both sources.
+
 **Who edits what.** Only the writer lane edits this page, and only to define `fold64-v1`. No lane edits the fixtures, `make_cases.py` or `sdk/tests/test_replica_contract.py`: a lane that finds this page and a case disagreeing stops and reports.
 
 ## 9. Not settled here
 
-- Whether a signature mismatch alone raises (after the eight-GPU run).
-- D1's wording and acceptance test (held by the author).
+- Whether a signature mismatch alone raises. The author's call of Nov 20, 2026: it stays evidence. The eight-GPU run measures how often signatures differ on healthy steps and plants a byte difference below the fingerprint tolerance, signed zero among them; whether any mismatch is an incident, and under which conditions, is decided after that. Megatron's hash is of a CPU float32 copy and `fold64-v1` is of the original bits, so the two can disagree about the same tensors.
+- D1's cases and acceptance test. Released by the author on Nov 20, 2026; its cases come before any code.
 - SDK-06: whether to record again after a second optimizer steps. Its cost is hashing, device synchronisation and record size, to be measured, not assumed free.
-- How a reader that shows one incident for a kind presents two sources on one step.
+- **L25, released for a fix by the author on Nov 20, 2026:** exchange keys scoped to a generation of the job where a trustworthy one is at hand, tested with a restarted rank other than 0 arriving before rank 0. A delayed second read alone can still return the old entry.
 - **What the two stale-launch rules leave.** A rank whose second read is still stale (rank 0 of its start had not reached `init` by the rank's first observation, which needs a job whose ranks do not step together), under a launch in which the earlier start's same rank never reported: its rows would be the first attempt under the old launch and could pair with the earlier start's other ranks. A store left on disk by a crashed job (a `FileStore` file) is the same exposure from the first read on. Closing it for certain needs rank 0 to wait for the others or a collective at `init`, and this wave took both out of the training path. The same store entry also carries the run ID, which is read the same way today (bug list, L25).
 - Whether a restarted torchrun job completes on the setup the probe ran on: in the probe's second start rank 0 printed nothing before the run was stopped. Not looked into.
