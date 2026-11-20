@@ -133,6 +133,7 @@ Not from either review. Not counted in the 72.
 | Item | State |
 |---|---|
 | `activation_drift` fired on 6 of 7 healthy small trainings on CPU (11 of their 12 runs), the TrainCheck re-creations. Since C24's fix (M1) a model that is one leaf module is observed too, and it fired there as well: step 75 on a healthy bare `nn.Linear` in a trigger test | Open. Anomalies do not fire the trigger by default until thresholds are checked on a real job |
+| `resume_incomplete` does not compare a checkpoint's tensors with the model's (TrainCheck B14). Reproduced on CPU: two LSTM tensors (`lstm.weight_hh_l0`, `lstm.bias_hh_l0`) were missing from the checkpoint, were fresh after the resume, and the final loss was 1.76 against 1.35 healthy; the check, which looks only at which components a checkpoint holds, said nothing | Open. The fix is a checkpoint-to-model comparison at resume that raises an incident naming each missing tensor. Notes: `experiments/traincheck-bugs/README.md` |
 | Thresholds (spike 5×, diversity drop 0.6, starved ratio, stall count) rest on Granite and synthetic fixtures | Open until a real job runs without false alarms |
 | A probe flush of about 150 ms delays a live acknowledgement; 620 ms was seen once | Logged as an open gap |
 | `--watch` with the Python detectors recomputes the whole run: 8.1 s per update at 10,000 steps | Open gap |
@@ -147,6 +148,7 @@ Not from either review. Not counted in the 72.
   - L9, above.
   - `activation_drift` fires on healthy small trainings, now including single-leaf models (section 9). It needs thresholds checked on a real job.
   - L10: a lone rank with batch hashes is listed as "compared" (section 7). A question for the author.
+- **A demonstrated gap with a clear fix:** checkpoint-to-model verification (section 9, TrainCheck B14). An alert that names the missing tensors gives the user an immediate action.
 - **Needs the author, not code:** X02 (an amendment), X09 (`skipped=` on `session.step()`), SDK-22 after `init`, L3 and L10.
 
 ## Closed, for the record
