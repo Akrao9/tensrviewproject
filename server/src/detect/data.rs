@@ -41,8 +41,10 @@ fn number(value: &Value) -> Option<f64> {
 }
 
 /// A batch hash's kind: the text before its first `:` (`v2` for `v2:cd09ce7a08834a9e`), and
-/// `""` for a hash with none, which the writer before C16 made (lane V2, Nov 19, 2026). Two
-/// hashes are compared only when their kinds are equal, the same rule as `data_checks.py`:
+/// `""` for a hash with none, which the writer before C16 made (lane V2, Nov 19, 2026), and `v3`
+/// for a step that drew a batch of bools and other integers, which `v2` hashed as its integers
+/// (lane X4, Nov 19, 2026; nothing here reads the kind's name). Two hashes are compared only
+/// when their kinds are equal, the same rule as `data_checks.py`:
 ///
 /// - `data_stalled`: a hash of another kind than the one before it counts as a missing hash.
 /// - `epoch_order_repeated`: a position whose hashes differ in kind breaks the order, as a

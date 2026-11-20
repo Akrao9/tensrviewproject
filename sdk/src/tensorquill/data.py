@@ -17,9 +17,8 @@ every process, rank and attempt that draws the same samples in the same order ge
 hash. A batch of integers that fit int64 is its indices as little-endian int64 after a tag
 byte (one C loop: the common case); any other batch is a tag byte, then each item's type,
 byte length and bytes (text as UTF-8, bytes as they are), so batches of different ids do
-not share their bytes. One exception keeps the fast path one C loop: a list that starts with
-an int and holds a bool hashes as its integers (`[1, True]` as `[1, 1]`). It is written as
-`v2:` and 16 hex digits.
+not share their bytes. It is written as `v2:` and 16 hex digits, or `v3:` for a step that drew
+a batch holding both bools and other integers (below).
 
 The prefix is the encoding's version. A writer before it wrote the 16 hex digits alone,
 from int64 indices or from the items' text joined by NUL bytes, in which different batches
@@ -27,6 +26,16 @@ could share their bytes (`["a\\x00b", "c"]` and `["a", "b\\x00c"]`; byte ids dec
 replacement). Hashes of two versions are of different encodings: equal batches give
 different hashes, so a reader compares only hashes of one version (the text before the first
 `:`, none for the old writer's) and leaves a pair of two versions not compared.
+
+`v3` (C16, lane X4, Nov 19, 2026) is `v2` without its one exception: the `v2` writer hashed a
+list that starts with an int and holds a bool as its integers (`[1, True]` as `[1, 1]`), and
+now such a batch is typed items, as `(1, True)` already was. Every other batch's bytes are as
+they were, so a step whose batches hold no bool beside another integer keeps its `v2:` hash
+(and resumes from a `v2` run are still compared); a step that drew one is written `v3:`, so its
+hash is never compared with the `v2` writer's hash of the same batch. A tuple `(1, True)`,
+which `v2` hashed right, is written `v3:` too, so a batch's kind does not depend on what holds
+it. Telling the two apart
+costs one C loop over the batch's types beside the one that packs it.
 """
 
 from __future__ import annotations
@@ -52,6 +61,7 @@ _MAX_OTHER = 20
 
 
 HASH_PREFIX = "v2:"  # the version of the encoding below; the old writer's hashes have none
+MIXED_PREFIX = "v3:"  # a step that drew a batch of bools and other integers (C16, lane X4)
 _INTS, _ITEMS = b"i", b"t"  # a batch's first byte: int64 indices, or typed items
 
 
@@ -86,12 +96,24 @@ def _item_bytes(value: Any) -> bytes:
 
 def identity_bytes(values: Any) -> bytes | None:
     """The bytes a batch's sample indices (or ids) are hashed from; None when there are none."""
+    return _identity(values)[0]
+
+
+def _mixed(values: list[Any]) -> bool:
+    """Whether a batch holds a bool and another integer: the batches whose bytes `v2` got wrong."""
+    return any(isinstance(v, bool) for v in values) and any(
+        isinstance(v, numbers.Integral) and not isinstance(v, bool) for v in values
+    )
+
+
+def _identity(values: Any) -> tuple[bytes | None, bool]:
+    """`identity_bytes`, and whether the batch is mixed (`_mixed`)."""
     if values is None:
-        return None
-    if isinstance(values, list) and values and type(values[0]) is int:
+        return None, False
+    if isinstance(values, list) and values and type(values[0]) is int and bool not in set(map(type, values)):
         fast = _int_bytes(values)  # the common case: a batch sampler's list of indices
         if fast is not None:
-            return fast
+            return fast, False
     if isinstance(values, torch.Tensor):
         values = values.detach().reshape(-1).tolist()
     elif isinstance(values, (str, bytes, bytearray, memoryview)) or not isinstance(values, Iterable):
@@ -99,12 +121,12 @@ def identity_bytes(values: Any) -> bytes | None:
     else:
         values = [v.item() if isinstance(v, torch.Tensor) and v.numel() == 1 else v for v in values]
     if not values or any(v is None for v in values):
-        return None  # an IterableDataset's sampler yields None for every sample
+        return None, False  # an IterableDataset's sampler yields None for every sample
     if all(isinstance(v, numbers.Integral) and not isinstance(v, bool) for v in values):
         fast = _int_bytes(values)
         if fast is not None:
-            return fast  # else an index beyond int64: typed items below
-    return _ITEMS + b"".join(_item_bytes(v) for v in values)
+            return fast, False  # else an index beyond int64: typed items below
+    return _ITEMS + b"".join(_item_bytes(v) for v in values), _mixed(values)
 
 
 class DataStep:
@@ -114,10 +136,12 @@ class DataStep:
         self.batches = 0
         self._hash: Any = hashlib.blake2b(digest_size=8)
         self._known = True
+        self._mixed = False
         self.fields: dict[str, Any] = {}
 
     def add(self, values: Any, fields: Mapping[str, Any]) -> None:
-        raw = identity_bytes(values)
+        raw, mixed = _identity(values)
+        self._mixed |= mixed
         if raw is None:
             self._known = False
         else:
@@ -130,7 +154,7 @@ class DataStep:
     def record(self) -> dict[str, Any]:
         out: dict[str, Any] = {"batches": self.batches}
         if self.batches and self._known:
-            out["batch_hash"] = HASH_PREFIX + self._hash.hexdigest()
+            out["batch_hash"] = (MIXED_PREFIX if self._mixed else HASH_PREFIX) + self._hash.hexdigest()
         out.update(self.fields)
         return out
 

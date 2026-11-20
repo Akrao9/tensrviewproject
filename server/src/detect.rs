@@ -75,6 +75,8 @@ use system::{System, SystemColumns};
 mod lane_v7_tests;
 #[cfg(test)]
 mod lane_w3_tests;
+#[cfg(test)]
+mod lane_x4_tests;
 
 // The same values as the constants of the same names in evidence.py.
 pub const OVERLOAD_THRESHOLD: f64 = 0.35;

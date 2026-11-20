@@ -151,10 +151,14 @@ def test_c22_finite_logits_of_1e20_are_read_not_called_nonfinite():
 
 
 def test_c22_logits_beyond_the_sums_range_are_not_said_to_hold_nan_or_inf():
-    numbers = _numbers(torch.ones(1, 1), torch.tensor([[3.39e38], [3.39e38]]))  # finite FP32, past BF16's max
-    assert numbers["nonfinite_positions"] == 0 and numbers["positions"] == 0
-    assert numbers["overflow_positions"] == 1
-    assert "NaN" not in numbers["not_read"] and "overflow" in numbers["not_read"]
+    # Finite FP32 logits whose float32 sum overflows; BF16 rounds 3.39e38 to its largest finite
+    # value. Lane X4 (C22, open part): the mean is read, not counted as overflow.
+    numbers = _numbers(torch.ones(1, 1), torch.tensor([[3.39e38], [3.39e38]]))
+    assert numbers["nonfinite_positions"] == 0 and numbers["positions"] == 1
+    assert "overflow_positions" not in numbers and "not_read" not in numbers
+    # Nothing says NaN or Inf: no reason text, and every number read is finite.
+    assert all(numbers[key] < float("inf") and numbers[key] == numbers[key] for key in ("norm", "mean", "log_z", "gap"))
+    assert numbers["mean"] == pytest.approx(3.39e38, rel=1e-6)
 
 
 def test_c22_a_bf16_pass_that_overflows_leaves_the_position_out_as_overflow():
