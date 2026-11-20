@@ -44,6 +44,7 @@ import collections
 import copyreg
 import hashlib
 import numbers
+import re
 import sys
 import threading
 import warnings
@@ -474,6 +475,54 @@ def _model_tensors(value: Mapping[Any, Any]) -> int:
     return tensors
 
 
+# The names a checkpoint gives the entry that holds a model, as whole words of its last dotted
+# part (`model`, `ema_model`, `student_model`, `net`), or `state_dict` anywhere in it
+# (Lightning's `state_dict`, `model_state_dict`).
+_MODEL_WORDS = frozenset(("model", "models", "module", "modules", "net", "network", "ema", "weights"))
+# The names PyTorch's own modules give their parameters and buffers (`Linear`, `Embedding` and
+# the norms: `weight`, `bias`; `BatchNorm`: `running_*`, `num_batches_tracked`;
+# `MultiheadAttention`: `in_proj_*`, `bias_k`, `bias_v`; pruning and weight norm: `*_orig`,
+# `*_mask`, `weight_g`, `weight_v`; a rotary embedding's `inv_freq`). An RNN's are `weight_ih_l0`,
+# `bias_hh_l0`, ...: a `weight_` or `bias_` prefix, or a `_weight` or `_bias` suffix, is one too.
+_PARAMETER_NAMES = frozenset((
+    "weight", "bias", "running_mean", "running_var", "num_batches_tracked", "in_proj_weight", "in_proj_bias",
+    "bias_k", "bias_v", "weight_orig", "weight_mask", "bias_orig", "bias_mask", "weight_g", "weight_v", "inv_freq",
+))
+_WORD_BREAKS = re.compile(r"[^a-z0-9]+")
+
+
+def _names_a_model(name: str) -> bool:
+    return "state_dict" in name or not _MODEL_WORDS.isdisjoint(_WORD_BREAKS.split(name))
+
+
+def _parameter_path(key: Any) -> bool:
+    """A key a module's `state_dict()` writes: a dotted path (`layer.0.weight`, with DDP's
+    `module.` or `torch.compile`'s `_orig_mod.` before it), a module's extra state, or a
+    parameter or buffer of PyTorch's own modules."""
+    if not isinstance(key, str):
+        return False
+    if "." in key.strip("."):
+        return True
+    return _extra_state_key(key) or key in _PARAMETER_NAMES or key.startswith(("weight_", "bias_")) or key.endswith(
+        ("_weight", "_bias"))
+
+
+def _model_state(name: str, value: Mapping[Any, Any]) -> int:
+    """How many tensors `value` holds when it is a model's state dict, else 0 (lane Y6, XC9).
+
+    A mapping of tensors is not a model by its shape alone: a cache of `cached_embedding`
+    tensors has the same shape, and taken for the model it would say a resume restored a
+    model it never held. So it is the model only when its entry's name says so (`name`, the
+    last dotted part of its key, lowercased) or one of its keys is a parameter path. A model
+    whose parameters have none of these names, stored under a key that names no model, is
+    passed over: it is listed under `other`, and a resume from it reads the model as missing.
+    """
+    tensors = _model_tensors(value)
+    if tensors and (_names_a_model(name) or any(_parameter_path(k) for k in value)):
+        return tensors
+    return 0
+
+
 def _classify(key: str, value: Any) -> tuple[str, dict[str, Any]] | None:
     """The component a state-dict entry holds, with its identities; None when not known.
 
@@ -511,7 +560,7 @@ def _classify(key: str, value: Any) -> tuple[str, dict[str, Any]] | None:
             k in value for k in ("_num_yielded", "_sampler_iter_yielded", "samples_seen")
         ):
             return "data", {}
-        tensors = _model_tensors(value)
+        tensors = _model_state(name, value)
         if tensors:
             return "model", {"tensors": tensors, "keys_hash": _keys_hash(value.keys())}
         return None
@@ -527,7 +576,8 @@ def checkpoint_manifest(state: Mapping[str, Any]) -> dict[str, Any]:
 
     Each top-level entry is recognised by its shape: an optimizer's `state` and
     `param_groups`, a scheduler's `last_epoch`, a GradScaler's `scale`, a model's mapping
-    of tensors (with any module's `_extra_state` entries); RNG states and a data position by
+    of tensors (with any module's `_extra_state` entries) when its name or its keys say it is a
+    model's (`_model_state`: a cache of tensors is not); RNG states and a data position by
     the last dotted part of their names (`rng`, `random`;
     `dataloader`, `sampler`, `loops`, ...) or a StatefulDataLoader's keys. A mapping that is
     none of these is looked into once, so `{"training": {"optimizer": ...}}` is found too.
