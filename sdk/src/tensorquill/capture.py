@@ -60,7 +60,7 @@ from .probe import ProbeState, find_head, install_head_hook, install_probe_hooks
 from .sink import JsonlSink, Sink, clear_end_marker, write_end_marker
 from .system import SystemPart, SystemReadings
 from . import manifest as _manifest
-from .tracker import RunInfo, _world_size, read_launch_again, resolve_run, tracker_labels
+from .tracker import LaunchRead, RunInfo, _world_size, resolve_run, tracker_labels
 
 STATS = ("mean", "std", "abs_max", "zero_frac")
 _SEEN = len(STATS)  # last column: 1.0 when the hook ran this step
@@ -125,8 +125,9 @@ class Router:
     reason naming the count, the tokens and the declared `top_k`, since `moe_top_k` tells the
     detectors how large an expert's share can be. Judged from shapes alone, so the same under
     `torch.compile`; not judged when the tokens cannot be read from the router's first argument.
-    A `top_k` above `n_experts` refuses the router on the default integer tensor, as it does on
-    the top-k-of-logits path, with the reason "its top_k is K but it has E experts".
+    A `top_k` above `n_experts` refuses the router on every path (the default integer tensor, a
+    function given as `indices`, a routing map and the top-k of logits), with the reason "its
+    top_k is K but it has E experts".
 
     Expert ids, from `indices` or the default integer tensor, are judged on their values (the
     author's decision on C06): an id below 0 is no assignment (Megatron's -1 for no route), not
@@ -623,6 +624,13 @@ def _router_hook(
             if each is not None:
                 refuse(lambda: _ids_per_token_why("its indices= function returned", chosen, tokens, spec), f"top_k={each}")
                 return
+            if spec.top_k > spec.n_experts:
+                # As on the default integer path (C06): ids that do number `top_k` for each token are
+                # still judged against 1 / top_k by the share detectors, so with more ids a token than
+                # experts they are refused, not counted (L19). From the `Router` alone, after the
+                # count checks above, which name their own reason.
+                refuse(lambda: f"its top_k is {spec.top_k} but it has {spec.n_experts} experts", "top_k")
+                return
         else:
             idx = _first_tensor(output, integer=True)
             if idx is not None:
@@ -661,6 +669,12 @@ def _router_hook(
                 # float is exactly zero are left out: the padding `pad_to_capacity` adds to the map,
                 # and with it a real assignment whose weight is exactly zero (an underflow, say).
                 routing_map, paired = found
+                if spec.top_k > spec.n_experts:
+                    # A map routes a token to each expert at most once, so it cannot hold `top_k`
+                    # assignments a token, and `moe_top_k` would judge its shares against the wrong
+                    # limit (L19, C06's refusal). From the `Router` alone.
+                    refuse(lambda: f"its top_k is {spec.top_k} but it has {spec.n_experts} experts", "top_k")
+                    return
                 for tensor, what in ((routing_map, "its routing map"), (paired, "the float tensor paired with its routing map")):
                     wrong = None if tensor is None else _unusable(tensor, counts.device, what)
                     if wrong is not None:
@@ -1318,16 +1332,22 @@ class Session:
         self.param_names = [name for name, _ in params]
         # Every parameter of the model at `init`, frozen ones included: an optimizer that holds any
         # of them is this model's (`_owns`), so one that holds only frozen parameters still ends
-        # steps (TrainCheck B1, and a model whose every parameter is frozen at `init`). The
-        # parameters recorded are still those trainable at `init` (`_say_new_trainable`).
+        # steps (TrainCheck B1, and a model whose every parameter is frozen at `init`).
         everything = list(model.named_parameters())
         self._model_param_ids = {id(p) for _, p in everything}
+        # The parameters frozen at `init`, recorded from the step on which they are trainable
+        # (C12, `_take_unfrozen`). Weakly held: one the model drops is not kept alive.
+        recorded = {id(p) for p in self._params}
+        self._frozen: list[tuple[str, weakref.ref[torch.Tensor]]] = [
+            (name, weakref.ref(p)) for name, p in everything if id(p) not in recorded
+        ]
+        self._frozen_ids = {id(p) for _, p in everything if id(p) not in recorded}  # kept whole: `_say_new_trainable`
         # The parameters the cross-GPU drift check compares (`_plan_session`).
         replicas = plan.replicas
         self._replica_params = [p for _, p in replicas]
         self.replica_names = [name for name, _ in replicas]
-        # With no trainable parameter at `init`, the model's own device, so the layer statistics of a
-        # model on a GPU are read there rather than left out (`_output_unread`). Not run on a GPU.
+        # With no trainable parameter at `init`, the model's own: one unfrozen later then has its
+        # norms read where it is, not moved to the CPU at every step.
         self.device = _buffers_device(self._params or [p for _, p in everything])
 
         selected = plan.selected
@@ -1421,9 +1441,22 @@ class Session:
         # ranks for this step, kept per step; the launch is added when the record is written.
         self._spread_scope: list[int] | None = None
         self._ring_scope: list[list[int] | None] = []
-        # The launch the records carry: what `init` read, until the writer thread reads it again
-        # before the first record that needs it (`_launch_for_records`, contract 2).
-        self.launch: str | None = run.launch
+        # The launch the records carry (contract 2). Rank 0's own, at once. On a rank other than 0,
+        # what `init` read is provisional: the second read (`LaunchRead`) starts at the end of the
+        # first step, on a thread of its own, and until it returns the records carry null, never
+        # what `init` read (`_launch_for_records`).
+        self.launch: str | None = run.launch if run.rank == 0 or run.launch_source is None else None
+        self._launch_read: LaunchRead | None = None
+        self._launch_parked = False
+        if run.rank != 0 and run.launch_source is not None:
+            # The reader's thread starts here, parked, so the end of the first step only lets it go.
+            # It reads the session's run when it goes, through a weak reference: it keeps no session alive.
+            this = weakref.ref(self)
+            try:
+                self._launch_read = LaunchRead(read_run=lambda: getattr(this(), "run", None))
+                self._launch_parked = True
+            except Exception:  # noqa: BLE001
+                self._launch_read = None
         self._launch_confirmed = False
         self.launch_read_seconds: float | None = None
         self._ring_counts = {
@@ -1771,6 +1804,8 @@ class Session:
                 pass
         if self._stopped:
             return  # only the step count goes on, for the drift check's schedule (`_count_stopped`)
+        if self._leading and self._frozen and (self.updates or self._grads_wanted()):
+            self._take_unfrozen()  # before this step's gradients are read; on steps that read none, nothing to record
         if self._leading and self._probe_owed:
             # Every optimizer of the previous iteration has stepped: its probe runs now.
             self._run_owed_probe()
@@ -2099,6 +2134,8 @@ class Session:
         """
         if self._closed_call("record_grads()"):
             return
+        if self._frozen:
+            self._take_unfrozen()  # called by hand (`auto_step=False`), or by a scaler's update
         n_params = len(self._params)
         if self._grads_recorded:
             self._grad.zero_()
@@ -2568,16 +2605,27 @@ class Session:
         columns) is not recorded and is said once in a warning; what this step recorded before it
         stays as it was. Nothing is broadcast to parameters the table has no row for.
 
-        With a group this is a collective, an `all_gather` on it: every rank of the group must call
-        it on the same step, and it waits for them, as any collective does. It is the only way the
-        session gathers: the scheduled check is each rank's own observation (`replica`), with no
+        With a group this is a collective: every rank of the group must call it on the same step, and
+        it waits for them, as any collective does. It first exchanges one fixed-size row per rank
+        (`distributed._exchange`): how many parameters each compares, its table's device type,
+        whether it can gather it, and its projection setting. Where any rank cannot gather, or the
+        ranks compare different numbers of parameters or are on different device types, no rank
+        gathers and each names every parameter once in a warning with the same reason; otherwise
+        every rank gathers. A rank that compares no parameter, or whose session has stopped, still
+        takes part. It is the only way the session gathers: the scheduled check is each rank's own observation (`replica`), with no
         collective. Where the group's global ranks can be read and the rank knows its launch, the
         record also says what the spread covers (`replica_spread_scope`); a precomputed table has
         no scope.
         """
-        if self._closed or not self._replica_params:
+        if self._closed:
             return
         target = self._replica_group if group_or_spread is None else group_or_spread
+        if not self._replica_params:
+            if target is not None and not isinstance(target, torch.Tensor):
+                # Nothing to compare, but a peer that compares parameters is entering the exchange:
+                # this rank says it compares none there, and every rank skips the gather.
+                self._gather_and_drop(target)
+            return
         if target is None:
             raise ValueError("pass a replication process group or precomputed spread tensor")
         if self._stopped:
@@ -2683,20 +2731,40 @@ class Session:
                 )
         return {"width": width, "device": device.type, "metas": metas, "unread": unread}
 
-    def _launch_for_records(self) -> str | None:
-        """The launch the records carry. On the writer thread only: the first call reads it a
-        second time (`tracker.read_launch_again`: on a rank other than 0, one `check` then `get` on
-        the launch's key, waited for at most `tracker.LAUNCH_READ_SECONDS`, null if it fails) and
-        keeps what it gave, and how long that took (`launch_read_seconds`). Never on the training
-        thread, so a store that is slow or down costs the records a null launch, never a step."""
-        if not self._launch_confirmed:
-            self._launch_confirmed = True
-            began = time.perf_counter()
+    def _start_launch_read(self) -> LaunchRead:
+        """Begin the second read of the launch (`tracker.LaunchRead`), once: at the end of the first
+        step, so this rank has finished a step since `init` (contract 2), and rank 0 of its start has
+        had that long to set its launch. On a rank other than 0 the reader's thread was started at
+        `init`, parked; here it is let go, an `Event.set` (no thread is started on the training
+        thread: starting one there took up to 90 ms under a load average of 31). The store is read on
+        that thread, never on the training thread or the writer's. Rank 0 and a job of one rank have
+        no thread. A run replaced after `init` (tests do it) is read from a thread started here.
+        Never raises: a read that cannot start leaves the launch null."""
+        read = self._launch_read
+        if read is None:
             try:
-                self.launch = read_launch_again(self.run)
+                read = LaunchRead(self.run)
             except Exception:  # noqa: BLE001
-                self.launch = None
-            self.launch_read_seconds = time.perf_counter() - began
+                read = LaunchRead(None)
+            self._launch_read = read
+        elif self._launch_parked:
+            self._launch_parked = False
+            read.go()
+        return read
+
+    def _launch_for_records(self) -> str | None:
+        """The launch the records carry, on the writer thread, which never waits for it: what the
+        second read gave once it has returned (kept, with how long it took, `launch_read_seconds`),
+        and null while it is still out, so a record never carries the launch `init` read where the
+        second read would have replaced it. A store that hangs leaves every record's launch null; one
+        that fails, null; one that answers late, null until it does and its answer after."""
+        if not self._launch_confirmed:
+            done, launch = self._start_launch_read().result()
+            if not done:
+                return None
+            self._launch_confirmed = True
+            self.launch = launch
+            self.launch_read_seconds = self._launch_read.seconds
             self._drop_launch_source()
         return self.launch
 
@@ -2804,6 +2872,8 @@ class Session:
         if self._stopped:
             self._count_stopped(step)
             return
+        if self._launch_read is None or self._launch_parked:
+            self._start_launch_read()  # the end of the first step: the launch's second read (contract 2)
         current = self._next_step if step is None else step
         if self._probe_owed:
             self._run_owed_probe()  # the previous step's, before this one becomes the newest
@@ -3013,11 +3083,93 @@ class Session:
         except Exception as error:  # noqa: BLE001
             self._stop(error, f"moving a block of steps off the device raised {_short(error)}", reason="flush_error")
 
+    def _take_unfrozen(self) -> None:
+        """Start recording the parameters frozen at `init` that are trainable now (C12): from this
+        step on, each has a gradient norm, a weight check and an update size, under its own name;
+        the records before do not name it. The ring is written first (`_flush`), so every step in a
+        block has the same parameters; the new ones go at the end of the buffers, so what is kept
+        by position (the index cache, the parameters a weight check did not read exactly) stays
+        right, and their first weight check compares with nothing. Said once in a warning.
+
+        On the host, no read of a tensor: one pass over the parameters still frozen, on the lead's
+        steps that read gradients or update sizes and in `record_grads`. Measured at 0.49 µs a
+        parameter on a CPU under a load average of 157, so about 0.5 ms a step for 1,000 frozen
+        tensors there; unloaded it was not measured. Nothing for a model with none frozen. The drift
+        check across GPUs keeps the parameters chosen at `init`: each rank's observation names the
+        same parameters on every step, and an explicit gather exchanges their count first. Not in the
+        router-only mode, which records no parameter."""
+        if not (self.grad_every or self.weight_every or self.updates) or self._stopped:
+            return
+        try:
+            if not any((param := ref()) is None or param.requires_grad for _, ref in self._frozen):
+                return  # the usual step: nothing unfrozen
+            recorded = set(self.param_names)
+            new: list[tuple[str, torch.Tensor]] = []
+            still: list[tuple[str, weakref.ref[torch.Tensor]]] = []
+            for name, ref in self._frozen:
+                param = ref()
+                if param is None:
+                    continue  # dropped by the model
+                if param.requires_grad and name not in recorded:
+                    new.append((name, param))
+                else:
+                    still.append((name, ref))
+        except Exception:  # noqa: BLE001
+            return
+        self._frozen = still
+        if not new:
+            return
+        self._flush(hold_newest=False)
+        if self._stopped:
+            return
+        try:
+            self._add_params(new)
+        except Exception as error:  # noqa: BLE001
+            self._stop(error, f"adding the parameters unfrozen after init raised {_short(error)}", reason="flush_error")
+            return
+        self._new_trainable_said.update(name for name, _ in new)
+        shown = ", ".join(repr(name) for name, _ in new[:5]) + (f" and {len(new) - 5} more" if len(new) > 5 else "")
+        _warn(
+            f"TensorQuill is recording the parameter{'s' if len(new) != 1 else ''} {shown} from step "
+            f"{self._next_step}: trainable now, but frozen when the session started (unfrozen after "
+            "tensorquill.init). The records before that step do not name it, and the drift check across "
+            "GPUs compares only the parameters trainable at init.",
+            stacklevel=4,
+        )
+
+    @torch.no_grad()
+    def _add_params(self, new: list[tuple[str, torch.Tensor]]) -> None:
+        """Append `new` to the recorded parameters and widen the buffers kept per parameter, with the
+        ring empty (`_take_unfrozen`). The lists are replaced, not changed in place: a block already
+        queued keeps the names it was made with (`_decode`)."""
+        k = len(new)
+        self._params = self._params + [p for _, p in new]
+        self.param_names = self.param_names + [name for name, _ in new]
+        self._param_ids = {id(p) for p in self._params}
+        self._param_index = {id(p): index for index, p in enumerate(self._params)}
+        self._grad = torch.cat([self._grad, self._grad.new_zeros(k, self._grad.shape[1])])
+        self._ring_grad = torch.cat(
+            [self._ring_grad, self._ring_grad.new_zeros(self._ring_grad.shape[0], k, self._ring_grad.shape[2])], dim=1
+        )
+        if self.updates:
+            self._update = torch.cat([self._update, self._update.new_zeros(k, self._update.shape[1])])
+            self._ring_update = torch.cat(
+                [self._ring_update, self._ring_update.new_zeros(self._ring_update.shape[0], k, self._ring_update.shape[2])],
+                dim=1,
+            )
+        # No earlier norm to compare with: the first check of a new parameter is "not known".
+        if self._prev_weight is not None:
+            self._prev_weight = torch.cat([self._prev_weight, self._prev_weight.new_full((k,), math.nan)])
+        if self._weights_before is not None:
+            self._weights_before = torch.cat([self._weights_before, self._weights_before.new_full((k,), math.nan)])
+        self._owned = weakref.WeakKeyDictionary()  # what each optimizer holds of the recorded ones, judged again
+
     def _say_new_trainable(self) -> None:
-        """Name once, in a warning, each parameter of the model that is trainable now and was not when
-        the session started (unfrozen, added or replaced since `init`). The parameters a session
-        records are fixed at `init`, as are its buffers, so such a parameter has no gradient norm and
-        no weight check. At a flush, at most once per `WEIGHT_EVERY` steps, and at close; on the host:
+        """Name once, in a warning, each parameter of the model that is trainable now and was not part
+        of it when the session started (added or replaced since `init`): such a parameter has no
+        gradient norm and no weight check. One frozen at `init` and unfrozen later is recorded from
+        its first trainable step instead (`_take_unfrozen`), and said there. At a flush, at most once
+        per `WEIGHT_EVERY` steps, and at close; on the host:
         one pass over the model's parameters, no read of a tensor (about 0.45 ms for 600 parameter
         tensors on a CPU, so under 10 µs a step). Not in the router-only mode, which records no
         parameter."""
@@ -3029,7 +3181,8 @@ class Session:
         try:
             new = [
                 name for name, p in self._model.named_parameters()
-                if p.requires_grad and id(p) not in self._param_ids and name not in self._new_trainable_said
+                if p.requires_grad and id(p) not in self._param_ids and id(p) not in self._frozen_ids
+                and name not in self._new_trainable_said
             ]
         except Exception:  # noqa: BLE001
             return
@@ -3039,8 +3192,8 @@ class Session:
         shown = ", ".join(repr(name) for name in new[:5]) + (f" and {len(new) - 5} more" if len(new) > 5 else "")
         _warn(
             f"TensorQuill is not recording the parameter{'s' if len(new) != 1 else ''} {shown}: trainable now, "
-            "but not when the session started (unfrozen, added or replaced after tensorquill.init). A session "
-            "records the parameters that were trainable at init; to record these, close it and call "
+            "but not part of the model when the session started (added or replaced after tensorquill.init). A "
+            "session records the parameters the model had at init; to record these, close it and call "
             "tensorquill.init again.",
             stacklevel=4,
         )
@@ -3135,6 +3288,7 @@ class Session:
             steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
             spread_seen, scalars, probes, stamps, amps, data_rows, checkpoints, waits, system,
             refused, announce, updates, update_seen, update_why, grad_why, obs, obs_sig, obs_seen, scopes,
+            self.param_names,
         )
         if hold_newest:
             first = self._hold_newest(dict(zip(_BLOCK_FIELDS, block)), act_size=self._act.numel() if has_act else 0,
@@ -3185,6 +3339,7 @@ class Session:
             first[key], held[key] = (None, block[key]) if last else (block[key], {})
         first["system"], held["system"] = None, block["system"]
         first["refused"] = held["refused"] = block["refused"]
+        first["param_names"] = held["param_names"] = block["param_names"]
         self._held = {"block": held, "act_size": act_size, "dirty": set()}
         # The ring keeps the newest step as its only row, at row 0: its Python entries as they were
         # (logged tensors still on the device), and its update row on the device for a follower's.
@@ -3331,8 +3486,9 @@ class Session:
         self._next_step = current + 1
 
     def _gather_and_drop(self, group: Any) -> None:
-        """A stopped rank's explicit `record_replica_spread(group)`: the other ranks are entering
-        that collective too, so this one enters it and drops the result."""
+        """An explicit `record_replica_spread(group)` on a rank that records nothing (a stopped
+        session, or one that compares no parameter): the other ranks are entering the exchange and
+        maybe the gather too, so this one takes part and drops the result."""
         try:
             spread_buf, _ = self._ensure_spread_buffers()
             _spread_and_unread(self._replica_params, group, projection=self._replica_projection,
@@ -3482,6 +3638,9 @@ class Session:
         # the process group: one that the job destroys is then not kept alive by a session object
         # the caller still holds. So of the store, once the writer can no longer read the launch.
         self._replica_group = None
+        if self._launch_parked and self._launch_read is not None:
+            self._launch_parked = False
+            self._launch_read.cancel()  # no step ended: the parked reader ends without reading
         if not self._worker.is_alive():
             self._drop_launch_source()
         if self._stopped or getattr(self._sink, "path", None) is None:
@@ -3563,8 +3722,11 @@ class Session:
         obs_sig: torch.Tensor | None = None,
         obs_seen: list[Any] | None = None,
         scopes: list[list[int] | None] | None = None,
+        param_names: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
+        # The parameters the block was made with: `_take_unfrozen` may add some after it was queued.
+        names = self.param_names if param_names is None else param_names
+        n, n_layers, n_params = len(steps), len(self.layer_names), len(names)
         split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
         act = (
             floats[:split].reshape(n, n_layers, _SEEN + 1).tolist()
@@ -3582,8 +3744,8 @@ class Session:
         update_rows = updates.reshape(n, n_params, 2).tolist() if updates is not None and n_params > 0 else None
         obs_rows = obs.reshape(n, len(self.replica_names), FINGERPRINT_WIDTH + 1).tolist() if obs is not None else None
         sig_rows = obs_sig.reshape(n, len(self.replica_names)).tolist() if obs_sig is not None else None
-        # The launch, read a second time here on the writer thread before the first record that
-        # carries one (contract 2); never on the training thread.
+        # The launch, as the second read gave it once it has returned, else null (contract 2): the
+        # writer never waits for the store.
         needs_launch = (obs_rows is not None and any(obs_seen or ())) or any(
             scope is not None for scope in (scopes or ())
         )
@@ -3605,7 +3767,7 @@ class Session:
         records = []
         for i, step in enumerate(steps):
             grad_norms = (
-                {name: norm for name, (norm, seen, _, _) in zip(self.param_names, grad[i]) if seen}
+                {name: norm for name, (norm, seen, _, _) in zip(names, grad[i]) if seen}
                 if grad is not None and grad_seen[i]
                 else {}
             )
@@ -3630,7 +3792,7 @@ class Session:
             }
             if grad is not None and weight_seen[i]:
                 record["weight_norms"] = {
-                    name: row[2] for name, row in zip(self.param_names, grad[i])
+                    name: row[2] for name, row in zip(names, grad[i])
                 }
                 if isinstance(weight_seen[i], dict):
                     record["optimizer_ownership"] = weight_seen[i]["ownership"]
@@ -3641,14 +3803,14 @@ class Session:
                 # had an equal norm. What a name in the list asserts: `weights` in `init`.
                 if any(row[3] >= 0 for row in grad[i]):
                     record["weights_unchanged"] = [
-                        name for name, row in zip(self.param_names, grad[i]) if row[3] > 0
+                        name for name, row in zip(names, grad[i]) if row[3] > 0
                     ]
             if clips is not None and clip_seen[i]:
                 record["clip_grad_norm"] = math.sqrt(float(clips[i]))
             if update_rows is not None and update_seen and update_seen[i]:
                 # The RMS of the optimizer's update to each parameter it stepped (weight decay
                 # left out): the L2 norm of the update over the square root of its size.
-                record["update_rms"] = {name: rms for name, (rms, seen) in zip(self.param_names, update_rows[i]) if seen}
+                record["update_rms"] = {name: rms for name, (rms, seen) in zip(names, update_rows[i]) if seen}
             if lrs[i] is not None:
                 record["lr"] = lrs[i]
             if amps is not None and amps[i]:
@@ -3721,7 +3883,7 @@ _BLOCK_FIELDS = (
     "steps", "lrs", "floats", "counts", "spreads", "clips", "clip_seen", "grad_seen", "weight_seen",
     "spread_seen", "scalars", "probes", "stamps", "amps", "data_rows", "checkpoints", "waits", "system",
     "refused", "announce", "updates", "update_seen", "update_why", "grad_why", "obs", "obs_sig", "obs_seen",
-    "scopes",
+    "scopes", "param_names",
 )
 
 
@@ -4026,9 +4188,11 @@ def init(
             list does not say which. With no parameter compared the record has no
             `weights_unchanged`; an empty list means some were compared and none had an
             equal norm. Gradient norms and weight checks cover the
-            parameters that are trainable (`requires_grad`) when `init` runs: one unfrozen
-            later is named once in a warning and not recorded. An optimizer that holds any of
-            the model's parameters, frozen ones included, ends steps.
+            parameters that are trainable (`requires_grad`) when `init` runs, and one frozen
+            then from the first step on which it is trainable (said once in a warning; the
+            records before do not name it). One added to the model or replaced after `init`
+            is named once in a warning and not recorded. An optimizer that holds any of the
+            model's parameters, frozen ones included, ends steps.
         auto_step: count optimizer steps with PyTorch's global optimizer hooks. With a
             `torch.amp.GradScaler`, pass it as `scaler=`: the step then ends at
             `scaler.update()`, so a step the scaler skipped is counted too. Pass False and call

@@ -566,7 +566,11 @@ def exchange_7(monkeypatch):
 def test_rank_0_sets_a_nonce_before_the_run_ids_entry_which_keeps_its_two_items(exchange_7):
     store = Store()
     info = T._shared_run(_dist(store), 0, "my-run")
-    assert [(what, key) for what, key, _ in store.calls] == [("set", LAUNCH_KEY), ("set", RUN_KEY)]
+    # Rewritten by lane AA1 (L25): rank 0 first sets the mark that says its entries are also scoped
+    # by generation where one is trusted (none here), then the launch before the run ID, as before.
+    assert [(what, key) for what, key, _ in store.calls] == [
+        ("set", "tensorquill/scoped/7"), ("set", LAUNCH_KEY), ("set", RUN_KEY)
+    ]
     assert HEX32.fullmatch(info.launch) and store.entries[LAUNCH_KEY] == info.launch.encode()
     assert json.loads(store.entries[RUN_KEY]) == ["my-run", "explicit"]
     assert info.launch_source is None and T.read_launch_again(info) == info.launch
@@ -656,7 +660,11 @@ def test_the_session_reads_the_launch_again_on_its_writer_thread_before_the_firs
     store = Store({LAUNCH_KEY: "c" * 32})
     session.run = dataclasses.replace(session.run, rank=1, launch="a" * 32, launch_source=(store, LAUNCH_KEY))
     session.launch = "a" * 32
-    _train(session, model, 6)
+    # Rewritten by lane AA1: the read now starts at the end of the first step on a thread of its own
+    # and the writer never waits for it, so the test waits for it here before the first block.
+    _train(session, model, 1)
+    assert session._launch_read.done.wait(5)
+    _train(session, model, 5)
     session.close()
     assert [r["replica"]["launch"] for r in sink.records if "replica" in r] == ["c" * 32] * 3
     assert [(w, k) for w, k, _ in store.calls] == [("check", LAUNCH_KEY), ("get", LAUNCH_KEY)]  # once
@@ -728,10 +736,14 @@ else:
 steps = 12 if rank == 1 else 4
 began = time.monotonic()
 try:
-    for _ in range(steps):
+    for i in range(steps):
         opt.zero_grad()
         model(torch.ones(2, 4)).sum().backward()
         opt.step()
+        if i == 0 and getattr(session, "_launch_read", None) is not None:
+            # Lane AA1: the second read runs on its own thread from the end of the first step, and
+            # records carry null until it returns; wait for it so every observation has the launch.
+            session._launch_read.done.wait(10)
     found["seconds"] = time.monotonic() - began
     session.close()
 except BaseException as error:
