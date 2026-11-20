@@ -9,6 +9,7 @@ use tensorquill_server::detect::Thresholds;
 use tensorquill_server::ingest::{Ingest, IngestConfig, DEFAULT_FLUSH_STEPS, DEFAULT_QUOTA_BYTES};
 use tensorquill_server::server::{check_bind, serve, Tls};
 use tensorquill_server::storage::{Error, Storage, StoreOptions};
+use tensorquill_server::watchdog::check_silent_factor;
 use tokio::net::TcpListener;
 
 /// The one number the Python SDK checks before it runs this binary (`tensorquill-server protocol`).
@@ -73,8 +74,9 @@ struct Args {
     /// the default is not calibrated. A rank whose heartbeats show it stepping is not limited by this.
     #[arg(long, default_value_t = 1800.0, value_parser = seconds)]
     start_seconds: f64,
-    /// How many times a rank's usual time between batches it may stay quiet before it is silent.
-    #[arg(long, default_value_t = 5.0)]
+    /// How many times a rank's usual time between batches it may stay quiet before it is silent:
+    /// 0 for --silent-seconds alone, or a finite number above 1.
+    #[arg(long, default_value_t = 5.0, value_parser = factor)]
     silent_factor: f64,
     /// Look at each run's progress this often and rewrite runs/<run_id>/watchdog.json when its verdict
     /// changed, and every third look while the run is unfinished; 0 turns the file off.
@@ -142,6 +144,13 @@ fn seconds(text: &str) -> Result<f64, String> {
         .parse()
         .map_err(|_| format!("`{text}` is not a number of seconds"))?;
     duration(value).map(|_| value)
+}
+
+/// A silence factor the watchdog can use (`watchdog::check_silent_factor`), refused at startup with
+/// the flag's name otherwise.
+fn factor(text: &str) -> Result<f64, String> {
+    let value: f64 = text.trim().parse().map_err(|_| format!("`{text}` is not a number"))?;
+    check_silent_factor(value)
 }
 
 /// A number of hours that is a duration in seconds, as `seconds`.
@@ -343,5 +352,15 @@ mod tests {
         assert!(flag("--watchdog-seconds", 1e19 * 3.0)
             .unwrap_err()
             .starts_with("--watchdog-seconds"));
+    }
+
+    #[test]
+    fn a_silent_factor_is_zero_or_a_finite_number_above_one() {
+        for good in ["0", "-0", "1.0001", "5", "1e300"] {
+            assert!(factor(good).is_ok(), "{good}");
+        }
+        for bad in ["NaN", "inf", "-inf", "1e400", "-1", "-0.5", "0.5", "1", "five", ""] {
+            assert!(factor(bad).is_err(), "{bad}");
+        }
     }
 }

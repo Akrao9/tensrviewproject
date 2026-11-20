@@ -3118,3 +3118,215 @@ async fn w2_a_new_attempt_whose_rows_beat_its_first_heartbeat_owns_the_rank_with
         "{entry}"
     );
 }
+
+// --- Lane X6 (Nov 19, 2026): the server's watchdog and ingest ----------------------------------
+
+/// `attempt_schema()` with every key column nullable, as a sender other than the SDK may send it.
+fn nullable_key_schema() -> Arc<Schema> {
+    let fields: Vec<Field> = attempt_schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone().with_nullable(true))
+        .collect();
+    Arc::new(Schema::new(fields))
+}
+
+/// Rows of rank 0 in `nullable_key_schema()`: `(run_id, rank, attempt, step)`, any of them null.
+#[allow(clippy::type_complexity)]
+fn nullable_key_batch(rows: &[(Option<&str>, Option<i32>, Option<i64>, Option<i64>)]) -> RecordBatch {
+    let n = rows.len();
+    RecordBatch::try_new(
+        nullable_key_schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1; n])),
+            Arc::new(StringArray::from(rows.iter().map(|row| row.0).collect::<Vec<_>>())),
+            Arc::new(Int32Array::from(rows.iter().map(|row| row.1).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(rows.iter().map(|row| row.2).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(rows.iter().map(|row| row.3).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(vec![0.5; n])),
+            Arc::new(StringArray::from(vec!["{}"; n])),
+        ],
+    )
+    .unwrap()
+}
+
+/// RS10, live half. A row whose run, rank, step or attempt is null is dropped and counted by the
+/// key, and the other rows of its batch are stored and acknowledged: the stream goes on. Until
+/// Nov 19, 2026 the whole batch was refused with `INVALID_ARGUMENT`, which ended the stream, and
+/// the sender, which sends the same rows again from its offset, could store nothing more for the
+/// rank. A column that is missing or of another type is still refused: no row of it can be read.
+#[tokio::test]
+async fn a_row_with_a_null_key_is_dropped_and_counted_and_the_rest_of_its_batch_is_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        flush_steps: 1,
+        ..manual()
+    };
+    let server = start(dir.path(), config, None).await;
+    let mut put = open_with(&server.address, RUN, 0, None, nullable_key_schema()).await;
+    let good = |step: i64| (Some(RUN), Some(0), Some(1), Some(step));
+    put.send(
+        nullable_key_batch(&[
+            good(0),
+            good(1),
+            (Some(RUN), Some(0), Some(1), None), // no step
+            good(3),
+            (None, Some(0), Some(1), Some(4)), // no run
+            good(5),
+            (Some(RUN), None, Some(1), Some(6)), // no rank
+            (Some(RUN), Some(0), None, Some(7)), // no attempt
+            (None, Some(0), Some(1), None),      // no run and no step: counted once, by the run
+            good(9),
+        ]),
+        100,
+    )
+    .await;
+    assert_eq!(put.ack().await, Ok(100), "the batch was refused");
+    // A batch whose every row is dropped is acknowledged, so its sender does not send it forever.
+    put.send(nullable_key_batch(&[(Some(RUN), Some(0), Some(1), None)]), 200)
+        .await;
+    assert_eq!(put.ack().await, Ok(200));
+    // The stream goes on.
+    put.send(nullable_key_batch(&[good(10), good(11)]), 300).await;
+    assert_eq!(put.ack().await, Ok(300));
+    put.finish().await;
+    assert_eq!(stored_steps(dir.path())[&0], vec![0, 1, 3, 5, 9, 10, 11]);
+    assert_eq!(
+        server.ingest.dropped_rows(),
+        BTreeMap::from([
+            ("attempt".to_string(), 1),
+            ("rank".to_string(), 1),
+            ("run_id".to_string(), 2),
+            ("step".to_string(), 2),
+        ])
+    );
+    // A key column of another type is refused, as before, naming the column.
+    let mut put = open_with(&server.address, RUN, 0, None, put_schema_of_mistyped_attempt()).await;
+    let mistyped = RecordBatch::try_new(
+        put_schema_of_mistyped_attempt(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec![RUN])),
+            Arc::new(Int32Array::from(vec![0])),
+            Arc::new(StringArray::from(vec!["1"])),
+            Arc::new(Int64Array::from(vec![20])),
+        ],
+    )
+    .unwrap();
+    put.send(mistyped, 400).await;
+    assert_eq!(put.ack().await, Err(Code::InvalidArgument));
+    assert_eq!(stored_steps(dir.path())[&0], vec![0, 1, 3, 5, 9, 10, 11]);
+}
+
+/// The key columns, with `attempt` as text.
+fn put_schema_of_mistyped_attempt() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("schema_version", DataType::Int32, false),
+        Field::new("run_id", DataType::Utf8, false),
+        Field::new("rank", DataType::Int32, false),
+        Field::new("attempt", DataType::Utf8, false),
+        Field::new("step", DataType::Int64, false),
+    ]))
+}
+
+/// Starts the binary with `flags`. `None` when it started (it printed the line it listens on):
+/// it is then killed. Otherwise its exit code and stderr.
+#[cfg(unix)]
+fn exit_of_the_binary_with(flags: &[&str]) -> Option<(Option<i32>, String)> {
+    use std::io::{BufRead, BufReader, Read};
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
+        .args(["--listen", "127.0.0.1:0", "--watchdog-seconds", "0"])
+        .args(flags)
+        .arg("--store")
+        .arg(dir.path())
+        .env_remove("TENSORQUILL_TOKEN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    if line.starts_with("tensorquill-server listening on") {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    Some((status.code(), stderr))
+}
+
+/// RS15's open part. A `--silent-factor` the watchdog cannot use is refused at startup, naming the
+/// flag. Until Nov 19, 2026 the server started with any number: NaN or a negative one left the
+/// floor alone, as 0 does, and `inf` made every rank with a cadence never silent, never critical.
+/// 0 (the floor alone, which the SDK's tests use) and any finite number above 1 start.
+#[cfg(unix)]
+#[test]
+fn a_silent_factor_the_watchdog_cannot_use_is_refused_at_startup() {
+    for bad in ["NaN", "inf", "-inf", "-1", "-0.5", "0.5", "1", "1e400"] {
+        let flag = format!("--silent-factor={bad}");
+        let Some((code, stderr)) = exit_of_the_binary_with(&[&flag]) else {
+            panic!("{flag}: the server started");
+        };
+        assert_eq!(code, Some(2), "{flag}: {stderr}");
+        assert!(
+            stderr.contains("--silent-factor") && !stderr.contains("panicked"),
+            "{flag}: {stderr}"
+        );
+    }
+    for good in ["0", "1.5", "5", "1000"] {
+        let flag = format!("--silent-factor={good}");
+        assert_eq!(
+            exit_of_the_binary_with(&[&flag]),
+            None,
+            "{flag}: the server did not start"
+        );
+    }
+}
+
+/// RUST-16's open part. A rank whose rebuild failed is rebuilt once its wait has passed and the
+/// store reads again, though it sends nothing more: the timed pass tries it. Until Nov 19, 2026
+/// only a later part of the rank tried again, so a rank that sent nothing more (a job that ended,
+/// or one that hung right then) stayed without a report and unjudged for good.
+#[tokio::test]
+async fn a_rank_whose_rebuild_failed_is_rebuilt_without_a_later_part() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let config = IngestConfig {
+        flush_steps: 10,
+        replay_backoff: Duration::from_millis(100),
+        ..manual()
+    };
+    let server = start_on(store.clone(), config, None).await;
+    let mut put = open_with(&server.address, RUN, 0, None, data_attempt_schema()).await;
+    put.send(data_attempt_batch(1, 0..10), 1).await;
+    assert_eq!(put.ack().await, Ok(1));
+    status_until(&server, &store, "rank 0 judged", judged).await;
+    store.knobs.fail_gets.store(true, Ordering::SeqCst);
+    // A new attempt needs a rebuild from the store, which cannot be read.
+    put.send(data_attempt_batch(2, 0..10), 2).await;
+    assert_eq!(put.ack().await, Ok(2));
+    status_until(&server, &store, "rank 0 not judged", |status| !judged(status)).await;
+    store.knobs.fail_gets.store(false, Ordering::SeqCst);
+    // Nothing more is sent. The flusher's pass, about once a second here, tries the rebuild again.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = written_status(&server, &store).await;
+        if judged(&status) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never judged again without a later part: {}",
+            status["run_state"]
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let report = json_in(&store, &format!("runs/{RUN}/rank=0/incidents.json")).await;
+    assert_eq!(report["attempt"], serde_json::json!(2), "{report}");
+    put.finish().await;
+}

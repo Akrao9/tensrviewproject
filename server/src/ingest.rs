@@ -15,14 +15,17 @@
 //! `PutResult.app_metadata = {"end_byte_offset": N}`: everything up to byte N of the
 //! sender's file is durable. Buffered Arrow bytes across all streams are capped; a batch
 //! that does not fit is refused with `RESOURCE_EXHAUSTED` and the sender retries later.
+//! A row whose run, rank, step, attempt or schema version is null cannot be stored: it is dropped
+//! and counted, with a line on stderr, and the rest of its batch is kept and acknowledged (RS10).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, BooleanBuilder, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, BooleanArray, BooleanBuilder, Int32Array, Int64Array, StringArray};
 use arrow::compute::filter_record_batch;
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
 use arrow_flight::error::FlightError;
@@ -133,8 +136,9 @@ pub struct IngestConfig {
     /// rank in the run state; after it, the rank is unknown until the report catches up. As
     /// Python's watchers wait `report_grace` (decided Nov 19, 2026).
     pub report_grace: Duration,
-    /// After a rebuild of a rank's detectors from the store fails, the wait before the next part
-    /// may try again; it doubles with each failure in a row (see `Ingest::detect`).
+    /// After a rebuild of a rank's detectors from the store fails, the wait before it is tried
+    /// again, at the rank's next part or by the timed flush, whichever comes first; it doubles with
+    /// each failure in a row (see `Ingest::detect`).
     pub replay_backoff: Duration,
     /// A run whose status has read finished or abandoned, and been written so, for this long is
     /// let go of: nothing of it is held in memory (see `Ingest::evict_settled`).
@@ -284,6 +288,16 @@ struct RankBuffer {
     sealed: bool,
 }
 
+impl RankBuffer {
+    /// A rebuild of the rank's detectors failed and its wait has passed: the next try is due.
+    fn rebuild_due(&self, now: Instant) -> bool {
+        self.detectors.is_none()
+            && self.replay_failures > 0
+            && !self.detect_off
+            && self.replay_after.is_none_or(|after| now >= after)
+    }
+}
+
 /// The newest part stored for a rank and since when its report has been behind it.
 #[derive(Clone, Copy)]
 struct Stored {
@@ -334,6 +348,9 @@ pub struct Ingest {
     /// Streams that ended in an error, and the lines written about them (RUST-18).
     stream_errors: std::sync::atomic::AtomicU64,
     error_log: Mutex<ErrorLog>,
+    /// Rows dropped for a null key, by the key, and the lines written about them (RS10).
+    dropped_rows: Mutex<BTreeMap<&'static str, u64>>,
+    dropped_log: Mutex<ErrorLog>,
     /// Runs whose status has read finished or abandoned, and been written so (or, with the file
     /// off, has read so), since when: let go of after `evict_after` (see `evict_settled`).
     settled: Mutex<HashMap<String, Instant>>,
@@ -367,6 +384,8 @@ impl Ingest {
             replays: tokio::sync::Semaphore::new(REPLAY_CONCURRENCY),
             stream_errors: std::sync::atomic::AtomicU64::new(0),
             error_log: Mutex::new(ErrorLog::default()),
+            dropped_rows: Mutex::new(BTreeMap::new()),
+            dropped_log: Mutex::new(ErrorLog::default()),
             settled: Mutex::new(HashMap::new()),
             order_locks: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
@@ -376,6 +395,48 @@ impl Ingest {
             stopping: tokio::sync::watch::Sender::new(false),
             buffers: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Rows dropped since the server started because a key of theirs was null, by the key
+    /// (`run_id`, `rank`, `step`, `attempt`, `schema_version`), for the first null key of each row.
+    pub fn dropped_rows(&self) -> BTreeMap<String, u64> {
+        self.dropped_rows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, rows)| (key.to_string(), *rows))
+            .collect()
+    }
+
+    /// Rows of `key`'s batch were dropped for a null key (RS10): counted, and written to stderr at
+    /// most once per `STREAM_ERROR_LOG_INTERVAL` with the run, rank, the keys and how many rows,
+    /// never a value the sender sent.
+    fn rows_dropped(&self, key: &Key, dropped: &[(&'static str, u64)]) {
+        let totals = {
+            let mut totals = self.dropped_rows.lock().unwrap();
+            for (column, rows) in dropped {
+                *totals.entry(column).or_default() += rows;
+            }
+            totals.values().sum::<u64>()
+        };
+        let Some(held) = self.dropped_log.lock().unwrap().due(Instant::now()) else {
+            return;
+        };
+        let which: Vec<String> = dropped
+            .iter()
+            .map(|(column, rows)| format!("{rows} with a null {column}"))
+            .collect();
+        let held = if held > 0 {
+            format!("; {held} more batches with such rows since the last line")
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "tensorquill-server: {} rank {}: dropped rows that cannot be stored: {} ({totals} such rows since the server started{held})",
+            key.0,
+            key.1,
+            which.join(", ")
+        );
     }
 
     /// Streams that ended in an error since the server started.
@@ -463,6 +524,8 @@ impl Ingest {
         sender: Option<i64>,
         ack: &AckSender,
     ) -> Result<(), Status> {
+        // Rows with a null key are dropped before anything of the batch is placed or kept (RS10).
+        let (batch, dropped) = drop_rows_with_null_keys(batch)?;
         let pieces = split_by_attempt(batch)?;
         // Every attempt of the batch has its place in the store's order before any row of it is
         // taken (contract 1): a batch that cannot have it is refused, and its sender sends it again.
@@ -487,6 +550,11 @@ impl Ingest {
                     superseded += rows as u64;
                 }
             }
+        }
+        // Counted once the rest of the batch is taken: a batch refused before (the store could not
+        // be read) is sent again, and its rows would be counted twice.
+        if !dropped.is_empty() {
+            self.rows_dropped(key, &dropped);
         }
         let now = Instant::now();
         self.watchdog.superseded(key, superseded, now);
@@ -652,7 +720,8 @@ impl Ingest {
         if !appended {
             // A rebuild that failed is not tried again at every part, each a read of the whole
             // rank, but after a wait that doubles with each failure in a row (RUST-16; until
-            // Nov 19, 2026 every part tried). Meanwhile the rank has no report.
+            // Nov 19, 2026 every part tried). Meanwhile the rank has no report. Once the wait has
+            // passed, the timed flush tries it with no new part (`flush_due`, `stored` empty).
             if buffer.replay_after.is_some_and(|after| Instant::now() < after) {
                 self.forget_report(key);
                 return;
@@ -685,7 +754,7 @@ impl Ingest {
                     let wait = replay_wait(self.config.replay_backoff, buffer.replay_failures);
                     buffer.replay_after = Instant::now().checked_add(wait);
                     eprintln!(
-                        "tensorquill-server: detectors for {} rank {}: {error} (tried again after {:.0} s, at a later part)",
+                        "tensorquill-server: detectors for {} rank {}: {error} (tried again in {:.0} s)",
                         key.0,
                         key.1,
                         wait.as_secs_f64()
@@ -796,6 +865,12 @@ impl Ingest {
                     if let Err(status) = self.flush(&key, &mut buffer).await {
                         eprintln!("tensorquill-server: {}", status.message());
                     }
+                }
+                // A rank whose rebuild failed is tried again once its wait has passed, whether or
+                // not it sends another part (RUST-16's open part; until Nov 19, 2026 only a later part
+                // tried, and a rank that sent nothing more stayed without a report for good).
+                if self.config.detect && buffer.rebuild_due(Instant::now()) {
+                    self.detect(&key, &mut buffer, &[]).await;
                 }
             })
             .await;
@@ -1443,6 +1518,64 @@ fn parse_descriptor(descriptor: &FlightDescriptor) -> Result<Key, Status> {
         ));
     }
     Ok((run_id.clone(), rank))
+}
+
+/// Rows dropped from a batch, by the key column that was null.
+type Dropped = Vec<(&'static str, u64)>;
+
+/// The key columns of a row and the type each must have. `attempt` may be absent (a sender from
+/// before attempts: attempt 0); every other key column must be there.
+const KEY_COLUMNS: [(&str, DataType); 5] = [
+    ("run_id", DataType::Utf8),
+    ("rank", DataType::Int32),
+    ("step", DataType::Int64),
+    ("attempt", DataType::Int64),
+    ("schema_version", DataType::Int32),
+];
+
+/// Drops the rows whose run, rank, step, attempt or schema version is null, and says how many,
+/// by the first null key of each row in that order (RS10). These rows cannot be stored or placed,
+/// and the rest of the batch can: until Nov 19, 2026 one such row refused the whole batch, which
+/// ended the stream, and its sender, which sends from its offset again, stored nothing more for the
+/// rank. A key column that is missing or of another type is refused, as before, naming it: no row
+/// of the batch can be read then. The same keys as the offline modes check (`detect::check_keys`,
+/// lane V7), which refuse their whole input instead, since nothing sends it again.
+fn drop_rows_with_null_keys(batch: RecordBatch) -> Result<(RecordBatch, Dropped), Status> {
+    let mut keep = vec![true; batch.num_rows()];
+    let mut dropped = Vec::new();
+    for (name, wanted) in &KEY_COLUMNS {
+        let Some(column) = batch.column_by_name(name) else {
+            if *name == "attempt" {
+                continue;
+            }
+            return Err(Status::invalid_argument(format!("column `{name}` is missing")));
+        };
+        if column.data_type() != wanted {
+            return Err(Status::invalid_argument(format!(
+                "column `{name}` is {}, not {wanted}",
+                column.data_type()
+            )));
+        }
+        if column.null_count() == 0 {
+            continue;
+        }
+        let mut rows = 0;
+        for (row, kept) in keep.iter_mut().enumerate() {
+            if *kept && column.is_null(row) {
+                *kept = false;
+                rows += 1;
+            }
+        }
+        if rows > 0 {
+            dropped.push((*name, rows));
+        }
+    }
+    if dropped.is_empty() {
+        return Ok((batch, dropped));
+    }
+    let batch =
+        filter_record_batch(&batch, &BooleanArray::from(keep)).map_err(|error| Status::internal(error.to_string()))?;
+    Ok((batch, dropped))
 }
 
 /// Splits a batch into runs of consecutive rows with the same `attempt`. A batch from a

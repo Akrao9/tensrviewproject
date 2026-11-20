@@ -89,7 +89,8 @@
 //! clock is behind owns the rank because it was claimed later.
 //!
 //! A new owner is the job started again, seen before the new attempt stores a step: the status
-//! shows the attempt at once with `last_step` null and `attempt_without_steps`, and the rank is
+//! shows the attempt at once with `last_step` null and `attempt_without_steps`, its
+//! `seconds_since_progress` counted from that beat, and the rank is
 //! judged as one before its first step, from that beat (`starting` for `--start-seconds`, then
 //! `silent`, critical `--critical-seconds` later; `reconnecting` for that window while its stream
 //! is not open), not from the earlier attempt's last batch. The attempt's first batch ends that,
@@ -159,9 +160,26 @@ fn epoch_ms() -> i64 {
 /// instant: half a tenth (the phase's rounding) and half a thousandth (the counter's).
 const PHASE_ROUNDING: f64 = 0.051;
 
+/// A silence factor the watchdog can use (`--silent-factor`): 0, which leaves the floor alone, or a
+/// finite number above 1. At 1 or below, a rank whose floor is shorter than its own usual time
+/// between batches is called silent before its usual next batch, at every batch; a negative
+/// number or NaN leaves the floor alone, as 0 does, without saying so; and `inf` makes every rank
+/// with a cadence never silent and never critical. Until Nov 19, 2026 any number was taken (RS15's
+/// open part).
+pub fn check_silent_factor(factor: f64) -> Result<f64, String> {
+    if factor == 0.0 || (factor.is_finite() && factor > 1.0) {
+        return Ok(factor);
+    }
+    Err(format!(
+        "{factor} cannot be used: give 0 (the silence floor alone) or a finite number above 1 \
+         (at 1 or below, a rank would be called silent before its own usual time between batches)"
+    ))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct WatchdogConfig {
     pub silent_floor: Duration,
+    /// 0, or a finite number above 1: see [`check_silent_factor`], which the binary applies.
     pub silent_factor: f64,
     /// A rank quiet for longer than this is `critical`; between the threshold and this it is a `warning`.
     pub critical: Duration,
@@ -246,8 +264,9 @@ pub struct Pauses {
     pub max: f64,
     pub last: f64,
     /// When the last one ended, so the run's `last_seconds` is the pause that ended last of any
-    /// rank (RUST-13). Not in the status: a rank taken up after a restart has none, and its
-    /// pauses count as older than any this server saw end.
+    /// rank (RUST-13). Carried in the status's `restart` as an age (`ended_seconds`), so the order
+    /// survives a restart; a rank restored from a status written before that (Nov 19, 2026) has
+    /// none, and its pauses count as older than any this server saw end.
     pub ended: Option<Instant>,
 }
 
@@ -367,6 +386,11 @@ impl Progress {
         if known || reopened {
             self.attempt_since = Some(now);
             self.last_step = None;
+            // Its time since progress is its own, from now, as its verdicts are: the earlier
+            // attempt's last batch is not its progress (RS08's open part; until Nov 19, 2026 the
+            // status counted from that batch, over the whole downtime). Only the status shows it
+            // while the attempt has no batch: its first gap is measured from `attempt_since`.
+            self.last_progress = now;
             self.restarted = Some(now);
             // Only a stream that is not open yet waits for this window; one already open is
             // judged by the rules for an open stream, and a later drop by those for a drop.
@@ -610,6 +634,10 @@ impl Progress {
                 "total_seconds": round3(stats.total),
                 "max_seconds": round3(stats.max),
                 "last_seconds": round3(stats.last),
+                // How long ago the last one ended, so the order in which the ranks' pauses ended
+                // survives a restart (RUST-13). Null when none has ended on this server or the one
+                // it took the rank up from.
+                "ended_seconds": stats.ended.map(before),
             }))).collect::<serde_json::Map<String, Value>>(),
         })
     }
@@ -662,7 +690,9 @@ impl Progress {
                     total: seconds(&stats["total_seconds"])?,
                     max: seconds(&stats["max_seconds"])?,
                     last: seconds(&stats["last_seconds"])?,
-                    ended: None,
+                    // Absent or null from a status written before it was carried: the pause ended
+                    // before any this server sees end, as it did then.
+                    ended: seconds(&stats["ended_seconds"]).map(|age| ago(now, age)),
                 },
             );
         }
@@ -1290,7 +1320,7 @@ pub fn run_status(
             if p.attempt_since.is_some() {
                 // `attempt` is a new one, seen in its heartbeats, that has stored no step: `last_step`
                 // is null (the earlier attempt's steps are not its own), and the time since progress
-                // is still the earlier attempt's.
+                // counts from when it took the rank.
                 entry["attempt_without_steps"] = json!(true);
             }
             if p.superseded_rows > 0 {
@@ -2633,6 +2663,45 @@ mod tests {
         assert_eq!(rank_field(&dog, at(t0, 1231), "last_step"), 59);
     }
 
+    /// RS08's open part. Before a new attempt's first row, `seconds_since_progress` counts from when
+    /// the attempt took the rank (its first beat), as its verdicts do, not from the earlier attempt's
+    /// last batch: the earlier attempt's progress is not the owner's (contract 1). It is kept over a
+    /// restart, as the other clocks the status shows are, and the first batch ends it. Until
+    /// Nov 19, 2026 it read 396 s one second after the claim here, and a silent new attempt's
+    /// incident said none of its ranks had sent a step for the whole downtime.
+    #[test]
+    fn a_new_attempts_time_since_progress_counts_from_when_it_took_the_rank() {
+        // config(60): floor 60 s, critical 180 s, start limit 600 s.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, 1));
+        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 5));
+        dog.stream_ended(&key(0), false, at(t0, 6)); // killed
+        assert_eq!(rank_field(&dog, at(t0, 300), "seconds_since_progress"), json!(295.0));
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 400)));
+        dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, 400));
+        assert_eq!(rank_field(&dog, at(t0, 401), "seconds_since_progress"), json!(1.0));
+        dog.stream_opened(&key(0), at(t0, 402));
+        for second in (415..1100).step_by(15) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, second));
+        }
+        // Silent after its start limit: quiet for as long as its time since progress says.
+        let entry = &dog.statuses(at(t0, 1001), true)["run"]["ranks"][0];
+        assert_eq!(
+            (&entry["state"], &entry["seconds_since_progress"]),
+            (&json!("silent"), &json!(601.0))
+        );
+        // Kept over a restart.
+        let before = as_file(&dog.statuses(at(t0, 1001), true)["run"]);
+        let now = Instant::now();
+        let fresh = restarted(&before, 60, now);
+        assert_eq!(rank_field(&fresh, at(now, 10), "seconds_since_progress"), json!(611.0));
+        // Its first batch ends it.
+        dog.batch(&key(0), 2, Some(29), Some(1), at(t0, 1200));
+        assert_eq!(rank_field(&dog, at(t0, 1203), "seconds_since_progress"), json!(3.0));
+    }
+
     #[test]
     fn last_step_is_the_newest_attempts_once_it_stores_rows_and_stall_timing_is_unchanged() {
         // config(60): floor 60 s, critical 180 s. Attempt 1 reaches step 119; attempt 2 resumes
@@ -3710,6 +3779,55 @@ mod tests {
                 (&json!(2), &json!(60.0), &json!(20.0)),
                 "rank {newer}'s pause ended last"
             );
+        }
+    }
+
+    /// RUST-13's open part. The order in which the ranks' pauses ended survives a restart: the run's
+    /// `last_seconds` is still the pause that ended last of any rank, whichever rank it was. Until
+    /// Nov 19, 2026 the restart carried no end, every restored pause counted as ended at once, and
+    /// the highest rank's won (60 s here where the newest was 20 s). A status written before the end
+    /// was carried still restores, as before; a pause that ends after the restart is the newest.
+    #[test]
+    fn the_merged_pauses_last_is_the_one_that_ended_last_after_a_restart() {
+        for (earlier, newer) in [(1, 0), (0, 1)] {
+            let t0 = Instant::now();
+            let dog = Watchdog::new(config(60));
+            for rank in [0, 1] {
+                dog.stream_opened(&key(rank), t0);
+                dog.heartbeat(&key(rank), "train", 15.0, None, None, t0);
+            }
+            dog.heartbeat(&key(earlier), "eval", 15.0, None, None, at(t0, 10));
+            dog.heartbeat(&key(earlier), "train", 15.0, None, None, at(t0, 70)); // 60 s, ended at 70 s
+            dog.heartbeat(&key(newer), "eval", 15.0, None, None, at(t0, 100));
+            dog.heartbeat(&key(newer), "train", 15.0, None, None, at(t0, 120)); // 20 s, ended at 120 s
+            let before = as_file(&dog.statuses(at(t0, 130), true)["run"]);
+            let now = Instant::now();
+            let fresh = restarted(&before, 60, now);
+            let eval = &fresh.statuses(now, true)["run"]["pauses"]["eval"];
+            assert_eq!(
+                (&eval["count"], &eval["max_seconds"], &eval["last_seconds"]),
+                (&json!(2), &json!(60.0), &json!(20.0)),
+                "rank {newer}'s pause ended last, before the restart"
+            );
+            // A pause that ends after the restart is newer than both.
+            fresh.stream_opened(&key(earlier), now);
+            fresh.heartbeat(&key(earlier), "eval", 15.0, None, None, at(now, 1));
+            fresh.heartbeat(&key(earlier), "train", 15.0, None, None, at(now, 6));
+            let eval = &fresh.statuses(at(now, 7), true)["run"]["pauses"]["eval"];
+            assert_eq!(
+                eval["last_seconds"],
+                json!(5.0),
+                "the pause after the restart ended last"
+            );
+            // A status written before the end was carried restores as before.
+            let mut older = before.clone();
+            for carry in older["restart"].as_array_mut().unwrap() {
+                for stats in carry["pauses"].as_object_mut().unwrap().values_mut() {
+                    stats.as_object_mut().unwrap().remove("ended_seconds");
+                }
+            }
+            let fresh = restarted(&older, 60, now);
+            assert_eq!(fresh.statuses(now, true)["run"]["pauses"]["eval"]["count"], json!(2));
         }
     }
 
