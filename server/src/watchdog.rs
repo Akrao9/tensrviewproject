@@ -120,6 +120,16 @@
 //! is `reconnecting`, then `lost`, as for any rank. The stop and its reason are in the rank's entry
 //! in every state, survive a restart, and go only when a newer attempt owns the rank. A run whose
 //! ranks are all stopped or finished reads `capture_stopped`; with another rank active, `degraded`.
+//!
+//! # Dropped rows
+//!
+//! Rows the ingest drops because a key of theirs is null (RS10) are counted per rank in the rank's
+//! entry of its own run's status, once there is one: `dropped_rows`, the total, and
+//! `dropped_row_keys`, by the first null key of each row. A rank that dropped none has neither,
+//! so its entry is as before. The counts survive a restart (in `restart`). They are a count only:
+//! no state, severity, incident or run state comes of them. A batch whose acknowledgement was lost
+//! and that is sent again is counted again, so a count is at most the rows dropped (decided
+//! Nov 20, 2026; until then the count reached only stderr).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
@@ -322,6 +332,8 @@ pub struct Progress {
     order_loaded: bool,
     /// Rows of an attempt that does not own the rank, received since the server took it up.
     superseded_rows: u64,
+    /// Rows dropped for a null key (RS10), by the first null key of each row.
+    dropped_rows: BTreeMap<String, u64>,
     /// The owner attempt's capture stopped (contract 3), its reason and since when the server saw
     /// it. Kept whatever state the rank reads, until a newer attempt owns the rank.
     capture_stopped: Option<(String, Instant)>,
@@ -355,6 +367,7 @@ impl Progress {
             order: AttemptOrder::default(),
             order_loaded: false,
             superseded_rows: 0,
+            dropped_rows: BTreeMap::new(),
             capture_stopped: None,
         }
     }
@@ -627,6 +640,7 @@ impl Progress {
             "stepped": self.stepped,
             "attempt_without_steps": self.attempt_since.is_some(),
             "superseded_rows": self.superseded_rows,
+            "dropped_rows": self.dropped_rows,
             "step_seconds": self.step_seconds.iter().copied().map(round3).collect::<Vec<_>>(),
             "gaps_seconds": self.gaps.iter().copied().map(round3).collect::<Vec<_>>(),
             "pauses": self.pauses.iter().map(|(phase, stats)| (phase.clone(), json!({
@@ -744,6 +758,13 @@ impl Progress {
             order: AttemptOrder::default(),
             order_loaded: false,
             superseded_rows: carry["superseded_rows"].as_u64().unwrap_or(0),
+            // Absent from a status written before it was kept: none dropped.
+            dropped_rows: carry["dropped_rows"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(column, rows)| Some((column.clone(), rows.as_u64().filter(|rows| *rows > 0)?)))
+                .collect(),
             // Kept in the entry in every state once seen (contract 3), so a restart keeps it.
             capture_stopped: entry["capture_stopped"].as_object().map(|stopped| {
                 let reason = stopped
@@ -1022,6 +1043,19 @@ impl Watchdog {
         if rows > 0 {
             self.with(key, now, |p| p.superseded_rows = p.superseded_rows.saturating_add(rows));
         }
+    }
+
+    /// Rows of a batch of the rank were dropped for a null key (RS10): `(key, rows)`, counted.
+    pub fn dropped(&self, key: &Key, rows: &[(&str, u64)], now: Instant) {
+        if rows.iter().all(|(_, rows)| *rows == 0) {
+            return;
+        }
+        self.with(key, now, |p| {
+            for (column, rows) in rows {
+                let held = p.dropped_rows.entry(column.to_string()).or_default();
+                *held = held.saturating_add(*rows);
+            }
+        });
     }
 
     /// A stream counted as the rank's turned out to belong to an attempt that does not own the rank
@@ -1325,6 +1359,10 @@ pub fn run_status(
             }
             if p.superseded_rows > 0 {
                 entry["superseded_rows"] = json!(p.superseded_rows);
+            }
+            if !p.dropped_rows.is_empty() {
+                entry["dropped_rows"] = json!(p.dropped_rows.values().fold(0u64, |sum, rows| sum.saturating_add(*rows)));
+                entry["dropped_row_keys"] = json!(p.dropped_rows);
             }
             if let Some((reason, since)) = &p.capture_stopped {
                 entry["capture_stopped"] = json!({

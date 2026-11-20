@@ -1126,6 +1126,9 @@ mod store {
         pub order_puts: AtomicUsize,
         /// The next this-many writes of an `attempts.json` fail (and are not stored).
         pub fail_order_puts: AtomicUsize,
+        /// The next this-many writes of an `incidents.json` fail (and are not stored); other writes
+        /// are not touched (L17).
+        pub fail_incident_puts: AtomicUsize,
     }
 
     #[derive(Debug)]
@@ -1191,6 +1194,18 @@ mod store {
                     } else {
                         self.inner.put_opts(location, payload, opts).await
                     };
+                }
+                if location.as_ref().ends_with("incidents.json")
+                    && self
+                        .knobs
+                        .fail_incident_puts
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                        .is_ok()
+                {
+                    return Err(object_store::Error::Generic {
+                        store: "TestStore",
+                        source: "injected failure of a report".into(),
+                    });
                 }
                 self.knobs.puts.fetch_add(1, Ordering::SeqCst);
                 let now = self.knobs.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3329,4 +3344,210 @@ async fn a_rank_whose_rebuild_failed_is_rebuilt_without_a_later_part() {
     let report = json_in(&store, &format!("runs/{RUN}/rank=0/incidents.json")).await;
     assert_eq!(report["attempt"], serde_json::json!(2), "{report}");
     put.finish().await;
+}
+
+// --- Lane Y4 (Nov 20, 2026): dropped rows in the status, a report whose write failed -----------
+
+/// One batch of `run_id` rank 0 in `nullable_key_schema()`, with its own `app_metadata`.
+async fn send_for(put: &mut Put, run_id: &str, batch: RecordBatch, end_byte_offset: i64) {
+    let metadata = format!(
+        "{{\"schema_version\":1,\"run_id\":\"{run_id}\",\"rank\":0,\"min_step\":null,\"max_step\":null,\"end_byte_offset\":{end_byte_offset}}}"
+    );
+    put.send_with_metadata(batch, metadata).await;
+}
+
+/// Rank 0's `(dropped_rows, dropped_row_keys)` in the `watchdog.json` of `run_id`.
+fn dropped_in(root: &Path, run_id: &str) -> (serde_json::Value, serde_json::Value) {
+    let status = json_file(&root.join("runs").join(run_id).join("watchdog.json"));
+    let rank = &status["ranks"][0];
+    assert_eq!(rank["rank"], 0, "{status}");
+    (rank["dropped_rows"].clone(), rank["dropped_row_keys"].clone())
+}
+
+/// RS10's open part. The rows live ingest drops for a null key are counted in the rank's entry of
+/// its own run's `watchdog.json`, by the key, and the count survives a restart. Two runs at once:
+/// a drop in one changes only that run's count. Until Nov 20, 2026 the count reached only stderr.
+#[tokio::test]
+async fn rows_dropped_for_a_null_key_are_counted_in_their_own_runs_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        flush_steps: 1,
+        ..manual()
+    };
+    let other = "run-b";
+    let server = start(dir.path(), config.clone(), None).await;
+    let mut a = open_with(&server.address, RUN, 0, None, nullable_key_schema()).await;
+    let mut b = open_with(&server.address, other, 0, None, nullable_key_schema()).await;
+    let row = |run: &'static str, step: i64| (Some(run), Some(0), Some(1), Some(step));
+    send_for(
+        &mut a,
+        RUN,
+        nullable_key_batch(&[
+            row(RUN, 0),
+            (Some(RUN), Some(0), Some(1), None), // no step
+            (None, Some(0), Some(1), Some(2)),   // no run
+            (Some(RUN), Some(0), Some(1), None), // no step
+            row(RUN, 4),
+        ]),
+        100,
+    )
+    .await;
+    assert_eq!(a.ack().await, Ok(100));
+    send_for(&mut b, other, nullable_key_batch(&[row(other, 0), row(other, 1)]), 100).await;
+    assert_eq!(b.ack().await, Ok(100));
+    server.ingest.write_watchdog().await;
+    assert_eq!(
+        dropped_in(dir.path(), RUN),
+        (serde_json::json!(3), serde_json::json!({"run_id": 1, "step": 2}))
+    );
+    // A run that dropped nothing shows no count: its status is as before.
+    assert_eq!(
+        dropped_in(dir.path(), other),
+        (serde_json::Value::Null, serde_json::Value::Null)
+    );
+
+    // A drop in the other run: only that run's count changes, and the status is written again
+    // for it at once (the count is part of what makes a status new).
+    send_for(
+        &mut b,
+        other,
+        nullable_key_batch(&[(Some(other), None, Some(1), Some(2)), row(other, 3)]),
+        200,
+    )
+    .await;
+    assert_eq!(b.ack().await, Ok(200));
+    server.ingest.write_watchdog().await;
+    assert_eq!(
+        dropped_in(dir.path(), other),
+        (serde_json::json!(1), serde_json::json!({"rank": 1}))
+    );
+    assert_eq!(
+        dropped_in(dir.path(), RUN),
+        (serde_json::json!(3), serde_json::json!({"run_id": 1, "step": 2}))
+    );
+
+    // A restarted server takes the counts up from the status it reads.
+    a.finish().await;
+    b.finish().await;
+    drop(server);
+    let new = start(dir.path(), config, None).await;
+    assert_eq!(new.ingest.restore_watchdog().await.unwrap(), 2);
+    let statuses = new.ingest.watchdog_statuses();
+    assert_eq!(statuses[RUN]["ranks"][0]["dropped_rows"], 3, "{}", statuses[RUN]);
+    assert_eq!(
+        statuses[RUN]["ranks"][0]["dropped_row_keys"],
+        serde_json::json!({"run_id": 1, "step": 2})
+    );
+    assert_eq!(statuses[other]["ranks"][0]["dropped_rows"], 1, "{}", statuses[other]);
+}
+
+/// L17. When writing a rank's `incidents.json` fails, the report is written again by the timed
+/// flush once a short wait has passed, from the detectors the rank holds: no later part has to
+/// come. Until Nov 20, 2026 the rank kept its detectors and had no report, and only its next part
+/// wrote one; a rank that sent nothing more stayed unjudged for good.
+#[tokio::test]
+async fn a_report_whose_write_failed_is_written_again_without_a_later_part() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let config = IngestConfig {
+        flush_steps: 10,
+        replay_backoff: Duration::from_millis(100),
+        ..manual()
+    };
+    let server = start_on(store.clone(), config, None).await;
+    store.knobs.fail_incident_puts.store(1, Ordering::SeqCst);
+    let mut put = open_with(&server.address, RUN, 0, None, data_attempt_schema()).await;
+    put.send(data_attempt_batch(1, 0..10), 1).await;
+    assert_eq!(put.ack().await, Ok(1), "the part is stored and acknowledged");
+    // The part was judged and its report's write failed.
+    let deadline = tokio::time::Instant::now() + SLOW_BOUND;
+    while store.knobs.fail_incident_puts.load(Ordering::SeqCst) > 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the report was never written");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let rebuilds_before = store.knobs.gets.load(Ordering::SeqCst);
+    // Nothing more is sent. The flusher's pass, about once a second here, writes the report again.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = written_status(&server, &store).await;
+        if judged(&status) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never judged without a later part: {}",
+            status["run_state"]
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let report = json_in(&store, &format!("runs/{RUN}/rank=0/incidents.json")).await;
+    assert_eq!(
+        (&report["attempt"], &report["last_step"]),
+        (&serde_json::json!(1), &serde_json::json!(9)),
+        "{report}"
+    );
+    // The report came from the detectors held, not from a rebuild that read the rank's parts again.
+    assert_eq!(store.knobs.gets.load(Ordering::SeqCst), rebuilds_before);
+    put.finish().await;
+}
+
+/// RS10's stderr line. Each rank of each run has its own limit on the dropped-row line: a second
+/// rank that drops rows inside the first rank's 10 s gets a line of its own. Until Nov 20, 2026 one
+/// limit served every rank, and the second rank's drop showed only in a later line's total, if a
+/// later line came.
+#[cfg(unix)]
+#[tokio::test]
+async fn each_rank_gets_its_own_dropped_row_line_on_stderr() {
+    use std::io::{BufRead, BufReader, Read};
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
+        .args(["--listen", "127.0.0.1:0", "--watchdog-seconds", "0", "--no-detect"])
+        .arg("--store")
+        .arg(dir.path())
+        .env_remove("TENSORQUILL_TOKEN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let address = line
+        .trim()
+        .strip_prefix("tensorquill-server listening on ")
+        .unwrap_or_else(|| panic!("{line}"))
+        .to_string();
+    let address = format!("http://{address}");
+    // Both batches are sent before either is acknowledged, which the binary does at its timed
+    // flush (10 s), so the two drops come well inside one interval.
+    let mut puts = Vec::new();
+    for rank in [0, 1] {
+        let mut put = open_with(&address, RUN, rank, None, nullable_key_schema()).await;
+        put.send(
+            nullable_key_batch(&[
+                (Some(RUN), Some(rank), Some(1), Some(0)),
+                (Some(RUN), Some(rank), Some(1), None),
+            ]),
+            10,
+        )
+        .await;
+        puts.push(put);
+    }
+    for (rank, mut put) in puts.into_iter().enumerate() {
+        assert_eq!(put.ack().await, Ok(10), "rank {rank}");
+        put.finish().await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    for rank in [0, 1] {
+        assert!(
+            stderr.contains(&format!(
+                "{RUN} rank {rank}: dropped rows that cannot be stored: 1 with a null step"
+            )),
+            "no line for rank {rank}: {stderr}"
+        );
+    }
 }

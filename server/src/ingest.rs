@@ -16,7 +16,8 @@
 //! sender's file is durable. Buffered Arrow bytes across all streams are capped; a batch
 //! that does not fit is refused with `RESOURCE_EXHAUSTED` and the sender retries later.
 //! A row whose run, rank, step, attempt or schema version is null cannot be stored: it is dropped
-//! and counted, with a line on stderr, and the rest of its batch is kept and acknowledged (RS10).
+//! and counted, with a line on stderr and in the rank's entry of its run's `watchdog.json`
+//! (`dropped_rows`, `dropped_row_keys`), and the rest of its batch is kept and acknowledged (RS10).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -138,7 +139,8 @@ pub struct IngestConfig {
     pub report_grace: Duration,
     /// After a rebuild of a rank's detectors from the store fails, the wait before it is tried
     /// again, at the rank's next part or by the timed flush, whichever comes first; it doubles with
-    /// each failure in a row (see `Ingest::detect`).
+    /// each failure in a row (see `Ingest::detect`). The same wait, doubled the same way, is kept
+    /// after a failed write of a rank's `incidents.json`, which the timed flush then tries again.
     pub replay_backoff: Duration,
     /// A run whose status has read finished or abandoned, and been written so, for this long is
     /// let go of: nothing of it is held in memory (see `Ingest::evict_settled`).
@@ -280,6 +282,11 @@ struct RankBuffer {
     /// Rebuilds that failed in a row, and the time before which none is tried again (RUST-16).
     replay_failures: u32,
     replay_after: Option<Instant>,
+    /// Writes of the rank's `incidents.json` that failed in a row, and the time before which none
+    /// is tried again (L17): the timed flush writes the report again from the detectors held,
+    /// with no new part and no rebuild.
+    report_failures: u32,
+    report_after: Option<Instant>,
     /// Set when writing the buffer as a part failed. A `PUT` that reports failure may have
     /// stored the object (a timeout after the store committed it), so the buffer takes no more
     /// rows until a write of it succeeds: the retry is then the same part under the same name,
@@ -295,6 +302,15 @@ impl RankBuffer {
             && self.replay_failures > 0
             && !self.detect_off
             && self.replay_after.is_none_or(|after| now >= after)
+    }
+
+    /// Writing the rank's report failed, the detectors that judged it are held, and the wait has
+    /// passed: the report is due again.
+    fn report_due(&self, now: Instant) -> bool {
+        self.detectors.is_some()
+            && self.report_failures > 0
+            && !self.detect_off
+            && self.report_after.is_none_or(|after| now >= after)
     }
 }
 
@@ -348,9 +364,10 @@ pub struct Ingest {
     /// Streams that ended in an error, and the lines written about them (RUST-18).
     stream_errors: std::sync::atomic::AtomicU64,
     error_log: Mutex<ErrorLog>,
-    /// Rows dropped for a null key, by the key, and the lines written about them (RS10).
+    /// Rows dropped for a null key, by the key, and the lines written about them, held per rank so
+    /// one rank's line never holds back another's (RS10).
     dropped_rows: Mutex<BTreeMap<&'static str, u64>>,
-    dropped_log: Mutex<ErrorLog>,
+    dropped_log: Mutex<HashMap<Key, ErrorLog>>,
     /// Runs whose status has read finished or abandoned, and been written so (or, with the file
     /// off, has read so), since when: let go of after `evict_after` (see `evict_settled`).
     settled: Mutex<HashMap<String, Instant>>,
@@ -385,7 +402,7 @@ impl Ingest {
             stream_errors: std::sync::atomic::AtomicU64::new(0),
             error_log: Mutex::new(ErrorLog::default()),
             dropped_rows: Mutex::new(BTreeMap::new()),
-            dropped_log: Mutex::new(ErrorLog::default()),
+            dropped_log: Mutex::new(HashMap::new()),
             settled: Mutex::new(HashMap::new()),
             order_locks: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
@@ -409,8 +426,9 @@ impl Ingest {
     }
 
     /// Rows of `key`'s batch were dropped for a null key (RS10): counted, and written to stderr at
-    /// most once per `STREAM_ERROR_LOG_INTERVAL` with the run, rank, the keys and how many rows,
-    /// never a value the sender sent.
+    /// most once per `STREAM_ERROR_LOG_INTERVAL` per rank with the run, rank, the keys and how many
+    /// rows, never a value the sender sent. (Until Nov 20, 2026 one limit served every rank, and a
+    /// second rank's drop inside the interval showed only in a later line's total.)
     fn rows_dropped(&self, key: &Key, dropped: &[(&'static str, u64)]) {
         let totals = {
             let mut totals = self.dropped_rows.lock().unwrap();
@@ -419,7 +437,14 @@ impl Ingest {
             }
             totals.values().sum::<u64>()
         };
-        let Some(held) = self.dropped_log.lock().unwrap().due(Instant::now()) else {
+        let due = self
+            .dropped_log
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .due(Instant::now());
+        let Some(held) = due else {
             return;
         };
         let which: Vec<String> = dropped
@@ -484,6 +509,7 @@ impl Ingest {
         runs.extend(self.data_windows.lock().unwrap().keys().cloned());
         runs.extend(self.manifests.lock().unwrap().keys().cloned());
         runs.extend(self.written.lock().unwrap().keys().cloned());
+        runs.extend(self.dropped_log.lock().unwrap().keys().map(|key| key.0.clone()));
         runs.len()
     }
 
@@ -555,6 +581,7 @@ impl Ingest {
         // be read) is sent again, and its rows would be counted twice.
         if !dropped.is_empty() {
             self.rows_dropped(key, &dropped);
+            self.watchdog.dropped(key, &dropped, Instant::now());
         }
         let now = Instant::now();
         self.watchdog.superseded(key, superseded, now);
@@ -771,8 +798,20 @@ impl Ingest {
                 }
             };
         }
-        let Some(detectors) = &buffer.detectors else {
+        if buffer.detectors.is_none() {
             self.forget_report(key);
+            return;
+        }
+        self.write_report(key, buffer).await;
+    }
+
+    /// Writes the rank's `incidents.json` from the detectors it holds, and keeps what it says for
+    /// the run state once it is stored. When the write fails, the report is dropped from the run
+    /// state and written again by the timed flush after a wait that doubles with each failure in a
+    /// row (L17; until Nov 20, 2026 only the rank's next part wrote it, so a rank that sent nothing
+    /// more stayed without a report).
+    async fn write_report(&self, key: &Key, buffer: &mut RankBuffer) {
+        let Some(detectors) = &buffer.detectors else {
             return;
         };
         {
@@ -810,6 +849,8 @@ impl Ingest {
         };
         match self.storage.write_incidents(&key.0, key.1, &document).await {
             Ok(()) => {
+                buffer.report_failures = 0;
+                buffer.report_after = None;
                 let at = reported(&report);
                 self.reports.lock().unwrap().insert(key.clone(), report);
                 if let Some(stored) = self.stored.lock().unwrap().get_mut(key) {
@@ -822,9 +863,14 @@ impl Ingest {
                 // What the store holds is now behind what was judged: a reader finds the report
                 // behind, and the run state does not call the rank judged either.
                 self.reports.lock().unwrap().remove(key);
+                buffer.report_failures = buffer.report_failures.saturating_add(1);
+                let wait = replay_wait(self.config.replay_backoff, buffer.report_failures);
+                buffer.report_after = Instant::now().checked_add(wait);
                 eprintln!(
-                    "tensorquill-server: cannot write incidents.json for {} rank {}: {error}",
-                    key.0, key.1
+                    "tensorquill-server: cannot write incidents.json for {} rank {}: {error} (tried again in {:.0} s)",
+                    key.0,
+                    key.1,
+                    wait.as_secs_f64()
                 );
             }
         }
@@ -871,6 +917,10 @@ impl Ingest {
                 // tried, and a rank that sent nothing more stayed without a report for good).
                 if self.config.detect && buffer.rebuild_due(Instant::now()) {
                     self.detect(&key, &mut buffer, &[]).await;
+                }
+                // A report whose write failed is written again from the detectors held (L17).
+                if self.config.detect && buffer.report_due(Instant::now()) {
+                    self.write_report(&key, &mut buffer).await;
                 }
             })
             .await;
@@ -1373,6 +1423,7 @@ impl Ingest {
         self.manifests.lock().unwrap().remove(run_id);
         self.written.lock().unwrap().remove(run_id);
         self.order_locks.lock().unwrap().retain(|key, _| key.0 != run_id);
+        self.dropped_log.lock().unwrap().retain(|key, _| key.0 != run_id);
         drop(buffers);
         true
     }
@@ -1430,7 +1481,7 @@ impl Ingest {
                 "compared": status["ranks_compared"],
                 "run_state": status["run_state"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
-                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object(), (r["attempt"].clone(), r["attempt_without_steps"].clone(), r["superseded_rows"].clone(), r["capture_stopped"]["reason"].clone()))).collect::<Vec<_>>()
+                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object(), (r["attempt"].clone(), r["attempt_without_steps"].clone(), r["superseded_rows"].clone(), r["capture_stopped"]["reason"].clone()), r["dropped_row_keys"].clone())).collect::<Vec<_>>()
                 }),
             })
             .to_string();
