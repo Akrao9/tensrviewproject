@@ -184,13 +184,16 @@ def big_rank_file(path: Path, *, other_rank_at: int | None = None, run: str = RU
     return path
 
 
-def test_xc5_a_large_rank_file_with_no_world_size_says_its_count_is_not_known(tmp_path):
-    # Rank 1's row is in the middle, which the listing does not read: nothing settles the count.
+def test_xc5_a_large_rank_file_with_no_world_size_is_counted_from_every_line(tmp_path):
+    # Rewritten by lane AA5 (Nov 20, 2026): it pinned "1+" (`rank_count` None, "middle" in the
+    # reason). Rank 1's row is in the middle, which the listing scans for each line's rank (L21):
+    # every line is read, so the file holds ranks 0 and 1 and the count is settled without a
+    # manifest. Where the scan cannot read every line the count is still not known
+    # (`test_lane_aa5_readers.py`).
     big_rank_file(tmp_path / f"{RUN}.rank0.jsonl", other_rank_at=2)
     found = only_row(tmp_path)
-    assert found["ranks"] == [0] and found["rank_count"] is None
-    assert "middle" in found["rank_count_not_known"]
-    assert "1+" in runs_module.listing_text([found], tmp_path)
+    assert (found["ranks"], found["rank_count"]) == ([0, 1], 2) and "rank_count_not_known" not in found
+    assert "1+" not in runs_module.listing_text([found], tmp_path)
 
 
 def test_xc5_a_large_rank_file_is_counted_when_the_manifest_settles_it(tmp_path):

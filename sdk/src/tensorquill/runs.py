@@ -55,12 +55,20 @@ a rank's entry of `watchdog.json`) has `dropped_rows` on its row, in all, by key
 the printed listing a note. The count is an upper bound: a batch sent again after a lost
 acknowledgement is counted again (L22, lane Z5). A run that dropped none has no such key.
 
-How many ranks: a file named `<run_id>.rank<N>.jsonl` holds rank N alone when its first record
-and every record of its last megabyte are rank N's; one of which a record read names another
-rank is read as a file with a name of its own (XC5, lane Y3: only the first and last records
-were read). A file of rank N alone that is larger than what is read may still hold another
-rank in its middle: its count is the manifest's `world_size`, and with none it is not known
-(`rank_count` None, with why), never a definite count that may be wrong. A file with a name of its own may hold several ranks, and only reading
+How many ranks: a file named `<run_id>.rank<N>.jsonl` holds the ranks its lines name. Every
+line of it is read for that: the last megabyte parsed, and the part before it scanned for each
+line's rank and attempt (`_attempts_in_file`, which runs anyway for L21), so a file over a
+megabyte with no manifest is counted, not listed as "1+" (lane AA5, Nov 20, 2026; it was counted
+from the manifest's `world_size` alone). Holding rank N alone, it is rank N's file; holding
+others too (XC5), it is a file of several ranks, all of them named, so the count is still
+settled, and its evidence file is one rank's of several. Only when the scan cannot read every
+line (the file cut or unreadable while it is read) is the count the manifest's `world_size`,
+and with none not known (`rank_count` None, with why), never a definite count that may be
+wrong. A line torn by a killed writer with the next record written onto it is skipped by the
+readers and read here by its start: when that start names a rank no whole line of the file
+names, that rank is counted here and not by `compare` (the scan's one difference from a full
+parse, which for the attempts could only add a needless whole read). A rank named only in the
+part before the last megabyte has no last step in the row. A file with a name of its own may hold several ranks, and only reading
 it whole would name them all, so its ranks are counted from its name, its first and last
 records and the manifest's `world_size`: when the world size equals the ranks seen, that is the
 count; otherwise `rank_count` is None (printed as the ranks seen and "+") and
@@ -281,7 +289,15 @@ def _attempts_in_file(path: Path, before: int) -> dict[int, list[tuple[str, Any]
     """Each rank's `(run, attempt)` keys among the lines of `path` that start before byte
     `before`, in the order they first appear (see the notes above `_RECORD_HEAD`). Never raises:
     a file that cannot be read gives what was read of it."""
+    return _scan_file(path, before)[0]
+
+
+def _scan_file(path: Path, before: int) -> tuple[dict[int, list[tuple[str, Any]]], bool]:
+    """`_attempts_in_file`, and whether every line that starts before `before` was read: False
+    when the file could not be read, or was cut or replaced while it was, so the ranks found are
+    not all of the part's (lane AA5: the count of ranks is settled only by a whole scan)."""
     found: dict[int, dict[Any, None]] = {}
+    end = -1
     try:
         stat = path.stat()
         name = os.path.abspath(path)
@@ -304,17 +320,20 @@ def _attempts_in_file(path: Path, before: int) -> dict[int, list[tuple[str, Any]
         _SCANNED[name] = (ident, end, check, head, {rank: dict(keys) for rank, keys in found.items()})
     except OSError:
         pass
-    return {rank: list(keys) for rank, keys in found.items()}
+    # `before` is where a line starts (`_tail_from`), so a scan that read every line before it
+    # stops on it; one that stopped short (a read that failed, a file cut) did not.
+    return {rank: list(keys) for rank, keys in found.items()}, end == before
 
 
-def _hidden_attempts(path: Path, before: int, tail: list[dict[str, Any]], by_rank: Mapping[int, set[Any]]) -> list[int]:
+def _hidden_attempts(path: Path, before: int, tail: list[dict[str, Any]], by_rank: Mapping[int, set[Any]],
+                     scanned: Mapping[int, list[tuple[str, Any]]] | None = None) -> list[int]:
     """The ranks of `tail` (the records of a file's last megabyte) that show one attempt there
     while a newer one, of the same run, is in the part of the file before it (L21): the newest is
     the last to first appear in the file (contract 1), and only reading the file whole says where
-    such a rank stands."""
+    such a rank stands. `scanned` is `_attempts_in_file(path, before)` when it was read already."""
     from .evidence import _run_of
 
-    order = _attempts_in_file(path, before)
+    order = {rank: list(keys) for rank, keys in (scanned if scanned is not None else _attempts_in_file(path, before)).items()}
     for record in tail:
         rank = _record_rank(record)
         if rank is None:
@@ -695,21 +714,25 @@ def _record_rank(record: Mapping[str, Any] | None) -> int | None:
 def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, given: bool = False,
                  more: Mapping[int, list[Path]] | None = None, run_id: str | None = None) -> dict[str, Any]:
     """The ranks of a local run, from what the listing reads anyway: the file names, the first
-    line and the last megabyte of each file (every whole line of it), and the manifest's
-    `world_size`. No file is read whole to count them.
+    line and the last megabyte of each file (every whole line of it), the scan of the part before
+    the last megabyte (the rank and attempt at each line's start, `_scan_file`), and the
+    manifest's `world_size`. No file is parsed whole to count them.
 
-    A file named `<run_id>.rank<N>.jsonl` holds rank N alone (`tensorquill.init` writes one
-    such file a rank), when its first record and every record of its last megabyte are rank N's;
-    a file so named of which one of those names another rank is read as a file with a name of its
-    own (XC5, lane Y3, Nov 20, 2026: only the first and last records were read, so a row of
-    another rank in between was not seen). A file of a name of its own is counted from its first
+    A file named `<run_id>.rank<N>.jsonl` holds the ranks its lines name (`tensorquill.init`
+    writes one such file a rank): every line of it is read for them, the last megabyte parsed and
+    the part before it scanned (`_scan_file`, the scan L21 makes anyway; lane AA5). Rank N alone,
+    it is rank N's file; others too (XC5, lane Y3, Nov 20, 2026: only the first and last records
+    were read, so a row of another rank in between was not seen), it is a file of several ranks
+    whose ranks are all named (`every_line`), and the count is settled. When the scan cannot
+    read every line, the file is read as before: rank N's when what was read names N alone (then
+    `middle_not_read`), else as a file with a name of its own. A file of a name of its own is counted from its first
     and last records, as before. Such a file may hold several ranks: its name and what
     was read name some of them, and only reading it whole would name them all. Its count is
     settled when the manifest's `world_size` equals the ranks seen; otherwise it is not known,
     and `why` says so (the row prints it rather than a count that may be wrong). A file of its
-    rank alone that is larger than the part read (`middle_not_read`) may hold another rank in
-    its middle too: its count is settled by the manifest's `world_size` and, with none, is not
-    known either. When every file holds its rank alone, the ranks the manifest's `world_size`
+    rank alone whose middle the scan could not read (`middle_not_read`) may hold another rank
+    there: its count is settled by the manifest's `world_size` and, with none, is not known
+    either. When every file holds its rank alone, the ranks the manifest's `world_size`
     counts that have no file are `missing`, as the store counts a rank its status expects and
     that stored nothing: unknown, never clean. A world size above `MAX_EXPECTED_RANKS` (XC6) is
     not made into a list: the ranks without a file are a count, `beyond`, and are as unknown.
@@ -736,6 +759,7 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     misnamed: list[str] = []
     several: list[Path] = []
     middle_not_read: list[str] = []
+    every_line: set[Path] = set()  # files named for a rank, of several ranks, read on every line
     held: dict[Path, list[int]] = {}
     tails: dict[Path, list[dict[str, Any]]] = {}
     read: dict[Path, tuple[dict[str, Any] | None, dict[str, Any] | None]] = {}
@@ -751,18 +775,36 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
         # Every record read names its rank for a file named for one (XC5). A file of a name of its
         # own is counted from its ends as before: the files never settle its count either way.
         in_tail = {r for r in map(_record_rank, tail) if r is not None} if named is not None else set()
+        # The part before the last megabyte, scanned for the attempts (and so the ranks) its lines
+        # name (L21). `complete`: every whole line of the file was read, by the scan or the tail.
+        scanned, complete = _scan_file(path, tail_starts) if not whole else ({}, True)
         if number not in split_ranks:  # a rank's several files are read whole anyway (`split`)
             by_attempt = _attempts_by_rank(tail)
             restarted = [r for r, attempts in by_attempt.items() if len(attempts) > 1]
             if not whole:
                 # L21: an attempt newer than the last megabyte's, in the part before it.
-                restarted += [r for r in _hidden_attempts(path, tail_starts, tail, by_attempt) if r not in restarted]
+                restarted += [r for r in _hidden_attempts(path, tail_starts, tail, by_attempt, scanned)
+                              if r not in restarted]
             if restarted:
                 resolved[path] = {r: _rank_across_files([path], r, run_id)["last_step"] for r in restarted}
-        if named is not None and (ends | in_tail) <= {named}:
+        # A file named for a rank whose every line was read holds the ranks they name, no more
+        # (lane AA5, L21's "1+": a rank file over a megabyte was counted only by the manifest).
+        in_middle = set(scanned) if named is not None and complete else set()
+        if named is not None and (ends | in_tail | in_middle) <= {named}:
             seen.add(named)
-            if not whole:
+            if not complete:
                 middle_not_read.append(path.name)
+            continue
+        if named is not None and complete:
+            # It holds other ranks too, and every one of them is named: the count is theirs, and
+            # its evidence file is still one rank's of several (`several`, `shared`).
+            # Its rank is counted though no line names it, as `compare` counts it (unknown there).
+            here = ends | in_tail | in_middle | {named}
+            seen |= here
+            held[path] = sorted(here)
+            tails[path] = tail
+            several.append(path)
+            every_line.add(path)
             continue
         here = ends | in_tail | {named if named is not None else number}
         seen |= here
@@ -789,7 +831,8 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     beyond = world - len(seen) if not unsettled and world is not None and world > MAX_EXPECTED_RANKS else 0
     # `shared`: a lone file read as one run of several ranks, for its ends or for the world size.
     # Not on which rank wrote the last line alone, which changes from one listing to the next.
-    shared = len(pairs) == 1 and unsettled and (bool(several) or (world or 1) > 1)
+    # A file read on every line that holds several ranks is shared with its count settled (AA5).
+    shared = len(pairs) == 1 and (bool(several) or (unsettled and (world or 1) > 1))
     # Each rank's last step is read only where the row uses it: a file of several ranks in a run
     # of several files, or a lone file read as several ranks. A rank seen in several attempts is
     # where `resolve_attempts` leaves it (XC4).
@@ -798,7 +841,7 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     found: dict[str, Any] = {"ranks": sorted(seen | set(missing)), "ends": read, "held": held, "several": several,
                              "last_steps": last_steps, "missing": missing, "beyond": beyond, "resolved": resolved,
                              "missing_verb": ("was not read", "were not read") if given else ("has no file", "have no file"),
-                             "shared": shared,
+                             "shared": shared, "every_line": every_line,
                              "split": {number: _rank_across_files([files[number], *paths], number, run_id)
                                        for number, paths in (more or {}).items() if number in files and paths}}
     clauses = []
@@ -832,7 +875,7 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
 def _holds(path: Path, known: Mapping[str, Any]) -> str:
     """What the listing can say of the ranks a file of its own name (or a misnamed one) holds."""
     ranks = _rank_list(known["held"][path])
-    if "why" not in known:
+    if "why" not in known or path in known.get("every_line", ()):
         return f"holds {ranks}"
     # A file named for a rank is read for the rank of every record of its last megabyte (XC5).
     by = ("its name, its first record and its last megabyte" if _named_rank(path) is not None
