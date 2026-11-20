@@ -867,7 +867,9 @@ class FlightSender:
             waiting_since: float | None = None
             first_batch = True
 
-            def metadata_for(end: int, steps: list[int]) -> bytes:
+            def metadata_for(end: int, steps: list[int], asking: bool = False) -> bytes:
+                """A batch's metadata. The empty batch that asks for the store (`asking`) carries no
+                manifest: that rides on the stream's first batch of rows, as before the question."""
                 nonlocal first_batch
                 metadata = {
                     "schema_version": SCHEMA_VERSION,
@@ -880,9 +882,9 @@ class FlightSender:
                     # Optional, and unknown to a server older than it, which ignores it.
                     **({"sender_attempt": self._attempt} if self._attempt is not None else {}),
                     # Optional, and unknown to a server older than it, which ignores it.
-                    **({MANIFEST_KEY: self.manifest} if first_batch and self.manifest else {}),
+                    **({MANIFEST_KEY: self.manifest} if first_batch and self.manifest and not asking else {}),
                 }
-                first_batch = False
+                first_batch = first_batch and asking
                 return json.dumps(metadata).encode()
 
             try:
@@ -891,7 +893,7 @@ class FlightSender:
                         # No rows and no bytes claimed: the server answers it at once with what it
                         # already holds (an offset of 0 on this stream) and, when it has one, its store ID.
                         empty = pa.RecordBatch.from_pylist([], schema=schema)
-                        writer.write_with_metadata(empty, pa.py_buffer(metadata_for(0, [])))
+                        writer.write_with_metadata(empty, pa.py_buffer(metadata_for(0, [], asking=True)))
                         while not answered.is_set() and not ended.is_set():
                             if self._closing.is_set() and time.monotonic() >= self._deadline:
                                 break
