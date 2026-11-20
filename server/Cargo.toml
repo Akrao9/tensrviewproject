@@ -25,6 +25,8 @@ arrow-flight = "60.1.0"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
+# The store ID's 128 random bits (L3). Already in every build through Arrow's `ahash`.
+getrandom = "0.3"
 object_store = "0.14.2"
 parquet = { version = "60.1.0", default-features = false, features = ["arrow", "async", "zstd"] }
 serde = { version = "1", features = ["derive"] }

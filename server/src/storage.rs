@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::async_reader::{MetadataFetch, MetadataSuffixFetch};
 use parquet::arrow::ArrowWriter;
@@ -27,6 +27,13 @@ const FOOTER_PREFETCH_BYTES: usize = 64 * 1024;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
+/// A new store ID: 128 bits from the operating system's random source, as 32 lowercase hex digits.
+fn new_store_id() -> Result<String, Error> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| format!("cannot draw a store ID: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// One stored part of a rank, as its path says: `attempt=<attempt>/part-<first>-<last>.parquet`.
 #[derive(Clone, Debug)]
 pub struct StoredPart {
@@ -35,6 +42,12 @@ pub struct StoredPart {
     pub first_step: Option<i64>,
     pub location: Path,
 }
+
+/// The file at the store root that names the store (L3, decided by the author on Nov 20, 2026):
+/// `{"store_id": "<32 lowercase hex digits>", "created_at_ms": <Unix milliseconds>}`. Written once,
+/// by the first server to find none, and returned with every acknowledgement, so a sender can tell
+/// a store wiped and recreated behind the same address from the one its offset was saved against.
+pub const STORE_FILE: &str = "store.json";
 
 /// The file beside a rank's parts that keeps the order of its attempts (contract 1, decided Nov 19,
 /// 2026): `runs/<run_id>/rank=<rank>/attempts.json`.
@@ -371,6 +384,68 @@ impl Storage {
             _ => return Err("--store must be a directory, file://, s3:// or gs:// location".into()),
         };
         Ok(Self::new(store, root))
+    }
+
+    /// The store's ID, from `store.json` at its root, written first when there is none (L3). The
+    /// write is a create that fails if the file exists (`PutMode::Create`: a hard link on local disk,
+    /// `If-None-Match` on S3, a generation match on GCS), so two servers that start on an empty store
+    /// at once both end with the one that was written first. A store that cannot create
+    /// conditionally (S3 with conditional puts turned off) is written plainly and read back. A
+    /// `store.json` that is not a store ID is an error, never replaced: replacing it would make every
+    /// sender start its file again for nothing.
+    pub async fn store_id(&self) -> Result<String, Error> {
+        if let Some(id) = self.read_store_id().await? {
+            return Ok(id);
+        }
+        let id = new_store_id()?;
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        let document = serde_json::json!({"store_id": id, "created_at_ms": created_at_ms});
+        let payload = || PutPayload::from(Bytes::from(serde_json::to_vec_pretty(&document).expect("JSON")));
+        let path = self.store_file();
+        let create = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        match self.store.put_opts(&path, payload(), create).await {
+            Ok(_) => return Ok(id),
+            Err(object_store::Error::AlreadyExists { .. }) => {}
+            Err(object_store::Error::NotImplemented { .. }) => {
+                self.store.put(&path, payload()).await?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        self.read_store_id()
+            .await?
+            .ok_or_else(|| "store.json was written but cannot be read back".into())
+    }
+
+    /// The ID `store.json` names, none when there is no such file.
+    async fn read_store_id(&self) -> Result<Option<String>, Error> {
+        let bytes = match self.store.get(&self.store_file()).await {
+            Ok(response) => response.bytes().await?,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let id = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|document| document.get("store_id")?.as_str().map(String::from))
+            .filter(|id| {
+                !id.is_empty() && id.len() <= 128 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            });
+        match id {
+            Some(id) => Ok(Some(id)),
+            None => Err(format!(
+                "{} at the store root does not name a store ID; move it away to let the server write a new one",
+                STORE_FILE
+            )
+            .into()),
+        }
+    }
+
+    fn store_file(&self) -> Path {
+        self.root.clone().join(STORE_FILE)
     }
 
     /// Replaces `runs/<run_id>/watchdog.json`, the run's progress status. One `PUT`: a reader
@@ -1109,6 +1184,56 @@ mod tests {
                 error.contains("no S3 support") || error.contains("no GCS support"),
                 "{error}"
             );
+        }
+    }
+
+    /// L3 (lane AA3, Nov 20, 2026): servers that start on an empty store at once end with one ID,
+    /// the one written first, and a store's ID is read back as written.
+    #[tokio::test]
+    async fn servers_starting_at_once_on_an_empty_store_end_with_one_store_id() {
+        let store = Arc::new(InMemory::new());
+        let servers: Vec<Storage> = (0..8)
+            .map(|_| Storage::new(store.clone(), Path::from("prefix")))
+            .collect();
+        let ids = futures::future::try_join_all(servers.iter().map(Storage::store_id))
+            .await
+            .unwrap();
+        assert!(ids.iter().all(|id| id == &ids[0]), "{ids:?}");
+        assert_eq!(ids[0].len(), 32);
+        let written: serde_json::Value = serde_json::from_slice(
+            &store
+                .get(&Path::from("prefix/store.json"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["store_id"], ids[0]);
+        assert_eq!(servers[0].store_id().await.unwrap(), ids[0]);
+        // Another root in the same bucket is another store.
+        let beside = Storage::new(store.clone(), Path::from("other"))
+            .store_id()
+            .await
+            .unwrap();
+        assert_ne!(beside, ids[0]);
+    }
+
+    /// A `store.json` that names no ID is an error, and is left as it is: replacing it would give
+    /// the store a new ID and make every sender start its file again.
+    #[tokio::test]
+    async fn a_store_file_that_names_no_id_is_an_error_and_is_not_replaced() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("store.json");
+        for bad in [&b"not json"[..], br#"{"store_id": 7}"#, br#"{"store_id": "a/b"}"#] {
+            store.put(&path, PutPayload::from(bad.to_vec())).await.unwrap();
+            let error = Storage::new(store.clone(), Path::from(""))
+                .store_id()
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("store.json"), "{error}");
+            assert_eq!(store.get(&path).await.unwrap().bytes().await.unwrap().as_ref(), bad);
         }
     }
 
