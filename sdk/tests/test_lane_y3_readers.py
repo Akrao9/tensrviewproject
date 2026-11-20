@@ -166,12 +166,16 @@ def test_xc5_a_rank_file_holding_another_ranks_rows_is_not_counted_as_one_rank(t
     assert (found["ranks"], found["rank_count"]) == ([0, 1], 2)
 
 
-def test_xc5_an_evidence_file_beside_such_a_file_is_given_to_no_rank(tmp_path):
+def test_xc5_an_evidence_file_beside_such_a_file_names_the_rank_it_judged(tmp_path):
+    # Rewritten by lane AA5 (Nov 20, 2026): it pinned `evidence.rank` None ("given to no rank").
+    # The evidence names the rank it judged and the ranks the file held (lane Z2), so the row
+    # says rank 0's, and the other rank is still not judged.
     path = write(tmp_path / "job.rank0.jsonl",
                  [row(0, rank=0, run="job"), row(0, rank=1, run="job"), row(1, rank=0, run="job")])
     judged(path, rank=0)
     found = only_row(tmp_path)
-    assert found["evidence"]["rank"] is None and found["evidence"]["state"] == "ranks_unknown"
+    assert found["evidence"]["rank"] == 0 and found["evidence"]["state"] == "ranks_unknown"
+    assert found["evidence"]["ranks_in_source"] == [0, 1]
     assert found["run_state"] == "unknown"
 
 

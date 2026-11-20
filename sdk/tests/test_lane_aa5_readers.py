@@ -316,3 +316,75 @@ def test_l22_the_mcp_compare_runs_answer_has_the_count_bounded(tmp_path):
     assert len(dropped["ranks"]) == mcp_server.PER_RANK_ROWS and dropped["ranks_omitted"] == 6
     (described,) = [tool["description"] for tool in mcp_server.TOOLS if tool["name"] == "compare_runs"]
     assert "dropped_rows" in described and "upper bound" in described
+
+
+# --- 3. From lane Z2: the rank one rank's evidence of a shared file judged ------------------------
+
+
+def shared(folder: Path, name: str = "both.jsonl", ranks: tuple[int, ...] = (0, 1, 2), spike_on: int | None = None) -> Path:
+    """One file of several ranks, their rows interleaved; `spike_on` gives that rank a grad spike."""
+    rows = []
+    for step in range(60):
+        for rank in ranks:
+            found = row(step, rank=rank)
+            if rank == spike_on and step == 40:
+                found["grad_norm"] = 1e6
+            rows.append(found)
+    return write(folder / name, rows)
+
+
+def test_z2_the_row_names_the_rank_the_evidence_of_a_shared_file_judged(tmp_path):
+    """Fail before: `evidence.rank` None and "without saying which" in the detail, though the
+    evidence says `rank: 1` and `ranks_in_source: [0, 1, 2]`."""
+    path = shared(tmp_path, spike_on=1)
+    judged(path, rank=1)
+    found = only_row(tmp_path)
+    cell = found["evidence"]
+    assert (cell["state"], cell["rank"], cell["ranks_in_source"], cell["judged_ranks"]) == ("ranks_unknown", 1, [0, 1, 2], 1)
+    assert "its evidence file is rank 1's of the ranks 0, 1, 2 the file held when it was written" in cell["detail"]
+    assert "without saying which" not in cell["detail"]
+    # The other ranks are still not judged, and the incidents are rank 1's.
+    assert found["run_state"] == "unhealthy" and found["incidents"] == {"anomaly": 1}
+    assert "rank 1's" in cell["detail"] and "the other ranks are not judged" in cell["detail"]
+    # Rank 0's evidence, with no incident: unknown, never healthy.
+    judged(path, rank=0)
+    found = only_row(tmp_path)
+    assert (found["evidence"]["rank"], found["run_state"]) == (0, "unknown")
+    # The same for a file named for a rank, whose ranks the listing reads whole.
+    named = shared(tmp_path / "named", f"{RUN}.rank0.jsonl", spike_on=2)
+    judged(named, rank=2)
+    found = only_row(tmp_path / "named")
+    assert (found["rank_count"], found["evidence"]["rank"], found["evidence"]["ranks_in_source"]) == (3, 2, [0, 1, 2])
+    assert found["incidents"] == {"anomaly": 1}
+
+
+def test_z2_evidence_that_names_its_rank_without_the_ranks_in_source_still_names_it(tmp_path):
+    """Fail before: `evidence.rank` None. Evidence written when the file held its rank alone (it
+    has grown since) names the rank and no source ranks."""
+    path = shared(tmp_path)
+    evidence = ev.build_evidence(path, rank=2)
+    evidence.pop("ranks_in_source")
+    ev.write_evidence(evidence, path.with_suffix(".evidence.json"))
+    later = path.stat().st_mtime + 1
+    os.utime(path.with_suffix(".evidence.json"), (later, later))
+    cell = only_row(tmp_path)["evidence"]
+    assert cell["rank"] == 2 and "ranks_in_source" not in cell
+    assert "its evidence file is rank 2's: the row's incidents are rank 2's" in cell["detail"]
+
+
+@pytest.mark.parametrize("named", ["missing", None, True, "1", 7])
+def test_z2_evidence_that_names_no_rank_of_the_file_is_read_as_before(tmp_path, named):
+    """A control (passes before and after): evidence with no rank, a rank that is not a number,
+    or a rank the file is read not to hold (a file named for a rank: every line is read), is
+    given to no rank, as before."""
+    path = shared(tmp_path, f"{RUN}.rank0.jsonl")
+    evidence = ev.build_evidence(path, rank=1)
+    if named == "missing":
+        evidence.pop("rank")
+    else:
+        evidence["rank"] = named
+    ev.write_evidence(evidence, path.with_suffix(".evidence.json"))
+    later = path.stat().st_mtime + 1
+    os.utime(path.with_suffix(".evidence.json"), (later, later))
+    cell = only_row(tmp_path)["evidence"]
+    assert cell["rank"] is None and "ranks_in_source" not in cell and "without saying which" in cell["detail"]

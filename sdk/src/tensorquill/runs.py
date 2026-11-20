@@ -80,8 +80,12 @@ made into a list (XC6): the ranks without a file are a count, the row is unknown
 ranks (its ends name two, or, for a lone file, the manifest's `world_size` is above 1) is one
 rank's and does not say which, so it is given to no rank: its incidents are listed with no
 rank, its ranks are unknown (the row is `ranks_unknown`), and what was checked is not counted
-for them. The last step of such a file is its furthest rank's, each rank's read from its last
-line in the last megabyte. `compare` reads every rank of it.
+for them. When such a file is the run's only file and its evidence names the rank it judged
+(`rank`, with `ranks_in_source` when that rank was picked out of the file: lane Z2), the row's
+evidence cell names that rank and the ranks the file held (lane AA5, Nov 20, 2026); in a run of
+several files the evidence of such a file is still given to no rank. The last step of such a
+file is its furthest rank's, each rank's read from its last line in the last megabyte.
+`compare` reads every rank of it.
 
 A run without a manifest (every run recorded before the manifest existed) is listed under
 `uncategorized` with its run ID as its name.
@@ -948,10 +952,16 @@ def _file_step(path: Path, last: Mapping[str, Any] | None, known: Mapping[str, A
 
 def _local_shared_file_row(records: Path, known: Mapping[str, Any], row: dict[str, Any]) -> dict[str, Any]:
     """One `.jsonl` file that holds several ranks. Its evidence file, if any, is one rank's:
-    the command line judges one rank of such a file (`--rank N`) and does not write which. So
-    its incidents are listed as found, the run state is `unhealthy` if it shows any and
-    otherwise unknown (the other ranks are not judged: the all-ranks rule), and what was
-    checked is not counted for the run."""
+    the command line judges one rank of such a file (`--rank N`). So its incidents are listed as
+    found, the run state is `unhealthy` if it shows any and otherwise unknown (the other ranks
+    are not judged: the all-ranks rule), and what was checked is not counted for the run.
+
+    The evidence names the rank it judged (`rank`) and, when it was picked out of a file of
+    several ranks, the ranks that file held (`ranks_in_source`, lane Z2). When it names one of
+    the file's ranks, the row's evidence cell names it too (`rank`) and the detail says the ranks
+    the file held when it was written (lane AA5, Nov 20, 2026; it said "without saying which").
+    Evidence that names no rank, or one the file is read not to hold (its ranks all read), is
+    read as before."""
     first, last = known["ends"][records]
     # The furthest rank's, as for a run of several files or a store: the last line is one rank's,
     # and another rank may be ahead of it.
@@ -975,12 +985,25 @@ def _local_shared_file_row(records: Path, known: Mapping[str, Any], row: dict[st
     row["incidents"] = _by_class(incidents)
     row["first_incident"] = _first(incidents)
     row["run_state"] = "unhealthy" if (evidence.get("run_state") or {}).get("state") == "unhealthy" else "unknown"
+    judged = evidence.get("rank")
+    # A rank the file is read to hold, or any rank when the listing does not read all of them
+    # (`why`: a file of a name of its own is read at its ends only).
+    judged = judged if isinstance(judged, int) and not isinstance(judged, bool) and (
+        judged in known["ranks"] or "why" in known) else None
+    in_source = evidence.get("ranks_in_source")
+    in_source = (sorted(set(in_source)) if isinstance(in_source, list) and in_source
+                 and all(isinstance(n, int) and not isinstance(n, bool) for n in in_source) else None)
+    if judged is None:
+        whose = "one rank's, without saying which: the row's incidents are that rank's"
+    else:
+        held = f" of the {_rank_list(in_source)} the file held when it was written" if in_source else ""
+        whose = f"rank {judged}'s{held}: the row's incidents are rank {judged}'s"
     row["evidence"] = {
-        "state": "ranks_unknown", "rank": None, "path": look.get("path"), "judged_ranks": 1,
+        "state": "ranks_unknown", "rank": judged, "path": look.get("path"), "judged_ranks": 1,
         "unknown_ranks": len(known["ranks"]) - 1 if "why" not in known else None,
+        **({"ranks_in_source": in_source} if judged is not None and in_source else {}),
         **({"compact": True} if isinstance(evidence.get("compact"), Mapping) else {}),
-        "detail": f"{records.name} {holds}, and its evidence file is one "
-                  "rank's, without saying which: the row's incidents are that rank's, the other ranks are not judged, "
+        "detail": f"{records.name} {holds}, and its evidence file is {whose}, the other ranks are not judged, "
                   "and what was checked is not counted for the run (python -m tensorquill compare reads every rank)"
                   + ("; the records have grown since it was written" if look["state"] == "older_than_records" else ""),
     }
