@@ -958,3 +958,52 @@ def test_c12_a_parameter_that_appears_mid_run_adds_no_incident_in_rust(scale):
     before = server_report(_without(records, FIRST), binary=_server_binary())
     assert _kinds(now["incidents"]) == _kinds(before["incidents"])
     assert not any(i["kind"] in {"grad_spike", "update_spike", "stalled_weights"} for i in now["incidents"])
+
+
+# =============================================================================================
+# Item 5. L19: a declared `top_k` above `n_experts` refuses the router on the `indices=` path and on
+# the routing-map path too, with C06's reason, as it already did on the default integer path and on
+# the top-k-of-logits path. Before (on the commit before this item): both were counted, with `moe_top_k` 12.
+
+from test_router_guard import COMPILED, EXPERTS, Emits, _refused, _run  # noqa: E402
+
+from tensorquill.capture import Router  # noqa: E402
+
+ABOVE = (
+    f"its top_k is 12 but it has {EXPERTS} experts. To count it, pass routers={{'router': "
+    "tensorquill.Router(n_experts, top_k)} with its number of experts and a top_k of at most that number"
+)
+
+
+def _twelve_ids(output):
+    # Twelve ids for each token: every expert, then four again. The count check alone passes them.
+    return torch.cat([output.topk(EXPERTS, dim=-1).indices, output.topk(4, dim=-1).indices], dim=-1)
+
+
+def _routing_map(logits):
+    probs = logits.softmax(dim=-1)
+    top = probs.topk(2, dim=-1).indices
+    routing_map = torch.zeros_like(probs, dtype=torch.bool).scatter(-1, top, True)
+    return probs * routing_map, routing_map
+
+
+@COMPILED
+def test_l19_an_indices_function_under_a_top_k_above_the_experts_is_refused(tmp_path, compile_backend):
+    why = _refused(tmp_path, Emits(lambda logits: logits), "router", Router(EXPERTS, 12, indices=_twelve_ids),
+                   compile_backend)
+    assert why == ABOVE
+
+
+@COMPILED
+def test_l19_a_routing_map_under_a_top_k_above_the_experts_is_refused(tmp_path, compile_backend):
+    why = _refused(tmp_path, Emits(_routing_map), "router", Router(EXPERTS, 12), compile_backend)
+    assert why == ABOVE
+
+
+def test_l19_guard_the_same_routers_under_a_top_k_the_experts_allow_are_counted(tmp_path):
+    # Controls (pass on the commit before this item too): the refusal is the top_k's, nothing else.
+    records = _run(tmp_path / "ids", Emits(lambda logits: logits),
+                   {"router": Router(EXPERTS, 2, indices=lambda out: out.topk(2, dim=-1).indices)})
+    assert all(r["moe_stats"]["router"]["routed_tokens"] == 240 for r in records)
+    records = _run(tmp_path / "map", Emits(_routing_map), {"router": Router(EXPERTS, 2)})
+    assert all(r["moe_stats"]["router"]["routed_tokens"] == 240 and r["moe_top_k"]["router"] == 2 for r in records)

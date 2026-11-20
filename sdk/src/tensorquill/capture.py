@@ -125,8 +125,9 @@ class Router:
     reason naming the count, the tokens and the declared `top_k`, since `moe_top_k` tells the
     detectors how large an expert's share can be. Judged from shapes alone, so the same under
     `torch.compile`; not judged when the tokens cannot be read from the router's first argument.
-    A `top_k` above `n_experts` refuses the router on the default integer tensor, as it does on
-    the top-k-of-logits path, with the reason "its top_k is K but it has E experts".
+    A `top_k` above `n_experts` refuses the router on every path (the default integer tensor, a
+    function given as `indices`, a routing map and the top-k of logits), with the reason "its
+    top_k is K but it has E experts".
 
     Expert ids, from `indices` or the default integer tensor, are judged on their values (the
     author's decision on C06): an id below 0 is no assignment (Megatron's -1 for no route), not
@@ -623,6 +624,13 @@ def _router_hook(
             if each is not None:
                 refuse(lambda: _ids_per_token_why("its indices= function returned", chosen, tokens, spec), f"top_k={each}")
                 return
+            if spec.top_k > spec.n_experts:
+                # As on the default integer path (C06): ids that do number `top_k` for each token are
+                # still judged against 1 / top_k by the share detectors, so with more ids a token than
+                # experts they are refused, not counted (L19). From the `Router` alone, after the
+                # count checks above, which name their own reason.
+                refuse(lambda: f"its top_k is {spec.top_k} but it has {spec.n_experts} experts", "top_k")
+                return
         else:
             idx = _first_tensor(output, integer=True)
             if idx is not None:
@@ -661,6 +669,12 @@ def _router_hook(
                 # float is exactly zero are left out: the padding `pad_to_capacity` adds to the map,
                 # and with it a real assignment whose weight is exactly zero (an underflow, say).
                 routing_map, paired = found
+                if spec.top_k > spec.n_experts:
+                    # A map routes a token to each expert at most once, so it cannot hold `top_k`
+                    # assignments a token, and `moe_top_k` would judge its shares against the wrong
+                    # limit (L19, C06's refusal). From the `Router` alone.
+                    refuse(lambda: f"its top_k is {spec.top_k} but it has {spec.n_experts} experts", "top_k")
+                    return
                 for tensor, what in ((routing_map, "its routing map"), (paired, "the float tensor paired with its routing map")):
                     wrong = None if tensor is None else _unusable(tensor, counts.device, what)
                     if wrong is not None:
