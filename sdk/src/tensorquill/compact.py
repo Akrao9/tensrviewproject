@@ -4,8 +4,9 @@ For an MoE run the per-step `samples` (one per router per step) are nearly the w
 `evidence.json`: 86 MB of an 86 MB file at 10,000 steps of a 24-router, 32-expert run, where
 everything else is under 4 KB. An agent needs the incidents and what the routing looked like
 around them. `compact_evidence` keeps every key of the evidence as it is and, of `samples`,
-only the steps within a short window of each MoE incident; a `compact` key says what was
-kept, how much was left out and the last step that was still flagged.
+only the steps within a short window of each MoE incident and of each later step a starved
+expert's starvation began on; a `compact` key says what was kept, how much was left out and
+the last step that was still flagged.
 
     python -m tensorquill run.jsonl --compact            # writes run.evidence.compact.json
     python -m tensorquill run.jsonl --compact-window 20  # 20 recorded steps each side
@@ -84,12 +85,15 @@ def compact_evidence(evidence: Mapping[str, Any], window: int = DEFAULT_WINDOW) 
     """The compact form of `evidence` (what `build_evidence` or a watcher made).
 
     Every key is kept as it is but `samples`, of which only the steps within `window`
-    recorded steps of a MoE incident's step stay (every router of those steps), and of the
-    first flagged sample when no incident names it. A `compact` key is added before `samples`:
+    recorded steps of a MoE incident's step stay (every router of those steps), of each later
+    starvation onset (`ONSET_WINDOWS`), and of the first flagged sample when no incident names
+    it; and a router's last sample before a window when it routed no token before it
+    (`unrouted_before`). A `compact` key is added before `samples`:
 
         version        1
         window         recorded steps kept on each side of an incident's step
-        around         the incidents the windows are around: `[{"kind", "step"}]`
+        around         what the windows are around: `[{"kind", "step"}]`, the incidents, then
+                       `starved_expert_onset` for a later onset, `first_flagged_sample`
         kept_steps     `[[first, last], ...]`: the ranges of steps whose samples are here
         steps          `{"total", "kept", "omitted"}`: recorded steps with MoE samples
         samples        `{"total", "kept", "omitted"}`: samples (a router on a step)
@@ -183,6 +187,8 @@ def _unrouted_before(samples: list[Mapping[str, Any]], firsts: list[int]) -> tup
     compares the range's steps with it, as on the full evidence, with no delta to show, and no
     other reader of the samples takes a step with no token routed for one (lane X5, DET-13: the
     table at such a step was refused although nothing was missing for it)."""
+    if not firsts:  # no window, or only one at the run's first step: nothing before it
+        return [], set()
     by_layer: dict[int, list[Mapping[str, Any]]] = {}
     for sample in sorted(samples, key=lambda s: int(s["step"])):
         by_layer.setdefault(int(sample["layer"]), []).append(sample)
@@ -312,7 +318,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--compact",
         action="store_true",
         help="write the compact evidence file an agent reads instead of the full one: every incident and every "
-        "other key, and of the per-step MoE samples only the steps around each MoE incident, with a `compact` key "
+        "other key, and of the per-step MoE samples only the steps around each MoE incident and each later "
+        "starvation onset, with a `compact` key "
         "that counts what was left out (at 10,000 steps of a 24-router run: about 0.2 MB instead of 86 MB). "
         "Default output: <input>.evidence.compact.json, so a full file is never replaced; run again without "
         "--compact for the full file",
@@ -322,6 +329,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         type=_window_argument,
         metavar="N",
         help=f"with --compact (and implies it): recorded steps kept on each side of a MoE incident's step "
+        f"(and of a later starvation onset) "
         f"(default: {DEFAULT_WINDOW}; 0 keeps the incident's own step alone)",
     )
 

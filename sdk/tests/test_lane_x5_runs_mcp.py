@@ -360,7 +360,7 @@ def test_det13_a_window_whose_router_routed_nothing_before_it_still_has_its_tabl
 
 
 def test_det13_a_later_starvation_onset_gets_a_window_of_its_own():
-    from tensorquill.compact import ONSET_WINDOWS, compact_evidence
+    from tensorquill.compact import compact_evidence
 
     experts = [{"layer": 2, "expert": 1, "step": 40, "window_share": 0.001},
                {"layer": 2, "expert": 2, "step": 40, "window_share": 0.002},
@@ -372,6 +372,8 @@ def test_det13_a_later_starvation_onset_gets_a_window_of_its_own():
                                 {"kind": "starved_expert_onset", "step": 150}]
     assert marker["kept_steps"] == [[38, 42], [98, 102], [148, 152]]
     assert "starved_onsets_without_window" not in marker
+
+    from tensorquill.compact import ONSET_WINDOWS  # after the behaviour, which fails first on the old code
 
     # Onsets are bounded: past ONSET_WINDOWS later onset steps, the marker counts the rest.
     many = [{"layer": 1, "expert": 1, "step": 40, "window_share": 0.0}] + [
