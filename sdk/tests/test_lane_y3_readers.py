@@ -166,12 +166,16 @@ def test_xc5_a_rank_file_holding_another_ranks_rows_is_not_counted_as_one_rank(t
     assert (found["ranks"], found["rank_count"]) == ([0, 1], 2)
 
 
-def test_xc5_an_evidence_file_beside_such_a_file_is_given_to_no_rank(tmp_path):
+def test_xc5_an_evidence_file_beside_such_a_file_names_the_rank_it_judged(tmp_path):
+    # Rewritten by lane AA5 (Nov 20, 2026): it pinned `evidence.rank` None ("given to no rank").
+    # The evidence names the rank it judged and the ranks the file held (lane Z2), so the row
+    # says rank 0's, and the other rank is still not judged.
     path = write(tmp_path / "job.rank0.jsonl",
                  [row(0, rank=0, run="job"), row(0, rank=1, run="job"), row(1, rank=0, run="job")])
     judged(path, rank=0)
     found = only_row(tmp_path)
-    assert found["evidence"]["rank"] is None and found["evidence"]["state"] == "ranks_unknown"
+    assert found["evidence"]["rank"] == 0 and found["evidence"]["state"] == "ranks_unknown"
+    assert found["evidence"]["ranks_in_source"] == [0, 1]
     assert found["run_state"] == "unknown"
 
 
@@ -184,13 +188,16 @@ def big_rank_file(path: Path, *, other_rank_at: int | None = None, run: str = RU
     return path
 
 
-def test_xc5_a_large_rank_file_with_no_world_size_says_its_count_is_not_known(tmp_path):
-    # Rank 1's row is in the middle, which the listing does not read: nothing settles the count.
+def test_xc5_a_large_rank_file_with_no_world_size_is_counted_from_every_line(tmp_path):
+    # Rewritten by lane AA5 (Nov 20, 2026): it pinned "1+" (`rank_count` None, "middle" in the
+    # reason). Rank 1's row is in the middle, which the listing scans for each line's rank (L21):
+    # every line is read, so the file holds ranks 0 and 1 and the count is settled without a
+    # manifest. Where the scan cannot read every line the count is still not known
+    # (`test_lane_aa5_readers.py`).
     big_rank_file(tmp_path / f"{RUN}.rank0.jsonl", other_rank_at=2)
     found = only_row(tmp_path)
-    assert found["ranks"] == [0] and found["rank_count"] is None
-    assert "middle" in found["rank_count_not_known"]
-    assert "1+" in runs_module.listing_text([found], tmp_path)
+    assert (found["ranks"], found["rank_count"]) == ([0, 1], 2) and "rank_count_not_known" not in found
+    assert "1+" not in runs_module.listing_text([found], tmp_path)
 
 
 def test_xc5_a_large_rank_file_is_counted_when_the_manifest_settles_it(tmp_path):

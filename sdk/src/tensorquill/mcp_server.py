@@ -1360,12 +1360,16 @@ def compare_runs(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
     project = _text_argument(arguments, "project")
     rank = _integer(arguments, "rank", minimum=0)
     try:
-        return _compare.compare_runs(*wanted, source=folder, project=project, rank=rank, paths=False,
-                                     read_parts=False)
+        result = _compare.compare_runs(*wanted, source=folder, project=project, rank=rank, paths=False,
+                                       read_parts=False)
     except (ValueError, OSError, RuntimeError) as error:
         # A run that is not there, a name that fits several runs (the message lists their IDs),
         # or records that cannot be read.
         raise ToolError(f"{error} (the runs are looked up at {folder}; list_runs shows them)") from None
+    # L22 (lane AA5): a store run's dropped rows, with the ranks bounded as the other answers bound them.
+    result["runs"] = [{**run, "dropped_rows": _dropped_shown(run["dropped_rows"])} if "dropped_rows" in run else run
+                      for run in result["runs"]]
+    return result
 
 
 # --- The tools, as the protocol lists them --------------------------------------------------
@@ -1563,7 +1567,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " those not read, or, when every rank is read, those without a current report (not clean). Local files"
             " are judged here. A run in a server's store is read from the server's reports and no part is opened; a"
             " rank whose report is not current is unknown, and when no rank's is, the tool says so and compares"
-            " nothing."
+            " nothing. `runs[].dropped_rows`, only for a run in a server's store whose server dropped rows with a"
+            " null key (with `rank`, that rank's): the rows in all, by null key and by rank, the ranks listed up to"
+            f" {PER_RANK_ROWS} (`ranks_omitted` counts the rest). It is an upper bound: a batch sent again after a"
+            " lost acknowledgement is counted again. A run that dropped none has no such key."
         ),
         "inputSchema": {
             "type": "object",

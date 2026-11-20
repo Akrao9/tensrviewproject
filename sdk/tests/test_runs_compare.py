@@ -1061,14 +1061,16 @@ def test_a_file_of_several_ranks_is_listed_with_its_ranks_and_never_as_one(tmp_p
     manifest_file(folder, "both", world_size=2)
     monkeypatch.undo()
 
-    # Its evidence file is one rank's and does not say which: its incidents are listed, the
-    # run is never called healthy for it, and what was checked is not counted for the run.
+    # Its evidence file is one rank's: its incidents are listed, the run is never called
+    # healthy for it, and what was checked is not counted for the run. Rewritten by lane AA5
+    # (Nov 20, 2026): the cell's `rank` was None ("without saying which"); the evidence names the
+    # rank it judged and the ranks the file held (lane Z2), and the row says them.
     assert cli(str(both), "--rank", "0", cwd=folder).returncode == 0
     (row,) = tensorquill.list_runs(folder)
     assert (row["run_state"], row["incidents"], row["kinds_checked"]) == ("unknown", {}, None)
     assert (row["evidence"]["state"], row["evidence"]["rank"], row["evidence"]["judged_ranks"], row["evidence"]["unknown_ranks"]) == (
-        "ranks_unknown", None, 1, 1)
-    assert "its evidence file is one rank's, without saying which" in row["evidence"]["detail"]
+        "ranks_unknown", 0, 1, 1)
+    assert "its evidence file is rank 0's of the ranks 0, 1 the file held when it was written" in row["evidence"]["detail"]
     assert cli(str(both), "--rank", "1", cwd=folder).returncode == 0
     (row,) = tensorquill.list_runs(folder)
     assert (row["run_state"], row["incidents"], row["first_incident"]) == (
@@ -1108,7 +1110,8 @@ def test_a_file_named_for_its_rank_or_of_one_rank_is_counted_as_before(tmp_path)
     assert cli(str(folder / "ends-alike.jsonl"), "--rank", "0", cwd=folder).returncode == 0
     row = {r["run_id"]: r for r in tensorquill.list_runs(folder)}["ends-alike"]
     assert (row["rank_count"], row["run_state"], row["kinds_checked"]) == (None, "unknown", None)
-    assert (row["evidence"]["state"], row["evidence"]["rank"]) == ("ranks_unknown", None)
+    # Rewritten by lane AA5: the cell's `rank` was None; the evidence names rank 0.
+    assert (row["evidence"]["state"], row["evidence"]["rank"]) == ("ranks_unknown", 0)
     assert "may hold several ranks (its first and last records name rank 0)" in row["evidence"]["detail"]
 
 
@@ -1312,16 +1315,20 @@ def test_a_file_named_for_a_rank_whose_first_or_last_record_names_another_is_not
         rows = {row["run_id"]: row for row in tensorquill.list_runs(folder)}
     for run, file in (("x", both), ("y", other)):
         row = rows[run]
-        assert (row["ranks"], row["rank_count"]) == ([0, 1], None), run
-        assert f"{file.name} is named for rank 0 and its first and last records name rank" in row["rank_count_not_known"]
-        # Its evidence file would be one rank's without saying which, as for a file of its own name.
+        # Rewritten by lane AA5 (Nov 20, 2026): the count was None ("may hold other ranks"). Every
+        # line of a file named for a rank is read (the last megabyte, and the scan of the part
+        # before it), so the ranks it holds are all named and the count is theirs and its name's.
+        assert (row["ranks"], row["rank_count"]) == ([0, 1], 2) and "rank_count_not_known" not in row, run
+        assert f"{file.name} holds ranks 0, 1" in row["evidence"]["detail"], run
+        # Its evidence file would be one rank's of several, as for a file of its own name.
         assert (row["evidence"]["state"], row["evidence"]["rank"]) == ("missing", None)
     # The manifest's world size settles the count, as for a file of its own name.
     manifest_file(folder, "x", world_size=2)
     judged(both, rank=1)
     row = {r["run_id"]: r for r in tensorquill.list_runs(folder)}["x"]
     assert (row["ranks"], row["rank_count"], row["run_state"], row["kinds_checked"]) == ([0, 1], 2, "unknown", None)
-    assert (row["evidence"]["state"], row["evidence"]["rank"]) == ("ranks_unknown", None)
+    # Rewritten by lane AA5: the cell's `rank` was None; the evidence names rank 1.
+    assert (row["evidence"]["state"], row["evidence"]["rank"]) == ("ranks_unknown", 1)
     # `compare` reads every record, and says what the file named for rank 0 holds.
     reference = local_run(tmp_path / "other", "one")
     assert tensorquill.compare_runs(both, reference)["runs"][0]["rank_count"] == 2
@@ -1334,8 +1341,9 @@ def test_a_file_named_for_a_rank_whose_first_or_last_record_names_another_is_not
     local_run(folder, "z", project="p", name="z")
     write_capture(folder / "z.rank1.jsonl", dense(60, run="z", rank=2))
     (row,) = tensorquill.list_runs(folder)
-    assert (row["ranks"], row["rank_count"]) == ([0, 1, 2], None)
-    assert "z.rank1.jsonl is named for rank 1 and its first and last records name rank 2" in row["rank_count_not_known"]
+    # Rewritten by lane AA5: the count was None. Both files are read on every line: rank 0's
+    # holds rank 0, rank 1's holds rank 2 alone, and the ranks are those and rank 1's name.
+    assert (row["ranks"], row["rank_count"]) == ([0, 1, 2], 3) and "rank_count_not_known" not in row
     # A file whose first and last records name its own rank is trusted, as before.
     folder = tmp_path / "trusted"
     for rank in (0, 1):

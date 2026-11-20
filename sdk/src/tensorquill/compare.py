@@ -50,6 +50,13 @@ A run's `last_step` is where it stands after any resume: the highest step of the
 detectors judge (`evidence.resolve_attempts`), not of every attempt. A rank whose records are
 in several local files is read from all of them, the attempts resolved across them.
 
+A run in a server's store whose server dropped rows with a null key (`dropped_rows` and
+`dropped_row_keys` on a rank's entry of `watchdog.json`) has `dropped_rows` on its entry in
+`runs` (`runs.dropped_rows`: in all, by key and by rank; with `rank`, that rank's alone) and a
+line under it in the summary. The count is an upper bound: a batch sent again after a lost
+acknowledgement is counted again (L22, lane AA5, Nov 20, 2026). A run that dropped none, and
+every local run, has no such key, and its result is as before.
+
 `compare_runs` returns the result and writes nothing. The command line writes `compare.json`.
 """
 
@@ -586,8 +593,34 @@ def open_run(wanted: str | Path, source: str | Path | None = None, project: str 
                 f"{path} holds {len(found)} runs; name one by its ID or name with source={str(path)!r}")
         run = found[0]
     opened = _open_local(run, rank) if run["source"] == "local" else _open_store(run, rank, read_parts)
+    # With `rank`, the rank read: a run of one rank is read on the rank it has (`_open_store`).
+    read = opened["read_from"].get("rank") if rank is not None else None
+    dropped = _store_dropped(Path(run["path"]), read) if run["source"] != "local" else None
     return {"run_id": run["run_id"], "manifest": run.get("manifest"),
-            "block": _manifest.run_block(run["run_id"], run.get("manifest")), **opened}
+            "block": _manifest.run_block(run["run_id"], run.get("manifest")), **opened,
+            **({"dropped_rows": dropped} if dropped is not None else {})}
+
+
+def _store_dropped(folder: Path, rank: int | None) -> dict[str, Any] | None:
+    """The rows a store run's server dropped for a null key (`runs.dropped_rows`, from its
+    `watchdog.json`; L22, lane AA5, Nov 20, 2026): the whole run's, or with `rank` (the rank
+    read) that rank's alone, in the same shape. None when none was dropped (of that rank), so such a run's result
+    is as before. An upper bound: a batch sent again after a lost acknowledgement is counted
+    again. Never raises."""
+    from .evidence import read_watchdog
+
+    try:
+        dropped = _runs.dropped_rows(read_watchdog(folder / "watchdog.json"))
+    except (OSError, ValueError):
+        return None
+    if dropped is None or rank is None:
+        return dropped
+    mine = [item for item in dropped["ranks"] if item.get("rank") == rank]
+    if not mine:
+        return None
+    (item,) = mine
+    return {"rows": item["rows"], **({"by_key": item["by_key"]} if item.get("by_key") else {}), "ranks": mine,
+            "upper_bound": True, "note": dropped["note"]}
 
 
 # --- Part 1: the setup ----------------------------------------------------------------------
@@ -1172,6 +1205,8 @@ def compare_runs(*runs: str | Path, source: str | Path | None = None, project: s
             "rank_count": (len(run["read_from"]["ranks"]) if run["read_from"].get("ranks")
                            and not run["read_from"].get("ranks_not_counted") else None),
             "read_from": run["read_from"],
+            # L22: only for a store run whose server dropped rows (of the rank read, with `rank`).
+            **({"dropped_rows": run["dropped_rows"]} if run.get("dropped_rows") else {}),
         } for label, wanted, run in zip(labels, runs, opened)],
         # The order of the four parts is part of the format: what was checked is read before
         # the incidents.
@@ -1258,6 +1293,8 @@ def summary_text(result: Mapping[str, Any]) -> str:
             + f"{run['incidents']} incident{'s' if run['incidents'] != 1 else ''}; {rank}{of} from {read['path']}"
             + (" (a line that is not whole was left out: the run may still be going)" if read.get("unfinished_lines_left_out") else "")
         )
+        if run.get("dropped_rows"):
+            lines.append(f"      {run['label']}: {_runs._dropped_text(run['dropped_rows'])}")
 
     setup = result["setup"]
     lines.append(f"1. Setup: {len(setup['differs'])} difference{'s' if len(setup['differs']) != 1 else ''}")
