@@ -44,4 +44,12 @@ behind the same address from the one its saved offset belongs to; a restarted se
 other address that reaches the same store, return the same ID. Do not copy `store.json` from one
 store to another.
 
+The ID is written with a create that fails if the file already exists, so servers that start at
+once on an empty store agree on one. Local disk and GCS always support that, and so does S3 unless
+`AWS_CONDITIONAL_PUT=disabled` is set. On a backend that cannot, the server will not write
+`store.json` (two servers starting at once could give one store two IDs) and refuses to start until
+the ID is provisioned: put a `store.json` at the store root holding
+`{"store_id": "<32 lowercase hex digits>"}` (for example from `openssl rand -hex 16`), once, or turn
+conditional writes back on. An existing `store.json` is used on any backend.
+
 Licensed under either of Apache License, Version 2.0 or the MIT license, at your option.

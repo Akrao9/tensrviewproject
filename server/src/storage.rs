@@ -27,6 +27,19 @@ const FOOTER_PREFETCH_BYTES: usize = 64 * 1024;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
+/// Why a store with no `store.json` whose backend cannot create one atomically gets none, and the
+/// two ways out.
+fn no_conditional_create(path: &Path) -> String {
+    format!(
+        "the store has no {STORE_FILE} and its backend cannot create one atomically (a conditional \
+         create is not supported), so the server writes none: two servers starting at once could each \
+         write their own and give one store two IDs. Either provision the ID once by putting a \
+         {STORE_FILE} at the store root (the object `{path}`) holding {{\"store_id\": \"<32 lowercase \
+         hex digits, such as `openssl rand -hex 16` prints>\"}}, or turn on conditional writes for the backend (on S3, AWS_CONDITIONAL_PUT=etag, \
+         its default, on a service that honours If-None-Match)"
+    )
+}
+
 /// A new store ID: 128 bits from the operating system's random source, as 32 lowercase hex digits.
 fn new_store_id() -> Result<String, Error> {
     let mut bytes = [0u8; 16];
@@ -386,13 +399,19 @@ impl Storage {
         Ok(Self::new(store, root))
     }
 
-    /// The store's ID, from `store.json` at its root, written first when there is none (L3). The
-    /// write is a create that fails if the file exists (`PutMode::Create`: a hard link on local disk,
-    /// `If-None-Match` on S3, a generation match on GCS), so two servers that start on an empty store
-    /// at once both end with the one that was written first. A store that cannot create
-    /// conditionally (S3 with conditional puts turned off) is written plainly and read back. A
-    /// `store.json` that is not a store ID is an error, never replaced: replacing it would make every
-    /// sender start its file again for nothing.
+    /// The store's ID, from `store.json` at its root, written first when there is none (L3). An
+    /// existing `store.json` that names an ID is used on any backend. The write is a create that
+    /// fails if the file exists (`PutMode::Create`: a hard link on local disk, `If-None-Match` on S3,
+    /// a generation match on GCS), so two servers that start on an empty store at once both end with
+    /// the one that was written first.
+    ///
+    /// A backend that cannot create conditionally (`NotImplemented`: S3 with `AWS_CONDITIONAL_PUT`
+    /// set to `disabled`; none of the supported backends by default) gets no `store.json` written:
+    /// the call fails with an error that says how to provision the ID or turn conditional writes on.
+    /// Until Nov 20, 2026 it wrote plainly and read back, and two servers starting at once could each
+    /// read back their own ID and acknowledge two IDs for one store. A `store.json` that is not a store
+    /// ID is an error, never replaced: replacing it would make every sender start its file again for
+    /// nothing.
     pub async fn store_id(&self) -> Result<String, Error> {
         if let Some(id) = self.read_store_id().await? {
             return Ok(id);
@@ -411,9 +430,7 @@ impl Storage {
         match self.store.put_opts(&path, payload(), create).await {
             Ok(_) => return Ok(id),
             Err(object_store::Error::AlreadyExists { .. }) => {}
-            Err(object_store::Error::NotImplemented { .. }) => {
-                self.store.put(&path, payload()).await?;
-            }
+            Err(object_store::Error::NotImplemented { .. }) => return Err(no_conditional_create(&path).into()),
             Err(error) => return Err(error.into()),
         }
         self.read_store_id()
@@ -829,6 +846,9 @@ mod tests {
         inner: Arc<dyn ObjectStore>,
         gets: Mutex<Vec<Option<GetRange>>>,
         reject_suffix: bool,
+        /// A create that fails if the object exists (`PutMode::Create`) is `NotImplemented`, as on S3
+        /// with conditional puts turned off.
+        no_conditional_create: bool,
     }
 
     impl SpyStore {
@@ -837,6 +857,14 @@ mod tests {
                 inner,
                 gets: Mutex::new(Vec::new()),
                 reject_suffix,
+                no_conditional_create: false,
+            }
+        }
+
+        fn without_conditional_create(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                no_conditional_create: true,
+                ..Self::new(inner, false)
             }
         }
 
@@ -867,6 +895,13 @@ mod tests {
             'life1: 'async_trait,
             Self: 'async_trait,
         {
+            if self.no_conditional_create && matches!(opts.mode, PutMode::Create) {
+                return futures::future::err(object_store::Error::NotImplemented {
+                    operation: "`put_opts` with mode `PutMode::Create` when conditional put is disabled".into(),
+                    implementer: self.to_string(),
+                })
+                .boxed();
+            }
             self.inner.put_opts(location, payload, opts)
         }
 
@@ -1218,6 +1253,66 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(beside, ids[0]);
+    }
+
+    /// L3 follow-up (author's review of the trial merge, Nov 20, 2026): a backend that cannot create
+    /// `store.json` atomically writes none. Until then it wrote one plainly and read it back, so two
+    /// servers starting at once could each write, each read back its own, and acknowledge two IDs for
+    /// one store.
+    #[tokio::test]
+    async fn without_a_conditional_create_an_empty_store_gets_no_id_and_nothing_is_written() {
+        let inner = Arc::new(InMemory::new());
+        let spy = Arc::new(SpyStore::without_conditional_create(inner.clone()));
+        let error = Storage::new(spy, Path::from("prefix"))
+            .store_id()
+            .await
+            .unwrap_err()
+            .to_string();
+        for said in [
+            "store.json",
+            "two servers",
+            r#"{"store_id": "#,
+            "AWS_CONDITIONAL_PUT=etag",
+        ] {
+            assert!(error.contains(said), "{said:?} not in {error}");
+        }
+        let written: Vec<_> = inner.list(None).try_collect().await.unwrap();
+        assert!(written.is_empty(), "{written:?}");
+    }
+
+    /// The same backend holding a valid `store.json` (one an operator put there): its ID is returned.
+    #[tokio::test]
+    async fn without_a_conditional_create_a_provisioned_store_id_is_used() {
+        let inner = Arc::new(InMemory::new());
+        let id = "0123456789abcdef0123456789abcdef";
+        inner
+            .put(
+                &Path::from("prefix/store.json"),
+                PutPayload::from(format!(r#"{{"store_id": "{id}"}}"#).into_bytes()),
+            )
+            .await
+            .unwrap();
+        let spy = Arc::new(SpyStore::without_conditional_create(inner.clone()));
+        assert_eq!(Storage::new(spy, Path::from("prefix")).store_id().await.unwrap(), id);
+    }
+
+    /// Two servers that start at once on the empty store: neither gets an ID, and the store stays
+    /// empty, so no sender is ever told two IDs for it.
+    #[tokio::test]
+    async fn without_a_conditional_create_two_servers_on_an_empty_store_get_no_id() {
+        let inner = Arc::new(InMemory::new());
+        let servers: Vec<Storage> = (0..2)
+            .map(|_| {
+                Storage::new(
+                    Arc::new(SpyStore::without_conditional_create(inner.clone())),
+                    Path::from("prefix"),
+                )
+            })
+            .collect();
+        let (a, b) = futures::join!(servers[0].store_id(), servers[1].store_id());
+        assert!(a.is_err() && b.is_err(), "{a:?} {b:?}");
+        let written: Vec<_> = inner.list(None).try_collect().await.unwrap();
+        assert!(written.is_empty(), "{written:?}");
     }
 
     /// A `store.json` that names no ID is an error, and is left as it is: replacing it would give
