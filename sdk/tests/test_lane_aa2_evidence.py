@@ -75,13 +75,18 @@ def _store(tmp_path: Path, ranks: list[int], status: dict, reports: dict[int, di
     return run
 
 
-@pytest.fixture
-def no_part_is_opened(monkeypatch):
-    """The store's all-ranks view reads the reports and the status, and opens no part."""
+def _refuse_parts(monkeypatch) -> None:
+    """From here on, opening a part or comparing observations here fails the test."""
     def refuse(*_args, **_kwargs):
         raise AssertionError("the store's all-ranks view opened a part")
     monkeypatch.setattr(ev, "_read_part", refuse)
     monkeypatch.setattr(ev, "_replica_judged", refuse)
+
+
+@pytest.fixture
+def no_part_is_opened(monkeypatch):
+    """The store's all-ranks view reads the reports and the status, and opens no part."""
+    _refuse_parts(monkeypatch)
 
 
 # --- 1. Decision 4: a status with no `replica` key ----------------------------------------------
@@ -176,3 +181,102 @@ def _wait_for_status(run, done) -> dict:
             pass
         assert time.monotonic() < deadline, "watchdog.json never said what was waited for"
         time.sleep(0.05)
+
+
+# --- 2. Decision 8: two sources on one step ------------------------------------------------------
+#
+# The author's rule: the evidence keeps two findings, each with its own scope, and a display may
+# group them while showing both sources. These tests pin what the base already does, so they pass
+# there too (run on the base export: the 4 pass); no code changed for this item.
+
+UNSCOPED = "explicit_spread_without_a_scope_and_both_drift"
+SCOPED = "explicit_spread_and_observations_on_one_step"
+LAUNCH = "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47"
+
+
+def _local_view(records: list[dict], tolerance: float) -> dict:
+    """Every rank of a run kept as local files, as `compare` puts them together."""
+    per_rank = {}
+    for rank in sorted({r["rank"] for r in records}):
+        own = [r for r in records if r["rank"] == rank]
+        per_rank[rank] = {**ev.build_evidence(own, drift_tolerance=tolerance), "last_step": max(r["step"] for r in own)}
+    return ev.combine_rank_evidence(per_rank, replica_records=records, drift_tolerance=tolerance)
+
+
+def _two_sources_shown(view: dict, tolerance: float) -> None:
+    """The stored result holds both entries, each with its own scope; the run's incident is the
+    observations' and names the gathered spread; its words name both."""
+    body, _ = _case(UNSCOPED)
+    assert view["replica"]["replica_drift"] == body["expected"]["replica_drift"]
+    observed, gathered = view["replica"]["replica_drift"]
+    assert (observed["source"], observed["launch"], observed["group"]) == ("replica", LAUNCH, [0, 1])
+    assert gathered["source"] == "replica_spread" and "launch" not in gathered and "group" not in gathered
+    [found] = [i for i in view["run_incidents"] if i.get("kind") == "replica_drift"]
+    assert (found["source"], found["step"], found["launch"], found["group"]) == ("replica", 99, LAUNCH, [0, 1])
+    assert list(found["parameters"]) == ["w"] and found["tolerance"] == tolerance
+    assert found["also"] == [{"source": "replica_spread", "parameters": ["w"]}]
+    text = ev._describe(found)
+    assert "from the observations of ranks 0-1" in text and "a gathered spread (replica_spread) shows drift" in text
+    assert text in ev._all_ranks_summary(view)
+    # Each rank's own record is judged as before (contract 6), as that rank's incident.
+    [group] = [g for g in view["incident_groups"] if g["kind"] == "replica_drift"]
+    assert group["ranks"] == [0, 1] and group["incident"]["step"] == 99 and list(group["incident"]["parameters"]) == ["w"]
+
+
+def test_two_sources_on_one_step_in_the_local_all_ranks_view():
+    body, tolerance = _case(UNSCOPED)
+    _two_sources_shown(_local_view(body["records"], tolerance), tolerance)
+
+
+def test_two_sources_on_one_step_in_the_store_view(tmp_path, no_part_is_opened):
+    body, tolerance = _case(UNSCOPED)
+    replica = {"v": 1, "tolerance": tolerance, **body["expected"]}
+    evidence = ev.all_ranks_evidence(_store(tmp_path, [0, 1], _status([0, 1], replica)))
+    _two_sources_shown_from_the_server(evidence, replica)
+
+
+def _two_sources_shown_from_the_server(evidence: dict, replica: dict) -> None:
+    """As `_two_sources_shown`, for the server's result: the spreads of the observations were
+    computed by the server, so the incident names the parameters without them."""
+    assert evidence["replica"] == replica
+    [found] = [i for i in evidence["run_incidents"] if i.get("kind") == "replica_drift"]
+    assert (found["source"], found["launch"], found["group"], found["parameters"]) == ("replica", LAUNCH, [0, 1], {"w": {}})
+    assert found["also"] == [{"source": "replica_spread", "parameters": ["w"]}]
+    assert ev._describe(found) in ev._all_ranks_summary(evidence)
+    assert "a gathered spread (replica_spread) shows drift on that step too" in ev._all_ranks_summary(evidence)
+
+
+def test_two_sources_on_one_step_in_one_ranks_evidence():
+    """One rank's evidence compares no other rank, so the observations' step is `insufficient`
+    there and only the gathered spread, judged on the rank's own record, is listed: the second
+    entry is due only where every rank's observation is read (the two views above)."""
+    body, tolerance = _case(UNSCOPED)
+    evidence = ev.build_evidence(body["records"], rank=0, drift_tolerance=tolerance)  # a file of both ranks
+    assert evidence["replica"]["replica_drift"] == [{"step": 99, "parameters": ["w"], "source": "replica_spread"}]
+    [step] = evidence["replica"]["steps"]
+    assert (step["coverage"], step["missing"]) == ("insufficient", [1])
+    [found] = [i for i in evidence["incidents"] if i.get("kind") == "replica_drift"]
+    assert found["step"] == 99 and list(found["parameters"]) == ["w"] and "source" not in found and "also" not in found
+    check = evidence["kind_checks"]["replica_drift"]
+    assert check["value"] == "checked"  # the gathered spread was judged, on the rank's own record
+    assert check["coverage"]["missing_ranks"] == [1] and check["coverage"]["compared"] == 0
+
+
+def test_a_spread_of_the_same_scope_is_one_finding_in_every_view(tmp_path, monkeypatch):
+    """The other case: a gathered spread whose scope names the step's launch and group decides
+    the parameters it holds (contract 5), so there is one entry, from it, and no incident from
+    the observations, in each view."""
+    body, tolerance = _case(SCOPED)
+    [entry] = body["expected"]["replica_drift"]
+    assert (entry["source"], entry["launch"], entry["group"]) == ("replica_spread", LAUNCH, [0, 1])
+    local = _local_view(body["records"], tolerance)
+    one = ev.build_evidence(body["records"], rank=0, drift_tolerance=tolerance)
+    replica = {"v": 1, "tolerance": tolerance, **body["expected"]}
+    _refuse_parts(monkeypatch)
+    store = ev.all_ranks_evidence(_store(tmp_path, [0, 1], _status([0, 1], replica)))
+    for view in (local, store):
+        assert view["replica"]["replica_drift"] == [entry]
+        assert [i for i in view["run_incidents"] if i.get("kind") == "replica_drift"] == []
+        assert view["replica"]["steps"][0]["gathered"] == ["b", "w"]
+    assert [g["kind"] for g in local["incident_groups"]] == ["replica_drift"]  # each rank's spread, as before
+    assert one["replica"]["replica_drift"] == [entry]
