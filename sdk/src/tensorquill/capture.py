@@ -112,9 +112,9 @@ class Router:
     the router was called on (the open part of C06): any other count refuses the router with a
     reason naming the count, the tokens and the declared `top_k`, since `moe_top_k` tells the
     detectors how large an expert's share can be. Judged from shapes alone, so the same under
-    `torch.compile`; not judged when the tokens cannot be read from the router's first argument,
-    nor for the default integer tensor under a `top_k` above `n_experts`, which is only written
-    down there and counted as before.
+    `torch.compile`; not judged when the tokens cannot be read from the router's first argument.
+    A `top_k` above `n_experts` refuses the router on the default integer tensor, as it does on
+    the top-k-of-logits path, with the reason "its top_k is K but it has E experts".
 
     Expert ids, from `indices` or the default integer tensor, are judged on their values (the
     author's decision on C06): an id below 0 is no assignment (Megatron's -1 for no route), not
@@ -617,10 +617,14 @@ def _router_hook(
                         f"indices for the {tokens} tokens it was called on"
                     ))
                     return
-                # Not judged under a declared top_k above the experts: such a top_k is only written
-                # down for an integer router, which is counted as before (`test_router_guard.py`,
-                # `int-top_k-above`, keeps it so); the `indices=` path has no such exception.
-                each = None if spec.top_k > spec.n_experts else _ids_per_token(chosen, tokens, spec)
+                if spec.top_k > spec.n_experts:
+                    # No router chooses more distinct experts for a token than it has, and the share
+                    # detectors judge an expert's share against 1 / top_k (`moe_top_k`): counted, these
+                    # ids would be judged against the wrong limit (C06). Before, such a top_k was only
+                    # written down. From the `Router` alone, so the same under `torch.compile`.
+                    refuse(lambda: f"its top_k is {spec.top_k} but it has {spec.n_experts} experts", "top_k")
+                    return
+                each = _ids_per_token(chosen, tokens, spec)
                 if each is not None:
                     refuse(lambda: _ids_per_token_why("its output's first integer tensor holds", chosen, tokens, spec), f"top_k={each}")
                     return
@@ -846,25 +850,38 @@ def _leaf_layers(named: list[tuple[str, nn.Module]]) -> list[tuple[str, nn.Modul
 
 
 def _block_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
-    """The model's repeated blocks: the children of its largest `ModuleList` of composite
-    modules that share one class, such as a transformer's decoder layers.
+    """The model's repeated blocks, such as a transformer's decoder layers: the children of every
+    outermost `ModuleList` of two or more composite modules, in the model's order.
+
+    A list counts when its children share one class and the first is composite (as before), or,
+    for a list that mixes classes, when every child is composite: a hybrid stack of attention and
+    state-space layers is one stack (SDK-23). Every such list is taken, not only the largest, so
+    an encoder-decoder's two stacks are both watched. A list inside a block already taken (an MoE
+    layer's experts, a stage's blocks) is not, and a module reachable from two lists is watched
+    once, under its first name: no block is watched twice, so no block's hooks run inside
+    another's. A list whose items are whole sub-models (`ModuleList([encoder, decoder])`) is taken
+    as two blocks, not their layers.
 
     This is the unit PyTorch's FSDP `transformer_auto_wrap_policy` wraps. One hook per
     block locates a problem to a block at a fraction of the cost of one per leaf module.
     """
-    best: list[tuple[str, nn.Module]] = []
-    best_params = 0
+    blocks: list[tuple[str, nn.Module]] = []
+    inside: set[int] = set()  # every module in a block taken so far, the blocks themselves included
     for name, module in model.named_modules():
-        if not isinstance(module, nn.ModuleList) or len(module) < 2:
+        if not isinstance(module, nn.ModuleList) or len(module) < 2 or id(module) in inside:
             continue
         children = list(module)
-        if len({type(c) for c in children}) != 1 or not any(children[0].children()):
+        if len({type(c) for c in children}) == 1:
+            if not any(children[0].children()):
+                continue
+        elif not all(any(c.children()) for c in children):
             continue
-        count = sum(p.numel() for p in module.parameters())
-        if count > best_params:
-            best_params = count
-            best = [(f"{name}.{i}" if name else str(i), child) for i, child in enumerate(children)]
-    return best
+        for i, child in enumerate(children):
+            if id(child) in inside:
+                continue
+            blocks.append((f"{name}.{i}" if name else str(i), child))
+            inside.update(id(m) for m in child.modules())
+    return blocks
 
 
 def _root_leaf(model: nn.Module) -> list[tuple[str, nn.Module]]:
