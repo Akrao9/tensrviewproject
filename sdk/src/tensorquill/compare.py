@@ -152,6 +152,16 @@ def _world_size(manifest: Mapping[str, Any] | None) -> int:
     return world if isinstance(world, int) and not isinstance(world, bool) and 0 < world <= MAX_EXPECTED_RANKS else 0
 
 
+def _world_over_cap(manifest: Mapping[str, Any] | None) -> int:
+    """The run manifest's `world_size` when it is above the ranks a reader lists
+    (`MAX_EXPECTED_RANKS`), else 0. Such a run is never judged as the ranks it has files of
+    (XC6, lane Y3): the others are counted, not listed, and are unknown."""
+    from .evidence import MAX_EXPECTED_RANKS
+
+    world = (manifest or {}).get("world_size")
+    return world if isinstance(world, int) and not isinstance(world, bool) and world > MAX_EXPECTED_RANKS else 0
+
+
 def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
     from .evidence import build_evidence
 
@@ -185,7 +195,8 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
     ranks = sorted(set(files) | set(held))
     # A rank the manifest's world size counts that no file holds is unknown, as a store's rank its
     # status expects that stored nothing: the run is read whole, never as the ranks it has.
-    if rank is None and (len(ranks) > 1 or any(n not in ranks for n in range(_world_size(run.get("manifest"))))):
+    if rank is None and (len(ranks) > 1 or _world_over_cap(run.get("manifest"))
+                         or any(n not in ranks for n in range(_world_size(run.get("manifest"))))):
         return _open_local_all_ranks(run, files, path, records, unfinished)
     # The rank asked for; a run with one rank is read on the rank it has, and says which.
     picked = rank if rank in held else held[0] if held and (rank is None or len(ranks) == 1) else None
@@ -221,7 +232,7 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
     (`combine_rank_evidence`). The ranks are those the records hold, the files' names and the
     run manifest's `world_size`: a rank named by a file or counted by the world size that no
     file holds a record of is unknown, with why."""
-    from .evidence import build_evidence, combine_rank_evidence
+    from .evidence import MAX_EXPECTED_RANKS, RUN_STATES, build_evidence, combine_rank_evidence
 
     by_rank: dict[int, list[dict[str, Any]]] = {}
     paths: dict[int, str] = {}
@@ -282,12 +293,27 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
     combined = combine_rank_evidence(per_rank, unknown_ranks=unknown)
     last = combined.get("last_step")
     ranks = sorted(set(per_rank) | set(unknown))
+    over = _world_over_cap(run.get("manifest"))
+    beyond = max(over - len(ranks), 0)
+    if beyond:
+        # XC6: the ranks above the cap are counted and unknown, as a rank of `unknown` is: in no
+        # value, and the run is not healthy for them.
+        said = (f"the run manifest says world size {over:,}, more than the {MAX_EXPECTED_RANKS:,} ranks this reader "
+                f"lists: {beyond:,} rank{'s' if beyond != 1 else ''} beside the {len(ranks)} read {'are' if beyond != 1 else 'is'}"
+                " not judged")
+        state = combined.get("run_state") or {}
+        combined["run_state"] = {
+            **state, "state": max((state.get("state") or "unknown", "unknown"), key=RUN_STATES.index),
+            "reasons": [*(state.get("reasons") or ()), {"state": "unknown", "code": "ranks_not_counted",
+                                                        "count": beyond, "detail": said}],
+        }
     return {
         "evidence": _all_ranks_run(combined), "last_step": last.get("max") if isinstance(last, Mapping) else None,
         "read_from": {"path": str(first.parent if len(set(files.values())) > 1 else first), "kind": "local records",
                       "rank": None, "ranks": ranks, "all_ranks": True,
                       "judged_ranks": combined["judged_ranks"], "unknown_ranks": combined["unknown_ranks"],
                       **({"unknown_why": unknown} if unknown else {}),
+                      **({"ranks_not_counted": beyond, "ranks_not_counted_why": said} if beyond else {}),
                       **({"attempt_orders": orders_said} if orders_said else {}),
                       "judged_by": "the Python detectors, here, with the default thresholds, on each rank; the ranks put "
                                    "together by the all-ranks view's rules",
@@ -317,6 +343,12 @@ def _open_store(run: Mapping[str, Any], rank: int | None, read_parts: bool) -> d
         raise _runs.RunLookupError(f"run {run['run_id']} has no rank {rank}: its store holds ranks "
                                    f"{', '.join(map(str, sorted(folders)))}")
     look = read_server_report(folders[picked])
+    earlier = _earlier_attempt_reason(folder, folders, picked) if look["state"] == "current" else None
+    if earlier is not None:
+        # Its report is current, and the server's status shows the job started again on it: what
+        # the report judged is an earlier attempt's, so the rank is unknown with why, as the
+        # all-ranks view leaves it, and its parts (the same attempt's) are not judged again (L14).
+        return _unread_store_rank(run, folder, folders, picked, earlier)
     if look["state"] == "current":
         evidence = _report_evidence(folders[picked], look, read_watchdog(folder / "watchdog.json"))
         last = look["report"].get("last_step")
@@ -351,6 +383,22 @@ def _open_store(run: Mapping[str, Any], rank: int | None, read_parts: bool) -> d
                       "judged_by": judged},
         "records": {"path": str(folder), "rank": picked},
     }
+
+
+def _earlier_attempt_reason(folder: Path, folders: Mapping[int, Path], rank: int) -> str | None:
+    """`earlier_attempt: why` when the server's status shows that rank `rank`'s current report
+    was judged by an earlier attempt (`evidence._not_current_by_status`, the all-ranks view's
+    rule, L6), else None."""
+    from .evidence import EARLIER_ATTEMPT, _not_current_by_status, _whole_attempt, read_server_report, read_watchdog
+
+    status = read_watchdog(folder / "watchdog.json")
+    if status is None or rank not in folders:
+        return None
+    look = read_server_report(folders[rank])
+    if look["state"] != "current":
+        return None
+    found = _not_current_by_status(status, {rank: _whole_attempt((look.get("report") or {}).get("attempt"))})
+    return f"{EARLIER_ATTEMPT}: {found[rank]}" if rank in found else None
 
 
 def _unread_store_rank(run: Mapping[str, Any], folder: Path, folders: Mapping[int, Path], picked: int,
@@ -435,6 +483,13 @@ def _open_store_all_ranks(run: Mapping[str, Any], folder: Path, folders: Mapping
                    "reports are not current: the Python detectors judged their stored parts here, with the thresholds "
                    "the server's last report applied")
     unknown_now = list(combined.get("unknown_ranks") or ())
+    # A rank whose report is current and that the status shows was judged by an earlier attempt
+    # is moved to the unknown ranks by `combine_rank_evidence`, which keeps no reason: it is the
+    # view's (`earlier_attempt: why`), or the status's again (L14, lane Y3: it was null).
+    for number in unknown_now:
+        if not unknown.get(number):
+            unknown[number] = reasons.get(number) or _earlier_attempt_reason(folder, folders, number) or (
+                "not judged: the all-ranks rules left it out, and gave no reason")
     return {
         "evidence": _all_ranks_run(combined), "last_step": last.get("max") if isinstance(last, Mapping) else None,
         "read_from": {"path": str(folder), "kind": "server store", "rank": None,
@@ -1110,7 +1165,9 @@ def compare_runs(*runs: str | Path, source: str | Path | None = None, project: s
             "run_state": (run["evidence"].get("run_state") or {}).get("state"),
             "last_step": run["last_step"],
             "incidents": len([i for i in run["evidence"].get("incidents") or () if isinstance(i, Mapping)]),
-            "rank_count": len(run["read_from"]["ranks"]) if run["read_from"].get("ranks") else None,
+            # None where the ranks are more than are listed (XC6): `read_from.ranks_not_counted` says how many.
+            "rank_count": (len(run["read_from"]["ranks"]) if run["read_from"].get("ranks")
+                           and not run["read_from"].get("ranks_not_counted") else None),
             "read_from": run["read_from"],
         } for label, wanted, run in zip(labels, runs, opened)],
         # The order of the four parts is part of the format: what was checked is read before
@@ -1182,6 +1239,9 @@ def summary_text(result: Mapping[str, Any]) -> str:
             judged, unknown = read.get("judged_ranks") or [], read.get("unknown_ranks") or []
             rank = (f"all {len(read['ranks'])} ranks" if not unknown
                     else f"{len(judged)} of {len(read['ranks'])} ranks ({_rank_text(unknown)} not judged)")
+            if read.get("ranks_not_counted"):
+                rank = (f"{len(judged)} of {len(read['ranks']) + read['ranks_not_counted']:,} ranks "
+                        f"({read['ranks_not_counted']:,} beyond the ranks read are not judged)")
             of = ""
         else:
             rank = f"rank {read['rank']}" if read.get("rank") is not None else "one rank"

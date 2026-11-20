@@ -48,6 +48,7 @@ from typing import Any, Callable, Iterable, Mapping
 from . import __version__
 from . import compact as _compact
 from . import compare as _compare
+from . import manifest as _manifest
 from . import runs as _runs
 from .sink import read_end_marker
 from .evidence import (
@@ -326,6 +327,13 @@ class Source:
                 raise ToolError(f"the detectors could not read the records in {path} ({error!r}).") from None
 
         evidence = self._keep(("evidence", path, rank), self._capture_stamp(path), build)
+        # The run block is read at every call, not kept: the run manifest beside the capture may be
+        # written or replaced after the first query while the records stay the same (XC7, lane Y3,
+        # Nov 20, 2026: the project stayed `uncategorized` until the server was started again). It
+        # is the block `build_evidence` makes (`run_block` of the manifest `find_manifest` finds),
+        # the one thing in the evidence the manifest decides, so the detectors do not run again.
+        run_id = evidence.get("run_id")
+        evidence = {**evidence, "run": _manifest.run_block(run_id, _manifest.find_manifest(path, run_id))}
         # Read at every call, not kept: the marker is written after the last record, so the file's
         # stamp does not move when it appears.
         return {**evidence, "run_end": read_end_marker(path)} if path.suffix == ".jsonl" else evidence
@@ -677,6 +685,11 @@ def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, An
         answer["detection"] = evidence["detection"]
     if isinstance(evidence.get("run_end"), dict):
         answer["run_end"] = evidence["run_end"]  # a local file: whether its session closed it
+    if isinstance(evidence.get("head_trends"), dict):
+        # The probe's head numbers over the run (`evidence.head_logit_trends`, with the positions
+        # whose sums overflow), wherever the evidence has them (L15, lane Y3): one rank's evidence
+        # built from its records. No key where it has none, so other answers stay as they were.
+        answer["head_trends"] = evidence["head_trends"]
     summary = _summary(evidence)
     if summary:
         answer["summary"] = summary
@@ -1348,6 +1361,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " then the whole run's, read as get_all_ranks_status describes. For a local .jsonl file, `run_end` says"
             " whether its session closed it: any state but `closed` means not known to have finished (still running,"
             " killed or never closed look the same)."
+            " Where one rank's evidence has them, `head_trends` gives the probe's language-model head numbers over"
+            " the run: values with no threshold, never an incident (get_series with kind head gives each probe's)."
         ),
         "inputSchema": {
             "type": "object",
