@@ -165,3 +165,81 @@ fn l13_rows_that_share_no_parameter_are_not_compared() {
         .collect();
     assert_eq!(seen, [(json!(8), json!(5.001))]);
 }
+
+/// Rows with only a `probe_json` column beside the keys.
+fn probe_rows(rows: &[(i64, Option<Value>)]) -> RecordBatch {
+    let columns: Vec<(&str, ArrayRef)> = vec![
+        (
+            "run_id",
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|_| "y2"))),
+        ),
+        ("rank", Arc::new(Int32Array::from_iter_values(rows.iter().map(|_| 0)))),
+        (
+            "attempt",
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|_| 1))),
+        ),
+        ("step", Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0)))),
+        (
+            "probe_json",
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.1.as_ref().map(Value::to_string))
+                    .collect::<Vec<_>>(),
+            )),
+        ),
+    ];
+    let fields: Vec<Field> = columns
+        .iter()
+        .map(|(name, array)| Field::new(*name, array.data_type().clone(), true))
+        .collect();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns.into_iter().map(|(_, a)| a).collect(),
+    )
+    .unwrap()
+}
+
+/// L15: the report carries Python's `head_trends`, made from the probes' head entries.
+#[test]
+fn l15_the_report_carries_the_probes_head_trends() {
+    let head = |norm: f64, more: Value| {
+        let mut head = json!({"module": "lm_head", "norm": norm, "mean": 0.1, "gap": true});
+        head.as_object_mut().unwrap().extend(more.as_object().unwrap().clone());
+        json!({"head": head})
+    };
+    let rows = [
+        (0, Some(head(4.0, json!({})))),
+        (1, None),
+        (2, Some(head(2.0, json!({"overflow_positions": 2})))),
+        (3, Some(json!({"error": null, "head": {"norm": 100.0}}))),
+        (
+            4,
+            Some(json!({"head": {"not_read": "no position", "overflow_positions": 5}})),
+        ),
+        (
+            5,
+            Some(head(3.0, json!({"module": "model.lm_head", "overflow_positions": 1.0}))),
+        ),
+    ];
+    let detectors = judge(0, &[probe_rows(&rows)], &Arc::<Thresholds>::default()).unwrap();
+    let report = super::report("y2", 0, &detectors, 0);
+    assert_eq!(
+        report["head_trends"],
+        json!({
+            "probes": 4, "read": 3, "module": "model.lm_head", "first_step": 0, "latest_step": 5,
+            "numbers": {
+                "norm": {"first": 4.0, "latest": 3.0, "lowest": 2.0, "highest": 4.0, "probes": 3},
+                "mean": {"first": 0.1, "latest": 0.1, "lowest": 0.1, "highest": 0.1, "probes": 3},
+            },
+            "not_read": {"probes": 1, "first_step": 4, "reason": "no position"},
+            "overflow_positions": {"probes": 2, "positions": 7, "most": 5, "first_step": 2, "latest_step": 4},
+        })
+    );
+    let none = judge(
+        0,
+        &[probe_rows(&[(0, None), (1, Some(json!({"attention": {}})))])],
+        &Arc::<Thresholds>::default(),
+    )
+    .unwrap();
+    assert_eq!(super::report("y2", 0, &none, 0)["head_trends"], Value::Null);
+}

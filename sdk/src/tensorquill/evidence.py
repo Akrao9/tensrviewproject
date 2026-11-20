@@ -2850,7 +2850,15 @@ def read_server_report(
     - `unusable`: not a report for this rank, from a server with fewer kinds, ahead of the
       store, or beside parts whose names say nothing about their steps.
     - `other_thresholds`: a threshold given here differs from the one the server applied.
+
+    A threshold the detectors refuse (`check_thresholds`: a negative or non-finite number, a
+    window or `top_k` below 1 or not whole, a bool) raises `ValueError` before anything is read,
+    as `build_evidence` does (L15, Nov 20, 2026: it read as `other_thresholds`, or as `current`
+    for a bool equal to the server's value).
     """
+    check_thresholds(overload_threshold=overload_threshold, drift_tolerance=drift_tolerance,
+                     starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,
+                     update_window=update_window)
     folder = Path(folder)
     stored, _, unknown = _newest_part(folder)
     order, attempt_order = stored_attempt_order(folder)
@@ -2943,7 +2951,9 @@ def _report_evidence(
     (one is, the newest, when a stuck collective has to be dated against the last step).
 
     The incidents are in the order `build_evidence` gives them. It has no `samples`,
-    `weight_trends` or router sizes: those are per-step data, which stays in the parts.
+    `weight_trends` or router sizes: those are per-step data, which stays in the parts. The
+    probe's `head_trends` are the report's, which a server made them for from every stored
+    probe (L15, Nov 20, 2026); a report from an older server has none, and neither does this.
     """
     report = look["report"]
     record_incidents = [dict(incident) for incident in report["incidents"]]
@@ -2987,6 +2997,7 @@ def _report_evidence(
         "detection": {**_detection(look, "server", None), "moe_flagged": report.get("moe_flagged"),
                       "thresholds": applied_thresholds(report)},
         **({"not_checked": not_checked} if not_checked else {}),
+        **({"head_trends": dict(heads)} if isinstance(heads := report.get("head_trends"), Mapping) and heads else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
         **({"traincheck": traincheck_summary} if traincheck_summary else {}),
         **({"watchdog": {k: status[k] for k in (

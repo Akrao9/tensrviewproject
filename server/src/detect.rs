@@ -1986,6 +1986,183 @@ fn shared_largest(own: &[(String, f64)], largest: f64, before: &UpdateRow) -> Op
     sides
 }
 
+// --- head_trends ---------------------------------------------------------------------------
+
+/// The numbers of the probe's language-model head entry that `head_trends` follows, in Python's
+/// order (`HEAD_NUMBERS` in evidence.py).
+const HEAD_NUMBERS: [&str; 5] = ["norm", "mean", "log_z", "gap", "gap_relative"];
+
+/// One head number over the probes that read it: the first and latest value, the lowest and
+/// highest, and how many probes had it finite.
+struct HeadNumber {
+    first: (i64, f64),
+    latest: (i64, f64),
+    lowest: f64,
+    highest: f64,
+    probes: u64,
+}
+
+/// Python's `head_logit_trends`, made row by row (L15, Nov 20, 2026): the probe's head numbers
+/// over the run, for the report's `head_trends`, so evidence built from a server's report has
+/// them without reading the parts. Numbers only, with no rule and no incident. Rows come in
+/// step order; of rows of one step, the first is the earliest and the last the latest, as
+/// Python's stable sort gives them.
+#[derive(Default)]
+struct HeadTrends {
+    /// Probes with a `head` entry, read or not, and those that read it.
+    probes: u64,
+    read: u64,
+    /// The latest read probe's `module`, and the first and latest read step.
+    module: Value,
+    first_step: Option<i64>,
+    latest_step: Option<i64>,
+    numbers: [Option<HeadNumber>; 5],
+    /// Probes that did not read the head, with the first one's step and reason.
+    not_read: u64,
+    first_not_read: Option<(i64, String)>,
+    /// Probes that counted overflowing positions: how many, the positions in all, the most in
+    /// one, and the first and latest step of one.
+    overflowed: u64,
+    positions: u64,
+    most: u64,
+    overflow_steps: Option<(i64, i64)>,
+}
+
+impl HeadTrends {
+    fn row(&mut self, step: i64, columns: &Columns, row: usize) {
+        // Probes are sparse, and only one with a head entry is parsed.
+        let Some(text) = text(columns.probe, row).filter(|text| text.contains("\"head\"")) else {
+            return;
+        };
+        let Ok(Value::Object(probe)) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        if probe.contains_key("error") {
+            return;
+        }
+        let Some(Value::Object(head)) = probe.get("head") else {
+            return;
+        };
+        self.probes += 1;
+        if let Some(count) = head
+            .get("overflow_positions")
+            .and_then(Value::as_u64)
+            .filter(|count| *count > 0)
+        {
+            self.overflowed += 1;
+            self.positions = self.positions.saturating_add(count);
+            self.most = self.most.max(count);
+            self.overflow_steps = Some(self.overflow_steps.map_or((step, step), |(first, latest)| {
+                (first.min(step), if step >= latest { step } else { latest })
+            }));
+        }
+        if let Some(why) = head.get("not_read") {
+            self.not_read += 1;
+            if self.first_not_read.as_ref().is_none_or(|(first, _)| step < *first) {
+                self.first_not_read = Some((step, python_str(why)));
+            }
+            return;
+        }
+        self.read += 1;
+        if self.first_step.is_none_or(|first| step < first) {
+            self.first_step = Some(step);
+        }
+        if self.latest_step.is_none_or(|latest| step >= latest) {
+            self.latest_step = Some(step);
+            self.module = head.get("module").cloned().unwrap_or(Value::Null);
+        }
+        for (name, kept) in HEAD_NUMBERS.iter().zip(self.numbers.iter_mut()) {
+            // A finite JSON number; a bool is not one (Python's `_finite`).
+            let Some(value) = head
+                .get(*name)
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite())
+            else {
+                continue;
+            };
+            match kept {
+                None => {
+                    *kept = Some(HeadNumber {
+                        first: (step, value),
+                        latest: (step, value),
+                        lowest: value,
+                        highest: value,
+                        probes: 1,
+                    })
+                }
+                Some(number) => {
+                    if step < number.first.0 {
+                        number.first = (step, value);
+                    }
+                    if step >= number.latest.0 {
+                        number.latest = (step, value);
+                    }
+                    number.lowest = number.lowest.min(value);
+                    number.highest = number.highest.max(value);
+                    number.probes += 1;
+                }
+            }
+        }
+    }
+
+    /// The `head_trends` of Python's evidence, or null when no probe had a head entry.
+    fn value(&self) -> Value {
+        if self.probes == 0 {
+            return Value::Null;
+        }
+        let mut trends = json!({"probes": self.probes, "read": self.read});
+        if self.read > 0 {
+            let numbers: serde_json::Map<String, Value> = HEAD_NUMBERS
+                .iter()
+                .zip(&self.numbers)
+                .filter_map(|(name, number)| {
+                    let number = number.as_ref()?;
+                    Some((
+                        (*name).to_owned(),
+                        json!({
+                            "first": number.first.1,
+                            "latest": number.latest.1,
+                            "lowest": number.lowest,
+                            "highest": number.highest,
+                            "probes": number.probes,
+                        }),
+                    ))
+                })
+                .collect();
+            trends["module"] = self.module.clone();
+            trends["first_step"] = json!(self.first_step);
+            trends["latest_step"] = json!(self.latest_step);
+            trends["numbers"] = Value::Object(numbers);
+        }
+        if let Some((step, reason)) = &self.first_not_read {
+            trends["not_read"] = json!({"probes": self.not_read, "first_step": step, "reason": reason});
+        }
+        if let Some((first, latest)) = self.overflow_steps {
+            trends["overflow_positions"] = json!({
+                "probes": self.overflowed,
+                "positions": self.positions,
+                "most": self.most,
+                "first_step": first,
+                "latest_step": latest,
+            });
+        }
+        trends
+    }
+}
+
+/// Python's `str()` of a JSON value, for a reason the capture wrote (a string, which it always
+/// writes, is itself). Of the others, null, a bool and a number read as Python prints them, and
+/// an array or object as its JSON text, where Python would print its own form.
+fn python_str(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => "None".to_owned(),
+        Value::Bool(true) => "True".to_owned(),
+        Value::Bool(false) => "False".to_owned(),
+        other => other.to_string(),
+    }
+}
+
 // --- activation_spike, activation_drift, dead_activations --------------------------------
 
 #[derive(Default)]
@@ -3287,6 +3464,7 @@ pub struct RankDetectors {
     loss_scale: LossScale,
     activations: Activations,
     attention: Attention,
+    head: HeadTrends,
     non_finite: NonFinite,
     replica_drift: ReplicaDrift,
     system: System,
@@ -3370,6 +3548,7 @@ impl RankDetectors {
             self.loss_scale.row(step, &columns, row);
             self.activations.row(step, layers);
             self.attention.row(step, &columns, row, &mut self.scalars);
+            self.head.row(step, &columns, row);
             self.non_finite.row(step, &columns, row, layers);
             self.replica_drift
                 .row(step, &columns, row, self.thresholds.drift_tolerance);
@@ -3521,6 +3700,12 @@ impl RankDetectors {
     /// across ranks for `memory_imbalance`.
     pub fn memory(&self) -> Value {
         self.system.memory()
+    }
+
+    /// The probe's head numbers over the run, or null: Python's `head_trends`, which evidence
+    /// built from this report carries.
+    pub fn head_trends(&self) -> Value {
+        self.head.value()
     }
 
     /// What was not checked, in the shape of the `not_checked` list in Python's evidence:
@@ -3828,6 +4013,7 @@ pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64)
         "thresholds": detectors.thresholds().applied(),
         "moe_flagged": detectors.moe_flagged(),
         "memory": detectors.memory(),
+        "head_trends": detectors.head_trends(),
         "incidents": detectors.incidents(),
     })
 }

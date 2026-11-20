@@ -232,3 +232,105 @@ def test_det13_a_compact_file_that_kept_every_step_is_the_full_evidence():
     whole = _compact(full, window=500)
     for step in (0, 97, 150):
         assert tensorquill.expert_load_table(whole, step, 2) == tensorquill.expert_load_table(full, step, 2)
+
+
+# --- L15: a server report's thresholds and head trends ---------------------------------------
+
+@pytest.mark.parametrize("bad", [
+    {"overload_threshold": -0.1}, {"drift_tolerance": math.nan}, {"starve_ratio": math.inf},
+    {"starve_window": 0}, {"update_window": 2.5}, {"top_k": 0}, {"top_k": True}, {"starve_window": True},
+    {"top_k": {"router": 0}}, {"overload_threshold": "0.5"},
+])
+def test_l15_read_server_report_refuses_the_thresholds_the_detectors_refuse(tmp_path, bad):
+    folder = tmp_path / "store" / "runs" / "r" / "rank=0"
+    with pytest.raises(ValueError, match="the detectors refuse these thresholds") as error:
+        ev.read_server_report(folder, **bad)
+    # The words build_evidence uses for the same value.
+    with pytest.raises(ValueError) as same:
+        tensorquill.build_evidence([], **bad)
+    assert str(error.value) == str(same.value)
+
+
+def test_l15_read_server_report_takes_none_as_not_given(tmp_path):
+    folder = tmp_path / "store" / "runs" / "r" / "rank=0"
+    assert ev.read_server_report(folder)["state"] == "nothing_stored"
+    given = dict.fromkeys(ev.THRESHOLD_NAMES)
+    assert ev.read_server_report(folder, **given)["state"] == "nothing_stored"
+    assert ev.read_server_report(folder, starve_window=10, top_k={"router": 2})["state"] == "nothing_stored"
+
+
+HEAD = {"module": "lm_head", "positions": 8, "nonfinite_positions": 0, "vocab": 32, "calls": 1,
+        "input_dtype": "float32", "weight_dtype": "float32"}
+
+
+def _probed_run(run: str) -> list[dict]:
+    """Two attempts of one rank: attempt 2 resumes at step 30, so attempt 1's probes from there
+    on were rolled back. Among the probes: one that did not read the head, one that failed, one
+    whose numbers include a bool and a whole number, and two that counted overflowing positions."""
+    def row(step: int, attempt: int, probe: dict | None = None) -> dict:
+        out = {"schema_version": 1, "run_id": run, "rank": 0, "attempt": attempt, "step": step,
+               "ts": float(step), "grad_norm": 1.0}
+        return {**out, "probe": probe} if probe is not None else out
+
+    def head(step: int, **more) -> dict:
+        return {"head": {**HEAD, "norm": 4.0 + step / 10, "mean": 0.1 - step / 1000, "log_z": 3.0,
+                         "gap": 0.01 * (1 + step % 3), "gap_relative": 0.002, **more}}
+
+    probes = {
+        0: head(0),
+        5: head(5, overflow_positions=2),
+        10: {"head": {**HEAD, "positions": 0, "not_read": "no position had finite FP32 logits",
+                      "overflow_positions": 3}},
+        15: {"error": "the probe raised"},
+        20: head(20, gap=True, log_z=7),
+        35: head(35, module="model.lm_head"),  # rolled back by attempt 2
+    }
+    first = [row(step, 1, probes.get(step)) for step in range(40)]
+    later = {30: head(30, norm=9.0), 45: head(45, overflow_positions=1)}
+    second = [row(step, 2, later.get(step)) for step in range(30, 50)]
+    return first + second
+
+
+@needs_rust
+def test_l15_evidence_from_a_servers_report_carries_head_trends(tmp_path, rust):
+    from test_server_detectors import FAST, Stream
+
+    run = "y2-heads"
+    records = _probed_run(run)
+    python = tensorquill.build_evidence(records)["head_trends"]
+    assert python["probes"] == 6 and python["read"] == 5 and python["module"] == "lm_head"
+    assert python["overflow_positions"]["positions"] == 6 and python["latest_step"] == 45
+    stream = Stream(tmp_path, *FAST, run=run)
+    try:
+        stream.send([r for r in records if r["attempt"] == 1])
+        document = stream.send([r for r in records if r["attempt"] == 2])
+    finally:
+        assert stream.server.terminate() == 0
+    assert document["head_trends"] == python
+    folder = stream.incidents_file.parent
+    assert ev.read_server_report(folder)["state"] == "current"
+    out = ev.watch(folder, tmp_path / "live.json", interval=0.0, polls=1)
+    evidence = json.loads(out.read_text())
+    assert evidence["detection"]["source"] == "server"
+    assert evidence["head_trends"] == python
+    # The same as the evidence the server's store gives when its records are judged here.
+    assert tensorquill.build_evidence(folder)["head_trends"] == python
+
+
+@needs_rust
+def test_l15_a_report_with_no_probe_head_gives_no_head_trends(tmp_path, rust):
+    from test_server_detectors import FAST, Stream
+
+    run = "y2-no-heads"
+    records = [{"schema_version": 1, "run_id": run, "rank": 0, "attempt": 1, "step": s, "ts": float(s),
+                "grad_norm": 1.0} for s in range(10)]
+    stream = Stream(tmp_path, *FAST, run=run)
+    try:
+        document = stream.send(records)
+    finally:
+        assert stream.server.terminate() == 0
+    assert document["head_trends"] is None
+    out = ev.watch(stream.incidents_file.parent, tmp_path / "live.json", interval=0.0, polls=1)
+    evidence = json.loads(out.read_text())
+    assert evidence["detection"]["source"] == "server" and "head_trends" not in evidence
+    assert "head_trends" not in tensorquill.build_evidence(records)
