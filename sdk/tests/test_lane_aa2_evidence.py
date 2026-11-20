@@ -280,3 +280,72 @@ def test_a_spread_of_the_same_scope_is_one_finding_in_every_view(tmp_path, monke
         assert view["replica"]["steps"][0]["gathered"] == ["b", "w"]
     assert [g["kind"] for g in local["incident_groups"]] == ["replica_drift"]  # each rank's spread, as before
     assert one["replica"]["replica_drift"] == [entry]
+
+
+# --- 3. L20: the all-ranks view carries each rank's `head_trends` --------------------------------
+#
+# Fail before: on the base the view had no `head_trends_by_rank` (KeyError in each test but the
+# control, which says the key is absent where no rank has trends and passes there too).
+
+TRENDS = {"probes": 3, "read": 2, "module": "lm_head", "first_step": 0, "latest_step": 20,
+          "numbers": {"norm": {"first": 4.0, "latest": 6.0, "lowest": 4.0, "highest": 6.0, "probes": 2}},
+          "overflow_positions": {"probes": 1, "positions": 3, "most": 3, "first_step": 10, "latest_step": 10}}
+
+
+def test_the_store_view_carries_each_judged_ranks_head_trends(tmp_path, no_part_is_opened):
+    """From each current report, as one rank's evidence built from that report has them, and
+    nothing from a rank whose report is not current (it is not judged)."""
+    other = {**TRENDS, "probes": 1, "read": 1}
+    reports = {0: _report(0, head_trends=TRENDS), 1: _report(1), 2: _report(2, head_trends=other),
+               3: _report(3, head_trends=TRENDS, last_step=5)}  # behind: stops before the stored step 9
+    run = _store(tmp_path, [0, 1, 2, 3], _status([0, 1, 2, 3]), reports)
+    evidence = ev.all_ranks_evidence(run)
+    assert evidence["judged_ranks"] == [0, 1, 2]
+    assert evidence["head_trends_by_rank"] == [{"rank": 0, "head_trends": TRENDS}, {"rank": 2, "head_trends": other}]
+    assert "head_trends" not in evidence  # one rank's key, which a reader takes as one rank's
+    one = ev._report_evidence(run / "rank=0", ev.read_server_report(run / "rank=0"), None)
+    assert one["head_trends"] == evidence["head_trends_by_rank"][0]["head_trends"]
+
+
+def test_control_no_rank_with_head_trends_gives_no_key(tmp_path, no_part_is_opened):
+    evidence = ev.all_ranks_evidence(_store(tmp_path, [0, 1], _status([0, 1])))
+    assert "head_trends_by_rank" not in evidence and "head_trends" not in evidence
+
+
+def _probed(rank: int, with_head: bool) -> list[dict]:
+    rows = []
+    for step in range(12):
+        row = {"schema_version": 1, "run_id": RUN, "rank": rank, "attempt": 1, "step": step, "ts": float(step),
+               "grad_norm": 1.0}
+        if with_head and step % 4 == 0:
+            row["probe"] = {"head": {"module": "lm_head", "positions": 8, "nonfinite_positions": 0, "vocab": 32,
+                                     "calls": 1, "norm": 4.0 + step, "mean": 0.1, "log_z": 3.0, "gap": 0.01,
+                                     "gap_relative": 0.002, **({"overflow_positions": 2} if step == 4 else {})}}
+        rows.append(row)
+    return rows
+
+
+def test_the_local_all_ranks_view_carries_each_ranks_head_trends():
+    """`combine_rank_evidence`, as `compare` builds the view of a run's local files: each rank's
+    evidence has its own trends, and the view lists them by rank."""
+    per_rank = {0: ev.build_evidence(_probed(0, True)), 1: ev.build_evidence(_probed(1, False)),
+                2: ev.build_evidence(_probed(2, True))}
+    combined = ev.combine_rank_evidence(per_rank)
+    assert [e["rank"] for e in combined["head_trends_by_rank"]] == [0, 2]
+    assert combined["head_trends_by_rank"][0]["head_trends"] == per_rank[0]["head_trends"]
+    assert combined["head_trends_by_rank"][0]["head_trends"]["overflow_positions"]["positions"] == 2
+
+
+def test_the_store_view_of_a_real_server_carries_the_head_trends(tmp_path):
+    """Through the real server: its report's trends of rank 0, as the Python detectors make them
+    from rank 0's records, and none for rank 1, which probed nothing."""
+    twa, _ = _server()
+    run = twa.Run(tmp_path, *twa.FAST)
+    records = {0: [{**r, "run_id": twa.RUN} for r in _probed(0, True)],
+               1: [{**r, "run_id": twa.RUN} for r in _probed(1, False)]}
+    for rank, rows in records.items():
+        run.send(rank, rows)
+    evidence = ev.all_ranks_evidence(run.folder)
+    assert evidence["judged_ranks"] == [0, 1]
+    assert evidence["head_trends_by_rank"] == [{"rank": 0, "head_trends": ev.build_evidence(records[0])["head_trends"]}]
+    assert run.server.terminate() == 0

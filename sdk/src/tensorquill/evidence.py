@@ -4254,6 +4254,9 @@ def combine_rank_evidence(
         "incident_groups": groups,
         "run_incidents": run_incidents,
         **({"stopped_stacks": stacks} if (stacks := group_stopped_stacks(status)) else {}),
+        # Each judged rank's probe head numbers, from its evidence (L20).
+        **({"head_trends_by_rank": heads} if (heads := _head_trends_by_rank(
+            {n: per_rank[n].get("head_trends") for n in judged})) else {}),
     }
     stated = {n: found for n in judged if (found := stated_kind_checks(per_rank[n])) is not None}
     silent = [n for n in judged if n not in stated]
@@ -4292,6 +4295,16 @@ def combine_rank_evidence(
         judged_attempts={n: _whole_attempt((per_rank[n].get("detection") or {}).get("report_attempt")) for n in judged},
     )
     return combined
+
+
+def _head_trends_by_rank(found: Mapping[int, Any]) -> list[dict[str, Any]]:
+    """The probe's head numbers of each judged rank (`head_logit_trends`, with
+    `overflow_positions`), for the all-ranks view's `head_trends_by_rank` (L20): one entry per
+    rank whose evidence or report has them, `{"rank", "head_trends"}`, by rank. Each rank's are
+    its own: a run's ranks probe their own batches, so they are not added up or compared. Not
+    under `head_trends`, which one rank's evidence has and a reader of it takes as one rank's."""
+    return [{"rank": number, "head_trends": dict(trends)} for number, trends in sorted(found.items())
+            if isinstance(trends, Mapping) and trends]
 
 
 def _all_ranks_reported(evidence: Mapping[str, Any]) -> dict[Any, set[int]]:
@@ -4540,6 +4553,9 @@ def _all_ranks_evidence(
         "run_incidents": run_incidents,
         # The stopped ranks' stacks from the status, grouped: present only while a rank is stopped.
         **({"stopped_stacks": stacks} if (stacks := group_stopped_stacks(status)) else {}),
+        # Each judged rank's probe head numbers, from its current report (L20): no part is read.
+        **({"head_trends_by_rank": heads} if (heads := _head_trends_by_rank(
+            {n: looks[n]["report"].get("head_trends") for n in judged})) else {}),
         "ranks": entries,
         **({"not_checked": not_checked} if not_checked else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
