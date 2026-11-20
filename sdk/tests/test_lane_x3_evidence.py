@@ -1,0 +1,321 @@
+"""Lane X3 (wave X): the evidence core's open parts, each held by a test that failed before its fix.
+
+- L6, open part: in the all-ranks evidence a rank the status marks `attempt_without_steps` was
+  still counted among the judged ranks; only `run_state` called it unknown.
+- DET-14, open part: at a run's first step the expert-load table compared the step with itself.
+- Thresholds: `all_ranks_evidence` took any threshold a caller gave without checking it.
+- C03, the Python side: what a rank whose capture stopped raises is pinned as the author decided
+  (Nov 19, 2026): reading `unresponsive` or `lost`, the same stall as any rank; with fresh beats, none.
+- C22, the evidence half: the probe's count of head positions whose sums overflow was not in the
+  evidence.
+
+None needs `pyarrow` or the server binary.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import time
+from pathlib import Path
+
+import pytest
+
+import tensorquill
+from tensorquill import evidence as ev
+
+# --- L6: a rank started again with nothing stored is not among the judged ranks ------------------
+
+RUN = "x3run"
+
+
+def _report(rank: int, attempt: int, last: int, incidents: list[dict] | None = None) -> dict:
+    return {
+        "schema_version": 1, "source": "tensorquill-server", "run_id": RUN, "rank": rank, "attempt": attempt,
+        "last_step": last, "steps": last + 1, "incidents": incidents or [], "checked": list(ev.SERVER_KINDS),
+        "thresholds": {"spike_sustain": ev.SPIKE_SUSTAIN},
+    }
+
+
+def _status(ranks: list[dict], summary: str = "active") -> dict:
+    return {
+        "schema_version": 1, "run_id": RUN, "summary": summary, "server_running": True, "refresh_seconds": 30.0,
+        "written_at_ms": int(time.time() * 1000), "world_size": len(ranks), "missing_ranks": [],
+        "ranks": [{"phase": "train", "state": "active", "severity": None, "stream": "open", **r} for r in ranks],
+        "pauses": {}, "recommended_silent_seconds": None,
+    }
+
+
+def _store(tmp_path: Path, entries: list[dict], incidents: dict[int, list[dict]] | None = None) -> Path:
+    """A run folder with one attempt-1 part and a current report per rank, and `entries` as the status."""
+    run = tmp_path / "store" / "runs" / RUN
+    for entry in entries:
+        folder = run / f"rank={entry['rank']}" / "attempt=1"
+        folder.mkdir(parents=True)
+        (folder / "part-00000000-00000009.parquet").write_bytes(b"")
+        report = _report(entry["rank"], 1, 9, (incidents or {}).get(entry["rank"]))
+        (folder.parent / "incidents.json").write_text(json.dumps(report))
+    status = _status(entries)
+    status["incidents"] = []
+    (run / "watchdog.json").write_text(json.dumps(status))
+    return run
+
+
+STARTED_AGAIN = {"attempt": 2, "last_step": None, "attempt_without_steps": True}
+NAN = {"kind": "non_finite", "step": 5, "layers": ["a"], "grads": []}
+
+
+def test_l6_a_rank_started_again_is_not_judged_in_the_all_ranks_evidence(tmp_path):
+    run = _store(tmp_path, [{"rank": 0, "attempt": 1, "last_step": 9}, {"rank": 1, **STARTED_AGAIN}],
+                 incidents={1: [NAN]})
+    evidence = ev.all_ranks_evidence(run)
+    assert evidence["judged_ranks"] == [0]
+    assert evidence["unknown_ranks"] == [1]
+    assert evidence["clean_ranks"] == [0] and evidence["ranks_with_incidents"] == []
+    assert evidence["incident_groups"] == []  # rank 1's earlier attempt is not counted for the run
+    assert evidence["ranks_by_state"] == {"current": [0], ev.EARLIER_ATTEMPT: [1]}
+    entry = next(e for e in evidence["ranks"] if e["rank"] == 1)
+    assert entry["detection"]["judged"] is False and entry["detection"]["state"] == ev.EARLIER_ATTEMPT
+    assert "started again as attempt 2" in entry["detection"]["reason"]
+    # Its report is shown as what it was, never as the rank's incidents.
+    assert "incidents" not in entry and [i["kind"] for i in entry["last_report"]["incidents"]] == ["non_finite"]
+    # The run state names it once, with the status's reason, not "current: ...".
+    unknown = [r for r in evidence["run_state"]["reasons"] if r["code"] == "ranks_unknown"]
+    assert evidence["run_state"]["state"] == "unknown" and unknown[0]["ranks"] == [1]
+    # The summary lists it among the unknown ranks, with why.
+    summary = ev._all_ranks_summary(evidence)
+    assert "1 of 2 ranks are judged" in summary and f"rank 1 ({ev.EARLIER_ATTEMPT}): started again" in summary
+
+
+def test_l6_the_watcher_writes_the_same(tmp_path):
+    run = _store(tmp_path, [{"rank": 0, "attempt": 1, "last_step": 9}, {"rank": 1, **STARTED_AGAIN}])
+    out = tmp_path / "all.json"
+    ev.watch(run, out, interval=0.0, polls=1, rank="all")
+    written = json.loads(out.read_text())
+    assert written["judged_ranks"] == [0] and written["unknown_ranks"] == [1]
+    # The fixture's reports do not say what was checked: that is said of rank 0 alone.
+    assert written["kind_checks_not_stated"]["ranks"] == [0]
+
+
+def test_l6_a_rank_at_the_attempt_the_status_shows_stays_judged(tmp_path):
+    run = _store(tmp_path, [{"rank": 0, "attempt": 1, "last_step": 9}, {"rank": 1, "attempt": 1, "last_step": 9}])
+    evidence = ev.all_ranks_evidence(run)
+    assert evidence["judged_ranks"] == [0, 1] and evidence["unknown_ranks"] == []
+    assert evidence["run_state"]["state"] == "healthy"
+
+
+def test_l6_a_status_at_another_attempt_with_steps_is_not_judged_either(tmp_path):
+    # The same rule as `run_state`: a report of another attempt than the status shows.
+    run = _store(tmp_path, [{"rank": 0, "attempt": 1, "last_step": 9}, {"rank": 1, "attempt": 3, "last_step": 4}])
+    evidence = ev.all_ranks_evidence(run)
+    assert evidence["judged_ranks"] == [0] and evidence["unknown_ranks"] == [1]
+
+
+def _per_rank(rank: int, attempt: int, incidents: list[dict] | None = None) -> dict:
+    return {"rank": rank, "incidents": incidents or [], "last_step": 9,
+            "detection": {"source": "server", "state": "current", "report_attempt": attempt}}
+
+
+def test_l6_the_combined_view_moves_such_a_rank_to_the_unknown_ranks():
+    status = _status([{"rank": 0, "attempt": 1, "last_step": 9}, {"rank": 1, **STARTED_AGAIN}])
+    status["incidents"] = []
+    combined = ev.combine_rank_evidence({0: _per_rank(0, 1), 1: _per_rank(1, 1, [NAN])}, status=status,
+                                        status_expected=True)
+    assert combined["judged_ranks"] == [0] and combined["unknown_ranks"] == [1]
+    assert combined["incident_groups"] == [] and combined["rank_count"] == 2
+    unknown = [r for r in combined["run_state"]["reasons"] if r["code"] == "ranks_unknown"]
+    assert unknown and unknown[0]["ranks"] == [1]
+    # Without a status nothing is compared.
+    combined = ev.combine_rank_evidence({0: _per_rank(0, 1), 1: _per_rank(1, 1)})
+    assert combined["judged_ranks"] == [0, 1]
+
+
+# --- DET-14: the expert-load table at a run's first step ---------------------------------------
+
+
+def _moe(steps: list[list[int]]) -> dict:
+    return tensorquill.build_evidence([{"run_id": "t", "step": s, "moe": {"router": counts}}
+                                       for s, counts in enumerate(steps)], detectors="python")
+
+
+def test_det14_the_first_step_is_not_compared_with_itself():
+    evidence = _moe([[10, 30, 60, 0], [25, 25, 25, 25]])
+    lines = ev.expert_load_table(evidence, 0, 1).splitlines()
+    assert lines[0] == "**Layer 01 expert load** · step 0 (no earlier step to compare with)"
+    rows = lines[4:]
+    assert len(rows) == 4 and all("| n/a |" in row for row in rows)  # no delta, never +0.00
+    assert "+0.00" not in "\n".join(lines)
+    # Sorted by load, largest first.
+    assert [row.split(" | ")[0] for row in rows] == ["| #003", "| #002", "| #001", "| #004"]
+    # The next step is compared with the first, as before.
+    second = ev.expert_load_table(evidence, 1, 1).splitlines()
+    assert second[0] == "**Layer 01 expert load** · step 1 vs. 0"
+    assert "| #001 | 25.00% | +15.00 |" in "\n".join(second)
+
+
+def test_det14_a_one_step_run_has_its_table_without_a_comparison():
+    lines = ev.expert_load_table(_moe([[5, 5]]), 0, 1).splitlines()
+    assert lines[0].endswith("(no earlier step to compare with)")
+    assert all("| n/a |" in row for row in lines[4:])
+
+
+# --- Thresholds given to the all-ranks reader are checked at the call ---------------------------
+
+REFUSED = [
+    ({"overload_threshold": -0.1}, "overload_threshold must be a finite number of at least 0"),
+    ({"overload_threshold": float("nan")}, "overload_threshold must be a finite number"),
+    ({"overload_threshold": True}, "overload_threshold must be"),
+    ({"overload_threshold": "0.5"}, "overload_threshold must be"),
+    ({"drift_tolerance": float("inf")}, "drift_tolerance must be a finite number"),
+    ({"drift_tolerance": -1}, "drift_tolerance must be a finite number of at least 0"),
+    ({"starve_ratio": -0.5}, "starve_ratio must be a finite number of at least 0"),
+    ({"starve_ratio": float("-inf")}, "starve_ratio must be a finite number"),
+    ({"starve_window": 0}, "starve_window must be at least 1"),
+    ({"starve_window": 2.0}, "starve_window must be at least 1 and a whole number"),
+    ({"starve_window": True}, "starve_window must be"),
+    ({"update_window": -3}, "update_window must be at least 1"),
+    ({"top_k": 0}, "top_k must be at least 1"),
+    ({"top_k": 2.5}, "top_k must be a whole number"),
+    ({"top_k": "2"}, "top_k must be a whole number"),
+    ({"top_k": {"router": 0}}, "top_k must be at least 1"),
+    ({"top_k": {"router": 1.5}}, "top_k must be a whole number"),
+]
+
+
+@pytest.mark.parametrize("option, reason", REFUSED)
+def test_thresholds_a_value_no_server_applies_is_refused_at_the_call(tmp_path, option, reason):
+    run = _store(tmp_path, [{"rank": 0, "attempt": 1, "last_step": 9}])
+    with pytest.raises(ValueError, match=f"the detectors refuse these thresholds: {reason}"):
+        ev.all_ranks_evidence(run, **option)
+
+
+@pytest.mark.parametrize("option, reason", REFUSED[:3])
+def test_thresholds_are_refused_before_anything_is_read(tmp_path, option, reason):
+    # The source does not exist: the threshold is what is refused, not the folder.
+    with pytest.raises(ValueError, match=reason):
+        ev.all_ranks_evidence(tmp_path / "nowhere", **option)
+
+
+@pytest.mark.parametrize("option, reason", REFUSED[8:11])
+def test_thresholds_watch_all_ranks_called_directly_refuses_them_before_its_first_look(tmp_path, option, reason):
+    run = _store(tmp_path, [{"rank": 0, "attempt": 1, "last_step": 9}])
+    out = tmp_path / "all.json"
+    with pytest.raises(ValueError, match=reason):
+        ev.watch_all_ranks(run, out, interval=0.0, polls=1, **option)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("option", [
+    {}, {"overload_threshold": 0.0}, {"overload_threshold": 2}, {"drift_tolerance": 0}, {"starve_ratio": 0.0},
+    {"starve_window": 1}, {"update_window": 1}, {"top_k": 1}, {"top_k": {"router": 2}},
+    {"overload_threshold": None, "top_k": None},
+])
+def test_thresholds_the_values_a_server_applies_are_taken(tmp_path, option):
+    run = _store(tmp_path, [{"rank": 0, "attempt": 1, "last_step": 9}])
+    evidence = ev.all_ranks_evidence(run, **option)
+    assert evidence["rank_count"] == 1
+
+
+# --- C03, the Python side: what a rank whose capture stopped raises (the author's decision) -------
+#
+# Decided Nov 19, 2026 ("yes keep raising"): a rank whose capture stopped still sends heartbeats,
+# so one that then reads `unresponsive` or `lost` (contract 3: "as for any rank") raises the same
+# progress incident as any other rank, as the server's `progress_incidents` does. With fresh beats
+# it reads `capture_stopped` and raises none.
+
+STOPPED = {"capture_stopped": {"reason": "sink_error", "seconds": 3.0}}
+STALLS = ("job_stalled", "rank_silent")
+
+
+def _entry(rank: int, state: str, **extra) -> dict:
+    severity = "critical" if state in ("silent", "lost", "unresponsive") else None
+    return {"rank": rank, "state": state, "attempt": 1, "last_step": 40 + rank, "severity": severity, **extra}
+
+
+def _stalls(incidents: list[dict]) -> list[dict]:
+    return [i for i in incidents if i.get("kind") in STALLS]
+
+
+def _shape(incident: dict) -> tuple:
+    """What a stall says, without the status entries' own keys (the stop itself among them)."""
+    return (incident["kind"], incident["assessment"], incident["severity"], incident.get("lost_ranks"),
+            [r["rank"] for r in incident["ranks"]], [r["rank"] for r in incident.get("other_ranks", ())])
+
+
+@pytest.mark.parametrize("state", ["unresponsive", "lost"])
+@pytest.mark.parametrize("summary, others", [("stalled", []), ("degraded", ["active"]), ("stalled", ["silent"])],
+                         ids=["alone", "beside-an-active-rank", "beside-a-silent-rank"])
+def test_c03_a_stopped_rank_whose_beats_stop_raises_what_any_rank_raises(state, summary, others):
+    def status(stopped: bool) -> dict:
+        ranks = [_entry(0, state, **(STOPPED if stopped else {}))]
+        ranks += [_entry(n, other) for n, other in enumerate(others, 1)]
+        return {"summary": summary, "world_size": len(ranks), "missing_ranks": [], "ranks": ranks}
+
+    with_stop, without = _stalls(ev.detect_watchdog_incidents(status(True))), _stalls(ev.detect_watchdog_incidents(status(False)))
+    assert with_stop and [_shape(i) for i in with_stop] == [_shape(i) for i in without]
+    assert 0 in [r["rank"] for r in with_stop[0]["ranks"]]
+    # The run state still names the stop, with its reason.
+    judged = ev.run_state(incidents=with_stop, steps_judged=True, status=status(True))
+    assert "capture_stopped" in [r["code"] for r in judged["reasons"]]
+
+
+@pytest.mark.parametrize("summary, others", [("capture_stopped", []), ("degraded", ["active"])],
+                         ids=["alone", "beside-an-active-rank"])
+def test_c03_a_stopped_rank_with_fresh_beats_raises_no_stall(summary, others):
+    ranks = [_entry(0, "capture_stopped", **STOPPED)] + [_entry(n, other) for n, other in enumerate(others, 1)]
+    status = {"summary": summary, "world_size": len(ranks), "missing_ranks": [], "ranks": ranks}
+    assert _stalls(ev.detect_watchdog_incidents(status)) == []
+
+
+# --- C22, the evidence half: the probe's overflow count is in the evidence -----------------------
+
+
+def _head(**numbers) -> dict:
+    return {"module": "lm_head", "positions": 8, "nonfinite_positions": 0, "vocab": 32, "calls": 1,
+            "input_dtype": "float32", "weight_dtype": "float32", **numbers}
+
+
+READ = {"norm": 4.0, "mean": 0.1, "log_z": 3.0, "gap": 0.01, "gap_relative": 0.002}
+
+
+def _probed(heads: list[dict]) -> list[dict]:
+    return [{"run_id": "p", "step": step, "probe": {"head": head}} for step, head in enumerate(heads)]
+
+
+def test_c22_the_overflow_count_is_in_the_head_trends():
+    heads = [_head(**READ), _head(**READ, overflow_positions=2), _head(**READ),
+             _head(overflow_positions=8, positions=0, not_read="every position's FP32 logits are finite but too large:"
+                                                                " their sums overflow"),
+             _head(**READ, overflow_positions=1)]
+    trends = ev.head_logit_trends(_probed(heads))
+    assert trends["overflow_positions"] == {"probes": 3, "positions": 11, "most": 8, "first_step": 1, "latest_step": 4}
+    assert trends["read"] == 4 and trends["not_read"]["probes"] == 1
+    # And so in the evidence a reader opens.
+    evidence = tensorquill.build_evidence(_probed(heads), detectors="python")
+    assert evidence["head_trends"]["overflow_positions"]["positions"] == 11
+
+
+def test_c22_without_an_overflow_the_key_is_absent():
+    trends = ev.head_logit_trends(_probed([_head(**READ), _head(**READ, overflow_positions=0)]))
+    assert "overflow_positions" not in trends
+
+
+@pytest.mark.parametrize("count", [True, 2.5, "3", None, -1])
+def test_c22_a_count_that_is_not_a_whole_number_of_positions_is_not_counted(count):
+    trends = ev.head_logit_trends(_probed([_head(**READ, overflow_positions=count)]))
+    assert "overflow_positions" not in trends
+
+
+def test_c22_the_count_survives_a_stored_part(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    from tensorquill import flight
+
+    # The rows the sender sends and the server stores, written as a part and read back as a reader does.
+    records = [{**r, "rank": 0} for r in _probed([_head(**READ, overflow_positions=3), _head(**READ)])]
+    part = tmp_path / "part.parquet"
+    pq.write_table(pa.Table.from_batches([flight.records_to_batch(records)]), part)
+    back = ev._read_part(part)
+    assert back[0]["probe"]["head"]["overflow_positions"] == 3
+    assert ev.head_logit_trends(back)["overflow_positions"]["positions"] == 3

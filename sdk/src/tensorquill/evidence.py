@@ -621,6 +621,13 @@ def head_logit_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     BF16-to-FP32 `gap` needs real failing runs to set. Probes that did not read the head
     are counted under `not_read` with the first one's step and reason. Returns None when
     no probe carries a `head` entry (no probe, a failed one, or `probe_head=False`).
+
+    `overflow_positions` is there when a probe counted positions whose FP32 logits are finite
+    but whose sums overflow (the probe's `overflow_positions`, which leaves them out of the four
+    numbers, apart from positions with a NaN or an Inf): how many probes did, how many positions
+    in all, the most in one probe, and the first and latest step of one, over every probe that
+    has a `head` entry, read or not (C22, Nov 19, 2026; until then the count was in the records
+    only, so a number taken over fewer positions than the probe saw did not say so).
     """
     seen: list[tuple[int, dict[str, Any]]] = []
     for record in sorted(records, key=lambda r: r["step"]):
@@ -645,6 +652,14 @@ def head_logit_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     if skipped:
         trends["not_read"] = {"probes": len(skipped), "first_step": skipped[0][0],
                               "reason": str(skipped[0][1]["not_read"])}
+    overflowed = [(step, count) for step, head in seen
+                  if isinstance(count := head.get("overflow_positions"), int) and not isinstance(count, bool) and count > 0]
+    if overflowed:
+        trends["overflow_positions"] = {
+            "probes": len(overflowed), "positions": sum(count for _, count in overflowed),
+            "most": max(count for _, count in overflowed),
+            "first_step": overflowed[0][0], "latest_step": overflowed[-1][0],
+        }
     return trends
 
 
@@ -4090,9 +4105,19 @@ def combine_rank_evidence(
     `memory` is each rank's latest memory reading where its evidence does not carry it (a
     server report's `memory`). An evidence may carry `last_step`, which the caller knows from
     the records or the report; the run's is `{"min", "max"}` over the judged ranks.
+
+    A rank that the status shows to be judged by an earlier attempt (`_not_current_by_status`:
+    marked `attempt_without_steps`, or shown at another attempt than its evidence's report) is
+    moved to the unknown ranks, as `earlier_attempt` with why, and is in no value (L6).
     """
-    judged = sorted(per_rank)
     unknown = dict(unknown_ranks or {})
+    if status is not None:
+        earlier = _not_current_by_status(status, {
+            n: _whole_attempt((per_rank[n].get("detection") or {}).get("report_attempt")) for n in per_rank})
+        for number, why in earlier.items():
+            unknown[number] = f"{EARLIER_ATTEMPT}: {why}"
+        per_rank = {n: found for n, found in per_rank.items() if n not in earlier}
+    judged = sorted(per_rank)
     stream = ((list(status["incidents"]) if isinstance(status.get("incidents"), list) else detect_watchdog_incidents(status))
               if status is not None else [])
     looks = {n: {"report": {"incidents": [dict(i) for i in per_rank[n].get("incidents") or ()
@@ -4318,7 +4343,7 @@ def _all_ranks_evidence(
                          if isinstance(i, dict) and i.get("check") not in ("flight_recorder", "traincheck")]
             if unchecked:
                 entry["not_checked"] = unchecked
-        elif look["state"] in ("behind", "stale") and report:
+        elif look["state"] in ("behind", "stale", EARLIER_ATTEMPT) and report:
             # True when it was written and says nothing of what came after: shown as that, apart from the
             # ranks that are current, and never as the rank's incidents.
             entry["last_report"] = {
@@ -4475,6 +4500,28 @@ def _look_at_ranks(
     return folders, looks, tuple(keys)
 
 
+# The look state the all-ranks view gives a rank whose report is current with its store while
+# the server's status shows that the job was started again on it (L6, Nov 19, 2026).
+EARLIER_ATTEMPT = "earlier_attempt"
+
+
+def _earlier_attempt_looks(looks: Mapping[int, Mapping[str, Any]],
+                           status: Mapping[str, Any] | None) -> dict[int, Mapping[str, Any]]:
+    """`looks` with each current rank that the server's status says was judged by an earlier
+    attempt (`_not_current_by_status`: marked `attempt_without_steps`, or shown at another
+    attempt than its report's) read as `earlier_attempt`, with why. Such a rank is not judged:
+    it is in none of the view's values, as `run_state` calls it unknown, and its report is
+    shown as its `last_report`. Only the view's copy changes, never the watcher's memory or the
+    key it compares looks by (the status's stamp carries the flag, so it changing is news)."""
+    if status is None:
+        return dict(looks)
+    attempts = {n: _whole_attempt((look.get("report") or {}).get("attempt"))
+                for n, look in looks.items() if look["state"] == "current"}
+    found = _not_current_by_status(status, attempts)
+    return {n: ({**look, "state": EARLIER_ATTEMPT, "reason": found[n]} if n in found else look)
+            for n, look in looks.items()}
+
+
 def _all_ranks_whole(
     source: Path,
     folders: Mapping[int, Path],
@@ -4484,7 +4531,9 @@ def _all_ranks_whole(
     other_sources: Mapping[str, Any],
 ) -> dict[str, Any]:
     """The whole all-ranks evidence of one look: `_all_ranks_evidence`, how old the status is
-    when that is too old, and the run state."""
+    when that is too old, and the run state. A rank whose current report the status shows to be
+    an earlier attempt's is `earlier_attempt` here (`_earlier_attempt_looks`)."""
+    looks = _earlier_attempt_looks(looks, status)
     evidence = _all_ranks_evidence(source, folders, looks, status, **other_sources)
     if status_age is not None and "watchdog" in evidence:
         evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
@@ -4522,15 +4571,20 @@ def all_ranks_evidence(
     report is taken with what its server applied, which the evidence lists under `thresholds`.
     A first look has no memory of earlier ones, so a rank whose report is behind its store is
     `behind` here where a running watcher would wait `report_grace` for it.
+    A threshold given here that no server can apply (`check_thresholds`: the Rust detectors'
+    contract, so not finite, negative, a window or `top_k` below 1, not a number, a bool) raises
+    `ValueError` before anything is read; None is "not given".
     The evidence is `{"view": "all_ranks", ...}`: see `_all_ranks_evidence` and the README.
     """
-    source = _all_ranks_source(source)
-    status = read_watchdog(_all_ranks_status_file(source, watchdog))
-    thresholds = _given_thresholds({
+    given = {
         "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
         "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": top_k,
         "update_window": update_window,
-    })
+    }
+    check_thresholds(**given)
+    source = _all_ranks_source(source)
+    status = read_watchdog(_all_ranks_status_file(source, watchdog))
+    thresholds = _given_thresholds(given)
     folders, looks, _ = _look_at_ranks(source, status, {}, thresholds, REPORT_GRACE_SECONDS)
     other_sources = {"traincheck": traincheck, "flight_recorder": flight_recorder,
                      "flight_recorder_prefix": flight_recorder_prefix}
@@ -4566,7 +4620,9 @@ def watch_all_ranks(
     A rank's incidents count only while its report is current (`read_server_report`); a rank
     that is behind, stale, missing, unreadable, unusable, on other thresholds or has nothing
     stored is `unknown`, with its state and why, and is never listed among the ranks with no
-    incidents. Rank folders may appear or disappear between looks. `server_reports=False`
+    incidents. So is a rank whose report is current while the server's status shows the job
+    started again on it (`earlier_attempt`: marked `attempt_without_steps`, or at another
+    attempt than its report's; L6). Rank folders may appear or disappear between looks. `server_reports=False`
     (`--recompute`) is refused, because it asks for the detectors to run here, a rank at a
     time and for the whole run each time; use `rank=<n>` for that. Each rank's report is taken
     with the thresholds its server applied, which the evidence lists (`thresholds`); any of the
@@ -4587,6 +4643,8 @@ def watch_all_ranks(
             " another, on every change (about 8 s a rank at 10,000 steps); recompute one rank with rank=<n>"
         )
     status_file = _all_ranks_status_file(source, build_options.pop("watchdog", None))
+    # Said before the first look, as `watch` says it: this one may be called directly.
+    check_thresholds(**{name: build_options[name] for name in THRESHOLD_NAMES if name in build_options})
     thresholds = _given_thresholds(build_options)
     other_sources = {
         name: build_options.get(name) for name in ("traincheck", "flight_recorder", "flight_recorder_prefix")
@@ -5277,6 +5335,11 @@ def _missing_sample(step: int, layer: int, expert_count: int) -> dict[str, Any]:
 def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str:
     """Markdown table of one layer's expert load, sorted by largest positive delta first.
 
+    The step is compared with the last earlier one on which the router routed tokens, or else
+    the last earlier one. At the layer's first step there is none: the heading says so, every
+    delta is `n/a` and the rows are sorted by load (DET-14; until Nov 19, 2026 the first step
+    was compared with itself, every delta +0.00).
+
     Raises `compact.SamplesOmitted` for a step, or a step to compare it with, that compact
     evidence left out."""
     from .compact import require_table
@@ -5291,13 +5354,14 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
         for s in prior_steps
         if not samples[s, layer].get("missing") and samples[s, layer].get("routed_tokens", 0) > 0
     ]
+    previous: int | None
     if active_priors:
         previous = max(active_priors)
     elif prior_steps:
         previous = max(prior_steps)
     else:
-        previous = step
-    baseline = samples.get((previous, layer))
+        previous = None  # the layer's first step: nothing earlier to compare it with
+    baseline = samples.get((previous, layer)) if previous is not None else None
 
     tokens = int(sample.get("routed_tokens") or 0)
     if sample.get("missing") or tokens <= 0:
@@ -5335,7 +5399,8 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
         rows.sort(key=lambda row: row[:2])
     return "\n".join(
         [
-            f"**Layer {layer:02} expert load** · step {step} vs. {previous}",
+            f"**Layer {layer:02} expert load** · step {step} "
+            + (f"vs. {previous}" if previous is not None else "(no earlier step to compare with)"),
             "",
             "| Expert | Load | Δ load (pp) | Status |",
             "| --- | --- | --- | --- |",
