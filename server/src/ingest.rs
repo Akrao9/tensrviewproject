@@ -16,7 +16,8 @@
 //! sender's file is durable. Buffered Arrow bytes across all streams are capped; a batch
 //! that does not fit is refused with `RESOURCE_EXHAUSTED` and the sender retries later.
 //! A row whose run, rank, step, attempt or schema version is null cannot be stored: it is dropped
-//! and counted, with a line on stderr, and the rest of its batch is kept and acknowledged (RS10).
+//! and counted, with a line on stderr and in the rank's entry of its run's `watchdog.json`
+//! (`dropped_rows`, `dropped_row_keys`), and the rest of its batch is kept and acknowledged (RS10).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -555,6 +556,7 @@ impl Ingest {
         // be read) is sent again, and its rows would be counted twice.
         if !dropped.is_empty() {
             self.rows_dropped(key, &dropped);
+            self.watchdog.dropped(key, &dropped, Instant::now());
         }
         let now = Instant::now();
         self.watchdog.superseded(key, superseded, now);
@@ -1430,7 +1432,7 @@ impl Ingest {
                 "compared": status["ranks_compared"],
                 "run_state": status["run_state"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
-                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object(), (r["attempt"].clone(), r["attempt_without_steps"].clone(), r["superseded_rows"].clone(), r["capture_stopped"]["reason"].clone()))).collect::<Vec<_>>()
+                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object(), (r["attempt"].clone(), r["attempt_without_steps"].clone(), r["superseded_rows"].clone(), r["capture_stopped"]["reason"].clone()), r["dropped_row_keys"].clone())).collect::<Vec<_>>()
                 }),
             })
             .to_string();
