@@ -10,9 +10,10 @@ Written before each fix, against the branch's base. Each test says whether it fa
 - C06, its open part: the length check on a router's expert ids took any whole multiple of the
   tokens, whatever `top_k` said. Now the ids must number the tokens times the declared `top_k`;
   any other count refuses the router with a reason that names both, on the default integer path
-  and the `indices=` path alike. Never a raise, and the same under `torch.compile`. One exception,
-  kept because `test_router_guard.py` (`int-top_k-above`) guards it: on the default integer path a
-  declared `top_k` above `n_experts` is only written down, and the router is counted as before.
+  and the `indices=` path alike. Never a raise, and the same under `torch.compile`. The one exception
+  this file used to guard (on the default integer path a declared `top_k` above `n_experts` was
+  only written down, and the router counted as before) is gone: lane Y1 refuses that router too
+  (`test_lane_y1_capture.py`), and the guard test was removed when wave Y was merged.
 - C12 and TrainCheck B1, the part done here: an optimizer that holds only frozen parameters of the
   model (B1, `init` called after the freezing loops), or a model whose every parameter is frozen at
   `init`, looked like another job's optimizer, and no step was recorded. Now any of the model's
@@ -384,13 +385,6 @@ def test_c06_compiled_refuses_a_mismatch_as_eager_does(backend):
     torch._dynamo.reset()
     assert compiled == eager and compiled is not None
     assert _refused(counted) is None and counted[0]["moe"]["router"] == [1, 2, 2, 1]
-
-
-def test_c06_guard_a_default_integer_router_under_a_top_k_above_its_experts_is_counted_as_before():
-    # guard: the exception `test_router_guard.py`'s `int-top_k-above` case keeps.
-    records = _route(TWO_PER_TOKEN, tensorquill.Router(EXPERTS, EXPERTS + 1))
-    assert _refused(records) is None
-    assert [r["moe"]["router"] for r in records] == [[1, 2, 2, 1]] * 2
 
 
 def test_c06_an_indices_router_under_a_top_k_above_its_experts_is_refused():
