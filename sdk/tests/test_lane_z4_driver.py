@@ -971,6 +971,32 @@ def test_the_driver_trains_to_its_end_under_torchrun(tmp_path, world):
 
 
 @needs_trial_merge
+def test_the_driver_needs_no_numpy(tmp_path):
+    """Found in CI on `be9f522` (Nov 20, 2026): 13 jobs install no NumPy, and there every rank but 0
+    died in `broadcast_object_list`, which reads its bytes back through NumPy ("Numpy is not
+    available"), before any step. Here NumPy is hidden from every rank by a `sitecustomize` ahead
+    of the SDK on the path, so the test bites where NumPy is installed too.
+
+    Fail before: exit 1, no `verdict.json`, and that error from `_share_run` in the output."""
+    hidden = tmp_path / "no_numpy"
+    hidden.mkdir()
+    (hidden / "sitecustomize.py").write_text('import sys\nsys.modules["numpy"] = None\n')
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(hidden), str(SDK / "src")])}
+    env.pop("TENSORQUILL_ENDPOINT", None)
+    out = tmp_path / "out"
+    done = subprocess.run(
+        [sys.executable, "-m", "torch.distributed.run", "--nproc-per-node=2", "--master-addr", "127.0.0.1",
+         "--master-port", str(_free_port()), str(SDK / "examples" / "replica_check.py"), "--cpu",
+         "--out", str(out), "--steps", "16", "--step-seconds", "0.2", "--hold-rank", "1"],
+        capture_output=True, text=True, timeout=240, env=env, cwd=SDK,
+    )
+    assert "Numpy is not available" not in done.stdout + done.stderr, done.stdout + done.stderr
+    [verdict] = [json.loads(q.read_text()) for q in out.glob("*/verdict.json")]
+    assert verdict == {"code": proof.EXIT_PASS, "failures": []}, done.stdout + done.stderr
+    assert done.returncode == 0 and "PASS files on 2 ranks" in done.stdout
+
+
+@needs_trial_merge
 @pytest.mark.parametrize("world", [2, 3])
 @pytest.mark.parametrize("hold", ["none", "after-verdict", "never"])
 def test_trial_merge_files_mode(tmp_path, world, hold):

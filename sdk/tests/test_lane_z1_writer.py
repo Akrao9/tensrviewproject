@@ -88,7 +88,8 @@ def _words(t: torch.Tensor) -> list[int]:
         t = torch.view_as_real(t.resolve_conj())
     t = t.contiguous().reshape(-1)
     width = t.element_size()
-    raw = t.view(torch.uint8).numpy().tobytes() if t.numel() else b""
+    # Not `.numpy()`: TensorQuill does not require NumPy, and most CI jobs install none.
+    raw = bytes(t.view(torch.uint8).tolist()) if t.numel() else b""
     return [int.from_bytes(raw[i : i + width], "little") for i in range(0, len(raw), width)]
 
 

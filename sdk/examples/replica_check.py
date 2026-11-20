@@ -57,8 +57,15 @@ import replica_proof as proof  # noqa: E402
 from tensorquill.flight import offset_path  # noqa: E402
 
 
-def _share_run(plan: proof.Plan, rank: int) -> tuple[str, Path, str | None]:
-    """Rank 0 names the run and makes its folder; every rank learns both before training."""
+SHARED_BYTES = 2048  # room for the run ID and one message, sent as one tensor
+
+
+def _share_run(plan: proof.Plan, rank: int, device: torch.device) -> tuple[str, Path, str | None]:
+    """Rank 0 names the run and makes its folder; every rank learns both before training.
+
+    Sent as one int64 tensor on the run's device (a length, then the bytes of a JSON list) with
+    `dist.broadcast`, not with `broadcast_object_list`: torch reads that call's bytes back through
+    NumPy, which TensorQuill does not require, and every rank but 0 failed there without it."""
     problem = None
     run_id = plan.run_id or f"replica-check-{secrets.token_hex(6)}"
     work = plan.out / run_id
@@ -67,8 +74,16 @@ def _share_run(plan: proof.Plan, rank: int) -> tuple[str, Path, str | None]:
             problem = f"{work} is not empty; choose a new --out or --run-id"
         else:
             work.mkdir(parents=True, exist_ok=True)
-    shared = [run_id, problem]
-    dist.broadcast_object_list(shared, src=0)
+    payload = json.dumps([run_id, problem]).encode("utf-8")
+    if len(payload) > SHARED_BYTES:
+        payload = json.dumps(["", f"the run ID and its folder's path are too long to share ({len(payload)} bytes,"
+                                  f" {SHARED_BYTES} at most); choose a shorter --run-id or --out"]).encode("utf-8")
+    buffer = torch.zeros(1 + SHARED_BYTES, dtype=torch.int64, device=device)
+    if rank == 0:
+        buffer[0] = len(payload)
+        buffer[1 : 1 + len(payload)] = torch.tensor(list(payload), dtype=torch.int64, device=device)
+    dist.broadcast(buffer, src=0)
+    shared = json.loads(bytes(buffer[1 : 1 + int(buffer[0])].tolist()).decode("utf-8"))
     return shared[0], plan.out / shared[0], shared[1]
 
 
@@ -136,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     dist.init_process_group(backend, timeout=timedelta(seconds=60))
     try:
         rank = dist.get_rank()
-        run_id, work, problem = _share_run(plan, rank)
+        run_id, work, problem = _share_run(plan, rank, device)
         if problem:
             print(f"replica_check.py: {problem}", file=sys.stderr)
             return proof.EXIT_USAGE
