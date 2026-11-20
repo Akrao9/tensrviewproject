@@ -214,3 +214,91 @@ def test_thresholds_the_values_a_server_applies_are_taken(tmp_path, option):
     run = _store(tmp_path, [{"rank": 0, "attempt": 1, "last_step": 9}])
     evidence = ev.all_ranks_evidence(run, **option)
     assert evidence["rank_count"] == 1
+
+
+# --- C03, the Python side: a rank whose capture stopped raises no progress incident --------------
+
+STOPPED = {"capture_stopped": {"reason": "sink_error", "seconds": 3.0}}
+STALLS = ("job_stalled", "rank_silent")
+
+
+def _entry(rank: int, state: str, **extra) -> dict:
+    severity = "critical" if state in ("silent", "lost", "unresponsive") else None
+    return {"rank": rank, "state": state, "attempt": 1, "last_step": 40 + rank, "severity": severity, **extra}
+
+
+def _stalls(incidents: list[dict]) -> list[dict]:
+    return [i for i in incidents if i.get("kind") in STALLS]
+
+
+@pytest.mark.parametrize("state", ["unresponsive", "lost"])
+def test_c03_a_stopped_rank_beside_an_active_one_raises_no_stall(state):
+    status = {"summary": "degraded", "world_size": 2, "missing_ranks": [],
+              "ranks": [_entry(0, state, **STOPPED), _entry(1, "active")]}
+    assert _stalls(ev.detect_watchdog_incidents(status)) == []
+
+
+@pytest.mark.parametrize("state", ["unresponsive", "lost"])
+def test_c03_a_lone_stopped_rank_raises_no_stall(state):
+    status = {"summary": "stalled", "world_size": 1, "missing_ranks": [], "ranks": [_entry(0, state, **STOPPED)]}
+    assert _stalls(ev.detect_watchdog_incidents(status)) == []
+    # It is still unknown, with its reason: not judged, never healthy.
+    judged = ev.run_state(incidents=ev.detect_watchdog_incidents(status), steps_judged=True, status=status)
+    assert judged["state"] == "unknown" and "capture_stopped" in [r["code"] for r in judged["reasons"]]
+
+
+def test_c03_the_other_ranks_are_judged_as_before_without_the_stopped_one():
+    status = {"summary": "stalled", "world_size": 2, "missing_ranks": [],
+              "ranks": [_entry(0, "lost", **STOPPED), _entry(1, "silent")]}
+    [stall] = _stalls(ev.detect_watchdog_incidents(status))
+    assert stall["kind"] == "job_stalled" and [r["rank"] for r in stall["ranks"]] == [1]
+    # The stopped rank's lost stream does not explain the stall: it is not judged.
+    assert stall["assessment"] == "suspected_hang" and "lost_ranks" not in stall
+    status["summary"] = "degraded"
+    status["ranks"].append(_entry(2, "active"))
+    [silent] = _stalls(ev.detect_watchdog_incidents(status))
+    assert silent["kind"] == "rank_silent" and [r["rank"] for r in silent["ranks"]] == [1]
+    assert [r["rank"] for r in silent["other_ranks"]] == [2]
+
+
+def _server_stall(status: dict) -> dict:
+    """The `job_stalled` a server that counts the stopped rank among the stopped ones writes."""
+    return {"kind": "job_stalled", "class": "observation", "step": 41, "severity": "critical",
+            "assessment": "lost_connection", "lost_ranks": [0], "ranks": status["ranks"], "missing_ranks": []}
+
+
+DUPLICATES = {"kind": "duplicate_batches", "class": "invariant", "step": 3, "ranks": [0, 1]}
+
+
+def test_c03_a_servers_stall_for_a_stopped_rank_is_not_taken():
+    status = {"summary": "stalled", "world_size": 1, "missing_ranks": [], "ranks": [_entry(0, "lost", **STOPPED)]}
+    status["incidents"] = [_server_stall(status), DUPLICATES]
+    found = ev.status_incidents(status)
+    assert _stalls(found) == [] and [i["kind"] for i in found] == ["duplicate_batches"]
+
+
+def test_c03_a_servers_list_without_a_stopped_rank_is_taken_as_written():
+    status = {"summary": "stalled", "world_size": 1, "missing_ranks": [], "ranks": [_entry(0, "lost")]}
+    written = {**_server_stall(status), "newer_field": 1}
+    status["incidents"] = [written]
+    assert ev.status_incidents(status) == [written]
+
+
+def test_c03_the_all_ranks_evidence_and_the_watcher_raise_no_stall_for_it(tmp_path):
+    run = _store(tmp_path, [{"rank": 0, "attempt": 1, "last_step": 9}, {"rank": 1, "attempt": 1, "last_step": 9}])
+    status = _status([{"rank": 0, "attempt": 1, "last_step": 9},
+                      {"rank": 1, "attempt": 1, "last_step": 9, "state": "unresponsive", "severity": "critical",
+                       **STOPPED}], summary="degraded")
+    status["incidents"] = [{"kind": "rank_silent", "class": "observation", "step": 9, "severity": "critical",
+                            "assessment": "suspected_hang", "ranks": [status["ranks"][1]],
+                            "other_ranks": [{"rank": 0, "state": "active", "last_step": 9, "attempt": 1}],
+                            "missing_ranks": []}]
+    (run / "watchdog.json").write_text(json.dumps(status))
+    evidence = ev.all_ranks_evidence(run)
+    assert _stalls(evidence["run_incidents"]) == []
+    assert "capture_stopped" in [r["code"] for r in evidence["run_state"]["reasons"]]
+    out = tmp_path / "one.json"
+    ev.watch(run / "rank=1", out, interval=0.0, polls=1)
+    assert _stalls(json.loads(out.read_text())["incidents"]) == []
+    combined = ev.combine_rank_evidence({0: _per_rank(0, 1), 1: _per_rank(1, 1)}, status=status, status_expected=True)
+    assert _stalls(combined["run_incidents"]) == []
