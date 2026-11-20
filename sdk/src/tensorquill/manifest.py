@@ -245,8 +245,11 @@ def read_manifest(path: str | Path) -> dict[str, Any] | None:
 def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> bool:
     """Write the manifest by a temporary file and a rename. A run that starts again under the
     same run ID keeps the first start's `created_at`. Never raises: a manifest that cannot be
-    written is warned about and the run goes on without one."""
+    written is warned about and the run goes on without one. A scratch file that the failed
+    write or rename left (`.<name>.<pid>.tmp`) is removed (lane Z6, L23), and a removal that
+    fails is let be; the manifest already there is left as it was."""
     path = Path(path)
+    scratch: Path | None = None
     try:
         earlier = read_manifest(path)
         document = dict(manifest)
@@ -258,6 +261,11 @@ def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> bool:
         os.replace(scratch, path)
         return True
     except Exception as error:  # noqa: BLE001  nothing here may stop a run
+        if scratch is not None:
+            try:
+                scratch.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001  a scratch file that stays is untidy, never a failure
+                pass
         # Four frames up is the caller of `tensorquill.init` (this function, `init`, the
         # `torch.compiler.disable` wrapper around it, the caller); three named the wrapper.
         _say(
