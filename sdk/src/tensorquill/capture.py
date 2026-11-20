@@ -1352,6 +1352,14 @@ class Session:
         self._trainable_scan_at = 0  # the committed step count from which the next scan is due
         self._lead: weakref.ref[Any] | None = None
         self._leading = True
+        # Telling a replaced lead (L9, `_takes_lead`): the optimizers that are not the lead and have
+        # stepped since it last did; one parameter of the lead, its gradient and that gradient's
+        # version at the lead's last step, and which lead chose it; whether an optimizer holds any
+        # parameter the lead holds, with the sizes that was judged at.
+        self._since_lead: weakref.WeakSet[Any] = weakref.WeakSet()
+        self._lead_mark: tuple[Any, Any, int | None] | None = None
+        self._lead_mark_of: Callable[[], Any] = lambda: None
+        self._shares_lead: weakref.WeakKeyDictionary[Any, tuple[Any, bool]] = weakref.WeakKeyDictionary()
         self._grads_after_step = False
         # Step accounting under a loss scaler (`_commit`, `_watch_scaler`): whether an optimizer
         # that holds this model's parameters, or one that holds none of them, stepped since the
@@ -1613,10 +1621,24 @@ class Session:
         # written on the step the lead ended (`_after_optimizer_step`), which assumes they
         # step after it in each iteration. Gradients are read before the lead steps, after
         # backward, so they include every optimizer's parameters.
+        # The lead is replaced (L9) by an optimizer that holds some of the parameters it holds and
+        # steps in a later iteration than the lead last did: an LR finder's optimizer followed by
+        # the real one, or an optimizer rebuilt while the old one is still referenced. Before, the
+        # first lead kept leading while it lived, and the new one's steps were never counted.
         lead = self._lead() if self._lead is not None else None
         if lead is None:
             self._lead, lead = weakref.ref(optimizer), optimizer
+        elif optimizer is not lead and self._takes_lead(optimizer, lead):
+            self._lead, lead = weakref.ref(optimizer), optimizer
+            self._followers = False  # the old lead's followers; a follower of the new one is found again
         self._leading = optimizer is lead
+        if self._leading:
+            self._since_lead.clear()
+        else:
+            try:
+                self._since_lead.add(optimizer)
+            except TypeError:  # not weakly referenceable: only the backward signal can tell
+                pass
         if self._stopped:
             return  # only the step count goes on, for the drift check's schedule (`_count_stopped`)
         if self._leading and self._probe_owed:
@@ -1639,6 +1661,15 @@ class Session:
             return
         self._step_depth, self._outer_frame = 0, None
         self._stepped = True
+        if not self._leading and callable(kwargs.get("closure", args[1] if len(args) > 1 else None)):
+            # Under `step(closure)` the backward runs inside the step, after `_before_optimizer_step`
+            # judged whether this optimizer replaces the lead (L9): judged again now that it has run.
+            lead = self._lead() if self._lead is not None else None
+            if lead is not None and self._backward_since_lead() and self._shares_with_lead(optimizer, lead):
+                self._lead, self._leading, self._followers = weakref.ref(optimizer), True, False
+                self._since_lead.clear()
+        if self._leading:
+            self._mark_lead_grad(optimizer)
         if self._stopped:
             if self._leading and not self._commit_on_update:
                 self._count_stopped(None)
@@ -1672,6 +1703,93 @@ class Session:
         self._pending_lr = _learning_rates(optimizer)
         if not self._commit_on_update:
             self._commit(None)
+
+    def _takes_lead(self, optimizer: Any, lead: Any) -> bool:
+        """Whether `optimizer`, which is not the lead, replaces it from this step on (L9): it holds a
+        parameter the lead holds, and it steps in a later iteration than the lead last did. That is
+        known when a backward has run since the lead's last step (`_backward_since_lead`), or when
+        this optimizer already stepped since then. Two optimizers stepped one after the other in one
+        iteration (a follower, `_after_optimizer_step`) meet neither, and ones that hold none of each
+        other's parameters (two halves of a model, a GAN's two players) never replace each other, so
+        both stay as they were.
+
+        Under `step(closure)` the backward runs inside the step, after this is judged, so it is
+        judged again after the step (`_after_optimizer_step`), before the step is ended. On the
+        host, no device work: a check of one gradient's identity and version on every step of an
+        optimizer that is not the lead, and a pass over two optimizers' parameter lists when their
+        groups change."""
+        try:
+            again = optimizer in self._since_lead
+        except TypeError:
+            again = False
+        if not (again or self._backward_since_lead()):
+            return False
+        return self._shares_with_lead(optimizer, lead)
+
+    def _mark_lead_grad(self, optimizer: Any) -> None:
+        """After the lead's step: one parameter it holds, the gradient that parameter had and that
+        gradient's version, for `_backward_since_lead`. The parameter is chosen once per lead."""
+        try:
+            chosen = self._lead_mark[0]() if self._lead_mark is not None else None
+            if chosen is None or self._lead_mark_of() is not optimizer:
+                chosen = next(
+                    (p for group in optimizer.param_groups for p in group["params"] if id(p) in self._param_ids),
+                    None,
+                )
+                if chosen is None:
+                    self._lead_mark = None
+                    return
+                self._lead_mark_of = weakref.ref(optimizer)
+            grad = chosen.grad
+            self._lead_mark = (
+                weakref.ref(chosen),
+                None if grad is None else weakref.ref(grad),
+                None if grad is None else grad._version,
+            )
+        except Exception:  # noqa: BLE001
+            self._lead_mark = None
+
+    def _backward_since_lead(self) -> bool:
+        """Whether the gradient marked at the lead's last step (`_mark_lead_grad`) has changed since:
+        a new gradient (`zero_grad()` sets it to None, a backward makes another), or the same one
+        written in place (`zero_grad(set_to_none=False)`, or a backward that accumulates into it)."""
+        mark = self._lead_mark
+        if mark is None:
+            return False
+        try:
+            param, was, version = mark[0](), mark[1], mark[2]
+            if param is None:
+                return False
+            grad = param.grad
+            if was is None:
+                return grad is not None
+            if grad is None or grad is not was():
+                return True
+            return grad._version != version
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _shares_with_lead(self, optimizer: Any, lead: Any) -> bool:
+        """Whether `optimizer` holds a parameter `lead` holds. Kept for the pair and the sizes of
+        both optimizers' parameter groups, and judged again when those change (as `_owns` is)."""
+        key = (
+            id(lead),
+            tuple(len(group["params"]) for group in lead.param_groups),
+            tuple(len(group["params"]) for group in optimizer.param_groups),
+        )
+        try:
+            found = self._shares_lead.get(optimizer)
+        except TypeError:
+            found = None
+        if found is not None and found[0] == key:
+            return found[1]
+        held = {id(p) for group in lead.param_groups for p in group["params"]}
+        shared = any(id(p) in held for group in optimizer.param_groups for p in group["params"])
+        try:
+            self._shares_lead[optimizer] = (key, shared)
+        except TypeError:
+            pass
+        return shared
 
     @torch.no_grad()
     def _read_late_updates(self, optimizer: Any) -> None:
