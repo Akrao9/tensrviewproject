@@ -711,7 +711,7 @@ def _watchdog_beside(source: Any) -> Path | None:
         return None
     directory = Path(source).resolve()
     status = directory / "watchdog.json"
-    if _rank_number(directory.name) is not None and not status.is_file():
+    if rank_number(directory.name) is not None and not status.is_file():
         return directory.parent / status.name
     return status
 
@@ -1924,7 +1924,7 @@ def _attempt_place(order: list[int] | None, attempt: int) -> tuple[int, int]:
 _RANK_FOLDER = re.compile(r"rank=([0-9]+)")
 
 
-def _rank_number(name: str) -> int | None:
+def rank_number(name: str) -> int | None:
     """The rank a folder named `rank=<n>` holds, or None for any other name. `<n>` is what the
     server writes (`server/src/storage.rs`): ASCII digits, a rank of at least 0. Every reader of
     the name asks this one (DET-17, Nov 19, 2026: some took `isdecimal()`, which lets in other
@@ -1935,7 +1935,7 @@ def _rank_number(name: str) -> int | None:
 
 
 def _other_rank_folder(entry: os.DirEntry[str], rank: int) -> bool:
-    number = _rank_number(entry.name)
+    number = rank_number(entry.name)
     return number is not None and number != rank
 
 
@@ -1957,7 +1957,7 @@ def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
         relative = path.relative_to(directory.parent).parts[:-1]
         for depth, parent in enumerate(relative):
             name, _, value = parent.partition("=")
-            if name == "rank" and _rank_number(parent) is not None:
+            if name == "rank" and rank_number(parent) is not None:
                 numbers[name] = int(value)
                 rank_folder = directory.parent.joinpath(*relative[: depth + 1])
             elif name == "attempt" and (number := _attempt_number(value)) is not None:
@@ -2630,7 +2630,7 @@ STATUS_STALE_FACTOR = 2.0
 def _own_rank(source: Path) -> int | None:
     if not source.is_dir():
         return None
-    return _rank_number(source.resolve().name)
+    return rank_number(source.resolve().name)
 
 
 def _rank_dirs(source: Path) -> list[Path]:
@@ -3547,7 +3547,7 @@ def watch(
                 world_size = status.get("world_size") if status else None
                 if len(dirs) > 1 or (dirs and isinstance(world_size, int) and world_size > 1):
                     picked_rank = default_rank
-                    others_seen = {n for d in dirs if (n := _rank_number(d.name)) is not None}
+                    others_seen = {n for d in dirs if (n := rank_number(d.name)) is not None}
                     others_seen |= {int(r.get("rank", 0)) for r in tail.records}
                     if any(r.get("rank", 0) != picked_rank for r in tail.records):
                         emitted = None
@@ -3696,7 +3696,7 @@ def _discover_rank_folders(source: Path) -> dict[int, Path]:
     try:
         with os.scandir(source) as entries:
             for entry in entries:
-                number = _rank_number(entry.name)
+                number = rank_number(entry.name)
                 if number is not None and entry.is_dir():
                     found[number] = Path(entry.path)
     except OSError:

@@ -5,7 +5,7 @@ each row it fixes.
   an attempt seen only in the middle of a file orders the attempts as `compare` orders them
   (contract 1), and the `end` cell is taken from the file of the rank's newest attempt.
 - DET-17, open part: `manifest.py`, `runs.py` and `mcp_server.py` read `rank=<n>` folder names
-  with `evidence._rank_number` (ASCII digits only).
+  with `evidence.rank_number` (ASCII digits only).
 - CLI-14: the MCP server serves the probe's head and attention series.
 - DET-13: the compact file's table at a window's first step is made when the full evidence has
   no earlier step that routed tokens either, and a later starvation onset gets a window.
@@ -144,7 +144,7 @@ def test_cli13_the_end_cell_is_the_newest_attempts_file(tmp_path):
 # --- DET-17 -----------------------------------------------------------------------------------
 #
 # `rank=<n>` is ASCII digits, as the server writes it (`server/src/storage.rs`) and as the
-# evidence readers read it (`evidence._rank_number`). `rank=٣` (Arabic-Indic three) passed
+# evidence readers read it (`evidence.rank_number`). `rank=٣` (Arabic-Indic three) passed
 # `isdecimal()` in these modules and was read as rank 3; `²` and `--1` already failed it.
 
 STRAY = ["rank=٣", "rank=²", "rank=--1", "rank=+1", "rank= 1", "rank=x"]
@@ -153,18 +153,18 @@ STRAY = ["rank=٣", "rank=²", "rank=--1", "rank=+1", "rank= 1", "rank=x"]
 def test_det17_every_module_reads_rank_folders_with_the_evidence_readers_parser(tmp_path):
     from tensorquill import manifest as manifest_module
     from tensorquill import mcp_server
-    from tensorquill.evidence import _rank_number
+    from tensorquill.evidence import rank_number
 
     for name in [*STRAY, "rank=3", "rank=0"]:
         folder = tmp_path / "runs" / "r" / name
         folder.mkdir(parents=True)
-        is_rank = _rank_number(name) is not None
+        is_rank = rank_number(name) is not None
         # The manifest of a rank folder is its run folder's; any other folder's is its own.
         (where,) = manifest_module.manifest_candidates(folder)
         assert where == (folder.parent if is_rank else folder) / manifest_module.STORE_MANIFEST, name
         # The MCP server started on a rank folder reads that rank of its run folder.
         kind, path, rank = mcp_server.Source(folder).locate()
-        assert (kind, path, rank) == (("store", folder.parent, _rank_number(name)) if is_rank else ("store", folder, None)), name
+        assert (kind, path, rank) == (("store", folder.parent, rank_number(name)) if is_rank else ("store", folder, None)), name
         # A folder that holds only such a folder is a run folder only for a real rank folder.
         lone = tmp_path / "lone" / name.replace("=", "_") / "runid"
         (lone / name).mkdir(parents=True)

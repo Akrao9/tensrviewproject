@@ -285,10 +285,10 @@ def manifest_candidates(source: str | Path, run_id: str | None = None) -> list[P
         # Imported here: `evidence` imports this module. The one reader of `rank=<n>` (ASCII
         # digits, as the server writes it), so every module reads a store's folders alike
         # (lane X5, DET-17: `isdecimal()` here took `rank=٣` for rank 3).
-        from .evidence import _rank_number
+        from .evidence import rank_number
 
         folder = source.resolve()
-        if _rank_number(folder.name) is not None:
+        if rank_number(folder.name) is not None:
             folder = folder.parent
         return [folder / STORE_MANIFEST]
     ids = [i for i in (run_id, run_id_of_file(source)) if i]

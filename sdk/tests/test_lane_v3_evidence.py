@@ -238,7 +238,7 @@ def test_det17_a_stray_rank_folder_does_not_break_or_split_the_readers(tmp_path,
     (run / "rank=17").mkdir()
     with os.scandir(run) as entries:
         for entry in entries:
-            number = ev._rank_number(entry.name)
+            number = ev.rank_number(entry.name)
             assert number == ev._own_rank(Path(entry.path)), entry.name
             assert (number is not None and number != 0) == ev._other_rank_folder(entry, 0), entry.name
             assert number == {"rank=0": 0, "rank=17": 17}.get(entry.name), entry.name

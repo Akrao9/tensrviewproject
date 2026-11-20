@@ -59,7 +59,7 @@ from .evidence import (
     _attention_values,
     _discover_rank_folders,
     _parquet_parts,
-    _rank_number,  # the one reader of `rank=<n>`: ASCII digits (lane X5, DET-17: `isdecimal()` took `rank=٣`)
+    rank_number,  # the one reader of `rank=<n>`: ASCII digits (lane X5, DET-17: `isdecimal()` took `rank=٣`)
     all_ranks_evidence,
     all_ranks_kinds,
     build_evidence,
@@ -240,7 +240,7 @@ class Source:
                 " or the server was started on the wrong path."
             )
         if path.is_dir():
-            own = _rank_number(path.resolve().name)
+            own = rank_number(path.resolve().name)
             return ("store", path.resolve().parent, own) if own is not None else ("store", path, None)
         return ("capture" if path.suffix == ".jsonl" else "evidence"), path, None
 
@@ -254,7 +254,7 @@ class Source:
             path = self.path if self.path.exists() else self.path.absolute()
             if path.is_dir():
                 path = path.resolve()
-                folder = path.parent.parent if _rank_number(path.name) is not None else path.parent
+                folder = path.parent.parent if rank_number(path.name) is not None else path.parent
             else:
                 folder = path.parent
         if not folder.is_dir():
@@ -351,8 +351,8 @@ class Source:
             if where is None:
                 return None
             kind = "store" if where.is_dir() else "capture"
-            if kind == "store" and _rank_number(where.resolve().name) is not None:
-                default_rank, where = _rank_number(where.resolve().name), where.resolve().parent
+            if kind == "store" and rank_number(where.resolve().name) is not None:
+                default_rank, where = rank_number(where.resolve().name), where.resolve().parent
             if default_rank is None:
                 default_rank = _judged_rank(document)
         if kind == "capture":
