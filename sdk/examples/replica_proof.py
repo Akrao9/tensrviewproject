@@ -5,7 +5,9 @@ What is here, in the order the driver uses it:
 
 - `validate`: the arguments and the launcher's environment, for any world size of two or more.
 - `Plant`, `build_model`, `reset_and_plant`: the divergence the driver plants on one rank, one
-  parameter and one step (`add`, `neg` or `swap`, the three it has always planted).
+  parameter and one step: `add`, `neg` or `swap`, the three it has always planted, which move the
+  fingerprints; or `ulp` and `negzero`, which change the bits and leave the fingerprints within
+  the tolerance (contract 5: a signature-only difference is evidence and raises nothing).
 - `ProofSink`: wraps each rank's `JsonlSink`. It logs when each line reaches the file, and, on the
   held rank, holds that rank's lines back (released later, or never). The suppression lives here,
   in the driver's own files, never in the SDK. In server mode it also logs, on a thread of its own,
@@ -14,7 +16,10 @@ What is here, in the order the driver uses it:
   the file reader's), kept by launch, group and step, with when each state was first seen. A
   server may bound how many steps it lists, so nothing is judged from the last look alone.
 - `check_result`, `check_history`, `check_no_wait`, `check_latency`, `check_kinds`: the assertions.
-  Each returns a list of failures, empty when it holds; none asserts which rank drifted (D1 is held).
+  Each returns a list of failures, empty when it holds; none asserts which rank drifted (D1 is
+  released and not built).
+- `healthy_signatures`: on how many compared steps with no plant the signatures differed, by
+  parameter. Reported, and failed only with `--healthy-mismatch fail`.
 
 The contract is `REPLICA_OBSERVATION_CONTRACT.md` at the repository root.
 """
@@ -35,11 +40,12 @@ from typing import Any, Callable, Iterable, Mapping
 
 # --- The reader of local rank files (lane Z2) -----------------------------------------------
 #
-# Lane Z2's `tensorquill.evidence.compare_replicas(records, *, tolerance, attempt_order=None)`, as
-# read on its branch at 121a7a6: one run's records (`ValueError` for more than one) in, the object
-# of contract section 8 (`{"v", "tolerance", "steps", "replica_drift"}`, with `legacy` when there is
-# one) out. The driver passes every rank's lines, file by file in line order, which is each rank's
-# attempt order for one local file, so `attempt_order` is not given. A reader that raises is said
+# `tensorquill.evidence.compare_replicas(records, *, tolerance, attempt_order=None)`: one run's
+# records (`ValueError` for more than one) in, `{"steps", "replica_drift"}` out, with `legacy` when
+# there is one. It gives no `v` and no `tolerance`: those two are added by the server, which carries
+# the same lists under `replica` in `watchdog.json` (contract section 8). The driver passes every
+# rank's lines, file by file in line order, which is each rank's attempt order for one local file,
+# so `attempt_order` is not given. A reader that raises is said
 # at the end, as a failure with its message; it is never raised into training. `--reader module:function` names
 # another, as does the environment variable below (read by the driver and by its tests alike, so a
 # renamed reader is one setting on the trial merge, not a silent skip). A result wrapped as
@@ -55,7 +61,17 @@ TOLERANCE = 1e-6
 # --- The model and the planted divergence ----------------------------------------------------
 
 PARAM_NAMES = ("0.weight", "0.bias", "1.weight")
-KINDS = ("add", "neg", "swap")
+# The three that move a fingerprint above the tolerance, and so must raise `replica_drift`.
+LOUD_KINDS = ("add", "neg", "swap")
+# The two that change a parameter's bits and leave every fingerprint within the tolerance, and so
+# must read `fingerprints agree`, `signatures differ` and raise nothing (contract 5; the author's
+# call of Nov 20, 2026 that a signature-only difference stays evidence until the eight-GPU run):
+# `ulp` moves element 0 by the smallest step its dtype allows (`torch.nextafter` toward +inf: one
+# up in its bit pattern for a positive float); `negzero` turns element ZERO_INDEX, which the base
+# makes exactly +0.0, into -0.0.
+QUIET_KINDS = ("ulp", "negzero")
+KINDS = LOUD_KINDS + QUIET_KINDS
+ZERO_INDEX = -1  # the last element of every parameter; the loud kinds touch elements 0, 1 and 2 only
 
 
 @dataclass(frozen=True)
@@ -67,6 +83,11 @@ class Plant:
 
     def __str__(self) -> str:
         return f"{self.kind} on {self.param} of rank {self.rank} at step {self.step}"
+
+    @property
+    def quiet(self) -> bool:
+        """Whether it changes bits and no fingerprint (a signature-only difference)."""
+        return self.kind in QUIET_KINDS
 
 
 def parse_plant(text: str) -> Plant:
@@ -82,10 +103,13 @@ def parse_plant(text: str) -> Plant:
 
 
 def default_plants(world: int) -> list[Plant]:
-    """The three the driver has always planted, each on one rank: with two ranks, two ranks that
-    disagree; with three or more, one outlier among the others (the controls D1 will need)."""
+    """The three the driver has always planted (steps 1, 3 and 5) and the two that change bits
+    only (steps 2 and 4), each on one rank: with two ranks, two ranks that disagree; with three or
+    more, one outlier among the others (the controls D1 will need). All fall below step 6, so six
+    steps still run the defaults, as before; with the default eight, steps 0, 6 and 7 stay clean."""
     last = world - 1
-    return [Plant(last, 1, "0.weight", "add"), Plant(1, 3, "1.weight", "neg"), Plant(last, 5, "1.weight", "swap")]
+    return [Plant(last, 1, "0.weight", "add"), Plant(last, 2, "0.bias", "ulp"), Plant(1, 3, "1.weight", "neg"),
+            Plant(last, 5, "1.weight", "swap"), Plant(1, 4, "0.weight", "negzero")]
 
 
 def build_model(device: Any) -> Any:
@@ -96,15 +120,18 @@ def build_model(device: Any) -> Any:
 
 
 def base_values(model: Any) -> dict[str, Any]:
-    """Fixed, distinct, non-zero values, the same on every rank: a sign flip changes the sum and
-    not the norm, and a swap of two elements changes neither, only the projection."""
+    """Fixed values, the same on every rank: distinct and above zero everywhere but the last
+    element, which is exactly +0.0. A sign flip of element 0 changes the sum and not the norm, a
+    swap of elements 1 and 2 changes neither, only the projection, and the zero is what `negzero`
+    turns into -0.0."""
     import torch
 
     out = {}
     for offset, (name, param) in enumerate(model.named_parameters()):
         n = param.numel()
         values = (torch.arange(1, n + 1, dtype=torch.float32) + offset * 0.5) / n
-        out[name] = values.reshape(param.shape).to(param.device)
+        values[ZERO_INDEX] = 0.0
+        out[name] = values.reshape(param.shape).to(device=param.device, dtype=param.dtype)
     return out
 
 
@@ -124,6 +151,13 @@ def reset_and_plant(model: Any, base: Mapping[str, Any], plants: Iterable[Plant]
                 flat[0].neg_()
             elif plant.kind == "swap":
                 flat[[1, 2]] = flat[[2, 1]].clone()
+            elif plant.kind == "ulp":
+                one = flat[0:1]
+                one.copy_(torch.nextafter(one, torch.full_like(one, math.inf)))
+            elif plant.kind == "negzero":
+                # -(+0.0) is -0.0. Were the element not zero this would be a sign flip, which moves
+                # the sum, and the check would fail saying the fingerprints moved.
+                flat[ZERO_INDEX].neg_()
 
 
 # --- Arguments --------------------------------------------------------------------------------
@@ -157,6 +191,7 @@ class Plan:
     cpu: bool = True
     run_id: str | None = None
     final_seconds: float = 60.0
+    healthy_mismatch: str = "report"  # "report" or "fail": a step with no plant whose signatures differ
 
     @property
     def group(self) -> list[int]:
@@ -168,6 +203,14 @@ class Plan:
 
     def plants_at(self, step: int, rank: int | None = None) -> list[Plant]:
         return [p for p in self.plants if p.step == step and (rank is None or p.rank == rank)]
+
+    def loud_at(self, step: int) -> list[str]:
+        """The parameters a fingerprint-moving plant changes at `step`, sorted."""
+        return sorted({p.param for p in self.plants_at(step) if not p.quiet})
+
+    def quiet_at(self, step: int) -> list[str]:
+        """The parameters a bits-only plant changes at `step`, sorted."""
+        return sorted({p.param for p in self.plants_at(step) if p.quiet})
 
     def held(self, step: int) -> bool:
         """Whether this step's observation of the held rank is held back."""
@@ -197,6 +240,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"plant a divergence (PARAM one of {', '.join(PARAM_NAMES)}; KIND one of {', '.join(KINDS)});"
                         " repeat for more; default: three plants on steps 1, 3 and 5")
     p.add_argument("--no-plants", action="store_true", help="plant nothing: every step must read clean")
+    p.add_argument("--healthy-mismatch", choices=("report", "fail"), default="report",
+                   help="a step with no plant whose signatures differ: report it in the count (the default: how"
+                        " often that happens on healthy steps is what the eight-GPU run measures) or fail the run")
     p.add_argument("--hold-rank", type=int, help="hold back this rank's telemetry (it keeps training)")
     p.add_argument("--hold-from", type=int, default=2, help="the first step whose records are held")
     p.add_argument("--release", choices=("after-verdict", "never"), default="after-verdict",
@@ -264,12 +310,17 @@ def validate(argv: list[str] | None, env: Mapping[str, str], cuda_devices: int |
             raise UsageError(f"plant {plant}: the model's parameters are {', '.join(PARAM_NAMES)}")
         if plant.kind not in KINDS:
             raise UsageError(f"plant {plant}: the kinds are {', '.join(KINDS)}")
+    for step in sorted({p.step for p in plants}):
+        on_step = [p for p in plants if p.step == step]
+        if any(p.quiet for p in on_step) and not all(p.quiet for p in on_step):
+            raise UsageError(f"step {step}: a plant of {', '.join(QUIET_KINDS)} and one of {', '.join(LOUD_KINDS)}"
+                             " on one step; the step's verdict could not show the bits-only plant on its own")
     plan = Plan(
         world=world, rank=rank, local_rank=local_rank, mode=args.mode, out=args.out, steps=args.steps,
         replica_every=args.replica_every, step_seconds=args.step_seconds, plants=plants,
         hold_steps=args.hold_steps, margin=args.latency_margin, wait_slack=args.wait_slack,
         endpoint=args.endpoint, store=args.store, reader=args.reader, cpu=args.cpu, run_id=args.run_id,
-        final_seconds=args.final_seconds,
+        final_seconds=args.final_seconds, healthy_mismatch=args.healthy_mismatch,
     )
     if args.hold_rank is not None:
         if not 0 <= args.hold_rank < world:
@@ -562,8 +613,12 @@ _LAUNCH = re.compile(r"^[0-9a-f]{32}$")
 def check_result(result: Mapping[str, Any], plan: Plan, launch: str | None) -> list[str]:
     """Contract sections 4 and 5, per scheduled step, from the result object (never from one rank's
     record): the coverage; for a judged step, drift on exactly the planted parameters or agreement;
-    `replica_drift` raised on exactly the planted, judged steps, each naming the parameters, the
-    step, the launch and the group; and nothing for a step that stays insufficient."""
+    `replica_drift` raised on exactly the steps with a fingerprint-moving plant that were judged,
+    each naming the parameters, the step, the launch and the group; and nothing for a step that
+    stays insufficient. A step with a bits-only plant (`ulp`, `negzero`) must read fingerprints
+    `agree` and signatures `differ` on exactly the planted parameters, and raise nothing: a
+    signature-only difference is evidence (contract 5). A step with no plant whose signatures
+    differ fails only with `--healthy-mismatch fail`; otherwise `healthy_signatures` counts it."""
     failures: list[str] = []
     if not isinstance(launch, str) or not _LAUNCH.match(launch):
         return [f"rank 0's own record names no launch (got {launch!r}): nothing can be matched"]
@@ -598,8 +653,22 @@ def check_result(result: Mapping[str, Any], plan: Plan, launch: str | None) -> l
             failures.append(f"step {step}: coverage {entry.get('coverage')} (missing {entry.get('missing')});"
                             " complete is due")
             continue
-        planted = sorted({p.param for p in plan.plants_at(step)})
-        if planted:
+        planted = plan.loud_at(step)
+        quiet = plan.quiet_at(step)
+        if quiet:
+            kinds = ", ".join(str(p) for p in plan.plants_at(step))
+            if entry.get("fingerprints") != "agree":
+                failures.append(f"step {step}: {kinds} changes bits below the fingerprint tolerance, so fingerprints"
+                                f" agree is due; got {entry.get('fingerprints')} on"
+                                f" {entry.get('drift_parameters') or entry.get('fingerprints_why')}")
+            if entry.get("signatures") != "differ":
+                failures.append(f"step {step}: {kinds} was not seen: signatures {entry.get('signatures')}"
+                                f"{' (' + str(entry.get('signatures_why')) + ')' if entry.get('signatures_why') else ''}"
+                                f", where differ on {quiet} is due")
+            elif sorted(entry.get("signature_parameters") or []) != quiet:
+                failures.append(f"step {step}: signatures differ on {entry.get('signature_parameters')}, not exactly"
+                                f" the planted {quiet}")
+        elif planted:
             if entry.get("fingerprints") != "drift" or sorted(entry.get("drift_parameters") or []) != planted:
                 failures.append(f"step {step}: drift on {planted} is due; fingerprints {entry.get('fingerprints')}"
                                 f" on {entry.get('drift_parameters')}")
@@ -609,11 +678,11 @@ def check_result(result: Mapping[str, Any], plan: Plan, launch: str | None) -> l
             if entry.get("fingerprints") != "agree":
                 failures.append(f"step {step}: a clean step must read agree; fingerprints {entry.get('fingerprints')}"
                                 f" ({entry.get('drift_parameters') or entry.get('fingerprints_why')})")
-            if entry.get("signatures") == "differ":
-                failures.append(f"step {step}: signatures differ on a clean step ({entry.get('signature_parameters')})")
+            if entry.get("signatures") == "differ" and plan.healthy_mismatch == "fail":
+                failures.append(f"step {step}: signatures differ on a clean step ({entry.get('signature_parameters')})"
+                                " and --healthy-mismatch is fail")
     incidents = [i for i in result.get("replica_drift") or [] if isinstance(i, Mapping)]
-    due = {s: sorted({p.param for p in plan.plants_at(s)}) for s in plan.scheduled
-           if plan.plants_at(s) and not plan.never_judged(s)}
+    due = {s: plan.loud_at(s) for s in plan.scheduled if plan.loud_at(s) and not plan.never_judged(s)}
     raised: dict[int, list[Mapping[str, Any]]] = {}
     for incident in incidents:
         if incident.get("source") != "replica":
@@ -623,7 +692,12 @@ def check_result(result: Mapping[str, Any], plan: Plan, launch: str | None) -> l
         raised.setdefault(incident.get("step"), []).append(incident)
     for step, found in sorted(raised.items(), key=lambda kv: (kv[0] is None, kv[0] or 0)):
         if step not in due:
-            failures.append(f"replica_drift raised at step {step}, where none is due: {found}")
+            if isinstance(step, int) and plan.quiet_at(step):
+                failures.append(f"step {step}: replica_drift raised for a bits-only plant"
+                                f" ({', '.join(str(p) for p in plan.plants_at(step))}): a signature-only difference"
+                                f" is evidence and raises nothing (contract 5): {found}")
+            else:
+                failures.append(f"replica_drift raised at step {step}, where none is due: {found}")
             continue
         if len(found) != 1:
             failures.append(f"step {step}: {len(found)} replica_drift incidents where one is due")
@@ -763,8 +837,11 @@ def _clock(t: float) -> str:
 def check_kinds(records: list[dict], plan: Plan, launch: str | None) -> tuple[list[str], list[str]]:
     """From every rank's record of a planted step (a cross-rank reading, as the result object is):
     `add` moves the norm; `neg` keeps the norm and moves the sum; `swap` keeps both and moves only
-    the projection. Also prints each rank's fingerprints of the planted parameter, the evidence D1
-    will count, without naming any rank. Returns (failures, lines)."""
+    the projection; `ulp` keeps all three within the tolerance; `negzero` leaves all three exactly
+    equal across ranks; and each of the two bits-only kinds leaves the planted parameter's `sig`
+    not the same on every rank. Also prints each rank's fingerprints of the planted parameter, the
+    evidence D1 will count, without naming any rank, and the spreads of a bits-only plant.
+    Returns (failures, lines)."""
     failures: list[str] = []
     lines: list[str] = []
     for step in sorted({p.step for p in plan.plants}):
@@ -784,7 +861,9 @@ def check_kinds(records: list[dict], plan: Plan, launch: str | None) -> tuple[li
                 failures.append(f"step {step}: {param} is not in every rank's params")
                 continue
             values = sorted({tuple(v) for v in fps.values()})
-            lines.append(f"step {step} {param}: {len(values)} distinct fingerprint(s) among {len(fps)} ranks"
+            sigs = {rank: obs["params"][param].get("sig") for rank, obs in by_rank.items()}
+            lines.append(f"step {step} {param}: {len(values)} distinct fingerprint(s) and"
+                         f" {len(set(sigs.values()))} distinct signature(s) among {len(fps)} ranks"
                          f" (D1 held: no rank is named) " + "; ".join(f"rank {r} {fps[r]}" for r in sorted(fps)))
             scale = max(1e-12, sum(v[0] for v in fps.values()) / len(fps))
 
@@ -795,6 +874,12 @@ def check_kinds(records: list[dict], plan: Plan, launch: str | None) -> tuple[li
                 return (max(column_values) - min(column_values)) / scale
 
             norm, total, projection = spread(0), spread(1), spread(2)
+            if kinds & set(QUIET_KINDS):
+                lines.append(f"step {step} {param} ({', '.join(sorted(kinds))}; D1 held: no rank is named): spreads"
+                             f" {norm!r} (norm), {total!r} (sum), {projection!r} (projection), tolerance {TOLERANCE}")
+                if len(set(sigs.values())) < 2:
+                    failures.append(f"step {step} {param}: {', '.join(sorted(kinds))} left the signature the same on"
+                                    f" every rank ({sorted(set(map(str, sigs.values())))}): the bits were not seen")
             if len(kinds) > 1:
                 continue
             [kind] = kinds
@@ -806,6 +891,13 @@ def check_kinds(records: list[dict], plan: Plan, launch: str | None) -> tuple[li
             if kind == "swap" and not (norm <= TOLERANCE and total <= TOLERANCE and projection > TOLERANCE):
                 failures.append(f"step {step} {param}: a swap moves only the projection (spreads {norm}, {total},"
                                 f" {projection})")
+            if kind == "ulp" and not (norm <= TOLERANCE and total <= TOLERANCE and projection <= TOLERANCE):
+                failures.append(f"step {step} {param}: one step of the dtype must keep every fingerprint within the"
+                                f" tolerance {TOLERANCE} (spreads {norm}, {total}, {projection})")
+            if kind == "negzero" and len(values) != 1:
+                failures.append(f"step {step} {param}: a 0.0 made -0.0 must leave every fingerprint equal across"
+                                f" ranks; {len(values)} distinct (spreads {norm}, {total}, {projection}): the element"
+                                " was not exactly zero, or a fingerprint reads the sign of a zero")
     return failures, lines
 
 
@@ -824,11 +916,61 @@ def check_records(records: list[dict], plan: Plan) -> list[str]:
     return failures
 
 
+def healthy_signatures(result: Mapping[str, Any], plan: Plan, launch: str | None) -> dict:
+    """Of the scheduled steps with no plant, this run's launch and group: how many were compared
+    (coverage complete, signatures `agree` or `differ`), on how many of those the signatures
+    differed, and on how many steps each parameter's did. Steps with no plant that were judged
+    but whose signatures were not compared (with why), and those never judged, are counted apart,
+    so 0 of 0 never reads as clean. Whether a difference here is a fault is the question the
+    eight-GPU run answers, so it fails the run only with `--healthy-mismatch fail`.
+
+    What it can show: every step resets each rank's weights to one base with `lr=0`, so the count
+    says whether equal bits are read as equal on these devices, not whether training keeps the
+    replicas bit-equal."""
+    clean = [s for s in plan.scheduled if not plan.plants_at(s)]
+    entries = {e.get("step"): e for e in result.get("steps") or []
+               if isinstance(e, Mapping) and e.get("launch") == launch and e.get("group") == plan.group
+               and e.get("coverage") != "not_established"}
+    compared = differ = 0
+    by_parameter: dict[str, int] = {}
+    not_compared: dict[str, Any] = {}
+    not_judged: list[int] = []
+    for step in clean:
+        entry = entries.get(step)
+        if entry is None or entry.get("coverage") != "complete":
+            not_judged.append(step)
+            continue
+        signatures = entry.get("signatures")
+        if signatures not in ("agree", "differ"):
+            not_compared[str(step)] = entry.get("signatures_why") or signatures
+            continue
+        compared += 1
+        if signatures == "differ":
+            differ += 1
+            for param in entry.get("signature_parameters") or []:
+                by_parameter[param] = by_parameter.get(param, 0) + 1
+    return {"steps_without_plant": len(clean), "compared": compared, "signatures_differ": differ,
+            "by_parameter": dict(sorted(by_parameter.items())), "not_compared": not_compared,
+            "not_judged": not_judged, "on_mismatch": plan.healthy_mismatch}
+
+
+def healthy_line(healthy: Mapping[str, Any]) -> str:
+    by = healthy.get("by_parameter") or {}
+    return (f"healthy steps: signatures differed on {healthy.get('signatures_differ')} of {healthy.get('compared')}"
+            f" compared steps with no plant ({healthy.get('steps_without_plant')} scheduled; by parameter"
+            f" {', '.join(f'{p} {n}' for p, n in by.items()) or 'none'}; signatures not compared"
+            f" {healthy.get('not_compared') or 'on none'}; never judged {healthy.get('not_judged') or 'none'});"
+            f" {'reported, not failed' if healthy.get('on_mismatch') == 'report' else 'any fails the run'}."
+            " Weights are reset to one base each step, so this counts whether equal bits read as equal,"
+            " not whether training keeps the replicas bit-equal")
+
+
 @dataclass
 class Verdict:
     code: int
     lines: list[str]
     failures: list[str]
+    healthy: dict = field(default_factory=dict)  # `healthy_signatures`, written into verdict.json
 
 
 def evaluate(plan: Plan, log: VerdictLog, seen_while: Mapping[int, int], reports: Mapping[int, Mapping[str, Any]],
@@ -836,7 +978,7 @@ def evaluate(plan: Plan, log: VerdictLog, seen_while: Mapping[int, int], reports
     """Every check, composed once, for the driver and its tests alike: PASS only when each holds;
     NOT PROVEN when the file reader was not found (whatever else held); FAIL otherwise."""
     lines = [f"{plan.world} ranks, mode {plan.mode}, launch {launch}, group {plan.group},"
-             f" plants: {'; '.join(map(str, plan.plants)) or 'none'}"]
+             f" plants: {'; '.join(map(str, plan.plants)) or 'none'}; healthy mismatches: {plan.healthy_mismatch}"]
     if plan.hold_rank is not None:
         held = reports.get(plan.hold_rank, {})
         lines.append(f"rank {plan.hold_rank} held from step {plan.hold_from} ({plan.release}): held steps"
@@ -850,14 +992,17 @@ def evaluate(plan: Plan, log: VerdictLog, seen_while: Mapping[int, int], reports
         lines.append(f"NOT PROVEN: the reader {plan.reader} was not found (lane Z2's function; --reader or"
                      f" {READER_ENV} names another). Trained {plan.steps} steps on {len(reports)} of {plan.world}"
                      " ranks; no verdict was read.")
-        return Verdict(EXIT_FAIL if failures else EXIT_NOT_PROVEN, lines, failures)
+        return Verdict(EXIT_FAIL if failures else EXIT_NOT_PROVEN, lines, failures,
+                       healthy_signatures(log.as_result(), plan, launch))
     result = log.as_result()
+    healthy = healthy_signatures(result, plan, launch)
     for entry in sorted(result["steps"], key=lambda e: (e.get("step") is None, e.get("step") or 0)):
         lines.append(f"  step {entry.get('step')}: {entry.get('coverage')}"
                      + (f" missing {entry.get('missing')}" if entry.get("missing") else "")
                      + (f" fingerprints {entry.get('fingerprints')}" if entry.get("fingerprints") else "")
                      + (f" on {entry.get('drift_parameters')}" if entry.get("drift_parameters") else "")
-                     + (f" signatures {entry.get('signatures')}" if entry.get("signatures") else ""))
+                     + (f" signatures {entry.get('signatures')}" if entry.get("signatures") else "")
+                     + (f" on {entry.get('signature_parameters')}" if entry.get("signature_parameters") else ""))
     lines += [f"  replica_drift: {incident}" for incident in result["replica_drift"]]
     failures += check_result(result, plan, launch)
     failures += check_history(log, plan, launch, reports.get(plan.hold_rank) if plan.hold_rank is not None
@@ -871,12 +1016,13 @@ def evaluate(plan: Plan, log: VerdictLog, seen_while: Mapping[int, int], reports
         failures.append(f"the reader {plan.reader} raised at {len(log.errors)} of {log.looks} looks; first:"
                         f" {log.errors[0]}")
     lines += [f"  {line}" for line in clock_lines + d1_lines]
+    lines.append(f"  {healthy_line(healthy)}")
     lines += [f"  reader error at a look: {error}" for error in log.errors[:5]]
     lines += [f"FAIL {f}" for f in failures]
     if failures:
-        return Verdict(EXIT_FAIL, lines, failures)
+        return Verdict(EXIT_FAIL, lines, failures, healthy)
     lines.append(f"PASS {plan.mode} on {plan.world} ranks ({log.looks} looks)")
-    return Verdict(EXIT_PASS, lines, failures)
+    return Verdict(EXIT_PASS, lines, failures, healthy)
 
 
 # --- The observer -----------------------------------------------------------------------------

@@ -67,7 +67,8 @@ def test_the_driver_validates_on_two_three_and_eight_ranks(world):
     plan = _plan(world)
     assert plan.group == list(range(world))
     assert plan.scheduled == list(range(8))
-    assert {p.step for p in plan.plants} == {1, 3, 5}
+    assert {p.step for p in plan.plants if not p.quiet} == {1, 3, 5}  # the three it has always planted
+    assert {p.step for p in plan.plants if p.quiet} == {2, 4}  # the two bits-only plants (lane AA6)
     held = _plan(world, "--hold-rank", str(world - 1), "--steps", "12")
     assert (held.hold_rank, held.hold_from, held.release) == (world - 1, 2, "after-verdict")
     never = _plan(world, "--hold-rank", "1", "--release", "never")
@@ -172,8 +173,11 @@ def _record(plan: proof.Plan, rank: int, step: int, launch: str = LAUNCH, run_id
                 fp = [fp[0] + 0.1, fp[1] + 0.25, fp[2] + 0.3]
             elif plant.kind == "neg":
                 fp = [fp[0], fp[1] - 2.0, fp[2] + 0.5]
-            else:
+            elif plant.kind == "swap":
                 fp = [fp[0], fp[1], fp[2] + 0.2]
+            elif plant.kind == "ulp":  # the bits move; every fingerprint by far less than the tolerance
+                fp = [fp[0] + 1e-9, fp[1] + 2e-9, fp[2] - 1e-9]
+            # negzero: the bits move and no fingerprint does
         params[name] = {"shape": _SHAPES[name], "dtype": "float32", "fp": fp, "sig": sig}
     return {"schema_version": 1, "run_id": run_id, "rank": rank, "attempt": 1795000000000 + rank * 7, "step": step,
             "scalars": {"train/loss": 1.0},
@@ -229,9 +233,10 @@ def _mutations(result: dict) -> dict[str, dict]:
     return {
         "a clean step that is not listed": _drop_step(result, 0),
         "a planted step that is not listed": _drop_step(result, 3),
-        "a clean step read as drift": _mutate(result, 2, fingerprints="drift", drift_parameters=["0.bias"]),
-        "a clean step not compared": _mutate(result, 2, fingerprints="not_compared", fingerprints_why="device"),
-        "a clean step whose signatures differ": _mutate(result, 2, signatures="differ"),
+        "a clean step read as drift": _mutate(result, 0, fingerprints="drift", drift_parameters=["0.bias"]),
+        "a clean step not compared": _mutate(result, 0, fingerprints="not_compared", fingerprints_why="device"),
+        # "a clean step whose signatures differ" fails only with --healthy-mismatch fail (lane AA6):
+        # test_lane_aa6_driver.py holds it, both ways.
         "a planted step read as agree": _mutate(result, 1, fingerprints="agree", drift_parameters=None),
         "drift on another parameter as well": _mutate(result, 1, drift_parameters=["0.bias", "0.weight"]),
         "drift on the wrong parameter": _mutate(result, 1, drift_parameters=["1.weight"]),
@@ -250,7 +255,7 @@ def _mutations(result: dict) -> dict[str, dict]:
             {**result["steps"][0], "step": 40}]},
         "a planted step's incident missing": _incidents(result, lambda xs: [i for i in xs if i["step"] != 3]),
         "every incident missing": _incidents(result, lambda xs: []),
-        "an incident on a clean step": _incidents(result, lambda xs: xs + [{**first(xs), "step": 2}]),
+        "an incident on a clean step": _incidents(result, lambda xs: xs + [{**first(xs), "step": 0}]),
         "an incident twice": _incidents(result, lambda xs: xs + [first(xs)]),
         "an incident on the wrong parameter": _incidents(result, lambda xs: [{**first(xs), "parameters": ["0.bias"]},
                                                                              *xs[1:]]),
@@ -534,11 +539,13 @@ def test_the_default_reader_is_lane_z2s_compare_replicas():
 
 
 def _stand_in_compare_replicas(records, *, tolerance=1e-6, attempt_order=None):
-    """Lane Z2's signature and return shape (its branch at 121a7a6), with the reference reading
-    inside: ValueError for records of more than one run, the section-8 object otherwise."""
+    """`tensorquill.evidence.compare_replicas`'s signature and return shape, with the reference
+    reading inside: ValueError for records of more than one run; otherwise `steps` and
+    `replica_drift`, with `legacy` when there is one, and no `v` or `tolerance` (those two are the
+    server's, in `watchdog.json`). test_lane_aa6_driver.py holds it equal to the real one."""
     if len({r.get("run_id") for r in records}) > 1:
         raise ValueError("records of more than one run")
-    return {"v": 1, "tolerance": tolerance, **reference(list(records), tolerance)}
+    return reference(list(records), tolerance)
 
 
 def _look_with(reader, tmp_path: Path, records: list[dict]) -> proof.Observer:
@@ -558,7 +565,7 @@ def test_the_return_shape_of_compare_replicas_is_read_as_it_is(tmp_path):
     plan, _, reports, records = _passing()
     legacy = [{"rank": 0, "step": 99, "drift": False}]
     shaped = proof.read_result(lambda rs: {**_stand_in_compare_replicas(rs), "legacy": legacy}, records)
-    assert shaped["v"] == 1 and shaped["tolerance"] == 1e-6 and shaped["legacy"] == legacy
+    assert "v" not in shaped and "tolerance" not in shaped and shaped["legacy"] == legacy
     assert shaped["steps"] == reference(records, 1e-6)["steps"]
     # Through the observer's look over the rank files, as the driver reads them.
     observer = _look_with(_stand_in_compare_replicas, tmp_path, records)
@@ -928,6 +935,14 @@ needs_trial_merge = pytest.mark.skipif(
 )
 
 
+def _passed(verdict: dict) -> bool:
+    """PASS with no failure, and (lane AA6) the healthy-step count in `verdict.json` with no
+    signature differing on a step with no plant: on the CPU none may."""
+    healthy = verdict.get("healthy_signatures") or {}
+    return ((verdict.get("code"), verdict.get("failures")) == (proof.EXIT_PASS, [])
+            and healthy.get("signatures_differ") == 0 and healthy.get("compared", 0) > 0)
+
+
 def _server_binary() -> Path | None:
     named = os.environ.get("TENSORQUILL_SERVER_BIN")
     if named:
@@ -967,7 +982,7 @@ def test_the_driver_trains_to_its_end_under_torchrun(tmp_path, world):
         assert verdict["failures"] == []  # every rank trained every step and recorded it, with the loss
         assert reports[-1]["held_steps"] == list(range(2, 16))
     else:
-        assert verdict == {"code": proof.EXIT_PASS, "failures": []}, done.stdout + done.stderr
+        assert _passed(verdict), done.stdout + done.stderr
 
 
 @needs_trial_merge
@@ -992,7 +1007,7 @@ def test_the_driver_needs_no_numpy(tmp_path):
     )
     assert "Numpy is not available" not in done.stdout + done.stderr, done.stdout + done.stderr
     [verdict] = [json.loads(q.read_text()) for q in out.glob("*/verdict.json")]
-    assert verdict == {"code": proof.EXIT_PASS, "failures": []}, done.stdout + done.stderr
+    assert _passed(verdict), done.stdout + done.stderr
     assert done.returncode == 0 and "PASS files on 2 ranks" in done.stdout
 
 
@@ -1005,7 +1020,7 @@ def test_trial_merge_files_mode(tmp_path, world, hold):
         argv += ["--hold-rank", str(world - 1), "--release", hold]
     done = _torchrun(world, *argv)
     [verdict] = [json.loads(p.read_text()) for p in tmp_path.glob("*/verdict.json")]
-    assert verdict == {"code": proof.EXIT_PASS, "failures": []}, done.stdout + done.stderr
+    assert _passed(verdict), done.stdout + done.stderr
     assert done.returncode == 0 and f"PASS files on {world} ranks" in done.stdout
 
 
@@ -1028,7 +1043,7 @@ def test_trial_merge_server_mode(tmp_path, world, hold):
             argv += ["--hold-rank", str(world - 1), "--release", hold]
         done = _torchrun(world, *argv)
         [verdict] = [json.loads(p.read_text()) for p in (tmp_path / "out").glob("*/verdict.json")]
-        assert verdict == {"code": proof.EXIT_PASS, "failures": []}, done.stdout + done.stderr
+        assert _passed(verdict), done.stdout + done.stderr
         assert done.returncode == 0 and f"PASS server on {world} ranks" in done.stdout
     finally:
         server.terminate()
