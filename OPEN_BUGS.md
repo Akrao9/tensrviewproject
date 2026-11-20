@@ -141,11 +141,13 @@ Not from either review. Not counted in the 72.
 
 ## What to fix first
 
-- **Before a release:** the five P1 rows: SDK-22, C03, C06, E1 and RS05. RS05 and E1 each need a decision first.
-- **For the GPU runs:** no row is shown to change them. Two were considered:
-  - C20 moves evaluation time into `data_wait` and `step_time` on the step after a pause. It matters to the group C cell only if that cell runs evaluation between training steps; no evaluation loop was found in the cell's description.
-  - C14 needs two different weights whose float64 norms are exactly equal. The stalled-weights seeded case freezes a weight, which is a true stall, so it does not create that.
-- **Needs the author, not code:** X02 (an amendment) and RS05 (an ordering policy).
+- **Before the GPU runs:** L9 (section 7). The lead optimizer is held by a weak reference to the first optimizer that ever stepped; a user who rebuilds an optimizer and keeps the old one gets no steps counted, silently.
+- **Before a release:** the three P1 rows, each fixed in part: SDK-22, C03 and C06. SDK-22's open part needs the author's decision.
+- **Found during waves V and W, not fixed, and not counted in the 21:**
+  - L9, above.
+  - `activation_drift` fires on healthy small trainings, now including single-leaf models (section 9). It needs thresholds checked on a real job.
+  - L10: a lone rank with batch hashes is listed as "compared" (section 7). A question for the author.
+- **Needs the author, not code:** X02 (an amendment), X09 (`skipped=` on `session.step()`), SDK-22 after `init`, L3 and L10.
 
 ## Closed, for the record
 
