@@ -615,3 +615,149 @@ def test_rank_0_and_a_job_of_one_rank_read_nothing_again(world1):
     # A control (passes on `2e2f4dc` too): rank 0 writes its own nonce on every record from the first.
     assert session.run.launch_source is None
     assert _launches(sink) == [(1, session.run.launch), (3, session.run.launch)]
+
+
+# =============================================================================================
+# Item 3. L25: the exchange keys of a restarted torchrun job, scoped to its generation.
+#
+# The store is a real TCPStore that the test holds, as torchrun's agent holds its store across a
+# restart of its workers; each rank of each start is a process of its own that connects to it, with
+# the environment torchrun gives its workers, and runs `tracker._shared_run` on it. A start of the
+# whole job under torchrun is not run (on this Mac a restarted torchrun job's second start hangs in
+# gloo's `init_process_group`, with or without TensorQuill).
+#
+# The generation trusted: `TORCHELASTIC_RESTART_COUNT`, and only where `GROUP_WORLD_SIZE` is 1 (one
+# agent, so one counter for every worker). Before (on the commit before this item): the restarted rank 1, arriving before
+# the new rank 0, took the earlier start's run ID and launch at once.
+
+_EXCHANGE_RANK = """
+import datetime, json, os, sys, time, types
+import torch.distributed as dist
+from tensorquill import tracker as T
+
+port, rank, out = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+plan = json.loads(sys.argv[4])
+store = dist.TCPStore("127.0.0.1", port, is_master=False, timeout=datetime.timedelta(seconds=30))
+fake = types.SimpleNamespace(get_world_size=lambda: 2,
+                             distributed_c10d=types.SimpleNamespace(_get_default_store=lambda: store))
+T.RUN_ID_WAIT_SECONDS = plan.get("wait", 20.0)
+began = time.monotonic()
+info = T._shared_run(fake, rank, None)
+found = {"run_id": info.run_id, "launch": info.launch, "source": info.source,
+         "seconds": time.monotonic() - began}
+found["second"] = T.read_launch_again(info, 5.0)
+with open(out, "w") as file:
+    json.dump(found, file)
+"""
+
+
+def _agent_store():
+    port = _free_port()
+    return torch.distributed.TCPStore("127.0.0.1", port, is_master=True, wait_for_workers=False,
+                                      timeout=timedelta(seconds=30)), port
+
+
+def _start_rank(tmp_path, port, rank, restart, tag, plan=None, agents="1"):
+    script = tmp_path / "exchange_rank.py"
+    script.write_text(_EXCHANGE_RANK)
+    env = {k: v for k, v in os.environ.items() if k not in SCRUBBED}
+    source = str(Path(tensorquill.__file__).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join([source, *filter(None, [os.environ.get("PYTHONPATH")])])
+    env.update({"RANK": str(rank), "LOCAL_RANK": str(rank), "WORLD_SIZE": "2", "LOCAL_WORLD_SIZE": "2"})
+    if restart is not None:
+        env["TORCHELASTIC_RESTART_COUNT"] = str(restart)
+        env["TORCHELASTIC_MAX_RESTARTS"] = "3"
+    if agents is not None:
+        env["GROUP_WORLD_SIZE"] = agents
+    out = tmp_path / f"{tag}-rank{rank}.json"
+    proc = subprocess.Popen([sys.executable, str(script), str(port), str(rank), str(out), json.dumps(plan or {})],
+                            cwd=tmp_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return proc, out
+
+
+def _finish(proc, out):
+    log = proc.communicate(timeout=90)[0]
+    assert out.exists(), log[-3000:]
+    return json.loads(out.read_text())
+
+
+def _one_start(tmp_path, port, restart, tag, *, first=1, delay=1.0, agents="1"):
+    """One start of a two-rank job: rank `first` arrives, and the other `delay` seconds later."""
+    a = _start_rank(tmp_path, port, first, restart, tag, agents=agents)
+    time.sleep(delay)
+    b = _start_rank(tmp_path, port, 1 - first, restart, tag, agents=agents)
+    found = {first: _finish(*a), 1 - first: _finish(*b)}
+    return found[0], found[1]
+
+
+@needs_dist
+def test_l25_a_restarted_rank_arriving_before_rank_0_takes_the_new_starts_run_id_and_launch(tmp_path):
+    store, port = _agent_store()
+    rank0, rank1 = _one_start(tmp_path, port, 0, "start0", first=0, delay=0.0)
+    assert rank1["run_id"] == rank0["run_id"] and rank1["launch"] == rank0["launch"]
+    # The restart: the store keeps the first start's entries; rank 1 is back first, a second ahead.
+    new0, new1 = _one_start(tmp_path, port, 1, "start1", first=1, delay=1.0)
+    assert new0["run_id"] != rank0["run_id"] and new0["launch"] != rank0["launch"]  # generated anew
+    assert new1["run_id"] == new0["run_id"], (new1, new0, rank0)
+    assert new1["launch"] == new0["launch"] and new1["second"] == new0["launch"]
+    assert new1["seconds"] >= 0.5  # it waited for the new rank 0, as a rank of a first start does
+    # And a second restart, the same way: each generation has keys of its own.
+    last0, last1 = _one_start(tmp_path, port, 2, "start2", first=1, delay=1.0)
+    assert last1["run_id"] == last0["run_id"] != new0["run_id"] and last1["launch"] == last0["launch"]
+
+
+@needs_dist
+def test_l25_generation_0_keeps_todays_keys_and_a_later_one_adds_its_own(tmp_path):
+    store, port = _agent_store()
+    _one_start(tmp_path, port, 0, "start0", first=0, delay=0.0)
+    assert store.check(["tensorquill/run_id/0", "tensorquill/launch/0"])
+    rank0, _ = _one_start(tmp_path, port, 1, "start1", first=0, delay=0.0)
+    assert store.check(["tensorquill/restart/1/run_id/0", "tensorquill/restart/1/launch/0"])
+    # Today's keys hold the new start's entry too, for a rank on an older TensorQuill.
+    assert json.loads(store.get("tensorquill/run_id/0"))[0] == rank0["run_id"]
+    assert store.get("tensorquill/launch/0").decode() == rank0["launch"]
+
+
+@needs_dist
+def test_l25_a_rank_0_on_an_older_sdk_in_a_restarted_start_is_still_read(tmp_path):
+    # A control for the old rank 0 (passes on the commit before this item too): it writes today's key only, with no
+    # launch and no mark that the keys are scoped. The new rank 1 takes it, as it always did, without
+    # waiting for a scoped key that never comes.
+    store, port = _agent_store()
+    store.set("tensorquill/run_id/0", json.dumps(["old-rank-0", "generated"]))
+    proc, out = _start_rank(tmp_path, port, 1, 1, "old0", plan={"wait": 20.0})
+    found = _finish(proc, out)
+    assert found["run_id"] == "old-rank-0" and found["launch"] is None and found["seconds"] < 5.0
+
+
+@needs_dist
+def test_l25_no_generation_is_trusted_with_several_agents(tmp_path):
+    # Several agents (nodes) each count their own restarts, and one restarted for a membership change
+    # does not count it, so the counts can differ between ranks of one start: today's keys, and the
+    # restarted rank can still read the earlier start's entry (the documented limit).
+    store, port = _agent_store()
+    rank0, _ = _one_start(tmp_path, port, 0, "start0", first=0, delay=0.0, agents="2")
+    _, stale1 = _one_start(tmp_path, port, 1, "start1", first=1, delay=1.0, agents="2")
+    assert stale1["run_id"] == rank0["run_id"]  # the earlier start's, as before
+    assert not store.check(["tensorquill/restart/1/run_id/0"])
+
+
+def test_l25_the_generation_is_read_only_from_one_agents_restart_count(monkeypatch):
+    for name in ("TORCHELASTIC_RESTART_COUNT", "GROUP_WORLD_SIZE", "WORLD_SIZE"):
+        monkeypatch.delenv(name, raising=False)
+    assert T._generation(2) is None  # not under torchrun
+    monkeypatch.setenv("TORCHELASTIC_RESTART_COUNT", "3")
+    assert T._generation(2) is None  # agents unknown
+    monkeypatch.setenv("GROUP_WORLD_SIZE", "2")
+    assert T._generation(2) is None  # several agents: counts can differ
+    monkeypatch.setenv("GROUP_WORLD_SIZE", "1")
+    assert T._generation(2) is None  # no WORLD_SIZE: not torchrun's workers
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    assert T._generation(2) == 3
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    assert T._generation(2) is None  # the process group is not the launcher's world
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("TORCHELASTIC_RESTART_COUNT", "0")
+    assert T._generation(2) is None  # the first start keeps today's keys
+    monkeypatch.setenv("TORCHELASTIC_RESTART_COUNT", "x")
+    assert T._generation(2) is None

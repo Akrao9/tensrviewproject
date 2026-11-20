@@ -566,7 +566,11 @@ def exchange_7(monkeypatch):
 def test_rank_0_sets_a_nonce_before_the_run_ids_entry_which_keeps_its_two_items(exchange_7):
     store = Store()
     info = T._shared_run(_dist(store), 0, "my-run")
-    assert [(what, key) for what, key, _ in store.calls] == [("set", LAUNCH_KEY), ("set", RUN_KEY)]
+    # Rewritten by lane AA1 (L25): rank 0 first sets the mark that says its entries are also scoped
+    # by generation where one is trusted (none here), then the launch before the run ID, as before.
+    assert [(what, key) for what, key, _ in store.calls] == [
+        ("set", "tensorquill/scoped/7"), ("set", LAUNCH_KEY), ("set", RUN_KEY)
+    ]
     assert HEX32.fullmatch(info.launch) and store.entries[LAUNCH_KEY] == info.launch.encode()
     assert json.loads(store.entries[RUN_KEY]) == ["my-run", "explicit"]
     assert info.launch_source is None and T.read_launch_again(info) == info.launch

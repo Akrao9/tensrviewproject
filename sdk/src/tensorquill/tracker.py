@@ -30,13 +30,51 @@ RUN_ID_WAIT_SECONDS = 300.0
 # number of times (as for a collective), so the n-th call on every rank reads the n-th key, and
 # a second `init` in the same group never reads the first one's ID. `init_process_group` puts the
 # group's own prefix on every key. torchrun keeps one store across a restart of its workers, so
-# a restarted rank can find the earlier start's entry under the same key (bug list, L25).
+# a restarted rank could find the earlier start's entry under the same key (bug list, L25): where a
+# generation of the job can be trusted (`_generation`), each later generation has keys of its own.
 _KEY = "tensorquill/run_id/{}"
 # The launch (replica observation contract, section 2): a nonce rank 0 makes at each `init` and
 # sets under a key of its own before the run ID's, so the run ID's entry keeps its two items and a
 # rank on an older SDK still reads it. The same n as the run ID's key.
 _LAUNCH_KEY = "tensorquill/launch/{}"
+# L25: the same two keys for generation g >= 1 of a job (`_generation`). Generation 0, and a job
+# with no trusted generation, use the keys above, as before. Rank 0 also sets the keys above in
+# every generation, for a rank on an older TensorQuill, and first sets `_MARK_KEY`, which says its
+# entries are also under scoped keys: a rank that finds today's entry and no mark knows it is an
+# older rank 0's.
+_SCOPED_KEY = "tensorquill/restart/{}/run_id/{}"
+_SCOPED_LAUNCH_KEY = "tensorquill/restart/{}/launch/{}"
+_MARK_KEY = "tensorquill/scoped/{}"
 _exchanges = itertools.count()
+
+
+def _generation(world: int) -> int | None:
+    """Which start of a torchrun job this is, where every rank of the start reads the same number and
+    no earlier start of the same store read it: `TORCHELASTIC_RESTART_COUNT`, when it is 1 or more,
+    only when `GROUP_WORLD_SIZE` is 1 and `WORLD_SIZE` is the process group's size; else None.
+
+    torchrun's agent sets `TORCHELASTIC_RESTART_COUNT` to its `max_restarts` less the restarts it has
+    left (`local_elastic_agent.py`, PyTorch 2.6 and 2.15), and takes one off only when its own
+    worker group failed; a restart for a membership change counts nothing ("membership changes do
+    not count as retries", `api.py`), and an agent that joins later starts at 0. So with several
+    agents (nodes) the ranks of one start can hold different counts, and keys scoped by them would
+    never meet: a rank would wait for its key for `RUN_ID_WAIT_SECONDS` and write a run apart.
+    With one agent (`GROUP_WORLD_SIZE` 1: one node, `--standalone` or `--nnodes 1`) every worker's
+    count is that agent's, so it is the same on every rank, and it grows by one at each restart
+    after a failure, so a later start never reads an earlier one's keys in that agent's store.
+    PyTorch's own rendezvous scopes its keys by run ID and round (`dynamic_rendezvous.py`), which
+    holds across nodes, but the round is not given to workers. Generation 0 is None too: the first
+    start keeps today's keys, which a rank 0 on an older TensorQuill also uses.
+
+    What it leaves: several agents (L25 stays open there); a restart for a membership change that
+    ends with one agent again, which keeps the count; and a store that outlives the agent (an
+    external rendezvous store reused by a second torchrun, which starts at 0 again)."""
+    count = os.environ.get("TORCHELASTIC_RESTART_COUNT", "")
+    if not count.isdigit() or int(count) == 0:
+        return None
+    if os.environ.get("GROUP_WORLD_SIZE") != "1" or os.environ.get("WORLD_SIZE") != str(world):
+        return None
+    return int(count)
 
 #: At most how long `read_launch_again` waits for the second read of the launch, in seconds; a
 #: store that has not answered by then leaves the launch null. The session never waits for it: it
@@ -242,30 +280,50 @@ def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
     The launch (contract, section 2) goes the same way under a key of its own: rank 0 makes a
     nonce and sets it before the run ID's entry; a rank that has read the run ID looks for it once
     and never waits for it. A rank that did not get rank 0's run ID, or found no launch, has a
-    null launch."""
+    null launch.
+
+    L25: in generation g >= 1 of a torchrun job with one agent (`_generation`), rank 0 also sets
+    both entries under keys of that generation (`_SCOPED_KEY`, `_SCOPED_LAUNCH_KEY`), first, after
+    a mark (`_MARK_KEY`), and the other ranks wait for the scoped entry, so a restarted rank that
+    arrives before its rank 0 never takes the earlier start's entry left under today's key. A
+    rank that finds today's entry with no mark beside it is reading a rank 0 on an older
+    TensorQuill, which sets only today's key: it takes that entry, as before."""
     n = next(_exchanges)
     key, launch_key = _KEY.format(n), _LAUNCH_KEY.format(n)
     world = dist.get_world_size()
+    generation = _generation(world)
+    scoped = None if generation is None else (_SCOPED_KEY.format(generation, n),
+                                              _SCOPED_LAUNCH_KEY.format(generation, n))
+    mark = _MARK_KEY.format(n)
     if rank == 0:
         found = _resolve_here(rank, run_id)
         launch = new_launch()
+        entry = json.dumps(list(found), default=str)
+        # The mark first; then each pair launch before run ID, so a rank that has read a run ID
+        # finds the launch beside it; the generation's pair before today's.
+        pairs = [(launch_key, launch), (key, entry)]
+        if scoped is not None:
+            pairs = [(scoped[1], launch), (scoped[0], entry), *pairs]
+        failed: BaseException | None = None
         try:
             store = dist.distributed_c10d._get_default_store()
-        except Exception:  # noqa: BLE001  said below, where the run ID's `set` fails the same way
-            store = None
-        try:
-            # Before the run ID's entry: a rank that has read the new run ID finds the new launch.
-            store.set(launch_key, launch)
-        except Exception:  # noqa: BLE001  the other ranks record a null launch; nothing else changes
-            pass
-        try:
-            if store is None:
-                store = dist.distributed_c10d._get_default_store()
-            store.set(key, json.dumps(list(found), default=str))
-        except Exception as error:  # noqa: BLE001  nothing here may stop a run
+        except Exception as error:  # noqa: BLE001  said below
+            store, failed = None, error
+        if store is not None:
+            try:
+                store.set(mark, "1")
+            except Exception:  # noqa: BLE001  the run ID's `set` below fails the same way, and says so
+                pass
+            for name, value in pairs:
+                try:
+                    store.set(name, value)
+                except Exception as error:  # noqa: BLE001  a launch not set: the others record null
+                    if name in (key, scoped and scoped[0]) and failed is None:
+                        failed = error
+        if failed is not None:  # nothing here may stop a run
             _say(
                 f"tensorquill.init on rank 0 of {world} could not share its run ID {found[0]!r} through the process "
-                f"group's store ({_brief(error)}), so the other ranks each write under an ID of their own once their "
+                f"group's store ({_brief(failed)}), so the other ranks each write under an ID of their own once their "
                 "wait for it runs out. Pass the same run_id= on every rank.",
                 stacklevel=4,
             )
@@ -283,7 +341,17 @@ def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
         if 0 < own < wait:
             wait = own
         deadline, pause = time.monotonic() + wait, 0.01
-        while not store.check([key]):
+        while True:
+            if scoped is None:
+                if store.check([key]):
+                    break
+            elif store.check([scoped[0]]):
+                key, launch_key = scoped
+                break
+            # Today's entry with no mark beside it: an older rank 0, which never sets a scoped key.
+            # The mark is set before today's entry, so one written by this TensorQuill always has it.
+            elif store.check([key]) and not store.check([mark]):
+                break
             left = deadline - time.monotonic()
             if left <= 0:
                 raise TimeoutError("rank 0 has put nothing in the process group's store")
@@ -304,7 +372,7 @@ def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
         )
         return RunInfo(found[0], found[1], rank, None)
     # The launch beside it: one look, no wait (contract 2). Provisional: read again after this
-    # rank's first step (`LaunchRead`).
+    # rank's first step (`LaunchRead`), under the same key.
     launch = _look_for_launch(store, launch_key)
     if run_id and str(run_id) != str(shared_id):
         _say(
