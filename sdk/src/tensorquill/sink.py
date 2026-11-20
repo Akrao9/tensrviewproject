@@ -7,9 +7,10 @@ import math
 import os
 import threading
 import time
-import warnings
 from pathlib import Path
 from typing import Any, Protocol
+
+from .manifest import _say
 
 
 class Sink(Protocol):
@@ -123,9 +124,13 @@ def write_end_marker(
     records_file: str | Path, *, run_id: Any, rank: Any, attempt: Any, exception: BaseException | None = None,
 ) -> bool:
     """Write the marker by a temporary file and a rename, after the file is closed. Never raises:
-    a run that finished is not failed for want of its marker, which then reads as not closed."""
+    a run that finished is not failed for want of its marker, which then reads as not closed.
+    The failure is said by `manifest._say` (lane Z6, L23), so under `python -W error` it is
+    logged on the `tensorquill` logger rather than raised and lost; a scratch file the failed
+    write or rename left is removed, and a removal that fails is let be."""
     records = Path(records_file)
     path = end_marker_path(records)
+    scratch: Path | None = None
     try:
         document = {
             "marker": END_MARKER,
@@ -143,9 +148,21 @@ def write_end_marker(
         os.replace(scratch, path)
         return True
     except Exception as error:  # noqa: BLE001  nothing here may fail a finished run
-        warnings.warn(f"tensorquill could not write the end marker {path} ({error}); the run reads as not closed.",
-                      RuntimeWarning, stacklevel=3)
+        _remove_scratch(scratch)
+        # Three frames up, as before: this function, `Session.close`, the caller of `close`.
+        _say(f"tensorquill could not write the end marker {path} ({error}); the run reads as not closed.",
+             stacklevel=3)
         return False
+
+
+def _remove_scratch(scratch: Path | None) -> None:
+    """Remove a scratch file a failed write or rename left behind. Never raises."""
+    if scratch is None:
+        return
+    try:
+        scratch.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001  a scratch file that stays is untidy, never a failure
+        pass
 
 
 def read_end_marker(records_file: str | Path) -> dict[str, Any]:
