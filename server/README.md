@@ -26,4 +26,15 @@ no `tensorquill-server` command. The `tensorquill` package then uses its Python 
 one-shot reads. To get the program there, build it from the source with `cargo build --release`
 in the `server` directory.
 
+The `tensorquill` package and this program must speak the same protocol number
+(`tensorquill-server protocol` prints it; 3 since Nov 19, 2026). The package refuses a binary
+with another number for offline detection and says which to install; streaming still works
+across the two.
+
+Beside the Parquet parts, each rank's folder in the store holds `incidents.json` (what the
+detectors found) and `attempts.json` (the order in which the job's attempts were first seen,
+which decides which attempt owns the rank after a restart). The run's `watchdog.json` says
+whether each rank is making progress; a rank whose capture stopped while training went on
+reads `capture_stopped`, which is neither a hang nor finished.
+
 Licensed under either of Apache License, Version 2.0 or the MIT license, at your option.

@@ -3654,7 +3654,11 @@ def init(
             `session.step()` yourself when the hooks cannot see the step, as when a framework
             steps copies of the weights (DeepSpeed ZeRO, Megatron-LM).
         replica_group: optional replication `ProcessGroup` (or precomputed spread tensor)
-            for cross-GPU parameter drift checks.
+            for cross-GPU parameter drift checks. With a real `ProcessGroup` of more than one
+            member, every rank's `init` waits for the other members to agree whether the check
+            can run, at most `distributed.AGREE_WAIT_SECONDS` (300 s); replicas on different
+            device types or with different parameter counts turn the check off on every rank
+            alike. `init` never raises for it.
         replica_every: run the cross-GPU drift check every N steps (default 50). Each
             check reads every weight in float64 and gathers 32 bytes per parameter tensor
             from each rank: norm, sum and a seeded random projection, which catches

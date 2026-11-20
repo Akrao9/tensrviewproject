@@ -109,8 +109,9 @@ enum Command {
     /// that rank's incidents.json; with --run, over every rank of one run. No server is started
     /// and no store is read.
     Detect {
-        /// The rows as an Arrow IPC stream in the schema the SDK sends, grouped by attempt
-        /// (oldest first) and in recorded order; `-` or nothing reads standard input. With
+        /// The rows as an Arrow IPC stream in the schema the SDK sends, grouped by attempt in
+        /// the order first seen (each attempt is read in step order); `-` or nothing reads
+        /// standard input. With
         /// --run, any number of streams.
         input: Vec<PathBuf>,
         /// Add `samples` to the report: one entry for every step and MoE router, with its
