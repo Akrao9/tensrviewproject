@@ -601,11 +601,18 @@ def test_a_refused_router_and_steps_of_another_model_do_not_raise_under_warnings
 
 
 def test_init_says_how_many_bytes_the_drift_check_gathers():
+    """Rewritten by lane Z1 (SDK-22): the scheduled check gathers nothing, which `init` says; the
+    bytes an explicit gather moves are said where the gather is, in `replica_spread`."""
+    from tensorquill.distributed import replica_spread
+
     gathered = (FINGERPRINT_WIDTH + 1) * 8  # float64 fingerprints and the flag column (`_fingerprint_table`)
     assert gathered == 32
     doc = " ".join(tensorquill.init.__doc__.split())
-    assert f"gathers {gathered} bytes per parameter tensor" in doc
-    assert "24 bytes with the flag" in doc and "24 bytes per parameter tensor" not in doc
+    assert "no collective, no store and no wait for another rank" in doc
+    assert "a collective every rank of the group must call, which can block" in doc
+    assert "gathers 32 bytes" not in doc
+    spread_doc = " ".join(replica_spread.__doc__.split())
+    assert f"It gathers {gathered} bytes per parameter per rank (24 without the projection)" in spread_doc
 
 
 def test_the_writer_thread_is_named_once_per_open_session():
@@ -883,18 +890,11 @@ def _stopped_rank_worker(rank, store_path, out_dir):
     faulthandler.enable(file=stacks, all_threads=True)
     atexit.register(lambda: say("atexit: the interpreter is shutting down; threads alive: "
                                 + ", ".join(sorted(t.name for t in threading.enumerate()))))
-    # The session's two waits on the other rank, logged on the way in and out and passed through
-    # unchanged: the agreement at init (through the store) and each drift check's gather, which a
-    # stopped rank's `_gather_and_drop` enters too and whose error it swallows.
+    # Any gather the session enters, logged on the way in and out and passed through unchanged.
+    # Since the SDK-22 wave (lane Z1) the session issues none on its own schedule, live or
+    # stopped, and the agreement at init is gone: the test asserts no gather is entered at all.
     box: list = []
-    real_agree, real_gather = capture._agree_on_gather, capture._spread_and_unread
-
-    def agree(*args, **kwargs):
-        say("agreement on the gather (store) entered")
-        why = real_agree(*args, **kwargs)
-        say(f"agreement on the gather returned {why!r}")
-        return why
-
+    real_gather = capture._spread_and_unread
     gathers = [0]
 
     def gather(*args, **kwargs):
@@ -910,7 +910,7 @@ def _stopped_rank_worker(rank, store_path, out_dir):
         say(f"gather {n} returned")
         return out
 
-    capture._agree_on_gather, capture._spread_and_unread = agree, gather
+    capture._spread_and_unread = gather
     say("init_process_group")
     dist.init_process_group("gloo", rank=rank, world_size=2, store=dist.FileStore(store_path, 2),
                             timeout=timedelta(seconds=60))
@@ -967,10 +967,13 @@ def _ranks_report(context, out_dir: Path, started: float, status: list[str]) -> 
     return "\n".join(parts)
 
 
-def test_a_stopped_rank_keeps_entering_the_drift_checks_gather(tmp_path):
-    """Rank 0's sink fails at its second block, so its capture stops; rank 1's goes on. The drift
-    check's `all_gather` is due every second step on both: a stopped rank that left it would leave
-    rank 1 waiting there."""
+def test_a_stopped_rank_and_a_live_one_enter_no_gather_and_both_finish(tmp_path):
+    """Rank 0's sink fails at its second block, so its capture stops; rank 1's goes on. Both were
+    given a replica group with the check due every second step. Before lane Z1 the check was an
+    `all_gather` that a stopped rank had to keep entering (`_gather_and_drop`), or rank 1 waited
+    there; now neither rank enters a gather, and rank 1 writes its own observation on each
+    scheduled step. Rewritten by lane Z1 from `test_a_stopped_rank_keeps_entering_the_drift_checks_gather`,
+    whose premise (a scheduled gather) is gone; the diagnostics are kept."""
     dist = pytest.importorskip("torch.distributed")
     if not dist.is_available():
         pytest.skip("needs torch.distributed")
@@ -1009,19 +1012,23 @@ def test_a_stopped_rank_keeps_entering_the_drift_checks_gather(tmp_path):
             process.terminate()
         pytest.fail(f"a rank had not finished {STOPPED_RANK_LIMIT:g} s after the spawn; where each rank was:\n"
                     f"{report}")
-    for rank in (0, 1):  # both ranks entered and left every gather due, the stopped one too
+    for rank in (0, 1):  # neither rank entered a gather, the stopped one included
         said = (tmp_path / f"progress{rank}").read_text()
-        assert [f"gather {n} returned" in said for n in range(1, 6)] == [True] * 4 + [False], said
+        assert "gather 1 entered" not in said, said
+        assert "step 7 done" in said, said
     assert "disk gone" in (tmp_path / "done0").read_text() and (tmp_path / "done1").read_text() == "None"
     records = [json.loads(line) for line in (tmp_path / "rank1.jsonl").read_text().splitlines()]
     assert [r["step"] for r in records] == list(range(8))
-    assert [r["step"] for r in records if "replica_spread" in r] == [1, 3, 5, 7]
+    assert [r["step"] for r in records if "replica" in r] == [1, 3, 5, 7]
+    assert not any("replica_spread" in r for r in records)
+    assert {r["replica"]["group"] == [0, 1] for r in records if "replica" in r} == {True}
 
 
 def _scaled_run(monkeypatch, stop: bool) -> tuple[int, int]:
     """Four iterations under a GradScaler, the second with an inf gradient (the scaler skips that
     step), on a session with a drift-check group (its gather faked): where the session's step count
-    and its gathers end up."""
+    and its gathers end up. The group is a stand-in whose ranks cannot be read, so it gets no
+    observation either."""
     gathers = [0]
 
     def fake(params, group, *, projection, device):
@@ -1052,12 +1059,14 @@ def _scaled_run(monkeypatch, stop: bool) -> tuple[int, int]:
     return steps, gathers[0]
 
 
-def test_a_stopped_rank_counts_the_steps_a_scaler_ends_as_a_live_one_does(monkeypatch):
-    """A step the scaler skipped ends a live session's step at `scaler.update()`; a stopped rank must
-    count it too, or its gather falls a step behind the other ranks'."""
-    live = _scaled_run(monkeypatch, stop=False)
-    assert live == (4, 4)
-    assert _scaled_run(monkeypatch, stop=True) == live
+def test_under_a_scaler_neither_a_live_nor_a_stopped_rank_gathers_on_its_own(monkeypatch):
+    """A step the scaler skipped ends a live session's step at `scaler.update()`, and the live
+    session counts all four. Before lane Z1 a stopped rank had to count them too, or its scheduled
+    gather fell a step behind the other ranks'; with no scheduled gather (SDK-22) neither enters
+    one, and a stopped rank's hooks are off like any stopped session's. Rewritten by lane Z1 from
+    `test_a_stopped_rank_counts_the_steps_a_scaler_ends_as_a_live_one_does`."""
+    assert _scaled_run(monkeypatch, stop=False) == (4, 0)
+    assert _scaled_run(monkeypatch, stop=True)[1] == 0
 
 
 # --- C03's trigger, decided by the author: the queue sized in steps, about 400, floor 2 rings -----

@@ -12,9 +12,10 @@ import logging
 import os
 import secrets
 import sys
+import threading
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -27,10 +28,20 @@ RUN_ID_WAIT_SECONDS = 300.0
 
 # One key in the process group's store for each exchange. Every rank calls `init` the same
 # number of times (as for a collective), so the n-th call on every rank reads the n-th key, and
-# a second `init` in the same group never reads the first one's ID. torchrun gives each restart
-# a new store, and `init_process_group` puts the group's own prefix on every key.
+# a second `init` in the same group never reads the first one's ID. `init_process_group` puts the
+# group's own prefix on every key. torchrun keeps one store across a restart of its workers, so
+# a restarted rank can find the earlier start's entry under the same key (bug list, L25).
 _KEY = "tensorquill/run_id/{}"
+# The launch (replica observation contract, section 2): a nonce rank 0 makes at each `init` and
+# sets under a key of its own before the run ID's, so the run ID's entry keeps its two items and a
+# rank on an older SDK still reads it. The same n as the run ID's key.
+_LAUNCH_KEY = "tensorquill/launch/{}"
 _exchanges = itertools.count()
+
+#: At most how long the second read of the launch (`read_launch_again`) is waited for, in
+#: seconds, on the writer thread that does it. A store that has not answered by then leaves the
+#: launch null. It never runs on the training thread.
+LAUNCH_READ_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -38,6 +49,69 @@ class RunInfo:
     run_id: str | None
     source: str  # "explicit", "env", "mlflow", "wandb", "launcher" or "generated"
     rank: int
+    # Which start of the job this process belongs to: 32 hex digits, or None when it could not be
+    # learned (contract, section 2). On a rank other than 0 it is what `init` read, provisional
+    # until `read_launch_again` reads it a second time. Not part of equality: two RunInfo are
+    # equal when they name the same run, as before the launch was added.
+    launch: str | None = field(default=None, compare=False)
+    # (store, key) for that second read, on a rank other than 0 that took rank 0's run ID.
+    launch_source: Any = field(default=None, repr=False, compare=False)
+
+
+def new_launch() -> str:
+    """A launch nonce: 128 bits from the operating system's entropy, never from a random number
+    generator the training uses (`random`, `numpy`, `torch` are left untouched)."""
+    return secrets.token_hex(16)
+
+
+def _launch_or_none(value: Any) -> str | None:
+    """`value` (bytes from the store) as a launch, or None when it is not 32 lowercase hex digits."""
+    try:
+        text = value.decode("ascii") if isinstance(value, (bytes, bytearray)) else str(value)
+    except Exception:  # noqa: BLE001
+        return None
+    return text if len(text) == 32 and all(c in "0123456789abcdef" for c in text) else None
+
+
+def _look_for_launch(store: Any, key: str) -> str | None:
+    """One look at the launch's key: `check`, then `get` only if it is there (a `get` on a
+    missing key waits the store's whole timeout). Never waits for it, never raises: None when it
+    is not there, cannot be read, or is not a launch."""
+    try:
+        if not store.check([key]):
+            return None
+        return _launch_or_none(store.get(key))
+    except Exception:  # noqa: BLE001  nothing here may stop a run
+        return None
+
+
+def read_launch_again(run: RunInfo, timeout: float | None = None) -> str | None:
+    """The launch to write in this process's records (contract, section 2, the second read).
+
+    Rank 0, a job of one rank and a rank that never took rank 0's run ID keep what `init` gave
+    them. A rank other than 0 that did reads the launch's key once more, `check` then `get`, and
+    takes what that gives, None if it fails or finds nothing: what `init` read may be the entry an
+    earlier start left in a store torchrun kept across a restart. The look runs on a daemon thread
+    of its own and is waited for at most `timeout` (`LAUNCH_READ_SECONDS` by default), so a store
+    that hangs costs a null launch, never a wait without end. Never raises. Call it off the
+    training thread: the session calls it on its writer thread."""
+    source = run.launch_source
+    if run.rank == 0 or source is None:
+        return run.launch
+    try:
+        limit = max(float(LAUNCH_READ_SECONDS if timeout is None else timeout), 0.0)
+    except (TypeError, ValueError):
+        limit = 5.0
+    found: list[str | None] = []
+    try:
+        reader = threading.Thread(
+            target=lambda: found.append(_look_for_launch(*source)), name="tensorquill-launch", daemon=True
+        )
+        reader.start()
+        reader.join(limit)
+    except Exception:  # noqa: BLE001
+        return None
+    return found[0] if found else None
 
 
 def _rank() -> int:
@@ -89,7 +163,9 @@ def resolve_run(run_id: str | None = None) -> RunInfo:
             _warn_tracker_unshared(found)
         elif found[1] == "generated":
             _warn_generated_unshared(found[0])
-    return RunInfo(found[0], found[1], rank)
+        # Several ranks and no process group to share a launch through: not known (contract 2).
+        return RunInfo(found[0], found[1], rank, None)
+    return RunInfo(found[0], found[1], rank, new_launch())  # a job of one rank makes its own
 
 
 def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
@@ -101,13 +177,31 @@ def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
     and NCCL's monitor thread polls the same client with `TORCH_NCCL_DUMP_ON_TIMEOUT` (PyTorch
     2.6, `ProcessGroupNCCL::heartbeatMonitor`), so a long `wait` would hold it up. Never raises:
     a store that fails, or a wait that runs out, leaves the rank with an ID of its own, and one
-    warning."""
-    key = _KEY.format(next(_exchanges))
+    warning.
+
+    The launch (contract, section 2) goes the same way under a key of its own: rank 0 makes a
+    nonce and sets it before the run ID's entry; a rank that has read the run ID looks for it once
+    and never waits for it. A rank that did not get rank 0's run ID, or found no launch, has a
+    null launch."""
+    n = next(_exchanges)
+    key, launch_key = _KEY.format(n), _LAUNCH_KEY.format(n)
     world = dist.get_world_size()
     if rank == 0:
         found = _resolve_here(rank, run_id)
+        launch = new_launch()
         try:
-            dist.distributed_c10d._get_default_store().set(key, json.dumps(list(found), default=str))
+            store = dist.distributed_c10d._get_default_store()
+        except Exception:  # noqa: BLE001  said below, where the run ID's `set` fails the same way
+            store = None
+        try:
+            # Before the run ID's entry: a rank that has read the new run ID finds the new launch.
+            store.set(launch_key, launch)
+        except Exception:  # noqa: BLE001  the other ranks record a null launch; nothing else changes
+            pass
+        try:
+            if store is None:
+                store = dist.distributed_c10d._get_default_store()
+            store.set(key, json.dumps(list(found), default=str))
         except Exception as error:  # noqa: BLE001  nothing here may stop a run
             _say(
                 f"tensorquill.init on rank 0 of {world} could not share its run ID {found[0]!r} through the process "
@@ -115,7 +209,7 @@ def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
                 "wait for it runs out. Pass the same run_id= on every rank.",
                 stacklevel=4,
             )
-        return RunInfo(found[0], found[1], rank)
+        return RunInfo(found[0], found[1], rank, launch)
     try:
         wait = max(float(RUN_ID_WAIT_SECONDS), 0.0)
     except (TypeError, ValueError):  # set to something that is not a number
@@ -148,14 +242,17 @@ def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
             "rank.",
             stacklevel=4,
         )
-        return RunInfo(found[0], found[1], rank)
+        return RunInfo(found[0], found[1], rank, None)
+    # The launch beside it: one look, no wait (contract 2). Provisional: read again before this
+    # rank's first observation (`read_launch_again`).
+    launch = _look_for_launch(store, launch_key)
     if run_id and str(run_id) != str(shared_id):
         _say(
             f"tensorquill.init on rank {rank} was given run_id={run_id!r}, and rank 0's run ID is {shared_id!r}: "
             "under torch.distributed every rank writes under rank 0's. Pass the same run_id= on every rank.",
             stacklevel=4,
         )
-    return RunInfo(shared_id, source, rank)
+    return RunInfo(shared_id, source, rank, launch, (store, launch_key))
 
 
 def _brief(error: BaseException) -> str:

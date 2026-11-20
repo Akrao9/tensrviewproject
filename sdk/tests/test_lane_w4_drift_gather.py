@@ -1,19 +1,17 @@
-"""Lane W4: the drift check's gather, decided alike on every rank at `init`.
+"""Lane W4: the drift check's gather, decided alike on every rank at `init`; revised by lane Z1.
 
-- SDK-22, criterion 1 (this lane's): every rank skips a check known at `init` to be incompatible,
-  and no rank issues the gather while another skips it. Lane U5's check (`_gather_problem`) is
-  judged by each rank alone, so ranks that see different things (L5: a session on another device
-  type) decided differently: one skipped while its peers waited in the gather. Now the members
-  of the replica group exchange their verdicts through the default store at `init`
-  (`_agree_on_gather`) and every one takes the one decision the store holds (`compare_set`,
-  first writer wins).
-- SDK-22, criterion 2, NOT covered and not claimed: a process group that fails after `init` still
-  fails inside the training step, where the gather is issued.
+- SDK-22, criterion 1 (lane W4's): every rank skipped a check known at `init` to be incompatible,
+  through an agreement at `init` (`_agree_on_gather`, the members' verdicts exchanged through the
+  default store). Lane Z1 (Nov 20, 2026, SDK-22 "Yes, approve") took the scheduled gather out of
+  the training step and the agreement with it. Removed with it, since what they tested no longer
+  exists: the exchange's unit tests (`_exchange_verdicts`, `_agree_on_gather`), the explicit-level
+  L5 test (ranks on different device types, which without the agreement leaves one rank of an
+  explicit `replica_spread` in the gather alone: the README now says each rank decides alone), and
+  the test of tables of different shapes (a gather Gloo would now be given). The session-level
+  test is rewritten: the ranks gather nothing on their own.
 - SDK-22, the public `replica_spread` on a `meta` or sparse parameter: it raised before the gather
   (so a rank that raised left its peers waiting in it). It now enters the same gather as every
   other rank and gives NaN for a parameter some rank could not read, with a warning that says why.
-- L5: ranks on different device types, here a table on `meta` on one rank (gloo has no backend
-  for it), which `_gather_problem` reads with nothing injected.
 
 The tests of several processes start Gloo CPU processes with a 15 s group timeout and a 90 s
 limit, so a rank left waiting fails the test rather than hanging the suite. None needs the server
@@ -112,10 +110,10 @@ def _ranks(tmp_path: Path, world: int, body: str, plan: dict) -> list[dict]:
 
 
 # --------------------------------------------------------------------------------------------
-# L5 and SDK-22 criterion 1, at the level of `distributed.py`: what the session calls, in its
-# order. Rank 1's table is on another device type (`meta`, for which gloo has no backend), so
-# lane U5's check says "skip" on rank 1 only. Every step also runs a training all_reduce over
-# both ranks, so a rank that skipped the gather while the other entered it breaks the next one.
+# The explicit gather at the level of `distributed.py`, between steps of a training all_reduce
+# over both ranks, so a rank that skipped the gather while the other entered it breaks the next
+# one. (Lane W4 also ran it with rank 1's table on `meta`, covered by the agreement lane Z1
+# removed; see the module docstring.)
 
 _DEVICES_BODY = """
 devices = plan["devices"]
@@ -142,26 +140,8 @@ except BaseException as error:
 
 
 @needs_dist
-@pytest.mark.parametrize("store", ["file", "tcp"])
-def test_l5_ranks_on_different_device_types_all_skip_the_gather(tmp_path, store):
-    # Before: rank 1 skipped (no gloo backend for its table's device type), rank 0 entered the
-    # gather alone and failed after the group's timeout, or the next all_reduce did.
-    plan = {"devices": ["cpu", "meta"], **({"port": _free_port()} if store == "tcp" else {})}
-    found = _ranks(tmp_path, 2, _DEVICES_BODY, plan)
-    for f in found:
-        assert f["raised"] is None, f
-        assert f["steps"] == 4
-        assert len(f["reasons"]) == 2
-        for reasons in f["reasons"]:
-            assert all(r and "gather cannot run" in r for r in reasons), reasons
-    # Rank 0 is told why: it is rank 1's verdict, decided once for both.
-    assert "meta" in found[0]["reasons"][0][0], found[0]["reasons"]
-    assert found[0]["codes"] == [[float(D._NOT_GATHERED)] * 2] * 2
-
-
-@needs_dist
 def test_sdk22_ranks_that_agree_still_gather(tmp_path):
-    # The agreement must not switch a working check off.
+    # Ranks that can gather do, in the explicit call (`agree` is absent since lane Z1).
     found = _ranks(tmp_path, 2, _DEVICES_BODY, {"devices": ["cpu", "cpu"]})
     for f in found:
         assert f["raised"] is None, f
@@ -169,36 +149,12 @@ def test_sdk22_ranks_that_agree_still_gather(tmp_path):
         assert f["reasons"] == [[None, None]] * 2
 
 
-_SHAPE_BODY = """
-params = [torch.ones(3)] * (2 if rank == 0 else 3)
-found["raised"] = None
-try:
-    if hasattr(D, "_agree_on_gather"):  # absent on the base
-        D._agree_on_gather(dist.group.WORLD, torch.device("cpu"), params)
-    spread, unread, reasons = D._spread_and_unread(params, dist.group.WORLD, projection=True,
-                                                   device=torch.device("cpu"))
-    found["codes"] = unread.tolist()
-    found["reasons"] = reasons
-    dist.all_reduce(torch.ones(2))
-except BaseException as error:
-    found["raised"] = f"{type(error).__name__}: {error}"[:300]
-"""
-
-
-@needs_dist
-def test_sdk22_ranks_with_different_numbers_of_replicated_parameters_skip(tmp_path):
-    # A gather of tables of different shapes is not issued: every rank skips, with the counts.
-    found = _ranks(tmp_path, 2, _SHAPE_BODY, {})
-    for f in found:
-        assert f["raised"] is None, f
-        assert set(f["codes"]) == {float(D._NOT_GATHERED)}
-        assert all("2 on rank 0" in r and "3 on rank 1" in r for r in f["reasons"]), f["reasons"]
-
-
 # --------------------------------------------------------------------------------------------
-# SDK-22 criterion 1 end to end, through `tensorquill.init`: `Session.__init__` calls
-# `_agree_on_gather` (the one line lane W4 added to `capture.py`, the top session's recorded exception
-# to file ownership). Without it the ranks decide alone and rank 0 waits in a gather rank 1 skips.
+# SDK-22 end to end, through `tensorquill.init`. Lane W4's agreement at `init` (`_agree_on_gather`)
+# made ranks that would decide differently all skip the scheduled gather. Lane Z1 removed the
+# scheduled gather (SDK-22, "Yes, approve"), and the agreement with it: rewritten from
+# `test_sdk22_a_session_whose_ranks_decide_differently_skips_on_every_rank`, the same ranks now
+# gather nothing on their own, and each writes its own observation.
 
 _SESSION_BODY = """
 if rank == 1:
@@ -226,108 +182,19 @@ with warnings.catch_warnings(record=True) as caught:
     except BaseException as error:
         found["raised"] = f"{type(error).__name__}: {error}"[:300]
 found["spread_steps"] = [r["step"] for r in sink.records if "replica_spread" in r]
+found["observed"] = [r["step"] for r in sink.records if "replica" in r]
 found["warnings"] = [str(w.message) for w in caught if "across replicas" in str(w.message)]
 """
 
 
 @needs_dist
-def test_sdk22_a_session_whose_ranks_decide_differently_skips_on_every_rank(tmp_path):
+def test_sdk22_a_session_whose_ranks_would_decide_differently_gathers_nothing_on_its_own(tmp_path):
     found = _ranks(tmp_path, 2, _SESSION_BODY, {})
     for f in found:
         assert "raised" not in f, f
         assert f["steps"] == 8
-        assert f["spread_steps"] == []
-        assert f["warnings"] and all("cannot carry" in w for w in f["warnings"]), f
-
-
-# --------------------------------------------------------------------------------------------
-# The exchange itself, on one process with an in-memory store standing in for the group's.
-
-
-def _verdict(problem=None, device="cpu", count=2):
-    return {"problem": problem, "device": device, "count": count}
-
-
-def _post(store, base, rank, verdict):
-    store.set(f"{base}/{rank}", json.dumps(verdict))
-
-
-@needs_dist
-def test_sdk22_every_rank_ready_gives_one_yes():
-    store = torch.distributed.HashStore()
-    _post(store, "k", 1, _verdict())
-    assert D._exchange_verdicts(store, "k", 0, [0, 1], _verdict(), wait=1.0) is None
-    # The decision is in the store: a later rank takes it whatever it would decide itself.
-    assert json.loads(store.get("k/decision"))["why"] is None
-
-
-@needs_dist
-def test_sdk22_one_rank_that_cannot_gather_turns_the_check_off_for_all():
-    store = torch.distributed.HashStore()
-    _post(store, "k", 1, _verdict("no backend for cpu tensors"))
-    why = D._exchange_verdicts(store, "k", 0, [0, 1], _verdict(), wait=1.0)
-    assert why is not None and "rank 1" in why and "no backend for cpu tensors" in why
-
-
-@needs_dist
-def test_l5_different_device_types_turn_the_check_off():
-    store = torch.distributed.HashStore()
-    _post(store, "k", 1, _verdict(device="cuda"))
-    _post(store, "k", 2, _verdict(device="cuda"))
-    why = D._exchange_verdicts(store, "k", 0, [0, 1, 2], _verdict(device="cpu"), wait=1.0)
-    assert why is not None and "different device types" in why
-    assert "cpu on rank 0" in why and "cuda on ranks 1, 2" in why
-
-
-@needs_dist
-def test_sdk22_a_wait_that_runs_out_turns_the_check_off():
-    store = torch.distributed.HashStore()
-    why = D._exchange_verdicts(store, "k", 0, [0, 1], _verdict(), wait=0.05)
-    assert why is not None and "did not hear" in why and "rank 1" in why
-    assert json.loads(store.get("k/decision"))["why"] == why
-
-
-@needs_dist
-def test_sdk22_a_rank_whose_wait_ran_out_still_takes_the_stores_decision():
-    # Another rank read every verdict and decided first: this rank follows it, so the ranks never
-    # split even though this one saw too little to decide "on" itself.
-    store = torch.distributed.HashStore()
-    store.set("k/decision", json.dumps({"why": None}))
-    assert D._exchange_verdicts(store, "k", 0, [0, 1], _verdict(), wait=0.05) is None
-
-
-@needs_dist
-def test_sdk22_a_store_that_fails_before_the_verdict_is_written_turns_the_check_off():
-    # Safe: no rank can have decided "on" without this rank's verdict.
-    class Broken:
-        def set(self, *a):
-            raise RuntimeError("store down")
-
-        check = get = compare_set = set
-
-    why = D._exchange_verdicts(Broken(), "k", 0, [0, 1], _verdict(), wait=1.0)
-    assert why is not None and "store down" in why
-
-
-def test_sdk22_a_stand_in_group_takes_part_in_no_exchange(monkeypatch):
-    # Tests and tools pass a group that is not a ProcessGroup with their own all_gather: no store.
-    import torch.distributed as dist
-
-    def forbidden(*a, **k):
-        raise AssertionError("the agreement touched the store")
-
-    monkeypatch.setattr(dist.distributed_c10d, "_get_default_store", forbidden)
-    assert D._agree_on_gather(object(), torch.device("cpu"), [torch.ones(2)]) is None
-
-
-def test_sdk22_the_agreement_never_raises(monkeypatch):
-    import torch.distributed as dist
-
-    def boom(*a, **k):
-        raise RuntimeError("anything")
-
-    monkeypatch.setattr(dist.distributed_c10d, "_rank_not_in_group", boom)
-    assert D._agree_on_gather(dist.GroupMember.WORLD, torch.device("cpu"), [torch.ones(2)]) is None
+        assert f["spread_steps"] == [] and f["warnings"] == []
+        assert f["observed"] == [1, 3, 5, 7]
 
 
 # --------------------------------------------------------------------------------------------

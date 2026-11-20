@@ -317,6 +317,10 @@ with warnings.catch_warnings(record=True) as caught:
                 # every rank and every step, which a rank that skipped or added one would break.
                 for p in model.parameters():
                     dist.all_reduce(p.grad)
+            if plan.get("explicit") and (step + 1) % 2 == 0:
+                # Since lane Z1 (SDK-22) the scheduled check gathers nothing: the gather these
+                # tests are about is the explicit call's, made on every rank on the same steps.
+                session.record_replica_spread()
             opt.step()
             found["steps"] += 1
         session.close()
@@ -326,6 +330,7 @@ found["spread_steps"] = [r["step"] for r in sink.records if "replica_spread" in 
 found["spreads"] = [r["replica_spread"] for r in sink.records if "replica_spread" in r]
 found["warnings"] = [str(w.message) for w in caught if "across replicas" in str(w.message)]
 found["torch_warnings"] = [str(w.message) for w in caught if "does not belong to the given group" in str(w.message)]
+found["observed"] = [[r["step"], r["replica"]["group"]] for r in sink.records if "replica" in r]
 """
 
 
@@ -334,10 +339,13 @@ def test_sdk22_a_group_with_no_backend_for_the_tables_device_skips_on_every_rank
     # Gloo registered for CUDA tensors only: like NCCL, which serves CUDA only, given CPU tensors.
     # Before: "No backend type associated with device type cpu" came out of optimizer.step() on
     # both ranks at the first scheduled check.
-    found = _ranks(tmp_path, 2, _GATHER_BODY, {"backend": "cuda:gloo"})
+    # Rewritten by lane Z1: the gather is the explicit call's; each rank's own observation, which
+    # needs no backend, is written on every scheduled step.
+    found = _ranks(tmp_path, 2, _GATHER_BODY, {"backend": "cuda:gloo", "explicit": True})
     for f in found:
         assert "raised" not in f, f
         assert f["steps"] == 8
+        assert f["observed"] == [[s, [0, 1]] for s in (1, 3, 5, 7)]
         assert f["spread_steps"] == []  # no record claims a comparison
         assert f["warnings"], f
         assert all("no backend for cpu tensors" in w for w in f["warnings"]), f["warnings"]
@@ -351,12 +359,16 @@ def test_sdk22_a_rank_outside_the_replica_group_skips_and_its_peers_are_not_left
     # Three ranks; the replica group is ranks 0 and 1. Before: rank 2's gather on a group it is not
     # in returned nothing, and `torch.stack([])` came out of its optimizer.step(); rank 2 then
     # stopped issuing the training all_reduce, and ranks 0 and 1 waited in it.
-    found = _ranks(tmp_path, 3, _GATHER_BODY, {"members": [0, 1], "all_reduce": True})
+    # Rewritten by lane Z1: the gather is the explicit call's, which every rank makes; the rank
+    # outside the group writes no observation, its peers one each on every scheduled step.
+    found = _ranks(tmp_path, 3, _GATHER_BODY, {"members": [0, 1], "all_reduce": True, "explicit": True})
     for f in found:
         assert "raised" not in f, f
         assert f["steps"] == 8
         assert f["torch_warnings"] == []  # no all_gather was issued on a group the rank is not in
+    assert found[2]["observed"] == []
     for f in found[:2]:
+        assert f["observed"] == [[s, [0, 1]] for s in (1, 3, 5, 7)]
         assert f["spread_steps"] == [1, 3, 5, 7]
         assert all(v == [0.0, 0.0, 0.0] for spread in f["spreads"] for v in spread.values())
         assert f["warnings"] == []

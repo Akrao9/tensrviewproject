@@ -675,10 +675,12 @@ def test_two_optimizers_count_one_step_per_iteration(set_to_none):
 
 
 def test_drift_check_follows_the_step_number_not_the_rank_local_count(monkeypatch):
-    import torch.distributed as dist
+    """Rewritten by lane Z1 (SDK-22): the scheduled check is each rank's own observation, no
+    longer a gather, so the group's ranks are given here instead of a faked `all_gather`. A
+    reader pairs the ranks' observations by step, so the schedule must still follow the step."""
+    from tensorquill import capture
 
-    monkeypatch.setattr(dist, "get_world_size", lambda g=None: 2)
-    monkeypatch.setattr(dist, "all_gather", lambda out, t, group=None: [o.copy_(t) for o in out])
+    monkeypatch.setattr(capture, "group_ranks", lambda group: ([0, 1], None))
     model = nn.Linear(2, 2)
     sink = tensorquill.MemorySink()
     # This rank's session started at step 4, as after a resume or a late start: the check
@@ -689,7 +691,8 @@ def test_drift_check_follows_the_step_number_not_the_rank_local_count(monkeypatc
     for _ in range(6):
         session.step()
     session.close()
-    assert [r["step"] for r in sink.records if "replica_spread" in r] == [5, 8]
+    assert [r["step"] for r in sink.records if "replica" in r] == [5, 8]
+    assert not any("replica_spread" in r for r in sink.records)
 
 
 def test_a_slow_sink_stops_capture_instead_of_making_training_wait(monkeypatch):

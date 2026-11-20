@@ -73,9 +73,13 @@ def _fake_two_ranks(monkeypatch, other=None):
     return gathers
 
 
-def _train(model, session, steps):
+def _train(model, session, steps, gather=False):
     for _ in range(steps):
         model(torch.ones(2, 4)).sum().backward()
+        if gather:
+            # Since lane Z1 (SDK-22) the scheduled check gathers nothing: the gather these tests
+            # are about is the explicit call's, a collective every rank makes on the same step.
+            session.record_replica_spread()
         session.step()
 
 
@@ -135,7 +139,7 @@ def test_a_meta_parameter_is_gathered_left_out_of_the_record_and_named_once(monk
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         session = tensorquill.init(model, sink=sink, auto_step=False, every=2, replica_group=object(), replica_every=1)
-        _train(model, session, 4)
+        _train(model, session, 4, gather=True)
         session.close()
     # Every check gathered every parameter's row, the one on `meta` included.
     assert [g.shape for g in gathers] == [(3, 4)] * 4
@@ -165,7 +169,7 @@ def test_a_parameter_only_another_replica_cannot_read_is_left_out_here_too(monke
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         session = tensorquill.init(model, sink=sink, auto_step=False, every=2, replica_group=object(), replica_every=1)
-        _train(model, session, 2)
+        _train(model, session, 2, gather=True)
         session.close()
     assert [set(r["replica_spread"]) for r in sink.records] == [{"weight"}] * 2
     assert _replica_warnings(caught) == [
@@ -183,7 +187,7 @@ def test_a_nan_weight_that_was_read_still_reads_as_drift_beside_one_left_out(mon
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         session = tensorquill.init(model, sink=sink, auto_step=False, replica_group=object(), replica_every=1)
-        _train(model, session, 1)
+        _train(model, session, 1, gather=True)
         session.close()
     spread = sink.records[0]["replica_spread"]
     assert set(spread) == {"0.weight", "0.bias"}
@@ -234,6 +238,7 @@ def _two_rank_worker(rank, store_path, out_dir):
             optimizer = torch.optim.SGD(model[0].parameters(), lr=0.1)
             for _ in range(3):
                 model(torch.ones(2, 4)).sum().backward()
+                session.record_replica_spread()  # the explicit gather, on every rank (lane Z1)
                 optimizer.step()
                 optimizer.zero_grad()
             session.close()
@@ -261,6 +266,13 @@ def test_on_two_ranks_one_meta_parameter_on_one_rank_neither_hangs_nor_raises(tm
         records = [json.loads(line) for line in (tmp_path / f"rank{rank}.jsonl").read_text().splitlines()]
         assert [set(r["replica_spread"]) for r in records] == [{"0.weight", "0.bias"}] * 3
         assert all(v == [0.0, 0.0, 0.0] for r in records for v in r["replica_spread"].values())
+        # Each rank's own observation (lane Z1): rank 0 lists its parameter on `meta` as unread.
+        observed = [r["replica"] for r in records]
+        assert len(observed) == 3 and all(o["group"] == [0, 1] for o in observed)
+        if rank == 0:
+            assert all(o["unread"] == {"1.extra": META_WHY} and "1.extra" not in o["params"] for o in observed)
+        else:
+            assert all(o["unread"] == {} and set(o["params"]) == {"0.weight", "0.bias", "1.extra"} for o in observed)
         warned = json.loads((tmp_path / f"warned{rank}.json").read_text())
         assert len(warned) == 1 and "'1.extra'" in warned[0]
         assert (META_WHY if rank == 0 else f"on another replica in the group, {META_WHY}") in warned[0]

@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import itertools
-import json
-import time
-import weakref
-from typing import Any, Iterable
+import hashlib
+from typing import Any, Iterable, Sequence
 
 import torch
 import torch.distributed as dist
 
-from .tracker import _brief, _say
+from .tracker import _say
 
 try:
     from torch.distributed.tensor import DTensor
@@ -186,7 +183,11 @@ def _unread_reason(code: float) -> str:
 
 @torch.no_grad()
 def _fingerprint_table(
-    params: Iterable[torch.Tensor], *, projection: bool, device: torch.device | None = None
+    params: Iterable[torch.Tensor],
+    *,
+    projection: bool,
+    device: torch.device | None = None,
+    seeds: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, list[str | None]]:
     """What `_spread_and_unread` gathers: `[n_params, width + 1]` float64 on `device`, each
     parameter's fingerprints (`parameter_fingerprints`, the same values, `width` 3 or 2) and then
@@ -199,7 +200,10 @@ def _fingerprint_table(
     parameter's values are not looked at to decide, so a NaN weight is read, as before.
 
     `device`: where the table is built (the session's, which is never `meta`); by default
-    where the first parameter that is read leaves its fingerprints, else the CPU."""
+    where the first parameter that is read leaves its fingerprints, else the CPU.
+
+    `seeds`: each parameter's projection seed; by default its position in `params`, as the
+    explicit gather has it. The observation passes `name-v1` seeds (`name_v1_seed`)."""
     local = [unwrap_local(p) for p in params]
     width = FINGERPRINT_WIDTH if projection else 2
     codes = [_unread_code(p) for p in local]
@@ -213,15 +217,16 @@ def _fingerprint_table(
     # One pass over every parameter, as `parameter_fingerprints` makes, with an empty tensor in
     # place of one not read (its row stays zero); only if that raises, one parameter at a time.
     empty = torch.zeros(0, dtype=F64, device=device)
+    seed = list(range(len(local))) if seeds is None else [int(v) for v in seeds]
     try:
-        items = [(i, empty if code else p) for i, (p, code) in enumerate(zip(local, codes))]
+        items = [(seed[i], empty if code else p) for i, (p, code) in enumerate(zip(local, codes))]
         table[:, :width].copy_(_rows(items, projection))
     except Exception:  # noqa: BLE001
         for i, p in enumerate(local):
             if codes[i]:
                 continue
             try:
-                table[i, :width].copy_(_rows([(i, p)], projection)[0])
+                table[i, :width].copy_(_rows([(seed[i], p)], projection)[0])
             except Exception as error:  # noqa: BLE001
                 table[i, :width].zero_()
                 codes[i] = _RAISED
@@ -275,168 +280,6 @@ def _gather_problem(group: object, device: torch.device) -> str | None:
     return None
 
 
-#: At most how long `_agree_on_gather` waits at `init` for every member of the replica group to
-#: say whether it can take part in the drift check's gather, in seconds, and never longer than
-#: the default store's own timeout. After this the check is off on every rank, with the reason.
-AGREE_WAIT_SECONDS = 300.0
-
-# One set of keys in the default store for each agreement: the group's global ranks, then the
-# n-th agreement for those ranks in this process. Every member makes the same agreements in the
-# same order (one per session with that replica group, as for a collective), so the n-th on every
-# member reads the same keys, and a second session never reads the first one's verdicts.
-_AGREE_KEY = "tensorquill/replica_check/{}/{}"
-_agreements: dict[tuple[int, ...], Any] = {}
-# What the newest agreement on a group decided: (the table's device type, None for "gather", or
-# the reason every member skips). Weak, so a destroyed group's entry goes with it.
-_agreed: weakref.WeakKeyDictionary[Any, tuple[str, str | None]] = weakref.WeakKeyDictionary()
-
-
-def _agree_on_gather(group: object, device: torch.device, params: Iterable[torch.Tensor] = ()) -> str | None:
-    """At `init`, before the first scheduled check: make every member of `group` take the same
-    decision on whether the drift check's gather runs. Returns None (gather) or why every member
-    skips it, and keeps it for `_spread_and_unread` and `replica_spread` on `group`. Never raises.
-
-    `_gather_problem` alone is judged by each rank from what it sees, which ranks that differ do
-    not see alike (L5: a session on another device type; also a different number of replicated
-    parameters, whose gather of unequal shapes aborts the process under Gloo). So each member
-    puts its own verdict (`_gather_problem`, its table's device type, how many parameters it
-    compares) in the default process group's store, waits a bounded time for every member's, and
-    then puts "gather" (every member could, alike) or "skip" (any could not, they differ, or the
-    wait ran out) under one key with `compare_set`, first writer wins. Every member takes what
-    the store holds, so a member whose own wait ran out still follows one that saw every verdict.
-    No collective is issued and nothing is put on a device.
-
-    Only a real `ProcessGroup` of two or more members, on a rank in it, takes part: a stand-in
-    group (tests and tools with their own `all_gather`) and a rank outside the group are judged
-    as before, by `_gather_problem` at each check.
-
-    What this does not cover: a group that fails after `init` (a rank that dies, a timeout, an
-    aborted communicator) still fails in the gather inside the training step, as the training
-    run's own collectives on it do; and a member whose store fails after it has put its verdict
-    in cannot learn the decision, so it skips while the others may gather."""
-    try:
-        if dist.distributed_c10d._rank_not_in_group(group) or not isinstance(group, dist.ProcessGroup):
-            return None
-        if not dist.is_initialized():
-            return None
-        ranks = tuple(int(r) for r in dist.get_process_group_ranks(group))
-        me = int(dist.get_rank(group))
-        device = torch.device(device)
-        count = len(list(params))
-    except Exception:  # noqa: BLE001  an API this PyTorch does not have: each check decides alone
-        return None
-    if len(ranks) < 2 or not 0 <= me < len(ranks):
-        return None
-    try:
-        verdict = {"problem": _gather_problem(group, device), "device": device.type, "count": count}
-        base = _AGREE_KEY.format("-".join(map(str, ranks)), next(_agreements.setdefault(ranks, itertools.count())))
-        try:
-            store = dist.distributed_c10d._get_default_store()
-        except Exception as error:  # noqa: BLE001  nothing put in: no member can decide "gather"
-            why: str | None = f"rank {ranks[me]} could not reach the process group's store ({_brief(error)})"
-        else:
-            why = _exchange_verdicts(store, base, me, ranks, verdict, wait=_agree_wait(store))
-        _agreed[group] = (device.type, why)
-        return why
-    except Exception:  # noqa: BLE001  nothing here may stop a run
-        return None
-
-
-def _agree_wait(store: Any) -> float:
-    try:
-        wait = max(float(AGREE_WAIT_SECONDS), 0.0)
-    except (TypeError, ValueError):  # set to something that is not a number
-        wait = 300.0
-    try:
-        own = store.timeout.total_seconds()
-    except Exception:  # noqa: BLE001  a store with no timeout of its own
-        own = 0.0
-    return own if 0 < own < wait else wait
-
-
-def _exchange_verdicts(
-    store: Any, base: str, me: int, ranks: Iterable[int], verdict: dict, *, wait: float
-) -> str | None:
-    """`_agree_on_gather`'s exchange through `store`: this member's `verdict` under `base/<me>`
-    (`me` its index in the group), every member's read once all are there, and the decision
-    under `base/decision`, whichever member put it there first. Returns None ("gather") or the
-    reason. Polls with `check` (10 ms, doubling to 1 s) as `tracker._shared_run` does, never a
-    `get` on a missing key, which waits the store's whole timeout. Never raises."""
-    ranks = list(ranks)
-    keys = [f"{base}/{i}" for i in range(len(ranks))]
-    try:
-        store.set(keys[me], json.dumps(verdict))
-    except Exception as error:  # noqa: BLE001  this verdict is missing: no member can decide "gather"
-        return f"rank {ranks[me]} could not put its verdict in the process group's store ({_brief(error)})"
-    try:
-        deadline, pause = time.monotonic() + wait, 0.01
-        while not store.check(keys):
-            left = deadline - time.monotonic()
-            if left <= 0:
-                break
-            time.sleep(min(pause, left))
-            pause = min(pause * 2, 1.0)
-        missing = [ranks[i] for i, key in enumerate(keys) if not store.check([key])]
-        if missing:
-            proposal = (
-                f"rank {ranks[me]} did not hear from {_ranks_text(missing)} of the replica group within {wait:g} s "
-                "at init (every rank must call tensorquill.init with the same replica_group)"
-            )
-        else:
-            proposal = _decide([json.loads(store.get(key)) for key in keys], ranks)
-        decided = json.loads(store.compare_set(f"{base}/decision", "", json.dumps({"why": proposal})))
-        why = decided["why"]
-        return None if why is None else str(why)
-    except Exception as error:  # noqa: BLE001  the window this cannot close: see `_agree_on_gather`
-        return (
-            f"the process group's store failed on rank {ranks[me]} while the ranks agreed whether to run it "
-            f"({_brief(error)})"
-        )
-
-
-def _ranks_text(ranks: list[int]) -> str:
-    return f"rank {ranks[0]}" if len(ranks) == 1 else "ranks " + ", ".join(map(str, ranks))
-
-
-def _decide(verdicts: list[Any], ranks: list[int]) -> str | None:
-    """None when every member can gather, alike; else why none does. The same on every member,
-    since each reads the same verdicts in the same order."""
-    problems = []
-    for rank, verdict in zip(ranks, verdicts):
-        if not isinstance(verdict, dict):
-            problems.append((rank, "its verdict could not be read"))
-        elif verdict.get("problem"):
-            problems.append((rank, str(verdict["problem"])))
-    if problems:
-        rank, problem = problems[0]
-        more = f" (as do {len(problems) - 1} more)" if len(problems) > 1 else ""
-        return f"rank {rank} of the replica group cannot take part{more}: {problem}"
-    for field, what in (
-        ("device", "the replicas' sessions are on different device types ({}), and fingerprints made on different "
-                   "devices are neither gathered alike nor computed alike"),
-        ("count", "the replicas compare different numbers of parameters ({}), and a gather of tables of different "
-                  "shapes cannot be issued"),
-    ):
-        seen: dict[str, list[int]] = {}
-        for rank, verdict in zip(ranks, verdicts):
-            seen.setdefault(str(verdict.get(field)), []).append(rank)
-        if len(seen) > 1:
-            return what.format("; ".join(f"{value} on {_ranks_text(members)}" for value, members in seen.items()))
-    return None
-
-
-def _agreed_problem(group: object, device: torch.device) -> str | None:
-    """Why the agreement at `init` (`_agree_on_gather`) turned the check off on `group` for a
-    table on `device`'s type, or None: it decided to gather, or it was never made."""
-    try:
-        found = _agreed.get(group)
-    except TypeError:  # a stand-in group that cannot be weakly referenced: never agreed
-        return None
-    if found is None or found[0] != device.type:
-        return None
-    return found[1]
-
-
 @torch.no_grad()
 def _spread_and_unread(
     params: Iterable[torch.Tensor], group: dist.ProcessGroup, *, projection: bool, device: torch.device | None = None
@@ -453,13 +296,15 @@ def _spread_and_unread(
     process group, a rank outside the group), no collective is issued: every row comes back
     with the code `_NOT_GATHERED`, zeros for its spread and the reason, so the session leaves
     every parameter out of `replica_spread` and names each once, as for a parameter that could
-    not be read. The same holds where the agreement at `init` (`_agree_on_gather`) turned the
-    check off: every member of the group took that one decision, so where ranks would judge
-    differently by themselves (sessions on different device types) none gathers while another
-    skips. Without an agreement, each rank judges alone, which every rank of a data-parallel job
-    does alike. A gather that raises once issued is not caught: a rank that caught it and went
-    on would issue its next collective (the training run's own) while its peers still wait in
-    this one. So a group that fails after `init` still fails here, inside the training step."""
+    not be read. Each rank judges alone, which every rank of a data-parallel job does alike; ranks
+    that judge differently (sessions on different device types, L5) leave one rank in the gather
+    while another skips, as any collective the caller issues on such a group would. A gather that
+    raises once issued is not caught: a rank that caught it and went on would issue its next
+    collective (the training run's own) while its peers still wait in this one.
+
+    Only the two explicit calls reach it (`replica_spread`, `Session.record_replica_spread`),
+    collectives every rank of the group must call: the session's scheduled check gathers nothing
+    (`_observation_table`)."""
     params = list(params)
     if device is None:
         locals_ = [unwrap_local(p) for p in params]
@@ -467,7 +312,7 @@ def _spread_and_unread(
             (torch.device("cpu") if p.device.type == "mps" else p.device for p in locals_ if not _unread_code(p)),
             torch.device("cpu"),
         )
-    why = _agreed_problem(group, device) or _gather_problem(group, device)
+    why = _gather_problem(group, device)
     if why is not None:
         width = FINGERPRINT_WIDTH if projection else 2
         n = len(params)
@@ -500,6 +345,11 @@ def replica_spread(
     """Compare replicated parameters across `group` and return `[n_params, 3]` relative spread
     (norm, sum, seeded projection).
 
+    A collective: one `all_gather` on `group`, which every rank of the group must call, on the
+    same step, and which waits for them as any collective does. A rank that never calls leaves
+    the others waiting until the process group times out. The session's scheduled check does not
+    call it: each rank records its own observation instead (`Session`, the `replica` key).
+
     `params`: tensors meant to be identical on every rank in `group`.
     `projection=False` skips the seeded projection (two columns instead of three), which
     costs about seven times the norm and sum on CPU; its GPU cost is not yet measured.
@@ -510,8 +360,7 @@ def replica_spread(
     raised) is still gathered, so every rank enters the same `all_gather` with the same shape and
     none is left waiting; its row is NaN on every rank, and one warning per call names it with
     why. Where the gather cannot run at all (as the session's check judges it: no backend for the
-    tensors' device, no process group, a rank outside `group`, or a session's agreement at
-    `init` that turned the check off on `group`), no collective is issued and every row is NaN,
+    tensors' device, no process group, a rank outside `group`), no collective is issued and every row is NaN,
     with the reason. A NaN weight that was read gives NaN too, with no warning. NaN compares
     false with any tolerance, so `spread > tol` reads such a row as no drift: test
     `spread.isnan()` first, and treat a NaN row as not compared (or, for a NaN weight, drift).
@@ -541,3 +390,154 @@ def replica_spread(
         stacklevel=3,
     )
     return spread
+
+
+# ---- the replica observation (replica observation contract, section 1) ---------------------------
+# Each rank's own record of its replicated parameters, with no collective and no store: the
+# fingerprints (`name-v1` projection) and an exact signature (`fold64-v1`), compared by a reader
+# that has every rank's record. Nothing here talks to another rank.
+
+PROJECTION_NAME = "name-v1"
+SIGNATURE_NAME = "fold64-v1"
+_M64 = (1 << 64) - 1
+
+
+def name_v1_seed(name: str) -> int:
+    """`name-v1`'s seed of a parameter's projection: the first four bytes of the SHA-256 of its
+    name in UTF-8 (not normalised), read as a big-endian unsigned 32-bit number. Python's `hash()`
+    is never used: it differs from one process to the next."""
+    return int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:4], "big")
+
+
+def _signed(value: int) -> int:
+    """An unsigned 64-bit number as the signed int64 with the same bits."""
+    value &= _M64
+    return value - (1 << 64) if value >> 63 else value
+
+
+# `fold64-v1`'s constants: the golden-ratio increment and the two multipliers of SplitMix64's
+# finaliser (Steele, Lea and Flood, 2014), as signed int64 so torch can hold them.
+_FOLD_STEP = 0x9E3779B97F4A7C15
+_FOLD_M1 = 0xBF58476D1CE4E5B9
+_FOLD_M2 = 0x94D049BB133111EB
+_FOLD_STEP_S, _FOLD_M1_S, _FOLD_M2_S = _signed(_FOLD_STEP), _signed(_FOLD_M1), _signed(_FOLD_M2)
+_UNSIGNED_VIEW = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _shift_right(z: torch.Tensor, bits: int) -> torch.Tensor:
+    """A logical right shift of int64 `z`: torch's `>>` on int64 copies the sign bit in."""
+    return (z >> bits) & ((1 << (64 - bits)) - 1)
+
+
+def _mix_tensor(z: torch.Tensor) -> torch.Tensor:
+    """SplitMix64's finaliser on int64 `z`, every step modulo 2^64 (int64 products wrap)."""
+    z = (z ^ _shift_right(z, 30)) * _FOLD_M1_S
+    z = (z ^ _shift_right(z, 27)) * _FOLD_M2_S
+    return z ^ _shift_right(z, 31)
+
+
+def _mix(z: int) -> int:
+    """`_mix_tensor` on one Python number, unsigned 64-bit in and out."""
+    z &= _M64
+    z = ((z ^ (z >> 30)) * _FOLD_M1) & _M64
+    z = ((z ^ (z >> 27)) * _FOLD_M2) & _M64
+    return z ^ (z >> 31)
+
+
+def _element_bits(chunk: torch.Tensor) -> torch.Tensor:
+    """Each element's bit pattern as an unsigned number in int64: the element's bytes read as
+    the unsigned integer of its width (IEEE 754 bits for a float, two's complement for an
+    integer, 0 or 1 for a bool)."""
+    if chunk.dtype == torch.bool:
+        return chunk.to(torch.int64)
+    width = chunk.element_size()
+    bits = chunk.view(_UNSIGNED_VIEW[width]).to(torch.int64)
+    return bits & ((1 << (8 * width)) - 1) if width in (2, 4) else bits
+
+
+@torch.no_grad()
+def fold64_sum(p: torch.Tensor) -> torch.Tensor:
+    """The device part of `fold64-v1`: `S`, the sum modulo 2^64 of every element's mixed word,
+    as a 0-dim int64 (the signed number with `S`'s bits) on the parameter's device (the CPU for
+    MPS). A sum, so the order a device reduces in cannot change it, and each word mixes in its
+    element's index, so moving a value to another place does. `fold64_finish` adds the dtype and
+    the shape on the host. Reads `p` as `_projection_f64` does: row-major, a complex tensor as
+    its real pairs. Raises for a tensor it cannot read (meta, sparse, nested)."""
+    flat = _as_real(p).reshape(-1)
+    device = torch.device("cpu") if p.device.type == "mps" else p.device
+    total = torch.zeros((), dtype=torch.int64, device=device)
+    for i, chunk in enumerate(flat.split(PROJECTION_CHUNK)):
+        chunk = chunk.cpu() if chunk.device.type == "mps" else chunk
+        index = torch.arange(i * PROJECTION_CHUNK, i * PROJECTION_CHUNK + chunk.numel(), dtype=torch.int64,
+                             device=chunk.device)
+        total = total + _mix_tensor(_element_bits(chunk) ^ (index * _FOLD_STEP_S)).sum()
+    return total
+
+
+def _dtype_word(dtype_name: str) -> int:
+    return int.from_bytes(hashlib.sha256(dtype_name.encode("utf-8")).digest()[:8], "big")
+
+
+def fold64_finish(total: int, dtype_name: str, shape: Sequence[int]) -> int:
+    """`fold64-v1` from `fold64_sum`'s `S` (signed or unsigned), the dtype's name as the record
+    writes it (`"float32"`) and the shape: `S`, then the dtype's word, the number of dimensions and
+    each size mixed in by turn (`h = mix(h ^ v)`). The signature as a signed 64-bit number."""
+    h = int(total) & _M64
+    for value in (_dtype_word(dtype_name), len(shape), *(int(n) for n in shape)):
+        h = _mix(h ^ (value & _M64))
+    return _signed(h)
+
+
+def dtype_name(dtype: torch.dtype) -> str:
+    """A dtype as the record writes it: `"float32"`, `"bfloat16"`."""
+    return str(dtype).removeprefix("torch.")
+
+
+def group_ranks(group: object) -> tuple[list[int] | None, str | None]:
+    """The global ranks of `group`, sorted, read on the host with no communication, and None; or
+    None and why they cannot be read (no process group, a stand-in group, a rank outside it).
+    Never raises."""
+    try:
+        if not (dist.is_available() and dist.is_initialized()):
+            return None, "torch.distributed has no default process group"
+        if dist.distributed_c10d._rank_not_in_group(group):
+            return None, "this rank is not a member of the replica group"
+        ranks = sorted(int(r) for r in dist.get_process_group_ranks(group))
+        if dist.get_rank() not in ranks:
+            return None, "this rank is not a member of the replica group"
+        return ranks, None
+    except Exception as error:  # noqa: BLE001  a stand-in group, or an API this PyTorch lacks
+        text = " ".join(f"{type(error).__name__}: {error}".split())[:160]
+        return None, f"its global ranks could not be read ({text})"
+
+
+@torch.no_grad()
+def _observation_table(
+    params: Sequence[torch.Tensor], seeds: Sequence[int], *, projection: bool, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, list[str | None], list[tuple[list[int], str]]]:
+    """This rank's observation of `params`, all on `device` with no transfer to the host and no
+    collective: the `[n, width + 1]` fingerprint table of `_fingerprint_table` (seeded by
+    `seeds`, the `name-v1` seeds), the `[n]` int64 `fold64_sum` of each, each parameter's reason
+    when it was not read (or None), and each one's (shape, dtype name) as read, for the record and
+    for `fold64_finish`. A parameter whose signature cannot be computed is not read either: its
+    row gets the code of a raised read, so it is in the record's `unread`, never in `params`
+    without a signature. Never raises for a parameter."""
+    local = [unwrap_local(p) for p in params]
+    table, reasons = _fingerprint_table(local, projection=projection, device=device, seeds=seeds)
+    width = table.shape[1] - 1
+    metas = [(list(p.shape), dtype_name(p.dtype)) for p in local]
+    sums = torch.zeros(len(local), dtype=torch.int64, device=device)
+    read = [i for i, why in enumerate(reasons) if why is None]
+    try:
+        if read:
+            sums[read] = torch.stack([fold64_sum(local[i]).to(device) for i in read])
+    except Exception:  # noqa: BLE001  one at a time
+        for i in read:
+            try:
+                sums[i] = fold64_sum(local[i]).to(device)
+            except Exception as error:  # noqa: BLE001
+                text = " ".join(f"{type(error).__name__}: {error}".split())
+                reasons[i] = f"reading it raised {text if len(text) <= 200 else text[:199] + '…'}"
+                table[i, :width].zero_()
+                table[i, width].fill_(float(_RAISED))
+    return table, sums, reasons, metas

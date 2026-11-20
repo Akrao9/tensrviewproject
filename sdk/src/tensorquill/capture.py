@@ -43,13 +43,24 @@ from .data import (
     optimizer_step_value,
 )
 from . import datawait
-from .distributed import FINGERPRINT_WIDTH, _agree_on_gather, _spread_and_unread, _unread_reason, unwrap_local
+from .distributed import (
+    FINGERPRINT_WIDTH,
+    PROJECTION_NAME,
+    SIGNATURE_NAME,
+    _observation_table,
+    _spread_and_unread,
+    _unread_reason,
+    fold64_finish,
+    group_ranks,
+    name_v1_seed,
+    unwrap_local,
+)
 from .flight import _without_traceback
 from .probe import ProbeState, find_head, install_head_hook, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink, clear_end_marker, write_end_marker
 from .system import SystemPart, SystemReadings
 from . import manifest as _manifest
-from .tracker import RunInfo, _world_size, resolve_run, tracker_labels
+from .tracker import RunInfo, _world_size, read_launch_again, resolve_run, tracker_labels
 
 STATS = ("mean", "std", "abs_max", "zero_frac")
 _SEEN = len(STATS)  # last column: 1.0 when the hook ran this step
@@ -451,6 +462,15 @@ def _short(error: BaseException) -> str:
     # several routers' reasons with "; ".
     text = " ".join(f"{type(error).__name__}: {error}".split()).replace("; ", ", ")
     return text if len(text) <= 200 else text[:199] + "…"
+
+
+def _finite_or_text(value: float) -> float | str:
+    """A fingerprint as the observation writes it (contract 1): a finite number as it is, and
+    otherwise `"nan"`, `"inf"` or `"-inf"`, in the record itself, since not every path a record
+    takes (a `MemorySink`, the stream's row) goes through the JSONL sink's own conversion."""
+    if math.isfinite(value):
+        return float(value)
+    return "nan" if math.isnan(value) else ("inf" if value > 0 else "-inf")
 
 
 def _not_indices(idx: Any, device: torch.device) -> str | None:
@@ -1378,9 +1398,34 @@ class Session:
         self._update_readable: weakref.WeakKeyDictionary[Any, str | None] = weakref.WeakKeyDictionary()
         self._ring_spread: torch.Tensor | None = None
         self._ring_spread_seen: list[int] = []  # columns recorded at each step; 0 if none
-        if replica_group is not None and self._replica_params:
-            self._ensure_spread_buffers()
-            _agree_on_gather(replica_group, self._spread.device, self._replica_params)
+        # The replica observation (contract, section 1): written on each scheduled step by a session
+        # given a replica group, from this rank's own parameters, with no collective and no store.
+        # The group's global ranks are read here, on the host; a group whose ranks cannot be read
+        # (a stand-in object, a rank outside it) gets no observation, said once.
+        self._obs_group: list[int] | None = None
+        self._obs_seeds = [name_v1_seed(name) for name in self.replica_names]
+        self._ring_obs: torch.Tensor | None = None
+        self._ring_obs_sig: torch.Tensor | None = None
+        self._ring_obs_seen: list[Any] = []  # None, or what the row's observation needs on the host
+        self._obs_unread_said: set[str] = set()
+        self._obs_failed_said = False
+        if replica_group is not None and not isinstance(replica_group, torch.Tensor) and self._replica_params:
+            self._obs_group, why = group_ranks(replica_group)
+            if self._obs_group is None:
+                _warn(
+                    f"TensorQuill writes no replica observation for this session: {why}, so the records "
+                    "could not say which ranks it is to be compared with. The explicit calls are unchanged.",
+                    stacklevel=4,
+                )
+        # What an explicit gather covers (contract 1, `replica_spread_scope`): the group's global
+        # ranks for this step, kept per step; the launch is added when the record is written.
+        self._spread_scope: list[int] | None = None
+        self._ring_scope: list[list[int] | None] = []
+        # The launch the records carry: what `init` read, until the writer thread reads it again
+        # before the first record that needs it (`_launch_for_records`, contract 2).
+        self.launch: str | None = run.launch
+        self._launch_confirmed = False
+        self.launch_read_seconds: float | None = None
         self._ring_counts = {
             name: torch.zeros(every, *counts.shape, dtype=torch.int64, device=self.device)
             for name, counts in self._counts.items()
@@ -2522,6 +2567,13 @@ class Session:
         A table of another shape (rows other than one per compared parameter, or other than 2 or 3
         columns) is not recorded and is said once in a warning; what this step recorded before it
         stays as it was. Nothing is broadcast to parameters the table has no row for.
+
+        With a group this is a collective, an `all_gather` on it: every rank of the group must call
+        it on the same step, and it waits for them, as any collective does. It is the only way the
+        session gathers: the scheduled check is each rank's own observation (`replica`), with no
+        collective. Where the group's global ranks can be read and the rank knows its launch, the
+        record also says what the spread covers (`replica_spread_scope`); a precomputed table has
+        no scope.
         """
         if self._closed or not self._replica_params:
             return
@@ -2539,7 +2591,9 @@ class Session:
         unread: torch.Tensor | None = None
         if isinstance(target, torch.Tensor):
             spread = target.to(spread_buf)
+            self._spread_scope = None
         else:
+            self._spread_scope = group_ranks(target)[0]
             spread, unread, reasons = _spread_and_unread(
                 self._replica_params, target, projection=self._replica_projection, device=spread_buf.device
             )
@@ -2588,6 +2642,87 @@ class Session:
                     "of replica_spread, so the cross-GPU drift check does not cover it.",
                     stacklevel=4,
                 )
+
+    def _observe_replicas(self, row: int) -> dict[str, Any] | None:
+        """This step's replica observation (contract 1) into row `row` of the observation ring:
+        each compared parameter's fingerprints (norm, sum and, unless `replica_projection=False`,
+        the `name-v1` projection) and its `fold64-v1` sum, all left on the device, so the step adds
+        no transfer and no synchronisation; the block's flush moves them with the rest. No
+        collective and no store: nothing here waits for another rank. Returns what the record needs
+        from the host (the columns, the device type, each parameter's shape and dtype as read, and
+        why one was not read), or None when it could not be made, which is said once. Never
+        raises."""
+        try:
+            device = torch.device("cpu") if self.device.type == "mps" else self.device
+            n = len(self._replica_params)
+            if self._ring_obs is None or self._ring_obs_sig is None:
+                self._ring_obs = torch.zeros(self.every, n, FINGERPRINT_WIDTH + 1, dtype=torch.float64, device=device)
+                self._ring_obs_sig = torch.zeros(self.every, n, dtype=torch.int64, device=device)
+            table, sums, reasons, metas = _observation_table(
+                self._replica_params, self._obs_seeds, projection=self._replica_projection, device=device
+            )
+            width = table.shape[1] - 1
+            self._ring_obs[row].zero_()
+            self._ring_obs[row, :, :width].copy_(table[:, :width])
+            self._ring_obs[row, :, FINGERPRINT_WIDTH].copy_(table[:, width])
+            self._ring_obs_sig[row].copy_(sums)
+        except Exception as error:  # noqa: BLE001  nothing here may stop a run
+            if not self._obs_failed_said:
+                self._obs_failed_said = True
+                _warn(f"TensorQuill could not make this step's replica observation ({_short(error)}); a step "
+                      "without one reads as not covered for this rank.", stacklevel=5)
+            return None
+        unread = {name: why for name, why in zip(self.replica_names, reasons) if why is not None}
+        for name, why in unread.items():
+            if name not in self._obs_unread_said:
+                self._obs_unread_said.add(name)
+                _warn(
+                    f"TensorQuill is not observing the parameter {name!r} for the cross-GPU drift check: {why}. "
+                    "It is listed under the observation's unread, and a reader leaves it out of the comparison.",
+                    stacklevel=5,
+                )
+        return {"width": width, "device": device.type, "metas": metas, "unread": unread}
+
+    def _launch_for_records(self) -> str | None:
+        """The launch the records carry. On the writer thread only: the first call reads it a
+        second time (`tracker.read_launch_again`: on a rank other than 0, one `check` then `get` on
+        the launch's key, waited for at most `tracker.LAUNCH_READ_SECONDS`, null if it fails) and
+        keeps what it gave, and how long that took (`launch_read_seconds`). Never on the training
+        thread, so a store that is slow or down costs the records a null launch, never a step."""
+        if not self._launch_confirmed:
+            self._launch_confirmed = True
+            began = time.perf_counter()
+            try:
+                self.launch = read_launch_again(self.run)
+            except Exception:  # noqa: BLE001
+                self.launch = None
+            self.launch_read_seconds = time.perf_counter() - began
+        return self.launch
+
+    def _observation_record(self, fp: list[list[float]], sums: list[int], seen: dict[str, Any],
+                            launch: str | None) -> dict[str, Any]:
+        """The `replica` key of one record (contract 1), from the row's values on the host."""
+        width = seen["width"]
+        params: dict[str, Any] = {}
+        for name, row, total, (shape, dtype) in zip(self.replica_names, fp, sums, seen["metas"]):
+            if name in seen["unread"]:
+                continue
+            params[name] = {
+                "shape": shape,
+                "dtype": dtype,
+                "fp": [_finite_or_text(v) for v in row[:width]],
+                "sig": str(fold64_finish(total, dtype, shape)),
+            }
+        return {
+            "v": 1,
+            "launch": launch,
+            "group": list(self._obs_group or []),
+            "device": seen["device"],
+            "projection": PROJECTION_NAME if width == FINGERPRINT_WIDTH else None,
+            "signature": SIGNATURE_NAME,
+            "params": params,
+            "unread": dict(seen["unread"]),
+        }
 
     def step(self, step: int | None = None, lr: float | Sequence[float] | None = None) -> None:
         """Mark the end of one optimizer step. Only for `auto_step=False`.
@@ -2668,19 +2803,18 @@ class Session:
                 self._count_stopped(step)
                 return
         self._say_router_problems(stacklevel=4)
-        if (
-            not self._spread_recorded
-            and self._replica_group is not None
-            and self._replica_params
-            and (current + 1) % self.replica_every == 0
-        ):
-            # Like Megatron's check_weight_hash_across_dp_replicas_interval: a float64 pass
-            # over every weight plus an all_gather is too costly for every step. The
-            # all_gather is a collective, so every rank must call it on the same steps:
-            # it is scheduled from the step number, which the ranks share, not from each
-            # rank's own count of recorded steps, which can differ (a rank that started
-            # its session later, or skipped a step), and would leave the others waiting.
-            self.record_replica_spread(self._replica_group)
+        observed = None
+        if self._replica_group is not None and self._replica_params and (current + 1) % self.replica_every == 0:
+            # Like Megatron's check_weight_hash_across_dp_replicas_interval: a float64 pass over
+            # every weight is too costly for every step. Scheduled from the step number, which
+            # the ranks share, so every rank observes the same steps and a reader can pair them.
+            if isinstance(self._replica_group, torch.Tensor):
+                if not self._spread_recorded:
+                    self.record_replica_spread(self._replica_group)  # a precomputed table: no collective
+            elif self._obs_group is not None:
+                # This rank's own observation (contract 1), whether or not an explicit gather ran
+                # on this step: no collective, no store, nothing moved to the host here.
+                observed = self._observe_replicas(len(self._steps))
         # A step `scaler.update()` ended with no optimizer stepping is one the scaler skipped: its
         # weights are the previous step's. Told on the host, with no sync. (The record's own
         # `step_skipped` is the scaler's verdict, read at the flush.)
@@ -2747,6 +2881,9 @@ class Session:
             self._ring_spread[row].copy_(self._spread)
             self._spread.zero_()
         self._ring_spread_seen.append(self._spread_recorded)
+        self._ring_scope.append(self._spread_scope if self._spread_recorded else None)
+        self._spread_scope = None
+        self._ring_obs_seen.append(observed)
         if self._counts_list:
             torch._foreach_copy_(
                 [ring[row] for ring in self._ring_counts_list], self._counts_list
@@ -2845,6 +2982,8 @@ class Session:
         self._ring_update_seen = []
         self._ring_no_optimizer = []
         self._ring_spread_seen = []
+        self._ring_scope = []
+        self._ring_obs_seen = []
         self._ring_data = []
         self._ring_checkpoint = []
         self._ring_wait = []
@@ -2934,6 +3073,11 @@ class Session:
         )
         if spreads is not None:
             self._say_replica_unread(spreads, self._ring_spread_seen)
+        obs_seen, scopes = self._ring_obs_seen, self._ring_scope
+        self._ring_obs_seen, self._ring_scope = [], []
+        observed = any(obs_seen) and self._ring_obs is not None and self._ring_obs_sig is not None
+        obs = _cpu_copy(self._ring_obs[:n]) if observed else None
+        obs_sig = _cpu_copy(self._ring_obs_sig[:n]) if observed else None
         clips = _cpu_copy(self._ring_clip[:n]) if any(self._ring_clip_seen) else None
         clip_seen = self._ring_clip_seen
         update_seen, self._ring_update_seen = self._ring_update_seen, []
@@ -2980,7 +3124,7 @@ class Session:
         block = (
             steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
             spread_seen, scalars, probes, stamps, amps, data_rows, checkpoints, waits, system,
-            refused, announce, updates, update_seen, update_why, grad_why,
+            refused, announce, updates, update_seen, update_why, grad_why, obs, obs_sig, obs_seen, scopes,
         )
         if hold_newest:
             first = self._hold_newest(dict(zip(_BLOCK_FIELDS, block)), act_size=self._act.numel() if has_act else 0,
@@ -3000,9 +3144,9 @@ class Session:
         first: dict[str, Any] = {}
         held: dict[str, Any] = {}
         for key in ("steps", "lrs", "clip_seen", "grad_seen", "weight_seen", "spread_seen", "scalars", "probes",
-                    "stamps", "amps", "data_rows", "checkpoints", "waits", "update_seen"):
+                    "stamps", "amps", "data_rows", "checkpoints", "waits", "update_seen", "obs_seen", "scopes"):
             first[key], held[key] = block[key][:-1], block[key][-1:]
-        for key in ("spreads", "clips", "updates"):
+        for key in ("spreads", "clips", "updates", "obs", "obs_sig"):
             rows = block[key]
             first[key], held[key] = (None, None) if rows is None else (rows[:-1], rows[-1:].clone())
         floats = block["floats"]
@@ -3042,6 +3186,7 @@ class Session:
         self._ring_grad_seen, self._ring_weight_seen = block["grad_seen"][-1:], block["weight_seen"][-1:]
         self._ring_clip_seen, self._ring_spread_seen = block["clip_seen"][-1:], block["spread_seen"][-1:]
         self._ring_update_seen = block["update_seen"][-1:]
+        self._ring_obs_seen, self._ring_scope = block["obs_seen"][-1:], block["scopes"][-1:]
         if self.updates and n > 1:
             self._ring_update[0].copy_(self._ring_update[n - 1])
         return None if last else first
@@ -3114,9 +3259,9 @@ class Session:
         they read under `torch.compile` would be guarded, and flipping it would recompile; their
         buffers are never read again. The clipping and loader hooks come off. The optimizer hooks
         become no-ops (taking them out now could be inside PyTorch's loop over them, which would
-        raise) and `close()` removes them; with a `replica_group` they instead keep counting steps,
-        so this rank keeps entering the drift check's gather on the same steps as the others
-        (`_count_stopped`). `close()` then writes no end marker, so the file reads as cut off.
+        raise) and `close()` removes them; with a `replica_group` too, since the scheduled check
+        issues no collective a stopped rank would have to keep entering. `close()` then writes no
+        end marker, so the file reads as cut off.
 
         A streamed session's heartbeat is told (contract 3): every later beat carries
         `capture_stopped` with `reason`, a short word (`sink_error`, `writer_behind`, `close_timeout`,
@@ -3145,18 +3290,17 @@ class Session:
                 undo()
             except Exception:  # noqa: BLE001
                 pass
-        if not self._keeps_schedule():
-            for handle in self._optimizer_handles:
-                try:
-                    hooks = handle.hooks_dict_ref()
-                    if hooks is not None and handle.id in hooks:
-                        hooks[handle.id] = _noop_hook  # same key: safe while PyTorch iterates them
-                except Exception:  # noqa: BLE001
-                    pass
+        for handle in self._optimizer_handles:
             try:
-                self._unwatch_scaler()
+                hooks = handle.hooks_dict_ref()
+                if hooks is not None and handle.id in hooks:
+                    hooks[handle.id] = _noop_hook  # same key: safe while PyTorch iterates them
             except Exception:  # noqa: BLE001
                 pass
+        try:
+            self._unwatch_scaler()
+        except Exception:  # noqa: BLE001
+            pass
         if what is None:
             what = f"its sink raised {_short(cause)}" if cause is self._error else str(cause)
         _warn(
@@ -3166,25 +3310,19 @@ class Session:
             stacklevel=4,
         )
 
-    def _keeps_schedule(self) -> bool:
-        """Whether a stopped session must keep counting steps: it takes part in the drift check's
-        `all_gather`, which every rank of the group must enter on the same steps."""
-        return (
-            self._replica_group is not None and not isinstance(self._replica_group, torch.Tensor)
-            and bool(self._replica_params)
-        )
-
     def _count_stopped(self, step: int | None) -> None:
-        """A step ended on a stopped session: only the drift check's gather goes on, on the steps it
-        was due (as `_commit` schedules it), and its result is dropped."""
+        """A step ended on a stopped session (`session.step()`, or a hook that ran before it was
+        made a no-op): only the count goes on. Nothing is gathered: the scheduled check issues no
+        collective, so a stopped rank leaves no other rank waiting."""
         current = self._next_step if step is None else step
         self._stepped = self._foreign_stepped = False
-        if self._keeps_schedule() and not self._spread_recorded and (current + 1) % self.replica_every == 0:
-            self._gather_and_drop(self._replica_group)
         self._spread_recorded = 0
+        self._spread_scope = None
         self._next_step = current + 1
 
     def _gather_and_drop(self, group: Any) -> None:
+        """A stopped rank's explicit `record_replica_spread(group)`: the other ranks are entering
+        that collective too, so this one enters it and drops the result."""
         try:
             spread_buf, _ = self._ensure_spread_buffers()
             _spread_and_unread(self._replica_params, group, projection=self._replica_projection,
@@ -3409,6 +3547,10 @@ class Session:
         update_seen: list[bool] | None = None,
         update_why: Mapping[str, str] | None = None,
         grad_why: Mapping[str, str] | None = None,
+        obs: torch.Tensor | None = None,
+        obs_sig: torch.Tensor | None = None,
+        obs_seen: list[Any] | None = None,
+        scopes: list[list[int] | None] | None = None,
     ) -> list[dict[str, Any]]:
         n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
         split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
@@ -3426,6 +3568,14 @@ class Session:
             spreads.reshape(n, len(self.replica_names), FINGERPRINT_WIDTH + 1).tolist() if spreads is not None else None
         )
         update_rows = updates.reshape(n, n_params, 2).tolist() if updates is not None and n_params > 0 else None
+        obs_rows = obs.reshape(n, len(self.replica_names), FINGERPRINT_WIDTH + 1).tolist() if obs is not None else None
+        sig_rows = obs_sig.reshape(n, len(self.replica_names)).tolist() if obs_sig is not None else None
+        # The launch, read a second time here on the writer thread before the first record that
+        # carries one (contract 2); never on the training thread.
+        needs_launch = (obs_rows is not None and any(obs_seen or ())) or any(
+            scope is not None for scope in (scopes or ())
+        )
+        launch = self._launch_for_records() if needs_launch else None
         moe: dict[str, list[list[int]]] = {}
         unassigned: dict[str, list[int | None]] = {}  # None: the ids were not checked on that step
         left_out: dict[str, list[list[int] | None]] = {}  # None: no routing map was checked on that step
@@ -3517,6 +3667,12 @@ class Session:
                 }
                 if compared:
                     record["replica_spread"] = compared
+                    # What it covers (contract 1): only when both the group and the launch are known.
+                    scope = scopes[i] if scopes is not None and i < len(scopes) else None
+                    if scope is not None and launch is not None:
+                        record["replica_spread_scope"] = {"launch": launch, "group": list(scope)}
+            if obs_rows is not None and sig_rows is not None and obs_seen is not None and obs_seen[i]:
+                record["replica"] = self._observation_record(obs_rows[i], sig_rows[i], obs_seen[i], launch)
             if moe:
                 step_moe = {name: rows[i] for name, rows in moe.items()}
                 record["moe"] = step_moe
@@ -3552,7 +3708,8 @@ class Session:
 _BLOCK_FIELDS = (
     "steps", "lrs", "floats", "counts", "spreads", "clips", "clip_seen", "grad_seen", "weight_seen",
     "spread_seen", "scalars", "probes", "stamps", "amps", "data_rows", "checkpoints", "waits", "system",
-    "refused", "announce", "updates", "update_seen", "update_why", "grad_why",
+    "refused", "announce", "updates", "update_seen", "update_why", "grad_why", "obs", "obs_sig", "obs_seen",
+    "scopes",
 )
 
 
@@ -3866,20 +4023,22 @@ def init(
             `session.step()` yourself when the hooks cannot see the step, as when a framework
             steps copies of the weights (DeepSpeed ZeRO, Megatron-LM).
         replica_group: optional replication `ProcessGroup` (or precomputed spread tensor)
-            for cross-GPU parameter drift checks. With a real `ProcessGroup` of more than one
-            member, every rank's `init` waits for the other members to agree whether the check
-            can run, at most `distributed.AGREE_WAIT_SECONDS` (300 s); replicas on different
-            device types or with different parameter counts turn the check off on every rank
-            alike. `init` never raises for it.
-        replica_every: run the cross-GPU drift check every N steps (default 50). Each
-            check reads every weight in float64 and gathers 32 bytes per parameter tensor
-            from each rank: norm, sum and a seeded random projection, which catches
-            changes that keep the other two, such as swapped elements, and a flag for a
-            parameter some replica could not read. It is a screen, not proof of equality.
-            `session.record_replica_spread()` records one on demand.
-        replica_projection: set False to skip the projection (two values per tensor, 24 bytes
-            with the flag). On
-            CPU it takes about seven times the norm and sum; GPU cost is not yet measured.
+            for the cross-GPU parameter drift check. Each rank records its own observation of
+            the replicated parameters on the scheduled steps (the `replica` key): no collective,
+            no store and no wait for another rank, inside the step or at `init`. The comparison
+            is made afterwards by a reader that has every rank's records (the all-ranks reader,
+            the server), so the verdict comes after the records do. The group's global ranks are
+            read once here; a group whose ranks cannot be read gets no observation, with a
+            warning. `init` never raises for it.
+        replica_every: observe every N steps (default 50). Each observation reads every
+            compared weight in float64: its norm, its sum and a projection seeded by its name,
+            which catches changes that keep the other two, such as swapped elements (a screen,
+            not proof of equality), and an exact 64-bit signature of its bytes, shape and dtype
+            (`fold64-v1`; different signatures prove a difference, equal ones do not prove
+            equality). `session.record_replica_spread(group)` gathers a spread on demand: a
+            collective every rank of the group must call, which can block.
+        replica_projection: set False to skip the projection. On CPU it takes about seven
+            times the norm and sum; GPU cost is not yet measured.
         heartbeat_seconds: with `endpoint=`, a thread of its own tells the server every this
             many seconds that the process is alive and in which phase (see
             `session.phase`), whether or not it is stepping, so the server can tell

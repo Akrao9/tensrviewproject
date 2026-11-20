@@ -84,14 +84,17 @@ def test_non_finite_and_replica_drift_detectors_from_capture_session(tmp_path, m
         replica_group=group,
         replica_every=1,
     )
-    # Step 0: identical replicas, finite activations and gradients
+    # Step 0: identical replicas, finite activations and gradients. Since lane Z1 (SDK-22) the
+    # scheduled check gathers nothing: the spread here comes from the explicit call, a collective.
     model_a(torch.ones(2, 4)).sum().backward()
+    session.record_replica_spread()
     session.step(0)
 
     # Step 5: replica B's weights drift and model A sees a NaN batch
     with torch.no_grad():
         model_b[0].weight[0, 0] += 0.05
     model_a(torch.full((2, 4), float("nan"))).sum().backward()
+    session.record_replica_spread()
     session.step(5)
     session.close()
 
@@ -732,8 +735,12 @@ def test_activation_detectors_skip_non_finite_values():
 
 
 def test_replica_drift_check_runs_every_replica_every_steps(monkeypatch):
+    """Rewritten by lane Z1 (SDK-22): the scheduled check is each rank's own observation
+    (`replica`), and it gathers nothing."""
     import torch.distributed as dist
     from torch import nn
+
+    from tensorquill import capture
 
     model = nn.Linear(4, 2, bias=False)
     gathers = []
@@ -745,6 +752,7 @@ def test_replica_drift_check_runs_every_replica_every_steps(monkeypatch):
             out.copy_(tensor)
 
     monkeypatch.setattr(dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(capture, "group_ranks", lambda group: ([0, 1], None))
     sink = tensorquill.MemorySink()
     session = tensorquill.init(
         model, sink=sink, every=2, auto_step=False, replica_group=object(), replica_every=3
@@ -754,8 +762,9 @@ def test_replica_drift_check_runs_every_replica_every_steps(monkeypatch):
         session.step()
     session.close()
 
-    assert len(gathers) == 2
-    assert [("replica_spread" in r) for r in sink.records] == [False, False, True] * 2
+    assert gathers == []
+    assert [("replica" in r) for r in sink.records] == [False, False, True] * 2
+    assert not any("replica_spread" in r for r in sink.records)
     with pytest.raises(ValueError, match="replica_every"):
         tensorquill.init(nn.Linear(2, 2), sink=tensorquill.MemorySink(), replica_every=0)
 
