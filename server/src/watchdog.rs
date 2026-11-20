@@ -125,8 +125,12 @@
 //!
 //! Rows the ingest drops because a key of theirs is null (RS10) are counted per rank in the rank's
 //! entry of its own run's status, once there is one: `dropped_rows`, the total, and
-//! `dropped_row_keys`, by the first null key of each row. A rank that dropped none has neither,
-//! so its entry is as before. The counts survive a restart (in `restart`). They are a count only:
+//! `dropped_row_keys`, by the first null key of each row, with the rows whose `schema_version` is
+//! not one the server reads under `unsupported_schema_version` (from Nov 20, 2026). Batches refused
+//! whole, because a key column was missing or of another type, are counted beside them:
+//! `refused_batches`, the total, and `refused_batch_keys`, by the column; the same batch sent
+//! again after its stream ended is not counted again. A rank that dropped or refused none has none
+//! of these keys, so its entry is as before. The counts survive a restart (in `restart`). They are a count only:
 //! no state, severity, incident or run state comes of them. A batch whose acknowledgement was lost
 //! and that is sent again is counted again, so a count is at most the rows dropped (decided
 //! Nov 20, 2026; until then the count reached only stderr).
@@ -332,8 +336,11 @@ pub struct Progress {
     order_loaded: bool,
     /// Rows of an attempt that does not own the rank, received since the server took it up.
     superseded_rows: u64,
-    /// Rows dropped for a null key (RS10), by the first null key of each row.
+    /// Rows dropped for a null key (RS10), by the first null key of each row, and for a version
+    /// not read (`unsupported_schema_version`).
     dropped_rows: BTreeMap<String, u64>,
+    /// Batches refused because a key column was missing or of another type (RS10), by the column.
+    refused_batches: BTreeMap<String, u64>,
     /// The owner attempt's capture stopped (contract 3), its reason and since when the server saw
     /// it. Kept whatever state the rank reads, until a newer attempt owns the rank.
     capture_stopped: Option<(String, Instant)>,
@@ -368,6 +375,7 @@ impl Progress {
             order_loaded: false,
             superseded_rows: 0,
             dropped_rows: BTreeMap::new(),
+            refused_batches: BTreeMap::new(),
             capture_stopped: None,
         }
     }
@@ -641,6 +649,7 @@ impl Progress {
             "attempt_without_steps": self.attempt_since.is_some(),
             "superseded_rows": self.superseded_rows,
             "dropped_rows": self.dropped_rows,
+            "refused_batches": self.refused_batches,
             "step_seconds": self.step_seconds.iter().copied().map(round3).collect::<Vec<_>>(),
             "gaps_seconds": self.gaps.iter().copied().map(round3).collect::<Vec<_>>(),
             "pauses": self.pauses.iter().map(|(phase, stats)| (phase.clone(), json!({
@@ -759,12 +768,9 @@ impl Progress {
             order_loaded: false,
             superseded_rows: carry["superseded_rows"].as_u64().unwrap_or(0),
             // Absent from a status written before it was kept: none dropped.
-            dropped_rows: carry["dropped_rows"]
-                .as_object()
-                .into_iter()
-                .flatten()
-                .filter_map(|(column, rows)| Some((column.clone(), rows.as_u64().filter(|rows| *rows > 0)?)))
-                .collect(),
+            dropped_rows: counts(&carry["dropped_rows"]),
+            // Absent from a status written before Nov 20, 2026: none refused.
+            refused_batches: counts(&carry["refused_batches"]),
             // Kept in the entry in every state once seen (contract 3), so a restart keeps it.
             capture_stopped: entry["capture_stopped"].as_object().map(|stopped| {
                 let reason = stopped
@@ -809,6 +815,16 @@ fn median(times: &VecDeque<f64>) -> Option<f64> {
     let mut times: Vec<f64> = times.iter().copied().collect();
     times.sort_by(|a, b| a.total_cmp(b));
     Some(times[times.len() / 2])
+}
+
+/// A carried map of key to count, the counts above zero (absent: none).
+fn counts(carried: &Value) -> BTreeMap<String, u64> {
+    carried
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, count)| Some((key.clone(), count.as_u64().filter(|count| *count > 0)?)))
+        .collect()
 }
 
 fn round3(value: f64) -> f64 {
@@ -1055,6 +1071,14 @@ impl Watchdog {
                 let held = p.dropped_rows.entry(column.to_string()).or_default();
                 *held = held.saturating_add(*rows);
             }
+        });
+    }
+
+    /// A batch of the rank none of whose rows could be read was refused (RS10), for its key `column`.
+    pub fn refused(&self, key: &Key, column: &str, now: Instant) {
+        self.with(key, now, |p| {
+            let held = p.refused_batches.entry(column.to_string()).or_default();
+            *held = held.saturating_add(1);
         });
     }
 
@@ -1363,6 +1387,11 @@ pub fn run_status(
             if !p.dropped_rows.is_empty() {
                 entry["dropped_rows"] = json!(p.dropped_rows.values().fold(0u64, |sum, rows| sum.saturating_add(*rows)));
                 entry["dropped_row_keys"] = json!(p.dropped_rows);
+            }
+            if !p.refused_batches.is_empty() {
+                entry["refused_batches"] =
+                    json!(p.refused_batches.values().fold(0u64, |sum, batches| sum.saturating_add(*batches)));
+                entry["refused_batch_keys"] = json!(p.refused_batches);
             }
             if let Some((reason, since)) = &p.capture_stopped {
                 entry["capture_stopped"] = json!({

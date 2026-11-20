@@ -15,9 +15,16 @@
 //! `PutResult.app_metadata = {"end_byte_offset": N}`: everything up to byte N of the
 //! sender's file is durable. Buffered Arrow bytes across all streams are capped; a batch
 //! that does not fit is refused with `RESOURCE_EXHAUSTED` and the sender retries later.
-//! A row whose run, rank, step, attempt or schema version is null cannot be stored: it is dropped
-//! and counted, with a line on stderr and in the rank's entry of its run's `watchdog.json`
-//! (`dropped_rows`, `dropped_row_keys`), and the rest of its batch is kept and acknowledged (RS10).
+//! A row whose run, rank, step, attempt or schema version is null, or whose `schema_version` is not
+//! 0 or 1, cannot be stored: it is dropped and counted, with a line on stderr and in the rank's
+//! entry of its run's `watchdog.json` (`dropped_rows`, `dropped_row_keys`), and the rest of its
+//! batch is kept and acknowledged (RS10). A batch whose key column is missing or of another type
+//! has no row that can be read: it is refused with `INVALID_ARGUMENT` naming the column, which ends
+//! its stream, and counted in the same entry (`refused_batches`, `refused_batch_keys`). The stream
+//! has to end: a `DoPut` tells its sender of a refusal only by the status that ends the call, every
+//! later batch of the stream has the same schema and would be refused too, and a batch that is not
+//! acknowledged stays with its sender, which sends it again from its offset, to a server that can
+//! read it once there is one. Nothing is acknowledged past a refused batch.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -296,6 +303,9 @@ struct RankBuffer {
     /// which replaces the earlier one, and no second, overlapping part with other bounds can
     /// be left beside it. The sender keeps the refused rows and sends them again.
     sealed: bool,
+    /// The key column and end offset of the rank's last batch refused because no row of it could be
+    /// read (RS10): the same batch sent again is not counted again.
+    last_refused: Option<(&'static str, i64)>,
 }
 
 impl RankBuffer {
@@ -429,7 +439,8 @@ impl Ingest {
     }
 
     /// Rows dropped since the server started because a key of theirs was null, by the key
-    /// (`run_id`, `rank`, `step`, `attempt`, `schema_version`), for the first null key of each row.
+    /// (`run_id`, `rank`, `step`, `attempt`, `schema_version`), for the first null key of each row,
+    /// and because their `schema_version` is not one this server reads (`unsupported_schema_version`).
     pub fn dropped_rows(&self) -> BTreeMap<String, u64> {
         self.dropped_rows
             .lock()
@@ -439,9 +450,9 @@ impl Ingest {
             .collect()
     }
 
-    /// Rows of `key`'s batch were dropped for a null key (RS10): counted, and written to stderr at
-    /// most once per `STREAM_ERROR_LOG_INTERVAL` per rank with the run, rank, the keys and how many
-    /// rows, never a value the sender sent. (Until Nov 20, 2026 one limit served every rank, and a
+    /// Rows of `key`'s batch were dropped for a null key or a version this server does not read
+    /// (RS10): counted, and written to stderr at most once per `STREAM_ERROR_LOG_INTERVAL` per rank
+    /// with the run, rank, the keys and how many rows, never a value the sender sent. (Until Nov 20, 2026 one limit served every rank, and a
     /// second rank's drop inside the interval showed only in a later line's total.)
     fn rows_dropped(&self, key: &Key, dropped: &[(&'static str, u64)]) {
         let totals = {
@@ -463,7 +474,10 @@ impl Ingest {
         };
         let which: Vec<String> = dropped
             .iter()
-            .map(|(column, rows)| format!("{rows} with a null {column}"))
+            .map(|(column, rows)| match *column {
+                UNSUPPORTED_SCHEMA_VERSION => format!("{rows} of a schema_version this server does not read"),
+                column => format!("{rows} with a null {column}"),
+            })
             .collect();
         let held = if held > 0 {
             format!("; {held} more batches with such rows since the last line")
@@ -476,6 +490,21 @@ impl Ingest {
             key.1,
             which.join(", ")
         );
+    }
+
+    /// A batch of `key` that no row of can be read, for its key `column`, was refused (RS10): counted
+    /// in the rank's status (`refused_batches`, `refused_batch_keys`). Its stream ends with the
+    /// status that names the column, and its sender, which keeps the rows, sends them again from its
+    /// offset; the same batch sent again (the same column and end offset as the rank's last refusal)
+    /// is not counted again, so the count is of batches, not of retries.
+    async fn batch_refused(&self, key: &Key, column: &'static str, end_byte_offset: i64) {
+        let buffer = self.buffer(key);
+        let mut buffer = buffer.lock().await;
+        if buffer.last_refused == Some((column, end_byte_offset)) {
+            return;
+        }
+        buffer.last_refused = Some((column, end_byte_offset));
+        self.watchdog.refused(key, column, Instant::now());
     }
 
     /// Streams that ended in an error since the server started.
@@ -565,8 +594,17 @@ impl Ingest {
         sender: Option<i64>,
         ack: &AckSender,
     ) -> Result<(), Status> {
-        // Rows with a null key are dropped before anything of the batch is placed or kept (RS10).
-        let (batch, dropped) = drop_rows_with_null_keys(batch)?;
+        // Rows that cannot be stored are dropped before anything of the batch is placed or kept, and
+        // a batch none of whose rows can be read is refused and counted (RS10).
+        let (batch, dropped) = match drop_unstorable_rows(batch) {
+            Ok(kept) => kept,
+            Err(refused) => {
+                if let Some(column) = refused.column {
+                    self.batch_refused(key, column, end_byte_offset).await;
+                }
+                return Err(refused.status);
+            }
+        };
         let pieces = split_by_attempt(batch)?;
         // Every attempt of the batch has its place in the store's order before any row of it is
         // taken (contract 1): a batch that cannot have it is refused, and its sender sends it again.
@@ -1716,14 +1754,33 @@ const KEY_COLUMNS: [(&str, DataType); 5] = [
     ("schema_version", DataType::Int32),
 ];
 
-/// Drops the rows whose run, rank, step, attempt or schema version is null, and says how many,
-/// by the first null key of each row in that order (RS10). These rows cannot be stored or placed,
-/// and the rest of the batch can: until Nov 19, 2026 one such row refused the whole batch, which
-/// ended the stream, and its sender, which sends from its offset again, stored nothing more for the
-/// rank. A key column that is missing or of another type is refused, as before, naming it: no row
-/// of the batch can be read then. The same keys as the offline modes check (`detect::check_keys`,
-/// lane V7), which refuse their whole input instead, since nothing sends it again.
-fn drop_rows_with_null_keys(batch: RecordBatch) -> Result<(RecordBatch, Dropped), Status> {
+/// The row versions (`schema_version`) this server stores: 1, the current one, and 0, which
+/// `flight.py` writes for a record that names none. A row of any other version is dropped and
+/// counted under `unsupported_schema_version` (RS10, decided by the author on Nov 20, 2026).
+pub const SUPPORTED_ROW_VERSIONS: [i32; 2] = [0, 1];
+
+/// The key under which rows of a version this server does not read are counted.
+pub const UNSUPPORTED_SCHEMA_VERSION: &str = "unsupported_schema_version";
+
+/// A batch none of whose rows can be stored: the key column it lacks or holds in another type (none
+/// for an error of the server's own, which is not counted), and the status its stream ends with.
+struct Refused {
+    column: Option<&'static str>,
+    status: Status,
+}
+
+/// Drops the rows that cannot be stored and says how many, by key (RS10): first the rows whose run,
+/// rank, step, attempt or schema version is null, by the first null key of each row in that order;
+/// then, of the rest, the rows whose `schema_version` is not one of `SUPPORTED_ROW_VERSIONS`. The
+/// rest of the batch is kept: until Nov 19, 2026 one null key refused the whole batch, which ended
+/// the stream, and its sender, which sends from its offset again, stored nothing more for the rank;
+/// until Nov 20, 2026 a row's version was not looked at. The batch is checked whole before any of
+/// it is placed or kept, as MLflow's file store validates a batch before its write loops.
+///
+/// A key column that is missing or of another type refuses the batch, naming the column: no row of
+/// it can be read then. The same keys as the offline modes check (`detect::check_keys`, lane V7),
+/// which refuse their whole input instead, since nothing sends it again.
+fn drop_unstorable_rows(batch: RecordBatch) -> Result<(RecordBatch, Dropped), Refused> {
     let mut keep = vec![true; batch.num_rows()];
     let mut dropped = Vec::new();
     for (name, wanted) in &KEY_COLUMNS {
@@ -1731,13 +1788,19 @@ fn drop_rows_with_null_keys(batch: RecordBatch) -> Result<(RecordBatch, Dropped)
             if *name == "attempt" {
                 continue;
             }
-            return Err(Status::invalid_argument(format!("column `{name}` is missing")));
+            return Err(Refused {
+                column: Some(name),
+                status: Status::invalid_argument(format!("column `{name}` is missing; the batch is refused")),
+            });
         };
         if column.data_type() != wanted {
-            return Err(Status::invalid_argument(format!(
-                "column `{name}` is {}, not {wanted}",
-                column.data_type()
-            )));
+            return Err(Refused {
+                column: Some(name),
+                status: Status::invalid_argument(format!(
+                    "column `{name}` is {}, not {wanted}; the batch is refused",
+                    column.data_type()
+                )),
+            });
         }
         if column.null_count() == 0 {
             continue;
@@ -1753,11 +1816,27 @@ fn drop_rows_with_null_keys(batch: RecordBatch) -> Result<(RecordBatch, Dropped)
             dropped.push((*name, rows));
         }
     }
+    let versions = batch
+        .column_by_name("schema_version")
+        .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+        .expect("checked above");
+    let mut rows = 0;
+    for (row, kept) in keep.iter_mut().enumerate() {
+        if *kept && !SUPPORTED_ROW_VERSIONS.contains(&versions.value(row)) {
+            *kept = false;
+            rows += 1;
+        }
+    }
+    if rows > 0 {
+        dropped.push((UNSUPPORTED_SCHEMA_VERSION, rows));
+    }
     if dropped.is_empty() {
         return Ok((batch, dropped));
     }
-    let batch =
-        filter_record_batch(&batch, &BooleanArray::from(keep)).map_err(|error| Status::internal(error.to_string()))?;
+    let batch = filter_record_batch(&batch, &BooleanArray::from(keep)).map_err(|error| Refused {
+        column: None,
+        status: Status::internal(error.to_string()),
+    })?;
     Ok((batch, dropped))
 }
 
