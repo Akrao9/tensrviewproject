@@ -228,19 +228,22 @@ def _rank_across_files(paths: list[Path], rank: int, run_id: str | None = None) 
         for line, record in _file_lines(path):
             if _record_rank(record) != rank:
                 continue
-            key = hash(line.strip())
-            mine.add(key)
-            if key in seen:
-                continue
             attempt = record.get("attempt", 0)
             try:
                 found = (_run_of(record), attempt)
                 hash(found)
             except TypeError:  # an attempt that is not a number or a string: `compare` cannot read it either
                 continue
+            # A file holds the attempt whether or not its lines were read from an earlier file:
+            # a copy sorting first leaves the file the attempt wrote, and its end marker, a holder.
+            if path not in holders.setdefault(found, []):
+                holders[found].append(path)
+            line_key = hash(line.strip())
+            mine.add(line_key)
+            if line_key in seen:
+                continue
             if found not in here:
                 here[found] = {"run_id": found[0], "rank": rank, "attempt": attempt, "ts": record.get("ts")}
-                holders.setdefault(found, []).append(path)
             step = record.get("step")
             if isinstance(step, int) and not isinstance(step, bool) and -(1 << 63) <= step < (1 << 63):
                 steps.setdefault(found, array("q")).append(step)
@@ -248,24 +251,24 @@ def _rank_across_files(paths: list[Path], rank: int, run_id: str | None = None) 
         firsts.append(list(here.values()))
     report = attempt_order_report(firsts, [p.name for p in paths])
     keys = list(report)
-    key = next((k for k in keys if k[0] == run_id), keys[0] if keys else None)
-    if key is None:
+    picked = next((k for k in keys if k[0] == run_id), keys[0] if keys else None)
+    if picked is None:
         return {"last_step": None, "order": [], "report": None, "holders": []}
-    order = report[key]["order"]
+    order = report[picked]["order"]
     # The furthest step `resolve_attempts` keeps, from a few of each attempt's steps: its first
     # and last, and its last below each other attempt's first, where every cut it can make falls.
-    picked = []
+    chosen: list[dict[str, Any]] = []
     for (run, attempt), held in steps.items():
-        if run != key[0]:
+        if run != picked[0]:
             continue
         ordered = sorted(set(held))
         cuts = {min(other) for (r, a), other in steps.items() if r == run and a != attempt}
         keep = {ordered[0], ordered[-1]} | {ordered[at - 1] for cut in cuts if (at := bisect_left(ordered, cut)) > 0}
-        picked += [{"run_id": run, "rank": rank, "attempt": attempt, "step": step} for step in sorted(keep)]
-    kept = resolve_attempts(picked, order={(key[0], rank): order})
+        chosen += [{"run_id": run, "rank": rank, "attempt": attempt, "step": step} for step in sorted(keep)]
+    kept = resolve_attempts(chosen, order={(picked[0], rank): order})
     newest = order[-1] if order else None
-    return {"last_step": max((r["step"] for r in kept), default=None), "order": order, "report": report[key],
-            "holders": holders.get((key[0], newest), [])}
+    return {"last_step": max((r["step"] for r in kept), default=None), "order": order, "report": report[picked],
+            "holders": holders.get((picked[0], newest), [])}
 
 
 def _is_run_folder(folder: Path) -> bool:

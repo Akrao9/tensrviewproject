@@ -131,6 +131,14 @@ def test_cli13_the_end_cell_is_the_newest_attempts_file(tmp_path):
     assert write_end_marker(closed, run_id=RUN, rank=0, attempt=1)
     (copy / "x.bak.jsonl").write_bytes(closed.read_bytes())
     assert only_row(copy)["end"]["state"] == "closed"
+    # The same with the copy's name sorting first: its lines are read and the closed file's are
+    # then read once, but the closed file still holds the newest attempt.
+    flipped = tmp_path / "flipped"
+    closed = write(flipped / f"{RUN}.rank0.jsonl", rows(1, range(0, 30), 1000.0))
+    assert write_end_marker(closed, run_id=RUN, rank=0, attempt=1)
+    (flipped / "a.bak.jsonl").write_bytes(closed.read_bytes())
+    assert sorted(p.name for p in runs_module.discover_runs(flipped)[0]["files"].values())[0] == "a.bak.jsonl"
+    assert only_row(flipped)["end"]["state"] == "closed"
 
 
 # --- DET-17 -----------------------------------------------------------------------------------
