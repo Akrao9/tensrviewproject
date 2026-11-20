@@ -124,7 +124,69 @@ Coverage says who sent a record. It does not say anything was compared. Only a s
 - `agree` when none differs and at least one parameter's signatures were compared. It means no difference was found, not that the bytes were proved equal.
 - `not_compared` when none was, with why: the methods differ or a rank records none, no parameter could be compared, or the group has one rank.
 
-**Attribution (D1, released by the author on Nov 20, 2026; not built).** Not part of the wave that built this page, and built only after its own cases are written here. It is computed from these same records: `agree`, `attributed` when a strict majority of the ranks hold one value and the others are named, `inconclusive` otherwise. Two ranks that differ are inconclusive: they establish that the replicas diverge and name no rank. Three equivalent replicas split two to one name the one. A rank with no peer is never said to agree: one rank observed, zero peers compared (section 3), and the same words hold for batch hashes.
+**Attribution (D1).** Which rank a difference is attributed to is a fifth fact, with its own section, 4a. It never changes the four above.
+
+## 4a. Which rank (D1)
+
+Released by the author on Nov 20, 2026; written here on the same day, and not built. Its cases are in `sdk/tests/fixtures/replica/attribution_cases.json`, checked by `sdk/tests/test_replica_attribution_contract.py`.
+
+**What it is.** Where the ranks of a step differ on a parameter, attribution says whether one value is held by a strict majority of the group, and if so which ranks stand apart from it. It describes a difference. It raises nothing and silences nothing: section 5 alone decides what raises, and the count of incidents is the same with or without it.
+
+**Where it is read.** Only on a step whose coverage is `complete`, from the rows that were compared: one observation from each rank of the group, the first attempt's where a rank has two under one launch (section 2). A step that is `insufficient` or `not_established` has no attribution, even when every rank that reported agrees or two of them differ: the missing rank could change either reading. A gathered spread holds one number for a parameter and no rank's value, so it attributes nothing.
+
+**By fingerprints,** for each parameter in the step's `drift_parameters`, with `n` the number of ranks in the group:
+
+1. `n = 2`: `inconclusive`, why `two_ranks`. Two ranks that differ establish that the replicas diverge and cannot say which is wrong.
+2. A rank with a fingerprint that is not finite stands apart.
+3. For each compared column (norm and sum, and the projection where it is compared), take the median of the finite ranks' values: the middle one, or with an even number the mean of the two middle ones. A rank stands apart when its value is further from that median than the tolerance, measured as section 4 measures a spread: the distance divided by the mean of the finite ranks' norms, never less than `1e-12`.
+4. No rank stands apart: `inconclusive`, why `no_outlier`. The spread from the lowest rank to the highest is over the tolerance and no rank is far from the middle.
+5. The ranks that do not stand apart are a strict majority, more than `n / 2`: `attributed`, with `outliers`, the ranks that stand apart, in order.
+6. Otherwise: `inconclusive`, why `no_majority`.
+
+**By signatures,** for each parameter in the step's `signature_parameters`: `n = 2` is `inconclusive`, why `two_ranks`; one signature held by more than `n / 2` of the ranks is `attributed`, with the other ranks as `outliers`; anything else is `inconclusive`, why `no_majority`. This is the rule of SCOUT's exact classifier (`lm_resiliency/detection/c3.py`, `classify_evidence`). It is evidence, as the signatures are: a signature-only difference is shown with the rank whose bits stand apart, and raises nothing.
+
+The two readings are separate entries and may differ on one parameter (`not_finite_on_two_of_three`). Each parameter is attributed on its own, so one step can name different ranks for different parameters, and a reader never carries one parameter's outlier to another.
+
+**The entry.** The result gains one key, `attribution`, a list present only when it has an entry, so a result with no difference is spelled exactly as before. Each entry has `step`, `launch`, `group`, `parameter`, `by` (`fingerprints` or `signatures`), `verdict` (`attributed` or `inconclusive`), and `outliers` when attributed or `why` when not. The list is ordered by step, launch, group, parameter, then `by`. The `steps` and `replica_drift` lists do not change.
+
+**A rank with no peer** is never said to agree: one rank observed, zero peers compared (section 3). The same words hold for batch hashes.
+
+**Where a named rank is shown.** In the cross-rank result, and in the incident a reader builds from it: the incident says, for each parameter, the ranks named or that none could be. No rank's own report changes, since no rank's records can say it.
+
+**How this differs from two earlier wordings.** The Focused Plan's item says "further than the tolerance from the group's median", and this page said "a strict majority of the ranks hold one value". Under a tolerance, holding one value is not a relation that sorts ranks into groups (a can be near b, and b near c, with a far from c), so the rule above takes the median as the point to measure from and then asks for a strict majority beside it. For values far from the tolerance the two wordings and this rule give the same answer.
+
+**The cases.**
+
+| Case | What it pins |
+|---|---|
+| `two_ranks_differ` | Two ranks: divergence, no rank named |
+| `three_ranks_two_to_one` | Two to one names the one |
+| `three_ranks_rank_0_is_the_outlier` | Rank 0 is not a reference to compare against |
+| `three_ranks_all_differ` | Three values: no majority |
+| `four_ranks_two_to_two` | A half is not a strict majority |
+| `four_ranks_three_to_one` | Three of four names the fourth |
+| `four_ranks_two_one_one` | The largest group is not a majority |
+| `five_ranks_three_one_one` | Two outliers beside a majority of three |
+| `a_peer_is_missing_and_the_reporters_agree` | Insufficient coverage: nothing attributed, nothing agrees |
+| `a_peer_is_missing_and_the_reporters_differ` | The same, when the reporters differ |
+| `two_parameters_with_different_outliers` | Each parameter names its own rank; one incident |
+| `signature_only_two_to_one` | A signature-only difference is shown with its rank and raises nothing |
+| `signature_only_between_two_ranks` | The same between two ranks: no rank named |
+| `signed_zero_on_one_of_three` | `0.0` against `-0.0`: evidence only |
+| `below_tolerance_on_one_of_three` | A difference far inside the tolerance: evidence only |
+| `not_finite_on_one_of_three` | A value that is not finite stands apart |
+| `not_finite_on_two_of_three` | The two readings can differ |
+| `spread_over_three_ranks_with_no_outlier` | Drift with no rank apart |
+| `only_the_projection_separates_the_outlier` | The projection column counts |
+| `clean_three_ranks` | No difference, no entry |
+| `group_of_one` | One rank observed, zero peers compared |
+| `one_step_under_two_launches_with_different_outliers` | Each launch on its own rows |
+| `a_set_aside_later_attempt_does_not_vote` | Only compared rows vote |
+| `device_differs_and_one_signature_stands_apart` | Signatures are read where fingerprints are not |
+| `a_gathered_spread_drifts_and_the_observations_agree` | A gathered spread names no rank |
+| `one_clean_step_and_one_attributed` | Entries only for the step that differs |
+
+Every case keeps its values far from the tolerance. The file also says, under `earlier_cases`, what attribution adds to each of the 39 cases of sections 2 to 6; their two files are unchanged.
 
 ## 5. What raises `replica_drift`
 
@@ -154,6 +216,10 @@ Incidents are listed by step, then by source, then by launch and group.
 | | `projection_compared` | `false` when the ranks' projection settings differ; absent otherwise |
 | | `gathered` | The parameters a gathered spread of this launch, group and step decides |
 | An incident | `source` | `replica` (with `launch` and `group`) or `replica_spread` (with them when it has a scope) |
+| The result, when it has an entry | `attribution` | A list of entries (section 4a) |
+| An attribution entry | `by` | `fingerprints`, `signatures` |
+| | `verdict` | `attributed` (with `outliers`, the ranks) or `inconclusive` (with `why`) |
+| | `why` | `two_ranks`, `no_majority`, `no_outlier` |
 
 ## 6. Old captures
 
@@ -186,7 +252,7 @@ The proof for this uses a rank that is alive and training while its telemetry is
 ## 9. Not settled here
 
 - Whether a signature mismatch alone raises. The author's call of Nov 20, 2026: it stays evidence. The eight-GPU run measures how often signatures differ on healthy steps and plants a byte difference below the fingerprint tolerance, signed zero among them; whether any mismatch is an incident, and under which conditions, is decided after that. Megatron's hash is of a CPU float32 copy and `fold64-v1` is of the original bits, so the two can disagree about the same tensors.
-- D1's cases and acceptance test. Released by the author on Nov 20, 2026; its cases come before any code.
+- D1 is written (section 4a) and not built. Two things in it go beyond what the author asked and are his to confirm: a rank is also named from signatures, as evidence; and where the largest spread is over the tolerance and no rank is far from the median, the reading is `inconclusive` with why `no_outlier`. Its acceptance test on real processes is the driver's: three CPU ranks with one drifted rank name that rank, and two ranks report drift and name none.
 - SDK-06: whether to record again after a second optimizer steps. Its cost is hashing, device synchronisation and record size, to be measured, not assumed free.
 - **L25, fixed in wave AA for one agent and open for several.** The exchange keys are scoped by `TORCHELASTIC_RESTART_COUNT` when one torchrun agent launched every rank (`GROUP_WORLD_SIZE` is 1 and `WORLD_SIZE` matches the group), tested on the store with the restarted rank other than 0 arriving before rank 0. With several agents the count is not trusted (a restart for a membership change does not raise it, and a node that joins starts at 0), so the stale read stays possible there and the two rules above are what stand against it. A whole restarted job has not completed on the machine this was built on.
 - **What the two stale-launch rules leave.** A rank whose second read is still stale (rank 0 of its start had not reached `init` by the rank's first observation, which needs a job whose ranks do not step together), under a launch in which the earlier start's same rank never reported: its rows would be the first attempt under the old launch and could pair with the earlier start's other ranks. A store left on disk by a crashed job (a `FileStore` file) is the same exposure from the first read on. Closing it for certain needs rank 0 to wait for the others or a collective at `init`, and this wave took both out of the training path. The same store entry also carries the run ID, which is read the same way today (bug list, L25).
