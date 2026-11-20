@@ -38,8 +38,8 @@ except the files of a rank whose records are in several files, which are read wh
 alone, an attempt seen only in the middle of a file was not seen, and the order across the
 files could be wrong). That costs a JSON parse of every line, about 120 MB a second on a
 recorded capture here, and only for such a rank; what is kept is each attempt's first record in
-each file and its steps, never the records. A file whose first record and last megabyte show a
-rank in more than one attempt is read whole the same way, for that rank's last step (XC4, lane
+each file and its steps, never the records. A file whose last megabyte shows a rank in more
+than one attempt is read whole the same way, for that rank's last step (XC4, lane
 Y3, Nov 20, 2026: a late row of an attempt that a later one replaced was taken as the last step).
 An attempt seen only in the middle of a file larger than a megabyte is still not seen there.
 
@@ -136,15 +136,16 @@ def _tail_lines(path: Path) -> list[bytes]:
     return _tail(path)[0]
 
 
-def _attempts_by_rank(first: Mapping[str, Any] | None, tail: list[dict[str, Any]]) -> dict[int, set[Any]]:
-    """The attempts each rank's records name among a file's first record and the records of its
-    last megabyte (`tail`), as `(run, attempt)`. More than one for a rank means the file may hold
-    a late row of an attempt that a later one replaced (XC4), and the rank's last line is then not
-    where it stands."""
+def _attempts_by_rank(tail: list[dict[str, Any]]) -> dict[int, set[Any]]:
+    """The attempts each rank's records name among the records of a file's last megabyte
+    (`tail`), as `(run, attempt)`. More than one for a rank means the file may hold a late row of
+    an attempt that a later one replaced (XC4), and the rank's last line is then not where it
+    stands. One means its last line stands: a resume whose new attempt fills the last megabyte is
+    not read again (a late row of the old attempt after it would be in the tail too)."""
     from .evidence import _run_of
 
     found: dict[int, set[Any]] = {}
-    for record in ([first] if first is not None else []) + tail:
+    for record in tail:
         rank = _record_rank(record)
         if rank is None:
             continue
@@ -514,8 +515,8 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     `held` gives each file of its own name (or misnamed) the ranks it is seen to hold, and
     `several` the files among them that hold several; `last_steps` the ranks' last steps
     (`_steps_by_rank`) of each file that holds or may hold several, where the row uses them.
-    `resolved` has, for each file whose first record and last megabyte show a rank in more than
-    one attempt, that rank's last step as `resolve_attempts` keeps it, the file read whole
+    `resolved` has, for each file whose last megabyte shows a rank in more than one attempt, that
+    rank's last step as `resolve_attempts` keeps it, the file read whole
     (`_rank_across_files`, XC4): a late row of a replaced attempt does not move it.
 
     `more` are a rank's other files (`discover_runs`' `more_files`): read as the others are for
@@ -545,7 +546,7 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
         # own is counted from its ends as before: the files never settle its count either way.
         in_tail = {r for r in map(_record_rank, tail) if r is not None} if named is not None else set()
         if number not in split_ranks:  # a rank's several files are read whole anyway (`split`)
-            restarted = [r for r, attempts in _attempts_by_rank(first, tail).items() if len(attempts) > 1]
+            restarted = [r for r, attempts in _attempts_by_rank(tail).items() if len(attempts) > 1]
             if restarted:
                 resolved[path] = {r: _rank_across_files([path], r, run_id)["last_step"] for r in restarted}
         if named is not None and (ends | in_tail) <= {named}:
@@ -623,7 +624,9 @@ def _holds(path: Path, known: Mapping[str, Any]) -> str:
     ranks = _rank_list(known["held"][path])
     if "why" not in known:
         return f"holds {ranks}"
-    by = "its name and its first and last records" if _named_rank(path) is not None else "its first and last records"
+    # A file named for a rank is read for the rank of every record of its last megabyte (XC5).
+    by = ("its name, its first record and its last megabyte" if _named_rank(path) is not None
+          else "its first and last records")
     return f"may hold several ranks ({by} name {ranks})"
 
 

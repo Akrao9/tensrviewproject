@@ -2,8 +2,8 @@
 it fixes.
 
 - XC4: in one rank file, a late row of an attempt that a later one replaced does not move the
-  rank's last step: the listing reads the file whole, as `compare` does, when its first record
-  and its last megabyte show more than one attempt.
+  rank's last step: the listing reads the file whole, as `compare` does, when its last megabyte
+  shows more than one attempt.
 - XC5: a file named for one rank that holds another rank's rows is not counted as that rank
   alone: every whole line of the last megabyte is read for its rank, and a file whose middle
   is not read gives a definite count only when the run manifest's world size settles it.
@@ -108,8 +108,8 @@ def test_xc4_a_late_row_of_a_replaced_attempt_does_not_move_the_last_step(tmp_pa
 
 
 def test_xc4_holds_when_the_file_is_larger_than_the_part_the_listing_reads(tmp_path):
-    # Attempt 900's first record is more than a megabyte before the restart, so only the first
-    # record and the last megabyte name the attempts; the file is then read whole.
+    # Attempt 900's first record is more than a megabyte before the restart; the last megabyte
+    # names both attempts, so the file is read whole.
     path = restarted(tmp_path / f"{RUN}.rank0.jsonl", pad_before=60)
     assert path.stat().st_size > runs_module._TAIL_BYTES
     assert only_row(tmp_path)["last_step"] == 30
@@ -129,6 +129,18 @@ def test_xc4_a_file_of_several_ranks_counts_each_rank_from_its_current_attempt(t
                                     for at, (rank, attempt, step) in enumerate(triples)])
     found = only_row(tmp_path)
     assert found["ranks"] == [0, 1] and found["last_step"] == 30
+
+
+def test_xc4_a_resume_that_fills_the_last_megabyte_is_not_read_again(tmp_path, monkeypatch):
+    # Attempt 1 writes steps 0 to 9; attempt 2 resumes at step 5 and its rows fill the last
+    # megabyte. Its last line stands, so the file is not read whole on every listing.
+    rows = [row(step, attempt=1, ts=2_000.0 + step) for step in range(10)]
+    rows += [row(step, attempt=2, ts=3_000.0 + step, pad=True) for step in range(5, 125)]
+    path = write(tmp_path / f"{RUN}.rank0.jsonl", rows)
+    assert path.stat().st_size > 2 * runs_module._TAIL_BYTES
+    monkeypatch.setattr(runs_module, "_rank_across_files", lambda *a, **k: pytest.fail("the file was read whole"))
+    manifest(tmp_path, world_size=1)
+    assert only_row(tmp_path)["last_step"] == 124
 
 
 def test_xc4_a_file_of_one_attempt_is_still_read_from_its_ends_only(tmp_path, monkeypatch):
