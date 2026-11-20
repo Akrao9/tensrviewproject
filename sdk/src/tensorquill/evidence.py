@@ -4560,10 +4560,10 @@ def _all_ranks_evidence(
         **({"not_checked": not_checked} if not_checked else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
         **({"traincheck": traincheck_summary} if traincheck_summary else {}),
-        **({"watchdog": {k: status[k] for k in (
+        **({"watchdog": {**{k: status[k] for k in (
             "summary", "written_at_ms", "world_size", "pauses", "recommended_silent_seconds",
             "silent_floor_seconds", "critical_seconds",
-        ) if k in status}} if status else {}),
+        ) if k in status}, **_dropped_rows_said(status)}} if status else {}),
     }
     _all_ranks_kind_checks(evidence, looks, status, flight_recorder=flight_recorder is not None,
                            traincheck=traincheck is not None)
@@ -4574,6 +4574,24 @@ def _all_ranks_evidence(
     if not_checked:
         evidence["not_checked"] = not_checked
     return evidence
+
+
+def _dropped_rows_said(status: Mapping[str, Any] | None) -> dict[str, Any]:
+    """`{"dropped_rows": ...}` for the all-ranks view's `watchdog` block, or nothing when no rank
+    dropped a row, so such a run's block is as before (L22). The rows the server dropped because
+    a key of theirs was null (`runs.dropped_rows`, which reads each rank's `dropped_rows` and
+    `dropped_row_keys` in the status): the total, by null key, and the ranks that dropped any,
+    as ranges (the first 8 and a count of the rest), so the block stays small however many ranks
+    there are; the MCP answers give each rank's count. An upper bound: a
+    batch sent again after a lost acknowledgement is counted again."""
+    from .runs import dropped_rows
+
+    found = dropped_rows(status)
+    if found is None:
+        return {}
+    return {"dropped_rows": {"rows": found["rows"], **({"by_key": found["by_key"]} if found.get("by_key") else {}),
+                             "rank_ranges": _rank_ranges((item["rank"] for item in found["ranks"]), 8),
+                             "upper_bound": True, "note": found["note"]}}
 
 
 def _all_ranks_run_state(evidence: Mapping[str, Any], looks: Mapping[int, Mapping[str, Any]],
@@ -4811,6 +4829,10 @@ def watch_all_ranks(
                 # The server's replica result changing is news (contract 7: a verdict is due at the
                 # next look). Absent, the stamp is what it was before the key.
                 stamp = (*stamp, json.dumps(status["replica"], sort_keys=True, default=str))
+            if dropped := _dropped_rows_said(status):
+                # So is a change in the rows the server dropped (L22), which the view's `watchdog`
+                # block carries. None dropped, the stamp is what it was before.
+                stamp = (*stamp, json.dumps(dropped, sort_keys=True))
             folders, looks, keys = _look_at_ranks(source, status, memory, thresholds, report_grace)
             if not looks and status is None:
                 continue

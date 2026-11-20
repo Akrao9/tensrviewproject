@@ -75,6 +75,22 @@ def _store(tmp_path: Path, ranks: list[int], status: dict, reports: dict[int, di
     return run
 
 
+@pytest.fixture(autouse=True)
+def servers_are_stopped():
+    """Every server a test here started is gone when it ends, passed or failed (the servers of
+    `test_watch_all_ranks.Run`, which keeps them in `STARTED`)."""
+    yield
+    started = getattr(sys.modules.get("test_watch_all_ranks"), "STARTED", None)
+    for server in started or ():
+        if server.process.poll() is None:
+            server.process.kill()
+            server.process.wait(20)
+        if not server.process.stdout.closed:
+            server.process.stdout.close()
+    if started is not None:
+        started.clear()
+
+
 def _refuse_parts(monkeypatch) -> None:
     """From here on, opening a part or comparing observations here fails the test."""
     def refuse(*_args, **_kwargs):
@@ -349,3 +365,72 @@ def test_the_store_view_of_a_real_server_carries_the_head_trends(tmp_path):
     assert evidence["judged_ranks"] == [0, 1]
     assert evidence["head_trends_by_rank"] == [{"rank": 0, "head_trends": ev.build_evidence(records[0])["head_trends"]}]
     assert run.server.terminate() == 0
+
+
+# --- 4. L22: the rows the server dropped, in the all-ranks view's `watchdog` block ----------------
+#
+# Fail before: on the base the block had no `dropped_rows` and the watcher did not write again for
+# a change in them (3 tests fail); the control, a run that dropped nothing or whose value is not a
+# count (7 cases), passes there too. The statuses are written by hand in the shape the server writes
+# (`rows_dropped_for_a_null_key_are_counted_in_their_own_runs_status` in `server/tests/ingest_test.rs`):
+# the Python sender cannot send a null key, and a hand-built Flight put was not got to work here.
+
+WATCHDOG_KEYS = ("summary", "written_at_ms", "world_size", "pauses", "recommended_silent_seconds",
+                 "silent_floor_seconds", "critical_seconds")
+
+
+def _dropping(status: dict, drops: dict[int, object]) -> dict:
+    """`status` with rank entries counting dropped rows: `{rank: {key: count}}` sets both keys as
+    the server does, any other value sets `dropped_rows` alone."""
+    for entry in status["ranks"]:
+        keys = drops.get(entry["rank"])
+        if isinstance(keys, dict):
+            entry["dropped_row_keys"], entry["dropped_rows"] = keys, sum(keys.values())
+        elif entry["rank"] in drops:
+            entry["dropped_rows"] = keys
+    return status
+
+
+def test_the_watchdog_block_carries_the_dropped_rows_as_an_upper_bound(tmp_path, no_part_is_opened):
+    from tensorquill.runs import DROPPED_ROWS_NOTE
+
+    status = _dropping(_status([0, 1, 2, 3]), {1: {"step": 2, "run_id": 1}, 2: {"step": 4}, 3: {"step": 1}})
+    evidence = ev.all_ranks_evidence(_store(tmp_path, [0, 1, 2, 3], status))
+    assert evidence["watchdog"]["dropped_rows"] == {
+        "rows": 8, "by_key": {"run_id": 1, "step": 7}, "rank_ranges": "1-3", "upper_bound": True,
+        "note": DROPPED_ROWS_NOTE}
+    assert "upper bound" in evidence["watchdog"]["dropped_rows"]["note"]
+    assert {k: v for k, v in evidence["watchdog"].items() if k != "dropped_rows"} == {
+        k: status[k] for k in WATCHDOG_KEYS if k in status}
+
+
+def test_the_ranks_are_ranges_and_bounded(tmp_path, no_part_is_opened):
+    """However many ranks dropped rows, the block names 8 ranges and counts the rest."""
+    ranks = list(range(40))
+    evidence = ev.all_ranks_evidence(_store(tmp_path, ranks, _dropping(_status(ranks), {r: {"step": 1} for r in ranks[::2]})))
+    said = evidence["watchdog"]["dropped_rows"]
+    assert said["rows"] == 20 and said["rank_ranges"] == "0, 2, 4, 6, 8, 10, 12, 14, and 12 more"
+
+
+@pytest.mark.parametrize("drops", [{}, {0: 0}, {0: -3}, {0: True}, {0: "5"}, {0: 1.5}, {0: None}])
+def test_control_a_run_that_dropped_nothing_reads_as_before(tmp_path, no_part_is_opened, drops):
+    status = _dropping(_status([0, 1]), drops)
+    evidence = ev.all_ranks_evidence(_store(tmp_path, [0, 1], status))
+    assert evidence["watchdog"] == {k: status[k] for k in WATCHDOG_KEYS if k in status}
+
+
+def test_the_watcher_writes_again_when_only_the_dropped_rows_change(tmp_path):
+    """Nothing else in the status changes: the count alone is news, as the block now carries it."""
+    run = _store(tmp_path, [0, 1], _status([0, 1]))
+    written: list[dict] = []
+
+    def update(evidence: dict, _path: Path) -> None:
+        written.append(evidence)
+        if len(written) == 1:
+            status = json.loads((run / "watchdog.json").read_text())
+            (run / "watchdog.json").write_text(json.dumps(_dropping(status, {1: {"step": 3}})))
+
+    ev.watch_all_ranks(run, tmp_path / "all.json", interval=0.0, polls=3, on_update=update)
+    assert len(written) == 2
+    assert "dropped_rows" not in written[0]["watchdog"]
+    assert written[1]["watchdog"]["dropped_rows"]["rows"] == 3
