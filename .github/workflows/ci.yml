@@ -108,7 +108,8 @@ jobs:
   server:
     name: Ingest server and end-to-end streaming
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The whole SDK suite runs here (below): about 15 minutes of server tests and 8 of the rest on the last run, after the cargo steps.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -133,11 +134,19 @@ jobs:
           pip install --no-deps -e .
           pip install 'moto[server]' boto3  # the S3 emulator for test_object_store_e2e.py
       - name: Sender and end-to-end tests
+        # The whole suite, with the binary: a list of files left out every server-dependent test file
+        # added after it (lanes V7, W2 and W3: XC10), and the CPU jobs skip those tests without the
+        # binary. A test skipped here for want of the binary, or of pyarrow to hand it records, fails the job.
         env:
           TENSORQUILL_SERVER_BIN: ${{ github.workspace }}/server/target/debug/tensorquill-server
         run: |
+          set -o pipefail
           test -x "$TENSORQUILL_SERVER_BIN"
-          pytest -ra tests/test_flight.py tests/test_flight_e2e.py tests/test_two_ranks_e2e.py tests/test_server_detectors.py tests/test_server_detect.py tests/test_golden.py tests/test_server_reports.py tests/test_watch_all_ranks.py tests/test_object_store_e2e.py tests/test_data_server.py tests/test_attention.py tests/test_run_state.py tests/test_incident_classes.py tests/test_mcp_server.py tests/test_trigger.py tests/test_kind_checks.py tests/test_reader_thresholds.py tests/test_all_ranks_look.py tests/test_all_ranks_rust.py tests/test_watch_rust.py tests/test_run_detect.py tests/test_thresholds_line.py tests/test_starting_bound.py tests/test_run_manifest.py tests/test_runs_compare.py tests/test_router_guard.py tests/test_auto_detectors.py tests/test_lane_u4_flight_sink.py tests/test_lane_u7_evidence.py
+          pytest -ra 2>&1 | tee "$RUNNER_TEMP/server-pytest.log"
+          if grep -E '^SKIPPED.*(tensorquill-server|TENSORQUILL_SERVER_BIN|server binary|pyarrow)' "$RUNNER_TEMP/server-pytest.log"; then
+            echo "::error::the tests above were skipped for want of the server binary or pyarrow, which this job provides"
+            exit 1
+          fi
 
   package:
     name: Build, twine check, clean-venv smoke

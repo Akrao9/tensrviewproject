@@ -34,9 +34,13 @@ fails.
 
     python examples/seeded_failures.py --case both --out runs/seeded
 
-`--case healthy` trains the same model on the same batches with nothing planted, and passes when
-`build_evidence` lists no incident; `--case all` runs it and then the two seeded cases. It is the
-other half of a pair for `python -m tensorquill compare`: each case is a run of the project
+`--case healthy` trains the same model on the same batches with nothing planted. It passes only when
+the capture holds every step from 0 to the last, closed cleanly (its end marker, and no stopped
+writer), the evidence says `grad_spike` and `stalled_weights` were checked with enough history, and
+`build_evidence` lists no incident: an empty or cut-short capture is a FAIL, not a clean run. It
+needs at least `HEALTHY_MIN_STEPS` (200) steps, the last weight check `stalled_weights` needs; the
+default is as many as the longer seeded case. `--case all` runs it and then the two seeded cases.
+It is the other half of a pair for `python -m tensorquill compare`: each case is a run of the project
 `seeded-failures`, named after its case, with what was planted in its `config`. Every case writes
 `<case>.jsonl` and its evidence (`<case>.evidence.json`) into the `--out` folder itself, so one
 listing shows them all:
@@ -71,6 +75,7 @@ import tensorquill
 from tensorquill.capture import WEIGHT_EVERY
 from tensorquill.evidence import default_evidence_path, write_evidence
 from tensorquill.evidence import SPIKE_FACTOR, SPIKE_MIN_HISTORY, SPIKE_SUSTAIN, SPIKE_WINDOW, STALL_STEPS, UPDATE_WINDOW
+from tensorquill.sink import read_end_marker
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dense_outlier_check import FLUSH_EVERY, MODEL, build_models, load_batches, train_step  # noqa: E402
@@ -82,6 +87,10 @@ HEALTHY = "healthy"  # nothing planted: the run the seeded ones are compared wit
 PROJECT = "seeded-failures"
 DEFAULT_PARAMETER = "self_attn.k_proj.weight"  # suffix; the block is the middle one unless --layer says
 DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
+# The healthy run is a control for the seeded kinds only if their detectors looked. `stalled_weights`
+# needs STALL_STEPS weight checks that each compare with the one before; the first check has nothing
+# to compare with, so the last one it needs falls on step (STALL_STEPS + 1) * WEIGHT_EVERY - 1.
+HEALTHY_MIN_STEPS = max((STALL_STEPS + 1) * WEIGHT_EVERY, SPIKE_MIN_HISTORY + 1)
 
 
 # ---- the two faults ---------------------------------------------------------------------
@@ -200,6 +209,7 @@ def gradient_facts(records: list[dict[str, Any]], seeded: str, seed_step: int) -
     if not before or seed_step not in by_step:
         return facts
     shares = [r["grad_norms"][seeded] / r[key] for r in before if r[key] > 0 and seeded in r.get("grad_norms", {})]
+    facts["before"] = len(before)
     facts["baseline"] = statistics.median(r[key] for r in before)
     facts["share"] = statistics.median(shares) if shares else None
     facts["at_seed"] = by_step[seed_step][key]
@@ -215,7 +225,15 @@ def judge_grad_spike(
     and its listed parameters include `seeded` (its rank among them is printed)."""
     facts = gradient_facts(records, seeded, seed_step)
     notes = []
-    if "share" in facts and facts["share"] is not None:
+    if facts.get("ratio_at_seed") is None and "baseline" in facts:
+        # A median of 0 (XC8): no ratio to the median exists, so none is printed; the incident decides.
+        notes.append(
+            f"the total gradient norm's median over the {facts['before']} recorded steps before the seed is 0, so its "
+            f"ratio at step {seed_step} ({facts['at_seed']:.4g}) is undefined"
+            + (f"; {seeded} is {100 * facts['share']:.2f}% of the total on the steps where the total is not 0"
+               if facts["share"] is not None else "")
+        )
+    elif "share" in facts and facts["share"] is not None:
         # Multiplying one gradient by `factor` takes the total from G to sqrt(G^2 + (factor^2 - 1) g^2).
         predicted = math.sqrt(1 + (factor * factor - 1) * facts["share"] ** 2)
         notes.append(
@@ -242,10 +260,12 @@ def judge_grad_spike(
     if seeded not in names:
         return Verdict("grad_spike", False, f"grad_spike at {where} does not list {seeded}", notes)
     rank = names.index(seeded) + 1
+    own = incident["parameters"][rank - 1].get("ratio")
+    own = f"{own:.1f}" if isinstance(own, (int, float)) else "unknown"
     return Verdict(
         "grad_spike", True,
         f"grad_spike at {where}, lists {seeded} (rank {rank} of {len(names)} listed, ratio "
-        f"{incident['parameters'][rank - 1]['ratio']:.1f} on its own median; gradient x{factor:g})", notes,
+        f"{own} on its own median; gradient x{factor:g})", notes,
     )
 
 
@@ -275,6 +295,66 @@ def judge_update_spike(evidence: dict[str, Any], seeded: str, seed_step: int, fa
         f"update_spike at {where}, names {seeded} first (its update went {top['previous']:.3g} to {top['update_rms']:.3g}; gradient x{factor:g})",
         notes,
     )
+
+
+def judge_healthy(
+    evidence: dict[str, Any], records: list[dict[str, Any]], steps: int, run_end: dict[str, Any] | None,
+    capture_error: BaseException | None = None,
+) -> Verdict:
+    """PASS only when nothing was planted and nothing was found in a capture that is all there.
+
+    An empty incident list says nothing about a run that recorded nothing (XC1), so all of these
+    must hold, and every one that fails is said:
+    - the capture did not stop (`capture_error`, the session's `writer_error`) and closed cleanly
+      (`run_end`, `sink.read_end_marker` of the records file: `closed`, outcome `closed`);
+    - the records hold exactly the steps 0 to `steps - 1`, none missing and none beyond;
+    - the evidence's `kind_checks` say each seeded kind (`CASES`) was `checked` with enough history;
+    - and the evidence lists no incident.
+    """
+    problems: list[str] = []
+    notes: list[str] = []
+    if capture_error is not None:
+        problems.append(f"the capture stopped: {type(capture_error).__name__}: {capture_error}")
+    end = run_end or {}
+    if end.get("state") != "closed" or end.get("outcome") != "closed":
+        said = end.get("state", "no end marker read")
+        if end.get("outcome") and end.get("outcome") != "closed":
+            said += f", outcome {end['outcome']}" + (f" ({end['exception']})" if end.get("exception") else "")
+        problems.append(f"the capture is not known to have closed cleanly ({said})")
+    seen = {r["step"] for r in records if isinstance(r.get("step"), int) and not isinstance(r.get("step"), bool)}
+    expected = set(range(steps))
+    if not records:
+        problems.append(f"the capture has no rows (expected steps 0 to {steps - 1})")
+    else:
+        missing = sorted(expected - seen)
+        beyond = sorted(seen - expected)
+        if missing:
+            problems.append(f"{len(missing)} of the {steps} expected steps are missing, from step {missing[0]}"
+                            + (f" (the last recorded is {max(seen)})" if seen else ""))
+        if beyond:
+            problems.append(f"{len(beyond)} recorded step(s) outside 0 to {steps - 1}, first {beyond[0]}")
+    checks = evidence.get("kind_checks", {})
+    looked = []
+    for kind in CASES:
+        check = checks.get(kind)
+        if not isinstance(check, dict) or check.get("value") != "checked" or check.get("enough_history") is False:
+            if isinstance(check, dict):
+                said = f"{check.get('value')}, {check.get('records')} of {check.get('records_needed')} records"
+                said += f": {check['reason']}" if check.get("reason") else ""
+            else:
+                said = "no kind check in the evidence"
+            problems.append(f"{kind} was not checked ({said})")
+        else:
+            looked.append(f"{kind} ({check.get('records')} records)")
+    kinds = sorted({incident["kind"] for incident in evidence.get("incidents", [])})
+    if kinds:
+        problems.append(f"nothing was planted and the evidence lists {', '.join(kinds)}")
+    notes.append(f"{len(records)} row(s), steps {min(seen) if seen else None} to {max(seen) if seen else None}; "
+                 f"end marker: {end.get('state', 'not read')}")
+    if problems:
+        return Verdict(HEALTHY, False, "; ".join(problems), notes)
+    return Verdict(HEALTHY, True, f"no incident in steps 0 to {steps - 1}, with nothing planted; checked: "
+                   f"{', '.join(looked)}; the capture closed", notes)
 
 
 def unchanged_streak_start(records: list[dict[str, Any]], seeded: str, consecutive: int = STALL_STEPS) -> int | None:
@@ -415,6 +495,7 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
     else:
         planted.update(freeze_step=args.freeze_step)
         print(f"Seeding {name} ({dtype}): learning rate 0 from step {args.freeze_step}, {steps} steps", flush=True)
+    session = None
     try:
         with tensorquill.init(
             model, run_id=f"seeded-{case}", capture="full", every=FLUSH_EVERY, weights=WEIGHT_EVERY,
@@ -441,9 +522,8 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
     elif case == UPDATE:
         verdict = judge_update_spike(evidence, name, args.seed_step, factor)
     elif case == HEALTHY:
-        kinds = sorted({incident["kind"] for incident in evidence["incidents"]})
-        verdict = Verdict(case, not kinds, "no incident, with nothing planted" if not kinds else
-                          f"nothing was planted and the evidence lists {', '.join(kinds)}")
+        verdict = judge_healthy(evidence, records, steps, read_end_marker(jsonl),
+                                getattr(session, "writer_error", None))
     else:
         verdict = judge_stalled_weights(evidence, records, name, args.freeze_step)
     print()
@@ -491,6 +571,9 @@ def main(argv: list[str] | None = None) -> None:
     cases = {"both": CASES, "all": (HEALTHY, *CASES)}.get(args.case, (args.case,))
     for case in cases:
         if case == HEALTHY:
+            if args.steps and args.steps < HEALTHY_MIN_STEPS:
+                parser.error(f"--steps {args.steps} ends before the healthy run's checks can be made: stalled_weights "
+                             f"needs at least {HEALTHY_MIN_STEPS} steps")
             continue
         # A spike in one parameter is known once it has lasted SPIKE_SUSTAIN recorded steps.
         if case == UPDATE:

@@ -192,7 +192,8 @@ def test_cli19_runs_lists_a_case_in_the_folder_given_as_out(tmp_path):
     out = tmp_path / "out"
     buffer = io.StringIO()
     with contextlib.redirect_stdout(buffer):
-        sf.main(["--toy", "--out", str(out), "--case", "healthy", "--steps", "60"])
+        # The healthy verdict needs its checks made (lane Y5, XC1), so the shortest run that can pass.
+        sf.main(["--toy", "--out", str(out), "--case", "healthy", "--steps", str(sf.HEALTHY_MIN_STEPS)])
     rows = tensorquill.list_runs(out)
     assert [row["run_id"] for row in rows] == ["seeded-healthy"]
     assert rows[0]["project"] == sf.PROJECT and rows[0]["evidence"]["state"] != "missing", rows[0]
