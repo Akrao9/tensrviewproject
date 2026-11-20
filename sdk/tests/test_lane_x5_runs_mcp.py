@@ -284,6 +284,25 @@ def test_cli14_a_name_that_is_also_a_layer_stays_the_layer_unless_kind_says_othe
     assert series(capture, name=ATTN, kind="attention")["kind"] == "attention"
 
 
+def test_cli14_a_run_folder_in_a_store_serves_the_probe_series_of_each_rank(tmp_path):
+    pq = pytest.importorskip("pyarrow.parquet")
+    import pyarrow as pa
+
+    from tensorquill.flight import records_to_batch
+
+    run = tmp_path / "runs" / RUN
+    for rank, scale in ((0, 1.0), (1, 3.0)):
+        group = probed(1, range(0, 20), 1000.0, rank=rank, scale=scale)
+        for record in group:  # a part's JSON columns are strict JSON: no NaN or Inf
+            for stats in (record.get("probe") or {}).get("attention", {}).values():
+                stats["entropy_share"], stats["max_logit"][2] = [0.2, 0.4, 0.6], 1.0
+        folder = run / f"rank={rank}" / "attempt=1"
+        folder.mkdir(parents=True)
+        pq.write_table(pa.Table.from_batches([records_to_batch(group)]), folder / "part-00000000-00000019.parquet")
+    assert series(run, name=HEAD, rank=1, stat="norm")["values"]["norm"] == [30.0, 45.0, 60.0]  # 15 was not read
+    assert series(run / "rank=0", name=ATTN, stat="max_logit")["values"]["max_logit"] == [2.0, 5.0, 10.0, 15.0]
+
+
 def test_cli14_an_attention_incident_points_at_the_attention_series():
     from tensorquill import mcp_server
 
