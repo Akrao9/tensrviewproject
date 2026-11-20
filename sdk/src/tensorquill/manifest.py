@@ -46,6 +46,26 @@ MANIFEST_SEND_BYTES = 60_000
 _RANK_FILE = re.compile(r"^(?P<run_id>.+)\.rank\d+\.jsonl$")
 
 
+def _say(message: str, stacklevel: int = 2) -> None:
+    """`warnings.warn(message, RuntimeWarning)`, which never raises (lane Y6, XC3). Under
+    `python -W error` (or a filter that makes a RuntimeWarning an error) the message is logged
+    on the `tensorquill` logger instead (stderr, through logging's last-resort handler, when no
+    handler is set): a project name that had to be made to fit, a manifest that could not be
+    written or one too large for a stream is said, and the run goes on. A filter that ignores
+    the warning still silences it. `stacklevel` counts from the caller, as `warnings.warn`'s
+    does. The same as `tracker._say` and `capture._warn`, kept here since this module imports
+    nothing else of the package; `flight.py` uses it too."""
+    try:
+        warnings.warn(message, RuntimeWarning, stacklevel=stacklevel + 1)
+    except Exception:  # noqa: BLE001  nothing here may stop a run
+        try:
+            import logging
+
+            logging.getLogger("tensorquill").warning("%s", message)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def project_problem(project: str) -> str | None:
     """Why `project` is not a project name by W&B's rule, or None when it is one."""
     if not project:
@@ -90,10 +110,9 @@ def resolve_project(argument: str | None, tracker: str | None = None) -> str:
         if problem is None:
             return found
         fitted = conform_project(found)
-        warnings.warn(
+        _say(
             f"{where} is {found!r}, which cannot be a TensorQuill project name ({problem}); "
             f"the run is filed under {fitted!r}. Pass project= to choose the name.",
-            RuntimeWarning,
             stacklevel=4,
         )
         return fitted
@@ -239,11 +258,12 @@ def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> bool:
         os.replace(scratch, path)
         return True
     except Exception as error:  # noqa: BLE001  nothing here may stop a run
-        warnings.warn(
+        # Four frames up is the caller of `tensorquill.init` (this function, `init`, the
+        # `torch.compiler.disable` wrapper around it, the caller); three named the wrapper.
+        _say(
             f"tensorquill could not write the run manifest {path} ({error}); the run goes on, and is listed "
             f"under {DEFAULT_PROJECT!r} with its run ID as its name.",
-            RuntimeWarning,
-            stacklevel=3,
+            stacklevel=4,
         )
         return False
 

@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from .manifest import METADATA_KEY as MANIFEST_KEY, manifest_to_send
+from .manifest import METADATA_KEY as MANIFEST_KEY, _say, manifest_to_send
 
 SCHEMA_VERSION = 1
 BATCH_STEPS = 50
@@ -510,10 +510,8 @@ class FlightSender:
         # A copy too large for a batch's metadata goes without its config, or not at all.
         self.manifest, left_out = manifest_to_send(manifest)
         if left_out:
-            import warnings
-
-            warnings.warn(f"tensorquill: {left_out}. The local file has all of it; the run streams as usual.",
-                          RuntimeWarning, stacklevel=4)
+            # Said, never raised (lane Y6, XC3): under `python -W error` it is logged instead.
+            _say(f"tensorquill: {left_out}. The local file has all of it; the run streams as usual.", stacklevel=4)
         self.last_error: BaseException | None = None
         self.skipped_lines = 0
         self._location = _location(endpoint)

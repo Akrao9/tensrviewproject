@@ -75,10 +75,12 @@ _WORD_BREAKS = re.compile(r"[^a-z0-9]+")
 #: Record keys that identify a record and are not series.
 _IDENTITY_KEYS = ("schema_version", "run_id", "rank", "attempt", "step")
 #: Record keys that are notes, written once on the first record after the capture knew: why a
-#: series is not in the records (a refused router, an optimizer whose update size is not read).
-#: They are not data, so they are neither compared nor listed as not compared; the evidence
-#: turns each into a `not_checked` entry, which `compare`'s part 2 shows.
-_NOTE_KEYS = ("moe_refused", "update_not_read")
+#: series is not in the records (a refused router, an optimizer whose update size is not read,
+#: a parameter whose gradient could not be read: `grads_not_read`, lane Y6, XC9). They are not
+#: data, so they are neither compared nor listed as not compared. The evidence turns
+#: `moe_refused` and `update_not_read` into `not_checked` entries, which `compare`'s part 2
+#: shows; it has none for `grads_not_read` yet.
+_NOTE_KEYS = ("moe_refused", "update_not_read", "grads_not_read")
 
 # Ties at the first step go to the series nearest the start of the step's own work: a block's
 # output changes before the loss computed from it and the gradients computed from that, and the
