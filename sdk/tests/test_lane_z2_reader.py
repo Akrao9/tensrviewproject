@@ -6,9 +6,13 @@ engines must give. `evidence.compare_replicas` is the Python engine. It is writt
 contract and does not use the reference reading in `test_replica_contract.py`, which this file
 does not import: three readings (the reference, this one, the server's) that agree on every case.
 
-Fail before (on `main` at 633c9da, run with the main checkout's `tensorquill`): every test here
-fails there, the case tests with `ImportError` on `compare_replicas`, which did not exist; the
-notes on the wiring tests say what each read on `main` where the import alone is not the point.
+Fail before: this file run on an export of `633c9da` (the branch's base) gives 140 failed, 3
+errors, 4 passed, 1 skipped. The case tests fail on `compare_replicas`, which did not exist; the
+notes on the wiring tests say what each read there where that is not the point. The four that
+pass are controls: `test_there_are_39_cases`, `test_old_records_keep_todays_verdict_in_the_evidence`,
+`test_records_without_observations_leave_the_evidence_as_it_was` and
+`test_l21_a_file_of_one_rank_and_a_store_get_no_new_key`. The skip is the Rust-path test of L23,
+which needs a server binary.
 """
 
 from __future__ import annotations
