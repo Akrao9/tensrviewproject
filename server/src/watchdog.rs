@@ -263,8 +263,9 @@ pub struct Pauses {
     pub max: f64,
     pub last: f64,
     /// When the last one ended, so the run's `last_seconds` is the pause that ended last of any
-    /// rank (RUST-13). Not in the status: a rank taken up after a restart has none, and its
-    /// pauses count as older than any this server saw end.
+    /// rank (RUST-13). Carried in the status's `restart` as an age (`ended_seconds`), so the order
+    /// survives a restart; a rank restored from a status written before that (Nov 19, 2026) has
+    /// none, and its pauses count as older than any this server saw end.
     pub ended: Option<Instant>,
 }
 
@@ -627,6 +628,10 @@ impl Progress {
                 "total_seconds": round3(stats.total),
                 "max_seconds": round3(stats.max),
                 "last_seconds": round3(stats.last),
+                // How long ago the last one ended, so the order in which the ranks' pauses ended
+                // survives a restart (RUST-13). Null when none has ended on this server or the one
+                // it took the rank up from.
+                "ended_seconds": stats.ended.map(before),
             }))).collect::<serde_json::Map<String, Value>>(),
         })
     }
@@ -679,7 +684,9 @@ impl Progress {
                     total: seconds(&stats["total_seconds"])?,
                     max: seconds(&stats["max_seconds"])?,
                     last: seconds(&stats["last_seconds"])?,
-                    ended: None,
+                    // Absent or null from a status written before it was carried: the pause ended
+                    // before any this server sees end, as it did then.
+                    ended: seconds(&stats["ended_seconds"]).map(|age| ago(now, age)),
                 },
             );
         }
@@ -3727,6 +3734,55 @@ mod tests {
                 (&json!(2), &json!(60.0), &json!(20.0)),
                 "rank {newer}'s pause ended last"
             );
+        }
+    }
+
+    /// RUST-13's open part. The order in which the ranks' pauses ended survives a restart: the run's
+    /// `last_seconds` is still the pause that ended last of any rank, whichever rank it was. Until
+    /// Nov 19, 2026 the restart carried no end, every restored pause counted as ended at once, and
+    /// the highest rank's won (60 s here where the newest was 20 s). A status written before the end
+    /// was carried still restores, as before; a pause that ends after the restart is the newest.
+    #[test]
+    fn the_merged_pauses_last_is_the_one_that_ended_last_after_a_restart() {
+        for (earlier, newer) in [(1, 0), (0, 1)] {
+            let t0 = Instant::now();
+            let dog = Watchdog::new(config(60));
+            for rank in [0, 1] {
+                dog.stream_opened(&key(rank), t0);
+                dog.heartbeat(&key(rank), "train", 15.0, None, None, t0);
+            }
+            dog.heartbeat(&key(earlier), "eval", 15.0, None, None, at(t0, 10));
+            dog.heartbeat(&key(earlier), "train", 15.0, None, None, at(t0, 70)); // 60 s, ended at 70 s
+            dog.heartbeat(&key(newer), "eval", 15.0, None, None, at(t0, 100));
+            dog.heartbeat(&key(newer), "train", 15.0, None, None, at(t0, 120)); // 20 s, ended at 120 s
+            let before = as_file(&dog.statuses(at(t0, 130), true)["run"]);
+            let now = Instant::now();
+            let fresh = restarted(&before, 60, now);
+            let eval = &fresh.statuses(now, true)["run"]["pauses"]["eval"];
+            assert_eq!(
+                (&eval["count"], &eval["max_seconds"], &eval["last_seconds"]),
+                (&json!(2), &json!(60.0), &json!(20.0)),
+                "rank {newer}'s pause ended last, before the restart"
+            );
+            // A pause that ends after the restart is newer than both.
+            fresh.stream_opened(&key(earlier), now);
+            fresh.heartbeat(&key(earlier), "eval", 15.0, None, None, at(now, 1));
+            fresh.heartbeat(&key(earlier), "train", 15.0, None, None, at(now, 6));
+            let eval = &fresh.statuses(at(now, 7), true)["run"]["pauses"]["eval"];
+            assert_eq!(
+                eval["last_seconds"],
+                json!(5.0),
+                "the pause after the restart ended last"
+            );
+            // A status written before the end was carried restores as before.
+            let mut older = before.clone();
+            for carry in older["restart"].as_array_mut().unwrap() {
+                for stats in carry["pauses"].as_object_mut().unwrap().values_mut() {
+                    stats.as_object_mut().unwrap().remove("ended_seconds");
+                }
+            }
+            let fresh = restarted(&older, 60, now);
+            assert_eq!(fresh.statuses(now, true)["run"]["pauses"]["eval"]["count"], json!(2));
         }
     }
 
