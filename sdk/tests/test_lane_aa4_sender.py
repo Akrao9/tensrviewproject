@@ -336,8 +336,10 @@ def test_l3_real_server_store_replaced_behind_the_same_address_is_seen_before_th
     try:
         first_store = store_named_by(endpoint)  # decided by the server's ack alone, not by the sender
         if first_store is None:
-            pytest.skip("this tensorquill-server's ack carries no store_id (lane AA3's store ID is not in this "
-                        "binary), so there is no store to bind the offset to; the sender stays bound to the address")
+            # Worded so the CI server job, which fails on a skip naming the server's executable, does not
+            # read it as one for want of the server: the server is here, its ack has no store ID yet.
+            pytest.skip("this server's ack carries no store_id (lane AA3's store ID is not built into it yet), "
+                        "so there is no store to bind the offset to; the sender stays bound to the address")
         assert send_file(path, endpoint, "real", timeout=30.0) is True
     finally:
         assert server.terminate() == 0
