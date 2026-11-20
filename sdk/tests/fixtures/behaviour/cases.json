@@ -1,0 +1,1184 @@
+{
+ "contract": "STEP_AND_EVIDENCE_CONTRACT.md",
+ "cases": {
+  "a_spike_on_a_skipped_step": {
+   "section": 1,
+   "status": "pin",
+   "says": "The total gradient norm is fifty times its usual size on a step whose update was skipped. Not judged.",
+   "detector": "detect_grad_spikes",
+   "records": [
+    {
+     "step": 0,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 2,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 3,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 5,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 6,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 8,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 9,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 11,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 12,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 14,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 15,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 16,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 17,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 18,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 19,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 20,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 21,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 22,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 23,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 24,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 25,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 26,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 27,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 28,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 29,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 30,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 31,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 32,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 33,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 34,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 35,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 36,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 37,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 38,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 39,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 40,
+     "grad_norm": 50.0,
+     "step_skipped": true
+    },
+    {
+     "step": 41,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 42,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 43,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 44,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 45,
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": false
+   }
+  },
+  "a_spike_on_an_applied_step": {
+   "section": 1,
+   "status": "pin",
+   "says": "The same norm on a step that says its update was applied. Judged.",
+   "detector": "detect_grad_spikes",
+   "records": [
+    {
+     "step": 0,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 2,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 3,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 5,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 6,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 8,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 9,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 11,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 12,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 14,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 15,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 16,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 17,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 18,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 19,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 20,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 21,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 22,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 23,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 24,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 25,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 26,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 27,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 28,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 29,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 30,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 31,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 32,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 33,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 34,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 35,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 36,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 37,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 38,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 39,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 40,
+     "grad_norm": 50.0,
+     "step_skipped": false
+    },
+    {
+     "step": 41,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 42,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 43,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 44,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 45,
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "kind": "grad_spike",
+    "step": 40
+   }
+  },
+  "a_spike_with_nothing_said": {
+   "section": 1,
+   "status": "pin",
+   "says": "The same norm on a step that says nothing of skipping, as every step did before the argument. Judged.",
+   "detector": "detect_grad_spikes",
+   "records": [
+    {
+     "step": 0,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 2,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 3,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 5,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 6,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 8,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 9,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 11,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 12,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 14,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 15,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 16,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 17,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 18,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 19,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 20,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 21,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 22,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 23,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 24,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 25,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 26,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 27,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 28,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 29,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 30,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 31,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 32,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 33,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 34,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 35,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 36,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 37,
+     "grad_norm": 1.01
+    },
+    {
+     "step": 38,
+     "grad_norm": 1.02
+    },
+    {
+     "step": 39,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 40,
+     "grad_norm": 50.0
+    },
+    {
+     "step": 41,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 42,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 43,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 44,
+     "grad_norm": 1.0
+    },
+    {
+     "step": 45,
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "kind": "grad_spike",
+    "step": 40
+   }
+  },
+  "a_gradient_not_finite_on_a_skipped_step": {
+   "section": 1,
+   "status": "pin",
+   "says": "A gradient norm that is not finite on a skipped step is what the skip is for. Nothing is raised for it.",
+   "detector": "detect_non_finite",
+   "records": [
+    {
+     "step": 3,
+     "grad_norm": "nan",
+     "step_skipped": true
+    }
+   ],
+   "expected": {
+    "fires": false
+   }
+  },
+  "an_activation_not_finite_on_a_skipped_step": {
+   "section": 1,
+   "status": "pin",
+   "says": "A layer statistic that is not finite is raised on a skipped step too: activations are still read.",
+   "detector": "detect_non_finite",
+   "records": [
+    {
+     "step": 3,
+     "grad_norm": "nan",
+     "step_skipped": true,
+     "layers": {
+      "blk": {
+       "mean": "nan",
+       "std": 1.0,
+       "abs_max": 1.0
+      }
+     }
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "kind": "non_finite",
+    "step": 3
+   }
+  },
+  "ten_skips_in_a_row_with_no_loss_scale": {
+   "section": 1,
+   "status": "pin",
+   "says": "A caller reports ten skipped updates in a row and records no loss scale. The streak is raised.",
+   "detector": "detect_loss_scale_trouble",
+   "records": [
+    {
+     "step": 0,
+     "step_skipped": false
+    },
+    {
+     "step": 1,
+     "step_skipped": false
+    },
+    {
+     "step": 2,
+     "step_skipped": false
+    },
+    {
+     "step": 3,
+     "step_skipped": false
+    },
+    {
+     "step": 4,
+     "step_skipped": false
+    },
+    {
+     "step": 5,
+     "step_skipped": true
+    },
+    {
+     "step": 6,
+     "step_skipped": true
+    },
+    {
+     "step": 7,
+     "step_skipped": true
+    },
+    {
+     "step": 8,
+     "step_skipped": true
+    },
+    {
+     "step": 9,
+     "step_skipped": true
+    },
+    {
+     "step": 10,
+     "step_skipped": true
+    },
+    {
+     "step": 11,
+     "step_skipped": true
+    },
+    {
+     "step": 12,
+     "step_skipped": true
+    },
+    {
+     "step": 13,
+     "step_skipped": true
+    },
+    {
+     "step": 14,
+     "step_skipped": true
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "kind": "loss_scale_trouble",
+    "step": 14,
+    "reason": "skips",
+    "consecutive_skips": 10
+   }
+  },
+  "weights_unchanged_across_skipped_steps": {
+   "section": 1,
+   "status": "new",
+   "says": "A parameter's norm is unchanged across three steps, and all three were skipped updates. That is not a stall: the weights were not meant to move.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_absent": [
+     "stalled_weights"
+    ]
+   }
+  },
+  "a_nan_layer_beside_an_unread_gradient": {
+   "section": 2,
+   "status": "new",
+   "says": "One parameter's gradient could not be read, and an unrelated layer's statistic is not finite. The finding stands, and the kind reads checked.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "grads_not_read": {
+       "emb.weight": "a sparse gradient"
+      },
+      "grad_norm": 1.0
+     },
+     {
+      "step": 1,
+      "grad_norm": 1.0,
+      "layers": {
+       "blk": {
+        "mean": "nan",
+        "std": 1.0,
+        "abs_max": 1.0
+       }
+      }
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_present": [
+     "non_finite"
+    ],
+    "kind_values": {
+     "non_finite": "checked"
+    },
+    "not_checked": [
+     {
+      "check": "gradients",
+      "parameters": [
+       "emb.weight"
+      ]
+     }
+    ],
+    "run_state": "unhealthy"
+   }
+  },
+  "a_spike_beside_an_unread_gradient": {
+   "section": 2,
+   "status": "new",
+   "says": "One parameter's gradient could not be read, so the total norm leaves it out. The kind is unavailable. A spike in the total as read is still raised.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "grads_not_read": {
+       "emb.weight": "a sparse gradient"
+      },
+      "grad_norm": 1.0
+     },
+     {
+      "step": 1,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 2,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 3,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 4,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 5,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 6,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 7,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 8,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 9,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 10,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 11,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 12,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 13,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 14,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 15,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 16,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 17,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 18,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 19,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 20,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 21,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 22,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 23,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 24,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 25,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 26,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 27,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 28,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 29,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 30,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 31,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 32,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 33,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 34,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 35,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 36,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 37,
+      "grad_norm": 1.01
+     },
+     {
+      "step": 38,
+      "grad_norm": 1.02
+     },
+     {
+      "step": 39,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 40,
+      "grad_norm": 50.0
+     },
+     {
+      "step": 41,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 42,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 43,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 44,
+      "grad_norm": 1.0
+     },
+     {
+      "step": 45,
+      "grad_norm": 1.0
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_present": [
+     "grad_spike"
+    ],
+    "kind_values": {
+     "grad_spike": "unavailable"
+    },
+    "not_checked": [
+     {
+      "check": "gradients",
+      "parameters": [
+       "emb.weight"
+      ]
+     }
+    ]
+   }
+  },
+  "a_stall_beside_an_unread_gradient": {
+   "section": 2,
+   "status": "new",
+   "says": "One parameter's gradient could not be read and another parameter stops changing. The stall is raised for the one that was read; the unread one is named and not judged.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "grads_not_read": {
+       "emb.weight": "a sparse gradient"
+      },
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_present": [
+     "stalled_weights"
+    ],
+    "kind_values": {
+     "stalled_weights": "checked"
+    },
+    "not_checked": [
+     {
+      "check": "gradients",
+      "parameters": [
+       "emb.weight"
+      ]
+     }
+    ]
+   }
+  },
+  "one_rank_with_batch_hashes": {
+   "section": 2,
+   "status": "new",
+   "says": "One rank sent batch hashes and no other rank did. It was compared with nothing.",
+   "given": {
+    "ranks_with_batch_hashes": [
+     0
+    ]
+   },
+   "expected": {
+    "status": {
+     "ranks_compared": []
+    },
+    "kind_values": {
+     "duplicate_batches": "not_configured"
+    },
+    "words": "one rank observed, zero peers compared"
+   }
+  },
+  "silent_after_capture_stopped": {
+   "section": 3,
+   "status": "new",
+   "says": "Rank 1's capture stopped at step 120 with a writer error, training went on, and later its heartbeats ceased. The silence is still raised, and the incident says when and why capture had stopped.",
+   "given": {
+    "rank": 1,
+    "capture_stopped": {
+     "step": 120,
+     "reason": "the writer failed: disk full"
+    },
+    "then": "heartbeats cease"
+   },
+   "expected": {
+    "incident_kinds_present": [
+     "rank_silent"
+    ],
+    "incident_carries": {
+     "capture_stopped": {
+      "step": 120,
+      "reason": "the writer failed: disk full"
+     }
+    },
+    "words": "cannot tell from this rank whether training itself stalled"
+   }
+  },
+  "silent_with_capture_running": {
+   "section": 3,
+   "status": "new",
+   "says": "Rank 1's heartbeats cease while its capture was running. The incident is as today and has no such key.",
+   "given": {
+    "rank": 1,
+    "capture_stopped": null,
+    "then": "heartbeats cease"
+   },
+   "expected": {
+    "incident_kinds_present": [
+     "rank_silent"
+    ],
+    "incident_lacks": [
+     "capture_stopped"
+    ]
+   }
+  },
+  "a_checkpoint_with_no_identified_model_state": {
+   "section": 4,
+   "status": "new",
+   "says": "A resume from a checkpoint in which no entry is identified as the model's state. The reader does not know it is absent, only that the rule found none.",
+   "given": {
+    "checkpoint_components": {
+     "optimizer": "present",
+     "model": "none identified"
+    }
+   },
+   "expected": {
+    "incident_kinds_present": [
+     "resume_incomplete"
+    ],
+    "findings": [
+     {
+      "component": "model",
+      "finding": "not_identified"
+     }
+    ],
+    "words": "model state could not be identified",
+    "words_absent": "model not in the checkpoint"
+   }
+  },
+  "a_checkpoint_with_no_optimizer_state": {
+   "section": 4,
+   "status": "new",
+   "says": "A resume from a checkpoint with no optimizer state. The other components keep the finding they have today.",
+   "given": {
+    "checkpoint_components": {
+     "optimizer": "absent",
+     "model": "present"
+    }
+   },
+   "expected": {
+    "incident_kinds_present": [
+     "resume_incomplete"
+    ],
+    "findings": [
+     {
+      "component": "optimizer",
+      "finding": "missing"
+     }
+    ]
+   }
+  }
+ }
+}
