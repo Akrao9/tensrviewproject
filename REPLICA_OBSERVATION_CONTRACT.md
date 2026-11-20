@@ -4,7 +4,7 @@ Step 0 of the SDK-22 wave (Nov 20, 2026), revised the same day after the author'
 
 This page is what the writer, the Python reader, the server and the driver build against. The cases in `sdk/tests/fixtures/replica/` are its examples, and `sdk/tests/test_replica_contract.py` holds a small reference reading of the rules that every case is checked with. Where this page and a case disagree, that is a fault in one of them, to be fixed before a lane builds on either.
 
-Nothing here is built yet. The four lanes that build against this page (writer, Python reader, server, driver) do not start until the author releases them.
+The author released the four lanes that build against this page on Nov 20, 2026 ("Release lanes 1–4"): Z1 the writer, Z2 the Python reader, Z3 the server, Z4 the driver. Until they merge, nothing reads or writes the keys below.
 
 ## 1. What a rank writes
 
@@ -163,6 +163,10 @@ The proof for this uses a rank that is alive and training while its telemetry is
 - **Writer** (`capture.py`, `distributed.py`, and `tracker.py`, where the store exchange lives): sections 1 and 2; no collective in a step by default; the scope key on an explicit gather. It defines `fold64-v1` on this page to the precision `name-v1` has, with a test vector, before it merges. It times the signature and the device synchronisation it needs, and reports the record's size: with a parameter's name, shape and dtype written at every scheduled step, an observation of a few hundred parameters is tens of kilobytes (one recorded capture names 290).
 - **Python reader** (`evidence.py`) and **server** (`detect.rs`, `ingest.rs`, `detect/data.rs`): sections 2 to 7; both pass every case in the fixtures with the same result.
 - **Driver** (`replica_check.py`): section 7's two proofs, on two and three ranks; its end-to-end results are taken on the trial merge, where the real writer and readers are together.
+
+**Where the server's result is carried.** The server writes the result of sections 2 to 6 for a run as one object under the key `replica` at the top level of that run's `watchdog.json`, beside `ranks_compared`: `{"v": 1, "tolerance": <number>, "steps": [...], "replica_drift": [...]}`, with `legacy` when there is one, each list spelled as the fixtures spell it. The Python all-ranks reader, which opens no part and runs no detector, takes the result from there; a reader of local rank files computes the same object from the records. The driver's clock (section 7) stops at the first `watchdog.json` whose `replica` object holds the step's verdict. How many steps the object lists, and what the server holds for steps that stay `insufficient`, is the server lane's to bound and to say.
+
+**Who edits what.** Only the writer lane edits this page, and only to define `fold64-v1`. No lane edits the fixtures, `make_cases.py` or `sdk/tests/test_replica_contract.py`: a lane that finds this page and a case disagreeing stops and reports.
 
 ## 9. Not settled here
 
