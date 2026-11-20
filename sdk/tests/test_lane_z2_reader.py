@@ -451,3 +451,55 @@ def test_l21_a_shared_file_without_a_rank_is_a_usage_error_not_a_traceback(tmp_p
     done = _cli(str(_shared_file(tmp_path)), "--detectors", "python")
     assert done.returncode == 2 and "Traceback" not in done.stderr
     assert "holds ranks 0-2: choose one with --rank N" in done.stderr
+
+
+# --- 4. L23, first part: a gradient that was not read is said under `not_checked` ----------------
+
+
+def _grads_records(unread: dict | None) -> list[dict]:
+    out = []
+    for step in range(4):
+        record = {"schema_version": 1, "run_id": "r1", "rank": 0, "attempt": 1, "step": step, "ts": 1.0 + step,
+                  "grad_norm": 1.0, "grad_norms": {"a.weight": 1.0}}
+        if unread and step == 1:
+            record["grads_not_read"] = unread
+        out.append(record)
+    return out
+
+
+def test_l23_a_gradient_not_read_makes_its_kinds_unavailable():
+    """Fail before: no `not_checked` entry, the three kinds read `checked` and the run `healthy`,
+    though `b.weight` was never looked at."""
+    evidence = ev.build_evidence(_grads_records({"b.weight": "on meta", "c.weight": "its norm raised"}))
+    [entry] = [i for i in evidence["not_checked"] if i["check"] == "gradients"]
+    assert entry["parameters"] == ["b.weight", "c.weight"] and entry["step"] == 1
+    assert entry["kinds"] == list(ev.GRADS_NOT_READ_KINDS)
+    assert "b.weight: on meta" in entry["reason"] and "c.weight: its norm raised" in entry["reason"]
+    for kind in ev.GRADS_NOT_READ_KINDS:
+        assert evidence["kind_checks"][kind]["value"] == "unavailable"
+        assert evidence["kind_checks"][kind]["check"] == "gradients"
+    assert evidence["run_state"]["state"] == "degraded"
+    assert "Not checked (gradients)" in ev.incident_summary(evidence)
+
+
+def test_l23_records_with_every_gradient_read_are_as_before():
+    evidence = ev.build_evidence(_grads_records(None))
+    assert "not_checked" not in evidence and evidence["kind_checks"]["grad_spike"]["value"] == "checked"
+    assert ev.grads_not_read_not_checked(_grads_records(None)) is None
+
+
+def test_l23_the_rust_path_says_the_same():
+    """The server reads no `grads_not_read` yet: `build_evidence` adds the entry to its report, so
+    both detectors give the same evidence. Needs the server binary."""
+    from tensorquill.server_detect import rust_ready
+
+    try:
+        rust_ready()
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    records = _grads_records({"b.weight": "on meta"})
+    python, rust = ev.build_evidence(records), ev.build_evidence(records, detectors="rust")
+    assert [i for i in rust["not_checked"] if i["check"] == "gradients"] == \
+        [i for i in python["not_checked"] if i["check"] == "gradients"]
+    for kind in ev.GRADS_NOT_READ_KINDS:
+        assert rust["kind_checks"][kind] == python["kind_checks"][kind]

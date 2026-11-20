@@ -575,6 +575,41 @@ def update_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[st
     }
 
 
+# The kinds judged from each parameter's own gradient norm (`grad_norms`): a parameter whose
+# gradient was not read is not judged by them.
+GRADS_NOT_READ_KINDS = ("grad_spike", "stalled_weights", "non_finite")
+
+
+def grads_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The `gradients` entry of `not_checked` (L23): parameters whose gradient could not be read.
+
+    The capture leaves such a gradient out of `grad_norms` on its own (one on `meta`, a nested
+    one, or one whose norm raised) and says which parameter, and why, once, under
+    `grads_not_read` on the first record it wrote after it knew (`record_grads`). Without this
+    entry the kinds judged from each parameter's gradient (`GRADS_NOT_READ_KINDS`) would read
+    "nothing found" for a parameter that was never looked at. As for `update_size`, the kinds are
+    `unavailable` and the run `degraded`. The server writes no such entry yet; `build_evidence`
+    adds this one to a report that has none.
+    """
+    first: dict[str, tuple[int, str]] = {}
+    for record in records:
+        said = record.get("grads_not_read")
+        if not isinstance(said, Mapping):
+            continue
+        for name, why in said.items():
+            first.setdefault(str(name), (int(record["step"]), str(why)))
+    if not first:
+        return None
+    names = sorted(first)
+    return {
+        "check": "gradients",
+        "kinds": list(GRADS_NOT_READ_KINDS),
+        "parameters": names,
+        "reason": "gradient not read for " + "; ".join(f"{name}: {first[name][1]}" for name in names),
+        "step": min(step for step, _ in first.values()),
+    }
+
+
 def _spiking_parameters(
     record: dict[str, Any],
     per_param: dict[str, list[tuple[int, float]]],
@@ -5698,6 +5733,14 @@ def build_evidence(
             dict(item) for item in report.get("not_checked") or ()
             if isinstance(item, dict) and item.get("check") not in ("flight_recorder", "traincheck")
         ]
+        grads_unread = grads_not_read_not_checked(records)
+        if grads_unread is not None and not any(item.get("check") == "gradients" for item in not_checked):
+            # The server does not read `grads_not_read` yet (L23): said here, as the Python path says it.
+            not_checked.append(grads_unread)
+            for kind in grads_unread["kinds"]:
+                held = rank_checks[kind]
+                rank_checks[kind] = _unavailable(grads_unread, **{key: held[key] for key in (
+                    "records", "records_needed", "enough_history", "needs") if key in held})
     else:
         samples = _moe_samples(records, router_sizes, router_top_k, overload_threshold)
         _mark_starved(samples, starve_window, starve_ratio)
@@ -5748,6 +5791,9 @@ def build_evidence(
         not_read = update_not_read_not_checked(records)
         if not_read is not None:
             not_checked.append(not_read)
+        grads_unread = grads_not_read_not_checked(records)
+        if grads_unread is not None:
+            not_checked.append(grads_unread)
         rank_checks = kind_checks(
             input_counts(records), not_checked, starve_window=starve_window, update_window=update_window)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
