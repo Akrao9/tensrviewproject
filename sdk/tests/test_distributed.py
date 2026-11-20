@@ -62,14 +62,21 @@ def test_replica_params_compares_only_replicated_weights(monkeypatch):
         out[1].copy_(_fingerprint_table((p for n, p in rank1.named_parameters() if n in names), projection=True)[0])
 
     monkeypatch.setattr(dist, "all_gather", gather)
+    # Lane Z1 (SDK-22): the scheduled check is this rank's own observation; the gather is the
+    # explicit call's. The group's ranks are given so the stand-in group gets an observation.
+    from tensorquill import capture
+
+    monkeypatch.setattr(capture, "group_ranks", lambda group: ([0, 1], None))
     sink = tensorquill.MemorySink()
     session = tensorquill.init(
         rank0, sink=sink, auto_step=False, replica_group=object(), replica_every=1,
         replica_params=lambda name, p: not getattr(p, "tensor_model_parallel", False),
     )
+    session.record_replica_spread()
     session.step()
     session.close()
     assert set(sink.records[0]["replica_spread"]) == {"norm.weight", "norm.bias"}
+    assert set(sink.records[0]["replica"]["params"]) == {"norm.weight", "norm.bias"}
     assert tensorquill.detect_replica_drift(sink.records) is None
 
 
@@ -154,11 +161,16 @@ def test_session_records_the_projection_unless_switched_off(monkeypatch, project
 
     monkeypatch.setattr(dist, "get_world_size", lambda g=None: 2)
     monkeypatch.setattr(dist, "all_gather", gather)
+    from tensorquill import capture
+
+    monkeypatch.setattr(capture, "group_ranks", lambda group: ([0, 1], None))  # lane Z1, as above
     sink = tensorquill.MemorySink()
     session = tensorquill.init(
         model, sink=sink, auto_step=False, replica_group=object(), replica_every=1,
         replica_projection=projection,
     )
+    session.record_replica_spread()
     session.step()
     session.close()
     assert {len(v) for v in sink.records[0]["replica_spread"].values()} == {width}
+    assert {len(v["fp"]) for v in sink.records[0]["replica"]["params"].values()} == {width}
