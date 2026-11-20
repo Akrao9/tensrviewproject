@@ -413,11 +413,13 @@ class ProofSink:
         # under self._lock
         if self.released_at is not None or self.hold_from is None:
             return
-        self.released_at, self.released_at_step = self.clock(), self.progress.step
-        self.released_at_close = at_close
+        # `released_at` is when the release began, set only once every held line is in the file, so
+        # `holding` turns False with the file complete.
+        began, step = self.clock(), self.progress.step
         held, self.held = self.held, []
         for record in held:
             self._write_one(record)
+        self.released_at, self.released_at_step, self.released_at_close = began, step, at_close
 
     def _maybe_release(self) -> None:
         if self.holding and not self.never and self.release_file is not None and self.release_file.exists():
