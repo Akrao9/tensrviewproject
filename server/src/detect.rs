@@ -1794,6 +1794,8 @@ struct UpdateRow {
     largest: f64,
     total: f64,
     own: Vec<(String, f64)>,
+    /// Each parameter's gradient norm (`grad_norms`; a null one as NaN), or None with none.
+    grads: Option<Vec<(String, f64)>>,
 }
 
 /// Python's `detect_update_spikes` and `update_not_read_not_checked`.
@@ -1877,8 +1879,24 @@ impl Updates {
             .as_ref()
             .filter(|before| before.attempt == attempt)
             .and_then(|before| shared_largest(&own, largest, before).map(|sides| (before, sides)));
+        let grads: Option<Vec<(String, f64)>> = columns.grad_norms.as_ref().and_then(|norms| {
+            let entries = norms.row(row);
+            (!entries.is_empty()).then(|| {
+                entries
+                    .map(|entry| {
+                        let norm = if norms.values.is_null(entry) {
+                            f64::NAN
+                        } else {
+                            norms.values.value(entry)
+                        };
+                        (norms.keys.value(entry).to_owned(), norm)
+                    })
+                    .collect()
+            })
+        });
         if let Some((before, (largest, was))) = compared {
-            let (change, rise) = ((largest - was).abs(), (total - before.total).max(0.0));
+            let (now, then) = shared_totals(total, grads.as_deref(), before.total, before.grads.as_deref());
+            let (change, rise) = ((largest - was).abs(), (now - then).max(0.0));
             if self.recent.len() < window {
                 self.recent.push_back(change);
             } else {
@@ -1918,8 +1936,8 @@ impl Updates {
                             "change": change,
                             "baseline": baseline,
                             "threshold": threshold,
-                            "grad_norm": total,
-                            "grad_norm_before": before.total,
+                            "grad_norm": now,
+                            "grad_norm_before": then,
                             "grad_rise": rise,
                             "parameters": parameters,
                         }));
@@ -1937,6 +1955,7 @@ impl Updates {
             largest,
             total,
             own,
+            grads,
         });
     }
 
@@ -1984,6 +2003,48 @@ fn shared_largest(own: &[(String, f64)], largest: f64, before: &UpdateRow) -> Op
         }
     }
     sides
+}
+
+/// The gradient totals of two rows compared by `update_spike`, over the parameters both name:
+/// Python's `_shared_totals` (L13), each row's total times `sqrt(shared² / all²)` over its
+/// `grad_norms`. The whole totals when both rows name the same parameters, and when they cannot
+/// be split: a row without `grad_norms`, a norm that is not finite, no shared parameter, or
+/// norms that are all 0. Sums as Python's `fsum` sums them.
+fn shared_totals(
+    total: f64,
+    grads: Option<&[(String, f64)]>,
+    before: f64,
+    grads_before: Option<&[(String, f64)]>,
+) -> (f64, f64) {
+    let whole = (total, before);
+    let (Some(now), Some(then)) = (grads, grads_before) else {
+        return whole;
+    };
+    if now.len() == then.len() && now.iter().zip(then).all(|((a, _), (b, _))| a == b) {
+        return whole; // the usual row: the same parameters in the same order
+    }
+    let known: HashMap<&str, f64> = then.iter().map(|(name, norm)| (name.as_str(), *norm)).collect();
+    let shared: Vec<(f64, f64)> = now
+        .iter()
+        .filter_map(|(name, norm)| known.get(name.as_str()).map(|was| (*norm, *was)))
+        .collect();
+    let named_alike = shared.len() == now.len() && known.len() == now.len();
+    if named_alike || shared.is_empty() || now.iter().chain(then).any(|(_, norm)| !norm.is_finite()) {
+        return whole;
+    }
+    let (all_now, all_then) = (
+        fsum(now.iter().map(|(_, v)| v * v)),
+        fsum(then.iter().map(|(_, v)| v * v)),
+    );
+    if all_now <= 0.0 || all_then <= 0.0 {
+        return whole;
+    }
+    let part_now = fsum(shared.iter().map(|(v, _)| v * v));
+    let part_then = fsum(shared.iter().map(|(_, v)| v * v));
+    (
+        total * (part_now / all_now).sqrt(),
+        before * (part_then / all_then).sqrt(),
+    )
 }
 
 // --- head_trends ---------------------------------------------------------------------------

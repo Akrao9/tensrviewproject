@@ -441,8 +441,9 @@ def detect_update_spikes(
     compared with the last one before it that could be judged, in the same attempt, and `R` is
     the largest update over the parameters both of them name, on each side (a parameter recorded
     from a later step on is not a jump, L13): `change` is how far `R` moved (either way) and
-    `rise` how far the total gradient norm rose (0 when it fell). Two records that share no
-    parameter are not compared. The first `window` changes are not judged. After that
+    `rise` how far the total gradient norm rose (0 when it fell), the totals taken over the
+    parameters both records name where their `grad_norms` differ (`_shared_totals`). Two
+    records that share no parameter are not compared. The first `window` changes are not judged. After that
     `baseline` is the mean of the last `window` changes that were not flagged, and a record is
     flagged when `rise > 0` and `change > baseline / (alpha * sqrt(rise))` (Altenbernd et al.,
     arXiv 2604.00726, eq. 13). A flagged change stays out of the baseline, so a fault that lasts
@@ -459,7 +460,8 @@ def detect_update_spikes(
     record before, largest first, so the incident says where the jump is.
     """
     key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
-    before: tuple[Any, float, dict[str, float]] | None = None  # attempt, total, each parameter's
+    # attempt, total, each parameter's update size, each parameter's gradient norm (or None)
+    before: tuple[Any, float, dict[str, float], Mapping[str, Any] | None] | None = None
     recent: deque[float] = deque(maxlen=window)  # the last `window` changes that were not flagged
     first: dict[str, Any] | None = None
     spikes: list[int] = []
@@ -474,15 +476,17 @@ def detect_update_spikes(
         if not own:
             continue
         attempt = record.get("attempt", 0)
+        grads = record.get("grad_norms") if isinstance(record.get("grad_norms"), Mapping) else None
         # R on both sides is the largest update over the parameters both records name (L13, Nov 20,
         # 2026): a parameter recorded from a later step on (unfrozen after `init`), or one that is
         # left out of this record, is not a jump. Records that share no parameter are not compared,
-        # and their change joins no baseline. The gradient total stays the whole record's: a
-        # pre-clipping `clip_grad_norm` cannot be split by parameter.
+        # and their change joins no baseline. The gradient totals are taken over the parameters
+        # both name too (`_shared_totals`).
         shared = [name for name in own if name in before[2]] if before is not None and before[0] == attempt else []
         if shared:
             largest, was = max(own[name] for name in shared), max(before[2][name] for name in shared)
-            change, rise = abs(largest - was), max(0.0, total - before[1])
+            now, then = _shared_totals(total, grads, before[1], before[3])
+            change, rise = abs(largest - was), max(0.0, now - then)
             if len(recent) < window:
                 recent.append(change)
             else:
@@ -502,13 +506,43 @@ def detect_update_spikes(
                         )
                         first = {
                             "step": step, "update_rms": largest, "previous": was, "change": change,
-                            "baseline": baseline, "threshold": threshold, "grad_norm": total,
-                            "grad_norm_before": before[1], "grad_rise": rise, "parameters": moved[:10],
+                            "baseline": baseline, "threshold": threshold, "grad_norm": now,
+                            "grad_norm_before": then, "grad_rise": rise, "parameters": moved[:10],
                         }
-        before = (attempt, total, own)
+        before = (attempt, total, own, grads)
     if first is None:
         return None
     return {"kind": "update_spike", **first, "spike_count": len(spikes), "spike_steps": spikes[:20]}
+
+
+def _shared_totals(
+    total: float, grads: Mapping[str, Any] | None, before: float, grads_before: Mapping[str, Any] | None
+) -> tuple[float, float]:
+    """The gradient totals of two records compared by `update_spike`, over the parameters both
+    name (L13): each record's total times the share of its gradient those parameters carry,
+    `total * sqrt(shared² / all²)` over its `grad_norms`. For a total that is `grad_norm`, the
+    root of the squares of `grad_norms`, that is the shared parameters' own norm; for a
+    pre-clipping `clip_grad_norm` it is theirs before clipping, since clipping scales every
+    gradient by one factor and the per-parameter norms are read after it.
+
+    The whole totals when both records name the same parameters (so no record set whose
+    parameters never change is judged otherwise), and when they cannot be split: a record
+    without `grad_norms`, a norm there that is not a finite number, no shared parameter, or a
+    record whose norms are all 0. The server's rule is the same (`shared_totals`, detect.rs)."""
+    if grads is None or grads_before is None or grads.keys() == grads_before.keys():
+        return total, before
+    shared = [name for name in grads if name in grads_before]
+    sides = []
+    for side, norms in ((total, grads), (before, grads_before)):
+        values = [_finite(v) for v in norms.values()]
+        if not shared or any(v is None for v in values):
+            return total, before
+        whole = math.fsum(v * v for v in values)
+        if whole <= 0:
+            return total, before
+        part = math.fsum(norm * norm for norm in (_finite(norms[name]) for name in shared))
+        sides.append(side * math.sqrt(part / whole))
+    return sides[0], sides[1]
 
 
 def update_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:

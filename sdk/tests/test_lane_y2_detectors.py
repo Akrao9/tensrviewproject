@@ -131,6 +131,73 @@ def test_l13_records_that_share_no_parameter_are_not_compared():
         assert [(s["step"], s["previous"]) for s in spikes] == [(8, 5.001)], engine
 
 
+def _grads_row(at: int, sizes: dict[str, float], grads: dict[str, float], clip: float | None = None) -> dict:
+    out = _row(at, sizes, total=math.sqrt(math.fsum(v * v for v in grads.values())))
+    out["grad_norms"] = grads
+    if clip is not None:
+        out["clip_grad_norm"] = clip
+    return out
+
+
+@pytest.mark.parametrize("clipped", [False, True])
+def test_l13_the_gradient_rise_is_taken_over_the_shared_parameters_too(clipped):
+    # The new parameter carries almost all of the gradient: the whole total rises by about 500,
+    # which with an ordinary change of R (0.001) would pass the limit on its own. Over the two
+    # parameters both records name it did not rise at all.
+    def quiet_row(at):
+        grads = {"big": 0.6, "small": 0.8}
+        return _grads_row(at, {"big": 0.010 + 0.001 * (at % 2), "small": 0.002}, grads,
+                          clip=10.0 if clipped else None)
+
+    records = [quiet_row(at) for at in range(6)]
+    grads = {"big": 0.6, "small": 0.8, "late": 500.0}
+    # Clipped to a norm of 1: every gradient scaled by one factor, the total before clipping kept.
+    if clipped:
+        whole = math.sqrt(math.fsum(v * v for v in grads.values()))
+        grads = {name: v / whole for name, v in grads.items()}
+    records.append(_grads_row(6, {"big": 0.010, "small": 0.002, "late": 0.010}, grads,
+                              clip=10.0 * 500.001 if clipped else None))
+    for engine, spikes in _both_engines(records, update_window=4):
+        assert spikes == [], engine
+    # The same jump in the whole total with the parameter set unchanged is still a rise.
+    same = [quiet_row(at) for at in range(6)]
+    same.append(_grads_row(6, {"big": 0.010, "small": 0.002}, {"big": 0.6, "small": 500.0},
+                           clip=10.0 * 500.0 if clipped else None))
+    for engine, spikes in _both_engines(same, update_window=4):
+        assert [s["step"] for s in spikes] == [6], engine
+
+
+def test_l13_a_spike_with_a_new_parameter_reports_the_shared_gradient_totals():
+    records = [_grads_row(at, {"big": 0.010 + 0.001 * (at % 2), "small": 0.002}, {"big": 0.6, "small": 0.8})
+               for at in range(6)]
+    # `small` jumps and its own gradient rises (0.8 -> 4.8): the shared total goes 1 -> sqrt(0.36 + 23.04).
+    records.append(_grads_row(6, {"big": 0.010, "small": 0.300, "late": 0.010},
+                              {"big": 0.6, "small": 4.8, "late": 100.0}))
+    found = _both_engines(records, update_window=4)
+    for engine, spikes in found:
+        (hit,) = spikes
+        assert hit["grad_norm"] == pytest.approx(math.sqrt(0.36 + 23.04), rel=1e-12), engine
+        assert hit["grad_norm_before"] == pytest.approx(1.0, rel=1e-12), engine
+        assert hit["grad_rise"] == pytest.approx(math.sqrt(0.36 + 23.04) - 1.0, rel=1e-12), engine
+    if len(found) == 2:
+        assert json.dumps(found[0][1], sort_keys=True) == json.dumps(found[1][1], sort_keys=True)
+
+
+def test_l13_without_per_parameter_gradients_the_whole_totals_are_compared():
+    # A record with no `grad_norms` (or a norm that is not finite) cannot be split: the whole
+    # totals are compared, as before the fix.
+    records = _quiet(6) + [_row(6, {"big": 0.010, "small": 0.002, "late": 0.010}, total=500.0)]
+    for engine, spikes in _both_engines(records, update_window=4):
+        assert [s["step"] for s in spikes] == [6], engine
+    with_nan = [_grads_row(at, {"big": 0.010 + 0.001 * (at % 2), "small": 0.002}, {"big": 0.6, "small": 0.8})
+                for at in range(6)]
+    with_nan.append(_grads_row(6, {"big": 0.010, "small": 0.002, "late": 0.010},
+                               {"big": 0.6, "small": 0.8, "late": 500.0}))
+    with_nan[-1]["grad_norms"]["small"] = math.nan
+    for engine, spikes in _both_engines(with_nan, update_window=4):
+        assert [s["step"] for s in spikes] == [6], engine
+
+
 def test_l13_the_known_cases_are_judged_as_before():
     """Records whose parameters never change keep every result: the update-size golden cases and
     parity cases are checked by `test_golden.py` and `test_server_detect.py`; this is the short

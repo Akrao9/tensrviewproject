@@ -243,3 +243,98 @@ fn l15_the_report_carries_the_probes_head_trends() {
     .unwrap();
     assert_eq!(super::report("y2", 0, &none, 0)["head_trends"], Value::Null);
 }
+
+/// A row's step, each parameter's update RMS and each parameter's gradient norm.
+type GradsRow = (i64, Vec<(&'static str, f64)>, Vec<(&'static str, f64)>);
+
+/// Rows as `batch` makes them, with each row's `grad_norms` and the total their root of squares.
+fn grads_batch(rows: &[GradsRow]) -> RecordBatch {
+    let mut sizes = MapBuilder::new(None, StringBuilder::new(), Float64Builder::new());
+    let mut norms = MapBuilder::new(None, StringBuilder::new(), Float64Builder::new());
+    for (_, own, grads) in rows {
+        for (name, size) in own {
+            sizes.keys().append_value(name);
+            sizes.values().append_value(*size);
+        }
+        sizes.append(true).unwrap();
+        for (name, norm) in grads {
+            norms.keys().append_value(name);
+            norms.values().append_value(*norm);
+        }
+        norms.append(true).unwrap();
+    }
+    let totals = rows
+        .iter()
+        .map(|(_, _, grads)| grads.iter().map(|(_, v)| v * v).sum::<f64>().sqrt());
+    let columns: Vec<(&str, ArrayRef)> = vec![
+        (
+            "run_id",
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|_| "y2"))),
+        ),
+        ("rank", Arc::new(Int32Array::from_iter_values(rows.iter().map(|_| 0)))),
+        (
+            "attempt",
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|_| 1))),
+        ),
+        ("step", Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0)))),
+        ("grad_norm", Arc::new(Float64Array::from_iter_values(totals))),
+        ("update_rms", Arc::new(sizes.finish())),
+        ("grad_norms", Arc::new(norms.finish())),
+    ];
+    let fields: Vec<Field> = columns
+        .iter()
+        .map(|(name, array)| Field::new(*name, array.data_type().clone(), true))
+        .collect();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns.into_iter().map(|(_, a)| a).collect(),
+    )
+    .unwrap()
+}
+
+/// L13: the gradient rise is taken over the parameters both rows name, so a new parameter that
+/// carries most of the gradient raises no `update_spike` through the rise alone.
+#[test]
+fn l13_the_gradient_rise_is_taken_over_the_shared_parameters() {
+    let thresholds = Arc::new(Thresholds::parse(r#"{"update_window": 4}"#).unwrap());
+    let quiet = |at: i64| {
+        (
+            at,
+            vec![("big", 0.010 + 0.001 * (at % 2) as f64), ("small", 0.002)],
+            vec![("big", 0.6), ("small", 0.8)],
+        )
+    };
+    let found = |last: GradsRow| {
+        let mut rows: Vec<_> = (0..6).map(quiet).collect();
+        rows.push(last);
+        judge(0, &[grads_batch(&rows)], &thresholds)
+            .unwrap()
+            .incidents()
+            .into_iter()
+            .filter(|incident| incident["kind"] == "update_spike")
+            .collect::<Vec<Value>>()
+    };
+    let new = found((
+        6,
+        vec![("big", 0.010), ("small", 0.002), ("late", 0.010)],
+        vec![("big", 0.6), ("small", 0.8), ("late", 500.0)],
+    ));
+    assert_eq!(new, Vec::<Value>::new());
+    // The same rise of the whole total over unchanged parameters is a rise.
+    let same = found((
+        6,
+        vec![("big", 0.010), ("small", 0.002)],
+        vec![("big", 0.6), ("small", 500.0)],
+    ));
+    assert_eq!(same.len(), 1, "{same:?}");
+    // A spike with a new parameter reports the shared totals.
+    let hit = found((
+        6,
+        vec![("big", 0.010), ("small", 0.300), ("late", 0.010)],
+        vec![("big", 0.6), ("small", 4.8), ("late", 100.0)],
+    ));
+    assert_eq!(hit.len(), 1, "{hit:?}");
+    let shared = (0.36_f64 + 23.04).sqrt();
+    assert!((hit[0]["grad_norm"].as_f64().unwrap() - shared).abs() < 1e-12 * shared);
+    assert!((hit[0]["grad_norm_before"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+}
