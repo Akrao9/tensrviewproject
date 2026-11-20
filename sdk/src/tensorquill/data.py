@@ -482,6 +482,9 @@ def _model_tensors(value: Mapping[Any, Any]) -> int:
 # entry is: `model_cache` and `weights_cache` are caches.
 _MODEL_WORDS = frozenset(("model", "models", "module", "modules", "net", "network", "ema", "weights"))
 _STATE_WORDS = frozenset(("state", "states", "dict"))
+# The last words that say an entry is a cache, which no key evidence overrides (lane Z6, L23):
+# `kv_cache` with `layers.0.k`, `embedding_cache` with `emb_weight`, `model_cache`.
+_CACHE_WORDS = frozenset(("cache", "caches"))
 # The names PyTorch's own modules give their parameters and buffers (`Linear`, `Embedding` and
 # the norms: `weight`, `bias`; `BatchNorm`: `running_*`, `num_batches_tracked`;
 # `MultiheadAttention`: `in_proj_*`, `bias_k`, `bias_v`; pruning and weight norm: `*_orig`,
@@ -494,13 +497,24 @@ _PARAMETER_NAMES = frozenset((
 _WORD_BREAKS = re.compile(r"[^a-z0-9]+")
 
 
-def _names_a_model(name: str) -> bool:
+def _last_word(name: str) -> str | None:
+    """The last word of `name` once a trailing `state`, `states` or `dict` is set aside; None
+    when nothing is left. `state_dict` itself is "state_dict"."""
     words = [word for word in _WORD_BREAKS.split(name) if word]
     if words == ["state", "dict"]:
-        return True
+        return "state_dict"
     while words and words[-1] in _STATE_WORDS:
         words.pop()
-    return bool(words) and words[-1] in _MODEL_WORDS
+    return words[-1] if words else None
+
+
+def _names_a_model(name: str) -> bool:
+    word = _last_word(name)
+    return word == "state_dict" or word in _MODEL_WORDS
+
+
+def _names_a_cache(name: str) -> bool:
+    return _last_word(name) in _CACHE_WORDS
 
 
 def _parameter_path(key: Any) -> bool:
@@ -521,12 +535,17 @@ def _model_state(name: str, value: Mapping[Any, Any]) -> int:
     A mapping of tensors is not a model by its shape alone: a cache of `cached_embedding`
     tensors has the same shape, and taken for the model it would say a resume restored a
     model it never held. So it is the model only when its entry's name says so (`name`, the
-    last dotted part of its key, lowercased) or one of its keys is a parameter path. A model
-    whose parameters have none of these names, stored under a key that names no model, is
-    passed over: it is listed under `other`, and a resume from it reads the model as missing.
+    last dotted part of its key, lowercased) or one of its keys is a parameter path, and never
+    when its name says it is a cache (`kv_cache`, `model_cache`: lane Z6), whatever its keys.
+
+    Known limits (L23): a model whose parameters have none of these names, stored under a key
+    that names no model, is passed over: it is listed under `other`, and a resume from it
+    reads the model as missing; a model kept under a cache's name is passed over likewise. A
+    mapping of non-parameter tensors under any other name with a dotted or `*_weight` key, or
+    under a model's name, is still taken for the model.
     """
     tensors = _model_tensors(value)
-    if tensors and (_names_a_model(name) or any(_parameter_path(k) for k in value)):
+    if tensors and not _names_a_cache(name) and (_names_a_model(name) or any(_parameter_path(k) for k in value)):
         return tensors
     return 0
 

@@ -272,3 +272,121 @@ def test_z6_init_with_a_refused_manifest_rename_leaves_no_scratch_file(tmp_path,
     assert scratch_files(tmp_path) == []
     assert not (tmp_path / "r.run.json").exists()
     assert records.read_text()
+
+
+# --- 3. The model-state rule ----------------------------------------------------------------
+#
+# The rule (`data._model_state`): a mapping of tensors is the model when its entry's name says
+# so or one of its keys is a parameter path. Two misses in L23. The Rust twin
+# (`server/src/detect/data.rs`) holds no copy of this rule: it reads the `components` the SDK
+# wrote into the record, so a change here changes both engines' verdicts alike.
+
+T = torch.zeros(2)
+
+
+def test_z6_known_limit_a_custom_model_with_only_unusual_names_under_a_plain_key_is_not_the_model():
+    """KNOWN LIMIT, not closed (today's behaviour, pinned). A model whose only parameters are
+    registered at its top level under names no PyTorch module uses (`cls_token`, `pos_embed`),
+    saved under a key that names no model (`generator`), is a mapping of tensors with nothing
+    that tells it from a cache: it goes to `other`, and a resume from it reads the model as
+    missing. Closing it from the dict alone would flip the pinned "a cache is not the model"
+    cases (`state`, `dict`, `cache`); the way to close it is to compare the entry's keys with
+    the live model's (`capture.py`, not this lane's file)."""
+
+    class Generator(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cls_token = torch.nn.Parameter(torch.zeros(1, 4))
+            self.pos_embed = torch.nn.Parameter(torch.zeros(8, 4))
+
+    for key in ("generator", "g", "backbone"):
+        manifest = checkpoint_manifest({key: Generator().state_dict()})
+        assert "model" not in manifest["components"], key
+        assert manifest["other"] == [f"{key}.cls_token", f"{key}.pos_embed"]
+
+
+@pytest.mark.parametrize("key, entries", [
+    ("cache", {"layers.0.k": T, "layers.0.v": T}),  # dotted
+    ("kv_cache", {"attn_weight": T}),  # a `_weight` suffix
+    ("embedding_cache", {"emb_weight": T, "emb_bias": T}),
+    ("cache", {"weight": T}),  # a PyTorch parameter name
+    ("model_cache", {"blocks.0.weight": T}),  # the last word is `cache`
+    ("cache_state_dict", {"layers.0.k": T}),  # `state_dict` set aside, as for a model's name
+    ("caches", {"weight_ih_l0": T}),
+])
+def test_z6_a_cache_with_parameter_like_keys_is_not_the_model(key, entries):
+    """Fail before: any dotted or `*_weight` key made a cache the model, though its name said it
+    was a cache. Now an entry whose name's last word is `cache`/`caches` (once a trailing
+    `state`/`states`/`dict` is set aside) is never the model, whatever its keys."""
+    manifest = checkpoint_manifest({key: entries, "optimizer": {"state": {}, "param_groups": [{}]}})
+    assert "model" not in manifest["components"]
+    assert manifest["other"] == [f"{key}.{k}" for k in entries]
+
+
+def test_z6_a_cache_beside_the_model_is_not_listed_with_it():
+    """Fail before: the cache was listed as a second model key (`keys == ["model", "kv_cache"]`)."""
+    manifest = checkpoint_manifest({"model": torch.nn.Linear(2, 2).state_dict(),
+                                    "kv_cache": {"layers.0.k": T, "layers.0.v": T}})
+    assert manifest["components"]["model"]["keys"] == ["model"]
+    assert manifest["components"]["model"]["tensors"] == 2
+
+
+def test_z6_a_resume_from_a_checkpoint_holding_only_a_dotted_cache_finds_the_model_missing():
+    """Fail before: the cache stood in for the model, so a resume that restored no model said
+    nothing about it."""
+    from tensorquill import data_checks
+
+    first = {"checkpoint": {"load": checkpoint_manifest({
+        "kv_cache": {"layers.0.k": T, "layers.0.v": T},
+        "optimizer": {"state": {0: {"step": 3}}, "param_groups": [{}]},
+    })}}
+    findings, _, checked = data_checks._state_findings(first, 3, 3, None, False, None, None)
+    assert checked and {"component": "model", "finding": "missing"} in findings
+
+
+@pytest.mark.parametrize("key, entries", [
+    ("buffers", {"layers.0.k": T}),
+    ("stats", {"loss_weight": T}),
+    ("history", {"grad_norm.mean": T}),
+    ("model", {"cached_embedding": T}),  # stored under a model's name
+])
+def test_z6_known_limit_a_cache_under_a_name_that_is_not_cache_is_still_the_model(key, entries):
+    """KNOWN LIMIT, not closed (today's behaviour, pinned). Only a name that says `cache` vetoes
+    the key evidence; a mapping of non-parameter tensors under any other name with a dotted or
+    `*_weight` key, or under a model's name, is still the model. Narrowing the dotted or suffix
+    rule would make real models (a ViT's `encoder.cls_token`, `MultiheadAttention(kdim=...)`'s
+    `q_proj_weight`) missed instead."""
+    assert checkpoint_manifest({key: entries})["components"]["model"]["keys"] == [key]
+
+
+def _modules() -> list[tuple[str, torch.nn.Module]]:
+    nn = torch.nn
+    return [
+        ("Linear", nn.Linear(2, 2)), ("Bilinear", nn.Bilinear(2, 2, 2)), ("Embedding", nn.Embedding(4, 2)),
+        ("EmbeddingBag", nn.EmbeddingBag(4, 2)), ("Conv2d", nn.Conv2d(1, 1, 1)), ("LayerNorm", nn.LayerNorm(2)),
+        ("GroupNorm", nn.GroupNorm(1, 2)), ("BatchNorm1d", nn.BatchNorm1d(2)), ("PReLU", nn.PReLU()),
+        ("LSTM", nn.LSTM(2, 2)), ("GRU", nn.GRU(2, 2, bidirectional=True)), ("RNN", nn.RNN(2, 2)),
+        ("MultiheadAttention", nn.MultiheadAttention(4, 2)),
+        ("MultiheadAttention-kdim", nn.MultiheadAttention(4, 2, kdim=3, vdim=3)),
+        ("TransformerEncoderLayer", nn.TransformerEncoderLayer(4, 2, dim_feedforward=8)),
+        ("Sequential", nn.Sequential(nn.Linear(2, 2), nn.ReLU(), nn.Linear(2, 2))),
+    ]
+
+
+@pytest.mark.parametrize("label, module", _modules(), ids=[label for label, _ in _modules()])
+@pytest.mark.parametrize("key", ["generator", "teacher", "encoder", "model", "state"])
+def test_z6_a_real_modules_state_dict_is_the_model_under_any_name_but_a_cache(label, module, key):
+    """Held before too: the cache veto changes nothing for an entry not named a cache. Every
+    module here is the model under a plain key by its keys alone."""
+    state = module.state_dict()
+    manifest = checkpoint_manifest({key: state})
+    assert manifest["components"]["model"]["keys"] == [key], label
+    assert manifest["components"]["model"]["tensors"] == len(state)
+
+
+@pytest.mark.parametrize("label, module", _modules(), ids=[label for label, _ in _modules()])
+def test_z6_a_real_modules_state_dict_under_a_cache_name_is_not_the_model(label, module):
+    """Fail before (each module): a model's state dict saved under a name whose last word is
+    `cache` was the model. This is the price of the veto, a call for the author: a checkpoint
+    that keeps its model under `model_cache` now reads as missing its model."""
+    assert "model" not in checkpoint_manifest({"model_cache": module.state_dict()})["components"], label
