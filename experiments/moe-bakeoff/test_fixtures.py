@@ -209,9 +209,11 @@ def test_moe_records_have_the_shape_of_a_real_capture():
     session.step(3)
     session.close()
     (real,) = sink.records
+    # The preregistered fixtures predate these fields and are deliberately unchanged; a missing key reads as unknown.
+    real_without_new = {k: v for k, v in real.items() if k not in ("moe_unassigned", "moe_left_out")}
     for fixture in MOE:
         for ours in fixture.records()[:1]:
-            assert types(ours) == types(real)
+            assert types(ours) == types(real_without_new)
             router, real_router = next(iter(ours["moe"])), next(iter(real["moe"]))
             assert {type(count) for count in ours["moe"][router]} == {type(count) for count in real["moe"][real_router]}
             assert types(ours["moe_stats"][router]) == types(real["moe_stats"][real_router])
