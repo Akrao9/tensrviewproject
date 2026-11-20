@@ -3106,7 +3106,15 @@ def _not_current_by_status(status: Mapping[str, Any], judged: Mapping[int, int |
     attempt has stored nothing), or names another attempt than the one judged. The rule of
     `run_state` in server/src/watchdog.rs (lane U6), applied here (L6, Nov 19, 2026). A status
     entry that names no attempt (a server from before attempts) and an attempt not known here
-    (None) are not compared."""
+    (None) are not compared.
+
+    Nor is an entry written before the rank's first batch: attempt 0 with `last_step` null and no
+    `attempt_without_steps`. The server gives a rank whose stream is open and that has stored
+    nothing attempt 0, its word for "none yet" as well as the attempt of rows that name none, and
+    the file is rewritten only every `--watchdog-seconds` (10 by default), so that entry can stand
+    for seconds beside a report on steps the rank has stored since. Read as "attempt 0", it left
+    the first rank to send out of the all-ranks view (CI, Nov 20, 2026). The server's own rule
+    compares in memory, where the two are never out of step."""
     found: dict[int, str] = {}
     for entry in status.get("ranks") or ():
         if not isinstance(entry, Mapping):
@@ -3118,6 +3126,8 @@ def _not_current_by_status(status: Mapping[str, Any], judged: Mapping[int, int |
         if entry.get("attempt_without_steps") is True:
             found[rank] = (f"started again{f' as attempt {shown}' if shown is not None else ''}, which has stored no"
                            " step yet: what was judged is an earlier attempt's")
+        elif shown == 0 and "last_step" in entry and entry["last_step"] is None:
+            continue  # written before the rank's first batch: it names no attempt yet
         elif shown is not None and was is not None and shown != was:
             found[rank] = f"attempt {was} was judged, and the server's status shows attempt {shown}"
     return found

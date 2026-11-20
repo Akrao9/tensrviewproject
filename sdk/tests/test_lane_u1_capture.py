@@ -860,6 +860,7 @@ def _progress(out_dir, rank, what: str) -> None:
 
 
 def _stopped_rank_worker(rank, store_path, out_dir):
+    import atexit
     import faulthandler
     import signal
 
@@ -876,6 +877,12 @@ def _stopped_rank_worker(rank, store_path, out_dir):
     faulthandler.dump_traceback_later(STOPPED_RANK_STACKS, file=stacks)
     if hasattr(signal, "SIGUSR1"):
         faulthandler.register(signal.SIGUSR1, file=stacks, all_threads=True)
+    # A worker that dies of a signal says where too. In CI on Nov 20, 2026 (`73eac65`, Python 3.11,
+    # PyTorch 2.15) rank 0 aborted after this function had returned ("terminate called without an
+    # active exception", SIGABRT) and nothing was dumped: the two lines below are for the next time.
+    faulthandler.enable(file=stacks, all_threads=True)
+    atexit.register(lambda: say("atexit: the interpreter is shutting down; threads alive: "
+                                + ", ".join(sorted(t.name for t in threading.enumerate()))))
     # The session's two waits on the other rank, logged on the way in and out and passed through
     # unchanged: the agreement at init (through the store) and each drift check's gather, which a
     # stopped rank's `_gather_and_drop` enters too and whose error it swallows.
@@ -933,7 +940,8 @@ def _stopped_rank_worker(rank, store_path, out_dir):
     finally:
         say("destroy_process_group")
         dist.destroy_process_group()
-        say("destroy_process_group returned; the worker returns")
+        say("destroy_process_group returned; the worker returns; threads alive: "
+            + ", ".join(sorted(t.name for t in threading.enumerate())))
 
 
 def _ranks_report(context, out_dir: Path, started: float, status: list[str]) -> str:

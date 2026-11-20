@@ -44,6 +44,7 @@ from .data import (
 )
 from . import datawait
 from .distributed import FINGERPRINT_WIDTH, _agree_on_gather, _spread_and_unread, _unread_reason, unwrap_local
+from .flight import _without_traceback
 from .probe import ProbeState, find_head, install_head_hook, install_probe_hooks, probe_callable, run_probe
 from .sink import JsonlSink, Sink, clear_end_marker, write_end_marker
 from .system import SystemPart, SystemReadings
@@ -3123,7 +3124,7 @@ class Session:
         if self._stopped:
             return
         self._stopped = True
-        self.writer_error = cause
+        self.writer_error = _without_traceback(cause)  # no frames kept, so no cycle through the session (`_drain`)
         # Contract 3: a streamed session's heartbeat says so from now on, with a short reason word
         # (`sink_error` for the sink's own error, unless the call site names another).
         beat = getattr(self._sink, "heartbeat", None)
@@ -3329,6 +3330,10 @@ class Session:
                 self._sink.close()
             except Exception as error:  # noqa: BLE001
                 self._stop(error, reason="sink_error")
+        # A closed session issues no collective again (its optimizer hooks are off), so it lets go of
+        # the process group: one that the job destroys is then not kept alive by a session object
+        # the caller still holds.
+        self._replica_group = None
         if self._stopped or getattr(self._sink, "path", None) is None:
             return
         try:
@@ -3368,7 +3373,10 @@ class Session:
                     try:
                         self._sink.write(self._decode(*item))
                     except BaseException as error:  # noqa: BLE001
-                        self._error = error
+                        # Kept without its traceback: that holds this frame, and through it the
+                        # session, which then outlives its last reference until a garbage collection
+                        # and keeps its `replica_group` alive after `destroy_process_group`.
+                        self._error = _without_traceback(error)
                 if self._stopped and self._queue.empty():
                     return
         finally:
