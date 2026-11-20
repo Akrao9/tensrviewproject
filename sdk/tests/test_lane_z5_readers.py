@@ -14,8 +14,11 @@ fixes.
   entry of `watchdog.json`) are in the listing's row, its printed notes, and the MCP tools
   `list_runs` and `get_all_ranks_status`, said to be an upper bound. A rank that dropped none
   reads as before.
-  Fail before (on 89bef4e): every L22 test but the controls failed with `KeyError: 'dropped_rows'`
-  or an assertion that the key or the note was there.
+  Fail before (on 89bef4e): the row, MCP and description tests failed on behaviour (`KeyError:
+  'dropped_rows'`, the printed note missing, the description without it); the six cases of
+  `test_l22_a_count_that_is_not_a_count_is_left_out` failed only because `runs.dropped_rows` did
+  not exist (`AttributeError`), not on behaviour, and the bounded-answer test was added after the
+  first run. The controls (`..._reads_as_before`, `..._dropped_none_...`) pass on both.
 
 The records and the store folders are built here (the status by hand, from the shape
 `server/src/watchdog.rs` writes near line 1363), so nothing depends on another lane's test file.
@@ -373,6 +376,31 @@ def test_l22_the_mcp_answers_of_a_run_that_dropped_none_are_as_before(tmp_path):
     assert "dropped_rows" not in status and all("dropped_rows" not in e for e in status["per_rank"])
     assert "dropped_rows" not in mcp_server.list_incidents(source, {"rank": 0})["rank"]
     assert "dropped_rows" not in mcp_server.list_runs(source, {})["runs"][0]
+
+
+def test_l22_a_large_run_whose_every_rank_dropped_rows_has_a_bounded_answer(tmp_path):
+    # A null key usually hits every rank: the answers list the ranks up to `PER_RANK_ROWS` and
+    # count the rest, through the server's own path (`call_tool`, which cuts what does not fit).
+    many = mcp_server.PER_RANK_ROWS + 36
+    folder = tmp_path / "store" / "runs" / STORE_RUN
+    folder.mkdir(parents=True)
+    (folder / "watchdog.json").write_text(json.dumps({
+        "schema_version": 1, "run_id": STORE_RUN, "summary": "active", "written_at_ms": int(time.time() * 1000),
+        "world_size": many, "missing_ranks": [], "incidents": [], "pauses": {},
+        "ranks": [{"rank": r, "state": "active", "stream": "open", "attempt": 1, "last_step": 9,
+                   "dropped_rows": 2, "dropped_row_keys": {"step": 2}} for r in range(many)],
+    }))
+    source = mcp_server.Source(folder)
+    for tool, arguments in (("get_all_ranks_status", {}), ("list_runs", {})):
+        reply = mcp_server.call_tool(source, 1, {"name": tool, "arguments": arguments})
+        assert reply["result"]["isError"] is False, reply
+        answer = json.loads(reply["result"]["content"][0]["text"])
+        assert "truncated" not in answer, answer.get("truncated")
+        dropped = answer["dropped_rows"] if tool == "get_all_ranks_status" else answer["runs"][0]["dropped_rows"]
+        assert dropped["rows"] == 2 * many and dropped["by_key"] == {"step": 2 * many}
+        assert len(dropped["ranks"]) == mcp_server.PER_RANK_ROWS and dropped["ranks_omitted"] == 36
+    one = mcp_server.get_all_ranks_status(source, {"rank": many - 1})
+    assert one["rank"]["dropped_rows"] == {"rows": 2, "by_key": {"step": 2}}
 
 
 def test_l22_the_tool_descriptions_say_the_count_is_an_upper_bound():

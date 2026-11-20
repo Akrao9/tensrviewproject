@@ -652,6 +652,15 @@ def _dropped(opened: Mapping[str, Any]) -> dict[str, Any] | None:
     return _runs.dropped_rows(read_watchdog(Path(opened["source"]["path"]) / "watchdog.json"))
 
 
+def _dropped_shown(dropped: Any) -> Any:
+    """`dropped_rows` as an answer shows it: the total and the keys whole, and the ranks up to
+    `PER_RANK_ROWS` (`ranks_omitted` counts the rest; `rank=` gives one rank's). A null key
+    usually hits every rank, so the list would otherwise grow with the run."""
+    if not isinstance(dropped, dict) or len(dropped.get("ranks") or ()) <= PER_RANK_ROWS:
+        return dropped
+    return {**dropped, "ranks": dropped["ranks"][:PER_RANK_ROWS], "ranks_omitted": len(dropped["ranks"]) - PER_RANK_ROWS}
+
+
 def _rank_dropped(dropped: Mapping[str, Any] | None, rank: int) -> dict[str, Any] | None:
     """One rank's part of `_dropped`: `{"rows", "by_key"}`, or None when it dropped none."""
     for item in (dropped or {}).get("ranks") or ():
@@ -1270,7 +1279,7 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
         answer["stopped_stacks"] = evidence["stopped_stacks"]
     dropped = _dropped(opened)
     if dropped is not None:  # L22: no key when no rank dropped a row
-        answer["dropped_rows"] = dropped
+        answer["dropped_rows"] = _dropped_shown(dropped)
     if rank is not None:
         answer["rank"] = _rank_entry(evidence, rank)
         mine = _rank_dropped(dropped, rank)
@@ -1338,7 +1347,8 @@ def list_runs(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]:
            if len(shown) < len(rows) else {}),
         # A row says nothing it did not read: `run_state` null with `evidence.state` "missing"
         # means no evidence file was written for that run, not that the run is clean.
-        "runs": [{key: row[key] for key in _ROW_KEYS if key in row} for row in shown],
+        "runs": [{key: _dropped_shown(row[key]) if key == "dropped_rows" else row[key] for key in _ROW_KEYS if key in row}
+                 for row in shown],
     }
 
 
@@ -1504,8 +1514,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "description": (
             "The runs kept in the same folder or store as this one, by project: each run's name, run ID, run state,"
             " last step, incidents by class, first incident (kind and step), how many of the kinds were checked, and"
-            " start time. The run ID is the identity; a name is a label and may repeat. It reads each run's manifest"
-            " and its small evidence or report files only, and runs no detector: a local run whose evidence file was"
+            " start time. The run ID is the identity; a name is a label and may repeat. It reads each run's manifest,"
+            " its small evidence or report files and the ends of its .jsonl files (one over a megabyte is scanned"
+            " for the attempts its lines name), and runs no detector: a local run whose evidence file was"
             " never written has `run_state` null and `evidence.state` \"missing\", which is not \"clean\". A run"
             " with `has_manifest` false was recorded before runs had a project, and is listed under"
             " `uncategorized` with its run ID as its name. `rank_count` is how many ranks the run has, or null when the"

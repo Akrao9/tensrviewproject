@@ -175,8 +175,9 @@ def _tail_from(path: Path) -> tuple[list[bytes], bool, int]:
 # byte of each file larger than a megabyte is read at each listing, about 1.5 GB a second on the
 # recorded 6 to 17 MB captures (a full parse is about 120 MB a second) and 0.9 GB a second on a
 # file of a million 114-byte lines of one rank. A file whose ranks change from one line to the
-# next (8 ranks, line by line: 86 MB a second) or whose lines start in another order (each is
-# parsed) is read at about the rate of a full parse. Within one process (the MCP server lists the
+# next is stepped a line at a time: 8 or 2,000 ranks line by line, about 0.6 times a full parse's
+# time; a new rank or attempt on nearly every line (100,000 ranks), about 1.3 times. Lines that
+# start in another order are each parsed, at a full parse's rate. Within one process (the MCP server lists the
 # runs at each call) a file that only grew is read from where the last scan stopped (`_SCANNED`).
 # The file is read whole, parsed, only when an attempt newer than the last megabyte's is in the
 # part before it.
@@ -233,13 +234,17 @@ def _scan_block(block: bytes, found: dict[int, dict[Any, None]], decoded: dict[A
             at = end
         else:
             start = block[at:head.end()]
-            skip = skips.get(start)
-            if skip is None:
-                if len(skips) >= _SKIPS_MOST:
-                    skips.clear()
-                skip = skips[start] = re.compile(rb"\n(?!" + re.escape(start) + rb")")
-            after = skip.search(block, at)
-            at = after.end() if after is not None else size
+            at = block.index(b"\n", at) + 1
+            # The search pays only where the next line starts the same way: a file whose ranks
+            # change from line to line is stepped a line at a time, never a pattern a line.
+            if block.startswith(start, at):
+                skip = skips.get(start)
+                if skip is None:
+                    if len(skips) >= _SKIPS_MOST:
+                        skips.clear()
+                    skip = skips[start] = re.compile(rb"\n(?!" + re.escape(start) + rb")")
+                after = skip.search(block, at)
+                at = after.end() if after is not None else size
         if key is not None:
             try:
                 found.setdefault(key[0], {}).setdefault(key[1], None)
@@ -715,9 +720,10 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     `held` gives each file of its own name (or misnamed) the ranks it is seen to hold, and
     `several` the files among them that hold several; `last_steps` the ranks' last steps
     (`_steps_by_rank`) of each file that holds or may hold several, where the row uses them.
-    `resolved` has, for each file whose last megabyte shows a rank in more than one attempt, that
+    `resolved` has, for each file whose last megabyte shows a rank in more than one attempt (XC4),
+    or in one attempt while a newer one is in the part before it (`_hidden_attempts`, L21), that
     rank's last step as `resolve_attempts` keeps it, the file read whole
-    (`_rank_across_files`, XC4): a late row of a replaced attempt does not move it.
+    (`_rank_across_files`): a late row of a replaced attempt does not move it.
 
     `more` are a rank's other files (`discover_runs`' `more_files`): read as the others are for
     the count. `split` has, for each rank in `more`, its files read whole (`_rank_across_files`):
