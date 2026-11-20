@@ -1223,6 +1223,15 @@ DROPPED_ROWS_NOTE = (
     "rows the server dropped because a key of theirs was null, so they were never stored; a batch sent again after a "
     "lost acknowledgement is counted again, so this is an upper bound on the rows dropped"
 )
+# Since wave AA the server also drops a row whose `schema_version` it does not support (RS10), under
+# the key `unsupported_schema_version`. Said only where a run has such a row, so a run that dropped
+# rows for null keys alone reads as before.
+UNSUPPORTED_VERSION_KEY = "unsupported_schema_version"
+DROPPED_ROWS_NOTE_WITH_VERSIONS = (
+    "rows the server dropped because a key of theirs was null or their schema version is one it does not support, so "
+    "they were never stored; a batch sent again after a lost acknowledgement is counted again, so this is an upper "
+    "bound on the rows dropped"
+)
 
 
 def _count(value: Any) -> bool:
@@ -1260,7 +1269,8 @@ def dropped_rows(status: Mapping[str, Any] | None) -> dict[str, Any] | None:
         return None
     ranks.sort(key=lambda item: item["rank"])
     return {"rows": sum(item["rows"] for item in ranks), **({"by_key": dict(sorted(by_key.items()))} if by_key else {}),
-            "ranks": ranks, "upper_bound": True, "note": DROPPED_ROWS_NOTE}
+            "ranks": ranks, "upper_bound": True,
+            "note": DROPPED_ROWS_NOTE_WITH_VERSIONS if UNSUPPORTED_VERSION_KEY in by_key else DROPPED_ROWS_NOTE}
 
 
 def _dropped_text(dropped: Mapping[str, Any]) -> str:
@@ -1269,8 +1279,11 @@ def _dropped_text(dropped: Mapping[str, Any]) -> str:
     shown = ", ".join(f"rank {item['rank']}: {item['rows']:,}" for item in ranks[:8])
     shown += f" and {len(ranks) - 8} more ranks" if len(ranks) > 8 else ""
     keys = dropped.get("by_key") or {}
-    by_key = "; by null key: " + ", ".join(f"{key} {count:,}" for key, count in keys.items()) if keys else ""
-    return (f"the server dropped at most {rows:,} row{'s' if rows != 1 else ''} with a null key and stored none of them "
+    versions = UNSUPPORTED_VERSION_KEY in keys
+    by_key = (f"; by {'reason' if versions else 'null key'}: " + ", ".join(f"{key} {count:,}" for key, count in keys.items())
+              if keys else "")
+    why = "with a null key or an unsupported schema version" if versions else "with a null key"
+    return (f"the server dropped at most {rows:,} row{'s' if rows != 1 else ''} {why} and stored none of them "
             f"({shown}{by_key}); a batch sent again after a lost acknowledgement is counted again, so this is an upper "
             "bound")
 
