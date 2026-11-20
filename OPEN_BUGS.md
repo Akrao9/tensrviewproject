@@ -26,10 +26,10 @@ Only the rows marked *Run on main* were run again when this file was written. Ro
 | Training SDK | 2 | 7 | 1 | 10 |
 | Evidence readers, detectors, command line, MCP | 0 | 4 | 1 | 5 |
 | Rust server | 0 | 1 | 1 | 2 |
-| Experiments, examples, CI, docs | 0 | 3 | 0 | 3 |
-| **All** | **3** | **15** | **3** | **21** |
+| Experiments, examples, CI, docs | 0 | 2 | 0 | 2 |
+| **All** | **3** | **14** | **3** | **20** |
 
-There were 72 when this file was written. Waves V and W closed 51 of them in four merge groups; 21 remain, 16 of which are fixed in part and say what is still open. Three P1 rows remain, each fixed in part: SDK-22 (a process group that fails after `init`), C03 (every stop notice lost, accepted for v1) and C06 (the length check). Section 6 holds what is left of the closed findings and the two reviews' disagreements, section 7 the items the lanes raised, section 8 the audit's notes on cost and narrow cases, and section 9 the wrong behaviour the plan records from measurement. None of those is counted here.
+There were 72 when this file was written. Waves V and W closed 51 of them in four merge groups, and CI on Nov 19, 2026 closed X11; 20 remain, 14 of which are fixed in part and say what is still open (the earlier "16 of 21" counted L6 of section 7 by mistake; it was 15). Three P1 rows remain, each fixed in part: SDK-22 (a process group that fails after `init`), C03 (every stop notice lost, accepted for v1) and C06 (the length check). Section 6 holds what is left of the closed findings and the two reviews' disagreements, section 7 the items the lanes raised, section 8 the audit's notes on cost and narrow cases, and section 9 the wrong behaviour the plan records from measurement. None of those is counted here.
 
 ## 1. Can raise into training, or stop it
 
@@ -84,7 +84,6 @@ RUST-17 (Low) was shown by lane V6 and fixed: rebuilds from the stream path had 
 |---|---|---|---|---|
 | X02 | | P2 | Gate 1's older speed gate reads zero tool calls as an infinite speedup. Needs the author's amendment to the preregistration | Audit |
 | X09 | | P2 | **Open part after M2:** the detectors still judge a step Megatron skipped as one that updated the weights. Treating it as skipped needs a public `skipped=` on `session.step()`, the author's decision, parked. Fixed (lane V8): the guide's example records `megatron/update_successful` as a scalar | Run (V8) |
-| X11 | | P2 | **Open part after M2:** the two new CI jobs (Python 3.10 with PyTorch 2.6, Python 3.12 with PyTorch 2.9) have never run; this machine has neither. They run first after a push | Read |
 
 ## 6. Parts of closed findings, and where the two reviews disagree
 
@@ -142,6 +141,7 @@ Not from either review. Not counted in the 72.
 
 ## What to fix first
 
+- **First:** find why `test_a_stopped_rank_keeps_entering_the_drift_checks_gather` timed out once in CI on Python 3.12 with PyTorch 2.6 (Nov 19, 2026) and passed on a re-run. The log does not say where the two ranks stopped; a rank left waiting in a gather is what this project must not do, so a pass on re-run does not close it.
 - **Before the GPU runs:** L9 (section 7). The lead optimizer is held by a weak reference to the first optimizer that ever stepped; a user who rebuilds an optimizer and keeps the old one gets no steps counted, silently.
 - **Before a release:** the three P1 rows, each fixed in part: SDK-22, C03 and C06. SDK-22's open part needs the author's decision.
 - **Found during waves V and W, not fixed, and not counted in the 21:**
@@ -164,3 +164,4 @@ Not from either review. Not counted in the 72.
 | Wave W, merge group M3 (`main` at `af846f7`, Nov 19, 2026; lane W4) | SDK-22's first criterion and L5 (ranks on different device types), with W4's one call in `capture.py`. SDK-22 stays open above for a failure after `init`. Verified on the trial merge with gloo on CPU; not NCCL, MPI or a GPU |
 | Wave W, merge group M4 (`main` at `c0b63ab`, Nov 19, 2026; lanes W1, W2, W3) | Four of the five P1 rows: C03 and C06 (each with a part still listed above), E1 and RS05. Also E5, DET-09, DET-10, DET-11, DET-16, E3's count half, L2, RUST-05's residual and RUST-12's coverage case. The protocol number is 3. Golden files: 73 lines in 72 files, all from E3 (the `needs` text and what counts as a checkpoint input), RUST-12 and DET-16; none from E1, the step order, DET-09 or DET-11. Verified on the trial merge, with the attempt fixture, the lifecycle test, the cross-file cases and both mixed-version streaming runs; macOS and CPU only |
 | Found by CI on Linux after the waves were pushed (`23940bb`), fixed in `367c529` | Two SDK faults seen only on older PyTorch, neither in either review: a compiled router that returns a routing map broke the graph on PyTorch 2.6 (`next()` with a default inside the hook); the probe's histogram of one repeated huge value raised on PyTorch 2.6 and 2.9 (`torch.histc` with equal bounds). One test fault on Python 3.13 and 3.14 (docstring indentation). Not yet run on CI after the fix |
+| CI on `99c3b8f` (Nov 19, 2026) | X11: the two jobs it added, Python 3.10 with PyTorch 2.6 and Python 3.12 with PyTorch 2.9, ran and passed. The three faults CI had found on the push before are fixed in `367c529` and passed on every job. One job, Python 3.12 with PyTorch 2.6, failed once on `test_a_stopped_rank_keeps_entering_the_drift_checks_gather` (two gloo ranks did not finish in 120 s) and passed on a re-run with no change: intermittent, not explained, listed under "What to fix first" |
