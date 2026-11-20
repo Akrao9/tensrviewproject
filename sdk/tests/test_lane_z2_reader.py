@@ -402,3 +402,52 @@ def test_the_watcher_writes_again_when_the_servers_result_changes(tmp_path):
     assert [s["coverage"] for s in written[0]["replica"]["steps"]] == ["insufficient"]
     assert [s["coverage"] for s in written[1]["replica"]["steps"]] == ["complete"]
     assert written[1]["kind_checks"]["replica_drift"]["value"] == "checked"
+
+
+# --- 4. L21, second part: an evidence file beside a file of several ranks says which it judged ----
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+
+def _shared_file(tmp_path: Path, ranks: tuple[int, ...] = (0, 1, 2)) -> Path:
+    path = tmp_path / "job.jsonl"
+    path.write_text("".join(
+        json.dumps({"schema_version": 1, "run_id": "r1", "rank": rank, "attempt": 1, "step": step, "ts": 1.0 + step,
+                    "grad_norm": 1.0 + rank}) + "\n"
+        for step in range(3) for rank in ranks))
+    return path
+
+
+def _cli(*args: str) -> subprocess.CompletedProcess:
+    env = {**__import__("os").environ, "PYTHONPATH": str(Path(ev.__file__).resolve().parents[1])}
+    return subprocess.run([sys.executable, "-m", "tensorquill", *args], capture_output=True, text=True, env=env,
+                          timeout=120)
+
+
+def test_l21_the_evidence_of_one_rank_of_a_shared_file_names_the_ranks_it_held(tmp_path):
+    """Fail before: the evidence said `rank: 1` and nothing of ranks 0 and 2 in the same file, so a
+    reader beside it (the run listing) could not tell it was one rank's of three."""
+    path = _shared_file(tmp_path)
+    done = _cli(str(path), "--rank", "1", "--detectors", "python")
+    assert done.returncode == 0, done.stderr
+    written = json.loads(path.with_suffix(".evidence.json").read_text())
+    assert written["rank"] == 1 and written["ranks_in_source"] == [0, 1, 2]
+    # The library call says the same, for a file and for a list.
+    assert ev.build_evidence(path, rank=2)["ranks_in_source"] == [0, 1, 2]
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert ev.build_evidence(records, rank=0)["ranks_in_source"] == [0, 1, 2]
+
+
+def test_l21_a_file_of_one_rank_and_a_store_get_no_new_key(tmp_path):
+    """A control: evidence of a file that holds only the rank judged is what it was."""
+    path = _shared_file(tmp_path, ranks=(0,))
+    assert "ranks_in_source" not in ev.build_evidence(path)
+    assert "ranks_in_source" not in ev.build_evidence(path, rank=0)
+
+
+def test_l21_a_shared_file_without_a_rank_is_a_usage_error_not_a_traceback(tmp_path):
+    """Fail before: `ValueError` from `build_evidence` came out as a traceback."""
+    done = _cli(str(_shared_file(tmp_path)), "--detectors", "python")
+    assert done.returncode == 2 and "Traceback" not in done.stderr
+    assert "holds ranks 0-2: choose one with --rank N" in done.stderr

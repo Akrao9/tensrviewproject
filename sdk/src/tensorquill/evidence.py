@@ -5567,6 +5567,9 @@ def build_evidence(
     The detectors read one rank's steps. `rank` picks that rank out of a run directory or a
     list of records; records of several ranks with no `rank` given raise `ValueError`,
     because merged they repeat step numbers and give incidents that belong to neither rank.
+    The evidence names the rank judged (`rank`), and, when `rank` picked it out of a file or list
+    that also held other ranks, every rank that source held (`ranks_in_source`, L21): such an
+    evidence file beside a file of several ranks is that one rank's.
 
     `watchdog` is the server's `watchdog.json` (a path or the parsed document). A run directory
     or one of its `rank=` folders automatically reads the run's status; its progress verdict
@@ -5612,7 +5615,15 @@ def build_evidence(
     check_thresholds(overload_threshold=overload_threshold, drift_tolerance=drift_tolerance,
                      starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,
                      update_window=update_window, none_given=True)
-    every_attempt, left_out = _load_counted(source, rank)
+    held_ranks: list[int] | None = None
+    if rank is not None and not (isinstance(source, (str, Path)) and Path(source).is_dir()):
+        # A file or list is read whole either way: the ranks it holds are kept, so the evidence
+        # can say it judged one of several (L21). A store's rank folder holds one rank.
+        everything, left_out = _load_counted(source, None)
+        held_ranks = sorted({int(r.get("rank", 0)) for r in everything})
+        every_attempt = [r for r in everything if r.get("rank", 0) == rank]
+    else:
+        every_attempt, left_out = _load_counted(source, rank)
     if attempt_order:
         every_attempt = in_attempt_order(every_attempt, attempt_order)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
@@ -5797,6 +5808,9 @@ def build_evidence(
         # The rank judged (lane U7, Nov 19, 2026): a reader that holds records of several ranks
         # beside this file (`mcp_server`) uses its samples only for this rank.
         "rank": ranks[0] if ranks else rank,
+        # The ranks the file or list held when it held others than the one judged (L21): its
+        # evidence is that one rank's, and the others are not judged in it.
+        **({"ranks_in_source": held_ranks} if held_ranks is not None and held_ranks != [rank] else {}),
         "run": _manifest.run_block(run_id, _manifest.find_manifest(
             run_manifest if run_manifest is not None else source, run_id)),
         "layer_count": len(routers),
@@ -7208,14 +7222,22 @@ def main() -> None:
     if fallback is not None:
         print(f"tensorquill: warning: {fallback}. `--detectors python` asks for the Python detectors without this "
               "warning", file=sys.stderr)
-    records, left_out = _load_counted(args.input, rank)
+    # A file is read whole and its rank picked by `build_evidence`, which then says which ranks the
+    # file held (L21); a directory is read a rank at a time, as before.
+    whole_file = not args.input.is_dir()
+    records, left_out = _load_counted(args.input, None if whole_file else rank)
+    held = sorted({int(r.get("rank", 0)) for r in records})
+    if whole_file and rank is None and len(held) > 1:
+        parser.error(f"{args.input} holds ranks {_rank_ranges(held, 8)}: choose one with --rank N (the evidence is one "
+                     "rank's), or compare every rank with python -m tensorquill compare")
+    own = records if rank is None else [r for r in records if r.get("rank", 0) == rank]
     try:
-        check_one_run(records)  # a usage error with either detectors, as the Rust path gives it
+        check_one_run(own)  # a usage error with either detectors, as the Rust path gives it
     except ValueError as error:
         parser.error(str(error))
     try:
         evidence = build_evidence(
-            records, **args.thresholds, watchdog=_watchdog_beside(args.input),
+            records, rank=rank, **args.thresholds, watchdog=_watchdog_beside(args.input),
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
             traincheck=args.traincheck, detectors=detectors, run_manifest=args.input, records_file=args.input,
         )
@@ -7233,7 +7255,7 @@ def main() -> None:
     print(run_state_line(evidence))
     print(f"wrote {'evidence' if args.compact_window is None else 'compact evidence'} -> {out_json}")
     if args.rerun is not None:
-        export_rerun(evidence, args.rerun, records=resolve_attempts(records))
+        export_rerun(evidence, args.rerun, records=resolve_attempts(own))
         print(f"wrote Rerun recording -> {args.rerun}")
 
 
