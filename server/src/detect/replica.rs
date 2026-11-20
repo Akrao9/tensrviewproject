@@ -22,10 +22,13 @@
 //!   judged cells' observations go first, least recently touched step first; then the unfinished
 //!   ones, whose launch and step are then *let go*: their entries stay as they read (`insufficient`,
 //!   with the ranks then missing), and a row that arrives for them later is counted, not compared.
-//! - At most `listed_steps` step numbers are listed, the most recently touched. A step past it is
-//!   forgotten; its incidents are kept (the first `kept_incidents`) and the rest counted.
+//! - At most `listed_steps` step numbers are listed, the most recently touched, and no more than
+//!   `listed_bytes` of their entries as JSON (the object is rewritten at every status interval). A
+//!   step past either is forgotten; its incidents are kept (the first `kept_incidents`) and the rest
+//!   counted, and a row that arrives later for a launch it listed is counted, not listed again.
 //! - What any bound dropped is said under `omitted`, a key the result has only when something was:
-//!   `steps` (step numbers no longer listed), `replica_drift` (incidents no longer listed) and
+//!   `steps` (step numbers no longer listed), `replica_drift` (incidents no longer listed),
+//!   `late_rows` (rows that arrived for a launch at a step no longer listed: counted, not listed), and
 //!   `frozen` (each launch and step whose entries no longer change, with why and how many rows
 //!   arrived for it that were not compared). Nothing dropped ever reads as `complete` or `agree`.
 //!
@@ -49,6 +52,9 @@ pub const RESULT_VERSION: u64 = 1;
 pub const DEFAULT_HELD_BYTES: usize = 32 * 1024 * 1024;
 /// Step numbers listed per run.
 pub const DEFAULT_LISTED_STEPS: usize = 256;
+/// JSON of the listed steps' entries, incidents and legacy entries per run: the object is rewritten
+/// at every status interval. At 290 parameters a step where every one drifts lists about 49 KB.
+pub const DEFAULT_LISTED_BYTES: usize = 1024 * 1024;
 /// Incidents kept per run for steps no longer listed.
 pub const DEFAULT_KEPT_INCIDENTS: usize = 64;
 /// Entries of `omitted.frozen` listed; the rest are counted in `frozen_more`.
@@ -59,6 +65,7 @@ const FROZEN_LISTED: usize = 64;
 pub struct Bounds {
     pub held_bytes: usize,
     pub listed_steps: usize,
+    pub listed_bytes: usize,
     pub kept_incidents: usize,
 }
 
@@ -67,6 +74,7 @@ impl Default for Bounds {
         Self {
             held_bytes: DEFAULT_HELD_BYTES,
             listed_steps: DEFAULT_LISTED_STEPS,
+            listed_bytes: DEFAULT_LISTED_BYTES,
             kept_incidents: DEFAULT_KEPT_INCIDENTS,
         }
     }
@@ -78,6 +86,7 @@ impl Bounds {
         Self {
             held_bytes: usize::MAX,
             listed_steps: usize::MAX,
+            listed_bytes: usize::MAX,
             kept_incidents: usize::MAX,
         }
     }
@@ -511,6 +520,8 @@ struct StepState {
     frozen_spreads: BTreeMap<Scope, BTreeSet<String>>,
     frozen_legacy: Vec<Value>,
     output: Output,
+    /// The output's size as JSON, for the listing bound.
+    size: usize,
     dirty: bool,
     touched: u64,
 }
@@ -564,6 +575,13 @@ pub struct Comparison {
     kept: Vec<Value>,
     incidents_dropped: u64,
     steps_forgotten: u64,
+    /// The launches each forgotten step listed (an index into `launches`, None for no launch): a
+    /// late row for one of them is counted in `late_rows`, never listed again, so a backlog cannot
+    /// bring an old step back as `insufficient` and push a recent one out. One entry per launch and
+    /// forgotten step: a few bytes each for the run's whole length.
+    forgotten: HashMap<i64, BTreeSet<Option<usize>>>,
+    launches: Vec<String>,
+    late_rows: u64,
     version: u64,
 }
 
@@ -580,6 +598,9 @@ impl Comparison {
             kept: Vec::new(),
             incidents_dropped: 0,
             steps_forgotten: 0,
+            forgotten: HashMap::new(),
+            launches: Vec::new(),
+            late_rows: 0,
             version: 0,
         }
     }
@@ -607,6 +628,25 @@ impl Comparison {
         }
         self.clock += 1;
         self.version += 1;
+        if let Some(launches) = self.forgotten.get(&record.step) {
+            // A step no longer listed: a gathered spread there is not listed again, nor an
+            // observation of a launch it listed. A new launch at that step number is a new cell.
+            let named = record.observed.as_ref().map(|observed| {
+                observed
+                    .launch
+                    .as_ref()
+                    .map(|launch| self.launches.iter().position(|known| known == launch))
+            });
+            let late = match named {
+                None => true,
+                Some(None) => launches.contains(&None),
+                Some(Some(at)) => at.is_some() && launches.contains(&at),
+            };
+            if late {
+                self.late_rows += 1;
+                return;
+            }
+        }
         let (clock, step_number, rank, attempt) = (self.clock, record.step, record.rank, record.attempt);
         let alone = record.observed.is_none();
         let mut owner_changed: Option<(String, i64)> = None;
@@ -685,6 +725,11 @@ impl Comparison {
         loop {
             match self.judge_once(number, &mut step) {
                 Ok(output) => {
+                    step.size = [&output.entries, &output.incidents, &output.legacy]
+                        .iter()
+                        .flat_map(|list| list.iter())
+                        .map(|item| item.to_string().len() + 1)
+                        .sum();
                     step.output = output;
                     break;
                 }
@@ -922,13 +967,37 @@ impl Comparison {
 
     fn enforce_bounds(&mut self) {
         // Step numbers listed: the least recently touched go first; their incidents are kept.
-        while self.steps.len() > self.bounds.listed_steps {
+        let mut listed: usize = self.steps.values().map(|step| step.size).sum();
+        while self.steps.len() > self.bounds.listed_steps || (listed > self.bounds.listed_bytes && self.steps.len() > 1)
+        {
             let Some(oldest) = self.steps.iter().min_by_key(|(_, step)| step.touched).map(|(n, _)| *n) else {
                 break;
             };
             let step = self.steps.remove(&oldest).expect("listed");
+            listed -= step.size;
             self.held_bytes -= step.held();
             self.steps_forgotten += 1;
+            let listed: BTreeSet<Option<String>> = step
+                .output
+                .entries
+                .iter()
+                .map(|entry| entry["launch"].as_str().map(str::to_string))
+                .chain(step.rows.values().map(|row| row.launch.clone()))
+                .chain(step.frozen.keys().cloned())
+                .collect();
+            let mut indexes = BTreeSet::new();
+            for launch in listed {
+                indexes.insert(
+                    launch.map(|launch| match self.launches.iter().position(|known| *known == launch) {
+                        Some(at) => at,
+                        None => {
+                            self.launches.push(launch);
+                            self.launches.len() - 1
+                        }
+                    }),
+                );
+            }
+            self.forgotten.entry(oldest).or_default().extend(indexes);
             for incident in step.output.incidents {
                 if self.kept.len() < self.bounds.kept_incidents {
                     self.kept.push(incident);
@@ -1043,6 +1112,7 @@ impl Comparison {
         let omitted = &written["omitted"];
         self.steps_forgotten += omitted["steps"].as_u64().unwrap_or(0);
         self.incidents_dropped += omitted["replica_drift"].as_u64().unwrap_or(0);
+        self.late_rows += omitted["late_rows"].as_u64().unwrap_or(0);
         for said in omitted["frozen"].as_array().into_iter().flatten() {
             let frozen = said["step"]
                 .as_i64()
@@ -1090,6 +1160,9 @@ impl Comparison {
         }
         if self.incidents_dropped > 0 {
             omitted.insert("replica_drift".into(), json!(self.incidents_dropped));
+        }
+        if self.late_rows > 0 {
+            omitted.insert("late_rows".into(), json!(self.late_rows));
         }
         if !frozen.is_empty() {
             if frozen.len() > FROZEN_LISTED {

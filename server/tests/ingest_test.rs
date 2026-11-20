@@ -3560,3 +3560,38 @@ async fn each_rank_gets_its_own_dropped_row_line_on_stderr() {
         );
     }
 }
+
+/// Lane Z3. A run's replica result is taken up from its last `watchdog.json` before the server
+/// writes over it. When that read fails, no status is written for the run until it succeeds: the
+/// result written before is never replaced by one that lacks it.
+#[tokio::test]
+async fn a_status_that_cannot_be_read_is_not_written_over_until_its_replica_result_is_taken_up() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let written = serde_json::json!({"v": 1, "tolerance": 1e-6,
+        "steps": [{"launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47", "group": [0, 1], "step": 99, "coverage": "complete",
+            "fingerprints": "drift", "drift_parameters": ["w"], "signatures": "agree"}],
+        "replica_drift": [{"step": 99, "parameters": ["w"], "source": "replica",
+            "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47", "group": [0, 1]}]});
+    let path = object_store::path::Path::from(format!("runs/{RUN}/watchdog.json"));
+    let before = serde_json::json!({"summary": "finished", "replica": written});
+    store
+        .inner
+        .put(&path, serde_json::to_vec(&before).unwrap().into())
+        .await
+        .unwrap();
+    let server = start_on(store.clone(), manual(), None).await;
+    let _put = open(&server, 0).await;
+    until("the run is watched", || {
+        server.ingest.watchdog_statuses().contains_key(RUN)
+    })
+    .await;
+    store.knobs.fail_gets.store(true, Ordering::SeqCst);
+    server.ingest.write_watchdog().await;
+    assert_eq!(json_in(&store, &format!("runs/{RUN}/watchdog.json")).await, before);
+    store.knobs.fail_gets.store(false, Ordering::SeqCst);
+    server.ingest.write_watchdog().await;
+    let status = json_in(&store, &format!("runs/{RUN}/watchdog.json")).await;
+    assert_eq!(status["replica"], written, "{status}");
+    assert_eq!(status["run_state"]["state"], "unhealthy", "{status}");
+}

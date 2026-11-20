@@ -777,8 +777,9 @@ impl Ingest {
     /// Makes sure the run's replica comparison is held, taking up the result its last
     /// `watchdog.json` carries (a restart, or a run let go of and come back) before anything is
     /// added to it or written over it. One small read per run. False when the status could not be
-    /// read: nothing is started then, so a status written meanwhile does not drop what was written
-    /// before; the next part or status tries again.
+    /// read: nothing is started then, and `write_statuses` writes no status for the run until it is
+    /// taken up, so what was written before is not lost; the next part or status tries again. The
+    /// observations of a part stored meanwhile are not compared (a gap the report names).
     async fn replica_loaded(&self, run_id: &str) -> bool {
         if self.replicas.lock().unwrap().contains_key(run_id) {
             return true;
@@ -1566,6 +1567,11 @@ impl Ingest {
         let all_reports = self.reports.lock().unwrap().clone();
         let stored = self.stored.lock().unwrap().clone();
         for (run_id, mut status) in statuses {
+            // A run whose replica result written before has not been taken up (its status could not
+            // be read) is not written: the file would lose that result (lane Z3).
+            if self.config.detect && !self.replicas.lock().unwrap().contains_key(&run_id) {
+                continue;
+            }
             // The comparison's version is for the signature below, not for readers.
             let replica_version = status
                 .as_object_mut()

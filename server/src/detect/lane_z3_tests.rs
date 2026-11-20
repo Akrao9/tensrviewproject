@@ -341,3 +341,103 @@ fn the_run_state_counts_a_drift_raised_from_observations() {
         "{state}"
     );
 }
+
+/// A late rank's backlog for steps no longer listed is counted, not listed again: it cannot bring
+/// an old step back as `insufficient` (naming ranks that did report) or push a recent step out.
+#[test]
+fn a_backlog_for_a_forgotten_step_is_counted_not_listed() {
+    let bounds = Bounds {
+        listed_steps: 2,
+        ..Bounds::default()
+    };
+    let mut comparison = Comparison::new(1e-6, bounds);
+    for step in [99, 199, 299, 399, 499] {
+        feed(&mut comparison, &[record(0, step, 3.5, &[0, 1])]);
+    }
+    feed(
+        &mut comparison,
+        &[record(1, 99, 3.5, &[0, 1]), record(1, 199, 3.5, &[0, 1])],
+    );
+    let result = comparison.result();
+    let listed: Vec<i64> = result["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["step"].as_i64().unwrap())
+        .collect();
+    assert_eq!(listed, vec![399, 499], "{result}");
+    assert_eq!(result["omitted"], json!({"steps": 3, "late_rows": 2}));
+    feed(
+        &mut comparison,
+        &[record(1, 399, 3.5, &[0, 1]), record(1, 499, 3.6, &[0, 1])],
+    );
+    let result = comparison.result();
+    assert_eq!(result["steps"][0]["fingerprints"], "agree");
+    assert_eq!(result["steps"][1]["fingerprints"], "drift");
+    // A new launch at a forgotten step number is a new cell, judged as any other.
+    let mut new = record(0, 99, 3.5, &[0, 1]);
+    new["replica"]["launch"] = json!("b09d7e6f5a4c4b3a8f2e1d0c9b8a7f65");
+    feed(&mut comparison, &[new]);
+    assert_eq!(
+        comparison.result()["steps"][0]["launch"],
+        "b09d7e6f5a4c4b3a8f2e1d0c9b8a7f65"
+    );
+}
+
+/// What the `replica` object weighs at the listing bound: 256 steps, 290 parameters (as one recorded
+/// capture names), 8 ranks; clean, and the worst case where every parameter drifts and differs and
+/// every record also holds a gathered spread of every parameter.
+/// `cargo test --lib size_at_the_bounds -- --ignored --nocapture`
+#[test]
+#[ignore = "a measurement, not a check"]
+fn size_at_the_bounds() {
+    let observation = |rank: i64, step: i64, drift: bool| {
+        let params: serde_json::Map<String, Value> = (0..290)
+            .map(|at| {
+                let norm = if drift && rank == 1 { 3.6 } else { 3.5 };
+                let sig = if drift && rank == 1 {
+                    "1"
+                } else {
+                    "-4611686018427387904"
+                };
+                (
+                    format!("model.layers.{at}.mlp.down_proj.weight"),
+                    json!({"shape": [4096, 11008], "dtype": "bfloat16", "fp": [norm, -1.25, 0.75], "sig": sig}),
+                )
+            })
+            .collect();
+        let mut record = json!({"run_id": "r1", "rank": rank, "attempt": 1_795_000_000_000_i64 + rank, "step": step,
+            "replica": {"v": 1, "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47", "group": (0..8).collect::<Vec<i64>>(),
+                "device": "cuda", "projection": "name-v1", "signature": "fold64-v1", "params": params}});
+        if drift {
+            let table: serde_json::Map<String, Value> = (0..290)
+                .map(|at| {
+                    (
+                        format!("model.layers.{at}.mlp.down_proj.weight"),
+                        json!([0.01, 0.01, 0.01]),
+                    )
+                })
+                .collect();
+            record["replica_spread"] = json!(table);
+        }
+        record
+    };
+    eprintln!(
+        "one observation: {} bytes of JSON",
+        observation(0, 99, false)["replica"].to_string().len()
+    );
+    for drift in [false, true] {
+        let mut comparison = Comparison::new(1e-6, Bounds::default());
+        for step in 0..300 {
+            let records: Vec<Value> = (0..8).map(|rank| observation(rank, 99 + 100 * step, drift)).collect();
+            feed(&mut comparison, &records);
+        }
+        let text = comparison.status_object().to_string();
+        eprintln!(
+            "drift on every parameter: {drift}: replica object {} bytes, {} steps listed, observation JSON held {} bytes",
+            text.len(),
+            comparison.result()["steps"].as_array().unwrap().len(),
+            comparison.held_bytes()
+        );
+    }
+}
