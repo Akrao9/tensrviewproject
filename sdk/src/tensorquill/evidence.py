@@ -5347,13 +5347,13 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
     The step is compared with the last earlier one on which the router routed tokens, or else
     the last earlier one. At the layer's first step there is none: the heading says so, every
     delta is `n/a` and the rows are sorted by load (DET-14; until Nov 19, 2026 the first step
-    was compared with itself, every delta +0.00).
+    was compared with itself, every delta +0.00). In compact evidence that left out the step it
+    is compared with, the heading says so and the deltas are `n/a` the same way (DET-13).
 
-    Raises `compact.SamplesOmitted` for a step, or a step to compare it with, that compact
-    evidence left out."""
+    Raises `compact.SamplesOmitted` for a step that compact evidence left out."""
     from .compact import require_table
 
-    require_table(evidence, step, layer)
+    compared_here = require_table(evidence, step, layer)
     expert_count = int(evidence.get("expert_count", 0))
     samples = {(int(s["step"]), int(s["layer"])): s for s in evidence.get("samples", ())}
     sample = samples.get((step, layer)) or _missing_sample(step, layer, expert_count)
@@ -5370,6 +5370,8 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
         previous = max(prior_steps)
     else:
         previous = None  # the layer's first step: nothing earlier to compare it with
+    if not compared_here:
+        previous = None  # left out of a compact file: never an earlier window's step instead
     baseline = samples.get((previous, layer)) if previous is not None else None
 
     tokens = int(sample.get("routed_tokens") or 0)
@@ -5409,7 +5411,9 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
     return "\n".join(
         [
             f"**Layer {layer:02} expert load** · step {step} "
-            + (f"vs. {previous}" if previous is not None else "(no earlier step to compare with)"),
+            + (f"vs. {previous}" if previous is not None
+               else "(the step it is compared with was left out of this compact file)" if not compared_here
+               else "(no earlier step to compare with)"),
             "",
             "| Expert | Load | Δ load (pp) | Status |",
             "| --- | --- | --- | --- |",
