@@ -1124,6 +1124,9 @@ mod store {
         /// new attempt and read once per rank a server takes up.
         pub order_gets: AtomicUsize,
         pub order_puts: AtomicUsize,
+        /// Reads of a run's `watchdog.json`, also counted in `gets`: a server reads it once per run to
+        /// take up the replica result it carries (lane Z3, Nov 20, 2026).
+        pub status_gets: AtomicUsize,
         /// The next this-many writes of an `attempts.json` fail (and are not stored).
         pub fail_order_puts: AtomicUsize,
         /// The next this-many writes of an `incidents.json` fail (and are not stored); other writes
@@ -1267,6 +1270,9 @@ mod store {
                     self.knobs.order_gets.fetch_add(1, Ordering::SeqCst);
                     self.wait().await;
                     return self.inner.get_opts(location, options).await;
+                }
+                if location.as_ref().ends_with("watchdog.json") {
+                    self.knobs.status_gets.fetch_add(1, Ordering::SeqCst);
                 }
                 let whole = !matches!(options.range, Some(GetRange::Suffix(_) | GetRange::Bounded(_)));
                 if whole {
@@ -3465,7 +3471,10 @@ async fn a_report_whose_write_failed_is_written_again_without_a_later_part() {
         assert!(tokio::time::Instant::now() < deadline, "the report was never written");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let rebuilds_before = store.knobs.gets.load(Ordering::SeqCst);
+    // Reads of parts and reports; not the one read of the run's status that takes up its replica
+    // result (lane Z3).
+    let reads = || store.knobs.gets.load(Ordering::SeqCst) - store.knobs.status_gets.load(Ordering::SeqCst);
+    let rebuilds_before = reads();
     // Nothing more is sent. The flusher's pass, about once a second here, writes the report again.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -3487,7 +3496,7 @@ async fn a_report_whose_write_failed_is_written_again_without_a_later_part() {
         "{report}"
     );
     // The report came from the detectors held, not from a rebuild that read the rank's parts again.
-    assert_eq!(store.knobs.gets.load(Ordering::SeqCst), rebuilds_before);
+    assert_eq!(reads(), rebuilds_before);
     put.finish().await;
 }
 
@@ -3550,4 +3559,39 @@ async fn each_rank_gets_its_own_dropped_row_line_on_stderr() {
             "no line for rank {rank}: {stderr}"
         );
     }
+}
+
+/// Lane Z3. A run's replica result is taken up from its last `watchdog.json` before the server
+/// writes over it. When that read fails, no status is written for the run until it succeeds: the
+/// result written before is never replaced by one that lacks it.
+#[tokio::test]
+async fn a_status_that_cannot_be_read_is_not_written_over_until_its_replica_result_is_taken_up() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let written = serde_json::json!({"v": 1, "tolerance": 1e-6,
+        "steps": [{"launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47", "group": [0, 1], "step": 99, "coverage": "complete",
+            "fingerprints": "drift", "drift_parameters": ["w"], "signatures": "agree"}],
+        "replica_drift": [{"step": 99, "parameters": ["w"], "source": "replica",
+            "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47", "group": [0, 1]}]});
+    let path = object_store::path::Path::from(format!("runs/{RUN}/watchdog.json"));
+    let before = serde_json::json!({"summary": "finished", "replica": written});
+    store
+        .inner
+        .put(&path, serde_json::to_vec(&before).unwrap().into())
+        .await
+        .unwrap();
+    let server = start_on(store.clone(), manual(), None).await;
+    let _put = open(&server, 0).await;
+    until("the run is watched", || {
+        server.ingest.watchdog_statuses().contains_key(RUN)
+    })
+    .await;
+    store.knobs.fail_gets.store(true, Ordering::SeqCst);
+    server.ingest.write_watchdog().await;
+    assert_eq!(json_in(&store, &format!("runs/{RUN}/watchdog.json")).await, before);
+    store.knobs.fail_gets.store(false, Ordering::SeqCst);
+    server.ingest.write_watchdog().await;
+    let status = json_in(&store, &format!("runs/{RUN}/watchdog.json")).await;
+    assert_eq!(status["replica"], written, "{status}");
+    assert_eq!(status["run_state"]["state"], "unhealthy", "{status}");
 }

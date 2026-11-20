@@ -145,6 +145,8 @@ pub struct IngestConfig {
     /// A run whose status has read finished or abandoned, and been written so, for this long is
     /// let go of: nothing of it is held in memory (see `Ingest::evict_settled`).
     pub evict_after: Duration,
+    /// What the cross-rank comparison of replica observations holds per run (`detect::replica`).
+    pub replica_bounds: crate::detect::replica::Bounds,
 }
 
 impl Default for IngestConfig {
@@ -166,6 +168,7 @@ impl Default for IngestConfig {
             report_grace: DEFAULT_REPORT_GRACE,
             replay_backoff: DEFAULT_REPLAY_BACKOFF,
             evict_after: DEFAULT_EVICT_AFTER,
+            replica_bounds: crate::detect::replica::Bounds::default(),
         }
     }
 }
@@ -335,6 +338,12 @@ fn behind(at: (i64, i64), newest: (i64, i64)) -> bool {
     at.0 != newest.0 || at.1 < newest.1
 }
 
+/// One run's replica comparison and the `replica` object last built from it, with its version.
+struct ReplicaRun {
+    comparison: crate::detect::replica::Comparison,
+    built: Option<(u64, serde_json::Value)>,
+}
+
 pub struct Ingest {
     storage: Storage,
     config: IngestConfig,
@@ -350,6 +359,10 @@ pub struct Ingest {
     /// Each rank's last batch hashes, from its detectors, by run and rank: compared across the
     /// ranks of a run into the status's `duplicate_batches` and `ranks_compared`.
     data_windows: Mutex<HashMap<String, BTreeMap<i32, DataWindow>>>,
+    /// Each run's comparison of its ranks' replica observations (contract sections 2 to 7), and the
+    /// `replica` object last built from it, by the comparison's version. A run is here once its
+    /// result written before (if any) has been taken up (`replica_loaded`).
+    replicas: Mutex<HashMap<String, ReplicaRun>>,
     /// What each rank's detectors last reported, for the run state in `watchdog.json`. Kept
     /// apart from the rank buffers so the watchdog never waits for a flush or a rebuild.
     reports: Mutex<HashMap<Key, RankReport>>,
@@ -395,6 +408,7 @@ impl Ingest {
             watchdog,
             written: Mutex::new(HashMap::new()),
             data_windows: Mutex::new(HashMap::new()),
+            replicas: Mutex::new(HashMap::new()),
             reports: Mutex::new(HashMap::new()),
             stored: Mutex::new(HashMap::new()),
             manifests: Mutex::new(HashMap::new()),
@@ -507,6 +521,7 @@ impl Ingest {
         runs.extend(self.reports.lock().unwrap().keys().map(|key| key.0.clone()));
         runs.extend(self.stored.lock().unwrap().keys().map(|key| key.0.clone()));
         runs.extend(self.data_windows.lock().unwrap().keys().cloned());
+        runs.extend(self.replicas.lock().unwrap().keys().cloned());
         runs.extend(self.manifests.lock().unwrap().keys().cloned());
         runs.extend(self.written.lock().unwrap().keys().cloned());
         runs.extend(self.dropped_log.lock().unwrap().keys().map(|key| key.0.clone()));
@@ -717,9 +732,87 @@ impl Ingest {
             let _ = ack.send(Ok(result)); // the sender may be gone; it resends from its offset
         }
         if self.config.detect && !stored.is_empty() {
+            self.take_replicas(key, &stored).await;
             self.detect(key, buffer, &stored).await;
         }
         Ok(())
+    }
+
+    /// Gives the run's replica comparison the observations and gathered spreads of a part that has
+    /// just been stored and acknowledged: the clock of contract 7 starts at that acknowledgement, the
+    /// step is judged here, and the next status written carries the verdict. Every attempt's rows
+    /// are taken, as stored; the first attempt by the rank's order (contract 1) keeps a launch.
+    /// Nothing here can fail a flush: a panic is written to stderr and the run's comparison is taken
+    /// up again from its last status at the next part.
+    async fn take_replicas(&self, key: &Key, stored: &[RecordBatch]) {
+        let tolerance = self.config.thresholds.drift_tolerance;
+        let records: Vec<_> = stored
+            .iter()
+            .flat_map(|batch| crate::detect::replica::records_from_batch(batch, i64::from(key.1), tolerance))
+            .collect();
+        if records.is_empty() {
+            return;
+        }
+        self.replica_loaded(&key.0).await;
+        let order = self.watchdog.order(key);
+        let place = |_rank: i64, attempt: i64| order.position(attempt);
+        let mut runs = self.replicas.lock().unwrap();
+        let Some(run) = runs.get_mut(&key.0) else {
+            return;
+        };
+        let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for record in records {
+                run.comparison.insert(record, &place);
+            }
+        }));
+        if taken.is_err() {
+            eprintln!(
+                "tensorquill-server: the replica comparison of {} panicked on rank {}'s rows; taken up again from its last status",
+                key.0, key.1
+            );
+            runs.remove(&key.0);
+        }
+    }
+
+    /// Makes sure the run's replica comparison is held, taking up the result its last
+    /// `watchdog.json` carries (a restart, or a run let go of and come back) before anything is
+    /// added to it or written over it. One small read per run. False when the status could not be
+    /// read: nothing is started then, and `write_statuses` writes no status for the run until it is
+    /// taken up, so what was written before is not lost; the next part or status tries again. The
+    /// observations of a part stored meanwhile are not compared (a gap the report names).
+    async fn replica_loaded(&self, run_id: &str) -> bool {
+        if self.replicas.lock().unwrap().contains_key(run_id) {
+            return true;
+        }
+        let written = match self.storage.read_status(run_id).await {
+            Ok(status) => status.and_then(|status| status.get("replica").cloned()),
+            Err(error) => {
+                eprintln!(
+                    "tensorquill-server: cannot read the status of {run_id} to take up its replica result: {error}"
+                );
+                return false;
+            }
+        };
+        self.take_up_replica(run_id, written.as_ref());
+        true
+    }
+
+    /// Holds a comparison for the run, from the `replica` object written before when there is one.
+    fn take_up_replica(&self, run_id: &str, written: Option<&serde_json::Value>) {
+        let mut runs = self.replicas.lock().unwrap();
+        runs.entry(run_id.to_string()).or_insert_with(|| {
+            let mut comparison = crate::detect::replica::Comparison::new(
+                self.config.thresholds.drift_tolerance,
+                self.config.replica_bounds,
+            );
+            if let Some(written) = written {
+                comparison.restore(written);
+            }
+            ReplicaRun {
+                comparison,
+                built: None,
+            }
+        });
     }
 
     /// Runs the detectors over a part that has just been stored and acknowledged, and
@@ -1267,7 +1360,13 @@ impl Ingest {
 
     /// The progress status of every run, as the server sees it now.
     pub fn watchdog_statuses(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
-        self.with_data(self.watchdog.statuses(Instant::now(), true))
+        let mut statuses = self.with_data(self.watchdog.statuses(Instant::now(), true));
+        for status in statuses.values_mut() {
+            if let Some(status) = status.as_object_mut() {
+                status.remove("replica_version");
+            }
+        }
+        statuses
     }
 
     /// Adds each run's cross-rank data comparison to its status: always `ranks_compared`, the
@@ -1278,7 +1377,19 @@ impl Ingest {
     /// reader tell "compared, none found" from "not compared", after a restart too.
     fn with_data(&self, mut statuses: BTreeMap<String, serde_json::Value>) -> BTreeMap<String, serde_json::Value> {
         let windows = self.data_windows.lock().unwrap();
+        let mut replicas = self.replicas.lock().unwrap();
         for (run_id, status) in statuses.iter_mut() {
+            // The run's replica result (contract 8), once a result written before has been taken up:
+            // a run whose last status could not be read has none in this status.
+            if let Some(run) = replicas.get_mut(run_id).filter(|_| self.config.detect) {
+                let version = run.comparison.version();
+                if run.built.as_ref().is_none_or(|(built, _)| *built != version) {
+                    run.built = Some((version, run.comparison.status_object()));
+                }
+                status["replica"] = run.built.as_ref().expect("just built").1.clone();
+                // For `write_statuses`' signature only: the version this object was built from.
+                status["replica_version"] = serde_json::json!(version);
+            }
             let run = windows.get(run_id);
             status["ranks_compared"] = serde_json::json!(run.map(crate::detect::ranks_compared).unwrap_or_default());
             if let Some(found) = run.and_then(crate::detect::duplicate_batches) {
@@ -1312,6 +1423,9 @@ impl Ingest {
             match status {
                 Ok(Some(status)) => match self.watchdog.restore(&run_id, &status, now) {
                     Ok(true) => {
+                        if self.config.detect {
+                            self.take_up_replica(&run_id, status.get("replica"));
+                        }
                         restored += 1;
                         taken_up.extend(self.watchdog.rank_keys(&run_id));
                     }
@@ -1350,7 +1464,13 @@ impl Ingest {
     /// written again once `status_refresh` has passed, unless the run finished: a reader has
     /// only this file to tell that the server is still watching a run in which nothing moves.
     pub async fn write_watchdog(&self) {
-        self.write_statuses(self.watchdog_statuses()).await;
+        if self.config.detect {
+            for run_id in self.watchdog.run_ids() {
+                self.replica_loaded(&run_id).await;
+            }
+        }
+        self.write_statuses(self.with_data(self.watchdog.statuses(Instant::now(), true)))
+            .await;
         self.evict_settled();
     }
 
@@ -1420,6 +1540,7 @@ impl Ingest {
         self.reports.lock().unwrap().retain(|key, _| key.0 != run_id);
         self.stored.lock().unwrap().retain(|key, _| key.0 != run_id);
         self.data_windows.lock().unwrap().remove(run_id);
+        self.replicas.lock().unwrap().remove(run_id);
         self.manifests.lock().unwrap().remove(run_id);
         self.written.lock().unwrap().remove(run_id);
         self.order_locks.lock().unwrap().retain(|key, _| key.0 != run_id);
@@ -1446,6 +1567,16 @@ impl Ingest {
         let all_reports = self.reports.lock().unwrap().clone();
         let stored = self.stored.lock().unwrap().clone();
         for (run_id, mut status) in statuses {
+            // A run whose replica result written before has not been taken up (its status could not
+            // be read) is not written: the file would lose that result (lane Z3).
+            if self.config.detect && !self.replicas.lock().unwrap().contains_key(&run_id) {
+                continue;
+            }
+            // The comparison's version is for the signature below, not for readers.
+            let replica_version = status
+                .as_object_mut()
+                .and_then(|status| status.remove("replica_version"))
+                .unwrap_or_default();
             status["refresh_seconds"] = serde_json::json!(self.config.status_refresh.as_secs_f64());
             // A report that stops before the newest part stored for its rank, and has for longer
             // than `report_grace`, is behind: its rank is not judged until it catches up, and its
@@ -1479,6 +1610,7 @@ impl Ingest {
                 "abandoned": status["abandoned"],
                 "duplicates": status["duplicate_batches"],
                 "compared": status["ranks_compared"],
+                "replica": replica_version,
                 "run_state": status["run_state"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
                     ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object(), (r["attempt"].clone(), r["attempt_without_steps"].clone(), r["superseded_rows"].clone(), r["capture_stopped"]["reason"].clone()), r["dropped_row_keys"].clone())).collect::<Vec<_>>()
