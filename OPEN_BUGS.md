@@ -1,10 +1,10 @@
 # TensorQuill: open bugs, consolidated
 
-One list of the open bugs known from the two code reviews and the fix lanes, as of `main` at `c0b63ab`, after all four merge groups of waves V and W (Nov 19, 2026). It joins three sources that were tracked apart:
+One list of the open bugs known from the two code reviews and the fix lanes, as of `main` at `dc7cad0`, after all four merge groups of waves V and W and the six lanes of wave X (Nov 19, 2026). It joins three sources that were tracked apart:
 
 - `CODEBASE_AUDIT.md`, the second audit: 70 finding groups with IDs C, RS and X. Its evidence-reader rows have no IDs, so they are numbered E1 to E8 here.
 - `codebase_review_findings.md`, the first outside review: 87 findings with IDs SDK, DET, CLI and RUST.
-- The open items the fix lanes raised themselves, numbered L1 to L8 here.
+- The open items the fix lanes raised themselves, numbered L1 to L18 here.
 
 Both audit files are untracked. The decision log for all of this is `TensorQuill v3 — Product and Build Plan.md`.
 
@@ -24,12 +24,12 @@ Only the rows marked *Run on main* were run again when this file was written. Ro
 |---|---:|---:|---:|---:|
 | Can raise into training, or stop it | 1 | 0 | 0 | 1 |
 | Training SDK | 2 | 7 | 1 | 10 |
-| Evidence readers, detectors, command line, MCP | 0 | 4 | 1 | 5 |
+| Evidence readers, detectors, command line, MCP | 0 | 1 | 0 | 1 |
 | Rust server | 0 | 1 | 1 | 2 |
 | Experiments, examples, CI, docs | 0 | 2 | 0 | 2 |
-| **All** | **3** | **14** | **3** | **20** |
+| **All** | **3** | **11** | **2** | **16** |
 
-There were 72 when this file was written. Waves V and W closed 51 of them in four merge groups, and CI on Nov 19, 2026 closed X11; 20 remain, 14 of which are fixed in part and say what is still open. A recount by script on Nov 19, 2026 found 15 rows marked as fixed in part among the 21, not the 16 this file gave before. Three P1 rows remain, each fixed in part: SDK-22 (a process group that fails after `init`), C03 (every stop notice lost, accepted for v1) and C06 (the length check). Section 6 holds what is left of the closed findings and the two reviews' disagreements, section 7 the items the lanes raised, section 8 the audit's notes on cost and narrow cases, and section 9 the wrong behaviour the plan records from measurement. None of those is counted here.
+There were 72 when this file was written. Waves V and W closed 51 of them in four merge groups, and CI on Nov 19, 2026 closed X11; wave X closed four more (DET-14, DET-17, CLI-13, CLI-14); 16 remain, 12 of which are fixed in part and say what is still open. A recount by script on Nov 19, 2026 found 15 rows marked as fixed in part among the 21, not the 16 this file gave before. Three P1 rows remain, each fixed in part: SDK-22 (a process group that fails after `init`), C03 (every stop notice lost, accepted for v1) and C06 (the length check). Section 6 holds what is left of the closed findings and the two reviews' disagreements, section 7 the items the lanes raised, section 8 the audit's notes on cost and narrow cases, and section 9 the wrong behaviour the plan records from measurement. None of those is counted here.
 
 ## 1. Can raise into training, or stop it
 
@@ -44,36 +44,32 @@ There were 72 when this file was written. Waves V and W closed 51 of them in fou
 | ID | Issue | Checked | State |
 |---|---|---|---|
 | C03 | **Open part after M4, accepted for v1 by the author:** if every stop notice is lost and the server sees a clean close, the run reads `finished`. Not a bug, by the author's decision of Nov 19, 2026 ("yes keep raising"): a stopped rank that then reads `unresponsive` or `lost` raises `job_stalled` or `rank_silent`, in both engines, as contract 3 has it; such a rank still sends heartbeats, so their stopping is new evidence. Still open from that decision: the incident does not say that capture had stopped earlier, at which step and why, so a reader cannot see that TensorQuill cannot tell whether training itself stalled (both engines, not started). Fixed (lanes W1, W2, W3, contract 3): the heartbeat says capture stopped on every beat, the server has a state and a summary word of its own for it that survive a restart, and a run with such a rank never reads healthy | Run (W1, W2, W3; the lifecycle test) | Fixed in part |
-| C06 | **Open part after M4:** the length check accepts any whole multiple of the token count, whatever `top_k` says. Fixed (lane W1): a negative index is no assignment, counted and written as `moe_unassigned`; an index at or above `n_experts` refuses the router with a reason; the `indices=` path follows the same rule; `moe_left_out` records the routing-map entries left out, per expert | Run (W1) | Fixed in part |
+| C06 | **Open part after wave X:** on the default integer path a `top_k` above `n_experts` is still counted, because `test_router_guard.py` asserts it (line 625; that file was outside lane X1's). Fixed (lane X1): the expert ids must number tokens × `top_k`, on the default and the `indices=` paths, and any other count refuses the router with a reason. Fixed (lane W1): a negative index is no assignment, counted and written as `moe_unassigned`; an index at or above `n_experts` refuses the router with a reason; the `indices=` path follows the same rule; `moe_left_out` records the routing-map entries left out, per expert | Run (W1, X1) | Fixed in part |
 
 ### P2, P3, Medium and Low
 
 | ID | Also known as | Priority | Issue | Checked |
 |---|---|---|---|---|
 | C11 | | P2 | A closed session's forward hooks still run on every forward. `close()` leaves them on purpose: its docstring says removing a hook from a compiled module triggers a recompile | Read |
-| C12 | | P2 | **Open part after M1:** a parameter unfrozen after `init` is still not recorded; it is now named once in a warning. The other half is fixed (lane V1): an optimizer given the model later by `add_param_group` ends steps | Run (V1) |
+| C12 | | P2 | **Open part after wave X:** a parameter unfrozen after `init` is still not recorded; it is named once in a warning. Recording it does not break the record schema, but both engines' `update_spike` then fires a false incident at the unfreeze step (L13); lane X1 kept the working patch out. Fixed (lane X1): an optimizer that holds only frozen parameters ends steps, and so does a model whose every parameter is frozen at `init`, which catches TrainCheck B1 as `stalled_weights`. Fixed (lane V1): an optimizer given the model later by `add_param_group` ends steps | Run (V1, X1) |
 | C14 | | P2 | **Open part after M1, a stated limit:** two different weights that share a float64 norm are still listed in `weights_unchanged` (swapped rows, for example). Lane V1 fixed what the record claims: its documentation now says an equal norm is necessary, not sufficient, and a parameter that was not compared is never listed (contract 2) | Run (V1) |
-| C16 | | P2 | **Open part after M1:** the first resume after upgrading the SDK is not compared, once; the old writer's collisions stay in old stores; a list starting with an int that holds a bool hashes as its integers. Fixed (lanes V2, V3, V7): the new writer's `v2:` hashes do not collide, and both readers compare only hashes of one kind | Run (V2, V3, V7) |
+| C16 | | P2 | **Open part after M1:** the first resume after upgrading the SDK is not compared, once; the old writer's collisions stay in old stores. Fixed (lane X4): a batch of bools and other integers no longer hashes as its integers; a step that drew one is written `v3:`, so neither reader compares it with a `v2:` hash, and the protocol number is unchanged. Fixed (lanes V2, V3, V7): the new writer's `v2:` hashes do not collide, and both readers compare only hashes of one kind | Run (V2, V3, V7, X4) |
 | C20 | SDK-12 | P2 | **Open part after M1:** an unmarked evaluation's time is still in `step_time`; there is no host signal for it. Fixed (lane V1): a marked pause is out of `step_time`, and evaluation fetches, marked or not, are out of `data_wait` | Run (V1) |
-| C22 | SDK-11, SDK-17 | P2 | **Open part after M1:** on MPS squares of norms above about 1.8e19 still overflow (shown as `overflow_positions`, not as NaN; not run, no MPS here); a mean that overflows float32 is counted as overflow, not read. The rest is fixed (lane V2) | Run (V2) |
+| C22 | SDK-11, SDK-17 | P2 | **Open part after wave X:** still counted as overflow, not read: on MPS, squares of norms above about 1.8e19 (not run, no MPS here); a logit too large for BF16; logits near float32's largest value with both signs in one row. Evidence built from a server's report has no `head_trends`, so the overflow count shows only when Python reads the records (L15). Fixed (lane X4): a mean whose float32 sum overflows is read. Fixed (lane X3): `head_trends.overflow_positions` gives the probes, the positions, the most in one probe and the first and latest step. The rest is fixed (lane V2) | Run (V2, X3, X4) |
 | SDK-16 | | Medium | **Open part after M1:** the wrapper-module fix (lane V2) was not run with a real LightningModule, DDP or FSDP | Run (V2) |
-| SDK-23 | | Low | On a stack with two layer classes only one class's blocks are watched; an encoder-decoder gets only the larger stack | Run (T6) |
+| SDK-23 | | Low | On a stack with two layer classes only one class's blocks are watched; an encoder-decoder gets only the larger stack. Located by lane X4: `_block_layers` in `capture.py` keeps only the largest single-class `ModuleList`; not fixed, the file was lane X1's | Run (T6); read (X4) |
 
 ## 3. Evidence readers, detectors, command line and MCP
 
 | ID | Also known as | Priority | Issue | Checked |
 |---|---|---|---|---|
-| DET-13 | | Medium | The compact file's table refuses a baseline it cannot show, and only the earliest starvation onset anchors the window | Read |
-| DET-14 | | Medium | **Open part after M1:** at a run's first step the expert-load table compares the step with itself. Fixed (lane V3): the table is shown at the first step and layer names are escaped | Run (V3) |
-| DET-17 | | Low | **Open part after M4:** four other modules still parse `rank=` on their own (`manifest.py`, `runs.py`, `mcp_server.py`, `trigger.py`). Fixed (lanes V3, W3): the evidence readers share one `rank=` parser and `attempt=` folders are read as ASCII digits only | Run (V3, W3) |
-| CLI-13 | | Medium | **Open part after M4:** `runs` judges the order across a rank's files from each file's first and last records only, so an attempt that appears only in the middle of a file is not seen there (`compare` reads every record); the `end` cell still reads only the first file. Fixed (lanes V4, W3, contract 1): both files are read, and their order is each file's own order first, then `ts`, then attempt number, never path order | Run (V4, W3) |
-| CLI-14 | | Medium | MCP serves no head or attention probe series | Read |
+| DET-13 | | Medium | **Open part after wave X:** when the earlier step did route tokens and was left out of the compact file, the table is still refused; showing it with `n/a` deltas needs a change in `expert_load_table` (`evidence.py`), and `test_compact.py` pins the refusal. Fixed (lane X5): each later starvation onset gets its own window, up to 16, and the rest are counted (on the Granite captures the file keeps 68 of 650 steps, where it kept 22); the table is no longer refused when the router routed no token before the window | Run (X5) |
 
 ## 4. Rust server
 
 | ID | Also known as | Priority | Issue | Checked |
 |---|---|---|---|---|
-| RS10 | RUST-11 | P2 | **Open part after M1:** live ingest's per-row check (`keep_new_rows`) is unchanged. Fixed (lane V7): the offline modes refuse null or mistyped run, rank, step and attempt keys | Run (V7) |
+| RS10 | RUST-11 | P2 | **Open part after wave X:** the count of dropped rows reaches only stderr, not `watchdog.json`; a key column that is missing or of another type still refuses the whole batch and ends the stream; per-row `schema_version` values are not checked. Fixed (lane X6): live ingest drops a row with a null run, rank, step, attempt or schema version, counts it by key, and stores and acknowledges the rest of its batch. Fixed (lane V7): the offline modes refuse null or mistyped run, rank, step and attempt keys | Run (V7, X6) |
 | RS17 | RUST-15 | P3 | A negative expert count is judged as a routed sample. The audit ran it on a recorded vector `[-1, 3]`; T6 says no writer makes one, so it does not hold as a live bug | Audit |
 
 RUST-17 (Low) was shown by lane V6 and fixed: rebuilds from the stream path had no shared bound; they now share one of 16.
@@ -103,10 +99,14 @@ These are not in either audit.
 |---|---|---|
 | L1 | U1 | The tensor-subclass rule under `torch.compile` was run on `eager` and `aot_eager`, not on inductor |
 | L3 | U4 | The server's ack carries no store ID |
-| L6 | U6 | **Open part after M1:** in the all-ranks evidence a rank with `attempt_without_steps` is still counted among judged ranks; only `run_state` calls it unknown. Fixed (lane V3): the readers look at the flag |
-| L9 | W1 | Found in wave W, not fixed: the lead optimizer is a weak reference to the first optimizer that ever stepped. While that object stays alive, a new optimizer on the same model never leads and its steps are not counted, silently (an LR finder, or a user who rebuilds the optimizer and keeps the old one) |
 | L10 | V7 | A lone rank with batch hashes is still listed in `ranks_compared`, though it has no rank to be compared with. Existing behaviour, left as it is; a question for the author |
 | L12 | W2 | Limits of contract 1, stated in the contract: a stream that ends before its first batch is not attributed; two attempts first met by claim in one outage go by arrival; across local files, attempts no file orders go by `ts`, which is each host's clock; a lower-numbered replacement whose rows beat its first heartbeat, from a sender with no `sender_attempt`, is taken as backlog |
+| L13 | X1 | `update_spike`, in both engines, compares a record that names a parameter with one that does not, so recording a parameter unfrozen after `init` fires a false incident at the unfreeze step. It should compare only the parameters both records name. Blocks the rest of C12; the patch is in lane X1's notes |
+| L14 | X3 | `compare.py` keeps its own list of reasons and has none for the new `earlier_attempt` state, so with `read_parts` a started-again rank gets `unknown_why: null`. Nothing raises |
+| L15 | X3 | Evidence built from a server's report has no `head_trends`, and no MCP tool shows `head_trends`. `read_server_report` does not check the thresholds it is given; a bad value reads as `other_thresholds` |
+| L16 | X5 | `evidence._rank_number` is private and three modules now import it (`manifest.py`, `runs.py`, `mcp_server.py`); it should get a public name |
+| L17 | X6 | If writing `incidents.json` fails, the rank still waits for a later part to get its report (the retry of a failed rebuild no longer does). One rate limit covers every rank's dropped-row line on stderr |
+| L18 | X2 | Waits between two ranks, measured on PyTorch 2.15 with gloo on macOS: a rank that reaches `init_process_group` after its peer has given up waits with no limit; a stopped rank's `_gather_and_drop` swallows a gather timeout, so it can sit 60 s for each unmatched gather and say nothing. Both bear on SDK-22 |
 
 ## 8. The second audit's notes on cost and narrow cases
 
@@ -141,11 +141,11 @@ Not from either review. Not counted in the 72.
 
 ## What to fix first
 
-- **First:** find why `test_a_stopped_rank_keeps_entering_the_drift_checks_gather` timed out once in CI on Python 3.12 with PyTorch 2.6 (Nov 19, 2026) and passed on a re-run. The log does not say where the two ranks stopped; a rank left waiting in a gather is what this project must not do, so a pass on re-run does not close it.
-- **Before the GPU runs:** L9 (section 7). The lead optimizer is held by a weak reference to the first optimizer that ever stepped; a user who rebuilds an optimizer and keeps the old one gets no steps counted, silently.
+- **First:** find why `test_a_stopped_rank_keeps_entering_the_drift_checks_gather` timed out once in CI on Python 3.12 with PyTorch 2.6 (Nov 19, 2026) and passed on a re-run. The log does not say where the two ranks stopped; a rank left waiting in a gather is what this project must not do, so a pass on re-run does not close it. Lane X2 (wave X) did not find the cause: 550 two-rank runs with no hang (300 under CPU load) and 3,600 randomized runs with no mismatch in the stopped rank's gather schedule, all on PyTorch 2.15 on macOS, which says little about PyTorch 2.6 on Linux. The test now prints each rank's progress and every thread's stack if it times out again.
+- **Before the GPU runs:** replica drift names the rank (D1 / Q4, the author's decision of Nov 19, 2026; pending, not started). L9, which stood here, is fixed (lane X1).
 - **Before a release:** the three P1 rows, each fixed in part: SDK-22, C03 and C06. SDK-22's open part needs the author's decision. C03's open part is now only the incident's wording (Nov 19, 2026).
-- **Found during waves V and W, not fixed, and not counted in the 20:**
-  - L9, above.
+- **Found during waves V, W and X, not fixed, and not counted in the 16:**
+  - L13 to L18 (section 7), from wave X. L13 blocks the rest of C12.
   - `activation_drift` fires on healthy small trainings, now including single-leaf models (section 9). It needs thresholds checked on a real job.
   - L10: a lone rank with batch hashes is listed as "compared" (section 7). A question for the author.
 - **A demonstrated gap with a clear fix:** checkpoint-to-model verification (section 9, TrainCheck B14). An alert that names the missing tensors gives the user an immediate action.
@@ -165,3 +165,4 @@ Not from either review. Not counted in the 72.
 | Wave W, merge group M4 (`main` at `c0b63ab`, Nov 19, 2026; lanes W1, W2, W3) | Four of the five P1 rows: C03 and C06 (each with a part still listed above), E1 and RS05. Also E5, DET-09, DET-10, DET-11, DET-16, E3's count half, L2, RUST-05's residual and RUST-12's coverage case. The protocol number is 3. Golden files: 73 lines in 72 files, all from E3 (the `needs` text and what counts as a checkpoint input), RUST-12 and DET-16; none from E1, the step order, DET-09 or DET-11. Verified on the trial merge, with the attempt fixture, the lifecycle test, the cross-file cases and both mixed-version streaming runs; macOS and CPU only |
 | Found by CI on Linux after the waves were pushed (`23940bb`), fixed in `367c529` | Two SDK faults seen only on older PyTorch, neither in either review: a compiled router that returns a routing map broke the graph on PyTorch 2.6 (`next()` with a default inside the hook); the probe's histogram of one repeated huge value raised on PyTorch 2.6 and 2.9 (`torch.histc` with equal bounds). One test fault on Python 3.13 and 3.14 (docstring indentation). Not yet run on CI after the fix |
 | CI on `99c3b8f` (Nov 19, 2026) | X11: the two jobs it added, Python 3.10 with PyTorch 2.6 and Python 3.12 with PyTorch 2.9, ran and passed. The three faults CI had found on the push before are fixed in `367c529` and passed on every job. One job, Python 3.12 with PyTorch 2.6, failed once on `test_a_stopped_rank_keeps_entering_the_drift_checks_gather` (two gloo ranks did not finish in 120 s) and passed on a re-run with no change: intermittent, not explained, listed under "What to fix first" |
+| Wave X (`main` at `dc7cad0`, Nov 19, 2026; lanes X1 to X6, one merge each) | Fixed, by each lane's report that every new test failed before its fix. Checked again at the merge only this far: the new test files of lanes X1, X3, X4 and X5 were run against `a31dd37` and 24 of 33, 31 of 56, 12 of 23 and 14 of 14 of their tests failed there, counted per file and not per item; lane X6's branch was checked with `cargo test` alone; lane X2's with its three two-rank test files. The items: DET-14, DET-17 (three modules; `trigger.py` parsed no `rank=` folder), CLI-13, CLI-14, L6, L9, and four open parts from lane V6's hand-over (`--silent-factor` validation, pause order across a restart, a failed rebuild tried again without a later part, a new attempt's elapsed time). Fixed in part, still listed above: C06, C12, C16, C22, DET-13, RS10. Not fixed: SDK-23, and the cause of the two-rank timeout. C03's Python-side change was made by lane X3 and reverted on the author's decision. Lane X4 changed one of lane V2's tests, which pinned the behaviour C22's fix removes |
