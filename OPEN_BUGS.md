@@ -29,7 +29,7 @@ Only the rows marked *Run on main* were run again when this file was written. Ro
 | Experiments, examples, CI, docs | 0 | 2 | 0 | 2 |
 | **All** | **3** | **14** | **3** | **20** |
 
-There were 72 when this file was written. Waves V and W closed 51 of them in four merge groups, and CI on Nov 19, 2026 closed X11; 20 remain, 14 of which are fixed in part and say what is still open (the earlier "16 of 21" counted L6 of section 7 by mistake; it was 15). Three P1 rows remain, each fixed in part: SDK-22 (a process group that fails after `init`), C03 (every stop notice lost, accepted for v1) and C06 (the length check). Section 6 holds what is left of the closed findings and the two reviews' disagreements, section 7 the items the lanes raised, section 8 the audit's notes on cost and narrow cases, and section 9 the wrong behaviour the plan records from measurement. None of those is counted here.
+There were 72 when this file was written. Waves V and W closed 51 of them in four merge groups, and CI on Nov 19, 2026 closed X11; 20 remain, 14 of which are fixed in part and say what is still open. A recount by script on Nov 19, 2026 found 15 rows marked as fixed in part among the 21, not the 16 this file gave before. Three P1 rows remain, each fixed in part: SDK-22 (a process group that fails after `init`), C03 (every stop notice lost, accepted for v1) and C06 (the length check). Section 6 holds what is left of the closed findings and the two reviews' disagreements, section 7 the items the lanes raised, section 8 the audit's notes on cost and narrow cases, and section 9 the wrong behaviour the plan records from measurement. None of those is counted here.
 
 ## 1. Can raise into training, or stop it
 
@@ -144,7 +144,7 @@ Not from either review. Not counted in the 72.
 - **First:** find why `test_a_stopped_rank_keeps_entering_the_drift_checks_gather` timed out once in CI on Python 3.12 with PyTorch 2.6 (Nov 19, 2026) and passed on a re-run. The log does not say where the two ranks stopped; a rank left waiting in a gather is what this project must not do, so a pass on re-run does not close it.
 - **Before the GPU runs:** L9 (section 7). The lead optimizer is held by a weak reference to the first optimizer that ever stepped; a user who rebuilds an optimizer and keeps the old one gets no steps counted, silently.
 - **Before a release:** the three P1 rows, each fixed in part: SDK-22, C03 and C06. SDK-22's open part needs the author's decision.
-- **Found during waves V and W, not fixed, and not counted in the 21:**
+- **Found during waves V and W, not fixed, and not counted in the 20:**
   - L9, above.
   - `activation_drift` fires on healthy small trainings, now including single-leaf models (section 9). It needs thresholds checked on a real job.
   - L10: a lone rank with batch hashes is listed as "compared" (section 7). A question for the author.
