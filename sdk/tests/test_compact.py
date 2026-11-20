@@ -190,12 +190,16 @@ def test_the_readers_of_samples_say_what_a_compact_file_left_out(collapsed, tmp_
         tensorquill.expert_load_table(small, 50, 1)
     assert "leaves out 93 of the run's 100 recorded steps" in str(error.value)
     assert "without --compact" in str(error.value) and not isinstance(error.value, KeyError)
-    # The window's first step: the step it is compared with was left out, so no +0.00 deltas.
-    with pytest.raises(SamplesOmitted, match="compared with the last earlier step.*--compact-window"):
-        tensorquill.expert_load_table(small, 94, 1)
+    # The window's first step: the step it is compared with was left out, so its loads are shown
+    # with every delta n/a, never +0.00 (DET-13; until Nov 20, 2026 the table was refused).
+    first = tensorquill.expert_load_table(small, 94, 1)
+    assert first.splitlines()[0] == (
+        "**Layer 01 expert load** · step 94 (the step it is compared with was left out of this compact file)"
+    )
+    assert [line.split("|")[3].strip() for line in first.splitlines()[4:]] == ["n/a"] * 4
     # With a window of 0 that holds for the incident's own step.
-    with pytest.raises(SamplesOmitted, match="compared with"):
-        tensorquill.expert_load_table(compact_evidence(collapsed, window=0), 100, 1)
+    alone = tensorquill.expert_load_table(compact_evidence(collapsed, window=0), 100, 1)
+    assert "left out of this compact file" in alone.splitlines()[0] and "+" not in alone
     # A window that starts at the run's first step has nothing left out before it.
     early = tensorquill.build_evidence(_moe_records(200, collapse_from=2))
     assert tensorquill.expert_load_table(compact_evidence(early), 0, 1) == tensorquill.expert_load_table(early, 0, 1)

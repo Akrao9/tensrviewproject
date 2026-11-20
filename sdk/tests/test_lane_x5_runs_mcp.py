@@ -348,15 +348,17 @@ def test_det13_a_window_whose_router_routed_nothing_before_it_still_has_its_tabl
     from tensorquill import mcp_server
 
     assert [s for s, _ in mcp_server._sample_rows("model.layers.1.mlp.router", small, None)] == list(range(97, 104))
-    # Router 2 routed before the window, and that step is left out: still refused, never +0.00.
-    with pytest.raises(SamplesOmitted, match="compared with the last earlier step"):
-        tensorquill.expert_load_table(small, 97, 2)
+    # Router 2 routed before the window, and that step is left out: its loads with n/a deltas,
+    # never +0.00 (lane Y2, DET-13: until then the table was refused). A step left out is refused.
+    assert "left out of this compact file" in tensorquill.expert_load_table(small, 97, 2).splitlines()[0]
+    assert "+" not in tensorquill.expert_load_table(small, 97, 2)
+    with pytest.raises(SamplesOmitted, match="step 96 is not here"):
+        tensorquill.expert_load_table(small, 96, 2)
     assert tensorquill.expert_load_table(small, 98, 2) == tensorquill.expert_load_table(full, 98, 2)
-    # A compact file written before the marker said so refuses as it did.
+    # A compact file written before the marker said so cannot tell, and shows no delta either.
     old = json.loads(json.dumps(small))
     old["compact"].pop("unrouted_before")
-    with pytest.raises(SamplesOmitted, match="compared with"):
-        tensorquill.expert_load_table(old, 97, 1)
+    assert "left out of this compact file" in tensorquill.expert_load_table(old, 97, 1).splitlines()[0]
 
 
 def test_det13_a_later_starvation_onset_gets_a_window_of_its_own():

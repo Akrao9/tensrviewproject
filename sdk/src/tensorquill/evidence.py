@@ -72,7 +72,8 @@ SPIKE_MIN_HISTORY = 10
 SPIKE_SUSTAIN = 3
 # A jump in the size of the optimizer's update (`update_spike`), by the rule of Altenbernd et
 # al. (arXiv 2604.00726, eqs. 8 to 13). R is the largest RMS update over the parameters on a
-# step (`update_rms`, with `init(..., updates=True)`). A step is flagged when R changed from
+# step (`update_rms`, with `init(..., updates=True)`), taken on both steps over the parameters
+# both name (L13). A step is flagged when R changed from
 # the step before by more than `baseline / (UPDATE_ALPHA * sqrt(rise))`: `rise` is how far the
 # total gradient norm before clipping rose from the step before (a norm that did not rise
 # flags nothing), and `baseline` is the mean of that change over the last UPDATE_WINDOW steps
@@ -436,10 +437,13 @@ def detect_update_spikes(
     """Return the first jump in the size of the optimizer's update and the parameters whose
     own update moved most, or None.
 
-    Each record's `update_rms` gives the RMS of Adam's update to each parameter; `R` is the
-    largest of them. A record is compared with the last one before it that could be judged, in
-    the same attempt: `change` is how far `R` moved (either way) and `rise` how far the total
-    gradient norm rose (0 when it fell). The first `window` changes are not judged. After that
+    Each record's `update_rms` gives the RMS of Adam's update to each parameter. A record is
+    compared with the last one before it that could be judged, in the same attempt, and `R` is
+    the largest update over the parameters both of them name, on each side (a parameter recorded
+    from a later step on is not a jump, L13): `change` is how far `R` moved (either way) and
+    `rise` how far the total gradient norm rose (0 when it fell), the totals taken over the
+    parameters both records name where their `grad_norms` differ (`_shared_totals`). Two
+    records that share no parameter are not compared. The first `window` changes are not judged. After that
     `baseline` is the mean of the last `window` changes that were not flagged, and a record is
     flagged when `rise > 0` and `change > baseline / (alpha * sqrt(rise))` (Altenbernd et al.,
     arXiv 2604.00726, eq. 13). A flagged change stays out of the baseline, so a fault that lasts
@@ -456,7 +460,8 @@ def detect_update_spikes(
     record before, largest first, so the incident says where the jump is.
     """
     key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
-    before: tuple[Any, float, float, dict[str, float]] | None = None  # attempt, R, total, each parameter's
+    # attempt, total, each parameter's update size, each parameter's gradient norm (or None)
+    before: tuple[Any, float, dict[str, float], Mapping[str, Any] | None] | None = None
     recent: deque[float] = deque(maxlen=window)  # the last `window` changes that were not flagged
     first: dict[str, Any] | None = None
     spikes: list[int] = []
@@ -470,10 +475,18 @@ def detect_update_spikes(
         own = {str(name): size for name, size in ((n, _finite(v)) for n, v in sizes.items()) if size is not None}
         if not own:
             continue
-        largest = max(own.values())
         attempt = record.get("attempt", 0)
-        if before is not None and before[0] == attempt:
-            change, rise = abs(largest - before[1]), max(0.0, total - before[2])
+        grads = record.get("grad_norms") if isinstance(record.get("grad_norms"), Mapping) else None
+        # R on both sides is the largest update over the parameters both records name (L13, Nov 20,
+        # 2026): a parameter recorded from a later step on (unfrozen after `init`), or one that is
+        # left out of this record, is not a jump. Records that share no parameter are not compared,
+        # and their change joins no baseline. The gradient totals are taken over the parameters
+        # both name too (`_shared_totals`).
+        shared = [name for name in own if name in before[2]] if before is not None and before[0] == attempt else []
+        if shared:
+            largest, was = max(own[name] for name in shared), max(before[2][name] for name in shared)
+            now, then = _shared_totals(total, grads, before[1], before[3])
+            change, rise = abs(largest - was), max(0.0, now - then)
             if len(recent) < window:
                 recent.append(change)
             else:
@@ -486,20 +499,50 @@ def detect_update_spikes(
                     spikes.append(step)
                     if first is None:
                         moved = sorted(
-                            ({"name": name, "update_rms": size, "previous": before[3][name],
-                              "change": abs(size - before[3][name])}
-                             for name, size in own.items() if name in before[3]),
+                            ({"name": name, "update_rms": own[name], "previous": before[2][name],
+                              "change": abs(own[name] - before[2][name])}
+                             for name in shared),
                             key=lambda p: (-p["change"], p["name"]),
                         )
                         first = {
-                            "step": step, "update_rms": largest, "previous": before[1], "change": change,
-                            "baseline": baseline, "threshold": threshold, "grad_norm": total,
-                            "grad_norm_before": before[2], "grad_rise": rise, "parameters": moved[:10],
+                            "step": step, "update_rms": largest, "previous": was, "change": change,
+                            "baseline": baseline, "threshold": threshold, "grad_norm": now,
+                            "grad_norm_before": then, "grad_rise": rise, "parameters": moved[:10],
                         }
-        before = (attempt, largest, total, own)
+        before = (attempt, total, own, grads)
     if first is None:
         return None
     return {"kind": "update_spike", **first, "spike_count": len(spikes), "spike_steps": spikes[:20]}
+
+
+def _shared_totals(
+    total: float, grads: Mapping[str, Any] | None, before: float, grads_before: Mapping[str, Any] | None
+) -> tuple[float, float]:
+    """The gradient totals of two records compared by `update_spike`, over the parameters both
+    name (L13): each record's total times the share of its gradient those parameters carry,
+    `total * sqrt(shared² / all²)` over its `grad_norms`. For a total that is `grad_norm`, the
+    root of the squares of `grad_norms`, that is the shared parameters' own norm; for a
+    pre-clipping `clip_grad_norm` it is theirs before clipping, since clipping scales every
+    gradient by one factor and the per-parameter norms are read after it.
+
+    The whole totals when both records name the same parameters (so no record set whose
+    parameters never change is judged otherwise), and when they cannot be split: a record
+    without `grad_norms`, a norm there that is not a finite number, no shared parameter, or a
+    record whose norms are all 0. The server's rule is the same (`shared_totals`, detect.rs)."""
+    if grads is None or grads_before is None or grads.keys() == grads_before.keys():
+        return total, before
+    shared = [name for name in grads if name in grads_before]
+    sides = []
+    for side, norms in ((total, grads), (before, grads_before)):
+        values = [_finite(v) for v in norms.values()]
+        if not shared or any(v is None for v in values):
+            return total, before
+        whole = math.fsum(v * v for v in values)
+        if whole <= 0:
+            return total, before
+        part = math.fsum(norm * norm for norm in (_finite(norms[name]) for name in shared))
+        sides.append(side * math.sqrt(part / whole))
+    return sides[0], sides[1]
 
 
 def update_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
@@ -2841,7 +2884,15 @@ def read_server_report(
     - `unusable`: not a report for this rank, from a server with fewer kinds, ahead of the
       store, or beside parts whose names say nothing about their steps.
     - `other_thresholds`: a threshold given here differs from the one the server applied.
+
+    A threshold the detectors refuse (`check_thresholds`: a negative or non-finite number, a
+    window or `top_k` below 1 or not whole, a bool) raises `ValueError` before anything is read,
+    as `build_evidence` does (L15, Nov 20, 2026: it read as `other_thresholds`, or as `current`
+    for a bool equal to the server's value).
     """
+    check_thresholds(overload_threshold=overload_threshold, drift_tolerance=drift_tolerance,
+                     starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,
+                     update_window=update_window)
     folder = Path(folder)
     stored, _, unknown = _newest_part(folder)
     order, attempt_order = stored_attempt_order(folder)
@@ -2934,7 +2985,9 @@ def _report_evidence(
     (one is, the newest, when a stuck collective has to be dated against the last step).
 
     The incidents are in the order `build_evidence` gives them. It has no `samples`,
-    `weight_trends` or router sizes: those are per-step data, which stays in the parts.
+    `weight_trends` or router sizes: those are per-step data, which stays in the parts. The
+    probe's `head_trends` are the report's, which a server made them for from every stored
+    probe (L15, Nov 20, 2026); a report from an older server has none, and neither does this.
     """
     report = look["report"]
     record_incidents = [dict(incident) for incident in report["incidents"]]
@@ -2978,6 +3031,7 @@ def _report_evidence(
         "detection": {**_detection(look, "server", None), "moe_flagged": report.get("moe_flagged"),
                       "thresholds": applied_thresholds(report)},
         **({"not_checked": not_checked} if not_checked else {}),
+        **({"head_trends": dict(heads)} if isinstance(heads := report.get("head_trends"), Mapping) and heads else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
         **({"traincheck": traincheck_summary} if traincheck_summary else {}),
         **({"watchdog": {k: status[k] for k in (
@@ -5338,13 +5392,13 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
     The step is compared with the last earlier one on which the router routed tokens, or else
     the last earlier one. At the layer's first step there is none: the heading says so, every
     delta is `n/a` and the rows are sorted by load (DET-14; until Nov 19, 2026 the first step
-    was compared with itself, every delta +0.00).
+    was compared with itself, every delta +0.00). In compact evidence that left out the step it
+    is compared with, the heading says so and the deltas are `n/a` the same way (DET-13).
 
-    Raises `compact.SamplesOmitted` for a step, or a step to compare it with, that compact
-    evidence left out."""
+    Raises `compact.SamplesOmitted` for a step that compact evidence left out."""
     from .compact import require_table
 
-    require_table(evidence, step, layer)
+    compared_here = require_table(evidence, step, layer)
     expert_count = int(evidence.get("expert_count", 0))
     samples = {(int(s["step"]), int(s["layer"])): s for s in evidence.get("samples", ())}
     sample = samples.get((step, layer)) or _missing_sample(step, layer, expert_count)
@@ -5361,6 +5415,8 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
         previous = max(prior_steps)
     else:
         previous = None  # the layer's first step: nothing earlier to compare it with
+    if not compared_here:
+        previous = None  # left out of a compact file: never an earlier window's step instead
     baseline = samples.get((previous, layer)) if previous is not None else None
 
     tokens = int(sample.get("routed_tokens") or 0)
@@ -5400,7 +5456,9 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
     return "\n".join(
         [
             f"**Layer {layer:02} expert load** · step {step} "
-            + (f"vs. {previous}" if previous is not None else "(no earlier step to compare with)"),
+            + (f"vs. {previous}" if previous is not None
+               else "(the step it is compared with was left out of this compact file)" if not compared_here
+               else "(no earlier step to compare with)"),
             "",
             "| Expert | Load | Δ load (pp) | Status |",
             "| --- | --- | --- | --- |",

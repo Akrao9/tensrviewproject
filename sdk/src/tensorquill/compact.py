@@ -19,8 +19,9 @@ full file already on disk is never replaced by a smaller one and no reader mista
 with `-o PATH` it goes to that path.
 
 `incident_summary` and `run_state_line` print the same text for both files: the first flagged
-sample, which the summary quotes, is always kept. `expert_load_table` and `export_rerun` need
-samples the compact file may not hold, and raise `SamplesOmitted` saying which.
+sample, which the summary quotes, is always kept. `export_rerun` needs every step's samples and
+`expert_load_table` the step it is asked for, and each raises `SamplesOmitted` saying which; a
+kept step whose table compares it with a step left out shows its loads with no delta.
 """
 
 from __future__ import annotations
@@ -254,19 +255,22 @@ def require_all_samples(evidence: Mapping[str, Any], what: str) -> None:
         raise SamplesOmitted(f"{what} needs every step's samples, and this is {describe(evidence)}. {_REBUILD}.")
 
 
-def require_table(evidence: Mapping[str, Any], step: int, layer: int) -> None:
-    """Raise `SamplesOmitted` when `expert_load_table(evidence, step, layer)` would not be the
-    table the full evidence gives: the step was left out, or the step it is compared with was.
+def require_table(evidence: Mapping[str, Any], step: int, layer: int) -> bool:
+    """Raise `SamplesOmitted` when `expert_load_table(evidence, step, layer)` cannot be made from
+    `evidence`: a compact file left the step out. Otherwise return whether the step the table
+    compares it with is here, which it always is in full evidence.
 
     The table compares a step with the last earlier one on which the router routed tokens.
-    At the first step a window keeps, that one is among the steps left out (so with
-    `window=0` no table can be made, and with any larger window the incident's own step can),
-    unless the router routed no token before the window (`unrouted_before`): then nothing is
-    left out that the table uses.
+    At the first step a window keeps, that one is among the steps left out (so with `window=0`
+    it is for the incident's own step), unless the window starts at the run's first step or
+    the router routed no token before the window (`unrouted_before`): then nothing is left out
+    that the table uses. Where it is left out, the table shows the step's loads with no delta
+    (DET-13, Nov 20, 2026; until then it was refused). A routed step of an earlier window is
+    never the one compared with: the step left out between them is.
     """
     marker = _omits(evidence)
     if marker is None:
-        return
+        return True
     found = next((r for r in marker.get("kept_steps") or () if r[0] <= step <= r[1]), None)
     if found is None:
         raise SamplesOmitted(
@@ -274,19 +278,13 @@ def require_table(evidence: Mapping[str, Any], step: int, layer: int) -> None:
         )
     sampled = marker.get("sampled_steps") or [None]
     if found[0] == sampled[0]:
-        return  # the run's first steps: nothing was left out before them
+        return True  # the run's first steps: nothing was left out before them
     if [found[0], layer] in (marker.get("unrouted_before") or ()):
-        return  # nothing routed before the window: the step compared with is kept, with no token
-    for sample in evidence.get("samples", ()):
-        if (
-            int(sample["layer"]) == layer and found[0] <= int(sample["step"]) < step
-            and not sample.get("missing") and sample.get("routed_tokens", 0) > 0
-        ):
-            return
-    raise SamplesOmitted(
-        f"the expert load at step {step} is compared with the last earlier step that routed tokens on layer"
-        f" {layer}, and that step is not here: this is {describe(evidence)}."
-        f" Ask for a later step of the range, or widen the window (--compact-window). {_REBUILD}."
+        return True  # nothing routed before the window: the step compared with is kept, with no token
+    return any(
+        int(sample["layer"]) == layer and found[0] <= int(sample["step"]) < step
+        and not sample.get("missing") and sample.get("routed_tokens", 0) > 0
+        for sample in evidence.get("samples", ())
     )
 
 
