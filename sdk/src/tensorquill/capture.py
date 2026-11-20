@@ -208,11 +208,13 @@ def _routing_map(output: Any, n_experts: int, tokens: int | None) -> tuple[torch
             break
     if found is None or not any(isinstance(item, torch.Tensor) and item.is_floating_point() for item in candidates):
         return None
-    paired = next(
-        (item for item in candidates
-         if isinstance(item, torch.Tensor) and item.is_floating_point() and item.shape == found.shape),
-        None,
-    )
+    # A plain loop, not `next(generator, None)`: Dynamo on PyTorch 2.6 cannot trace that call, and
+    # this runs inside the compiled router hook.
+    paired = None
+    for item in candidates:
+        if isinstance(item, torch.Tensor) and item.is_floating_point() and item.shape == found.shape:
+            paired = item
+            break
     return found, paired
 
 

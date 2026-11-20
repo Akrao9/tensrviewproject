@@ -478,9 +478,16 @@ def test_an_empty_parameter_is_never_weights_unchanged():
 
 
 def _arg(doc: str, name: str) -> str:
+    # By each line's indent relative to the argument's own line, not by a fixed number of spaces:
+    # Python 3.13 strips a docstring's common indentation when it compiles it.
     lines = doc.splitlines()
+
+    def indent(line: str) -> int:
+        return len(line) - len(line.lstrip())
+
     start = next(i for i, line in enumerate(lines) if line.strip().startswith(f"{name}:"))
-    end = next(i for i in range(start + 1, len(lines)) if not lines[i].startswith("            "))
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].strip() and indent(lines[i]) <= indent(lines[start])),
+               len(lines))
     return " ".join(line.strip() for line in lines[start:end])
 
 

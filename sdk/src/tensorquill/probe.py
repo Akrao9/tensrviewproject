@@ -104,7 +104,13 @@ def _histogram(tensor: torch.Tensor, bins: int) -> dict[str, Any]:
         return {"lo": 0.0, "hi": 0.0, "counts": [0] * bins, "nonfinite": nonfinite}
     lo, hi = (float(v) for v in torch.aminmax(values))
     if lo == hi:
-        lo, hi = lo - 0.5, hi + 0.5
+        # Every value is the same one. `torch.histc` needs min < max, and for a huge value
+        # `lo - 0.5 == lo` in floating point, which PyTorch before 2.10 refuses. The bounds are
+        # reported widened as before and the values all fall in the middle bin, where histc
+        # puts them when the widening holds.
+        counts = [0] * bins
+        counts[min(bins // 2, bins - 1)] = int(values.numel())
+        return {"lo": lo - 0.5, "hi": hi + 0.5, "counts": counts, "nonfinite": nonfinite}
     # The bin index is `(v - lo) * bins / (hi - lo)` in float32, which overflows once
     # `(hi - lo) * bins` passes float32's range: histc then counts nothing or misses values.
     # Values that large are scaled down by a power of two first, which is exact (values that
