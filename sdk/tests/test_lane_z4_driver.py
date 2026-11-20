@@ -176,6 +176,7 @@ def _record(plan: proof.Plan, rank: int, step: int, launch: str = LAUNCH, run_id
                 fp = [fp[0], fp[1], fp[2] + 0.2]
         params[name] = {"shape": _SHAPES[name], "dtype": "float32", "fp": fp, "sig": sig}
     return {"schema_version": 1, "run_id": run_id, "rank": rank, "attempt": 1795000000000 + rank * 7, "step": step,
+            "scalars": {"train/loss": 1.0},
             "replica": {"v": 1, "launch": launch, "group": plan.group, "device": "cpu", "projection": "name-v1",
                         "signature": "fold64-v1", "params": params}}
 
@@ -406,7 +407,8 @@ def test_in_server_mode_the_clock_starts_at_the_acknowledgement():
     log = proof.VerdictLog()
     log.add(11.5, reference(_records(plan), 1e-6))
     failures, lines = proof.check_latency(log, plan, LAUNCH, {0: report, 1: {**report, "rank": 1}})
-    assert failures == [] and "+1.100 s" in lines[0] and "status interval 0.5" in lines[0]
+    assert failures == [] and "+1.100 s" in lines[1] and "status interval 0.5" in lines[1]
+    assert "every 5 ms" in lines[0]
     log = proof.VerdictLog()
     log.add(12.0, reference(_records(plan), 1e-6))  # 1.6 s after the ack: above 0.5 + 1.0
     assert proof.check_latency(log, plan, LAUNCH, {0: report, 1: {**report, "rank": 1}})[0]
@@ -465,6 +467,92 @@ def test_the_never_proof_holds_branch_by_branch():
     assert any("released" in f for f in proof.check_history(log, plan, LAUNCH, {**held, "released_at": 1.0}, {2: 7}))
     assert any("held nothing" in f for f in proof.check_history(log, plan, LAUNCH, {**held, "dropped": 0}, {2: 7}))
     assert proof.check_history(log, _plan(3), LAUNCH, None, {}) == []  # nothing held, nothing to prove
+
+
+# --- The driver's verdict, composed ---------------------------------------------------------------------
+
+
+def _passing(world: int = 3):
+    plan = _plan(world, "--steps", "8")
+    records = _records(plan)
+    log = proof.VerdictLog()
+    log.add(100.5, reference(records, 1e-6))
+    reports = {r: {"rank": r, "steps_done": 8, "durations": [0.2] * 8,
+                   "written": [{"step": s, "end": 10 * (s + 1), "t": 100.0, "replica": True} for s in range(8)],
+                   "offsets": []} for r in plan.group}
+    return plan, log, reports, records
+
+
+def test_the_driver_passes_only_when_every_check_holds():
+    plan, log, reports, records = _passing()
+    verdict = proof.evaluate(plan, log, {}, reports, LAUNCH, records, reader_found=True)
+    assert verdict.code == proof.EXIT_PASS and verdict.failures == [] and verdict.lines[-1].startswith("PASS")
+    # One failure from each check reaches the driver's exit status.
+    broken = {
+        "result": (lambda: (log_without_step(log, 3), reports, records)),
+        "no_wait": (lambda: (log, {**reports, 1: {**reports[1], "steps_done": 7}}, records)),
+        "records": (lambda: (log, reports, [r for r in records if not (r["rank"] == 1 and r["step"] == 6)])),
+        "latency": (lambda: (late_log(log), reports, records)),
+    }
+    for name, make in broken.items():
+        a, b, c = make()
+        verdict = proof.evaluate(plan, a, {}, b, LAUNCH, c, reader_found=True)
+        assert verdict.code == proof.EXIT_FAIL and verdict.failures, name
+        assert any(line.startswith("FAIL") for line in verdict.lines), name
+
+
+def log_without_step(log: proof.VerdictLog, step: int) -> proof.VerdictLog:
+    out = proof.VerdictLog()
+    result = log.as_result()
+    out.add(100.5, {"steps": [e for e in result["steps"] if e["step"] != step], "replica_drift": result["replica_drift"]})
+    return out
+
+
+def late_log(log: proof.VerdictLog) -> proof.VerdictLog:
+    out = proof.VerdictLog()
+    out.add(110.0, log.as_result())
+    return out
+
+
+def test_without_the_reader_the_driver_says_not_proven_never_pass():
+    plan, log, reports, records = _passing()
+    verdict = proof.evaluate(plan, proof.VerdictLog(), {}, reports, LAUNCH, records, reader_found=False)
+    assert verdict.code == proof.EXIT_NOT_PROVEN and "NOT PROVEN" in verdict.lines[-1]
+    assert proof.READER_ENV in verdict.lines[-1]
+    short = {**reports, 2: {**reports[2], "steps_done": 5}}
+    assert proof.evaluate(plan, proof.VerdictLog(), {}, short, LAUNCH, records, reader_found=False).code == proof.EXIT_FAIL
+    # In server mode there is no file reader to miss.
+    server = _plan(3, "--mode", "server", "--endpoint", "grpc://h:1", "--store", "s", "--status-interval", "0.5")
+    assert proof.evaluate(server, proof.VerdictLog(), {}, reports, LAUNCH, records, reader_found=False).code == proof.EXIT_FAIL
+
+
+def test_the_reader_can_be_named_from_the_environment():
+    script = ("import sys; sys.path.insert(0, 'examples'); import replica_proof as p;"
+              " print(p.DEFAULT_READER, p.build_parser().parse_args([]).reader)")
+    named = subprocess.run([sys.executable, "-c", script], cwd=SDK, capture_output=True, text=True,
+                           env={**os.environ, "PYTHONPATH": str(SDK / "src"), proof.READER_ENV: "mod:fn"})
+    assert named.stdout.split() == ["mod:fn", "mod:fn"], named.stderr
+    assert proof.resolve_reader("json:loads") is not None
+    assert proof.resolve_reader("tensorquill.evidence:no_such_function") is None
+    assert proof.resolve_reader("no_such_module:fn") is None
+
+
+def test_each_rank_file_must_hold_every_step_with_the_loss():
+    plan = _plan(3, "--steps", "8")
+    records = _records(plan)
+    assert proof.check_records(records, plan) == []
+    assert "rank 2's file holds" in proof.check_records([r for r in records if r["step"] != 4 or r["rank"] != 2],
+                                                        plan)[0]
+    no_loss = copy.deepcopy(records)
+    no_loss[3]["scalars"] = {}
+    assert "loss" in proof.check_records(no_loss, plan)[0]
+    never = _plan(3, "--hold-rank", "2", "--release", "never")
+    assert proof.check_records(_records(never), never) == []
+    assert proof.check_records(records, never)  # a rank that never reports wrote what it held
+
+
+def test_the_out_folder_has_a_default_so_the_readmes_command_still_starts():
+    assert proof.validate([], _env(2), 2).out == Path("runs/replica")
 
 
 # --- Nothing waits ---------------------------------------------------------------------------------
@@ -672,6 +760,10 @@ def _simulate(tmp_path: Path, plan: proof.Plan, *, hold: bool = True, block_on_h
         "no_wait": proof.check_no_wait(reports, plan),
         "latency": latency, "lines": lines,
         "kinds": proof.check_kinds(records, plan, launch)[0],
+        "records": proof.check_records(records, plan),
+        # what the driver itself prints and exits with, from the same inputs
+        "verdict": proof.evaluate(plan, observer.log, observer.seen_while, reports, launch, records,
+                                  reader_found=plan.mode == "server" or reader is not None),
         "reports": reports, "observer": observer,
     }
 
@@ -688,7 +780,11 @@ def _sim_plan(world: int, mode: str, release: str, tmp_path: Path) -> proof.Plan
 
 
 def _failures(outcome: dict) -> list[str]:
-    return [f for key in ("result", "history", "no_wait", "latency", "kinds") for f in outcome[key]]
+    failures = [f for key in ("result", "history", "no_wait", "latency", "kinds", "records") for f in outcome[key]]
+    verdict = outcome["verdict"]
+    assert (verdict.code == proof.EXIT_PASS) == (not failures), verdict.lines
+    assert sorted(verdict.failures) == sorted(failures), verdict.lines
+    return failures
 
 
 @pytest.mark.parametrize("mode", ["files", "server"])
@@ -790,15 +886,17 @@ def _torchrun(world: int, *argv: str, timeout: float = 240) -> subprocess.Comple
 def test_the_driver_trains_to_its_end_under_torchrun(tmp_path, world):
     """Runs here: every rank trains every step with a rank held; without the reader the run ends
     NOT PROVEN (exit 3), never PASS. On the trial merge the same run must PASS."""
-    done = _torchrun(world, "--out", str(tmp_path), "--hold-rank", str(world - 1), "--steps", "10",
-                     "--step-seconds", "0.1")
+    done = _torchrun(world, "--out", str(tmp_path), "--hold-rank", str(world - 1), "--steps", "16",
+                     "--step-seconds", "0.2", "--look-seconds", "0.2")
     reports = [json.loads(p.read_text()) for p in sorted(tmp_path.glob("*/done.rank*.json"))]
-    assert [r["steps_done"] for r in reports] == [10] * world, done.stdout + done.stderr
+    assert [r["steps_done"] for r in reports] == [16] * world, done.stdout + done.stderr
+    [verdict] = [json.loads(p.read_text()) for p in tmp_path.glob("*/verdict.json")]
     if READER is None:
-        assert "NOT PROVEN" in done.stdout and "exitcode  : 3" in done.stderr, done.stdout + done.stderr
-        assert reports[-1]["held_steps"] == list(range(2, 10))
+        assert verdict["code"] == proof.EXIT_NOT_PROVEN and "NOT PROVEN" in done.stdout, done.stdout + done.stderr
+        assert verdict["failures"] == []  # every rank trained every step and recorded it, with the loss
+        assert reports[-1]["held_steps"] == list(range(2, 16))
     else:
-        assert done.returncode == 0 and f"PASS files on {world} ranks" in done.stdout, done.stdout + done.stderr
+        assert verdict == {"code": proof.EXIT_PASS, "failures": []}, done.stdout + done.stderr
 
 
 @needs_trial_merge
@@ -809,7 +907,9 @@ def test_trial_merge_files_mode(tmp_path, world, hold):
     if hold != "none":
         argv += ["--hold-rank", str(world - 1), "--release", hold]
     done = _torchrun(world, *argv)
-    assert done.returncode == 0 and f"PASS files on {world} ranks" in done.stdout, done.stdout + done.stderr
+    [verdict] = [json.loads(p.read_text()) for p in tmp_path.glob("*/verdict.json")]
+    assert verdict == {"code": proof.EXIT_PASS, "failures": []}, done.stdout + done.stderr
+    assert done.returncode == 0 and f"PASS files on {world} ranks" in done.stdout
 
 
 @needs_trial_merge
@@ -830,7 +930,9 @@ def test_trial_merge_server_mode(tmp_path, world, hold):
         if hold != "none":
             argv += ["--hold-rank", str(world - 1), "--release", hold]
         done = _torchrun(world, *argv)
-        assert done.returncode == 0 and f"PASS server on {world} ranks" in done.stdout, done.stdout + done.stderr
+        [verdict] = [json.loads(p.read_text()) for p in (tmp_path / "out").glob("*/verdict.json")]
+        assert verdict == {"code": proof.EXIT_PASS, "failures": []}, done.stdout + done.stderr
+        assert done.returncode == 0 and f"PASS server on {world} ranks" in done.stdout
     finally:
         server.terminate()
         server.wait(timeout=30)

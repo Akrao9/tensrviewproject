@@ -99,49 +99,26 @@ def _last_arrival(reports: dict[int, dict], plan: proof.Plan) -> float | None:
     return None if any(t is None for t in times) or not times else max(times)
 
 
-def _verdict(plan: proof.Plan, observer: proof.Observer, reports: dict[int, dict], launch: str | None,
-             records: list[dict]) -> int:
-    print(f"run {observer.run_id}: {plan.world} ranks, mode {plan.mode}, launch {launch}, group {plan.group},"
-          f" plants: {'; '.join(map(str, plan.plants)) or 'none'}")
-    if plan.hold_rank is not None:
-        held = reports.get(plan.hold_rank, {})
-        print(f"rank {plan.hold_rank} held from step {plan.hold_from} ({plan.release}): held steps"
-              f" {held.get('held_steps')}, released at training step {held.get('released_at_step')}"
-              f"{' (at its close)' if held.get('released_at_close') else ''}, dropped {held.get('dropped')} records;"
-              f" step {plan.hold_from} still read insufficient while rank 0 trained step"
-              f" {observer.seen_while.get(plan.hold_from)}")
-    failures = proof.check_no_wait(reports, plan)
-    if plan.mode == "files" and observer.reader is None:
-        for failure in failures:
-            print(f"FAIL {failure}")
-        print(f"NOT PROVEN: the reader {plan.reader} was not found (lane Z2's function; --reader names another)."
-              f" Trained {plan.steps} steps on {len(reports)} of {plan.world} ranks; no verdict was read.")
-        return proof.EXIT_FAIL if failures else proof.EXIT_NOT_PROVEN
-    result = observer.log.as_result()
-    for entry in sorted(result["steps"], key=lambda e: (e.get("step") is None, e.get("step") or 0)):
-        print(f"  step {entry.get('step')}: {entry.get('coverage')}"
-              + (f" missing {entry.get('missing')}" if entry.get("missing") else "")
-              + (f" fingerprints {entry.get('fingerprints')}" if entry.get("fingerprints") else "")
-              + (f" on {entry.get('drift_parameters')}" if entry.get("drift_parameters") else "")
-              + (f" signatures {entry.get('signatures')}" if entry.get("signatures") else ""))
-    for incident in result["replica_drift"]:
-        print(f"  replica_drift: {incident}")
-    failures += proof.check_result(result, plan, launch)
-    failures += proof.check_history(observer.log, plan, launch, reports.get(plan.hold_rank) if plan.hold_rank
-                                    is not None else None, observer.seen_while)
-    late, clock_lines = proof.check_latency(observer.log, plan, launch, reports)
-    kinds, d1_lines = proof.check_kinds(records, plan, launch)
-    failures += late + kinds
-    for line in clock_lines + d1_lines:
-        print(f"  {line}")
-    for error in observer.log.errors[:5]:
-        print(f"  reader error at a look: {error}")
-    for failure in failures:
-        print(f"FAIL {failure}")
-    if failures:
-        return proof.EXIT_FAIL
-    print(f"PASS {plan.mode} on {plan.world} ranks ({observer.log.looks} looks)")
-    return proof.EXIT_PASS
+def _fingerprint_time(model: torch.nn.Module, device: torch.device, rank: int) -> None:
+    """Today's fingerprint cost on this device, with and without the projection: printed, never
+    asserted (a tiny model: only the ratio and a GPU run mean anything). Never stops the check."""
+    try:
+        timings = {}
+        for projection in (False, True):
+            tensorquill.parameter_fingerprints(model.parameters(), projection=projection)  # warm up
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start = time.perf_counter()
+            for _ in range(20):
+                tensorquill.parameter_fingerprints(model.parameters(), projection=projection)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            timings[projection] = (time.perf_counter() - start) / 20 * 1000
+    except Exception as error:  # noqa: BLE001  a timing is evidence, not part of the check
+        print(f"rank {rank} fingerprint time not measured: {type(error).__name__}: {error}")
+        return
+    print(f"rank {rank} fingerprint time on {device.type}: {timings[False]:.3f} ms norm and sum,"
+          f" {timings[True]:.3f} ms with the projection (a tiny model: only the ratio and a GPU run mean anything)")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -203,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
                 durations.append(time.perf_counter() - started)
                 progress.step = step
         sink.stop()
+        _fingerprint_time(model, device, rank)
         _write_json(work / f"done.rank{rank}.json",
                     {"rank": rank, "steps_done": len(durations), "durations": durations, **sink.report()})
         if rank != 0:
@@ -225,7 +203,13 @@ def main(argv: list[str] | None = None) -> int:
             observer.stop()
             observer.look()  # the last look, after every rank has closed its file
         records = proof.run_records(work, run_id, plan.world)
-        return _verdict(plan, observer, reports, sink.launch, records)
+        verdict = proof.evaluate(plan, observer.log, observer.seen_while, reports, sink.launch, records,
+                                 reader_found=observer.reader is not None)
+        print(f"run {run_id}:")
+        for line in verdict.lines:
+            print(line)
+        _write_json(work / "verdict.json", {"code": verdict.code, "failures": verdict.failures})
+        return verdict.code
     finally:
         dist.destroy_process_group()
 

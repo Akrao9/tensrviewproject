@@ -39,9 +39,13 @@ from typing import Any, Callable, Iterable, Mapping
 # `tensorquill.evidence` that takes one run's records (every rank's lines, in file order) and
 # returns the object of contract section 8 (`{"v", "tolerance", "steps", "replica_drift"}`, with
 # `legacy` when there is one), spelled as the fixtures spell it. `--reader module:function` names
-# another. A result wrapped as `{"replica": {...}}` is unwrapped. When the function cannot be found
-# the run ends NOT PROVEN (exit 3), never PASS.
-DEFAULT_READER = "tensorquill.evidence:replica_result"
+# another, as does the environment variable below (read by the driver and by its tests alike, so a
+# renamed reader is one setting on the trial merge, not a silent skip). A result wrapped as
+# `{"replica": {...}}` is unwrapped. When the function cannot be found the run ends NOT PROVEN
+# (exit 3), never PASS.
+READER_ENV = "TENSORQUILL_REPLICA_READER"
+DEFAULT_READER = os.environ.get(READER_ENV) or "tensorquill.evidence:replica_result"
+ACK_POLL = 0.005  # how often each rank looks at its sender's offset file (server mode)
 
 EXIT_PASS, EXIT_FAIL, EXIT_USAGE, EXIT_NOT_PROVEN = 0, 1, 2, 3
 TOLERANCE = 1e-6
@@ -177,8 +181,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Check TensorQuill's cross-rank replica comparison on any number of ranks (contract section 7).",
     )
     p.add_argument("--cpu", action="store_true", help="use Gloo on the CPU instead of CUDA and NCCL")
-    p.add_argument("--out", type=Path, required=True,
-                   help="a folder for this check; each run writes <out>/<run_id>/<run_id>.rank<N>.jsonl")
+    p.add_argument("--out", type=Path, default=Path("runs/replica"),
+                   help="a folder for this check; each run writes <out>/<run_id>/<run_id>.rank<N>.jsonl"
+                        " (default: runs/replica)")
     p.add_argument("--mode", choices=("files", "server"), default="files",
                    help="where the verdict comes from: the Python reader of the local rank files, or a server's"
                         " watchdog.json (needs --endpoint, --store and --status-interval)")
@@ -363,7 +368,7 @@ class ProofSink:
 
     def __init__(self, inner: Any, *, hold_from: int | None = None, never: bool = False,
                  release_file: Path | None = None, progress: Progress | None = None,
-                 offsets: Path | None = None, poll: float = 0.005,
+                 offsets: Path | None = None, poll: float = ACK_POLL,
                  clock: Callable[[], float] = time.time) -> None:
         self.inner = inner
         self.path = inner.path
@@ -721,6 +726,9 @@ def check_latency(log: VerdictLog, plan: Plan, launch: str | None,
     lines: list[str] = []
     bound = plan.interval + plan.margin
     what = "look of the reader" if plan.mode == "files" else "status interval"
+    if plan.mode == "server":
+        lines.append(f"each rank looked at its offset file every {ACK_POLL * 1000:g} ms: an acknowledgement seen"
+                     " late makes a step's time read short by up to that much")
     for step in plan.scheduled:
         if plan.never_judged(step):
             lines.append(f"step {step}: never judged (rank {plan.hold_rank} never reports): no clock")
@@ -795,6 +803,71 @@ def check_kinds(records: list[dict], plan: Plan, launch: str | None) -> tuple[li
                 failures.append(f"step {step} {param}: a swap moves only the projection (spreads {norm}, {total},"
                                 f" {projection})")
     return failures, lines
+
+
+def check_records(records: list[dict], plan: Plan) -> list[str]:
+    """Each rank's own file holds every step it was due to write, each with the loss: every step on
+    a rank that reported, the steps before the hold on one that never did."""
+    failures: list[str] = []
+    for rank in plan.group:
+        mine = [r for r in records if r.get("rank") == rank]
+        due = [s for s in range(plan.steps) if not (rank == plan.hold_rank and plan.never_judged(s))]
+        steps = [r.get("step") for r in mine]
+        if steps != due:
+            failures.append(f"rank {rank}'s file holds steps {steps}, not {due}")
+        if not all("train/loss" in (r.get("scalars") or {}) for r in mine):
+            failures.append(f"rank {rank}: the loss was not recorded on every step")
+    return failures
+
+
+@dataclass
+class Verdict:
+    code: int
+    lines: list[str]
+    failures: list[str]
+
+
+def evaluate(plan: Plan, log: VerdictLog, seen_while: Mapping[int, int], reports: Mapping[int, Mapping[str, Any]],
+             launch: str | None, records: list[dict], reader_found: bool) -> Verdict:
+    """Every check, composed once, for the driver and its tests alike: PASS only when each holds;
+    NOT PROVEN when the file reader was not found (whatever else held); FAIL otherwise."""
+    lines = [f"{plan.world} ranks, mode {plan.mode}, launch {launch}, group {plan.group},"
+             f" plants: {'; '.join(map(str, plan.plants)) or 'none'}"]
+    if plan.hold_rank is not None:
+        held = reports.get(plan.hold_rank, {})
+        lines.append(f"rank {plan.hold_rank} held from step {plan.hold_from} ({plan.release}): held steps"
+                     f" {held.get('held_steps')}, released at training step {held.get('released_at_step')}"
+                     f"{' (at its close)' if held.get('released_at_close') else ''}, dropped {held.get('dropped')}"
+                     f" records; step {plan.hold_from} still read insufficient while rank 0 trained step"
+                     f" {seen_while.get(plan.hold_from)}")
+    failures = check_no_wait(reports, plan) + check_records(records, plan)
+    if plan.mode == "files" and not reader_found:
+        lines += [f"FAIL {f}" for f in failures]
+        lines.append(f"NOT PROVEN: the reader {plan.reader} was not found (lane Z2's function; --reader or"
+                     f" {READER_ENV} names another). Trained {plan.steps} steps on {len(reports)} of {plan.world}"
+                     " ranks; no verdict was read.")
+        return Verdict(EXIT_FAIL if failures else EXIT_NOT_PROVEN, lines, failures)
+    result = log.as_result()
+    for entry in sorted(result["steps"], key=lambda e: (e.get("step") is None, e.get("step") or 0)):
+        lines.append(f"  step {entry.get('step')}: {entry.get('coverage')}"
+                     + (f" missing {entry.get('missing')}" if entry.get("missing") else "")
+                     + (f" fingerprints {entry.get('fingerprints')}" if entry.get("fingerprints") else "")
+                     + (f" on {entry.get('drift_parameters')}" if entry.get("drift_parameters") else "")
+                     + (f" signatures {entry.get('signatures')}" if entry.get("signatures") else ""))
+    lines += [f"  replica_drift: {incident}" for incident in result["replica_drift"]]
+    failures += check_result(result, plan, launch)
+    failures += check_history(log, plan, launch, reports.get(plan.hold_rank) if plan.hold_rank is not None
+                              else None, seen_while)
+    late, clock_lines = check_latency(log, plan, launch, reports)
+    kinds, d1_lines = check_kinds(records, plan, launch)
+    failures += late + kinds
+    lines += [f"  {line}" for line in clock_lines + d1_lines]
+    lines += [f"  reader error at a look: {error}" for error in log.errors[:5]]
+    lines += [f"FAIL {f}" for f in failures]
+    if failures:
+        return Verdict(EXIT_FAIL, lines, failures)
+    lines.append(f"PASS {plan.mode} on {plan.world} ranks ({log.looks} looks)")
+    return Verdict(EXIT_PASS, lines, failures)
 
 
 # --- The observer -----------------------------------------------------------------------------
