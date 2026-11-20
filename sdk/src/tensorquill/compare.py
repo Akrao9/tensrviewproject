@@ -593,7 +593,9 @@ def open_run(wanted: str | Path, source: str | Path | None = None, project: str 
                 f"{path} holds {len(found)} runs; name one by its ID or name with source={str(path)!r}")
         run = found[0]
     opened = _open_local(run, rank) if run["source"] == "local" else _open_store(run, rank, read_parts)
-    dropped = _store_dropped(Path(run["path"]), rank) if run["source"] != "local" else None
+    # With `rank`, the rank read: a run of one rank is read on the rank it has (`_open_store`).
+    read = opened["read_from"].get("rank") if rank is not None else None
+    dropped = _store_dropped(Path(run["path"]), read) if run["source"] != "local" else None
     return {"run_id": run["run_id"], "manifest": run.get("manifest"),
             "block": _manifest.run_block(run["run_id"], run.get("manifest")), **opened,
             **({"dropped_rows": dropped} if dropped is not None else {})}
@@ -601,8 +603,8 @@ def open_run(wanted: str | Path, source: str | Path | None = None, project: str 
 
 def _store_dropped(folder: Path, rank: int | None) -> dict[str, Any] | None:
     """The rows a store run's server dropped for a null key (`runs.dropped_rows`, from its
-    `watchdog.json`; L22, lane AA5, Nov 20, 2026): the whole run's, or with `rank` that rank's
-    alone, in the same shape. None when none was dropped (of that rank), so such a run's result
+    `watchdog.json`; L22, lane AA5, Nov 20, 2026): the whole run's, or with `rank` (the rank
+    read) that rank's alone, in the same shape. None when none was dropped (of that rank), so such a run's result
     is as before. An upper bound: a batch sent again after a lost acknowledgement is counted
     again. Never raises."""
     from .evidence import read_watchdog

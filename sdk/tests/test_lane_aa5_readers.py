@@ -183,6 +183,26 @@ def test_l21_the_count_costs_no_read_beyond_the_scan(tmp_path, monkeypatch):
     assert starts == [0]
 
 
+def test_l21_a_split_ranks_file_of_its_own_name_is_not_scanned(tmp_path, monkeypatch):
+    """Fail before (on b2b7a95): every file over a megabyte was scanned, a split rank's file of a
+    name of its own too, whose lines its count does not read (it is read whole for the attempts
+    anyway). A split rank's file named for a rank is scanned: its count reads it."""
+    named = big_rank_file(tmp_path / f"{RUN}.rank0.jsonl")
+    other = big_rank_file(tmp_path / "earlier.jsonl")  # rank 0 of the same run, a name of its own
+    real = runs_module._scan_file
+    scanned: list[str] = []
+
+    def watched(path, before):
+        scanned.append(Path(path).name)
+        return real(path, before)
+
+    monkeypatch.setattr(runs_module, "_scan_file", watched)
+    runs_module._SCANNED.clear()
+    found = only_row(tmp_path)
+    assert other.name not in scanned and named.name in scanned
+    assert found["ranks"] == [0]
+
+
 @pytest.mark.skipif(not RECORDED.is_dir(), reason="the recorded captures are not on this machine")
 def test_l21_the_recorded_captures_named_for_a_rank_are_counted_as_one_rank(tmp_path):
     """Fail before: each listed as "1+" with no manifest. Each recorded capture (6 to 17 MB, one
@@ -285,6 +305,17 @@ def test_l22_compare_of_one_rank_shows_that_ranks_rows_alone(tmp_path):
     assert (one["rows"], one["by_key"], one["ranks"]) == (4, {"step": 4}, [{"rank": 1, "rows": 4, "by_key": {"step": 4}}])
     store(source, "other", {1: {"step": 4}})
     assert "dropped_rows" not in tensorquill.compare_runs("base", "other", source=source, rank=0)["runs"][1]
+
+
+def test_l22_compare_of_one_rank_shows_the_rows_of_the_rank_read(tmp_path):
+    """Fail before (on a5acac0): no `dropped_rows`. A run of one rank is read on the rank it has
+    whatever `rank` asks (`_open_store`), so its count is that rank's, not the asked rank's."""
+    source = tmp_path / "store"
+    store(source, "base")
+    store(source, "lone", {0: {"step": 3}}, ranks=1)
+    entry = tensorquill.compare_runs("base", "lone", source=source, rank=1)["runs"][1]
+    assert entry["read_from"]["rank"] == 0
+    assert (entry["dropped_rows"]["rows"], entry["dropped_rows"]["ranks"]) == (3, [{"rank": 0, "rows": 3, "by_key": {"step": 3}}])
 
 
 def test_l22_a_local_run_has_no_dropped_rows_in_compare(tmp_path):
