@@ -621,10 +621,10 @@ def test_in_eager_mode_anything_else_the_counting_raises_on_refuses_the_router(t
         (lambda logits: logits.topk(TOP_K, dim=-1).indices.to(torch.uint8), Router(EXPERTS, TOP_K), 120 * TOP_K),
         (lambda logits: logits.half(), Router(EXPERTS, TOP_K), 120 * TOP_K),
         (lambda logits: (logits.softmax(-1), logits), Router(EXPERTS, TOP_K), 120 * TOP_K),
-        # An integer router's top_k is only written down: above the experts it is counted as before.
-        (lambda logits: logits.topk(TOP_K, dim=-1).indices, Router(EXPERTS, 12), 120 * TOP_K),
+        # An integer router whose top_k is above its experts is no longer counted (C06's last case):
+        # it is refused, `test_lane_y1_capture.py`.
     ],
-    ids=["int32", "uint8", "float16", "weights-then-logits", "int-top_k-above"],
+    ids=["int32", "uint8", "float16", "weights-then-logits"],
 )
 def test_what_was_counted_before_is_counted_as_before(tmp_path, make, spec, routed, compile_backend):
     with warnings.catch_warnings():
