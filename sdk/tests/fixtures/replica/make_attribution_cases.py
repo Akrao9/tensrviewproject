@@ -129,6 +129,11 @@ cases = {
   "Three ranks whose norms step up evenly: the spread from the lowest to the highest is over the tolerance, and each rank is within it of the middle one. The step drifts and no rank stands apart.",
   [rec(0, G3), rec(1, G3, w=P(3.5000028, -1.25, 0.75, 71)), rec(2, G3, w=P(3.5000056, -1.25, 0.75, 72))], [cov(G3)],
   [unnamed("w", "fingerprints", "no_outlier", G3), unnamed("w", "signatures", "no_majority", G3)], 1),
+ "three_of_four_within_tolerance_of_the_median": case(
+  "Four ranks whose sums sit at -0.9, -0.9, +0.9 and +4 tolerances from the median, with equal norms. Three lie within the tolerance of the median, so rank 3 is named, though the three do not hold one value: the two sides are 1.8 tolerances apart. By signatures two ranks hold one value, which is not a strict majority of four, so that reading names no rank.",
+  [rec(0, G4, w=P(3.5, -1.25000315, 0.75, 81)), rec(1, G4, w=P(3.5, -1.25000315, 0.75, 81)),
+   rec(2, G4, w=P(3.5, -1.24999685, 0.75, 82)), rec(3, G4, w=P(3.5, -1.249986, 0.75, 83))], [cov(G4)],
+  [named("w", "fingerprints", [3], G4), unnamed("w", "signatures", "no_majority", G4)], 1),
  "only_the_projection_separates_the_outlier": case(
   "Two elements are swapped on rank 0: the norm and the sum are equal on every rank and the projection is not. Rank 0 is named.",
   [rec(0, G3, w=W_PROJ), rec(1, G3), rec(2, G3)], [cov(G3)], both("w", [0], G3), 1),

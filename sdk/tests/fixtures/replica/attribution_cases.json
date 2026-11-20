@@ -3388,6 +3388,247 @@
     "incidents": 1
    }
   },
+  "three_of_four_within_tolerance_of_the_median": {
+   "says": "Four ranks whose sums sit at -0.9, -0.9, +0.9 and +4 tolerances from the median, with equal norms. Three lie within the tolerance of the median, so rank 3 is named, though the three do not hold one value: the two sides are 1.8 tolerances apart. By signatures two ranks hold one value, which is not a strict majority of four, so that reading names no rank.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1,
+       2,
+       3
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25000315,
+         0.75
+        ],
+        "sig": "81"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000214,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1,
+       2,
+       3
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25000315,
+         0.75
+        ],
+        "sig": "81"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 2,
+     "attempt": 1795000000327,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1,
+       2,
+       3
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.24999685,
+         0.75
+        ],
+        "sig": "82"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 3,
+     "attempt": 1795000000440,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1,
+       2,
+       3
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.249986,
+         0.75
+        ],
+        "sig": "83"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "coverage": [
+     {
+      "step": 99,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1,
+       2,
+       3
+      ],
+      "coverage": "complete"
+     }
+    ],
+    "attribution": [
+     {
+      "step": 99,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1,
+       2,
+       3
+      ],
+      "parameter": "w",
+      "by": "fingerprints",
+      "verdict": "attributed",
+      "outliers": [
+       3
+      ]
+     },
+     {
+      "step": 99,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1,
+       2,
+       3
+      ],
+      "parameter": "w",
+      "by": "signatures",
+      "verdict": "inconclusive",
+      "why": "no_majority"
+     }
+    ],
+    "incidents": 1
+   }
+  },
   "only_the_projection_separates_the_outlier": {
    "says": "Two elements are swapped on rank 0: the norm and the sum are equal on every rank and the projection is not. Rank 0 is named.",
    "records": [

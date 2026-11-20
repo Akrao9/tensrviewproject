@@ -115,7 +115,7 @@ def test_each_case_has_the_coverage_attribution_and_incident_count_the_contract_
 
 
 def test_the_file_holds_the_cases_the_page_names():
-    assert len(NEW) == 26
+    assert len(NEW) == 27
     page = (Path(__file__).parents[2] / "REPLICA_OBSERVATION_CONTRACT.md").read_text()
     for case, _ in NEW:
         assert f"`{case}`" in page, f"{case} is not named in section 4a"
@@ -239,3 +239,21 @@ def test_a_reader_that_lets_a_ranks_later_row_vote_is_caught():
     named = [e["outliers"] for e in the_last_row_of_each_rank(
         DOCUMENT["cases"]["a_set_aside_later_attempt_does_not_vote"]["records"], TOLERANCE) if e["verdict"] == "attributed"]
     assert named and all(outliers == [0] for outliers in named)
+
+
+def test_a_reader_that_asks_fingerprints_for_one_value_held_by_a_majority_is_caught():
+    """ "A strict majority holds one value" is the signatures' rule. Asked of fingerprints, it finds
+    no value held by three of four here and names no rank; the fingerprints' rule is a strict
+    majority within the tolerance of the median, which names rank 3."""
+    def one_value(records, tolerance):
+        out = []
+        for e in attribution(records, tolerance):
+            if e["by"] == "fingerprints":
+                rows = {r["rank"]: {"sig": json.dumps(r["replica"]["params"][e["parameter"]]["fp"])}
+                        for r in records if r["step"] == e["step"] and r["replica"]["launch"] == e["launch"]}
+                e = {k: v for k, v in e.items() if k not in ("verdict", "outliers", "why")} | _by_signatures(rows)
+            out.append(e)
+        return out
+
+    assert _wrong(one_value, "three_of_four_within_tolerance_of_the_median")
+    assert not _wrong(one_value, "three_ranks_two_to_one")  # far from the tolerance the two rules agree
