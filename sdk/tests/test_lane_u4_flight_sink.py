@@ -381,12 +381,13 @@ def test_sdk21_unstorable_lines_are_skipped_and_counted_and_the_sender_moves_on(
     ]
     append(path, bad)
     with path.open("a", encoding="utf-8") as file:
+        # Stored since wave AA (lane AA4, L20), its NaN sent as "nan": skipped before.
         file.write('{"schema_version":1,"run_id":"run-a","rank":0,"step":6,"layers":{"x":NaN}}\n')
     append(path, [record(7), record(8)])
     sender = fast(path, server.endpoint)
     assert sender.close() is True
-    assert store.steps() == [0, 7, 8]
-    assert sender.skipped_lines == 6
+    assert store.steps() == [0, 6, 7, 8]
+    assert sender.skipped_lines == 5
     assert read_offset(offset_path(path)) == path.stat().st_size
 
 

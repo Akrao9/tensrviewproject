@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from .manifest import METADATA_KEY as MANIFEST_KEY, _say, manifest_to_send
+from .sink import _finite
 
 SCHEMA_VERSION = 1
 BATCH_STEPS = 50
@@ -102,14 +103,24 @@ def _map(item: Callable[[Any], Any]) -> Callable[[Any], list[tuple[str, Any]]]:
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, separators=(",", ":"), sort_keys=True, allow_nan=False)
+    """`value` as standard JSON text. A non-finite float inside it (a line holding a bare `NaN` or
+    `Infinity`, which a JSON reader accepts but `JsonlSink` never writes) is written as the string
+    `JsonlSink` writes, "nan", "inf" or "-inf", which both engines read (L20): before, the whole
+    record was refused and never sent."""
+    try:
+        return json.dumps(value, separators=(",", ":"), sort_keys=True, allow_nan=False)
+    except ValueError:
+        return json.dumps(_finite(value), separators=(",", ":"), sort_keys=True, allow_nan=False)
 
 
 def _ordered_json(value: Any) -> str:
     """`_json` with the object's key order kept. For `layers` that order is the model's, which the
     detectors use to say which block showed a change first; sorted, `model.layers.10` would
     come before `model.layers.2`."""
-    return json.dumps(value, separators=(",", ":"), allow_nan=False)
+    try:
+        return json.dumps(value, separators=(",", ":"), allow_nan=False)
+    except ValueError:
+        return json.dumps(_finite(value), separators=(",", ":"), allow_nan=False)
 
 
 # JSONL key -> (Arrow column, converter). A value that does not fit its column's type, and
@@ -275,13 +286,24 @@ def offset_path(jsonl_path: str | Path) -> Path:
 # The offset file says how many bytes of the local file the server stored, and also which
 # server (its address, the run and the rank) and which file: a digest of the file's first bytes
 # and of the bytes just before the offset. An append-only file never changes those bytes, so a
-# sender resumes at the offset only when the address, the run, the rank and both digests match;
+# sender resumes at the offset only when the server (its store, or for a server that names none its
+# address; see below), the run, the rank and both digests match;
 # anything else (another server, a file deleted and written again, a file rewritten in place,
 # a file shorter than the offset, an offset file from before the binding) sends the file again
 # from its start, which is safe because the server drops the steps it already has. The file's
 # inode is not part of it: a copy of the same bytes resumes, which is right, and a new file under
-# the same inode is told apart by its bytes. A server that lost its store behind the same address
-# cannot be told apart here: the server sends nothing that names its store.
+# the same inode is told apart by its bytes.
+#
+# Which store it is (L3). A server that names its store returns `store_id` with each ack
+# (`{"end_byte_offset": N, "store_id": "..."}`), and the offset file keeps it. The saved offset is
+# then bound to the store, not to the address: before a stream reuses a saved offset its first
+# message is an empty batch, and the answer to it names the store. The same store reached at
+# another address resumes; another store (wiped or replaced behind the same address), or an offset
+# saved before the server named its store, sends the file again from its start, said once per
+# sender. A server whose ack has no `store_id` (built before it) is bound to the address, as before.
+# W&B asks the server for its record of the run before it resumes a file stream
+# (`wandb/core/internal/runbranch/resume.go`, `processAllOffsets`); the empty first batch is how
+# this sender asks, with nothing but the ack the server already sends.
 OFFSET_VERSION = 2
 HEAD_BYTES = 64 * 1024
 TAIL_BYTES = 4 * 1024
@@ -330,6 +352,12 @@ def read_binding(path: Path) -> dict[str, Any]:
     if isinstance(document, int) and not isinstance(document, bool):
         return {"offset": max(0, document)}  # an offset file from before the binding
     return {"offset": 0}
+
+
+def _store_of(document: Mapping[str, Any]) -> str | None:
+    """The store ID that an ack or an offset file names: a non-empty string, else None."""
+    store_id = document.get("store_id")
+    return store_id if isinstance(store_id, str) and store_id else None
 
 
 def read_offset(path: Path) -> int:
@@ -410,9 +438,9 @@ def parse_lines(lines: Iterable[bytes], run_id: str) -> tuple[list[dict[str, Any
 def rows_to_send(records: Iterable[Mapping[str, Any]], schema: Any) -> tuple[Any, list[int], int]:
     """`records` as one record batch of `schema`, the steps it holds, and how many records were
     left out because a value cannot be stored: a null or a string where a key column needs an
-    integer (`"attempt": null`), an integer too large for its column, a NaN inside a nested
-    object. Such a line is skipped and counted like a line that is not JSON; were it kept, every
-    retry would start again at it and the sender would never get past it."""
+    integer (`"attempt": null`), an integer too large for its column. Such a line is skipped and
+    counted like a line that is not JSON; were it kept, every retry would start again at it and
+    the sender would never get past it. (A NaN inside a nested object is sent as "nan", L20.)"""
     import pyarrow as pa
 
     rows: list[dict[str, Any]] = []
@@ -533,7 +561,12 @@ class FlightSender:
         # Where the offset file binds its offset: this server, run and rank (see `write_offset`).
         self._destination = {"endpoint": self._location, "run_id": run_id, "rank": rank}
         self.replayed: str | None = None  # why the last stream started again at byte 0, if it did
-        self._acked = 0  # set from the offset file as each stream starts (`_resume`)
+        self._binding: dict[str, Any] = {"offset": 0}  # the offset file as the stream started
+        self._store_id: str | None = None  # the store this stream's server named, once it has
+        self._said_store = False  # a replay for want of the same store is said once per sender
+        # Set from the offset file once the server has named its store (`_stream`), never before:
+        # an offset that store did not confirm is not counted as confirmed.
+        self._acked = 0
         self._head = b""  # the file's first bytes and the bytes just before `sent`, to bind acks
         self._tail = b""
         self._pending: dict[int, dict[str, str]] = {}  # batch end offset -> the file's identity there
@@ -675,15 +708,20 @@ class FlightSender:
         return self._random.uniform(0.0, ceiling), min(self._backoff_cap, ceiling * 2.0)
 
     def _resume(self) -> int:
-        """Where this stream starts: the saved offset when the offset file names this server,
-        run and rank and the file's bytes match its digests, else 0 (the server drops what it
-        already has). Raises `LocalFileUnreadable` when the file cannot be read."""
+        """Where this stream may start as far as this side can tell: the saved offset when the
+        offset file names this run and rank and the file's bytes match its digests, else 0 (the
+        server drops what it already has), with `replayed` saying why. A saved offset above 0 is
+        used only once the server has named its store (`_bound`), so the address is checked here
+        only for an offset saved without a store ID. Raises `LocalFileUnreadable` when the file
+        cannot be read."""
         binding = read_binding(self.offset_path)
+        self._binding = binding
         offset = binding["offset"]
         try:
             head, tail = _windows(self.path, 0)
             reason = None
-            if offset and any(binding.get(key) != value for key, value in self._destination.items()):
+            checked = ("run_id", "rank") if _store_of(binding) else ("endpoint", "run_id", "rank")
+            if offset and any(binding.get(key) != self._destination[key] for key in checked):
                 reason = "the offset file names another server, run or rank" if "endpoint" in binding else (
                     "the offset file names no server or file")
             elif offset:
@@ -704,6 +742,37 @@ class FlightSender:
             self._pending.clear()
         return 0 if reason else offset
 
+    def _bound(self, store_id: str | None) -> str | None:
+        """Why the saved offset that passed `_resume` must not be used with the store this stream's
+        server named in its first ack (`store_id`, None from a server that names none), or None."""
+        if store_id is None:  # a server built before the store ID: bound to its address, as before
+            if self._binding.get("endpoint") != self._destination["endpoint"]:
+                return "the offset file names another server, run or rank"
+            return None
+        saved = _store_of(self._binding)
+        if saved is None:
+            return "the offset was saved before the server named its store"
+        if saved != store_id:
+            return "the server's store is not the one the offset was saved for"
+        return None  # the same store, at this address or another
+
+    def _replay(self, reason: str) -> None:
+        """Start this stream again at byte 0, for `reason`. A replay for want of the same store is
+        said once per sender: the stream may be opened again before the first ack is stored."""
+        self.replayed = reason
+        self._head, self._tail = b"", b""
+        with self._pending_lock:
+            self._pending.clear()
+        if "store" in reason and not self._said_store:
+            self._said_store = True
+            saved, named = _store_of(self._binding), self._store_id
+            which = f" (store {named}; the offset was saved for store {saved})" if saved else f" (store {named})"
+            print(
+                f"tensorquill: {reason}{which}, so {self.path} is sent to {self.endpoint} again from its start, "
+                f"once. The server keeps each step once; training is not affected.",
+                file=sys.stderr,
+            )
+
     def _sent(self, data: bytes, end: int) -> None:
         """Move the identity windows past `data`, the bytes just sent, which end at `end`."""
         if len(self._head) < HEAD_BYTES:
@@ -712,7 +781,16 @@ class FlightSender:
         with self._pending_lock:
             self._pending[end] = {"head": _digest(self._head), "tail": _digest(self._tail)}
 
-    def _ack(self, offset: int) -> None:
+    def _ack(self, offset: int, store_id: str | None = None) -> None:
+        """Take the server's ack of `offset`, which names `store_id` when the server names its store.
+        An ack naming another store than this stream's first ack did ends the stream: its offset
+        is not this store's to confirm."""
+        if store_id is not None:
+            if self._store_id is None:
+                self._store_id = store_id
+            elif store_id != self._store_id:
+                raise ConnectionError(
+                    f"the server named store {store_id} after naming store {self._store_id} on the same stream")
         if offset > self._acked:
             with self._pending_lock:
                 identity = self._pending.get(offset)
@@ -727,7 +805,8 @@ class FlightSender:
                     identity = file_identity(self.path, offset)
                 except (OSError, ValueError):
                     return  # later acks name the batches this stream sends
-            write_offset(self.offset_path, offset, {**self._destination, **identity})
+            store = {"store_id": self._store_id} if self._store_id is not None else {}
+            write_offset(self.offset_path, offset, {**self._destination, **identity, **store})
             self._acked = offset
             with self._pending_lock:
                 for end in [end for end in self._pending if end <= offset]:
@@ -739,8 +818,13 @@ class FlightSender:
         import pyarrow as pa
         import pyarrow.flight as flight
 
-        self._acked = self._resume()  # 0 when the file is not the one the offset was saved for
-        sent = self._acked
+        saved = self._resume()  # 0 when the file is not the one the offset was saved for
+        # A saved offset is used once the server has named its store, in answer to an empty first
+        # batch (L3): until then nothing past byte 0 is sent and nothing is counted as confirmed.
+        probing = saved > 0
+        self._acked = 0
+        self._store_id = None
+        sent = 0
         schema = flight_schema()
         headers = [(b"authorization", f"Bearer {self._token}".encode())] if self._token else []
         client_kwargs: dict[str, Any] = {
@@ -754,6 +838,10 @@ class FlightSender:
             writer, reader = client.do_put(descriptor, schema, flight.FlightCallOptions(headers=headers))
             failure: list[BaseException] = []
             ended = threading.Event()
+            answered = threading.Event()  # the first ack has come: it names the store, or none
+            decided = threading.Event()  # and this thread has chosen where the stream starts
+            named: list[str | None] = []
+            chose: list[bool] = []
 
             def read_acks() -> None:
                 try:
@@ -761,7 +849,15 @@ class FlightSender:
                         buffer = reader.read()
                         if buffer is None:
                             return
-                        self._ack(int(json.loads(buffer.to_pybytes())["end_byte_offset"]))
+                        document = json.loads(buffer.to_pybytes())
+                        offset, store_id = int(document["end_byte_offset"]), _store_of(document)
+                        if probing and not answered.is_set():
+                            named.append(store_id)
+                            answered.set()
+                            decided.wait()  # its offset is taken once the stream knows where it starts
+                            if not chose:
+                                return  # the stream failed before it chose: nothing of this store is taken
+                        self._ack(offset, store_id)
                 except BaseException as error:  # noqa: BLE001
                     failure.append(error)
                 finally:
@@ -771,7 +867,52 @@ class FlightSender:
             acks.start()
             waiting_since: float | None = None
             first_batch = True
+
+            def metadata_for(end: int, steps: list[int], asking: bool = False) -> bytes:
+                """A batch's metadata. The empty batch that asks for the store (`asking`) carries no
+                manifest: that rides on the stream's first batch of rows, as before the question."""
+                nonlocal first_batch
+                metadata = {
+                    "schema_version": SCHEMA_VERSION,
+                    "run_id": self.run_id,
+                    "rank": self.rank,
+                    "min_step": min(steps) if steps else None,
+                    "max_step": max(steps) if steps else None,
+                    "end_byte_offset": end,
+                    **({"world_size": self.world_size} if self.world_size else {}),
+                    # Optional, and unknown to a server older than it, which ignores it.
+                    **({"sender_attempt": self._attempt} if self._attempt is not None else {}),
+                    # Optional, and unknown to a server older than it, which ignores it.
+                    **({MANIFEST_KEY: self.manifest} if first_batch and self.manifest and not asking else {}),
+                }
+                first_batch = first_batch and asking
+                return json.dumps(metadata).encode()
+
             try:
+                if probing:
+                    try:
+                        # No rows and no bytes claimed: the server answers it at once with what it
+                        # already holds (an offset of 0 on this stream) and, when it has one, its store ID.
+                        empty = pa.RecordBatch.from_pylist([], schema=schema)
+                        writer.write_with_metadata(empty, pa.py_buffer(metadata_for(0, [], asking=True)))
+                        while not answered.is_set() and not ended.is_set():
+                            if self._closing.is_set() and time.monotonic() >= self._deadline:
+                                break
+                            answered.wait(self._poll_seconds)
+                        if not answered.is_set():
+                            if failure:
+                                raise failure[0]
+                            raise ConnectionError(
+                                "the server did not answer the stream's first batch, so the saved offset was not used")
+                        self._store_id = named[0]
+                        reason = self._bound(named[0])
+                        if reason is None:
+                            self._acked = sent = saved
+                        else:
+                            self._replay(reason)
+                        chose.append(True)
+                    finally:
+                        decided.set()
                 # The ack reader returning is how a stream the server ended shows up here;
                 # the server's status (such as "ingest buffer full") is raised by close().
                 while not ended.is_set():
@@ -785,22 +926,9 @@ class FlightSender:
                         records, skipped = parse_lines(lines, self.run_id)
                         batch, steps, unstorable = rows_to_send(records, schema)
                         self.skipped_lines += skipped + unstorable
-                        metadata = {
-                            "schema_version": SCHEMA_VERSION,
-                            "run_id": self.run_id,
-                            "rank": self.rank,
-                            "min_step": min(steps) if steps else None,
-                            "max_step": max(steps) if steps else None,
-                            "end_byte_offset": end,
-                            **({"world_size": self.world_size} if self.world_size else {}),
-                            # Optional, and unknown to a server older than it, which ignores it.
-                            **({"sender_attempt": self._attempt} if self._attempt is not None else {}),
-                            # Optional, and unknown to a server older than it, which ignores it.
-                            **({MANIFEST_KEY: self.manifest} if first_batch and self.manifest else {}),
-                        }
-                        first_batch = False
+                        metadata = metadata_for(end, steps)
                         self._sent(b"".join(line + b"\n" for line in lines), end)
-                        writer.write_with_metadata(batch, pa.py_buffer(json.dumps(metadata).encode()))
+                        writer.write_with_metadata(batch, pa.py_buffer(metadata))
                         sent = end
                         waiting_since = None
                         continue
