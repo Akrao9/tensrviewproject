@@ -575,6 +575,41 @@ def update_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[st
     }
 
 
+# The kinds judged from each parameter's own gradient norm (`grad_norms`): a parameter whose
+# gradient was not read is not judged by them.
+GRADS_NOT_READ_KINDS = ("grad_spike", "stalled_weights", "non_finite")
+
+
+def grads_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The `gradients` entry of `not_checked` (L23): parameters whose gradient could not be read.
+
+    The capture leaves such a gradient out of `grad_norms` on its own (one on `meta`, a nested
+    one, or one whose norm raised) and says which parameter, and why, once, under
+    `grads_not_read` on the first record it wrote after it knew (`record_grads`). Without this
+    entry the kinds judged from each parameter's gradient (`GRADS_NOT_READ_KINDS`) would read
+    "nothing found" for a parameter that was never looked at. As for `update_size`, the kinds are
+    `unavailable` and the run `degraded`. The server writes no such entry yet; `build_evidence`
+    adds this one to a report that has none.
+    """
+    first: dict[str, tuple[int, str]] = {}
+    for record in records:
+        said = record.get("grads_not_read")
+        if not isinstance(said, Mapping):
+            continue
+        for name, why in said.items():
+            first.setdefault(str(name), (int(record["step"]), str(why)))
+    if not first:
+        return None
+    names = sorted(first)
+    return {
+        "check": "gradients",
+        "kinds": list(GRADS_NOT_READ_KINDS),
+        "parameters": names,
+        "reason": "gradient not read for " + "; ".join(f"{name}: {first[name][1]}" for name in names),
+        "step": min(step for step, _ in first.values()),
+    }
+
+
 def _spiking_parameters(
     record: dict[str, Any],
     per_param: dict[str, list[tuple[int, float]]],
@@ -3836,6 +3871,8 @@ def _incident_identity(incident: Mapping[str, Any]) -> str:
         parts = [incident.get("reason")]
     elif kind == "replica_drift":
         parts = sorted(incident.get("parameters") or ())
+        if incident.get("source") is not None:  # from the ranks' observations: what was compared, too
+            parts = [parts, incident.get("source"), incident.get("launch"), incident.get("group")]
     elif kind in (
         "repeated_steps", "resume_lr_change", "resume_data_mismatch", "resume_incomplete",
         "memory_growth", "memory_pressure", "allocator_retries",
@@ -4152,8 +4189,20 @@ def combine_rank_evidence(
     status_expected: bool = False,
     unknown_ranks: Mapping[int, str] | None = None,
     memory: Mapping[int, Any] | None = None,
+    replica_records: Iterable[Mapping[str, Any]] | None = None,
+    drift_tolerance: float = DRIFT_TOLERANCE,
+    attempt_order: Mapping[tuple[str, Any], list[Any]] | None = None,
 ) -> dict[str, Any]:
     """The run-level part of the all-ranks view, built from one evidence per judged rank.
+
+    The ranks' replica observations (SDK-22) are compared across ranks here. For local files,
+    `replica_records` are every rank's records as written (all of them, not one rank's resolved
+    ones), compared by `compare_replicas` with `drift_tolerance` and `attempt_order` (each rank's
+    attempts oldest first, for a rank in several files). For a store, the server's result is
+    taken from `status` (`replica` in `watchdog.json`), and `replica_not_stated` says when the
+    status has none. Either way the result is under `replica`, its first incident from
+    observations is a run incident, and `kind_checks`' `replica_drift` entry says what was
+    compared (`replica_kind_check`). Records without an observation give no `replica` key.
 
     For the ranks `all_ranks_evidence` cannot read as a whole: a run of local `.jsonl` files
     (each rank judged by `build_evidence`, or read from its evidence file), and a store whose
@@ -4226,6 +4275,14 @@ def combine_rank_evidence(
             checks["duplicate_batches"] = {"value": "not_configured", "enough_history": False,
                                            "needs": _CROSS_RANK_NEEDS["duplicate_batches"]}
         combined["kind_checks"] = checks
+    if replica_records is not None:
+        listed = [dict(r) for r in replica_records]
+        if any(_observation(r) is not None for r in listed):
+            result, details = _replica_judged(listed, drift_tolerance, attempt_order)
+            _fold_replica(combined, _replica_object(result, drift_tolerance), None, run_incidents, not_checked, details)
+    else:
+        _fold_replica(combined, *_replica_from_status(status), run_incidents, not_checked)
+    with_classes(run_incidents)
     incidents = [group["incident"] for group in groups] + run_incidents
     combined["run_state"] = run_state(
         incidents=incidents, steps_judged=bool(steps),
@@ -4494,6 +4551,12 @@ def _all_ranks_evidence(
     }
     _all_ranks_kind_checks(evidence, looks, status, flight_recorder=flight_recorder is not None,
                            traincheck=traincheck is not None)
+    # The ranks' replica observations, compared by the server: its result is read from the status,
+    # as everything here is (contract 8), and no part is opened for it.
+    _fold_replica(evidence, *_replica_from_status(status), run_incidents, not_checked)
+    with_classes(run_incidents)
+    if not_checked:
+        evidence["not_checked"] = not_checked
     return evidence
 
 
@@ -4728,6 +4791,10 @@ def watch_all_ranks(
             status = read_watchdog(status_file)
             status_age = status_clock.check(status)
             stamp = (_status_stamp(status, status_age), _other_sources_stamp(**other_sources))
+            if isinstance(status, Mapping) and "replica" in status:
+                # The server's replica result changing is news (contract 7: a verdict is due at the
+                # next look). Absent, the stamp is what it was before the key.
+                stamp = (*stamp, json.dumps(status["replica"], sort_keys=True, default=str))
             folders, looks, keys = _look_at_ranks(source, status, memory, thresholds, report_grace)
             if not looks and status is None:
                 continue
@@ -4883,6 +4950,472 @@ def detect_replica_drift(
                 "parameters": diverged,
             }
     return None
+
+
+# --- Replica observations (SDK-22) ---------------------------------------------------------
+#
+# Each rank records its own observation under `replica` on a scheduled step, and a reader that
+# has every rank's record compares them (REPLICA_OBSERVATION_CONTRACT.md, sections 2 to 7). This
+# is the Python reader; the server is the other engine, and the two give the same object for
+# every case in `tests/fixtures/replica/`.
+_SPREAD_NAMES = ("norm_spread", "sum_spread", "projection_spread")  # as `detect_replica_drift` names them
+REPLICA_NOT_COMPARED_LISTED = 20  # steps a `kind_checks` coverage entry lists; the rest are counted
+
+
+def _fingerprint(value: Any) -> float:
+    """One fingerprint as a float. Contract 1 writes one that is not finite as the string "nan",
+    "inf" or "-inf"; anything that is not a number is read as not finite."""
+    if isinstance(value, bool):
+        return math.nan
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return math.nan
+    return math.nan
+
+
+def _observation(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    found = record.get("replica")
+    return found if isinstance(found, Mapping) else None
+
+
+def _spread_table(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    found = record.get("replica_spread")
+    return found if isinstance(found, Mapping) else None
+
+
+def _spread_scope(record: Mapping[str, Any]) -> tuple[str, tuple[int, ...]] | None:
+    """What a gathered spread says it covers (contract 1): its launch and group, or None when it
+    does not say both (an old record, a table the job computed itself, a group not read)."""
+    scope = record.get("replica_spread_scope")
+    if not isinstance(scope, Mapping):
+        return None
+    launch, group = scope.get("launch"), scope.get("group")
+    if launch is None or not isinstance(group, (list, tuple)):
+        return None
+    return str(launch), tuple(group)
+
+
+def _over_tolerance(record: Mapping[str, Any], tolerance: float) -> list[str]:
+    """The parameters a gathered spread shows drift on, by today's rule on its own record
+    (`detect_replica_drift`, contract 6), sorted."""
+    found = detect_replica_drift([dict(record)], tolerance=tolerance)
+    return sorted(found["parameters"]) if found else []
+
+
+def _compare_one_group(seen: Mapping[int, Mapping[str, Any]], tolerance: float) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Contract 3 and 4 for one launch, group and step whose every rank sent an observation:
+    the step entry's facts, and the spreads of each parameter that drifted (`_SPREAD_NAMES`,
+    or `non_finite`) for the incident's detail."""
+    ranks = sorted(seen)
+    if len(ranks) < 2:  # a group of one has no rank to be compared with
+        return {"fingerprints": "not_compared", "fingerprints_why": "one_rank",
+                "signatures": "not_compared", "signatures_why": "one_rank"}, {}
+    observed = [seen[rank] for rank in ranks]
+    devices = {o.get("device") for o in observed}
+    projections = {o.get("projection") for o in observed}
+    methods = {o.get("signature") for o in observed}
+    prints_comparable = len(devices) == 1
+    projection_column = len(projections) == 1 and None not in projections
+    signatures_comparable = len(methods) == 1 and None not in methods
+    params = [o.get("params") if isinstance(o.get("params"), Mapping) else {} for o in observed]
+    unread = [o.get("unread") if isinstance(o.get("unread"), Mapping) else {} for o in observed]
+    left_out: dict[str, str] = {}
+    drifted: dict[str, dict[str, Any]] = {}
+    differing: list[str] = []
+    prints_made = signatures_made = 0
+    for name in sorted({str(n) for table in (*params, *unread) for n in table}):
+        if any(name in table for table in unread):
+            left_out[name] = "unread"
+            continue
+        rows = [table.get(name) for table in params]
+        if not all(isinstance(row, Mapping) for row in rows):
+            left_out[name] = "not_recorded"
+            continue
+        kinds = {(tuple(row.get("shape") or ()), row.get("dtype")) for row in rows}  # type: ignore[union-attr]
+        if len(kinds) > 1:
+            left_out[name] = "shape_dtype"
+            continue
+        if signatures_comparable:
+            signatures_made += 1
+            if len({str(row.get("sig")) for row in rows}) > 1:  # type: ignore[union-attr]
+                differing.append(name)
+        if not prints_comparable:
+            continue
+        prints_made += 1
+        width = 3 if projection_column else 2
+        table = [[_fingerprint(v) for v in list(row.get("fp") or ())[:width]] for row in rows]  # type: ignore[union-attr]
+        if not all(math.isfinite(v) for prints in table for v in prints):
+            drifted[name] = {"non_finite": True}
+            continue
+        norms = [prints[0] for prints in table if prints]
+        scale = max(math.fsum(norms) / len(norms), 1e-12) if norms else 1e-12  # `spread_from_fingerprints`
+        spreads = [(max(column) - min(column)) / scale for column in zip(*table)]
+        if any(spread > tolerance for spread in spreads):
+            drifted[name] = dict(zip(_SPREAD_NAMES, spreads))
+    facts: dict[str, Any] = {}
+    if prints_made:
+        facts["fingerprints"] = "drift" if drifted else "agree"
+        if drifted:
+            facts["drift_parameters"] = sorted(drifted)
+    else:
+        facts["fingerprints"] = "not_compared"
+        facts["fingerprints_why"] = "device" if not prints_comparable else "no_parameters"
+    if signatures_made:
+        facts["signatures"] = "differ" if differing else "agree"
+        if differing:
+            facts["signature_parameters"] = differing
+    else:
+        facts["signatures"] = "not_compared"
+        facts["signatures_why"] = "method" if not signatures_comparable else "no_parameters"
+    if left_out:
+        facts["not_compared"] = left_out
+    if not projection_column and projections != {None}:
+        facts["projection_compared"] = False
+    return facts, drifted
+
+
+def _replica_place(entry: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Contract 4's order of step entries: by step, then the rows that name no launch, then by
+    launch, then by group (a group that could not be named first), a step's own entry before
+    the rows set aside from it."""
+    launch, group = entry.get("launch"), entry.get("group")
+    return (entry["step"], launch is not None, launch or "", group is not None, list(group or ()),
+            entry.get("why") == "attempt")
+
+
+def _replica_judged(
+    records: Iterable[Mapping[str, Any]], tolerance: float, attempt_order: Mapping[tuple[str, Any], list[Any]] | None,
+) -> tuple[dict[str, Any], dict[tuple[Any, ...], dict[str, Any]]]:
+    """`compare_replicas` and, by `(step, launch, group)` of each incident from observations,
+    the spreads of its parameters."""
+    listed = [dict(r) for r in records]
+    check_one_run(listed)
+    if attempt_order:
+        listed = in_attempt_order(listed, attempt_order)
+    legacy: list[dict[str, Any]] = []
+    # Every gathered spread, kept under what it says it covers and its step (contract 5).
+    covers: dict[tuple[Any, int], dict[str, set[str]]] = {}
+    # Observations by launch and step, each rank's; and the rows of a rank's later attempt.
+    cells: dict[tuple[Any, int], dict[int, Mapping[str, Any]]] = {}
+    keeps: dict[tuple[str, int], Any] = {}  # (launch, rank): the attempt that keeps the launch
+    aside: dict[tuple[str, tuple[int, ...], int], set[int]] = {}
+    for record in listed:
+        step, rank = int(record["step"]), int(record.get("rank", 0))
+        observation, table = _observation(record), _spread_table(record)
+        if table is not None:
+            over = _over_tolerance(record, tolerance)
+            held = covers.setdefault((_spread_scope(record), step), {"covered": set(), "over": set()})
+            held["covered"].update(str(name) for name in table)
+            held["over"].update(over)
+            if observation is None:  # an old capture: judged as before, on its own (contract 6)
+                legacy.append({"rank": rank, "step": step, "drift": bool(over), **({"parameters": over} if over else {})})
+        if observation is None:
+            continue
+        launch = observation.get("launch")
+        if launch is not None:
+            attempt = record.get("attempt", 0)
+            if keeps.setdefault((launch, rank), attempt) != attempt:
+                # This rank's later attempt under one launch read the launch an earlier start left
+                # in the store (contract 2): set aside, never paired with that start's rows.
+                group = tuple(observation.get("group") or ())
+                aside.setdefault((launch, group, step), set()).add(rank)
+                continue
+        cells.setdefault((launch, step), {})[rank] = observation
+    steps: list[dict[str, Any]] = []
+    raised: list[dict[str, Any]] = []
+    details: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for (launch, step), seen in cells.items():
+        named = {tuple(o.get("group") or ()) for o in seen.values()}
+        if launch is None:
+            steps.append({"launch": None, "group": list(next(iter(named))) if len(named) == 1 else None, "step": step,
+                          "coverage": "not_established", "why": "launch"})
+            continue
+        unlike = sorted(named)
+        overlapping = any(set(a) & set(b) for at, a in enumerate(unlike) for b in unlike[at + 1:])
+        outside = any(rank not in (o.get("group") or ()) for rank, o in seen.items())
+        if overlapping or outside:
+            steps.append({"launch": launch, "group": None, "step": step, "coverage": "not_established", "why": "group"})
+            continue
+        for group in unlike:
+            members = {rank: o for rank, o in seen.items() if tuple(o.get("group") or ()) == group}
+            entry: dict[str, Any] = {"launch": launch, "group": list(group), "step": step}
+            missing = [rank for rank in group if rank not in members]
+            if missing:
+                steps.append({**entry, "coverage": "insufficient", "missing": missing})
+                continue
+            facts, drifted = _compare_one_group(members, tolerance)
+            decided = covers.get(((launch, group), step), {}).get("covered", set())
+            steps.append({**entry, "coverage": "complete", **({"gathered": sorted(decided)} if decided else {}), **facts})
+            mine = [name for name in facts.get("drift_parameters", ()) if name not in decided]
+            if mine:  # a gathered spread of this launch, group and step decides the parameters it holds
+                raised.append({"step": step, "parameters": mine, "source": "replica", "launch": launch, "group": list(group)})
+                details[(step, launch, group)] = {name: drifted[name] for name in mine}
+    for (launch, group, step), ranks in aside.items():
+        steps.append({"launch": launch, "group": list(group), "step": step, "coverage": "not_established",
+                      "why": "attempt", "ranks": sorted(ranks)})
+    for (scope, step), held in covers.items():
+        if held["over"]:
+            raised.append({"step": step, "parameters": sorted(held["over"]), "source": "replica_spread",
+                           **({"launch": scope[0], "group": list(scope[1])} if scope else {})})
+    steps.sort(key=_replica_place)
+    raised.sort(key=lambda i: (i["step"], i["source"], i.get("launch") or "", list(i.get("group") or ())))
+    return {"steps": steps, "replica_drift": raised, **({"legacy": legacy} if legacy else {})}, details
+
+
+def compare_replicas(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    tolerance: float = DRIFT_TOLERANCE,
+    attempt_order: Mapping[tuple[str, Any], list[Any]] | None = None,
+) -> dict[str, Any]:
+    """Compare the ranks' replica observations of one run (REPLICA_OBSERVATION_CONTRACT.md,
+    sections 2 to 6): `{"steps": [...], "replica_drift": [...]}`, with `legacy` when a record
+    holds a gathered spread and no observation, each spelled as the contract's word table
+    (section 5) and the fixtures spell them. The server writes the same lists under `replica`
+    in a run's `watchdog.json`, with `v` and `tolerance` (contract 8).
+
+    `records` are one run's (`ValueError` otherwise), of any number of ranks. Their order across
+    ranks does not matter: the records of several rank files can be given file by file or
+    interleaved. Only each rank's own order does, since the first attempt of a rank under a
+    launch keeps the launch and a later one's rows are set aside (contract 2): it is contract 1's
+    order of the rank's attempts. For a rank in one local file that is the order of its lines;
+    for a store, its parts in stored attempt order (`load_records`); for a rank in several local
+    files, give `attempt_order` (`attempt_order_across` of that rank's files), which puts each
+    rank's attempts in that order first (`in_attempt_order`). Give every record written, not
+    `resolve_attempts`' (a later attempt's rollback leaves out rows a restart needs here).
+
+    A gathered spread (`replica_spread`) is judged on its own record by today's rule
+    (`detect_replica_drift`) wherever it is. It decides a step's comparison only for the
+    parameters it holds and only when its `replica_spread_scope` names that step's launch and
+    group. Nothing here names which rank drifted (D1 is held)."""
+    return _replica_judged(records, tolerance, attempt_order)[0]
+
+
+def _replica_object(result: Mapping[str, Any], tolerance: float) -> dict[str, Any]:
+    """The result as the server carries it in `watchdog.json` (contract 8)."""
+    return {"v": 1, "tolerance": tolerance, **result}
+
+
+def _replica_from_status(status: Mapping[str, Any] | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """The server's cross-rank result from its status (`replica` at the top level of
+    `watchdog.json`, contract 8), or why there is none: `(object, None)` or `(None, not_stated)`.
+    `(None, None)` when there is no status, which the view already says."""
+    if status is None:
+        return None, None
+    found = status.get("replica")
+    if found is None:
+        return None, {"code": "status_without_replica",
+                      "detail": "the server's status has no `replica` result (an older tensorquill-server): the ranks'"
+                                " replica observations are not compared here"}
+    if (not isinstance(found, Mapping) or not isinstance(found.get("steps"), list)
+            or not isinstance(found.get("replica_drift"), list) or _finite(found.get("tolerance")) is None):
+        return None, {"code": "status_replica_unreadable",
+                      "detail": "the server's status has a `replica` value without the `steps` and `replica_drift`"
+                                " lists and a finite `tolerance`: the ranks' replica observations are not compared here"}
+    return dict(found), None
+
+
+def _replica_step_compared(entry: Mapping[str, Any]) -> bool:
+    """Whether a step entry checked the kind: every rank sent an observation and fingerprints were
+    compared, or a gathered spread of that launch, group and step decides some parameters."""
+    return entry.get("coverage") == "complete" and (entry.get("fingerprints") in ("agree", "drift")
+                                                    or bool(entry.get("gathered")))
+
+
+def _replica_gap(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """A step entry that did not check the kind, with why: the missing ranks, why the records
+    cannot say who is compared, or why nothing was compared."""
+    gap = {key: entry.get(key) for key in ("step", "launch", "group", "coverage")}
+    for key in ("missing", "why", "ranks", "fingerprints_why"):
+        if key in entry:
+            gap[key] = entry[key]
+    return gap
+
+
+def replica_kind_check(
+    check: Mapping[str, Any], replica: Mapping[str, Any], *, all_ranks: bool, records: int | None = None,
+    held_ranks: Iterable[int] = (),
+) -> dict[str, Any]:
+    """The `replica_drift` entry of `kind_checks` where replica observations were read: `check` is
+    the entry counted from gathered spreads (`kind_checks`, or a server's report), `replica` the
+    cross-rank result (`compare_replicas`, or the server's object).
+
+    The kind is `checked` when a step compared fingerprints (or a gathered spread of its launch,
+    group and step decides it), or when a gathered spread was judged on its own record, as
+    before. A step whose coverage is `insufficient` or `not_established`, or `complete` with
+    nothing compared, does not read as checked: `coverage` lists those steps, the latest
+    `REPLICA_NOT_COMPARED_LISTED` with the count of the rest, each with why, and names the
+    ranks missing from any of them under `missing_ranks`. With no step compared and no spread,
+    one rank's evidence calls the kind `not_configured` (a comparison across ranks, as the two
+    other cross-rank kinds are there), and an all-ranks view `unavailable`, with
+    `check: "replica_coverage"` and the reason; but a run whose every step entry is a group of
+    one rank is `not_configured` in either, as one rank alone is for the other cross-rank kinds
+    (`_cross_rank_check`). A result with no step entry at all (a run without observations, or
+    before its first scheduled step) leaves `check` as it is. `signatures_differ` lists the steps
+    where signatures differ: evidence only, which raises nothing (contract 5). `records` is how
+    many records carried an observation or a spread; `held_ranks`, the ranks of a file that one
+    rank's evidence was picked from (`ranks_in_source`), lets `detail` tell a rank left out of
+    the evidence from one that sent nothing."""
+    steps = [entry for entry in replica.get("steps") or () if isinstance(entry, Mapping)]
+    if not steps:
+        return dict(check)
+    compared = [entry for entry in steps if _replica_step_compared(entry)]
+    gaps = [_replica_gap(entry) for entry in steps if not _replica_step_compared(entry)]
+    missing = sorted({rank for gap in gaps for rank in gap.get("missing") or ()})
+    differ = [{"step": e.get("step"), "launch": e.get("launch"), "group": e.get("group"),
+               "parameters": list(e.get("signature_parameters") or ())} for e in steps if e.get("signatures") == "differ"]
+    alone = all(gap.get("fingerprints_why") == "one_rank" for gap in gaps)
+    if compared or check.get("value") == "checked":
+        value = "checked"
+    else:
+        value = "unavailable" if all_ranks and not alone else "not_configured"
+    held = gaps[-REPLICA_NOT_COMPARED_LISTED:]
+    coverage = {
+        "steps": len(steps), "compared": len(compared),
+        **({"missing_ranks": missing} if missing else {}),
+        **({"not_compared": held} if held else {}),
+        **({"not_compared_omitted": len(gaps) - len(held)} if len(gaps) > len(held) else {}),
+    }
+    if not all_ranks and value != "checked":
+        held = set(held_ranks)
+        left, absent = [r for r in missing if r in held], [r for r in missing if r not in held]
+        coverage["detail"] = (
+            "one rank's records: the ranks' replica observations are compared across ranks, in the all-ranks view"
+            + (f"; rank{'s' if len(left) != 1 else ''} {_rank_ranges(left, 8)} {'are' if len(left) != 1 else 'is'} in"
+               " the source and not judged in this rank's evidence" if left else "")
+            + (f"; no observation of rank{'s' if len(absent) != 1 else ''} {_rank_ranges(absent, 8)} is in the"
+               " records read" if absent else ""))
+    out: dict[str, Any] = {
+        "value": value,
+        **({"records": records} if records is not None else
+           {k: check[k] for k in ("records",) if k in check}),
+        **{k: check[k] for k in ("records_needed",) if k in check},
+        "enough_history": value == "checked",
+        **{k: check[k] for k in ("needs",) if k in check},
+        **_noted("replica_drift", value),
+    }
+    if value == "unavailable":
+        out["check"] = "replica_coverage"
+        out["reason"] = _replica_reason(coverage)
+    out["coverage"] = coverage
+    if differ:
+        out["signatures_differ"] = differ[-REPLICA_NOT_COMPARED_LISTED:]
+    return out
+
+
+def _replica_reason(coverage: Mapping[str, Any]) -> str:
+    missing = coverage.get("missing_ranks") or ()
+    if not coverage.get("steps"):
+        return "no step of the ranks' replica observations is listed yet"
+    said = f"none of the {coverage['steps']} replica step entries compared fingerprints"
+    return said + (f": rank{'s' if len(missing) != 1 else ''} {_rank_ranges(missing, 8)} sent no observation"
+                   " for the steps listed" if missing else "")
+
+
+def replica_not_checked(check: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The `not_checked` entry for a `replica_drift` kind check that is `unavailable` for want of
+    coverage (`replica_kind_check` in an all-ranks view), so the run reads `degraded` as for any
+    kind that could not be judged; None otherwise."""
+    if check.get("value") != "unavailable" or check.get("check") != "replica_coverage":
+        return None
+    return {"check": "replica_coverage", "kinds": ["replica_drift"], "reason": check.get("reason")}
+
+
+def _replica_incident(
+    replica: Mapping[str, Any], details: Mapping[tuple[Any, ...], Mapping[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """The first incident the ranks' observations raise (`source: "replica"`), as evidence lists an
+    incident: `parameters` by name (with the spreads and `non_finite` where they were computed
+    here; empty from the server's object), the `tolerance`, the `launch` and `group` compared.
+    One incident for the kind, as each detector gives its first; every one is in the result's
+    `replica_drift`. When a gathered spread also shows drift on that step, it is named under
+    `also` with its source: the two cannot be shown to be one comparison (contract 5)."""
+    raised = [i for i in replica.get("replica_drift") or () if isinstance(i, Mapping)]
+    first = next((i for i in raised if i.get("source") == "replica"), None)
+    if first is None:
+        return None
+    group = list(first.get("group") or ())
+    spreads = (details or {}).get((first.get("step"), first.get("launch"), tuple(group))) or {}
+    also = [{key: i[key] for key in ("source", "parameters", "launch", "group") if key in i}
+            for i in raised if i is not first and i.get("step") == first.get("step")]
+    return {
+        "kind": "replica_drift", "step": first.get("step"), "tolerance": replica.get("tolerance"),
+        "parameters": {str(name): dict(spreads.get(name) or {}) for name in first.get("parameters") or ()},
+        "source": "replica", "launch": first.get("launch"), "group": group,
+        **({"also": also} if also else {}),
+    }
+
+
+def replica_line(evidence: Mapping[str, Any]) -> str | None:
+    """One line on the ranks' replica observations for a summary: how many steps were compared,
+    the steps that were not and the ranks missing from them, and the steps whose signatures
+    differ (evidence, not an incident). None for evidence without a result. A status without one
+    (`replica_not_stated`) gets no line: the view cannot tell whether any rank recorded an
+    observation, so the line would be on every run of an older server; the key says it."""
+    check = (evidence.get("kind_checks") or {}).get("replica_drift")
+    if not isinstance(evidence.get("replica"), Mapping) or not isinstance(check, Mapping):
+        return None
+    coverage = check.get("coverage")
+    if not isinstance(coverage, Mapping):  # a result with no step entry yet
+        return None
+    line = f"Replica observations: {coverage.get('compared', 0)} of {coverage.get('steps', 0)} step entries compared"
+    gaps = coverage.get("not_compared") or ()
+    if gaps:
+        last = gaps[-1]
+        line += (f"; not compared at {len(gaps) + int(coverage.get('not_compared_omitted') or 0)}, the latest step"
+                 f" {last.get('step')} ({last.get('coverage')}"
+                 + (f", missing rank{'s' if len(last['missing']) != 1 else ''} {_rank_ranges(last['missing'], 8)}"
+                    if last.get("missing") else f", {last.get('why') or last.get('fingerprints_why')}") + ")")
+    differ = check.get("signatures_differ") or ()
+    if differ:
+        line += (f"; signatures differ at step {differ[-1]['step']} on {', '.join(differ[-1]['parameters'][:3])}"
+                 " (evidence only: fingerprints decide drift)")
+    return line + "."
+
+
+def replica_across_ranks(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    tolerance: float = DRIFT_TOLERANCE,
+    attempt_order: Mapping[tuple[str, Any], list[Any]] | None = None,
+) -> dict[str, Any] | None:
+    """The cross-rank result of a run's local rank files, as the server carries it (`v`,
+    `tolerance`, and `compare_replicas`' lists), for `combine_rank_evidence(replica=...)`; None
+    when no record holds an observation. `records` are every rank's records as written, in the
+    order `compare_replicas` takes."""
+    listed = [dict(r) for r in records]
+    if not any(_observation(r) is not None for r in listed):
+        return None
+    return _replica_object(compare_replicas(listed, tolerance=tolerance, attempt_order=attempt_order), tolerance)
+
+
+def _fold_replica(
+    evidence: dict[str, Any], replica: Mapping[str, Any] | None, not_stated: Mapping[str, Any] | None,
+    run_incidents: list[dict[str, Any]], not_checked: list[dict[str, Any]],
+    details: Mapping[tuple[Any, ...], Mapping[str, Any]] | None = None,
+) -> None:
+    """Put a cross-rank replica result into an all-ranks evidence: the result under `replica`, its
+    first incident from observations among `run_incidents`, the `replica_drift` entry of
+    `kind_checks` from it (`replica_kind_check`), and, when no step could be compared, a
+    `not_checked` entry. With no result, `not_stated` says why under `replica_not_stated`."""
+    if replica is None:
+        if not_stated is not None:
+            evidence["replica_not_stated"] = dict(not_stated)
+        return
+    evidence["replica"] = dict(replica)
+    found = _replica_incident(replica, details)
+    if found is not None:
+        run_incidents.append(found)
+    checks = evidence.get("kind_checks")
+    if isinstance(checks, dict) and isinstance(checks.get("replica_drift"), Mapping):
+        checks["replica_drift"] = replica_kind_check(checks["replica_drift"], replica, all_ranks=True)
+        gap = replica_not_checked(checks["replica_drift"])
+        if gap is not None:
+            not_checked.append(gap)
 
 
 def _check_other_sources(
@@ -5084,6 +5617,9 @@ def build_evidence(
     The detectors read one rank's steps. `rank` picks that rank out of a run directory or a
     list of records; records of several ranks with no `rank` given raise `ValueError`,
     because merged they repeat step numbers and give incidents that belong to neither rank.
+    The evidence names the rank judged (`rank`), and, when `rank` picked it out of a file or list
+    that also held other ranks, every rank that source held (`ranks_in_source`, L21): such an
+    evidence file beside a file of several ranks is that one rank's.
 
     `watchdog` is the server's `watchdog.json` (a path or the parsed document). A run directory
     or one of its `rank=` folders automatically reads the run's status; its progress verdict
@@ -5129,7 +5665,15 @@ def build_evidence(
     check_thresholds(overload_threshold=overload_threshold, drift_tolerance=drift_tolerance,
                      starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,
                      update_window=update_window, none_given=True)
-    every_attempt, left_out = _load_counted(source, rank)
+    held_ranks: list[int] | None = None
+    if rank is not None and not (isinstance(source, (str, Path)) and Path(source).is_dir()):
+        # A file or list is read whole either way: the ranks it holds are kept, so the evidence
+        # can say it judged one of several (L21). A store's rank folder holds one rank.
+        everything, left_out = _load_counted(source, None)
+        held_ranks = sorted({int(r.get("rank", 0)) for r in everything})
+        every_attempt = [r for r in everything if r.get("rank", 0) == rank]
+    else:
+        every_attempt, left_out = _load_counted(source, rank)
     if attempt_order:
         every_attempt = in_attempt_order(every_attempt, attempt_order)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
@@ -5204,6 +5748,14 @@ def build_evidence(
             dict(item) for item in report.get("not_checked") or ()
             if isinstance(item, dict) and item.get("check") not in ("flight_recorder", "traincheck")
         ]
+        grads_unread = grads_not_read_not_checked(records)
+        if grads_unread is not None and not any(item.get("check") == "gradients" for item in not_checked):
+            # The server does not read `grads_not_read` yet (L23): said here, as the Python path says it.
+            not_checked.append(grads_unread)
+            for kind in grads_unread["kinds"]:
+                held = rank_checks[kind]
+                rank_checks[kind] = _unavailable(grads_unread, **{key: held[key] for key in (
+                    "records", "records_needed", "enough_history", "needs") if key in held})
     else:
         samples = _moe_samples(records, router_sizes, router_top_k, overload_threshold)
         _mark_starved(samples, starve_window, starve_ratio)
@@ -5254,6 +5806,9 @@ def build_evidence(
         not_read = update_not_read_not_checked(records)
         if not_read is not None:
             not_checked.append(not_read)
+        grads_unread = grads_not_read_not_checked(records)
+        if grads_unread is not None:
+            not_checked.append(grads_unread)
         rank_checks = kind_checks(
             input_counts(records), not_checked, starve_window=starve_window, update_window=update_window)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
@@ -5279,6 +5834,21 @@ def build_evidence(
         drift_hit = detect_replica_drift(records, tolerance=drift_tolerance)
     if drift_hit is not None:
         incidents.append(drift_hit)
+    # The ranks' replica observations (SDK-22). Every record as written, in attempt order: a rank's
+    # later attempt under one launch is set aside, which the rollback would hide. One rank's
+    # records compare with no other rank, so they raise nothing here and the kind's entry says
+    # which ranks were not in the records read; the gathered spreads above are judged as before.
+    replica: dict[str, Any] | None = None
+    if any(_observation(r) is not None for r in every_attempt):
+        result, replica_details = _replica_judged(every_attempt, drift_tolerance, None)
+        replica = _replica_object(result, drift_tolerance)
+        observed_hit = _replica_incident(replica, replica_details)
+        if observed_hit is not None:
+            incidents.append(observed_hit)
+        rank_checks["replica_drift"] = replica_kind_check(
+            rank_checks["replica_drift"], replica, all_ranks=False,
+            records=sum(_observation(r) is not None or _spread_table(r) is not None for r in records),
+            held_ranks=held_ranks or ())
 
     if any(record.get("scalars") for record in records):
         rust_made = {id(incident) for incident in from_rust or ()}  # these carry their scalars already
@@ -5300,6 +5870,9 @@ def build_evidence(
         # The rank judged (lane U7, Nov 19, 2026): a reader that holds records of several ranks
         # beside this file (`mcp_server`) uses its samples only for this rank.
         "rank": ranks[0] if ranks else rank,
+        # The ranks the file or list held when it held others than the one judged (L21): its
+        # evidence is that one rank's, and the others are not judged in it.
+        **({"ranks_in_source": held_ranks} if held_ranks is not None and held_ranks != [rank] else {}),
         "run": _manifest.run_block(run_id, _manifest.find_manifest(
             run_manifest if run_manifest is not None else source, run_id)),
         "layer_count": len(routers),
@@ -5319,6 +5892,8 @@ def build_evidence(
         "incidents": incidents,
         "samples": samples,
         **({"detectors": "rust"} if from_rust is not None else {}),
+        # The ranks' replica observations compared (`compare_replicas`), only where a record holds one.
+        **({"replica": replica} if replica is not None else {}),
         **({"run_end": read_end_marker(ended)} if (ended := _records_file(source, records_file)) else {}),
         **({"not_checked": not_checked} if not_checked else {}),
         **({"lines_left_out": left_out} if left_out else {}),
@@ -5883,7 +6458,14 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             f"Replicas diverged at step {incident['step']} in"
             f" {len(incident['parameters'])} parameters (tolerance {incident['tolerance']:g})"
         )
-        return text + (f", {bad} with NaN or Inf weights on some replica" if bad else "")
+        text += f", {bad} with NaN or Inf weights on some replica" if bad else ""
+        if incident.get("source") == "replica":
+            group = incident.get("group") or ()
+            text += (f", from the observations of ranks {_rank_ranges(group, 8)} in launch"
+                     f" {str(incident.get('launch'))[:8]}")
+            for other in incident.get("also") or ():
+                text += f"; a gathered spread ({other.get('source')}) shows drift on that step too"
+        return text
     return describe_system(incident)
 
 
@@ -6078,6 +6660,9 @@ def _all_ranks_summary(evidence: Mapping[str, Any]) -> str:
             f"Pauses the job reported: {seen}. A silence threshold of {recommended:.0f} s (twice the longest)"
             " would have tolerated them: set the server's --silent-seconds to it or more."
         )
+    replica = replica_line(evidence)
+    if replica:
+        lines.append(replica)
     checked = all_ranks_checked_line(evidence)
     if checked:
         lines.append(checked)
@@ -6699,14 +7284,22 @@ def main() -> None:
     if fallback is not None:
         print(f"tensorquill: warning: {fallback}. `--detectors python` asks for the Python detectors without this "
               "warning", file=sys.stderr)
-    records, left_out = _load_counted(args.input, rank)
+    # A file is read whole and its rank picked by `build_evidence`, which then says which ranks the
+    # file held (L21); a directory is read a rank at a time, as before.
+    whole_file = not args.input.is_dir()
+    records, left_out = _load_counted(args.input, None if whole_file else rank)
+    held = sorted({int(r.get("rank", 0)) for r in records})
+    if whole_file and rank is None and len(held) > 1:
+        parser.error(f"{args.input} holds ranks {_rank_ranges(held, 8)}: choose one with --rank N (the evidence is one "
+                     "rank's), or compare every rank with python -m tensorquill compare")
+    own = records if rank is None else [r for r in records if r.get("rank", 0) == rank]
     try:
-        check_one_run(records)  # a usage error with either detectors, as the Rust path gives it
+        check_one_run(own)  # a usage error with either detectors, as the Rust path gives it
     except ValueError as error:
         parser.error(str(error))
     try:
         evidence = build_evidence(
-            records, **args.thresholds, watchdog=_watchdog_beside(args.input),
+            records, rank=rank, **args.thresholds, watchdog=_watchdog_beside(args.input),
             flight_recorder=args.flight_recorder, flight_recorder_prefix=args.flight_recorder_prefix,
             traincheck=args.traincheck, detectors=detectors, run_manifest=args.input, records_file=args.input,
         )
@@ -6724,7 +7317,7 @@ def main() -> None:
     print(run_state_line(evidence))
     print(f"wrote {'evidence' if args.compact_window is None else 'compact evidence'} -> {out_json}")
     if args.rerun is not None:
-        export_rerun(evidence, args.rerun, records=resolve_attempts(records))
+        export_rerun(evidence, args.rerun, records=resolve_attempts(own))
         print(f"wrote Rerun recording -> {args.rerun}")
 
 
