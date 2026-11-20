@@ -79,6 +79,9 @@ mod lane_w3_tests;
 mod lane_x4_tests;
 #[cfg(test)]
 mod lane_y2_tests;
+#[cfg(test)]
+mod lane_z3_tests;
+pub mod replica;
 
 // The same values as the constants of the same names in evidence.py.
 pub const OVERLOAD_THRESHOLD: f64 = 0.35;
