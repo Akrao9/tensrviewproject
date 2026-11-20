@@ -286,7 +286,8 @@ def offset_path(jsonl_path: str | Path) -> Path:
 # The offset file says how many bytes of the local file the server stored, and also which
 # server (its address, the run and the rank) and which file: a digest of the file's first bytes
 # and of the bytes just before the offset. An append-only file never changes those bytes, so a
-# sender resumes at the offset only when the address, the run, the rank and both digests match;
+# sender resumes at the offset only when the server (its store, or for a server that names none its
+# address; see below), the run, the rank and both digests match;
 # anything else (another server, a file deleted and written again, a file rewritten in place,
 # a file shorter than the offset, an offset file from before the binding) sends the file again
 # from its start, which is safe because the server drops the steps it already has. The file's
