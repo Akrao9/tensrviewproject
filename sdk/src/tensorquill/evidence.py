@@ -5311,6 +5311,11 @@ def _missing_sample(step: int, layer: int, expert_count: int) -> dict[str, Any]:
 def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str:
     """Markdown table of one layer's expert load, sorted by largest positive delta first.
 
+    The step is compared with the last earlier one on which the router routed tokens, or else
+    the last earlier one. At the layer's first step there is none: the heading says so, every
+    delta is `n/a` and the rows are sorted by load (DET-14; until Nov 19, 2026 the first step
+    was compared with itself, every delta +0.00).
+
     Raises `compact.SamplesOmitted` for a step, or a step to compare it with, that compact
     evidence left out."""
     from .compact import require_table
@@ -5325,13 +5330,14 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
         for s in prior_steps
         if not samples[s, layer].get("missing") and samples[s, layer].get("routed_tokens", 0) > 0
     ]
+    previous: int | None
     if active_priors:
         previous = max(active_priors)
     elif prior_steps:
         previous = max(prior_steps)
     else:
-        previous = step
-    baseline = samples.get((previous, layer))
+        previous = None  # the layer's first step: nothing earlier to compare it with
+    baseline = samples.get((previous, layer)) if previous is not None else None
 
     tokens = int(sample.get("routed_tokens") or 0)
     if sample.get("missing") or tokens <= 0:
@@ -5369,7 +5375,8 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
         rows.sort(key=lambda row: row[:2])
     return "\n".join(
         [
-            f"**Layer {layer:02} expert load** · step {step} vs. {previous}",
+            f"**Layer {layer:02} expert load** · step {step} "
+            + (f"vs. {previous}" if previous is not None else "(no earlier step to compare with)"),
             "",
             "| Expert | Load | Δ load (pp) | Status |",
             "| --- | --- | --- | --- |",

@@ -128,3 +128,32 @@ def test_l6_the_combined_view_moves_such_a_rank_to_the_unknown_ranks():
     # Without a status nothing is compared.
     combined = ev.combine_rank_evidence({0: _per_rank(0, 1), 1: _per_rank(1, 1)})
     assert combined["judged_ranks"] == [0, 1]
+
+
+# --- DET-14: the expert-load table at a run's first step ---------------------------------------
+
+
+def _moe(steps: list[list[int]]) -> dict:
+    return tensorquill.build_evidence([{"run_id": "t", "step": s, "moe": {"router": counts}}
+                                       for s, counts in enumerate(steps)], detectors="python")
+
+
+def test_det14_the_first_step_is_not_compared_with_itself():
+    evidence = _moe([[10, 30, 60, 0], [25, 25, 25, 25]])
+    lines = ev.expert_load_table(evidence, 0, 1).splitlines()
+    assert lines[0] == "**Layer 01 expert load** · step 0 (no earlier step to compare with)"
+    rows = lines[4:]
+    assert len(rows) == 4 and all("| n/a |" in row for row in rows)  # no delta, never +0.00
+    assert "+0.00" not in "\n".join(lines)
+    # Sorted by load, largest first.
+    assert [row.split(" | ")[0] for row in rows] == ["| #003", "| #002", "| #001", "| #004"]
+    # The next step is compared with the first, as before.
+    second = ev.expert_load_table(evidence, 1, 1).splitlines()
+    assert second[0] == "**Layer 01 expert load** · step 1 vs. 0"
+    assert "| #001 | 25.00% | +15.00 |" in "\n".join(second)
+
+
+def test_det14_a_one_step_run_has_its_table_without_a_comparison():
+    lines = ev.expert_load_table(_moe([[5, 5]]), 0, 1).splitlines()
+    assert lines[0].endswith("(no earlier step to compare with)")
+    assert all("| n/a |" in row for row in lines[4:])
