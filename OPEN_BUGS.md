@@ -1,6 +1,6 @@
 # TensorQuill: open bugs, consolidated
 
-One list of the open bugs known from the two code reviews and the fix lanes, as of `main` at `4b0be90`, after both merge groups of wave V (Nov 19, 2026). It joins three sources that were tracked apart:
+One list of the open bugs known from the two code reviews and the fix lanes, as of `main` at `c0b63ab`, after all four merge groups of waves V and W (Nov 19, 2026). It joins three sources that were tracked apart:
 
 - `CODEBASE_AUDIT.md`, the second audit: 70 finding groups with IDs C, RS and X. Its evidence-reader rows have no IDs, so they are numbered E1 to E8 here.
 - `codebase_review_findings.md`, the first outside review: 87 findings with IDs SDK, DET, CLI and RUST.
@@ -24,12 +24,12 @@ Only the rows marked *Run on main* were run again when this file was written. Ro
 |---|---:|---:|---:|---:|
 | Can raise into training, or stop it | 1 | 0 | 0 | 1 |
 | Training SDK | 2 | 7 | 1 | 10 |
-| Evidence readers, detectors, command line, MCP | 1 | 10 | 1 | 12 |
-| Rust server | 1 | 1 | 1 | 3 |
+| Evidence readers, detectors, command line, MCP | 0 | 4 | 1 | 5 |
+| Rust server | 0 | 1 | 1 | 2 |
 | Experiments, examples, CI, docs | 0 | 3 | 0 | 3 |
-| **All** | **5** | **21** | **3** | **29** |
+| **All** | **3** | **15** | **3** | **21** |
 
-There were 72 when this file was written. Wave V closed 43 of them in its two merge groups (and, outside the 72, the lanes' items L4, L7 and L8 and the never-shown RUST-17); 29 remain, 14 of which are fixed in part and say what is still open. All five P1 rows are still open: they are wave W's. Section 6 holds five more that are parts of closed findings or that the two reviews disagree on, section 7 the items the lanes raised, section 8 the audit's notes on cost and narrow cases, and section 9 the wrong behaviour the plan records from measurement. None of those is counted here.
+There were 72 when this file was written. Waves V and W closed 51 of them in four merge groups; 21 remain, 16 of which are fixed in part and say what is still open. Three P1 rows remain, each fixed in part: SDK-22 (a process group that fails after `init`), C03 (every stop notice lost, accepted for v1) and C06 (the length check). Section 6 holds what is left of the closed findings and the two reviews' disagreements, section 7 the items the lanes raised, section 8 the audit's notes on cost and narrow cases, and section 9 the wrong behaviour the plan records from measurement. None of those is counted here.
 
 ## 1. Can raise into training, or stop it
 
@@ -43,8 +43,8 @@ There were 72 when this file was written. Wave V closed 43 of them in its two me
 
 | ID | Issue | Checked | State |
 |---|---|---|---|
-| C03 | After capture stops on a streaming run, the server reads a suspected hang about 2 s later, or `finished` if the session is closed while training goes on | Run (U1) | The local sink is fixed; this part is open |
-| C06 | A router's integer output with indices out of range is recorded as zeros with no refusal (`[-1, 8]` for 4 experts gives `[0, 0, 0, 0]`) | Run | The bool routing map is fixed; this part is open |
+| C03 | **Open part after M4, accepted for v1 by the author:** if every stop notice is lost and the server sees a clean close, the run reads `finished`. Also open: a stopped rank that then reads `unresponsive` or `lost` still raises `job_stalled` or `rank_silent` on the Python side. Fixed (lanes W1, W2, W3, contract 3): the heartbeat says capture stopped on every beat, the server has a state and a summary word of its own for it that survive a restart, and a run with such a rank never reads healthy | Run (W1, W2, W3; the lifecycle test) | Fixed in part |
+| C06 | **Open part after M4:** the length check accepts any whole multiple of the token count, whatever `top_k` says. Fixed (lane W1): a negative index is no assignment, counted and written as `moe_unassigned`; an index at or above `n_experts` refuses the router with a reason; the `indices=` path follows the same rule; `moe_left_out` records the routing-map entries left out, per expert | Run (W1) | Fixed in part |
 
 ### P2, P3, Medium and Low
 
@@ -63,24 +63,16 @@ There were 72 when this file was written. Wave V closed 43 of them in its two me
 
 | ID | Also known as | Priority | Issue | Checked |
 |---|---|---|---|---|
-| E1 | | P1 | A parameter that changes without a gradient is still called a stalled-weight invariant. Held out of wave U because it changes a detector rule | Audit |
-| E3 | | P2 | **Open part after M1:** a scaler-only resume that finds nothing still reads `not_configured`; counting the loss scale needs both engines changed together (lane W3). Fixed (lane V3): a kind that reports an incident is counted as checked | Run (V3) |
-| E5 | | P2 | The physical order of steps in the file changes which fault is named first | Audit |
-| DET-09 | | Medium | Learning rates seen only in rolled-back steps can make `scheduler` an expected component, so a resume can be called incomplete (Python and Rust) | Read |
-| DET-10 | | Medium | Records out of order within an attempt give the Rust detectors different incidents than Python. The capture writes steps in order | Run (T6) |
-| DET-11 | | Medium | In a top-k router's warm-up with `n_experts <= 2k`, `overloaded` is always empty (Python and Rust). Dead experts are still flagged | Read |
 | DET-13 | | Medium | The compact file's table refuses a baseline it cannot show, and only the earliest starvation onset anchors the window | Read |
 | DET-14 | | Medium | **Open part after M1:** at a run's first step the expert-load table compares the step with itself. Fixed (lane V3): the table is shown at the first step and layer names are escaped | Run (V3) |
-| DET-16 | | Medium | A bool is read as the number 1.0 (Python and Rust) | Run (T6) |
-| DET-17 | | Low | **Open part after M1:** `attempt=<n>` folders are still parsed with the looser rule (lane W3's code), and four other modules parse `rank=` on their own. Fixed (lane V3): the evidence readers share one `rank=` parser | Run (V3) |
-| CLI-13 | | Medium | **Open part after M2:** when a run and rank has two files, their order is path order and the `end` cell reads only the first file; both wait for contract 1's rule across files (wave W). Fixed (lane V4): the second file is no longer dropped | Run (V4) |
+| DET-17 | | Low | **Open part after M4:** four other modules still parse `rank=` on their own (`manifest.py`, `runs.py`, `mcp_server.py`, `trigger.py`). Fixed (lanes V3, W3): the evidence readers share one `rank=` parser and `attempt=` folders are read as ASCII digits only | Run (V3, W3) |
+| CLI-13 | | Medium | **Open part after M4:** `runs` judges the order across a rank's files from each file's first and last records only, so an attempt that appears only in the middle of a file is not seen there (`compare` reads every record); the `end` cell still reads only the first file. Fixed (lanes V4, W3, contract 1): both files are read, and their order is each file's own order first, then `ts`, then attempt number, never path order | Run (V4, W3) |
 | CLI-14 | | Medium | MCP serves no head or attention probe series | Read |
 
 ## 4. Rust server
 
 | ID | Also known as | Priority | Issue | Checked |
 |---|---|---|---|---|
-| RS05 | | P1 | A late new step from an older attempt takes ownership of live progress. Needs the author's choice of four ordering options (lane U6's entry in the plan) | Run (U6) |
 | RS10 | RUST-11 | P2 | **Open part after M1:** live ingest's per-row check (`keep_new_rows`) is unchanged. Fixed (lane V7): the offline modes refuse null or mistyped run, rank, step and attempt keys | Run (V7) |
 | RS17 | RUST-15 | P3 | A negative expert count is judged as a routed sample. The audit ran it on a recorded vector `[-1, 3]`; T6 says no writer makes one, so it does not hold as a live bug | Audit |
 
@@ -101,8 +93,6 @@ Not counted in the 72.
 | ID | Issue | What each source says |
 |---|---|---|
 | SDK-06 | After a second optimizer steps, the drift check is not repeated. The check runs after the lead optimizer steps and before the second optimizer steps. With the default 50-step interval, drift the second optimizer introduces right after a check is detected at the next check only if it persists; if the run ends or the replicas agree again before then, it goes undetected | **Left open for v1, the author's decision (Nov 19, 2026):** the gather stays where it is. The current schedule gives every rank a predictable point to enter the collective; moving it would change that point and lose the last scheduled check when training ends. Lane W4's judgement: today's timing is collective-safe. The limit is stated in `sdk/README.md` |
-| RUST-05 | On offline input with steps out of order, the resume comparison takes the first physical row, not the lowest step, so a learning-rate change or a numbering restart can be missed | The finding is fixed (lane T4). The second audit lists this as a remaining offline case. Audit, read |
-| RUST-12 | Four skipped rows with `update_window=2` give `checked, records=4, enough_history=true` although no comparison was eligible | Open, moved to lane W3: Python counts skipped steps the same way and a parity test holds the two together. T6: the finding does not hold as a parity bug. The second audit ran this coverage case and lists it. Audit, run |
 | SDK-14 | The heartbeat discards its client on failure without an explicit close | T6 ran it: no client was alive after its beat or after `close()`, so it does not hold. The second audit still calls it a cleanup gap, with no leak shown |
 | CLI-10 | A row built from an evidence file older than the records can show a healthy state for steps not yet judged | T6: documented, the row says it is as of those files. The second audit: still visible, and wants the newer interval marked unknown |
 
@@ -113,9 +103,12 @@ These are not in either audit.
 | # | Lane | Item |
 |---|---|---|
 | L1 | U1 | The tensor-subclass rule under `torch.compile` was run on `eager` and `aot_eager`, not on inductor |
-| L2 | U1 | The writer's bounded wait for NVML can stop capture above about 200 steps a second |
 | L3 | U4 | The server's ack carries no store ID |
 | L6 | U6 | **Open part after M1:** in the all-ranks evidence a rank with `attempt_without_steps` is still counted among judged ranks; only `run_state` calls it unknown. Fixed (lane V3): the readers look at the flag |
+| L9 | W1 | Found in wave W, not fixed: the lead optimizer is a weak reference to the first optimizer that ever stepped. While that object stays alive, a new optimizer on the same model never leads and its steps are not counted, silently (an LR finder, or a user who rebuilds the optimizer and keeps the old one) |
+| L10 | V7 | A lone rank with batch hashes is still listed in `ranks_compared`, though it has no rank to be compared with. Existing behaviour, left as it is; a question for the author |
+| L11 | W3 | The `detect` help text in `server/src/main.rs` still says rows are grouped by attempt "oldest first" and in recorded order; since contract 1 they are grouped by first appearance and read in step order |
+| L12 | W2 | Limits of contract 1, stated in the contract: a stream that ends before its first batch is not attributed; two attempts first met by claim in one outage go by arrival; across local files, attempts no file orders go by `ts`, which is each host's clock; a lower-numbered replacement whose rows beat its first heartbeat, from a sender with no `sender_attempt`, is taken as backlog |
 
 ## 8. The second audit's notes on cost and narrow cases
 
@@ -166,3 +159,4 @@ Not from either review. Not counted in the 72.
 | Wave V, merge group M1 (`main` at `351ad85`, Nov 19, 2026; lanes V1, V2, V3, V6, V7) | Fixed, each with a test that failed on `66b52d7`: C13, C15, C21, C23, DET-12, DET-18, E6, L4, L7, RS06, RS07, RS08, RS09, RS11, RS12, RS13, RS14, RS15, RS16, RS19, RUST-13, RUST-16, RUST-18, SDK-15, SDK-25, SDK-26. C24: V1: the capture half is fixed (a model that is one leaf module is observed under its class name); the sink half did not reproduce on `66b52d7`. RUST-17: V6: shown for concurrency (40 rebuilds at once after a restart) and fixed with a bound of 16. Fixed in part, still listed above with what is open: C12, C14, C16, C20, C22, SDK-16, E3, DET-14, DET-17, RS10, L6, CLI-24. Checked and left as they are: C11, SDK-23, RS17, L3 (options written, nothing changed). Verified on the trial merge, macOS and CPU only; not on Linux, PyTorch 2.6 or a GPU |
 | Wave V, merge group M2 (`main` at `4b0be90`, Nov 19, 2026; lanes V4, V5, V8) | Fixed, each with a test that failed on `66b52d7` (X06, X07 and X10 by reading, since the code had no seam to test before): CLI-08, CLI-09, CLI-15, CLI-17, CLI-19, CLI-20, CLI-21, CLI-22, CLI-24, DET-07, E2, E4, E7, E8, L8, X06, X07, X08, X10. DET-07's "paused" half does not hold, as T6 said. Fixed in part, still listed above: CLI-13, X09, X11. Checked and left as they are: CLI-10, DET-13, CLI-14. `seeded_failures.py` now writes every case flat into `--out`. Verified on the trial merge, macOS and CPU only |
 | Wave W, merge group M3 (`main` at `af846f7`, Nov 19, 2026; lane W4) | SDK-22's first criterion and L5 (ranks on different device types), with W4's one call in `capture.py`. SDK-22 stays open above for a failure after `init`. Verified on the trial merge with gloo on CPU; not NCCL, MPI or a GPU |
+| Wave W, merge group M4 (`main` at `c0b63ab`, Nov 19, 2026; lanes W1, W2, W3) | Four of the five P1 rows: C03 and C06 (each with a part still listed above), E1 and RS05. Also E5, DET-09, DET-10, DET-11, DET-16, E3's count half, L2, RUST-05's residual and RUST-12's coverage case. The protocol number is 3. Golden files: 73 lines in 72 files, all from E3 (the `needs` text and what counts as a checkpoint input), RUST-12 and DET-16; none from E1, the step order, DET-09 or DET-11. Verified on the trial merge, with the attempt fixture, the lifecycle test, the cross-file cases and both mixed-version streaming runs; macOS and CPU only |
