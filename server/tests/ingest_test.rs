@@ -3287,3 +3287,46 @@ fn a_silent_factor_the_watchdog_cannot_use_is_refused_at_startup() {
         );
     }
 }
+
+/// RUST-16's open part. A rank whose rebuild failed is rebuilt once its wait has passed and the
+/// store reads again, though it sends nothing more: the timed pass tries it. Until Nov 19, 2026
+/// only a later part of the rank tried again, so a rank that sent nothing more (a job that ended,
+/// or one that hung right then) stayed without a report and unjudged for good.
+#[tokio::test]
+async fn a_rank_whose_rebuild_failed_is_rebuilt_without_a_later_part() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let config = IngestConfig {
+        flush_steps: 10,
+        replay_backoff: Duration::from_millis(100),
+        ..manual()
+    };
+    let server = start_on(store.clone(), config, None).await;
+    let mut put = open_with(&server.address, RUN, 0, None, data_attempt_schema()).await;
+    put.send(data_attempt_batch(1, 0..10), 1).await;
+    assert_eq!(put.ack().await, Ok(1));
+    status_until(&server, &store, "rank 0 judged", judged).await;
+    store.knobs.fail_gets.store(true, Ordering::SeqCst);
+    // A new attempt needs a rebuild from the store, which cannot be read.
+    put.send(data_attempt_batch(2, 0..10), 2).await;
+    assert_eq!(put.ack().await, Ok(2));
+    status_until(&server, &store, "rank 0 not judged", |status| !judged(status)).await;
+    store.knobs.fail_gets.store(false, Ordering::SeqCst);
+    // Nothing more is sent. The flusher's pass, about once a second here, tries the rebuild again.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = written_status(&server, &store).await;
+        if judged(&status) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never judged again without a later part: {}",
+            status["run_state"]
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let report = json_in(&store, &format!("runs/{RUN}/rank=0/incidents.json")).await;
+    assert_eq!(report["attempt"], serde_json::json!(2), "{report}");
+    put.finish().await;
+}

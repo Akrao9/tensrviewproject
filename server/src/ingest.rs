@@ -136,8 +136,9 @@ pub struct IngestConfig {
     /// rank in the run state; after it, the rank is unknown until the report catches up. As
     /// Python's watchers wait `report_grace` (decided Nov 19, 2026).
     pub report_grace: Duration,
-    /// After a rebuild of a rank's detectors from the store fails, the wait before the next part
-    /// may try again; it doubles with each failure in a row (see `Ingest::detect`).
+    /// After a rebuild of a rank's detectors from the store fails, the wait before it is tried
+    /// again, at the rank's next part or by the timed flush, whichever comes first; it doubles with
+    /// each failure in a row (see `Ingest::detect`).
     pub replay_backoff: Duration,
     /// A run whose status has read finished or abandoned, and been written so, for this long is
     /// let go of: nothing of it is held in memory (see `Ingest::evict_settled`).
@@ -285,6 +286,16 @@ struct RankBuffer {
     /// which replaces the earlier one, and no second, overlapping part with other bounds can
     /// be left beside it. The sender keeps the refused rows and sends them again.
     sealed: bool,
+}
+
+impl RankBuffer {
+    /// A rebuild of the rank's detectors failed and its wait has passed: the next try is due.
+    fn rebuild_due(&self, now: Instant) -> bool {
+        self.detectors.is_none()
+            && self.replay_failures > 0
+            && !self.detect_off
+            && self.replay_after.is_none_or(|after| now >= after)
+    }
 }
 
 /// The newest part stored for a rank and since when its report has been behind it.
@@ -709,7 +720,8 @@ impl Ingest {
         if !appended {
             // A rebuild that failed is not tried again at every part, each a read of the whole
             // rank, but after a wait that doubles with each failure in a row (RUST-16; until
-            // Nov 19, 2026 every part tried). Meanwhile the rank has no report.
+            // Nov 19, 2026 every part tried). Meanwhile the rank has no report. Once the wait has
+            // passed, the timed flush tries it with no new part (`flush_due`, `stored` empty).
             if buffer.replay_after.is_some_and(|after| Instant::now() < after) {
                 self.forget_report(key);
                 return;
@@ -742,7 +754,7 @@ impl Ingest {
                     let wait = replay_wait(self.config.replay_backoff, buffer.replay_failures);
                     buffer.replay_after = Instant::now().checked_add(wait);
                     eprintln!(
-                        "tensorquill-server: detectors for {} rank {}: {error} (tried again after {:.0} s, at a later part)",
+                        "tensorquill-server: detectors for {} rank {}: {error} (tried again in {:.0} s)",
                         key.0,
                         key.1,
                         wait.as_secs_f64()
@@ -853,6 +865,12 @@ impl Ingest {
                     if let Err(status) = self.flush(&key, &mut buffer).await {
                         eprintln!("tensorquill-server: {}", status.message());
                     }
+                }
+                // A rank whose rebuild failed is tried again once its wait has passed, whether or
+                // not it sends another part (RUST-16's open part; until Nov 19, 2026 only a later part
+                // tried, and a rank that sent nothing more stayed without a report for good).
+                if self.config.detect && buffer.rebuild_due(Instant::now()) {
+                    self.detect(&key, &mut buffer, &[]).await;
                 }
             })
             .await;
