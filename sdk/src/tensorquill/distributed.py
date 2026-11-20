@@ -238,31 +238,38 @@ def _fingerprint_table(
     return table, reasons
 
 
-def _gather_problem(group: object, device: torch.device) -> str | None:
-    """Why the drift check's `all_gather` of a table on `device` cannot run on `group`, or None.
-
-    Judged on the host, with no communication, from what every rank of the group sees alike in
-    a data-parallel job: whether a default process group exists, the group's backends (the same
-    on every rank) and the type of the session's device (the same kind of device on every
-    replica). So every rank that would fail here skips, no rank enters a gather its peers skip,
-    and none is left waiting. The two failures this catches raise at the call, before anything
-    is sent: a group with no backend for the device's type (NCCL serves CUDA only, so a CPU
-    table under NCCL, as with FSDP's CPU offload), and a destroyed process group. A rank
-    outside `group` skips too: PyTorch's own collectives return at once on such a rank, so its
-    peers in the group never wait for it.
-
-    A group that is not a `ProcessGroup` (a stand-in some tests and tools pass with their own
-    `all_gather`) is not judged, and anything that cannot be read here leaves the gather as it
-    was: this never decides from something that might differ between ranks."""
+def _alike_problem(group: object) -> str | None:
+    """The part of `_gather_problem` every rank of the group judges alike, with no communication: a
+    rank outside the group (PyTorch's collectives return at once there, so its peers in the group never
+    wait for it) and a process group that was destroyed or never made. None otherwise, and for anything
+    that cannot be read here. Never raises."""
     try:
         if dist.distributed_c10d._rank_not_in_group(group):  # GroupMember.NON_GROUP_MEMBER
             return "this rank is not a member of the replica group, so it has no replica to compare with"
-        if not isinstance(group, dist.ProcessGroup):
-            return None
-        if not dist.is_initialized():
+        if isinstance(group, dist.ProcessGroup) and not dist.is_initialized():
             return "torch.distributed has no default process group (it was destroyed, or never initialized)"
     except Exception:  # noqa: BLE001  an API this PyTorch does not have: decide nothing
         return None
+    return None
+
+
+def _gather_problem(group: object, device: torch.device) -> str | None:
+    """Why the drift check's `all_gather` of a table on `device` cannot run on `group`, or None.
+
+    Judged on the host, with no communication, by this rank alone. The two failures this catches
+    raise at the call, before anything is sent: a group with no backend for the device's type (NCCL
+    serves CUDA only, so a CPU table under NCCL, as with FSDP's CPU offload), and a destroyed process
+    group; and a rank outside `group` skips (`_alike_problem`). The device's type can differ between
+    ranks (L5: sessions on different device types), so the backend verdict never decides alone
+    whether a rank enters the gather: it is this rank's part of the exchange before it
+    (`_exchange`), and every rank of the group takes the one decision the exchange gives.
+
+    A group that is not a `ProcessGroup` (a stand-in some tests and tools pass with their own
+    `all_gather`) is not judged, and anything that cannot be read here leaves the gather as it
+    was."""
+    alike = _alike_problem(group)
+    if alike is not None or not isinstance(group, dist.ProcessGroup):
+        return alike
     try:
         group._get_backend(device)
     except Exception as error:  # noqa: BLE001  "No backend type associated with device type cpu"
@@ -280,27 +287,160 @@ def _gather_problem(group: object, device: torch.device) -> str | None:
     return None
 
 
+# ---- the exchange before an explicit gather (L26, the author's decision 1 of Nov 20, 2026) --------
+# An explicit gather (`replica_spread`, `Session.record_replica_spread(group)`) first exchanges one
+# row per rank whose shape never depends on the inputs, then every rank of the group either gathers
+# or skips, all alike, each saying the same why. As PyTorch's DDP all-gathers each rank's parameter
+# count before it compares shapes (`verify_params_across_processes`, `reducer.cpp`), so unequal
+# inputs never reach a collective of unequal shapes. What the row holds:
+#   [0] the exchange's version, [1] how many parameters the rank compares, [2] its table's width (the
+#   fingerprint columns and the code column), [3] its table's device type (`_DEVICE_TYPES`, 0 for
+#   another), [4] 1 when the rank's own check (`_gather_problem`) says it cannot gather, [5] how many
+#   bytes of that check's text follow, then the text's UTF-8 bytes, one to an element.
+# The layout never changes: a new field is a new version, read by a rank that knows it, and a rank
+# that sees a version it does not know skips with every other rank.
+_EXCHANGE_VERSION = 1
+_TEXT_BYTES = 240
+_ROW_WIDTH = 6 + _TEXT_BYTES
+_DEVICE_TYPES = ("cpu", "cuda", "mps", "meta", "xpu", "hpu", "mtia", "npu", "privateuseone")
+# The device types tried, in this order, for the exchange's own row: the first the group has a
+# backend for. The group's backends are the same on every rank, so every rank picks the same type.
+_EXCHANGE_DEVICE_TYPES = ("cpu", "cuda", "xpu", "hpu", "npu", "mtia")
+
+
+def _exchange_row(count: int, width: int, device: torch.device, problem: str | None) -> torch.Tensor:
+    """One rank's row of the exchange (above), on the CPU: `_ROW_WIDTH` int64 whatever the inputs."""
+    row = torch.zeros(_ROW_WIDTH, dtype=torch.int64)
+    kind = device.type
+    text = (problem or "").encode("utf-8")[:_TEXT_BYTES]
+    head = [_EXCHANGE_VERSION, int(count), int(width), _DEVICE_TYPES.index(kind) + 1 if kind in _DEVICE_TYPES else 0,
+            1 if problem else 0, len(text)]
+    row[:6] = torch.tensor(head, dtype=torch.int64)
+    if text:
+        row[6:6 + len(text)] = torch.tensor(list(text), dtype=torch.int64)
+    return row
+
+
+def _ranks_text(ranks: Sequence[int]) -> str:
+    return f"rank {ranks[0]}" if len(ranks) == 1 else "ranks " + ", ".join(map(str, ranks))
+
+
+def _device_text(code: int) -> str:
+    return _DEVICE_TYPES[code - 1] if 1 <= code <= len(_DEVICE_TYPES) else "another device type"
+
+
+def _decide_gather(rows: Sequence[Any], ranks: Sequence[int]) -> str | None:
+    """None when every rank can gather tables of one shape on one kind of device; else why no rank
+    does. A pure function of the exchanged rows (and the group's global ranks, in group order), so the
+    same on every rank, since every rank sees every row."""
+    rows = [[int(v) for v in (row.tolist() if isinstance(row, torch.Tensor) else row)] for row in rows]
+    ranks = list(ranks)
+    odd = [rank for rank, row in zip(ranks, rows) if len(row) != _ROW_WIDTH or row[0] != _EXCHANGE_VERSION]
+    if odd:
+        return (
+            f"{_ranks_text(odd)} of the replica group sent an exchange this TensorQuill cannot read (every rank "
+            "must run a TensorQuill that gathers alike)"
+        )
+    problems = []
+    for rank, row in zip(ranks, rows):
+        if row[4]:
+            size = max(0, min(row[5], _TEXT_BYTES))
+            text = bytes(v & 0xFF for v in row[6:6 + size]).decode("utf-8", errors="ignore")
+            problems.append((rank, text or "its own check says it cannot gather"))
+    if problems:
+        rank, text = problems[0]
+        more = f" (as do {_ranks_text([r for r, _ in problems[1:]])})" if len(problems) > 1 else ""
+        return f"rank {rank} of the replica group cannot take part{more}: {text}"
+    empty = [rank for rank, row in zip(ranks, rows) if row[1] == 0]
+    if empty:
+        return f"{_ranks_text(empty)} of the replica group compare{'s' if len(empty) == 1 else ''} no parameter"
+    for field, value, what in (
+        (3, _device_text, "the replicas' tables are on different device types ({}), and fingerprints made on "
+                          "different devices are neither gathered alike nor computed alike"),
+        (1, str, "the replicas compare different numbers of parameters ({}), and a gather of tables of different "
+                 "shapes cannot be issued"),
+        (2, lambda w: "with the projection" if w == FINGERPRINT_WIDTH + 1 else "without the projection",
+         "the replicas' replica_projection settings differ ({}), and a gather of tables of different shapes "
+         "cannot be issued"),
+    ):
+        seen: dict[int, list[int]] = {}
+        for rank, row in zip(ranks, rows):
+            seen.setdefault(row[field], []).append(rank)
+        if len(seen) > 1:
+            return what.format("; ".join(f"{value(v)} on {_ranks_text(members)}" for v, members in seen.items()))
+    return None
+
+
+def _exchange_device(group: object) -> torch.device | None:
+    """Where the exchange's rows go: the first of `_EXCHANGE_DEVICE_TYPES` the group has a backend for
+    (the CPU under Gloo, the current CUDA device under NCCL). Read from the group's backends, which
+    every rank of the group has alike, never from the session's device, which can differ. None for
+    a group that is not a `ProcessGroup` (a stand-in with its own `all_gather`) or whose backends
+    cannot be read for any of those types: every rank then decides alone, as before. Never raises."""
+    try:
+        if not isinstance(group, dist.ProcessGroup) or not hasattr(group, "_get_backend"):
+            return None
+        for kind in _EXCHANGE_DEVICE_TYPES:
+            try:
+                group._get_backend(torch.device(kind))
+            except Exception:  # noqa: BLE001  "No backend type associated with device type ..."
+                continue
+            if kind == "cuda":
+                return torch.device("cuda", torch.cuda.current_device())
+            return torch.device(kind)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _group_order(group: object, size: int) -> list[int]:
+    """The global ranks of `group` in group-rank order (what the exchange's `all_gather` lists), or the
+    group ranks themselves where they cannot be read."""
+    try:
+        return [int(dist.get_global_rank(group, i)) for i in range(size)]
+    except Exception:  # noqa: BLE001
+        return list(range(size))
+
+
+def _exchange(
+    group: object, where: torch.device, count: int, width: int, device: torch.device, problem: str | None
+) -> str | None:
+    """The exchange before an explicit gather: one `all_gather` of each rank's `_exchange_row` on
+    `where`, then `_decide_gather` on what every rank sent. A collective like the gather after it:
+    every rank of the group must reach it, and one that fails raises here. It reads the rows on the
+    host, so on a GPU it waits for the device once."""
+    row = _exchange_row(count, width, device, problem).to(where)
+    out = [torch.empty_like(row) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(out, row, group=group)
+    rows = torch.stack(out).cpu()
+    return _decide_gather(list(rows), _group_order(group, len(out)))
+
+
 @torch.no_grad()
 def _spread_and_unread(
     params: Iterable[torch.Tensor], group: dist.ProcessGroup, *, projection: bool, device: torch.device | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, list[str | None]]:
-    """The session's cross-GPU check: one `all_gather` of `_fingerprint_table`, which every rank
-    enters with the same shape whatever it could read. Returns the `[n_params, width]` spread
-    (`spread_from_fingerprints`), for each parameter 0.0 where every rank read it or else the
-    largest code any rank gave (the same on every rank, since all see every rank's codes, so all
-    leave out the same rows), and this rank's own reasons. The spread of a row not read on some
-    rank means nothing: it is left out by its code, never by its value, so a NaN still reads
-    as drift and a zero as agreement only where the weights were read. Both stay on the device.
+    """The explicit cross-GPU check: the exchange (`_exchange`), then, when every rank of the group
+    can gather alike, one `all_gather` of `_fingerprint_table`, which every rank enters with the same
+    shape whatever it could read. Returns the `[n_params, width]` spread (`spread_from_fingerprints`),
+    for each parameter 0.0 where every rank read it or else the largest code any rank gave (the same
+    on every rank, since all see every rank's codes, so all leave out the same rows), and this rank's
+    own reasons. The spread of a row not read on some rank means nothing: it is left out by its code,
+    never by its value, so a NaN still reads as drift and a zero as agreement only where the weights
+    were read. Both stay on the device.
 
-    Where the gather cannot run (`_gather_problem`: no backend for the table's device, no
-    process group, a rank outside the group), no collective is issued: every row comes back
-    with the code `_NOT_GATHERED`, zeros for its spread and the reason, so the session leaves
-    every parameter out of `replica_spread` and names each once, as for a parameter that could
-    not be read. Each rank judges alone, which every rank of a data-parallel job does alike; ranks
-    that judge differently (sessions on different device types, L5) leave one rank in the gather
-    while another skips, as any collective the caller issues on such a group would. A gather that
-    raises once issued is not caught: a rank that caught it and went on would issue its next
-    collective (the training run's own) while its peers still wait in this one.
+    Where the gather cannot run, no rank of the group issues it: every row comes back with the code
+    `_NOT_GATHERED`, zeros for its spread and the reason, so the session leaves every parameter out of
+    `replica_spread` and names each once. A rank outside the group, or a destroyed process group,
+    is judged alike on every rank with no communication (`_alike_problem`). Anything else that could
+    differ between ranks is decided by the exchange first, a fixed-size `all_gather` (as PyTorch's
+    DDP exchanges parameter counts before it compares shapes): this rank's own verdict on its table's
+    device (`_gather_problem`), its table's device type, how many parameters it compares and its
+    table's width. Every rank then gathers, or every rank skips with the same why. A group that is
+    not a `ProcessGroup` (a stand-in with its own `all_gather`) has no exchange and decides alone, as
+    before. A collective that raises once issued, the exchange or the gather, is not caught: a rank
+    that caught it and went on would issue its next collective (the training run's own) while its
+    peers still wait in this one.
 
     Only the two explicit calls reach it (`replica_spread`, `Session.record_replica_spread`),
     collectives every rank of the group must call: the session's scheduled check gathers nothing
@@ -312,9 +452,13 @@ def _spread_and_unread(
             (torch.device("cpu") if p.device.type == "mps" else p.device for p in locals_ if not _unread_code(p)),
             torch.device("cpu"),
         )
-    why = _gather_problem(group, device)
+    width = FINGERPRINT_WIDTH if projection else 2
+    why = _alike_problem(group)
+    if why is None:
+        own = _gather_problem(group, device)
+        where = _exchange_device(group)
+        why = own if where is None else _exchange(group, where, len(params), width + 1, device, own)
     if why is not None:
-        width = FINGERPRINT_WIDTH if projection else 2
         n = len(params)
         spread = torch.zeros(n, width, dtype=F64, device=device)
         unread = torch.full((n,), float(_NOT_GATHERED), dtype=F64, device=device)
@@ -323,7 +467,6 @@ def _spread_and_unread(
     out = [torch.empty_like(table) for _ in range(dist.get_world_size(group))]
     dist.all_gather(out, table, group=group)  # 32 bytes per tensor per rank (24 without the projection)
     gathered = torch.stack(out)
-    width = table.shape[1] - 1
     return spread_from_fingerprints(gathered[..., :width]), gathered[..., width].amax(0), reasons
 
 
@@ -359,19 +502,29 @@ def replica_spread(
     A parameter that some replica cannot read (on `meta`, nested or sparse, or one whose reading
     raised) is still gathered, so every rank enters the same `all_gather` with the same shape and
     none is left waiting; its row is NaN on every rank, and one warning per call names it with
-    why. Where the gather cannot run at all (as the session's check judges it: no backend for the
-    tensors' device, no process group, a rank outside `group`), no collective is issued and every row is NaN,
-    with the reason. A NaN weight that was read gives NaN too, with no warning. NaN compares
+    why. Before the gather the ranks exchange one fixed-size row each (`_exchange`: how many
+    parameters each passes, its tensors' device type, whether it can gather them, and the
+    projection setting). Where any rank cannot gather, or the ranks pass different numbers of
+    parameters or tensors on different device types, no rank issues the gather: every row is NaN
+    on every rank, with the same reason, which names the ranks. A rank outside `group`, or no
+    process group, gathers nothing either, with no exchange. A rank that passes no parameter takes
+    part in the exchange and then raises `ValueError`; its peers skip. A NaN weight that was read gives NaN too, with no warning. NaN compares
     false with any tolerance, so `spread > tol` reads such a row as no drift: test
     `spread.isnan()` first, and treat a NaN row as not compared (or, for a NaN weight, drift).
-    A gather that
-    fails once issued still raises here. It gathers 32 bytes per parameter per rank (24 without
-    the projection), the session's table, so every rank must run a TensorQuill that gathers alike.
+    An exchange or gather that fails once issued still raises here. It gathers 32 bytes per
+    parameter per rank (24 without the projection), after an exchange of 246 int64 per rank
+    (1,968 bytes) in one `all_gather`, read on the host, so on a GPU it waits for the device once.
+    Every rank must run a TensorQuill that gathers alike: a rank on an older one enters the table's
+    gather while the others enter the exchange.
     """
     if group is None:
         raise ValueError("pass the replication process group explicitly")
     params = list(params)
     if not params:
+        if isinstance(group, dist.ProcessGroup) and _alike_problem(group) is None:
+            # Take part in the exchange, which says this rank compares nothing, so a peer that does
+            # compare parameters skips the gather instead of waiting in it alone; then raise.
+            _spread_and_unread([], group, projection=projection)
         raise ValueError("no replicated parameters to check")
     spread, unread, reasons = _spread_and_unread(params, group, projection=projection)
     codes = unread.tolist()  # one transfer: which rows to name

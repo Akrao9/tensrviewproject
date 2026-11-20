@@ -2568,16 +2568,27 @@ class Session:
         columns) is not recorded and is said once in a warning; what this step recorded before it
         stays as it was. Nothing is broadcast to parameters the table has no row for.
 
-        With a group this is a collective, an `all_gather` on it: every rank of the group must call
-        it on the same step, and it waits for them, as any collective does. It is the only way the
-        session gathers: the scheduled check is each rank's own observation (`replica`), with no
+        With a group this is a collective: every rank of the group must call it on the same step, and
+        it waits for them, as any collective does. It first exchanges one fixed-size row per rank
+        (`distributed._exchange`): how many parameters each compares, its table's device type,
+        whether it can gather it, and its projection setting. Where any rank cannot gather, or the
+        ranks compare different numbers of parameters or are on different device types, no rank
+        gathers and each names every parameter once in a warning with the same reason; otherwise
+        every rank gathers. A rank that compares no parameter, or whose session has stopped, still
+        takes part. It is the only way the session gathers: the scheduled check is each rank's own observation (`replica`), with no
         collective. Where the group's global ranks can be read and the rank knows its launch, the
         record also says what the spread covers (`replica_spread_scope`); a precomputed table has
         no scope.
         """
-        if self._closed or not self._replica_params:
+        if self._closed:
             return
         target = self._replica_group if group_or_spread is None else group_or_spread
+        if not self._replica_params:
+            if target is not None and not isinstance(target, torch.Tensor):
+                # Nothing to compare, but a peer that compares parameters is entering the exchange:
+                # this rank says it compares none there, and every rank skips the gather.
+                self._gather_and_drop(target)
+            return
         if target is None:
             raise ValueError("pass a replication process group or precomputed spread tensor")
         if self._stopped:
@@ -3331,8 +3342,9 @@ class Session:
         self._next_step = current + 1
 
     def _gather_and_drop(self, group: Any) -> None:
-        """A stopped rank's explicit `record_replica_spread(group)`: the other ranks are entering
-        that collective too, so this one enters it and drops the result."""
+        """An explicit `record_replica_spread(group)` on a rank that records nothing (a stopped
+        session, or one that compares no parameter): the other ranks are entering the exchange and
+        maybe the gather too, so this one takes part and drops the result."""
         try:
             spread_buf, _ = self._ensure_spread_buffers()
             _spread_and_unread(self._replica_params, group, projection=self._replica_projection,
