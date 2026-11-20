@@ -4254,6 +4254,9 @@ def combine_rank_evidence(
         "incident_groups": groups,
         "run_incidents": run_incidents,
         **({"stopped_stacks": stacks} if (stacks := group_stopped_stacks(status)) else {}),
+        # Each judged rank's probe head numbers, from its evidence (L20).
+        **({"head_trends_by_rank": heads} if (heads := _head_trends_by_rank(
+            {n: per_rank[n].get("head_trends") for n in judged})) else {}),
     }
     stated = {n: found for n in judged if (found := stated_kind_checks(per_rank[n])) is not None}
     silent = [n for n in judged if n not in stated]
@@ -4292,6 +4295,16 @@ def combine_rank_evidence(
         judged_attempts={n: _whole_attempt((per_rank[n].get("detection") or {}).get("report_attempt")) for n in judged},
     )
     return combined
+
+
+def _head_trends_by_rank(found: Mapping[int, Any]) -> list[dict[str, Any]]:
+    """The probe's head numbers of each judged rank (`head_logit_trends`, with
+    `overflow_positions`), for the all-ranks view's `head_trends_by_rank` (L20): one entry per
+    rank whose evidence or report has them, `{"rank", "head_trends"}`, by rank. Each rank's are
+    its own: a run's ranks probe their own batches, so they are not added up or compared. Not
+    under `head_trends`, which one rank's evidence has and a reader of it takes as one rank's."""
+    return [{"rank": number, "head_trends": dict(trends)} for number, trends in sorted(found.items())
+            if isinstance(trends, Mapping) and trends]
 
 
 def _all_ranks_reported(evidence: Mapping[str, Any]) -> dict[Any, set[int]]:
@@ -4540,14 +4553,17 @@ def _all_ranks_evidence(
         "run_incidents": run_incidents,
         # The stopped ranks' stacks from the status, grouped: present only while a rank is stopped.
         **({"stopped_stacks": stacks} if (stacks := group_stopped_stacks(status)) else {}),
+        # Each judged rank's probe head numbers, from its current report (L20): no part is read.
+        **({"head_trends_by_rank": heads} if (heads := _head_trends_by_rank(
+            {n: looks[n]["report"].get("head_trends") for n in judged})) else {}),
         "ranks": entries,
         **({"not_checked": not_checked} if not_checked else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
         **({"traincheck": traincheck_summary} if traincheck_summary else {}),
-        **({"watchdog": {k: status[k] for k in (
+        **({"watchdog": {**{k: status[k] for k in (
             "summary", "written_at_ms", "world_size", "pauses", "recommended_silent_seconds",
             "silent_floor_seconds", "critical_seconds",
-        ) if k in status}} if status else {}),
+        ) if k in status}, **_dropped_rows_said(status)}} if status else {}),
     }
     _all_ranks_kind_checks(evidence, looks, status, flight_recorder=flight_recorder is not None,
                            traincheck=traincheck is not None)
@@ -4558,6 +4574,24 @@ def _all_ranks_evidence(
     if not_checked:
         evidence["not_checked"] = not_checked
     return evidence
+
+
+def _dropped_rows_said(status: Mapping[str, Any] | None) -> dict[str, Any]:
+    """`{"dropped_rows": ...}` for the all-ranks view's `watchdog` block, or nothing when no rank
+    dropped a row, so such a run's block is as before (L22). The rows the server dropped because
+    a key of theirs was null (`runs.dropped_rows`, which reads each rank's `dropped_rows` and
+    `dropped_row_keys` in the status): the total, by null key, and the ranks that dropped any,
+    as ranges (the first 8 and a count of the rest), so the block stays small however many ranks
+    there are; the MCP answers give each rank's count. An upper bound: a
+    batch sent again after a lost acknowledgement is counted again."""
+    from .runs import dropped_rows
+
+    found = dropped_rows(status)
+    if found is None:
+        return {}
+    return {"dropped_rows": {"rows": found["rows"], **({"by_key": found["by_key"]} if found.get("by_key") else {}),
+                             "rank_ranges": _rank_ranges((item["rank"] for item in found["ranks"]), 8),
+                             "upper_bound": True, "note": found["note"]}}
 
 
 def _all_ranks_run_state(evidence: Mapping[str, Any], looks: Mapping[int, Mapping[str, Any]],
@@ -4795,6 +4829,10 @@ def watch_all_ranks(
                 # The server's replica result changing is news (contract 7: a verdict is due at the
                 # next look). Absent, the stamp is what it was before the key.
                 stamp = (*stamp, json.dumps(status["replica"], sort_keys=True, default=str))
+            if dropped := _dropped_rows_said(status):
+                # So is a change in the rows the server dropped (L22), which the view's `watchdog`
+                # block carries. None dropped, the stamp is what it was before.
+                stamp = (*stamp, json.dumps(dropped, sort_keys=True))
             folders, looks, keys = _look_at_ranks(source, status, memory, thresholds, report_grace)
             if not looks and status is None:
                 continue
@@ -5200,17 +5238,36 @@ def _replica_object(result: Mapping[str, Any], tolerance: float) -> dict[str, An
     return {"v": 1, "tolerance": tolerance, **result}
 
 
+def _status_says_no_detect(status: Mapping[str, Any]) -> bool:
+    """Whether the server's status says it runs with `--no-detect`. The status has no key for it;
+    its `run_state` says it in words, on the reason for the ranks without a current report
+    (`ranks_unknown`, `watchdog.rs`), which such a server gives for every rank it has heard of.
+    A server older than `run_state`, or one with no rank yet, does not say."""
+    state = status.get("run_state")
+    reasons = state.get("reasons") if isinstance(state, Mapping) else None
+    return any(isinstance(reason, Mapping) and reason.get("code") == "ranks_unknown"
+               and "--no-detect" in str(reason.get("detail") or "") for reason in reasons or ())
+
+
 def _replica_from_status(status: Mapping[str, Any] | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """The server's cross-rank result from its status (`replica` at the top level of
     `watchdog.json`, contract 8), or why there is none: `(object, None)` or `(None, not_stated)`.
-    `(None, None)` when there is no status, which the view already says."""
+    `(None, None)` when there is no status, which the view already says.
+
+    A server with detection on writes `replica` in every status it writes, its last one when it
+    stops among them (an empty result for a run without observations). So a status without the
+    key is from a server started with `--no-detect` or from one older than the comparison
+    (contract 8: the first must not be called the second). The words say which when the status
+    says the server runs with `--no-detect` (`_status_says_no_detect`), and both otherwise."""
     if status is None:
         return None, None
     found = status.get("replica")
     if found is None:
+        why = ("the server runs with --no-detect, which writes none" if _status_says_no_detect(status)
+               else "a server started with --no-detect, or an older tensorquill-server")
         return None, {"code": "status_without_replica",
-                      "detail": "the server's status has no `replica` result (an older tensorquill-server): the ranks'"
-                                " replica observations are not compared here"}
+                      "detail": f"the server's status has no `replica` result ({why}): the ranks' replica observations"
+                                " are not compared here"}
     if (not isinstance(found, Mapping) or not isinstance(found.get("steps"), list)
             or not isinstance(found.get("replica_drift"), list) or _finite(found.get("tolerance")) is None):
         return None, {"code": "status_replica_unreadable",
@@ -5355,7 +5412,8 @@ def replica_line(evidence: Mapping[str, Any]) -> str | None:
     the steps that were not and the ranks missing from them, and the steps whose signatures
     differ (evidence, not an incident). None for evidence without a result. A status without one
     (`replica_not_stated`) gets no line: the view cannot tell whether any rank recorded an
-    observation, so the line would be on every run of an older server; the key says it."""
+    observation, so the line would be on every run of an older server or one started with
+    `--no-detect`; the key says it."""
     check = (evidence.get("kind_checks") or {}).get("replica_drift")
     if not isinstance(evidence.get("replica"), Mapping) or not isinstance(check, Mapping):
         return None
