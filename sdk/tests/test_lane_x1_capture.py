@@ -7,6 +7,12 @@ Written before each fix, against the branch's base. Each test says whether it fa
   optimizer on the same model (an LR finder's, or a rebuilt one while the old is kept) never led,
   and its steps were not counted, silently. Now an optimizer that holds parameters the lead holds
   takes the lead when it steps in a later iteration than the lead last did, `step(closure)` included.
+- C06, its open part: the length check on a router's expert ids took any whole multiple of the
+  tokens, whatever `top_k` said. Now the ids must number the tokens times the declared `top_k`;
+  any other count refuses the router with a reason that names both, on the default integer path
+  and the `indices=` path alike. Never a raise, and the same under `torch.compile`. One exception,
+  kept because `test_router_guard.py` (`int-top_k-above`) guards it: on the default integer path a
+  declared `top_k` above `n_experts` is only written down, and the router is counted as before.
 """
 
 from __future__ import annotations
@@ -191,3 +197,186 @@ def test_l9_guard_nothing_raises_under_warnings_as_errors():
             _iterate(model, second, 3)
     assert _steps(sink.records) == list(range(5))
     assert first is not None
+
+
+# --- C06: expert ids counted against the tokens and the declared top_k ----------------------------
+
+EXPERTS = 4
+
+
+class IdsRouter(nn.Module):
+    """A router whose output is (logits, ids), with the ids the test sets (one row per token)."""
+
+    def __init__(self, ids: list[list[int]]) -> None:
+        super().__init__()
+        self.register_buffer("ids", torch.tensor(ids, dtype=torch.int64))
+        self.proj = nn.Linear(4, EXPERTS)
+
+    def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.proj(h), self.ids.clone()
+
+
+class OneRouter(nn.Module):
+    def __init__(self, router: nn.Module) -> None:
+        super().__init__()
+        self.inp = nn.Linear(4, 4)
+        self.router = router
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.inp(x)
+        return h.sum() + self.router(h)[0].sum()
+
+
+def _spec(route: str, top_k: int) -> tensorquill.Router:
+    if route == "indices":
+        return tensorquill.Router(EXPERTS, top_k, indices=lambda out: out[1])
+    return tensorquill.Router(EXPERTS, top_k)
+
+
+def _route(ids: list[list[int]], spec: tensorquill.Router, *, backend: str | None = None) -> list[dict]:
+    torch.manual_seed(0)
+    model = OneRouter(IdsRouter(ids))
+    sink = tensorquill.MemorySink()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        session = tensorquill.init(model, sink=sink, every=1, routers={"router": spec})
+        run = torch.compile(model, backend=backend, fullgraph=True) if backend else model
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        for _ in range(2):
+            opt.zero_grad()
+            run(torch.ones(len(ids), 4)).backward()
+            opt.step()
+        session.close()
+    assert session.writer_error is None
+    return sink.records
+
+
+def _refused(records: list[dict]) -> str | None:
+    found = [r["moe_refused"]["router"] for r in records if "router" in r.get("moe_refused", {})]
+    return found[0] if found else None
+
+
+TWO_PER_TOKEN = [[0, 1], [2, 3], [1, 2]]  # three tokens, two ids each
+
+
+@pytest.mark.parametrize("route", ["default", "indices"])
+def test_c06_two_ids_per_token_under_a_declared_top_1_refuse_the_router(route):
+    # fail-before: counted as six top-1 assignments of three tokens, with moe_top_k 1.
+    records = _route(TWO_PER_TOKEN, _spec(route, 1))
+    why = _refused(records)
+    assert why is not None, [r.get("moe") for r in records]
+    assert "6 expert ids for the 3 tokens" in why and "top_k is 1" in why, why
+    assert "; " not in why
+    assert "tensorquill.Router(4, 2" in why, why  # the fix names the top_k the ids show
+    assert not any("router" in r.get("moe", {}) for r in records)
+
+
+@pytest.mark.parametrize("route", ["default", "indices"])
+@pytest.mark.parametrize("top_k", [3, 4])
+def test_c06_fewer_ids_per_token_than_the_declared_top_k_refuse_the_router(route, top_k):
+    # fail-before: two ids a token, counted under a declared top_k of 3 or 4.
+    why = _refused(_route(TWO_PER_TOKEN, _spec(route, top_k)))
+    assert why is not None
+    assert f"top_k is {top_k}" in why and "2 for each" in why, why
+
+
+@pytest.mark.parametrize("route", ["default", "indices"])
+def test_c06_one_id_per_token_under_a_declared_top_2_refuses_the_router(route):
+    # fail-before: the share detectors would read top-2 limits over top-1 counts.
+    why = _refused(_route([[0], [1], [3], [2]], _spec(route, 2)))
+    assert why is not None and "top_k is 2" in why and "1 for each" in why, why
+
+
+@pytest.mark.parametrize("route", ["default", "indices"])
+@pytest.mark.parametrize("ids,top_k,counts", [
+    ([[0], [1], [1], [3]], 1, [1, 2, 0, 1]),
+    ([[0, 1], [2, 3], [1, 2]], 2, [1, 2, 2, 1]),
+])
+def test_c06_guard_ids_that_match_the_declared_top_k_are_counted(route, ids, top_k, counts):
+    records = _route(ids, _spec(route, top_k))
+    assert _refused(records) is None
+    assert [r["moe"]["router"] for r in records] == [counts, counts]
+    assert all(r["moe_top_k"] == {"router": top_k} for r in records)
+
+
+def test_c06_guard_a_count_that_is_no_multiple_of_the_tokens_keeps_its_reason():
+    # guard: three ids for two tokens is no whole multiple; the reason stays as it was worded.
+    why = _refused(_route_flat([0, 1, 2], tokens=2))
+    assert why is not None and "which is not expert indices for the 2 tokens" in why, why
+
+
+class FlatIdsRouter(nn.Module):
+    def __init__(self, ids: list[int]) -> None:
+        super().__init__()
+        self.register_buffer("ids", torch.tensor(ids, dtype=torch.int64))
+        self.proj = nn.Linear(4, EXPERTS)
+
+    def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.proj(h), self.ids.clone()
+
+
+def _route_flat(ids: list[int], tokens: int) -> list[dict]:
+    torch.manual_seed(0)
+    model = OneRouter(FlatIdsRouter(ids))
+    sink = tensorquill.MemorySink()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with tensorquill.init(model, sink=sink, every=1, routers={"router": EXPERTS}):
+            model(torch.ones(tokens, 4)).backward()
+            torch.optim.SGD(model.parameters(), lr=0.01).step()
+    return sink.records
+
+
+def test_c06_a_mismatch_raises_nothing_under_warnings_as_errors():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        model = OneRouter(IdsRouter(TWO_PER_TOKEN))
+        sink = tensorquill.MemorySink()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        with tensorquill.init(model, sink=sink, every=1, routers={"router": EXPERTS}):
+            for _ in range(2):
+                opt.zero_grad()
+                model(torch.ones(3, 4)).backward()
+                opt.step()
+    assert _refused(sink.records) is not None
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_c06_compiled_refuses_a_mismatch_as_eager_does(backend):
+    # fail-before. Shapes only, so `fullgraph=True` holds: a graph break in the hook fails here.
+    torch._dynamo.reset()
+    try:
+        torch.compile(OneRouter(IdsRouter(TWO_PER_TOKEN)), backend=backend, fullgraph=True)(torch.ones(3, 4))
+    except Exception as error:  # noqa: BLE001
+        pytest.skip(f"this PyTorch cannot compile the model without TensorQuill: {type(error).__name__}")
+    torch._dynamo.reset()
+    eager = _refused(_route(TWO_PER_TOKEN, _spec("default", 1)))
+    torch._dynamo.reset()
+    compiled = _refused(_route(TWO_PER_TOKEN, _spec("default", 1), backend=backend))
+    torch._dynamo.reset()
+    counted = _route(TWO_PER_TOKEN, _spec("default", 2), backend=backend)
+    torch._dynamo.reset()
+    assert compiled == eager and compiled is not None
+    assert _refused(counted) is None and counted[0]["moe"]["router"] == [1, 2, 2, 1]
+
+
+def test_c06_guard_a_default_integer_router_under_a_top_k_above_its_experts_is_counted_as_before():
+    # guard: the exception `test_router_guard.py`'s `int-top_k-above` case keeps.
+    records = _route(TWO_PER_TOKEN, tensorquill.Router(EXPERTS, EXPERTS + 1))
+    assert _refused(records) is None
+    assert [r["moe"]["router"] for r in records] == [[1, 2, 2, 1]] * 2
+
+
+def test_c06_an_indices_router_under_a_top_k_above_its_experts_is_refused():
+    # fail-before: the `indices=` path has no exception.
+    why = _refused(_route(TWO_PER_TOKEN, _spec("indices", EXPERTS + 1)))
+    assert why is not None and f"top_k is {EXPERTS + 1}" in why, why
+
+
+def test_c06_more_ids_a_token_than_experts_get_the_usual_fix_not_a_top_k_above_the_experts():
+    # fail-before. Five ids a token for four experts: no Router(4, 5) would be counted on the
+    # `indices=` path, so the fix offered is the usual one.
+    ids = [[0, 1, 2, 3, 0], [1, 2, 3, 0, 1]]
+    why = _refused(_route(ids, _spec("indices", 1)))
+    assert why is not None and "5 for each" in why, why
+    assert "Router(4, 5" not in why and "change its indices= function" in why, why

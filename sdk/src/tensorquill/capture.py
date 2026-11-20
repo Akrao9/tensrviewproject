@@ -105,9 +105,16 @@ class Router:
     `n_experts`.
 
     A function given as `indices` is checked as the default is, and more: it must return an
-    integer tensor on the counts' device, of a size that is a whole multiple of the tokens
-    the router was called on. One that raises, or returns anything else, has its router refused
-    for the session (`_router_hook`), never an error in training.
+    integer tensor on the counts' device. One that raises, or returns anything else, has its router
+    refused for the session (`_router_hook`), never an error in training.
+
+    Expert ids, from `indices` or the default integer tensor, must number `top_k` for each token
+    the router was called on (the open part of C06): any other count refuses the router with a
+    reason naming the count, the tokens and the declared `top_k`, since `moe_top_k` tells the
+    detectors how large an expert's share can be. Judged from shapes alone, so the same under
+    `torch.compile`; not judged when the tokens cannot be read from the router's first argument,
+    nor for the default integer tensor under a `top_k` above `n_experts`, which is only written
+    down there and counted as before.
 
     Expert ids, from `indices` or the default integer tensor, are judged on their values (the
     author's decision on C06): an id below 0 is no assignment (Megatron's -1 for no route), not
@@ -375,6 +382,8 @@ def _refusal(name: str, spec: Router, why: str, fix: str | None = None, device: 
     and a `top_k` above the number of experts. No "; ": the evidence joins several routers'
     reasons with it."""
     inner = "name the module inside it whose output is the router's logits"
+    if fix is not None and fix.startswith("top_k=") and int(fix.removeprefix("top_k=")) > spec.n_experts:
+        fix = None  # more ids a token than experts: no top_k would count them, so the usual two fixes
     if fix == "device":
         fix = (
             f"pass routers={{{name!r}: tensorquill.Router({spec.n_experts}, {spec.top_k}, indices=...)}} with a "
@@ -385,6 +394,21 @@ def _refusal(name: str, spec: Router, why: str, fix: str | None = None, device: 
             f"pass routers={{{name!r}: tensorquill.Router({spec.n_experts}, {spec.top_k}, indices=...)}} with a "
             f"function that returns the chosen expert indices as a plain torch.Tensor, or {inner}"
         )
+    elif fix is not None and fix.startswith("top_k="):
+        # The ids numbered a whole multiple of the tokens, but not `top_k` for each (`_ids_per_token`).
+        shown = fix.removeprefix("top_k=")
+        if spec.indices is None:
+            fix = (
+                f"pass routers={{{name!r}: tensorquill.Router({spec.n_experts}, {shown})}} if it chooses {shown} "
+                f"experts for each token, or tensorquill.Router({spec.n_experts}, {spec.top_k}, indices=...) with a "
+                f"function that returns {spec.top_k} expert ids for each token from its output"
+            )
+        else:
+            fix = (
+                f"pass routers={{{name!r}: tensorquill.Router({spec.n_experts}, {shown}, indices=...)}} if it "
+                f"chooses {shown} experts for each token, or change its indices= function to return {spec.top_k} "
+                f"expert ids for each token"
+            )
     elif fix == "top_k":
         fix = (
             f"pass routers={{{name!r}: tensorquill.Router(n_experts, top_k)}} with its number of experts and a "
@@ -479,6 +503,29 @@ def _unusable(t: torch.Tensor, device: torch.device, what: str) -> tuple[str, st
 # Readers take a missing value, every older record's included, as unknown.
 
 
+def _ids_per_token(chosen: Any, tokens: int | None, spec: Router) -> int | None:
+    """How many expert ids for each token `chosen` ids, a whole multiple of `tokens`, are, when that
+    is not the router's `top_k`, so the router is refused (`_ids_per_token_why`, and the fix
+    `_refusal` names for it); None when they number `top_k` for each token, or when either count is
+    not a plain int (no tokens read from the first argument; a symbolic size under `torch.compile`).
+    Before, any whole multiple was counted whatever `top_k` said (C06): two ids a token under a
+    declared top-1 were counted as top-1 assignments, and the share detectors, which read
+    `moe_top_k`, judged them against the wrong limit."""
+    if not tokens or type(tokens) is not int or type(chosen) is not int:
+        return None
+    if chosen == tokens * max(spec.top_k, 1):
+        return None
+    return chosen // tokens
+
+
+def _ids_per_token_why(what: str, chosen: int, tokens: int, spec: Router) -> str:
+    """The refusal's reason for `_ids_per_token`, built once (`refuse`)."""
+    return (
+        f"{what} {chosen} expert ids for the {tokens} tokens it was called on, {chosen // tokens} for each, "
+        f"but its top_k is {spec.top_k}"
+    )
+
+
 def _count_width(spec: Router) -> int:
     """Slots in a router's counts buffer, filled by `_router_hook` and read in `flush` with the copy to
     the CPU made anyway, so the values are judged without a sync and the hook's shapes depend on the
@@ -551,11 +598,15 @@ def _router_hook(
                     f"the {tokens} tokens it was called on"
                 ))
                 return
+            each = _ids_per_token(chosen, tokens, spec)
+            if each is not None:
+                refuse(lambda: _ids_per_token_why("its indices= function returned", chosen, tokens, spec), f"top_k={each}")
+                return
         else:
             idx = _first_tensor(output, integer=True)
             if idx is not None:
-                # An integer tensor in the output is taken as the chosen expert indices, one or
-                # `top_k` for each token. One that cannot be that (a router that returns
+                # An integer tensor in the output is taken as the chosen expert indices, `top_k`
+                # for each token (`_ids_per_token`). One that cannot be that (a router that returns
                 # per-expert token counts first, as nanoMoE's does) would be counted as indices
                 # and give wrong loads with no error. The shapes alone show it, so nothing here
                 # depends on the data; the session warns once and this router is not counted.
@@ -565,6 +616,13 @@ def _router_hook(
                         f"its output's first integer tensor has shape {tuple(idx.shape)}, which is not expert "
                         f"indices for the {tokens} tokens it was called on"
                     ))
+                    return
+                # Not judged under a declared top_k above the experts: such a top_k is only written
+                # down for an integer router, which is counted as before (`test_router_guard.py`,
+                # `int-top_k-above`, keeps it so); the `indices=` path has no such exception.
+                each = None if spec.top_k > spec.n_experts else _ids_per_token(chosen, tokens, spec)
+                if each is not None:
+                    refuse(lambda: _ids_per_token_why("its output's first integer tensor holds", chosen, tokens, spec), f"top_k={each}")
                     return
                 # One the counting below would raise on (another device than the counts, say).
                 wrong = _unusable(idx, counts.device, "its output's first integer tensor")
