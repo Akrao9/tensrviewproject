@@ -211,8 +211,31 @@ def test_a_reader_that_names_a_rank_of_two_is_caught():
 
 
 def test_a_reader_that_attributes_among_the_ranks_that_reported_is_caught():
-    """Two of three reported and differ; the third is missing. A reader that takes the reporters
-    for the group would call it two ranks, and one that lets a set-aside row vote names a rank."""
-    for case in ("a_peer_is_missing_and_the_reporters_differ", "a_peer_is_missing_and_the_reporters_agree"):
-        assert DOCUMENT["cases"][case]["expected"]["attribution"] == []
-        assert DOCUMENT["cases"][case]["expected"]["incidents"] == 0
+    """Two of three reported and differ; the third is missing. A reader that takes the ranks that
+    reported for the group calls it two ranks, where nothing can be said until the third is there."""
+    def among_the_reporters(records, tolerance):
+        rows: dict[tuple, dict[int, dict]] = {}
+        for record in records:
+            rows.setdefault((record["replica"]["launch"], record["step"]), {})[record["rank"]] = record["replica"]
+        out = []
+        for (launch, step), cells in rows.items():
+            for name in ("b", "w"):
+                held = {r: cell["params"][name] for r, cell in cells.items()}
+                if len({json.dumps(row["fp"]) for row in held.values()}) > 1:
+                    out.append({"step": step, "launch": launch, "group": sorted(cells), "parameter": name,
+                                "by": "fingerprints", **_by_fingerprints(held, 3, tolerance)})
+        return out
+
+    assert _wrong(among_the_reporters, "a_peer_is_missing_and_the_reporters_differ")
+
+
+def test_a_reader_that_lets_a_ranks_later_row_vote_is_caught():
+    """Rank 1's later attempt is set aside (contract 2). A reader that takes each rank's last row
+    counts it, finds two ranks holding the drifted value, and names the healthy rank."""
+    def the_last_row_of_each_rank(records, tolerance):
+        return attribution(list(reversed(records)), tolerance)
+
+    assert _wrong(the_last_row_of_each_rank, "a_set_aside_later_attempt_does_not_vote")
+    named = [e["outliers"] for e in the_last_row_of_each_rank(
+        DOCUMENT["cases"]["a_set_aside_later_attempt_does_not_vote"]["records"], TOLERANCE) if e["verdict"] == "attributed"]
+    assert named and all(outliers == [0] for outliers in named)

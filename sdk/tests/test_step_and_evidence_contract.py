@@ -34,7 +34,7 @@ def _numbers(value):
 
 def test_the_file_holds_the_cases_the_page_names():
     page = (ROOT / "STEP_AND_EVIDENCE_CONTRACT.md").read_text()
-    assert len(CASES) == 15 and len(PINS) == 6
+    assert len(CASES) == 20 and len(PINS) == 6
     for name, body in CASES.items():
         assert f"`{name}`" in page, f"{name} is not named on the page"
         assert body["section"] in (1, 2, 3, 4) and body["says"] and body["expected"]
@@ -64,7 +64,8 @@ def test_the_skip_changes_the_verdict_and_nothing_else_does():
 def test_a_new_case_states_a_target_in_the_pages_words(name, body):
     assert set(body) == {"section", "status", "says", "given", "expected"}
     allowed = {"incident_kinds_present", "incident_kinds_absent", "kind_values", "not_checked", "run_state", "status",
-               "words", "words_absent", "incident_carries", "incident_lacks", "findings"}
+               "words", "words_absent", "incident_carries", "incident_lacks", "findings",
+               "records_carry", "records_lack", "records"}
     assert set(body["expected"]) <= allowed, set(body["expected"]) - allowed
     for kind in (*body["expected"].get("incident_kinds_present", ()), *body["expected"].get("incident_kinds_absent", ()),
                  *body["expected"].get("kind_values", {})):

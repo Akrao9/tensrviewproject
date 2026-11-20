@@ -708,6 +708,110 @@
     "consecutive_skips": 10
    }
   },
+  "an_update_due_and_applied": {
+   "section": 1,
+   "status": "new",
+   "says": "The caller says an update was due and was applied.",
+   "given": {
+    "init": {
+     "auto_step": false
+    },
+    "calls": [
+     "session.step(skipped=False)"
+    ]
+   },
+   "expected": {
+    "records_carry": [
+     {
+      "step_skipped": false
+     }
+    ]
+   }
+  },
+  "an_update_due_and_skipped": {
+   "section": 1,
+   "status": "new",
+   "says": "The caller says an update was due and was skipped.",
+   "given": {
+    "init": {
+     "auto_step": false
+    },
+    "calls": [
+     "session.step(skipped=True)"
+    ]
+   },
+   "expected": {
+    "records_carry": [
+     {
+      "step_skipped": true
+     }
+    ]
+   }
+  },
+  "an_accumulation_microstep": {
+   "section": 1,
+   "status": "new",
+   "says": "Four forward and backward passes are accumulated into one update. The caller marks the one boundary, and the three microsteps before it end no record.",
+   "given": {
+    "init": {
+     "auto_step": false
+    },
+    "calls": [
+     "(backward)",
+     "(backward)",
+     "(backward)",
+     "(backward)",
+     "session.step(skipped=False)"
+    ]
+   },
+   "expected": {
+    "records_carry": [
+     {
+      "step_skipped": false
+     }
+    ],
+    "records": 1
+   }
+  },
+  "nothing_said_with_a_scaler": {
+   "section": 1,
+   "status": "new",
+   "says": "The argument is left out and `init` was given a loss scaler. The record carries the scaler's verdict, as today.",
+   "given": {
+    "init": {
+     "auto_step": false,
+     "scaler": "a GradScaler that skipped this step"
+    },
+    "calls": [
+     "session.step()"
+    ]
+   },
+   "expected": {
+    "records_carry": [
+     {
+      "step_skipped": true
+     }
+    ]
+   }
+  },
+  "nothing_said_without_a_scaler": {
+   "section": 1,
+   "status": "new",
+   "says": "The argument is left out and there is no scaler. The record has no such key, as today.",
+   "given": {
+    "init": {
+     "auto_step": false
+    },
+    "calls": [
+     "session.step()"
+    ]
+   },
+   "expected": {
+    "records_lack": [
+     "step_skipped"
+    ]
+   }
+  },
   "weights_unchanged_across_skipped_steps": {
    "section": 1,
    "status": "new",
@@ -996,7 +1100,8 @@
      "grad_spike"
     ],
     "kind_values": {
-     "grad_spike": "unavailable"
+     "grad_spike": "unavailable",
+     "non_finite": "checked"
     },
     "not_checked": [
      {
@@ -1094,12 +1199,15 @@
   "silent_after_capture_stopped": {
    "section": 3,
    "status": "new",
-   "says": "Rank 1's capture stopped at step 120 with a writer error, training went on, and later its heartbeats ceased. The silence is still raised, and the incident says when and why capture had stopped.",
+   "says": "Rank 1's capture stopped after step 120 with a writer error, training went on, and later its heartbeats ceased. The silence is still raised, and the incident says when and why capture had stopped.",
    "given": {
-    "rank": 1,
-    "capture_stopped": {
-     "step": 120,
-     "reason": "the writer failed: disk full"
+    "status_entry": {
+     "rank": 1,
+     "last_step": 120,
+     "capture_stopped": {
+      "reason": "sink_error",
+      "seconds": 398.0
+     }
     },
     "then": "heartbeats cease"
    },
@@ -1109,9 +1217,10 @@
     ],
     "incident_carries": {
      "capture_stopped": {
-      "step": 120,
-      "reason": "the writer failed: disk full"
-     }
+      "reason": "sink_error",
+      "seconds": 398.0
+     },
+     "capture_last_step": 120
     },
     "words": "cannot tell from this rank whether training itself stalled"
    }
@@ -1121,8 +1230,10 @@
    "status": "new",
    "says": "Rank 1's heartbeats cease while its capture was running. The incident is as today and has no such key.",
    "given": {
-    "rank": 1,
-    "capture_stopped": null,
+    "status_entry": {
+     "rank": 1,
+     "last_step": 120
+    },
     "then": "heartbeats cease"
    },
    "expected": {
@@ -1130,7 +1241,8 @@
      "rank_silent"
     ],
     "incident_lacks": [
-     "capture_stopped"
+     "capture_stopped",
+     "capture_last_step"
     ]
    }
   },

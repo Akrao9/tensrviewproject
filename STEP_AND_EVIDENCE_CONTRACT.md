@@ -8,16 +8,16 @@ Outside this page: the checkpoint-to-model check (B14), the median-and-MAD score
 
 ## 1. `session.step(skipped=...)`
 
-`session.step()` marks the end of one optimizer step under `auto_step=False`, for a framework whose stepping the hooks cannot see. It gains one argument, `skipped`, for an update that was due and did not happen. The record key is the one a loss scaler already writes, `step_skipped`, so both engines' detectors read a caller's skip as they read a scaler's.
+`session.step()` marks the end of one optimizer step under `auto_step=False`, for a framework whose stepping the hooks cannot see. It gains one argument, `skipped`, for an update that was due and did not happen. The record key is the one a loss scaler already writes, `step_skipped`, so the detectors read a caller's skip as they read a scaler's. The Python detectors' rules below were run for this page; the Rust detectors read the same column (`server/src/detect.rs`), seen by reading and not run here.
 
 **What is recorded.**
 
 | The call | What it means | `step_skipped` on the step's record |
 |---|---|---|
-| `session.step(skipped=False)` | An update was due and was applied | `false` |
-| `session.step(skipped=True)` | An update was due and was skipped | `true` |
-| No call | No update was due: an accumulation microstep is not a step | No record is ended |
-| `session.step()` | Not said | As today: the scaler's verdict when `init` was given `scaler=`, and no key otherwise |
+| `session.step(skipped=False)` | An update was due and was applied | `false` (`an_update_due_and_applied`, new) |
+| `session.step(skipped=True)` | An update was due and was skipped | `true` (`an_update_due_and_skipped`, new) |
+| No call | No update was due: an accumulation microstep is not a step | No record is ended (`an_accumulation_microstep`, new) |
+| `session.step()` | Not said | As today: the scaler's verdict when `init` was given `scaler=`, and no key otherwise (`nothing_said_with_a_scaler`, `nothing_said_without_a_scaler`, new as cases, today's behaviour) |
 
 With both a scaler and the argument, the step is skipped when either says so. `skipped` takes only `True`, `False` or nothing; anything else is refused at the call, as a wrong `lr` is, and never inside training's own step.
 
@@ -42,14 +42,14 @@ A step with `step_skipped: false`, or with no key, is judged by every kind as to
 
 ## 2. A check that is due, unread gradients, and a rank with no peer
 
-**Due.** A cross-rank comparison is due for a step once any rank has recorded its part for that step. Before that the kind reads as the ranks gave it, and a run is not degraded for a check that has not come round yet. Once a comparison is due and none was made, that must be visible: the kind reads `unavailable`, with the ranks that are missing. For replica observations this is built (lane Z2: no step entry leaves the kind as it is; a step entry with nothing compared is `unavailable` with `check: "replica_coverage"`), and the cases are `test_lane_z2_reader.py`'s. No engine changes for this.
+**Due.** A cross-rank comparison is due for a step once any rank has recorded its part for that step. Before that the kind reads as the ranks gave it, and a run is not degraded for a check that has not come round yet. Once a comparison is due and none was made, that must be visible: the kind reads `unavailable`, with the ranks that are missing. For replica observations this is built (lane Z2: no step entry leaves the kind as it is; a step entry with nothing compared is `unavailable` with `check: "replica_coverage"`). The cases that pin it are in `sdk/tests/test_lane_z2_reader.py`: `test_a_lone_rank_file_of_a_larger_group_does_not_read_as_checked`, `test_a_step_that_compared_nothing_does_not_read_as_checked` and `test_a_servers_result_with_a_rank_missing_does_not_read_as_checked`. No engine changes for this.
 
-**Unread gradients.** A parameter whose gradient could not be read is named in `grads_not_read` on a record, and the evidence has a `not_checked` entry with `check: "gradients"` naming each one, with why and the first step. What that does to each kind is decided by what the kind is judged from, and a finding on what was read always stands:
+**Unread gradients.** A parameter whose gradient could not be read is named in `grads_not_read` on a record, and the evidence has a `not_checked` entry with `check: "gradients"` naming each one, with why and the first step. What that does to each kind is decided by what the kind is judged from, and a finding on what was read always stands (it already does: run on today's Python, each of the three cases below raises its incident, and all three kinds read `unavailable`):
 
 | Kind | Judged from | With an unread gradient | Case |
 |---|---|---|---|
 | `non_finite` | Layer statistics and each gradient norm that was read | `checked`. A value that is not finite in anything that was read fires | `a_nan_layer_beside_an_unread_gradient` (new) |
-| `grad_spike` | The total gradient norm | `unavailable`, since the total leaves a parameter out. A spike in the total as read still fires | `a_spike_beside_an_unread_gradient` (new) |
+| `grad_spike` | The total gradient norm | `unavailable`, since the total leaves the unread parameter out (by `record_grads`' own account of how it reads the rest of a group; not measured here). A spike in the total as read still fires | `a_spike_beside_an_unread_gradient` (new) |
 | `stalled_weights` | Each parameter's own history | `checked` for the parameters read; an unread parameter is not judged and is named | `a_stall_beside_an_unread_gradient` (new) |
 
 The run still reads `degraded` for the `not_checked` entry, as any such entry makes it. This replaces lane Z2's call, which made all three kinds `unavailable`.
@@ -58,7 +58,7 @@ The run still reads `degraded` for the `not_checked` entry, as any such entry ma
 
 ## 3. A rank that went silent after its capture had stopped
 
-Contract 3 (v3 plan, Nov 19, 2026) has a rank whose capture stopped while training went on read `capture_stopped`, and the author kept the rule that such a rank raises `rank_silent` or `job_stalled` if its heartbeats later cease. What was missing is the link between the two. The incident keeps its kind and gains one key, `capture_stopped`, holding what the rank's status entry said when capture stopped: the step and the reason. Its text then says that capture had stopped at that step, for that reason, and that TensorQuill cannot tell from this rank whether training itself stalled. A rank whose capture never stopped gets no such key. Cases: `silent_after_capture_stopped`, `silent_with_capture_running` (new).
+Contract 3 (v3 plan, Nov 19, 2026) has a rank whose capture stopped while training went on read `capture_stopped`, and the author kept the rule that such a rank raises `rank_silent` or `job_stalled` if its heartbeats later cease. What was missing is the link between the two. The incident keeps its kind and gains two keys for such a rank: `capture_stopped`, the value of that key in the rank's status entry, unchanged (today a `reason` such as `sink_error` and `seconds`, how long ago), and `capture_last_step`, the rank's `last_step`, which is the last step stored before capture stopped. Its text then says that capture had stopped after that step, for that reason, and that TensorQuill cannot tell from this rank whether training itself stalled. A rank whose capture never stopped gets neither key. The status does not carry the step at which capture stopped apart from the last step stored; if the two can differ, saying so needs the heartbeat to carry it, which is the SDK's and is not asked for here. Cases: `silent_after_capture_stopped`, `silent_with_capture_running` (new).
 
 ## 4. A checkpoint whose model state cannot be identified
 
@@ -78,4 +78,4 @@ Contract 3 (v3 plan, Nov 19, 2026) has a rank whose capture stopped while traini
 
 - Whether `session.step(skipped=True)` on a record that also holds a gradient norm that is not finite should say so anywhere but in the skip count. Today nothing does, by the scaler's rule.
 - Whether the first step of a comparison, while its last rank's record is still on its way, should be given a short grace before the kind reads `unavailable`. Today it is visible at once and clears when the record arrives.
-- The inner shape of `capture_stopped` in a status entry is the server's as it stands; this page asks only that the incident carry it unchanged.
+- Whether the heartbeat should carry the step at which capture stopped, where it can differ from the last step stored.
