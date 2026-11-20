@@ -5200,17 +5200,36 @@ def _replica_object(result: Mapping[str, Any], tolerance: float) -> dict[str, An
     return {"v": 1, "tolerance": tolerance, **result}
 
 
+def _status_says_no_detect(status: Mapping[str, Any]) -> bool:
+    """Whether the server's status says it runs with `--no-detect`. The status has no key for it;
+    its `run_state` says it in words, on the reason for the ranks without a current report
+    (`ranks_unknown`, `watchdog.rs`), which such a server gives for every rank it has heard of.
+    A server older than `run_state`, or one with no rank yet, does not say."""
+    state = status.get("run_state")
+    reasons = state.get("reasons") if isinstance(state, Mapping) else None
+    return any(isinstance(reason, Mapping) and reason.get("code") == "ranks_unknown"
+               and "--no-detect" in str(reason.get("detail") or "") for reason in reasons or ())
+
+
 def _replica_from_status(status: Mapping[str, Any] | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """The server's cross-rank result from its status (`replica` at the top level of
     `watchdog.json`, contract 8), or why there is none: `(object, None)` or `(None, not_stated)`.
-    `(None, None)` when there is no status, which the view already says."""
+    `(None, None)` when there is no status, which the view already says.
+
+    A server with detection on writes `replica` in every status it writes, its last one when it
+    stops among them (an empty result for a run without observations). So a status without the
+    key is from a server started with `--no-detect` or from one older than the comparison
+    (contract 8: the first must not be called the second). The words say which when the status
+    says the server runs with `--no-detect` (`_status_says_no_detect`), and both otherwise."""
     if status is None:
         return None, None
     found = status.get("replica")
     if found is None:
+        why = ("the server runs with --no-detect, which writes none" if _status_says_no_detect(status)
+               else "a server started with --no-detect, or an older tensorquill-server")
         return None, {"code": "status_without_replica",
-                      "detail": "the server's status has no `replica` result (an older tensorquill-server): the ranks'"
-                                " replica observations are not compared here"}
+                      "detail": f"the server's status has no `replica` result ({why}): the ranks' replica observations"
+                                " are not compared here"}
     if (not isinstance(found, Mapping) or not isinstance(found.get("steps"), list)
             or not isinstance(found.get("replica_drift"), list) or _finite(found.get("tolerance")) is None):
         return None, {"code": "status_replica_unreadable",
@@ -5355,7 +5374,8 @@ def replica_line(evidence: Mapping[str, Any]) -> str | None:
     the steps that were not and the ranks missing from them, and the steps whose signatures
     differ (evidence, not an incident). None for evidence without a result. A status without one
     (`replica_not_stated`) gets no line: the view cannot tell whether any rank recorded an
-    observation, so the line would be on every run of an older server; the key says it."""
+    observation, so the line would be on every run of an older server or one started with
+    `--no-detect`; the key says it."""
     check = (evidence.get("kind_checks") or {}).get("replica_drift")
     if not isinstance(evidence.get("replica"), Mapping) or not isinstance(check, Mapping):
         return None
