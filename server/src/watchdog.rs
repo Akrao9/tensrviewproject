@@ -89,7 +89,8 @@
 //! clock is behind owns the rank because it was claimed later.
 //!
 //! A new owner is the job started again, seen before the new attempt stores a step: the status
-//! shows the attempt at once with `last_step` null and `attempt_without_steps`, and the rank is
+//! shows the attempt at once with `last_step` null and `attempt_without_steps`, its
+//! `seconds_since_progress` counted from that beat, and the rank is
 //! judged as one before its first step, from that beat (`starting` for `--start-seconds`, then
 //! `silent`, critical `--critical-seconds` later; `reconnecting` for that window while its stream
 //! is not open), not from the earlier attempt's last batch. The attempt's first batch ends that,
@@ -385,6 +386,11 @@ impl Progress {
         if known || reopened {
             self.attempt_since = Some(now);
             self.last_step = None;
+            // Its time since progress is its own, from now, as its verdicts are: the earlier
+            // attempt's last batch is not its progress (RS08's open part; until Nov 19, 2026 the
+            // status counted from that batch, over the whole downtime). Only the status shows it
+            // while the attempt has no batch: its first gap is measured from `attempt_since`.
+            self.last_progress = now;
             self.restarted = Some(now);
             // Only a stream that is not open yet waits for this window; one already open is
             // judged by the rules for an open stream, and a later drop by those for a drop.
@@ -1314,7 +1320,7 @@ pub fn run_status(
             if p.attempt_since.is_some() {
                 // `attempt` is a new one, seen in its heartbeats, that has stored no step: `last_step`
                 // is null (the earlier attempt's steps are not its own), and the time since progress
-                // is still the earlier attempt's.
+                // counts from when it took the rank.
                 entry["attempt_without_steps"] = json!(true);
             }
             if p.superseded_rows > 0 {
@@ -2655,6 +2661,45 @@ mod tests {
         assert_eq!(status["restart"][0]["gaps_seconds"], json!([5.0, 800.0]));
         dog.batch(&key(0), 2, Some(59), Some(1), at(t0, 1230));
         assert_eq!(rank_field(&dog, at(t0, 1231), "last_step"), 59);
+    }
+
+    /// RS08's open part. Before a new attempt's first row, `seconds_since_progress` counts from when
+    /// the attempt took the rank (its first beat), as its verdicts do, not from the earlier attempt's
+    /// last batch: the earlier attempt's progress is not the owner's (contract 1). It is kept over a
+    /// restart, as the other clocks the status shows are, and the first batch ends it. Until
+    /// Nov 19, 2026 it read 396 s one second after the claim here, and a silent new attempt's
+    /// incident said none of its ranks had sent a step for the whole downtime.
+    #[test]
+    fn a_new_attempts_time_since_progress_counts_from_when_it_took_the_rank() {
+        // config(60): floor 60 s, critical 180 s, start limit 600 s.
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, 1));
+        dog.batch(&key(0), 1, Some(99), Some(1), at(t0, 5));
+        dog.stream_ended(&key(0), false, at(t0, 6)); // killed
+        assert_eq!(rank_field(&dog, at(t0, 300), "seconds_since_progress"), json!(295.0));
+        assert!(dog.attempt_seen(&key(0), 2, at(t0, 400)));
+        dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, 400));
+        assert_eq!(rank_field(&dog, at(t0, 401), "seconds_since_progress"), json!(1.0));
+        dog.stream_opened(&key(0), at(t0, 402));
+        for second in (415..1100).step_by(15) {
+            dog.heartbeat(&key(0), "train", 15.0, Some(0), None, at(t0, second));
+        }
+        // Silent after its start limit: quiet for as long as its time since progress says.
+        let entry = &dog.statuses(at(t0, 1001), true)["run"]["ranks"][0];
+        assert_eq!(
+            (&entry["state"], &entry["seconds_since_progress"]),
+            (&json!("silent"), &json!(601.0))
+        );
+        // Kept over a restart.
+        let before = as_file(&dog.statuses(at(t0, 1001), true)["run"]);
+        let now = Instant::now();
+        let fresh = restarted(&before, 60, now);
+        assert_eq!(rank_field(&fresh, at(now, 10), "seconds_since_progress"), json!(611.0));
+        // Its first batch ends it.
+        dog.batch(&key(0), 2, Some(29), Some(1), at(t0, 1200));
+        assert_eq!(rank_field(&dog, at(t0, 1203), "seconds_since_progress"), json!(3.0));
     }
 
     #[test]
