@@ -843,29 +843,120 @@ def test_a_stop_causes_no_graph_break_and_no_recompile(toy_moe, backend):
     assert [r["step"] for r in sink.records] == [0, 1]
 
 
+STOPPED_RANK_LIMIT = 120.0  # seconds from the spawn the test waits for both ranks
+STOPPED_RANK_STACKS = 100.0  # seconds after its start a worker still running dumps every thread's stack
+
+
+def _progress(out_dir, rank, what: str) -> None:
+    """One line in `progress<rank>`: wall-clock time, pid, what the rank is about to do or has done.
+    The file is opened, appended to and closed each time, so the line is on disk whatever the
+    process does next (waits for good, or is terminated by the test). The test prints these when
+    a rank does not finish: CI job 136014937059 timed out here once with no output from either
+    rank, so nothing said where each one was."""
+    import os
+
+    with open(Path(out_dir) / f"progress{rank}", "a") as file:
+        file.write(f"{time.time():.3f} pid {os.getpid()}: {what}\n")
+
+
 def _stopped_rank_worker(rank, store_path, out_dir):
+    import faulthandler
+    import signal
+
     import torch.distributed as dist
 
+    def say(what: str) -> None:
+        _progress(out_dir, rank, what)
+
+    say("worker started")
+    # Where every thread is, written from C without the GIL (so also while blocked in gloo or the
+    # store): once on its own STOPPED_RANK_STACKS s in, and again when the test, giving up, sends
+    # SIGUSR1. faulthandler keeps the file open for as long as it needs it.
+    stacks = open(Path(out_dir) / f"stacks{rank}", "w")
+    faulthandler.dump_traceback_later(STOPPED_RANK_STACKS, file=stacks)
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, file=stacks, all_threads=True)
+    # The session's two waits on the other rank, logged on the way in and out and passed through
+    # unchanged: the agreement at init (through the store) and each drift check's gather, which a
+    # stopped rank's `_gather_and_drop` enters too and whose error it swallows.
+    box: list = []
+    real_agree, real_gather = capture._agree_on_gather, capture._spread_and_unread
+
+    def agree(*args, **kwargs):
+        say("agreement on the gather (store) entered")
+        why = real_agree(*args, **kwargs)
+        say(f"agreement on the gather returned {why!r}")
+        return why
+
+    gathers = [0]
+
+    def gather(*args, **kwargs):
+        gathers[0] += 1
+        n, session = gathers[0], (box[0] if box else None)
+        where = "" if session is None else f" at step {session._next_step}, session stopped {session._stopped}"
+        say(f"gather {n} entered{where}")
+        try:
+            out = real_gather(*args, **kwargs)
+        except BaseException as error:
+            say(f"gather {n} raised {' '.join(f'{type(error).__name__}: {error}'.split())[:300]}")
+            raise
+        say(f"gather {n} returned")
+        return out
+
+    capture._agree_on_gather, capture._spread_and_unread = agree, gather
+    say("init_process_group")
     dist.init_process_group("gloo", rank=rank, world_size=2, store=dist.FileStore(store_path, 2),
                             timeout=timedelta(seconds=60))
     try:
+        say("init_process_group returned")
         torch.manual_seed(0)
         model = nn.Linear(4, 2)
         path = Path(out_dir) / f"rank{rank}.jsonl"
         sink = FailingJsonl(path, good=1) if rank == 0 else tensorquill.JsonlSink(path)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            say("tensorquill.init")
             session = tensorquill.init(model, run_id="r1", sink=sink, every=1, replica_group=dist.group.WORLD,
                                        replica_every=2)
+            box.append(session)
+            say("tensorquill.init returned")
             optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-            for _ in range(8):
+            for i in range(8):
                 model(torch.ones(2, 4)).sum().backward()
                 optimizer.step()
                 optimizer.zero_grad()
+                say(f"step {i} done, session stopped {session._stopped}")
+            say("session.close")
             session.close()
+            say(f"session.close returned, writer_error {session.writer_error!r}")
         (Path(out_dir) / f"done{rank}").write_text(str(session.writer_error))
     finally:
+        say("destroy_process_group")
         dist.destroy_process_group()
+        say("destroy_process_group returned; the worker returns")
+
+
+def _ranks_report(context, out_dir: Path, started: float, status: list[str]) -> str:
+    """What each rank said (`_progress`), in seconds since the test spawned them, and the stacks
+    its threads were in (`_stopped_rank_worker`), after the status taken by the caller."""
+    parts = list(status)
+    for rank in range(len(context.processes)):
+        parts.append(f"--- rank {rank} progress (seconds since the spawn) ---")
+        try:
+            for line in (out_dir / f"progress{rank}").read_text().splitlines():
+                stamp, _, rest = line.partition(" ")
+                try:
+                    parts.append(f"+{float(stamp) - started:7.2f}s {rest}")
+                except ValueError:
+                    parts.append(line)
+        except OSError:
+            parts.append("(no progress file: the worker function never started)")
+        parts.append(f"--- rank {rank} stacks ---")
+        try:
+            parts.append((out_dir / f"stacks{rank}").read_text().strip() or "(none dumped)")
+        except OSError:
+            parts.append("(no stacks file)")
+    return "\n".join(parts)
 
 
 def test_a_stopped_rank_keeps_entering_the_drift_checks_gather(tmp_path):
@@ -875,17 +966,44 @@ def test_a_stopped_rank_keeps_entering_the_drift_checks_gather(tmp_path):
     dist = pytest.importorskip("torch.distributed")
     if not dist.is_available():
         pytest.skip("needs torch.distributed")
+    import os
+    import signal
+
     import torch.multiprocessing as mp
 
+    def status(context) -> list[str]:
+        return [
+            f"rank {rank}: pid {p.pid}, alive {p.is_alive()}, exit code {p.exitcode}, "
+            f"done file {'written' if (tmp_path / f'done{rank}').exists() else 'not written'}"
+            for rank, p in enumerate(context.processes)
+        ]
+
+    started = time.time()
     context = mp.start_processes(_stopped_rank_worker, args=(str(tmp_path / "store"), str(tmp_path)), nprocs=2,
                                  join=False, start_method="spawn")
-    for _ in range(240):
-        if context.join(timeout=0.5):
-            break
-    else:
+    try:
+        while not context.join(timeout=0.5):
+            if time.time() - started > STOPPED_RANK_LIMIT:
+                break
+    except Exception as error:  # a rank raised or died: its traceback, with where each rank was
+        pytest.fail(f"{error}\n{_ranks_report(context, tmp_path, started, status(context))}")
+    if not all(p.exitcode is not None for p in context.processes):
+        seen = status(context)
+        for process in context.processes:
+            if process.is_alive() and hasattr(signal, "SIGUSR1"):
+                try:
+                    os.kill(process.pid, signal.SIGUSR1)  # each thread's stack, to its stacks file
+                except OSError:
+                    pass
+        time.sleep(1.0)
+        report = _ranks_report(context, tmp_path, started, seen)
         for process in context.processes:
             process.terminate()
-        pytest.fail("a rank did not finish: it was left waiting in the all_gather")
+        pytest.fail(f"a rank had not finished {STOPPED_RANK_LIMIT:g} s after the spawn; where each rank was:\n"
+                    f"{report}")
+    for rank in (0, 1):  # both ranks entered and left every gather due, the stopped one too
+        said = (tmp_path / f"progress{rank}").read_text()
+        assert [f"gather {n} returned" in said for n in range(1, 6)] == [True] * 4 + [False], said
     assert "disk gone" in (tmp_path / "done0").read_text() and (tmp_path / "done1").read_text() == "None"
     records = [json.loads(line) for line in (tmp_path / "rank1.jsonl").read_text().splitlines()]
     assert [r["step"] for r in records] == list(range(8))
