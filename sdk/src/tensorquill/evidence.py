@@ -4090,9 +4090,19 @@ def combine_rank_evidence(
     `memory` is each rank's latest memory reading where its evidence does not carry it (a
     server report's `memory`). An evidence may carry `last_step`, which the caller knows from
     the records or the report; the run's is `{"min", "max"}` over the judged ranks.
+
+    A rank that the status shows to be judged by an earlier attempt (`_not_current_by_status`:
+    marked `attempt_without_steps`, or shown at another attempt than its evidence's report) is
+    moved to the unknown ranks, as `earlier_attempt` with why, and is in no value (L6).
     """
-    judged = sorted(per_rank)
     unknown = dict(unknown_ranks or {})
+    if status is not None:
+        earlier = _not_current_by_status(status, {
+            n: _whole_attempt((per_rank[n].get("detection") or {}).get("report_attempt")) for n in per_rank})
+        for number, why in earlier.items():
+            unknown[number] = f"{EARLIER_ATTEMPT}: {why}"
+        per_rank = {n: found for n, found in per_rank.items() if n not in earlier}
+    judged = sorted(per_rank)
     stream = ((list(status["incidents"]) if isinstance(status.get("incidents"), list) else detect_watchdog_incidents(status))
               if status is not None else [])
     looks = {n: {"report": {"incidents": [dict(i) for i in per_rank[n].get("incidents") or ()
@@ -4318,7 +4328,7 @@ def _all_ranks_evidence(
                          if isinstance(i, dict) and i.get("check") not in ("flight_recorder", "traincheck")]
             if unchecked:
                 entry["not_checked"] = unchecked
-        elif look["state"] in ("behind", "stale") and report:
+        elif look["state"] in ("behind", "stale", EARLIER_ATTEMPT) and report:
             # True when it was written and says nothing of what came after: shown as that, apart from the
             # ranks that are current, and never as the rank's incidents.
             entry["last_report"] = {
@@ -4475,6 +4485,28 @@ def _look_at_ranks(
     return folders, looks, tuple(keys)
 
 
+# The look state the all-ranks view gives a rank whose report is current with its store while
+# the server's status shows that the job was started again on it (L6, Nov 19, 2026).
+EARLIER_ATTEMPT = "earlier_attempt"
+
+
+def _earlier_attempt_looks(looks: Mapping[int, Mapping[str, Any]],
+                           status: Mapping[str, Any] | None) -> dict[int, Mapping[str, Any]]:
+    """`looks` with each current rank that the server's status says was judged by an earlier
+    attempt (`_not_current_by_status`: marked `attempt_without_steps`, or shown at another
+    attempt than its report's) read as `earlier_attempt`, with why. Such a rank is not judged:
+    it is in none of the view's values, as `run_state` calls it unknown, and its report is
+    shown as its `last_report`. Only the view's copy changes, never the watcher's memory or the
+    key it compares looks by (the status's stamp carries the flag, so it changing is news)."""
+    if status is None:
+        return dict(looks)
+    attempts = {n: _whole_attempt((look.get("report") or {}).get("attempt"))
+                for n, look in looks.items() if look["state"] == "current"}
+    found = _not_current_by_status(status, attempts)
+    return {n: ({**look, "state": EARLIER_ATTEMPT, "reason": found[n]} if n in found else look)
+            for n, look in looks.items()}
+
+
 def _all_ranks_whole(
     source: Path,
     folders: Mapping[int, Path],
@@ -4484,7 +4516,9 @@ def _all_ranks_whole(
     other_sources: Mapping[str, Any],
 ) -> dict[str, Any]:
     """The whole all-ranks evidence of one look: `_all_ranks_evidence`, how old the status is
-    when that is too old, and the run state."""
+    when that is too old, and the run state. A rank whose current report the status shows to be
+    an earlier attempt's is `earlier_attempt` here (`_earlier_attempt_looks`)."""
+    looks = _earlier_attempt_looks(looks, status)
     evidence = _all_ranks_evidence(source, folders, looks, status, **other_sources)
     if status_age is not None and "watchdog" in evidence:
         evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
