@@ -475,10 +475,13 @@ def _model_tensors(value: Mapping[Any, Any]) -> int:
     return tensors
 
 
-# The names a checkpoint gives the entry that holds a model, as whole words of its last dotted
-# part (`model`, `ema_model`, `student_model`, `net`), or `state_dict` anywhere in it
-# (Lightning's `state_dict`, `model_state_dict`).
+# The names a checkpoint gives the entry that holds a model: the last word of its last dotted
+# part is one of these (`model`, `ema_model`, `student_model`, `model_ema`, `teacher_net`), once
+# a trailing `state`, `states` or `dict` is set aside (`model_state`, `model_state_dict`), or
+# it is `state_dict` itself (Lightning's). The last word, since it says what the
+# entry is: `model_cache` and `weights_cache` are caches.
 _MODEL_WORDS = frozenset(("model", "models", "module", "modules", "net", "network", "ema", "weights"))
+_STATE_WORDS = frozenset(("state", "states", "dict"))
 # The names PyTorch's own modules give their parameters and buffers (`Linear`, `Embedding` and
 # the norms: `weight`, `bias`; `BatchNorm`: `running_*`, `num_batches_tracked`;
 # `MultiheadAttention`: `in_proj_*`, `bias_k`, `bias_v`; pruning and weight norm: `*_orig`,
@@ -492,7 +495,12 @@ _WORD_BREAKS = re.compile(r"[^a-z0-9]+")
 
 
 def _names_a_model(name: str) -> bool:
-    return "state_dict" in name or not _MODEL_WORDS.isdisjoint(_WORD_BREAKS.split(name))
+    words = [word for word in _WORD_BREAKS.split(name) if word]
+    if words == ["state", "dict"]:
+        return True
+    while words and words[-1] in _STATE_WORDS:
+        words.pop()
+    return bool(words) and words[-1] in _MODEL_WORDS
 
 
 def _parameter_path(key: Any) -> bool:

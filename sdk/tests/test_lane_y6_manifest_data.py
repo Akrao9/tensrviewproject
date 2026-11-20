@@ -214,6 +214,13 @@ def test_xc9_a_mapping_of_cached_tensors_is_not_the_model():
     assert manifest["other"] == ["embedding_cache.cached_embedding"]
 
 
+@pytest.mark.parametrize("key", ["embedding_cache", "cache", "model_cache", "weights_cache", "ema_cache", "module_cache",
+                                 "state", "dict", "cache_state_dict"])
+def test_xc9_a_cache_is_not_the_model_whatever_word_its_name_holds(key):
+    manifest = checkpoint_manifest({key: {"cached_embedding": torch.zeros(4), "cached_keys": torch.zeros(4)}})
+    assert "model" not in manifest["components"]
+
+
 def test_xc9_a_mapping_of_cached_tensors_beside_the_model_is_not_listed_as_the_model():
     model = torch.nn.Linear(2, 2)
     manifest = checkpoint_manifest({
@@ -269,6 +276,10 @@ def _compiled_keys(module: torch.nn.Module) -> dict:
     ("model", _OnlyCache().state_dict(), 1),  # named a model by its key
     ("model_state_dict", _OnlyCache().state_dict(), 1),
     ("student_model", _OnlyCache().state_dict(), 1),
+    ("model_ema", _OnlyCache().state_dict(), 1),
+    ("model_state", _OnlyCache().state_dict(), 1),
+    ("models", _OnlyCache().state_dict(), 1),
+    ("teacher_net", _OnlyCache().state_dict(), 1),
 ])
 def test_xc9_a_model_state_dict_is_still_the_model(key, state, tensors):
     manifest = checkpoint_manifest({key: state})
