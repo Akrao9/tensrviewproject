@@ -291,6 +291,13 @@ async fn run(args: Args) -> Result<(), Error> {
     if resumed > 0 {
         eprintln!("tensorquill-server: watching {resumed} unfinished runs from the last server's status");
     }
+    // The store's ID (L3), read from store.json at the store root or written there now, before any
+    // batch: every acknowledgement carries it.
+    let store_id = ingest
+        .store_id()
+        .await
+        .map_err(|error| format!("cannot read or write the store ID of {}: {error}", store_name(&store)))?;
+    eprintln!("tensorquill-server: store ID {store_id}");
     // Scripts and tests that ask for port 0 read the real address from this line.
     println!("tensorquill-server listening on {}", listener.local_addr()?);
     let flusher = ingest.spawn_flusher();

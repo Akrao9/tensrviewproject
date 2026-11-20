@@ -12,8 +12,11 @@
 //! is a new attempt and keeps the steps it writes again. Each attempt has its own directory. Kept rows wait in memory and
 //! are written as one Parquet part every 500 steps or 10 seconds, at the end of the stream,
 //! and at shutdown. Only after a part is stored does the server answer with
-//! `PutResult.app_metadata = {"end_byte_offset": N}`: everything up to byte N of the
-//! sender's file is durable. Buffered Arrow bytes across all streams are capped; a batch
+//! `PutResult.app_metadata = {"end_byte_offset": N, "store_id": "..."}`: everything up to byte N
+//! of the sender's file is durable in the store that `store_id` names (L3, from Nov 20, 2026: the ID
+//! is written once in `store.json` at the store root, kept across restarts, the same from any
+//! address that reaches the store, and new for a store wiped and made again; an older sender reads
+//! `end_byte_offset` alone, as before). Buffered Arrow bytes across all streams are capped; a batch
 //! that does not fit is refused with `RESOURCE_EXHAUSTED` and the sender retries later.
 //! A row whose run, rank, step, attempt or schema version is null, or whose `schema_version` is not
 //! 0 or 1, cannot be stored: it is dropped and counted, with a line on stderr and in the rank's
@@ -357,6 +360,9 @@ struct ReplicaRun {
 pub struct Ingest {
     storage: Storage,
     config: IngestConfig,
+    /// The store's ID (L3): read from `store.json` at the store root, or written there, at the first
+    /// need, and then held. Every acknowledgement carries it.
+    store_id: tokio::sync::OnceCell<String>,
     used: AtomicUsize,
     closed: AtomicBool,
     /// Set by `stop`: the timed flush and the status writer end after the round they are in.
@@ -435,7 +441,15 @@ impl Ingest {
             closed: AtomicBool::new(false),
             stopping: tokio::sync::watch::Sender::new(false),
             buffers: Mutex::new(HashMap::new()),
+            store_id: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// The store's ID, from `store.json` at the store root, which is written first if there is none
+    /// (L3, see `Storage::store_id`). Read once and then held: a store wiped under a running server
+    /// is not seen until the server starts again.
+    pub async fn store_id(&self) -> Result<String, crate::storage::Error> {
+        self.store_id.get_or_try_init(|| self.storage.store_id()).await.cloned()
     }
 
     /// Rows dropped since the server started because a key of theirs was null, by the key
@@ -594,6 +608,10 @@ impl Ingest {
         sender: Option<i64>,
         ack: &AckSender,
     ) -> Result<(), Status> {
+        // No batch is taken before the store's ID is known, so every acknowledgement can carry it (L3).
+        self.store_id()
+            .await
+            .map_err(|error| Status::unavailable(format!("cannot read the store's ID: {error}")))?;
         // Rows that cannot be stored are dropped before anything of the batch is placed or kept, and
         // a batch none of whose rows can be read is refused and counted (RS10).
         let (batch, dropped) = match drop_unstorable_rows(batch) {
@@ -764,8 +782,14 @@ impl Ingest {
             buffer.since = None;
         }
         if let (Some(offset), Some(ack)) = (buffer.pending_offset.take(), &buffer.ack) {
+            // `{"end_byte_offset": N, "store_id": "..."}` (L3). The ID is known: `accept` read it
+            // before it took the rows the offset covers.
+            let mut reply = serde_json::json!({"end_byte_offset": offset});
+            if let Some(id) = self.store_id.get() {
+                reply["store_id"] = serde_json::json!(id);
+            }
             let result = PutResult {
-                app_metadata: format!("{{\"end_byte_offset\":{offset}}}").into(),
+                app_metadata: reply.to_string().into(),
             };
             let _ = ack.send(Ok(result)); // the sender may be gone; it resends from its offset
         }

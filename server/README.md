@@ -37,4 +37,11 @@ which decides which attempt owns the rank after a restart). The run's `watchdog.
 whether each rank is making progress; a rank whose capture stopped while training went on
 reads `capture_stopped`, which is neither a hang nor finished.
 
+At the store root the server keeps `store.json`, which names the store with a random ID written
+once, by the first server to find none. Every acknowledgement carries it,
+`{"end_byte_offset": N, "store_id": "..."}`, so a sender can tell a store wiped and made again
+behind the same address from the one its saved offset belongs to; a restarted server, and any
+other address that reaches the same store, return the same ID. Do not copy `store.json` from one
+store to another.
+
 Licensed under either of Apache License, Version 2.0 or the MIT license, at your option.

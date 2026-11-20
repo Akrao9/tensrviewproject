@@ -1132,6 +1132,11 @@ mod store {
         /// The next this-many writes of an `incidents.json` fail (and are not stored); other writes
         /// are not touched (L17).
         pub fail_incident_puts: AtomicUsize,
+        /// Reads and writes of the store's `store.json` (L3, lane AA3, Nov 20, 2026), kept apart from
+        /// the counts and knobs above as the attempt order is: a server reads it once, and writes it
+        /// once when the store has none.
+        pub store_id_gets: AtomicUsize,
+        pub store_id_puts: AtomicUsize,
     }
 
     #[derive(Debug)]
@@ -1181,6 +1186,10 @@ mod store {
             Self: 'async_trait,
         {
             async move {
+                if location.as_ref() == "store.json" {
+                    self.knobs.store_id_puts.fetch_add(1, Ordering::SeqCst);
+                    return self.inner.put_opts(location, payload, opts).await;
+                }
                 if location.as_ref().ends_with("attempts.json") {
                     self.knobs.order_puts.fetch_add(1, Ordering::SeqCst);
                     self.wait().await;
@@ -1266,6 +1275,10 @@ mod store {
             Self: 'async_trait,
         {
             async move {
+                if location.as_ref() == "store.json" {
+                    self.knobs.store_id_gets.fetch_add(1, Ordering::SeqCst);
+                    return self.inner.get_opts(location, options).await;
+                }
                 if location.as_ref().ends_with("attempts.json") {
                     self.knobs.order_gets.fetch_add(1, Ordering::SeqCst);
                     self.wait().await;
@@ -1620,6 +1633,7 @@ async fn a_restart_costs_one_listing_and_one_footer_read_per_rank() {
     range_gets.store(0, Ordering::SeqCst);
     gets.store(0, Ordering::SeqCst);
     store.knobs.order_gets.store(0, Ordering::SeqCst);
+    store.knobs.store_id_gets.store(0, Ordering::SeqCst);
     let server = start_on(store.clone(), config, None).await;
     for rank in 0..64 {
         let mut put = open(&server, rank).await;
@@ -1636,6 +1650,9 @@ async fn a_restart_costs_one_listing_and_one_footer_read_per_rank() {
     // And one small read of each rank's `attempts.json`, which the first server wrote (contract 1):
     // the rank's order is known, so nothing is listed for it.
     assert_eq!(store.knobs.order_gets.load(Ordering::SeqCst), 64);
+    // And one read of the store's ID, which the first server wrote and this one does not (L3).
+    assert_eq!(store.knobs.store_id_gets.load(Ordering::SeqCst), 1);
+    assert_eq!(store.knobs.store_id_puts.load(Ordering::SeqCst), 1);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2297,11 +2314,17 @@ async fn a_manifest_that_cannot_be_stored_never_refuses_the_batch() {
     }
     assert_eq!(stored_manifest(dir.path()), None);
     assert_eq!(stored_steps(dir.path())[&0], (0..end).collect::<Vec<_>>());
-    let listed: Vec<_> = std::fs::read_dir(dir.path())
+    let mut listed: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert_eq!(listed, ["runs"], "nothing is written outside the run's folder");
+    listed.sort();
+    // `store.json` names the store (L3), written once at its root before the first batch is taken.
+    assert_eq!(
+        listed,
+        ["runs", "store.json"],
+        "nothing is written outside the run's folder"
+    );
 
     // The store refuses the manifest's write: the rows are stored and acknowledged all the same,
     // and the next stream's manifest is written.

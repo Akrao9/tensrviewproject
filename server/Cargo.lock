@@ -2307,6 +2307,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
+ "getrandom 0.3.4",
  "object_store",
  "parquet",
  "serde",
