@@ -32,23 +32,31 @@ The listing reads the manifest and the small evidence or report files only. It n
 Parquet part and never runs a detector, so a local run whose evidence file was never written
 is listed with its state unknown and a note saying how to write it. A local run of several
 ranks reads each rank's evidence file. Of a `.jsonl` file it
-reads the first line and the last megabyte (for the run ID, the start time, the last step and
-the ranks they name), except the files of a rank whose records are in several files, which are
-read whole, line by line (lane X5, CLI-13, Nov 19, 2026: from their first and last records
+reads the first line and the last megabyte, every whole line of it (for the run ID, the start
+time, the last step, and the ranks and attempts they name: about 8 ms a file at the rate below),
+except the files of a rank whose records are in several files, which are read whole, line by line (lane X5, CLI-13, Nov 19, 2026: from their first and last records
 alone, an attempt seen only in the middle of a file was not seen, and the order across the
 files could be wrong). That costs a JSON parse of every line, about 120 MB a second on a
 recorded capture here, and only for such a rank; what is kept is each attempt's first record in
-each file and its steps, never the records.
+each file and its steps, never the records. A file whose last megabyte shows a rank in more
+than one attempt is read whole the same way, for that rank's last step (XC4, lane
+Y3, Nov 20, 2026: a late row of an attempt that a later one replaced was taken as the last step).
+An attempt seen only in the middle of a file larger than a megabyte is still not seen there.
 
-How many ranks: a file named `<run_id>.rank<N>.jsonl` holds rank N alone when its first and
-last records are rank N's; one whose first or last record names another rank is read as a file
-with a name of its own. A file with a name of its own may hold several ranks, and only reading
+How many ranks: a file named `<run_id>.rank<N>.jsonl` holds rank N alone when its first record
+and every record of its last megabyte are rank N's; one of which a record read names another
+rank is read as a file with a name of its own (XC5, lane Y3: only the first and last records
+were read). A file of rank N alone that is larger than what is read may still hold another
+rank in its middle: its count is the manifest's `world_size`, and with none it is not known
+(`rank_count` None, with why), never a definite count that may be wrong. A file with a name of its own may hold several ranks, and only reading
 it whole would name them all, so its ranks are counted from its name, its first and last
 records and the manifest's `world_size`: when the world size equals the ranks seen, that is the
 count; otherwise `rank_count` is None (printed as the ranks seen and "+") and
 `rank_count_not_known` says why. When every file holds its rank alone and the manifest's
 `world_size` is above the files, the ranks without a file are counted and unknown, never
-clean, as a store's ranks its status expects. The evidence file beside a file of several
+clean, as a store's ranks its status expects. A `world_size` above `MAX_EXPECTED_RANKS` is not
+made into a list (XC6): the ranks without a file are a count, the row is unknown for them, and
+`rank_count` is None, with why. The evidence file beside a file of several
 ranks (its ends name two, or, for a lone file, the manifest's `world_size` is above 1) is one
 rank's and does not say which, so it is given to no rank: its incidents are listed with no
 rank, its ranks are unknown (the row is `ranks_unknown`), and what was checked is not counted
@@ -107,19 +115,47 @@ def _first_record(path: Path) -> dict[str, Any] | None:
     return found if isinstance(found, dict) else None
 
 
-def _tail_lines(path: Path) -> list[bytes]:
-    """The whole lines of a `.jsonl` file's last megabyte, last line last."""
+def _tail(path: Path) -> tuple[list[bytes], bool]:
+    """The whole lines of a `.jsonl` file's last megabyte, last line last, and whether that is
+    the whole file (no line before them is left unread)."""
     try:
         size = path.stat().st_size
         with path.open("rb") as file:
             file.seek(max(0, size - _TAIL_BYTES))
             tail = file.read()
     except OSError:
-        return []
+        return [], False
     lines = tail.split(b"\n")
     if size > _TAIL_BYTES:
         lines = lines[1:]  # the first piece starts mid-line
-    return lines[:-1]  # what follows the last newline is not finished
+    return lines[:-1], size <= _TAIL_BYTES  # what follows the last newline is not finished
+
+
+def _tail_lines(path: Path) -> list[bytes]:
+    """The whole lines of a `.jsonl` file's last megabyte, last line last."""
+    return _tail(path)[0]
+
+
+def _attempts_by_rank(tail: list[dict[str, Any]]) -> dict[int, set[Any]]:
+    """The attempts each rank's records name among the records of a file's last megabyte
+    (`tail`), as `(run, attempt)`. More than one for a rank means the file may hold a late row of
+    an attempt that a later one replaced (XC4), and the rank's last line is then not where it
+    stands. One means its last line stands: a resume whose new attempt fills the last megabyte is
+    not read again (a late row of the old attempt after it would be in the tail too)."""
+    from .evidence import _run_of
+
+    found: dict[int, set[Any]] = {}
+    for record in tail:
+        rank = _record_rank(record)
+        if rank is None:
+            continue
+        try:
+            key = (_run_of(record), record.get("attempt", 0))
+            hash(key)
+        except TypeError:  # an attempt that is not a number or a string: no reader orders it
+            continue
+        found.setdefault(rank, set()).add(key)
+    return found
 
 
 def _last_of(lines: list[bytes]) -> dict[str, Any] | None:
@@ -140,21 +176,13 @@ def _last_record(path: Path) -> dict[str, Any] | None:
     return _last_of(_tail_lines(path))
 
 
-def _steps_by_rank(lines: list[bytes]) -> dict[int, int]:
-    """Each rank's step on its last whole line among `lines` (a file's last megabyte). In a file
-    of several ranks the last line is one rank's, and another rank may be ahead of it. A rank's
-    last line is where that rank is: a resumed rank's later steps from the attempt it rolled
-    back come before it, not after."""
+def _steps_by_rank(tail: list[dict[str, Any]]) -> dict[int, int]:
+    """Each rank's step on its last record among `tail` (the records of a file's last megabyte).
+    In a file of several ranks the last line is one rank's, and another rank may be ahead of it.
+    A rank's last line is where that rank is when it has one attempt there; a rank whose
+    attempts are several is read whole (`_local_ranks`, XC4)."""
     steps: dict[int, int] = {}
-    for line in reversed(lines):
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(record, dict):
-            continue
+    for record in reversed(tail):
         rank, step = _record_rank(record), record.get("step")
         if rank is not None and rank not in steps and isinstance(step, int) and not isinstance(step, bool):
             steps[rank] = step
@@ -462,18 +490,24 @@ def _record_rank(record: Mapping[str, Any] | None) -> int | None:
 def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, given: bool = False,
                  more: Mapping[int, list[Path]] | None = None, run_id: str | None = None) -> dict[str, Any]:
     """The ranks of a local run, from what the listing reads anyway: the file names, the first
-    line and the last megabyte of each file, and the manifest's `world_size`. No file is read
-    whole to count them.
+    line and the last megabyte of each file (every whole line of it), and the manifest's
+    `world_size`. No file is read whole to count them.
 
     A file named `<run_id>.rank<N>.jsonl` holds rank N alone (`tensorquill.init` writes one
-    such file a rank), when its first and last records are rank N's; a file so named whose first
-    or last record names another rank is read as a file with a name of its own. Such a file may
-    hold several ranks: its name and its ends name some of them, and only reading it whole
-    would name them all. Its count is settled when the manifest's `world_size` equals the ranks
-    seen; otherwise it is not known, and `why` says so (the row prints it rather than a count
-    that may be wrong). When every file holds its rank alone, the ranks the manifest's
-    `world_size` counts that have no file are `missing`, as the store counts a rank its status
-    expects and that stored nothing: unknown, never clean.
+    such file a rank), when its first record and every record of its last megabyte are rank N's;
+    a file so named of which one of those names another rank is read as a file with a name of its
+    own (XC5, lane Y3, Nov 20, 2026: only the first and last records were read, so a row of
+    another rank in between was not seen). A file of a name of its own is counted from its first
+    and last records, as before. Such a file may hold several ranks: its name and what
+    was read name some of them, and only reading it whole would name them all. Its count is
+    settled when the manifest's `world_size` equals the ranks seen; otherwise it is not known,
+    and `why` says so (the row prints it rather than a count that may be wrong). A file of its
+    rank alone that is larger than the part read (`middle_not_read`) may hold another rank in
+    its middle too: its count is settled by the manifest's `world_size` and, with none, is not
+    known either. When every file holds its rank alone, the ranks the manifest's `world_size`
+    counts that have no file are `missing`, as the store counts a rank its status expects and
+    that stored nothing: unknown, never clean. A world size above `MAX_EXPECTED_RANKS` (XC6) is
+    not made into a list: the ranks without a file are a count, `beyond`, and are as unknown.
 
     With `given` (a run given as the path of one file, `discover_runs`), the other ranks' files
     were not looked for: a missing rank is one not read, and `missing_verb` says so.
@@ -481,6 +515,9 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     `held` gives each file of its own name (or misnamed) the ranks it is seen to hold, and
     `several` the files among them that hold several; `last_steps` the ranks' last steps
     (`_steps_by_rank`) of each file that holds or may hold several, where the row uses them.
+    `resolved` has, for each file whose last megabyte shows a rank in more than one attempt, that
+    rank's last step as `resolve_attempts` keeps it, the file read whole
+    (`_rank_across_files`, XC4): a late row of a replaced attempt does not move it.
 
     `more` are a rank's other files (`discover_runs`' `more_files`): read as the others are for
     the count. `split` has, for each rank in `more`, its files read whole (`_rank_across_files`):
@@ -492,29 +529,43 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     own_name: list[str] = []
     misnamed: list[str] = []
     several: list[Path] = []
+    middle_not_read: list[str] = []
     held: dict[Path, list[int]] = {}
-    tails: dict[Path, list[bytes]] = {}
+    tails: dict[Path, list[dict[str, Any]]] = {}
     read: dict[Path, tuple[dict[str, Any] | None, dict[str, Any] | None]] = {}
+    resolved: dict[Path, dict[int, int | None]] = {}
+    split_ranks = {number for number, paths in (more or {}).items() if number in files and paths}
     pairs = [*files.items(), *((number, path) for number, paths in (more or {}).items() for path in paths)]
     for number, path in pairs:
-        lines = _tail_lines(path)
+        lines, whole = _tail(path)
         read[path] = first, last = _first_record(path), _last_of(lines)  # kept: the row reads them too
+        tail = [r for r in map(_record_of, lines) if r is not None]
         ends = {r for r in (_record_rank(first), _record_rank(last)) if r is not None}
         named = _named_rank(path)
-        if named is not None and ends <= {named}:
+        # Every record read names its rank for a file named for one (XC5). A file of a name of its
+        # own is counted from its ends as before: the files never settle its count either way.
+        in_tail = {r for r in map(_record_rank, tail) if r is not None} if named is not None else set()
+        if number not in split_ranks:  # a rank's several files are read whole anyway (`split`)
+            restarted = [r for r, attempts in _attempts_by_rank(tail).items() if len(attempts) > 1]
+            if restarted:
+                resolved[path] = {r: _rank_across_files([path], r, run_id)["last_step"] for r in restarted}
+        if named is not None and (ends | in_tail) <= {named}:
             seen.add(named)
+            if not whole:
+                middle_not_read.append(path.name)
             continue
-        here = ends | {named if named is not None else number}
+        here = ends | in_tail | {named if named is not None else number}
         seen |= here
         held[path] = sorted(here)
-        tails[path] = lines
+        tails[path] = tail
         if len(here) > 1:
             several.append(path)
         if named is None:
             own_name.append(path.name)
         else:
-            misnamed.append(f"{path.name} is named for rank {named} and its first and last records name "
-                            f"{_rank_list(sorted(ends))}, so may hold other ranks")
+            by = "its first and last records name" if not ends <= {named} else "its first record and last megabyte name"
+            misnamed.append(f"{path.name} is named for rank {named} and {by} {_rank_list(sorted(ends | in_tail))}, so "
+                            "may hold other ranks")
     world = (manifest or {}).get("world_size")
     world = world if isinstance(world, int) and not isinstance(world, bool) and world > 0 else None
     unsettled = bool(own_name or misnamed)
@@ -524,32 +575,47 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
                   f"given, and {reason}")
     missing = {n: reason for n in range(world) if n not in seen} if (
         not unsettled and world is not None and world <= MAX_EXPECTED_RANKS) else {}
+    # Above the cap the ranks without a file are counted, never listed (XC6): as unknown as `missing`.
+    beyond = world - len(seen) if not unsettled and world is not None and world > MAX_EXPECTED_RANKS else 0
     # `shared`: a lone file read as one run of several ranks, for its ends or for the world size.
     # Not on which rank wrote the last line alone, which changes from one listing to the next.
     shared = len(pairs) == 1 and unsettled and (bool(several) or (world or 1) > 1)
     # Each rank's last step is read only where the row uses it: a file of several ranks in a run
-    # of several files, or a lone file read as several ranks.
-    last_steps = {path: _steps_by_rank(lines) for path, lines in tails.items() if path in several or shared}
+    # of several files, or a lone file read as several ranks. A rank seen in several attempts is
+    # where `resolve_attempts` leaves it (XC4).
+    last_steps = {path: {**_steps_by_rank(tail), **{r: s for r, s in resolved.get(path, {}).items() if s is not None}}
+                  for path, tail in tails.items() if path in several or shared}
     found: dict[str, Any] = {"ranks": sorted(seen | set(missing)), "ends": read, "held": held, "several": several,
-                             "last_steps": last_steps, "missing": missing,
+                             "last_steps": last_steps, "missing": missing, "beyond": beyond, "resolved": resolved,
                              "missing_verb": ("was not read", "were not read") if given else ("has no file", "have no file"),
                              "shared": shared,
                              "split": {number: _rank_across_files([files[number], *paths], number, run_id)
                                        for number, paths in (more or {}).items() if number in files and paths}}
+    clauses = []
     if unsettled and world != len(seen):
-        clauses = []
         if own_name:
             names = ", ".join(own_name[:4]) + (f" and {len(own_name) - 4} more" if len(own_name) > 4 else "")
             clauses.append(f"{names} {'has a name' if len(own_name) == 1 else 'have names'} of "
                            f"{'its' if len(own_name) == 1 else 'their'} own, so may hold several ranks")
         clauses += misnamed[:4] + ([f"{len(misnamed) - 4} more files are named for a rank their records do not hold alone"]
                                    if len(misnamed) > 4 else [])
+    if middle_not_read and world is None:
+        names = ", ".join(middle_not_read[:4]) + (f" and {len(middle_not_read) - 4} more" if len(middle_not_read) > 4 else "")
+        one = len(middle_not_read) == 1
+        clauses.append(f"{names} {'is' if one else 'are'} larger than the part of a file the listing reads (the first "
+                       f"line and the last megabyte), and the middle of {'it' if one else 'each'} may hold another rank")
+    if clauses:
         said = (f"the run manifest says world size {world}" if world is not None
                 else "no run manifest says the world size" if manifest is None
                 else "the run manifest does not say the world size")
-        by = "the file names and the first and last records" if len(own_name) < len(pairs) else "the first and last records"
+        by = ("the file names and their first lines and last megabytes" if len(own_name) < len(pairs)
+              else "the first lines and last megabytes")
         found["why"] = (f"{'; '.join(clauses)}; {by} name {_rank_list(sorted(seen))}, and {said}. How many ranks the run "
                         "has is not known without reading every record (python -m tensorquill compare reads them)")
+    elif beyond:
+        found["why"] = (f"the run manifest says world size {world:,}, more than the {MAX_EXPECTED_RANKS:,} ranks this "
+                        f"listing counts: {_rank_list(sorted(seen))} {'has a file' if len(seen) == 1 else 'have files'}, "
+                        f"and the other {beyond:,} are not judged")
     return found
 
 
@@ -558,7 +624,9 @@ def _holds(path: Path, known: Mapping[str, Any]) -> str:
     ranks = _rank_list(known["held"][path])
     if "why" not in known:
         return f"holds {ranks}"
-    by = "its name and its first and last records" if _named_rank(path) is not None else "its first and last records"
+    # A file named for a rank is read for the rank of every record of its last megabyte (XC5).
+    by = ("its name, its first record and its last megabyte" if _named_rank(path) is not None
+          else "its first and last records")
     return f"may hold several ranks ({by} name {ranks})"
 
 
@@ -582,15 +650,16 @@ def _local_row(run: Mapping[str, Any], known: Mapping[str, Any] | None) -> dict[
     if "why" in known:
         row["rank_count_not_known"] = known["why"]
     more = run.get("more_files") or {}
-    if len(files) > 1 or known["missing"] or more:
+    if len(files) > 1 or known["missing"] or known["beyond"] or more:
         return _local_all_ranks_row(files, row, known, more)
     rank = min(files)
     records = files[rank]
     if known["shared"]:
         return _local_shared_file_row(records, known, row)
     first, last = known["ends"][records]
-    if isinstance((last or {}).get("step"), int):
-        row["last_step"] = last["step"]
+    step = _file_step(records, last, known)
+    if step is not None:
+        row["last_step"] = step
     row["started_from_records"] = _iso((first or {}).get("ts"))
     evidence, look = _read_evidence_file(records)
     if evidence is None:
@@ -611,6 +680,17 @@ def _local_row(run: Mapping[str, Any], known: Mapping[str, Any] | None) -> dict[
     row["first_incident"] = _first(incidents)
     row["kinds_checked"] = _kinds_checked(evidence.get("kind_checks"))
     return row
+
+
+def _file_step(path: Path, last: Mapping[str, Any] | None, known: Mapping[str, Any]) -> int | None:
+    """The last step of a file that holds one rank: its last line's, unless the file shows the
+    rank in more than one attempt, and then the step `resolve_attempts` leaves it at, the file
+    read whole (`known["resolved"]`, XC4)."""
+    resolved = [s for s in (known["resolved"].get(path) or {}).values() if s is not None]
+    if resolved:
+        return max(resolved)
+    step = (last or {}).get("step")
+    return step if isinstance(step, int) and not isinstance(step, bool) else None
 
 
 def _local_shared_file_row(records: Path, known: Mapping[str, Any], row: dict[str, Any]) -> dict[str, Any]:
@@ -716,7 +796,7 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
     files, the attempts in contract 1's order across them (`known["split"]`), so an attempt that
     a later one replaced does not count (lane V4, CLI-13), and one seen only in the middle of a
     file is seen (lane X5). The files are named."""
-    from .evidence import RUN_STATES, _incident_identity, _rank_ranges, combine_rank_evidence, run_state
+    from .evidence import MAX_EXPECTED_RANKS, RUN_STATES, _incident_identity, _rank_ranges, combine_rank_evidence, run_state
 
     def ranks(numbers: list[int]) -> str:
         return f"rank{'s' if len(numbers) != 1 else ''} {_rank_ranges(numbers, 8)}"
@@ -742,8 +822,7 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
                              + (f"; {report['reason']}" if report.get("attempt_order") == "numeric" else ""))
             continue
         _, last = known["ends"][records]
-        step = (last or {}).get("step")
-        step = step if isinstance(step, int) and not isinstance(step, bool) else None
+        step = _file_step(records, last, known)
         steps += list((known["last_steps"].get(records) or {}).values()) or ([step] if step is not None else [])
         evidence, look = _read_evidence_file(records)
         looks[number] = look
@@ -781,27 +860,35 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
     if missing:
         notes.append(f"{ranks(sorted(missing))} {many if len(missing) != 1 else one}: "
                      f"{next(iter(known['missing'].values()))}, so nothing is said about incidents there")
+    beyond = known["beyond"]
+    if beyond:  # XC6: counted, never listed
+        notes.append(f"{beyond:,} more rank{'s' if beyond != 1 else ''} {many if beyond != 1 else one}: the run manifest "
+                     f"says world size {beyond + len(row['ranks']):,}, more than the {MAX_EXPECTED_RANKS:,} ranks this "
+                     "listing counts, so nothing is said about incidents there")
     if stale:
         notes.append(f"the records of {ranks(stale)} have grown since their evidence files were written; the row is as "
                      "of those files")
     shared_evidence = [evidence for _, evidence, _ in shared if evidence is not None]
     if not per_rank and not shared_evidence:
         if split and not no_evidence:  # every rank without one is in several files: no evidence file is missing
-            row["evidence"] = {"state": "ranks_unknown", "judged_ranks": 0, "unknown_ranks": len(row["ranks"]),
+            row["evidence"] = {"state": "ranks_unknown", "judged_ranks": 0, "unknown_ranks": len(row["ranks"]) + beyond,
                                "detail": "; ".join(notes)}
             return row
         detail = (f"no evidence file beside any of its {len(files)} ranks' .jsonl files: write each with python -m "
                   f"tensorquill <the rank's .jsonl file>, as for {files[min(files)].name}")
-        row["evidence"] = {"state": "missing", "judged_ranks": 0, "unknown_ranks": len(row["ranks"]),
+        row["evidence"] = {"state": "missing", "judged_ranks": 0, "unknown_ranks": len(row["ranks"]) + beyond,
                            "detail": "; ".join([detail] + notes[1 if no_evidence else 0:])}
         return row
     combined = combine_rank_evidence(per_rank, unknown_ranks=unknown)
-    state = "ranks_unknown" if unknown else "older_than_records" if stale else "current"
+    state = "ranks_unknown" if unknown or beyond else "older_than_records" if stale else "current"
     row["evidence"] = {
-        "state": state, "from": "each rank's evidence file", "judged_ranks": len(per_rank), "unknown_ranks": len(unknown),
+        "state": state, "from": "each rank's evidence file", "judged_ranks": len(per_rank),
+        "unknown_ranks": len(unknown) + beyond,
         **({"detail": "; ".join(notes)} if notes else {}),
     }
     _all_ranks_cells(row, combined)
+    if beyond:  # the ranks above the cap are in no value, as an unknown rank: the run is not healthy
+        row["run_state"] = max((row.get("run_state") or "unknown", "unknown"), key=RUN_STATES.index)
     if shared_evidence:
         groups = [g["incident"] for g in combined.get("incident_groups") or () if isinstance(g.get("incident"), Mapping)]
         counted = {_incident_identity(incident) for incident in groups}
@@ -918,7 +1005,7 @@ def run_row(run: Mapping[str, Any]) -> dict[str, Any]:
                  if files else None)
         row.update(_local_row(run, known))
         if known is not None:
-            row["end"] = _local_end(files, known["missing"], known["missing_verb"][0], known["split"])
+            row["end"] = _local_end(files, known["missing"], known["missing_verb"][0], known["split"], known["beyond"])
     else:
         row.update(_store_row(run))
     # None when the files cannot say without being read whole; `rank_count_not_known` says why.
@@ -930,26 +1017,32 @@ def run_row(run: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _local_end(files: Mapping[int, Path], missing: Mapping[int, str] | None = None,
-               verb: str = "has no file", split: Mapping[int, Mapping[str, Any]] | None = None) -> dict[str, Any]:
+               verb: str = "has no file", split: Mapping[int, Mapping[str, Any]] | None = None,
+               beyond: int = 0) -> dict[str, Any]:
     """Whether every rank's session closed its file (`sink.read_end_marker`). `closed` only when
     each file has a marker that matches it; otherwise `not_closed`, with the ranks: still running,
     killed or never closed look the same from the files. A rank the manifest's world size counts
     and that has no file, or whose file was not read (`missing`, with why), is not known to have
     closed one. A rank whose records are in several files (`split`, `_rank_across_files`) is read
     from the file its newest attempt wrote (`_newest_end`). A store's run has no such cell: the
-    server's status says how each stream ended."""
+    server's status says how each stream ended. `beyond` counts ranks above the ones a reader
+    lists (XC6): none of them is known to have closed a file, and they are a count, not a list."""
     ends = {number: _newest_end(split[number]) if number in (split or {}) else read_end_marker(path)
             for number, path in files.items()}
     closed = sorted(n for n, end in ends.items() if end["state"] == "closed")
     raised = sorted(n for n, end in ends.items() if end["state"] == "closed" and end.get("outcome") == "raised")
     other = sorted({n for n in ends if n not in closed} | set(missing or ()))
-    found: dict[str, Any] = {"state": "closed" if not other else "not_closed", "closed_ranks": closed}
+    found: dict[str, Any] = {"state": "closed" if not other and not beyond else "not_closed", "closed_ranks": closed}
     if raised:
         found["raised_ranks"] = raised
     if other:
         found["not_closed_ranks"] = other
         found["detail"] = (ends[other[0]]["detail"] if other[0] in ends
                            else f"rank {other[0]} {verb}: {(missing or {})[other[0]]}")
+    if beyond:
+        found["ranks_not_counted"] = beyond
+        found.setdefault("detail", f"the run manifest's world size counts {beyond:,} more rank{'s' if beyond != 1 else ''}"
+                                   " than this listing reads, none known to have closed a file")
     return found
 
 
