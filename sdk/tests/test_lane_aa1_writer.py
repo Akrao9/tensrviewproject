@@ -761,3 +761,200 @@ def test_l25_the_generation_is_read_only_from_one_agents_restart_count(monkeypat
     assert T._generation(2) is None  # the first start keeps today's keys
     monkeypatch.setenv("TORCHELASTIC_RESTART_COUNT", "x")
     assert T._generation(2) is None
+
+
+# =============================================================================================
+# Item 4. C12: a parameter frozen at `init` and unfrozen later is recorded from its first trainable
+# step. Lane X1's patch (`lane-x1-c12-recording.patch`), applied to today's code; its tests below,
+# its guard no longer an expected failure since L13 (lane Y2) made `update_spike` compare only the
+# parameters both records name. Before (on the commit before this item): the unfrozen parameter was never in a record.
+
+
+def _batch():
+    x = torch.randn(8, 4)
+    return x, x[:, :1] * 2
+
+
+def _two_layers():
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Linear(4, 8), nn.Tanh(), nn.Linear(8, 1))
+
+
+def _fit(model, opt, n):
+    for _ in range(n):
+        x, y = _batch()
+        opt.zero_grad()
+        (model(x) - y).pow(2).mean().backward()
+        opt.step()
+
+
+def _step_numbers(records):
+    return [r["step"] for r in records if "step" in r]
+
+
+FIRST = {"0.weight", "0.bias"}
+
+
+@pytest.mark.parametrize("every", [1, 3, 50])
+def test_c12_a_parameter_unfrozen_after_init_is_recorded_from_its_first_trainable_step(every):
+    model = _two_layers()
+    model[0].requires_grad_(False)
+    sink = tensorquill.MemorySink()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with tensorquill.init(model, sink=sink, every=every, weights=1, updates=True) as session:
+            _fit(model, opt, 2)
+            model[0].requires_grad_(True)  # a fine-tuning schedule unfreezes the first layer
+            _fit(model, opt, 4)
+    assert session.writer_error is None
+    records = sink.records
+    assert _step_numbers(records) == list(range(6))
+    for r in records[:2]:
+        assert not FIRST & (set(r["grad_norms"]) | set(r["weight_norms"]) | set(r["update_rms"])), r["step"]
+    for r in records[2:]:
+        assert FIRST <= set(r["grad_norms"]) and FIRST <= set(r["weight_norms"]), r["step"]
+        assert FIRST <= set(r["update_rms"]), r["step"]
+        assert all(r["grad_norms"][name] > 0 for name in FIRST)
+    # Its first weight check compares with nothing; the next ones see it change.
+    assert not FIRST & set(records[2]["weights_unchanged"])
+    assert all(not FIRST & set(r["weights_unchanged"]) for r in records[3:])
+    assert {"2.weight", "2.bias"} <= set(records[0]["grad_norms"])
+
+
+def test_c12_the_warning_says_once_that_the_parameter_is_recorded_from_that_step():
+    model = _two_layers()
+    model[0].weight.requires_grad_(False)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with tensorquill.init(model, sink=tensorquill.MemorySink(), every=2, weights=1):
+            _fit(model, opt, 1)
+            model[0].weight.requires_grad_(True)
+            _fit(model, opt, 4)
+    said = [str(w.message) for w in caught if "0.weight" in str(w.message)]
+    assert len(said) == 1, said
+    assert "after tensorquill.init" in said[0] and "recording" in said[0] and "from step 1" in said[0], said[0]
+
+
+def test_c12_blocks_queued_before_the_parameter_was_added_are_written_with_their_own_names():
+    # The writer decodes a block later, on its own thread: a block queued before the parameter was
+    # added is read with the names it was made with, not the newer ones.
+    model = _two_layers()
+    model[0].requires_grad_(False)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    gate = threading.Event()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        session = tensorquill.init(model, sink=sink, every=2, weights=1)
+        decode = session._decode
+
+        def gated(*args):
+            assert gate.wait(20)
+            return decode(*args)
+
+        session._decode = gated  # type: ignore[method-assign]
+        _fit(model, opt, 3)  # steps 0 and 1 queued, the writer held before decoding them
+        model[0].requires_grad_(True)
+        _fit(model, opt, 3)
+        gate.set()
+        session.close()
+    assert session.writer_error is None
+    records = sink.records
+    assert _step_numbers(records) == list(range(6))
+    assert all(not FIRST & set(r["grad_norms"]) for r in records[:3])
+    assert all(FIRST <= set(r["grad_norms"]) for r in records[3:])
+    assert records[0]["grad_norms"]["2.weight"] > 0
+
+
+def test_c12_every_parameter_frozen_at_init_then_the_head_unfrozen_records_it():
+    model = _two_layers()
+    model.requires_grad_(False)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with tensorquill.init(model, sink=sink, every=4, weights=1):
+            model[2].requires_grad_(True)
+            _fit(model, opt, 5)
+    records = sink.records
+    assert _step_numbers(records) == list(range(5))
+    assert all(set(r["grad_norms"]) == {"2.weight", "2.bias"} for r in records)
+
+
+def _without(records, names):
+    """The records as they were written before C12: `names` in none of them, and the total gradient
+    norm over the others only."""
+    import copy
+    import math
+
+    out = copy.deepcopy(records)
+    for r in out:
+        for key in ("grad_norms", "weight_norms", "update_rms", "optimizer_ownership"):
+            if isinstance(r.get(key), dict):
+                r[key] = {k: v for k, v in r[key].items() if k not in names}
+        if "weights_unchanged" in r:
+            r["weights_unchanged"] = [k for k in r["weights_unchanged"] if k not in names]
+        if r.get("grad_norms"):
+            r["grad_norm"] = math.sqrt(sum(v * v for v in r["grad_norms"].values()))
+    return out
+
+
+def _unfreeze_run(scale):
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 64), nn.Tanh(), nn.Linear(64, 1))
+    with torch.no_grad():
+        model[0].weight.mul_(scale)
+    model[0].requires_grad_(False)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    sink = tensorquill.MemorySink()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with tensorquill.init(model, run_id="c12", sink=sink, every=10, weights=5, updates=True) as session:
+            for i in range(320):
+                if i == 120:
+                    model[0].requires_grad_(True)
+                x, y = _batch()
+                opt.zero_grad()
+                loss = (model(x) - y).pow(2).mean()
+                session.log({"train/loss": loss})
+                loss.backward()
+                opt.step()
+    return sink.records
+
+
+def _kinds(incidents):
+    return sorted((i["kind"], i["step"]) for i in incidents)
+
+
+@pytest.mark.parametrize("scale", [1.0, 30.0])  # 30: the unfrozen layer then carries most of the gradient
+def test_c12_a_parameter_that_appears_mid_run_adds_no_incident_in_python(scale):
+    records = _unfreeze_run(scale)
+    assert FIRST <= set(records[120]["grad_norms"]) and not FIRST & set(records[119]["grad_norms"])
+    now = tensorquill.build_evidence(records)
+    before = tensorquill.build_evidence(_without(records, FIRST))
+    assert _kinds(now["incidents"]) == _kinds(before["incidents"])
+    assert not any(i["kind"] in {"grad_spike", "update_spike", "stalled_weights"} for i in now["incidents"])
+
+
+def _server_binary():
+    path = os.environ.get("TENSORQUILL_SERVER_BIN")
+    if path and Path(path).exists():
+        return path
+    built = Path(__file__).resolve().parents[2] / "server" / "target" / "debug" / "tensorquill-server"
+    return str(built) if built.exists() else None
+
+
+@pytest.mark.skipif(_server_binary() is None, reason="tensorquill-server is not built")
+@pytest.mark.parametrize("scale", [1.0, 30.0])
+def test_c12_a_parameter_that_appears_mid_run_adds_no_incident_in_rust(scale):
+    pytest.importorskip("pyarrow")
+    from tensorquill.server_detect import server_report
+
+    records = _unfreeze_run(scale)
+    assert FIRST <= set(records[120]["grad_norms"]) and not FIRST & set(records[119]["grad_norms"])
+    now = server_report(records, binary=_server_binary())
+    before = server_report(_without(records, FIRST), binary=_server_binary())
+    assert _kinds(now["incidents"]) == _kinds(before["incidents"])
+    assert not any(i["kind"] in {"grad_spike", "update_spike", "stalled_weights"} for i in now["incidents"])

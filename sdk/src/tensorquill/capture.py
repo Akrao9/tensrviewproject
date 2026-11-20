@@ -1318,16 +1318,22 @@ class Session:
         self.param_names = [name for name, _ in params]
         # Every parameter of the model at `init`, frozen ones included: an optimizer that holds any
         # of them is this model's (`_owns`), so one that holds only frozen parameters still ends
-        # steps (TrainCheck B1, and a model whose every parameter is frozen at `init`). The
-        # parameters recorded are still those trainable at `init` (`_say_new_trainable`).
+        # steps (TrainCheck B1, and a model whose every parameter is frozen at `init`).
         everything = list(model.named_parameters())
         self._model_param_ids = {id(p) for _, p in everything}
+        # The parameters frozen at `init`, recorded from the step on which they are trainable
+        # (C12, `_take_unfrozen`). Weakly held: one the model drops is not kept alive.
+        recorded = {id(p) for p in self._params}
+        self._frozen: list[tuple[str, weakref.ref[torch.Tensor]]] = [
+            (name, weakref.ref(p)) for name, p in everything if id(p) not in recorded
+        ]
+        self._frozen_ids = {id(p) for _, p in everything if id(p) not in recorded}  # kept whole: `_say_new_trainable`
         # The parameters the cross-GPU drift check compares (`_plan_session`).
         replicas = plan.replicas
         self._replica_params = [p for _, p in replicas]
         self.replica_names = [name for name, _ in replicas]
-        # With no trainable parameter at `init`, the model's own device, so the layer statistics of a
-        # model on a GPU are read there rather than left out (`_output_unread`). Not run on a GPU.
+        # With no trainable parameter at `init`, the model's own: one unfrozen later then has its
+        # norms read where it is, not moved to the CPU at every step.
         self.device = _buffers_device(self._params or [p for _, p in everything])
 
         selected = plan.selected
@@ -1784,6 +1790,8 @@ class Session:
                 pass
         if self._stopped:
             return  # only the step count goes on, for the drift check's schedule (`_count_stopped`)
+        if self._leading and self._frozen and (self.updates or self._grads_wanted()):
+            self._take_unfrozen()  # before this step's gradients are read; on steps that read none, nothing to record
         if self._leading and self._probe_owed:
             # Every optimizer of the previous iteration has stepped: its probe runs now.
             self._run_owed_probe()
@@ -2112,6 +2120,8 @@ class Session:
         """
         if self._closed_call("record_grads()"):
             return
+        if self._frozen:
+            self._take_unfrozen()  # called by hand (`auto_step=False`), or by a scaler's update
         n_params = len(self._params)
         if self._grads_recorded:
             self._grad.zero_()
@@ -3059,11 +3069,93 @@ class Session:
         except Exception as error:  # noqa: BLE001
             self._stop(error, f"moving a block of steps off the device raised {_short(error)}", reason="flush_error")
 
+    def _take_unfrozen(self) -> None:
+        """Start recording the parameters frozen at `init` that are trainable now (C12): from this
+        step on, each has a gradient norm, a weight check and an update size, under its own name;
+        the records before do not name it. The ring is written first (`_flush`), so every step in a
+        block has the same parameters; the new ones go at the end of the buffers, so what is kept
+        by position (the index cache, the parameters a weight check did not read exactly) stays
+        right, and their first weight check compares with nothing. Said once in a warning.
+
+        On the host, no read of a tensor: one pass over the parameters still frozen, on the lead's
+        steps that read gradients or update sizes and in `record_grads`. Measured at 0.49 µs a
+        parameter on a CPU under a load average of 157, so about 0.5 ms a step for 1,000 frozen
+        tensors there; unloaded it was not measured. Nothing for a model with none frozen. The drift
+        check across GPUs keeps the parameters chosen at `init`: each rank's observation names the
+        same parameters on every step, and an explicit gather exchanges their count first. Not in the
+        router-only mode, which records no parameter."""
+        if not (self.grad_every or self.weight_every or self.updates) or self._stopped:
+            return
+        try:
+            if not any((param := ref()) is None or param.requires_grad for _, ref in self._frozen):
+                return  # the usual step: nothing unfrozen
+            recorded = set(self.param_names)
+            new: list[tuple[str, torch.Tensor]] = []
+            still: list[tuple[str, weakref.ref[torch.Tensor]]] = []
+            for name, ref in self._frozen:
+                param = ref()
+                if param is None:
+                    continue  # dropped by the model
+                if param.requires_grad and name not in recorded:
+                    new.append((name, param))
+                else:
+                    still.append((name, ref))
+        except Exception:  # noqa: BLE001
+            return
+        self._frozen = still
+        if not new:
+            return
+        self._flush(hold_newest=False)
+        if self._stopped:
+            return
+        try:
+            self._add_params(new)
+        except Exception as error:  # noqa: BLE001
+            self._stop(error, f"adding the parameters unfrozen after init raised {_short(error)}", reason="flush_error")
+            return
+        self._new_trainable_said.update(name for name, _ in new)
+        shown = ", ".join(repr(name) for name, _ in new[:5]) + (f" and {len(new) - 5} more" if len(new) > 5 else "")
+        _warn(
+            f"TensorQuill is recording the parameter{'s' if len(new) != 1 else ''} {shown} from step "
+            f"{self._next_step}: trainable now, but frozen when the session started (unfrozen after "
+            "tensorquill.init). The records before that step do not name it, and the drift check across "
+            "GPUs compares only the parameters trainable at init.",
+            stacklevel=4,
+        )
+
+    @torch.no_grad()
+    def _add_params(self, new: list[tuple[str, torch.Tensor]]) -> None:
+        """Append `new` to the recorded parameters and widen the buffers kept per parameter, with the
+        ring empty (`_take_unfrozen`). The lists are replaced, not changed in place: a block already
+        queued keeps the names it was made with (`_decode`)."""
+        k = len(new)
+        self._params = self._params + [p for _, p in new]
+        self.param_names = self.param_names + [name for name, _ in new]
+        self._param_ids = {id(p) for p in self._params}
+        self._param_index = {id(p): index for index, p in enumerate(self._params)}
+        self._grad = torch.cat([self._grad, self._grad.new_zeros(k, self._grad.shape[1])])
+        self._ring_grad = torch.cat(
+            [self._ring_grad, self._ring_grad.new_zeros(self._ring_grad.shape[0], k, self._ring_grad.shape[2])], dim=1
+        )
+        if self.updates:
+            self._update = torch.cat([self._update, self._update.new_zeros(k, self._update.shape[1])])
+            self._ring_update = torch.cat(
+                [self._ring_update, self._ring_update.new_zeros(self._ring_update.shape[0], k, self._ring_update.shape[2])],
+                dim=1,
+            )
+        # No earlier norm to compare with: the first check of a new parameter is "not known".
+        if self._prev_weight is not None:
+            self._prev_weight = torch.cat([self._prev_weight, self._prev_weight.new_full((k,), math.nan)])
+        if self._weights_before is not None:
+            self._weights_before = torch.cat([self._weights_before, self._weights_before.new_full((k,), math.nan)])
+        self._owned = weakref.WeakKeyDictionary()  # what each optimizer holds of the recorded ones, judged again
+
     def _say_new_trainable(self) -> None:
-        """Name once, in a warning, each parameter of the model that is trainable now and was not when
-        the session started (unfrozen, added or replaced since `init`). The parameters a session
-        records are fixed at `init`, as are its buffers, so such a parameter has no gradient norm and
-        no weight check. At a flush, at most once per `WEIGHT_EVERY` steps, and at close; on the host:
+        """Name once, in a warning, each parameter of the model that is trainable now and was not part
+        of it when the session started (added or replaced since `init`): such a parameter has no
+        gradient norm and no weight check. One frozen at `init` and unfrozen later is recorded from
+        its first trainable step instead (`_take_unfrozen`), and said there. At a flush, at most once
+        per `WEIGHT_EVERY` steps, and at close; on the host:
         one pass over the model's parameters, no read of a tensor (about 0.45 ms for 600 parameter
         tensors on a CPU, so under 10 µs a step). Not in the router-only mode, which records no
         parameter."""
@@ -3075,7 +3167,8 @@ class Session:
         try:
             new = [
                 name for name, p in self._model.named_parameters()
-                if p.requires_grad and id(p) not in self._param_ids and name not in self._new_trainable_said
+                if p.requires_grad and id(p) not in self._param_ids and id(p) not in self._frozen_ids
+                and name not in self._new_trainable_said
             ]
         except Exception:  # noqa: BLE001
             return
@@ -3085,8 +3178,8 @@ class Session:
         shown = ", ".join(repr(name) for name in new[:5]) + (f" and {len(new) - 5} more" if len(new) > 5 else "")
         _warn(
             f"TensorQuill is not recording the parameter{'s' if len(new) != 1 else ''} {shown}: trainable now, "
-            "but not when the session started (unfrozen, added or replaced after tensorquill.init). A session "
-            "records the parameters that were trainable at init; to record these, close it and call "
+            "but not part of the model when the session started (added or replaced after tensorquill.init). A "
+            "session records the parameters the model had at init; to record these, close it and call "
             "tensorquill.init again.",
             stacklevel=4,
         )
@@ -3181,6 +3274,7 @@ class Session:
             steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
             spread_seen, scalars, probes, stamps, amps, data_rows, checkpoints, waits, system,
             refused, announce, updates, update_seen, update_why, grad_why, obs, obs_sig, obs_seen, scopes,
+            self.param_names,
         )
         if hold_newest:
             first = self._hold_newest(dict(zip(_BLOCK_FIELDS, block)), act_size=self._act.numel() if has_act else 0,
@@ -3231,6 +3325,7 @@ class Session:
             first[key], held[key] = (None, block[key]) if last else (block[key], {})
         first["system"], held["system"] = None, block["system"]
         first["refused"] = held["refused"] = block["refused"]
+        first["param_names"] = held["param_names"] = block["param_names"]
         self._held = {"block": held, "act_size": act_size, "dirty": set()}
         # The ring keeps the newest step as its only row, at row 0: its Python entries as they were
         # (logged tensors still on the device), and its update row on the device for a follower's.
@@ -3613,8 +3708,11 @@ class Session:
         obs_sig: torch.Tensor | None = None,
         obs_seen: list[Any] | None = None,
         scopes: list[list[int] | None] | None = None,
+        param_names: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        n, n_layers, n_params = len(steps), len(self.layer_names), len(self.param_names)
+        # The parameters the block was made with: `_take_unfrozen` may add some after it was queued.
+        names = self.param_names if param_names is None else param_names
+        n, n_layers, n_params = len(steps), len(self.layer_names), len(names)
         split = n * n_layers * (_SEEN + 1) if n_layers > 0 and floats is not None else 0
         act = (
             floats[:split].reshape(n, n_layers, _SEEN + 1).tolist()
@@ -3655,7 +3753,7 @@ class Session:
         records = []
         for i, step in enumerate(steps):
             grad_norms = (
-                {name: norm for name, (norm, seen, _, _) in zip(self.param_names, grad[i]) if seen}
+                {name: norm for name, (norm, seen, _, _) in zip(names, grad[i]) if seen}
                 if grad is not None and grad_seen[i]
                 else {}
             )
@@ -3680,7 +3778,7 @@ class Session:
             }
             if grad is not None and weight_seen[i]:
                 record["weight_norms"] = {
-                    name: row[2] for name, row in zip(self.param_names, grad[i])
+                    name: row[2] for name, row in zip(names, grad[i])
                 }
                 if isinstance(weight_seen[i], dict):
                     record["optimizer_ownership"] = weight_seen[i]["ownership"]
@@ -3691,14 +3789,14 @@ class Session:
                 # had an equal norm. What a name in the list asserts: `weights` in `init`.
                 if any(row[3] >= 0 for row in grad[i]):
                     record["weights_unchanged"] = [
-                        name for name, row in zip(self.param_names, grad[i]) if row[3] > 0
+                        name for name, row in zip(names, grad[i]) if row[3] > 0
                     ]
             if clips is not None and clip_seen[i]:
                 record["clip_grad_norm"] = math.sqrt(float(clips[i]))
             if update_rows is not None and update_seen and update_seen[i]:
                 # The RMS of the optimizer's update to each parameter it stepped (weight decay
                 # left out): the L2 norm of the update over the square root of its size.
-                record["update_rms"] = {name: rms for name, (rms, seen) in zip(self.param_names, update_rows[i]) if seen}
+                record["update_rms"] = {name: rms for name, (rms, seen) in zip(names, update_rows[i]) if seen}
             if lrs[i] is not None:
                 record["lr"] = lrs[i]
             if amps is not None and amps[i]:
@@ -3771,7 +3869,7 @@ _BLOCK_FIELDS = (
     "steps", "lrs", "floats", "counts", "spreads", "clips", "clip_seen", "grad_seen", "weight_seen",
     "spread_seen", "scalars", "probes", "stamps", "amps", "data_rows", "checkpoints", "waits", "system",
     "refused", "announce", "updates", "update_seen", "update_why", "grad_why", "obs", "obs_sig", "obs_seen",
-    "scopes",
+    "scopes", "param_names",
 )
 
 
@@ -4076,9 +4174,11 @@ def init(
             list does not say which. With no parameter compared the record has no
             `weights_unchanged`; an empty list means some were compared and none had an
             equal norm. Gradient norms and weight checks cover the
-            parameters that are trainable (`requires_grad`) when `init` runs: one unfrozen
-            later is named once in a warning and not recorded. An optimizer that holds any of
-            the model's parameters, frozen ones included, ends steps.
+            parameters that are trainable (`requires_grad`) when `init` runs, and one frozen
+            then from the first step on which it is trainable (said once in a warning; the
+            records before do not name it). One added to the model or replaced after `init`
+            is named once in a warning and not recorded. An optimizer that holds any of the
+            model's parameters, frozen ones included, ends steps.
         auto_step: count optimizer steps with PyTorch's global optimizer hooks. With a
             `torch.amp.GradScaler`, pass it as `scaler=`: the step then ends at
             `scaler.update()`, so a step the scaler skipped is counted too. Pass False and call

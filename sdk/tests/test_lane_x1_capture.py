@@ -460,10 +460,11 @@ def test_c12_every_parameter_frozen_at_init_then_the_head_unfrozen_records_every
             _train(model, opt, 5)
     records = sink.records
     assert _steps(records) == list(range(5))
-    # Not recorded (see the module's docstring), and said so once.
-    assert all(r["grad_norms"] == {} for r in records)
+    # Rewritten by lane AA1 (C12): the head unfrozen after `init` is now recorded from its first
+    # trainable step, and said so once.
+    assert all(set(r["grad_norms"]) == {"2.weight", "2.bias"} for r in records)
     said = [str(w.message) for w in caught if "'2.weight'" in str(w.message)]
-    assert len(said) == 1 and "after tensorquill.init" in said[0], said
+    assert len(said) == 1 and "after tensorquill.init" in said[0] and "recording" in said[0], said
 
 
 def test_c12_every_parameter_frozen_at_init_and_never_unfrozen_still_records_steps():
