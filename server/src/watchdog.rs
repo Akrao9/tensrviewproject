@@ -159,9 +159,26 @@ fn epoch_ms() -> i64 {
 /// instant: half a tenth (the phase's rounding) and half a thousandth (the counter's).
 const PHASE_ROUNDING: f64 = 0.051;
 
+/// A silence factor the watchdog can use (`--silent-factor`): 0, which leaves the floor alone, or a
+/// finite number above 1. At 1 or below, a rank whose floor is shorter than its own usual time
+/// between batches is called silent before its usual next batch, at every batch; a negative
+/// number or NaN leaves the floor alone, as 0 does, without saying so; and `inf` makes every rank
+/// with a cadence never silent and never critical. Until Nov 19, 2026 any number was taken (RS15's
+/// open part).
+pub fn check_silent_factor(factor: f64) -> Result<f64, String> {
+    if factor == 0.0 || (factor.is_finite() && factor > 1.0) {
+        return Ok(factor);
+    }
+    Err(format!(
+        "{factor} cannot be used: give 0 (the silence floor alone) or a finite number above 1 \
+         (at 1 or below, a rank would be called silent before its own usual time between batches)"
+    ))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct WatchdogConfig {
     pub silent_floor: Duration,
+    /// 0, or a finite number above 1: see [`check_silent_factor`], which the binary applies.
     pub silent_factor: f64,
     /// A rank quiet for longer than this is `critical`; between the threshold and this it is a `warning`.
     pub critical: Duration,

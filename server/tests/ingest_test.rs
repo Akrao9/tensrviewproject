@@ -3228,3 +3228,62 @@ fn put_schema_of_mistyped_attempt() -> Arc<Schema> {
         Field::new("step", DataType::Int64, false),
     ]))
 }
+
+/// Starts the binary with `flags`. `None` when it started (it printed the line it listens on):
+/// it is then killed. Otherwise its exit code and stderr.
+#[cfg(unix)]
+fn exit_of_the_binary_with(flags: &[&str]) -> Option<(Option<i32>, String)> {
+    use std::io::{BufRead, BufReader, Read};
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
+        .args(["--listen", "127.0.0.1:0", "--watchdog-seconds", "0"])
+        .args(flags)
+        .arg("--store")
+        .arg(dir.path())
+        .env_remove("TENSORQUILL_TOKEN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    if line.starts_with("tensorquill-server listening on") {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    Some((status.code(), stderr))
+}
+
+/// RS15's open part. A `--silent-factor` the watchdog cannot use is refused at startup, naming the
+/// flag. Until Nov 19, 2026 the server started with any number: NaN or a negative one left the
+/// floor alone, as 0 does, and `inf` made every rank with a cadence never silent, never critical.
+/// 0 (the floor alone, which the SDK's tests use) and any finite number above 1 start.
+#[cfg(unix)]
+#[test]
+fn a_silent_factor_the_watchdog_cannot_use_is_refused_at_startup() {
+    for bad in ["NaN", "inf", "-inf", "-1", "-0.5", "0.5", "1", "1e400"] {
+        let flag = format!("--silent-factor={bad}");
+        let Some((code, stderr)) = exit_of_the_binary_with(&[&flag]) else {
+            panic!("{flag}: the server started");
+        };
+        assert_eq!(code, Some(2), "{flag}: {stderr}");
+        assert!(
+            stderr.contains("--silent-factor") && !stderr.contains("panicked"),
+            "{flag}: {stderr}"
+        );
+    }
+    for good in ["0", "1.5", "5", "1000"] {
+        let flag = format!("--silent-factor={good}");
+        assert_eq!(
+            exit_of_the_binary_with(&[&flag]),
+            None,
+            "{flag}: the server did not start"
+        );
+    }
+}
