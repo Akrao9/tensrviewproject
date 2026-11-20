@@ -197,3 +197,122 @@ def test_l21_the_recorded_captures_named_for_a_rank_are_counted_as_one_rank(tmp_
         found = only_row(folder)
         assert (found["ranks"], found["rank_count"]) == ([first.get("rank", 0)], 1), path
         assert "rank_count_not_known" not in found, path
+
+
+# --- 2. L22: the rows a store run's server dropped, in `compare` ---------------------------------
+
+
+def store(source: Path, run: str, drops: dict[int, Any] | None = None, ranks: int = 2) -> Path:
+    """A run folder in a store at `source`, `ranks` ranks with current reports. `drops` puts a
+    rank's `dropped_row_keys` (a dict) on its status entry, with `dropped_rows` its total, as
+    `watchdog.rs` writes them; a value that is not a dict is written as the total alone."""
+    folder = source / "runs" / run
+    entries: list[dict[str, Any]] = [{"rank": r, "attempt": 1, "last_step": 9} for r in range(ranks)]
+    for entry in entries:
+        parts = folder / f"rank={entry['rank']}" / "attempt=1"
+        parts.mkdir(parents=True)
+        (parts / "part-00000000-00000009.parquet").write_bytes(b"")
+        (parts.parent / "incidents.json").write_text(json.dumps({
+            "schema_version": 1, "source": "tensorquill-server", "run_id": run, "rank": entry["rank"],
+            "attempt": 1, "last_step": 9, "steps": 10, "incidents": [], "checked": list(ev.SERVER_KINDS),
+            "thresholds": {"spike_sustain": ev.SPIKE_SUSTAIN},
+        }))
+        keys = (drops or {}).get(entry["rank"])
+        if isinstance(keys, dict):
+            entry["dropped_rows"] = sum(keys.values())
+            entry["dropped_row_keys"] = keys
+        elif keys is not None:
+            entry["dropped_rows"] = keys
+    (folder / "watchdog.json").write_text(json.dumps({
+        "schema_version": 1, "run_id": run, "summary": "active", "server_running": True,
+        "written_at_ms": int(time.time() * 1000), "world_size": ranks, "missing_ranks": [], "incidents": [],
+        "ranks": [{"phase": "train", "state": "active", "severity": None, "stream": "open", **e} for e in entries],
+        "pauses": {}, "recommended_silent_seconds": None,
+        # The carry state names the counts too; a reader that summed it as well would count twice.
+        "restart": [{"rank": e["rank"], "dropped_rows": e.get("dropped_row_keys", {})} for e in entries],
+    }))
+    return folder
+
+
+def without_time(result: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in result.items() if key != "written_at_ms"}
+
+
+def test_l22_compare_shows_the_rows_a_store_run_dropped_as_an_upper_bound(tmp_path):
+    """Fail before: no `dropped_rows` on the run's entry and no line in the summary."""
+    source = tmp_path / "store"
+    store(source, "base")
+    store(source, "after", {0: {"step": 2, "run_id": 1}, 1: {"step": 4}})
+    result = tensorquill.compare_runs("base", "after", source=source)
+    base, after = result["runs"]
+    assert "dropped_rows" not in base
+    dropped = after["dropped_rows"]
+    assert (dropped["rows"], dropped["by_key"], dropped["upper_bound"]) == (7, {"run_id": 1, "step": 6}, True)
+    assert dropped["ranks"] == [{"rank": 0, "rows": 3, "by_key": {"run_id": 1, "step": 2}},
+                                {"rank": 1, "rows": 4, "by_key": {"step": 4}}]
+    assert "sent again" in dropped["note"]
+    (line,) = [line for line in result["summary"].splitlines() if "dropped" in line]
+    assert line.lstrip().startswith("B: ") and "at most 7 rows" in line and "upper bound" in line
+
+
+def test_l22_compare_of_runs_that_dropped_nothing_reads_as_before(tmp_path):
+    """A control (passes before and after), and fails before through its second half: a run
+    that dropped no row has no key and no line, and a run that did differs by the key and the
+    line alone."""
+    source = tmp_path / "store"
+    for run in ("base", "after"):
+        store(source, run)
+    clean = tensorquill.compare_runs("base", "after", source=source)
+    assert all("dropped_rows" not in run for run in clean["runs"]) and "dropped" not in clean["summary"]
+    status = source / "runs" / "after" / "watchdog.json"
+    written = json.loads(status.read_text())
+    written["ranks"][1].update({"dropped_rows": 4, "dropped_row_keys": {"step": 4}})
+    status.write_text(json.dumps(written))
+    some = tensorquill.compare_runs("base", "after", source=source)
+    assert some["runs"][1]["dropped_rows"]["rows"] == 4
+    some["runs"][1].pop("dropped_rows")
+    assert [line for line in some["summary"].splitlines() if "dropped" not in line] == clean["summary"].splitlines()
+    assert {**without_time(some), "summary": None} == {**without_time(clean), "summary": None}
+
+
+def test_l22_compare_of_one_rank_shows_that_ranks_rows_alone(tmp_path):
+    """Fail before: no `dropped_rows`. With `rank=`, the entry is that rank's; a rank that
+    dropped none has no key though another rank of its run did."""
+    source = tmp_path / "store"
+    store(source, "base")
+    store(source, "after", {1: {"step": 4}, 0: {"run_id": 2}})
+    one = tensorquill.compare_runs("base", "after", source=source, rank=1)["runs"][1]["dropped_rows"]
+    assert (one["rows"], one["by_key"], one["ranks"]) == (4, {"step": 4}, [{"rank": 1, "rows": 4, "by_key": {"step": 4}}])
+    store(source, "other", {1: {"step": 4}})
+    assert "dropped_rows" not in tensorquill.compare_runs("base", "other", source=source, rank=0)["runs"][1]
+
+
+def test_l22_a_local_run_has_no_dropped_rows_in_compare(tmp_path):
+    """A control (passes before and after): local files hold every record; only a store's
+    server drops rows."""
+    for run in ("a", "b"):
+        write(tmp_path / f"{run}.rank0.jsonl", [row(step, run=run) for step in range(5)])
+    result = tensorquill.compare_runs("a", "b", source=tmp_path)
+    assert all("dropped_rows" not in run for run in result["runs"]) and "dropped" not in result["summary"]
+
+
+def test_l22_the_mcp_compare_runs_answer_has_the_count_bounded(tmp_path):
+    """Fail before: no `dropped_rows` in the answer, and the tool's description did not name it.
+    A null key usually hits every rank: the ranks are listed up to `PER_RANK_ROWS`, the rest
+    counted, through the server's own path (`call_tool`)."""
+    source = tmp_path / "store"
+    many = mcp_server.PER_RANK_ROWS + 6
+    store(source, "base")
+    store(source, "after", {r: {"step": 2} for r in range(many)}, ranks=many)
+    reply = mcp_server.call_tool(mcp_server.Source(source / "runs" / "base"), 1,
+                                 {"name": "compare_runs", "arguments": {"runs": ["base", "after"]}})
+    assert reply["result"]["isError"] is False, reply
+    answer = json.loads(reply["result"]["content"][0]["text"])
+    assert "truncated" not in answer, answer.get("truncated")
+    base, after = answer["runs"]
+    assert "dropped_rows" not in base
+    dropped = after["dropped_rows"]
+    assert (dropped["rows"], dropped["by_key"], dropped["upper_bound"]) == (2 * many, {"step": 2 * many}, True)
+    assert len(dropped["ranks"]) == mcp_server.PER_RANK_ROWS and dropped["ranks_omitted"] == 6
+    (described,) = [tool["description"] for tool in mcp_server.TOOLS if tool["name"] == "compare_runs"]
+    assert "dropped_rows" in described and "upper bound" in described
