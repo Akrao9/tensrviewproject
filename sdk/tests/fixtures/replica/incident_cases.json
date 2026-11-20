@@ -13,7 +13,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1,
@@ -59,7 +59,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1,
@@ -105,7 +105,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1,
@@ -147,7 +147,7 @@
    "expected": {
     "steps": [
      {
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1,
@@ -171,7 +171,13 @@
       "parameters": [
        "w"
       ],
-      "source": "replica"
+      "source": "replica",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1,
+       2
+      ]
      }
     ]
    }
@@ -187,7 +193,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -232,7 +238,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -273,7 +279,7 @@
    "expected": {
     "steps": [
      {
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -296,7 +302,12 @@
       "parameters": [
        "b"
       ],
-      "source": "replica"
+      "source": "replica",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
      }
     ]
    }
@@ -312,7 +323,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -357,7 +368,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -398,7 +409,7 @@
    "expected": {
     "steps": [
      {
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -421,7 +432,12 @@
       "parameters": [
        "w"
       ],
-      "source": "replica"
+      "source": "replica",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
      }
     ]
    }
@@ -437,7 +453,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -482,7 +498,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -523,7 +539,7 @@
    "expected": {
     "steps": [
      {
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -546,7 +562,12 @@
       "parameters": [
        "w"
       ],
-      "source": "replica"
+      "source": "replica",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
      }
     ]
    }
@@ -562,7 +583,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -607,7 +628,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -648,7 +669,7 @@
    "expected": {
     "steps": [
      {
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -674,7 +695,12 @@
       "parameters": [
        "b"
       ],
-      "source": "replica"
+      "source": "replica",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
      }
     ]
    }
@@ -690,7 +716,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -735,7 +761,7 @@
      "step": 99,
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -774,7 +800,7 @@
    "expected": {
     "steps": [
      {
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -798,13 +824,18 @@
       "parameters": [
        "b"
       ],
-      "source": "replica"
+      "source": "replica",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
      }
     ]
    }
   },
   "explicit_spread_and_observations_on_one_step": {
-   "says": "Both an explicit record_replica_spread() and the automatic observations at step 99, both showing drift on w. One incident, from the gathered spread.",
+   "says": "Both an explicit record_replica_spread() over the same launch and group and the automatic observations at step 99, both showing drift on w. One incident, from the gathered spread.",
    "records": [
     {
      "schema_version": 1,
@@ -824,9 +855,16 @@
        0.0
       ]
      },
+     "replica_spread_scope": {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
+     },
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -881,9 +919,16 @@
        0.0
       ]
      },
+     "replica_spread_scope": {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
+     },
      "replica": {
       "v": 1,
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
       "group": [
        0,
        1
@@ -924,7 +969,284 @@
    "expected": {
     "steps": [
      {
-      "launch": "rank0:1795000000101",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "gathered": [
+       "b",
+       "w"
+      ],
+      "fingerprints": "drift",
+      "drift_parameters": [
+       "w"
+      ],
+      "signatures": "differ",
+      "signature_parameters": [
+       "w"
+      ]
+     }
+    ],
+    "replica_drift": [
+     {
+      "step": 99,
+      "parameters": [
+       "w"
+      ],
+      "source": "replica_spread",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
+     }
+    ]
+   }
+  },
+  "explicit_spread_in_another_launch": {
+   "says": "The earlier launch gathered a clean spread at step 99. The new launch reaches step 99 and its ranks disagree on w. A gathered spread decides only its own launch's step, so the new launch's drift is raised.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "b": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "replica_spread_scope": {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
+     },
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "b": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "replica_spread_scope": {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
+     },
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000900101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "b09d7e6f5a4c4b3a8f2e1d0c9b8a7f65",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000900207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "b09d7e6f5a4c4b3a8f2e1d0c9b8a7f65",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.6,
+         -1.2,
+         0.7
+        ],
+        "sig": "999"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "gathered": [
+       "b",
+       "w"
+      ],
+      "fingerprints": "agree",
+      "signatures": "agree"
+     },
+     {
+      "launch": "b09d7e6f5a4c4b3a8f2e1d0c9b8a7f65",
       "group": [
        0,
        1
@@ -942,6 +1264,661 @@
      }
     ],
     "replica_drift": [
+     {
+      "step": 99,
+      "parameters": [
+       "w"
+      ],
+      "source": "replica",
+      "launch": "b09d7e6f5a4c4b3a8f2e1d0c9b8a7f65",
+      "group": [
+       0,
+       1
+      ]
+     }
+    ]
+   }
+  },
+  "explicit_spread_of_another_group": {
+   "says": "The job gathered a clean spread over all four ranks at step 99, and the replica group of ranks 0 and 1 disagrees on w. The gathered spread is of another group, so it does not decide this one's step.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "b": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "replica_spread_scope": {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1,
+       2,
+       3
+      ]
+     },
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "b": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "replica_spread_scope": {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1,
+       2,
+       3
+      ]
+     },
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.6,
+         -1.2,
+         0.7
+        ],
+        "sig": "999"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "drift",
+      "drift_parameters": [
+       "w"
+      ],
+      "signatures": "differ",
+      "signature_parameters": [
+       "w"
+      ]
+     }
+    ],
+    "replica_drift": [
+     {
+      "step": 99,
+      "parameters": [
+       "w"
+      ],
+      "source": "replica",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
+     }
+    ]
+   }
+  },
+  "explicit_spread_without_a_scope": {
+   "says": "A clean spread table the job computed itself and passed in, so the record cannot say which ranks or which start it covers. It keeps its own verdict and decides nothing else: the observations' drift on w is raised.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "b": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "b": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.6,
+         -1.2,
+         0.7
+        ],
+        "sig": "999"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "drift",
+      "drift_parameters": [
+       "w"
+      ],
+      "signatures": "differ",
+      "signature_parameters": [
+       "w"
+      ]
+     }
+    ],
+    "replica_drift": [
+     {
+      "step": 99,
+      "parameters": [
+       "w"
+      ],
+      "source": "replica",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
+     }
+    ]
+   }
+  },
+  "explicit_spread_covers_one_parameter": {
+   "says": "The gathered spread of the same launch and group holds w only, and is clean. The observations disagree on w and on b. The gathered spread decides w; b is raised from the observations.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "replica_spread_scope": {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
+     },
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "replica_spread_scope": {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
+     },
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.6,
+         -1.2,
+         0.7
+        ],
+        "sig": "999"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.6,
+         0.25,
+         -0.125
+        ],
+        "sig": "4243"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "gathered": [
+       "w"
+      ],
+      "fingerprints": "drift",
+      "drift_parameters": [
+       "b",
+       "w"
+      ],
+      "signatures": "differ",
+      "signature_parameters": [
+       "b",
+       "w"
+      ]
+     }
+    ],
+    "replica_drift": [
+     {
+      "step": 99,
+      "parameters": [
+       "b"
+      ],
+      "source": "replica",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
+     }
+    ]
+   }
+  },
+  "explicit_spread_without_a_scope_and_both_drift": {
+   "says": "A spread with no scope shows drift on w, and so do the observations. They cannot be shown to be the same comparison, so each is listed, with its source. The only case here with two entries.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.03,
+       0.01,
+       0.02
+      ],
+      "b": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.03,
+       0.01,
+       0.02
+      ],
+      "b": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "replica": {
+      "v": 1,
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.6,
+         -1.2,
+         0.7
+        ],
+        "sig": "999"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "drift",
+      "drift_parameters": [
+       "w"
+      ],
+      "signatures": "differ",
+      "signature_parameters": [
+       "w"
+      ]
+     }
+    ],
+    "replica_drift": [
+     {
+      "step": 99,
+      "parameters": [
+       "w"
+      ],
+      "source": "replica",
+      "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
+      "group": [
+       0,
+       1
+      ]
+     },
      {
       "step": 99,
       "parameters": [

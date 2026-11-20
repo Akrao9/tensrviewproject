@@ -1,10 +1,10 @@
 # Replica observations: the record and how it is compared
 
-Step 0 of the SDK-22 wave (Nov 20, 2026). The decision behind it is in `TensorQuill v3 — Product and Build Plan.md`, "Decision, SDK-22" and "Decision for the SDK-22 wave": the automatic drift check no longer gathers inside the training step. Each rank records what it sees; a reader that has every rank's record compares them.
+Step 0 of the SDK-22 wave (Nov 20, 2026), revised the same day after the author's review. The decision behind it is in `TensorQuill v3 — Product and Build Plan.md`, "Decision, SDK-22" and "Decision for the SDK-22 wave": the automatic drift check no longer gathers inside the training step. Each rank records what it sees; a reader that has every rank's record compares them.
 
 This page is what the writer, the Python reader, the server and the driver build against. The cases in `sdk/tests/fixtures/replica/` are its examples, and `sdk/tests/test_replica_contract.py` holds a small reference reading of the rules that every case is checked with. Where this page and a case disagree, that is a fault in one of them, to be fixed before a lane builds on either.
 
-Nothing here is built yet. No lane starts until the author releases it.
+Nothing here is built yet. The four lanes that build against this page (writer, Python reader, server, driver) do not start until the author releases them.
 
 ## 1. What a rank writes
 
@@ -13,7 +13,7 @@ On each scheduled step (`(step + 1) % replica_every == 0`, as today) a rank that
 ```json
 "replica": {
   "v": 1,
-  "launch": "rank0:1795000000101",
+  "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47",
   "group": [0, 1, 2],
   "device": "cuda",
   "projection": "name-v1",
@@ -26,29 +26,50 @@ On each scheduled step (`(step + 1) % replica_every == 0`, as today) a rank that
 }
 ```
 
-- **`launch`**: which start of the job this record belongs to (section 2). A string, or null when the rank could not learn it.
+- **`launch`**: which start of the job this record belongs to (section 2). 32 hex digits, or null when the rank could not learn it.
 - **`group`**: the global ranks of the replica group this rank expects to be compared with, itself included, sorted. For the world group that is every rank. It is what "every required rank" means to a reader.
 - **`device`**: the device type the fingerprints were computed on (`cpu`, `cuda`, `mps`).
-- **`projection`**: `"name-v1"` when the third fingerprint is recorded, null when it is not. `name-v1` seeds a parameter's projection weights from its name, not from its place in a list, so two ranks that list the same parameters in another order compute the same number.
+- **`projection`**: `"name-v1"` when the third fingerprint is recorded, null when it is not (defined below).
 - **`signature`**: the name of the signature method, or null when no signature is recorded.
-- **`params`**: one entry for each compared parameter, keyed by the parameter's name. `fp` is `[norm, sum]` or `[norm, sum, projection]` in float64. `sig` is the exact signature as a decimal string: a 64-bit number written as a JSON number loses digits in some readers. A fingerprint that is not finite is written as the string `"nan"`, `"inf"` or `"-inf"`, as layer statistics are, because the stream's encoder refuses a bare NaN.
+- **`params`**: one entry for each compared parameter, keyed by the parameter's name. `fp` is `[norm, sum]` or `[norm, sum, projection]` in float64. `sig` is the signature as a decimal string: a 64-bit number written as a JSON number loses digits in some readers. A fingerprint that is not finite is written as the string `"nan"`, `"inf"` or `"-inf"`, as layer statistics are, because the stream's encoder refuses a bare NaN.
 - **`unread`**: parameters this rank could not read, with why. A parameter is in `params` or in `unread`, never both.
 
 The key travels in `extra_json` on the stream and in Parquet, where every key without a column of its own already goes, so the stream's schema and protocol number do not change.
 
-A signature is equal on two ranks exactly when the parameter's bytes, shape and dtype are equal. Readers compare signatures for equality only, and only when both ranks name the same method.
+**`name-v1`.** A parameter's projection is the sum of its elements times fixed weights. `name-v1` takes the weights from the parameter's name, not from its place in a list, so two ranks that list the same parameters in another order compute the same number.
 
-Old records keep `replica_spread`, the spread the gather computed. A reader gives such a record the verdict it always did (section 6).
+- The seed is the first four bytes of the SHA-256 of the name, read as a big-endian unsigned 32-bit number. The name is the string that is the parameter's key in `params`, encoded as UTF-8 and not normalised. Python's `hash()` is never used: it differs from one process to the next.
+- The weight of element `i` (the tensor flattened in row-major order, a complex tensor as its real pairs) is, with every step taken modulo 2^32: `h = i·0x9E3779B1 + (seed + 1)·0x7F4A7C15`; `h = (h ^ (h >> 16))·0x85EBCA6B`; `h = (h ^ (h >> 13))·0xC2B2AE35`; `h = h ^ (h >> 16)`; weight `= h·2/2^32 − 1`. These are today's weights (`distributed._projection_weights`) with the seed changed, and that function was run with seeds up to `0xFFFFFFFF` without overflow.
+- Test vector: `"layers.0.weight"` has seed `1749384365` (`0x68457CAD`). Its first four weights are `-0.055502989795058966`, `-0.19597370875999331`, `-0.6474399706348777`, `0.46693889796733856`, and its projection of the elements `1, 2, 3, 4` is `-0.5220147273503244`.
+
+A change to any of this is a new name (`name-v2`), never a new meaning for the old one. The same holds for a signature method.
+
+**Signatures.** For one method, two different signatures of a parameter prove that its bytes, shape or dtype differ. Two equal signatures do not prove the bytes are equal: 64 bits can collide. Readers compare signatures for equality only, and only when both ranks name the same method.
+
+**What an explicit gather adds.** `record_replica_spread()` still writes `replica_spread`, the spread it gathered, as a table keyed by parameter name. When it gathered through a process group whose global ranks it could read, and the rank knows its launch, it also writes what the spread covers:
+
+```json
+"replica_spread_scope": {"launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47", "group": [0, 1, 2]}
+```
+
+The key is absent when either is unknown: a table the job computed itself and passed in, a group whose ranks could not be read, a rank with no launch, and every old record. The scope is never taken from a `replica` on the same record: the explicit call can name another group, and can fall on a step that has no observation.
+
+Old records keep `replica_spread` alone. A reader gives such a record the verdict it always did (section 6).
 
 ## 2. Which start of the job a record belongs to
 
 Each process makes its own `attempt` from its own clock, so healthy ranks of one start have different attempts. Attempts are therefore not matched between ranks. `launch` is.
 
-`launch` has one source: **rank 0's attempt**, written `"rank0:<attempt>"`. Rank 0 shares it through the process group's store, in the exchange that already shares the run ID at `init`. Rank 0 never waits; the other ranks wait as long as they do for the run ID, and no longer. A rank whose store failed, or whose wait ran out, records `launch` as null. A job of one rank uses its own attempt.
+`launch` has one source: **a nonce that rank 0's process makes once**, before its first `init` exchange: 128 bits from the operating system's entropy (`uuid.uuid4().hex`), never from a random number generator the training uses. Rank 0 shares it through the process group's store beside the run ID, under a key of its own that it sets before the run ID's. A rank that has read the run ID then looks for that key once and does not wait for it, so the exchange has no new wait, the run ID's entry keeps its two items, and a rank on an older SDK still reads the run ID. Rank 0 never waits. A rank whose store failed, whose wait for the run ID ran out, or that found no launch beside the run ID records `launch` as null. A job of one rank makes its own nonce.
 
-It has to be a value that is new at every start of the job. A launcher's restart count is not: torchrun's `TORCHELASTIC_RESTART_COUNT` is 0 on every fresh launch, so a job stopped and started again by hand under the same run ID would carry the same count twice, and the old start's rows would pair with the new one's. One source also means two ranks of one start can never disagree about which source they used.
+It has to be a value that is new at every start of the job, and two candidates are not:
 
-Two records can be compared only when they name the same run, the same `launch` (not null) and the same `group`. A reader never pairs records across launches: after a restart, an earlier launch's row at step 50 is not compared with the new launch's row at step 50.
+- **A launcher's restart count.** torchrun's `TORCHELASTIC_RESTART_COUNT` is 0 on every fresh launch, so a job stopped and started again by hand under the same run ID would carry the same count twice.
+- **Rank 0's attempt**, which the first draft of this page used. It is wall-clock milliseconds with a counter that lives in one process. A job started again where the clock is behind (another host, a clock set back) can get the same number, and the old start's rows would pair with the new one's.
+
+One source also means two ranks of one start can never disagree about which source they used.
+
+A reader's input is one run's records. Two records can be compared only when they name the same run, the same `launch` (not null) and the same `group`. A reader never pairs records across launches: after a restart, an earlier launch's row at step 50 is not compared with the new launch's row at step 50.
 
 Within one rank, when several attempts carry the same `launch` (which the SDK does not produce, but a file can hold), the newest attempt is used, by contract 1's order.
 
@@ -64,32 +85,44 @@ For one run, launch, group and step, a reader has zero or one observation from e
 | Same `projection` | The projection column is not compared; norm and sum are |
 | Same `signature` method | Signatures not compared |
 
-A parameter that is not compared is listed with its reason. It is never counted as agreeing.
+A parameter that is not compared is listed with its reason. It is never counted as agreeing. A group of one rank has no rank to be compared with, so none of its parameters is compared.
 
 ## 4. The four facts a reader reports
 
-They are separate, and a reader gives each one for each compared step.
+They are separate, and a reader gives each one for each compared step. The steps are listed by step, then the rows that name no launch, then by launch, then by group, so both engines give the same list.
 
 **Coverage.**
 - `complete`: every rank in `group` has an observation for this launch and step.
 - `insufficient`: some do not. The reader names the missing ranks. This is not a clean result and not an incident.
-- `not_established`: the records cannot say whether they belong to one start: a `launch` is null, or the ranks' groups differ. The reader says which. When some ranks of a step name a launch and one names none, both are said: the launch's step is `insufficient` without that rank, and that rank's row is `not_established`.
+- `not_established`: the records cannot say whether they belong to one start, or who is compared with whom: a `launch` is null, or two ranks of one launch and step name groups that overlap and are not the same, or a rank names a group it is not in. The reader says which. When some ranks of a step name a launch and one names none, both are said: the launch's step is `insufficient` without that rank, and that rank's row is `not_established`.
 
-Only a step with `complete` coverage can agree or drift. A lone rank's file is `insufficient` for a group of more than one rank.
+Coverage says who sent a record. It does not say anything was compared. Only a step with `complete` coverage can agree or drift, and a lone rank's file is `insufficient` for a group of more than one rank.
 
-**Fingerprints.** For each compared parameter and each fingerprint column, the spread is the largest value minus the smallest, divided by the mean of the ranks' norms (never less than `1e-12`), as `spread_from_fingerprints` computes today. `drift` when any spread is above the tolerance (`1e-6` by default), or when any rank's fingerprint is not finite; else `agree`.
+**Fingerprints.** For each compared parameter and each fingerprint column, the spread is the largest value minus the smallest, divided by the mean of the ranks' norms (never less than `1e-12`), as `spread_from_fingerprints` computes today.
+- `drift` when any spread is above the tolerance (`1e-6` by default), or when any rank's fingerprint is not finite.
+- `agree` when no spread is, and at least one parameter's fingerprints were compared.
+- `not_compared` when none was, with why: the device types differ, no parameter could be compared (every one unread, missing, or of another shape or dtype), or the group has one rank.
 
-**Signatures.** `agree` when every rank's signature of every compared parameter is equal, `differ` otherwise, with the parameters that differ. Null when not compared.
+**Signatures.**
+- `differ` when any compared parameter's signatures are not all equal, with the parameters.
+- `agree` when none differs and at least one parameter's signatures were compared. It means no difference was found, not that the bytes were proved equal.
+- `not_compared` when none was, with why: the methods differ or a rank records none, no parameter could be compared, or the group has one rank.
 
 **Attribution (D1, held).** Not part of this wave. When released it is computed from these same records: `agree`, `attributed` when a strict majority of the ranks hold one value and the others are named, `inconclusive` otherwise. Two ranks that differ are inconclusive.
 
 ## 5. What raises `replica_drift`
 
-One rule for v1: **`replica_drift` is raised when coverage is `complete` and fingerprints `drift`.** The incident names the parameters, the step and the ranks compared.
+One rule for v1: **`replica_drift` is raised when coverage is `complete` and fingerprints `drift`.** The incident names the parameters, the step, the launch and the group compared.
 
 - Fingerprints within tolerance and signatures different: the evidence says the signatures differ and names the parameters. No incident. Whether this raises on its own is decided after the eight-GPU run.
-- Coverage `insufficient` or `not_established`: no incident, and the kind does not read as checked for that step.
-- One step raises at most one `replica_drift` for a parameter. When a record also holds a `replica_spread` from an explicit `record_replica_spread()` call at the same step, that gathered spread decides the step, whether it shows drift or not, and the comparison of observations is shown as evidence only.
+- Coverage `insufficient` or `not_established`, or coverage `complete` with fingerprints `not_compared`: no incident, and the kind does not read as checked for that step.
+
+**A gathered spread beside observations.** A `replica_spread` is always judged on its own record, as in section 6, whatever else the step holds. What it decides beyond that depends on what it says it covers:
+
+- **Same run, launch, group and step** (its `replica_spread_scope` names the launch and the group of the compared step): for each parameter the gathered table holds, the gathered spread decides, whether it shows drift or not, and the comparison of observations for that parameter is shown as evidence only. A parameter the table does not hold is decided by the observations. One step raises at most one `replica_drift` for a parameter.
+- **Anything else** (another launch, another group, or no scope at all): it decides nothing but itself. The observations of that step are judged as if it were not there, so a clean spread of one launch never silences drift in another. When such a spread and the observations both show drift on one step, both are listed, each with its source: they cannot be shown to be the same comparison.
+
+Incidents are listed by step, then by source, then by launch and group.
 
 ## 6. Old captures
 
@@ -107,7 +140,7 @@ The proof for this uses a rank that is alive and training while its telemetry is
 
 ## 8. What each lane takes from this
 
-- **Writer** (`capture.py`, `distributed.py`): sections 1 and 2; no collective in a step by default; time the signature and the device synchronisation it needs, and report the record's size: with a parameter's name, shape and dtype written at every scheduled step, an observation of a few hundred parameters is tens of kilobytes (one recorded capture names 290).
+- **Writer** (`capture.py`, `distributed.py`, and `tracker.py`, where the store exchange lives): sections 1 and 2; no collective in a step by default; the scope key on an explicit gather. It defines `fold64-v1` on this page to the precision `name-v1` has, with a test vector, before it merges. It times the signature and the device synchronisation it needs, and reports the record's size: with a parameter's name, shape and dtype written at every scheduled step, an observation of a few hundred parameters is tens of kilobytes (one recorded capture names 290).
 - **Python reader** (`evidence.py`) and **server** (`detect.rs`, `ingest.rs`, `detect/data.rs`): sections 2 to 7; both pass every case in the fixtures with the same result.
 - **Driver** (`replica_check.py`): section 7's two proofs, on two and three ranks; its end-to-end results are taken on the trial merge, where the real writer and readers are together.
 
@@ -116,3 +149,4 @@ The proof for this uses a rank that is alive and training while its telemetry is
 - Whether a signature mismatch alone raises (after the eight-GPU run).
 - D1's wording and acceptance test (held by the author).
 - SDK-06: whether to record again after a second optimizer steps. Its cost is hashing, device synchronisation and record size, to be measured, not assumed free.
+- How a reader that shows one incident for a kind presents two sources on one step.
