@@ -526,6 +526,77 @@ def test_without_the_reader_the_driver_says_not_proven_never_pass():
     assert proof.evaluate(server, proof.VerdictLog(), {}, reports, LAUNCH, records, reader_found=False).code == proof.EXIT_FAIL
 
 
+def test_the_default_reader_is_lane_z2s_compare_replicas():
+    if os.environ.get(proof.READER_ENV):
+        pytest.skip(f"{proof.READER_ENV} names another reader")
+    assert proof.DEFAULT_READER == "tensorquill.evidence:compare_replicas"
+    assert proof.build_parser().parse_args([]).reader == proof.DEFAULT_READER
+
+
+def _stand_in_compare_replicas(records, *, tolerance=1e-6, attempt_order=None):
+    """Lane Z2's signature and return shape (its branch at 121a7a6), with the reference reading
+    inside: ValueError for records of more than one run, the section-8 object otherwise."""
+    if len({r.get("run_id") for r in records}) > 1:
+        raise ValueError("records of more than one run")
+    return {"v": 1, "tolerance": tolerance, **reference(list(records), tolerance)}
+
+
+def _look_with(reader, tmp_path: Path, records: list[dict]) -> proof.Observer:
+    work = tmp_path / "sim"
+    work.mkdir()
+    for rank in sorted({r["rank"] for r in records}):
+        with proof.rank_file(work, "sim", rank).open("w") as f:
+            for record in records:
+                if record["rank"] == rank:
+                    f.write(json.dumps(record) + "\n")
+    observer = proof.Observer(_plan(3), work, "sim", proof.Progress(), lambda: LAUNCH, reader)
+    observer.look()
+    return observer
+
+
+def test_the_return_shape_of_compare_replicas_is_read_as_it_is(tmp_path):
+    plan, _, reports, records = _passing()
+    legacy = [{"rank": 0, "step": 99, "drift": False}]
+    shaped = proof.read_result(lambda rs: {**_stand_in_compare_replicas(rs), "legacy": legacy}, records)
+    assert shaped["v"] == 1 and shaped["tolerance"] == 1e-6 and shaped["legacy"] == legacy
+    assert shaped["steps"] == reference(records, 1e-6)["steps"]
+    # Through the observer's look over the rank files, as the driver reads them.
+    observer = _look_with(_stand_in_compare_replicas, tmp_path, records)
+    assert observer.log.errors == []
+    expected = reference(records, 1e-6)
+    assert sorted(map(json.dumps, observer.log.as_result()["steps"])) == sorted(map(json.dumps, expected["steps"]))
+    assert len(observer.log.as_result()["replica_drift"]) == len(expected["replica_drift"]) == 3
+    log = proof.VerdictLog()
+    log.add(100.5, proof.read_result(_stand_in_compare_replicas, records))
+    assert proof.evaluate(plan, log, {}, reports, LAUNCH, records, reader_found=True).code == proof.EXIT_PASS
+
+
+def test_a_reader_that_raises_ends_in_a_stated_failure_not_a_traceback(tmp_path):
+    plan, _, reports, records = _passing()
+    # The stand-in raises on two runs' records; the driver gives it one run's lines only, so the
+    # look below uses a reader that raises on whatever it gets, with compare_replicas' message.
+    with pytest.raises(ValueError):
+        _stand_in_compare_replicas(records + [{**records[0], "run_id": "other"}])
+
+    def raising(records, *, tolerance=1e-6, attempt_order=None):
+        raise ValueError("records of more than one run")
+
+    observer = _look_with(raising, tmp_path, records)  # must not raise
+    assert observer.log.errors == ["ValueError: records of more than one run"] and observer.log.looks == 1
+    verdict = proof.evaluate(plan, observer.log, {}, reports, LAUNCH, records, reader_found=True)
+    assert verdict.code == proof.EXIT_FAIL
+    assert any("raised at 1 of 1 looks" in f and "ValueError: records of more than one run" in f
+               for f in verdict.failures), verdict.failures
+    assert any(line.startswith("FAIL the reader") for line in verdict.lines)
+    # A reader that raised once among good looks still fails, and says how often.
+    log = proof.VerdictLog()
+    log.add(100.5, proof.read_result(_stand_in_compare_replicas, records))
+    log.errors.append("ValueError: x")
+    log.looks += 1
+    assert any("raised at 1 of 2 looks" in f for f in proof.evaluate(plan, log, {}, reports, LAUNCH, records,
+                                                                    reader_found=True).failures)
+
+
 def test_the_reader_can_be_named_from_the_environment():
     script = ("import sys; sys.path.insert(0, 'examples'); import replica_proof as p;"
               " print(p.DEFAULT_READER, p.build_parser().parse_args([]).reader)")

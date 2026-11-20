@@ -35,16 +35,18 @@ from typing import Any, Callable, Iterable, Mapping
 
 # --- The reader of local rank files (lane Z2) -----------------------------------------------
 #
-# Assumed, since lane Z2's function was not named when this was written: a function in
-# `tensorquill.evidence` that takes one run's records (every rank's lines, in file order) and
-# returns the object of contract section 8 (`{"v", "tolerance", "steps", "replica_drift"}`, with
-# `legacy` when there is one), spelled as the fixtures spell it. `--reader module:function` names
+# Lane Z2's `tensorquill.evidence.compare_replicas(records, *, tolerance, attempt_order=None)`, as
+# read on its branch at 121a7a6: one run's records (`ValueError` for more than one) in, the object
+# of contract section 8 (`{"v", "tolerance", "steps", "replica_drift"}`, with `legacy` when there is
+# one) out. The driver passes every rank's lines, file by file in line order, which is each rank's
+# attempt order for one local file, so `attempt_order` is not given. A reader that raises is said
+# at the end, as a failure with its message; it is never raised into training. `--reader module:function` names
 # another, as does the environment variable below (read by the driver and by its tests alike, so a
 # renamed reader is one setting on the trial merge, not a silent skip). A result wrapped as
 # `{"replica": {...}}` is unwrapped. When the function cannot be found the run ends NOT PROVEN
 # (exit 3), never PASS.
 READER_ENV = "TENSORQUILL_REPLICA_READER"
-DEFAULT_READER = os.environ.get(READER_ENV) or "tensorquill.evidence:replica_result"
+DEFAULT_READER = os.environ.get(READER_ENV) or "tensorquill.evidence:compare_replicas"
 ACK_POLL = 0.005  # how often each rank looks at its sender's offset file (server mode)
 
 EXIT_PASS, EXIT_FAIL, EXIT_USAGE, EXIT_NOT_PROVEN = 0, 1, 2, 3
@@ -863,6 +865,11 @@ def evaluate(plan: Plan, log: VerdictLog, seen_while: Mapping[int, int], reports
     late, clock_lines = check_latency(log, plan, launch, reports)
     kinds, d1_lines = check_kinds(records, plan, launch)
     failures += late + kinds
+    if log.errors:
+        # The reader is given whole lines of one run only, so a raise is the reader's verdict on
+        # those records, not a look that came too early: it fails the check, with what it said.
+        failures.append(f"the reader {plan.reader} raised at {len(log.errors)} of {log.looks} looks; first:"
+                        f" {log.errors[0]}")
     lines += [f"  {line}" for line in clock_lines + d1_lines]
     lines += [f"  reader error at a look: {error}" for error in log.errors[:5]]
     lines += [f"FAIL {f}" for f in failures]
@@ -907,6 +914,7 @@ class Observer:
                 result = read_result(self.reader, records)
             except Exception as error:  # noqa: BLE001  said at the end, never raised into training
                 self.log.errors.append(f"{type(error).__name__}: {error}")
+                self.log.looks += 1
                 return False
             self.log.add(self.clock(), result)
         else:
