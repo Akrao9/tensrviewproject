@@ -1,0 +1,2456 @@
+{
+ "contract": "REPLICA_OBSERVATION_CONTRACT.md",
+ "tolerance": 1e-06,
+ "cases": {
+  "healthy_peers_with_distinct_attempts": {
+   "says": "Three ranks of one start, each with its own attempt number. Matched by launch, never by attempt.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 2,
+     "attempt": 1795000000350,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "agree",
+      "signatures": "agree"
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "one_rank_without_a_launch": {
+   "says": "Rank 2's wait for rank 0's launch ran out, so its row names none. The launch's step is insufficient without rank 2, and rank 2's row is said to belong to no known start.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 2,
+     "attempt": 1795000000350,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": null,
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": null,
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "step": 99,
+      "coverage": "not_established",
+      "why": "launch"
+     },
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "step": 99,
+      "coverage": "insufficient",
+      "missing": [
+       2
+      ]
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "delayed_rank_before_it_arrives": {
+   "says": "Rank 2's observation for step 99 has not arrived. Not clean, not an incident; the missing rank is named.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "step": 99,
+      "coverage": "insufficient",
+      "missing": [
+       2
+      ]
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "delayed_rank_after_it_arrives": {
+   "says": "The same step once rank 2's observation is there.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 2,
+     "attempt": 1795000000350,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "agree",
+      "signatures": "agree"
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "rank_that_never_reports": {
+   "says": "Rank 2 trains but its telemetry never arrives, on two scheduled steps. Each stays insufficient and says so.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 199,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 199,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "step": 99,
+      "coverage": "insufficient",
+      "missing": [
+       2
+      ]
+     },
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "step": 199,
+      "coverage": "insufficient",
+      "missing": [
+       2
+      ]
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "lone_rank_file": {
+   "says": "One rank's file of a three-rank group.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "step": 99,
+      "coverage": "insufficient",
+      "missing": [
+       1,
+       2
+      ]
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "stale_rows_after_a_restart": {
+   "says": "The job was started again under the same run ID, by its launcher or by hand (a launcher's restart count would be 0 both times; rank 0's attempt is not). The earlier launch reached step 99 on both ranks; the new one has reached it on rank 0 only, with other weights. The new launch's step is insufficient; rank 0's new row is never paired with rank 1's old one.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000900101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000900101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.75,
+         -1.5,
+         0.5
+        ],
+        "sig": "77"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "agree",
+      "signatures": "agree"
+     },
+     {
+      "launch": "rank0:1795000900101",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "insufficient",
+      "missing": [
+       1
+      ]
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "launch_not_known": {
+   "says": "The store failed, so no rank knows the launch. The reader cannot say these rows belong to one start, and says that.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": null,
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": null,
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": null,
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "not_established",
+      "why": "launch"
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "subgroups": {
+   "says": "Four ranks in two replica groups with different weights. Each group is compared within itself only.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 2,
+     "attempt": 1795000000350,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       2,
+       3
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         9.0,
+         2.0,
+         1.0
+        ],
+        "sig": "5"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 3,
+     "attempt": 1795000000361,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       2,
+       3
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         9.0,
+         2.0,
+         1.0
+        ],
+        "sig": "5"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "agree",
+      "signatures": "agree"
+     },
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       2,
+       3
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "agree",
+      "signatures": "agree"
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "reordered_parameters": {
+   "says": "Rank 1 lists the same parameters in another order. Identity is the name, and name-v1 projections do not depend on order.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       },
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "agree",
+      "signatures": "agree"
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "signature_only_disagreement": {
+   "says": "Fingerprints within the tolerance, signatures different on w. Reported as evidence; no incident under the v1 rule.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "123456789"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "agree",
+      "signatures": "differ",
+      "signature_parameters": [
+       "w"
+      ]
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "within_tolerance": {
+   "says": "A difference of 1e-9 of the norm on w: below the 1e-6 tolerance.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5000000035,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "agree",
+      "signatures": "agree"
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "unread_on_one_rank": {
+   "says": "Rank 1 could not read b. It is not compared, with why; w is.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       }
+      },
+      "unread": {
+       "b": "on meta"
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "not_compared": {
+       "b": "unread"
+      },
+      "fingerprints": "agree",
+      "signatures": "agree"
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "different_device_types": {
+   "says": "One rank on cuda, one on cpu: fingerprints are not compared, and that is said. Signatures are.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cpu",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "not_compared",
+      "why": "device",
+      "signatures": "agree"
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "drift_with_a_rank_missing": {
+   "says": "Ranks 0 and 1 disagree, and rank 2 has not reported. Coverage is insufficient, so nothing is raised yet.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.6,
+         -1.2,
+         0.7
+        ],
+        "sig": "999"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "step": 99,
+      "coverage": "insufficient",
+      "missing": [
+       2
+      ]
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "groups_differ": {
+   "says": "Rank 0 expects a group of two and rank 1 a group of three under one launch: the reader cannot establish who is compared with whom.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1,
+       2
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.6,
+         -1.2,
+         0.7
+        ],
+        "sig": "999"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": null,
+      "step": 99,
+      "coverage": "not_established",
+      "why": "group"
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "explicit_spread_clean_and_observations_drift": {
+   "says": "An explicit record_replica_spread() at step 99 gathered a clean spread, and the observations of the same step disagree on w. The gathered spread decides the step: no incident, and the observations' drift is shown as evidence.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "b": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "b": [
+       0.0,
+       0.0,
+       0.0
+      ]
+     },
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.6,
+         -1.2,
+         0.7
+        ],
+        "sig": "999"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.5,
+         0.25,
+         -0.125
+        ],
+        "sig": "1152921504606846977"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "drift",
+      "drift_parameters": [
+       "w"
+      ],
+      "signatures": "differ",
+      "signature_parameters": [
+       "w"
+      ]
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "zero_norm_parameter": {
+   "says": "A parameter of all zeros on both ranks: the spread's scale is the mean norm, never below 1e-12, so equal zeros agree.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 1795000000101,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.0,
+         0.0,
+         0.0
+        ],
+        "sig": "7"
+       }
+      }
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 1,
+     "attempt": 1795000000207,
+     "step": 99,
+     "replica": {
+      "v": 1,
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "device": "cuda",
+      "projection": "name-v1",
+      "signature": "fold64-v1",
+      "params": {
+       "w": {
+        "shape": [
+         8,
+         4
+        ],
+        "dtype": "float32",
+        "fp": [
+         3.5,
+         -1.25,
+         0.75
+        ],
+        "sig": "-4611686018427387904"
+       },
+       "b": {
+        "shape": [
+         8
+        ],
+        "dtype": "float32",
+        "fp": [
+         0.0,
+         0.0,
+         0.0
+        ],
+        "sig": "7"
+       }
+      }
+     }
+    }
+   ],
+   "expected": {
+    "steps": [
+     {
+      "launch": "rank0:1795000000101",
+      "group": [
+       0,
+       1
+      ],
+      "step": 99,
+      "coverage": "complete",
+      "fingerprints": "agree",
+      "signatures": "agree"
+     }
+    ],
+    "replica_drift": []
+   }
+  },
+  "legacy_replica_spread_below_tolerance": {
+   "says": "A record from before this format: the gathered spread, judged as it always was.",
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "r1",
+     "rank": 0,
+     "attempt": 0,
+     "step": 99,
+     "replica_spread": {
+      "w": [
+       0.0,
+       0.0,
+       0.0
+      ],
+      "b": [
+       1e-09,
+       0.0,
+       0.0
+      ]
+     }
+    }
+   ],
+   "expected": {
+    "steps": [],
+    "legacy": [
+     {
+      "rank": 0,
+      "step": 99,
+      "drift": false
+     }
+    ],
+    "replica_drift": []
+   }
+  }
+ }
+}
