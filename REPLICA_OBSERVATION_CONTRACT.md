@@ -4,7 +4,7 @@ Step 0 of the SDK-22 wave (Nov 20, 2026), revised the same day after the author'
 
 This page is what the writer, the Python reader, the server and the driver build against. The cases in `sdk/tests/fixtures/replica/` are its examples, and `sdk/tests/test_replica_contract.py` holds a small reference reading of the rules that every case is checked with. Where this page and a case disagree, that is a fault in one of them, to be fixed before a lane builds on either.
 
-The author released the four lanes that build against this page on Nov 20, 2026 ("Release lanes 1–4"): Z1 the writer, Z2 the Python reader, Z3 the server, Z4 the driver. Until they merge, nothing reads or writes the keys below.
+The author released the four lanes that build against this page on Nov 20, 2026 ("Release lanes 1–4"): Z1 the writer, Z2 the Python reader, Z3 the server, Z4 the driver. The four were merged into `main` on Nov 20, 2026 (at `8c45fb8`), with lanes Z5 and Z6: the writer, both readers and the driver now use the keys below.
 
 ## 1. What a rank writes
 
