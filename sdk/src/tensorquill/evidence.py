@@ -5212,10 +5212,10 @@ def _replica_from_status(status: Mapping[str, Any] | None) -> tuple[dict[str, An
                       "detail": "the server's status has no `replica` result (an older tensorquill-server): the ranks'"
                                 " replica observations are not compared here"}
     if (not isinstance(found, Mapping) or not isinstance(found.get("steps"), list)
-            or not isinstance(found.get("replica_drift"), list)):
+            or not isinstance(found.get("replica_drift"), list) or _finite(found.get("tolerance")) is None):
         return None, {"code": "status_replica_unreadable",
                       "detail": "the server's status has a `replica` value without the `steps` and `replica_drift`"
-                                " lists: the ranks' replica observations are not compared here"}
+                                " lists and a finite `tolerance`: the ranks' replica observations are not compared here"}
     return dict(found), None
 
 
@@ -5238,6 +5238,7 @@ def _replica_gap(entry: Mapping[str, Any]) -> dict[str, Any]:
 
 def replica_kind_check(
     check: Mapping[str, Any], replica: Mapping[str, Any], *, all_ranks: bool, records: int | None = None,
+    held_ranks: Iterable[int] = (),
 ) -> dict[str, Any]:
     """The `replica_drift` entry of `kind_checks` where replica observations were read: `check` is
     the entry counted from gathered spreads (`kind_checks`, or a server's report), `replica` the
@@ -5251,19 +5252,27 @@ def replica_kind_check(
     ranks missing from any of them under `missing_ranks`. With no step compared and no spread,
     one rank's evidence calls the kind `not_configured` (a comparison across ranks, as the two
     other cross-rank kinds are there), and an all-ranks view `unavailable`, with
-    `check: "replica_coverage"` and the reason. `signatures_differ` lists the steps where
-    signatures differ: evidence only, which raises nothing (contract 5). `records` is how many
-    records carried an observation or a spread."""
+    `check: "replica_coverage"` and the reason; but a run whose every step entry is a group of
+    one rank is `not_configured` in either, as one rank alone is for the other cross-rank kinds
+    (`_cross_rank_check`). A result with no step entry at all (a run without observations, or
+    before its first scheduled step) leaves `check` as it is. `signatures_differ` lists the steps
+    where signatures differ: evidence only, which raises nothing (contract 5). `records` is how
+    many records carried an observation or a spread; `held_ranks`, the ranks of a file that one
+    rank's evidence was picked from (`ranks_in_source`), lets `detail` tell a rank left out of
+    the evidence from one that sent nothing."""
     steps = [entry for entry in replica.get("steps") or () if isinstance(entry, Mapping)]
+    if not steps:
+        return dict(check)
     compared = [entry for entry in steps if _replica_step_compared(entry)]
     gaps = [_replica_gap(entry) for entry in steps if not _replica_step_compared(entry)]
     missing = sorted({rank for gap in gaps for rank in gap.get("missing") or ()})
     differ = [{"step": e.get("step"), "launch": e.get("launch"), "group": e.get("group"),
                "parameters": list(e.get("signature_parameters") or ())} for e in steps if e.get("signatures") == "differ"]
+    alone = all(gap.get("fingerprints_why") == "one_rank" for gap in gaps)
     if compared or check.get("value") == "checked":
         value = "checked"
     else:
-        value = "unavailable" if all_ranks else "not_configured"
+        value = "unavailable" if all_ranks and not alone else "not_configured"
     held = gaps[-REPLICA_NOT_COMPARED_LISTED:]
     coverage = {
         "steps": len(steps), "compared": len(compared),
@@ -5272,10 +5281,14 @@ def replica_kind_check(
         **({"not_compared_omitted": len(gaps) - len(held)} if len(gaps) > len(held) else {}),
     }
     if not all_ranks and value != "checked":
+        held = set(held_ranks)
+        left, absent = [r for r in missing if r in held], [r for r in missing if r not in held]
         coverage["detail"] = (
             "one rank's records: the ranks' replica observations are compared across ranks, in the all-ranks view"
-            + (f"; no observation of rank{'s' if len(missing) != 1 else ''} {_rank_ranges(missing, 8)} is in the"
-               " records read" if missing else ""))
+            + (f"; rank{'s' if len(left) != 1 else ''} {_rank_ranges(left, 8)} {'are' if len(left) != 1 else 'is'} in"
+               " the source and not judged in this rank's evidence" if left else "")
+            + (f"; no observation of rank{'s' if len(absent) != 1 else ''} {_rank_ranges(absent, 8)} is in the"
+               " records read" if absent else ""))
     out: dict[str, Any] = {
         "value": value,
         **({"records": records} if records is not None else
@@ -5346,7 +5359,9 @@ def replica_line(evidence: Mapping[str, Any]) -> str | None:
     check = (evidence.get("kind_checks") or {}).get("replica_drift")
     if not isinstance(evidence.get("replica"), Mapping) or not isinstance(check, Mapping):
         return None
-    coverage = check.get("coverage") or {}
+    coverage = check.get("coverage")
+    if not isinstance(coverage, Mapping):  # a result with no step entry yet
+        return None
     line = f"Replica observations: {coverage.get('compared', 0)} of {coverage.get('steps', 0)} step entries compared"
     gaps = coverage.get("not_compared") or ()
     if gaps:
@@ -5832,7 +5847,8 @@ def build_evidence(
             incidents.append(observed_hit)
         rank_checks["replica_drift"] = replica_kind_check(
             rank_checks["replica_drift"], replica, all_ranks=False,
-            records=sum(_observation(r) is not None or _spread_table(r) is not None for r in records))
+            records=sum(_observation(r) is not None or _spread_table(r) is not None for r in records),
+            held_ranks=held_ranks or ())
 
     if any(record.get("scalars") for record in records):
         rust_made = {id(incident) for incident in from_rust or ()}  # these carry their scalars already

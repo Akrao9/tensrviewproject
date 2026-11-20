@@ -507,3 +507,53 @@ def test_l23_the_rust_path_says_the_same():
         [i for i in python["not_checked"] if i["check"] == "gradients"]
     for kind in ev.GRADS_NOT_READ_KINDS:
         assert rust["kind_checks"][kind] == python["kind_checks"][kind]
+
+
+# --- After review: an empty result, a one-rank job, a shared file, the server's tolerance -------
+
+
+def test_a_servers_empty_result_leaves_the_run_as_it_was(tmp_path, nothing_is_judged_here):
+    """A status whose `replica` lists no step (a run without `replica_group`, or before its first
+    scheduled step) is every ordinary store run once the server writes the object: the kind's
+    entry is the ranks' own, nothing is added to `not_checked`, and the run stays healthy."""
+    empty = {"v": 1, "tolerance": 1e-6, "steps": [], "replica_drift": []}
+    evidence = ev.all_ranks_evidence(_store(tmp_path, [0, 1], empty))
+    before = ev.all_ranks_evidence(_store(tmp_path / "old", [0, 1]))
+    assert evidence["replica"] == empty and "replica_not_stated" not in evidence
+    assert evidence["kind_checks"]["replica_drift"] == before["kind_checks"]["replica_drift"]
+    assert "not_checked" not in evidence and evidence["run_state"]["state"] == before["run_state"]["state"] == "healthy"
+    assert ev.replica_line(evidence) is None
+
+
+def test_a_job_of_one_rank_is_not_configured_not_degraded():
+    """A group of one has no rank to be compared with: as one rank alone is for the other
+    cross-rank kinds, the kind is `not_configured`, and the run is not degraded for good."""
+    body, tolerance = _case("group_of_one")
+    combined = _local_run(body["records"], tolerance)
+    check = combined["kind_checks"]["replica_drift"]
+    assert check["value"] == "not_configured" and "check" not in check
+    assert check["coverage"]["not_compared"][0]["fingerprints_why"] == "one_rank"
+    assert combined["run_state"]["state"] == "healthy"
+
+
+def test_one_rank_of_a_shared_file_says_the_others_are_in_the_source():
+    """With `rank=` on records of three ranks, the ranks left out are in the source
+    (`ranks_in_source`), not missing from it."""
+    body, tolerance = _case("healthy_peers_with_distinct_attempts")
+    evidence = ev.build_evidence(body["records"], rank=0, drift_tolerance=tolerance)
+    detail = evidence["kind_checks"]["replica_drift"]["coverage"]["detail"]
+    assert evidence["ranks_in_source"] == [0, 1, 2]
+    assert "ranks 1-2 are in the source and not judged in this rank's evidence" in detail
+    assert "no observation" not in detail
+    lone, tolerance = _case("lone_rank_file")
+    assert "no observation of ranks 1-2 is in the records read" in \
+        ev.build_evidence(lone["records"], drift_tolerance=tolerance)["kind_checks"]["replica_drift"]["coverage"]["detail"]
+
+
+@pytest.mark.parametrize("tolerance", [None, "1e-6", True, float("nan")])
+def test_a_servers_result_without_a_finite_tolerance_is_unreadable(tmp_path, nothing_is_judged_here, tolerance):
+    replica = {**_server_object("drift_on_one_of_three"), "tolerance": tolerance}
+    evidence = ev.all_ranks_evidence(_store(tmp_path, [0, 1, 2], replica))
+    assert evidence["replica_not_stated"]["code"] == "status_replica_unreadable"
+    assert _replica_incidents(evidence, "run_incidents") == []
+    ev._all_ranks_summary(evidence)  # and the summary is written
