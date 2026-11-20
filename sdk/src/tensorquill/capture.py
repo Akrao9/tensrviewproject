@@ -60,7 +60,7 @@ from .probe import ProbeState, find_head, install_head_hook, install_probe_hooks
 from .sink import JsonlSink, Sink, clear_end_marker, write_end_marker
 from .system import SystemPart, SystemReadings
 from . import manifest as _manifest
-from .tracker import RunInfo, _world_size, read_launch_again, resolve_run, tracker_labels
+from .tracker import LaunchRead, RunInfo, _world_size, resolve_run, tracker_labels
 
 STATS = ("mean", "std", "abs_max", "zero_frac")
 _SEEN = len(STATS)  # last column: 1.0 when the hook ran this step
@@ -1421,9 +1421,22 @@ class Session:
         # ranks for this step, kept per step; the launch is added when the record is written.
         self._spread_scope: list[int] | None = None
         self._ring_scope: list[list[int] | None] = []
-        # The launch the records carry: what `init` read, until the writer thread reads it again
-        # before the first record that needs it (`_launch_for_records`, contract 2).
-        self.launch: str | None = run.launch
+        # The launch the records carry (contract 2). Rank 0's own, at once. On a rank other than 0,
+        # what `init` read is provisional: the second read (`LaunchRead`) starts at the end of the
+        # first step, on a thread of its own, and until it returns the records carry null, never
+        # what `init` read (`_launch_for_records`).
+        self.launch: str | None = run.launch if run.rank == 0 or run.launch_source is None else None
+        self._launch_read: LaunchRead | None = None
+        self._launch_parked = False
+        if run.rank != 0 and run.launch_source is not None:
+            # The reader's thread starts here, parked, so the end of the first step only lets it go.
+            # It reads the session's run when it goes, through a weak reference: it keeps no session alive.
+            this = weakref.ref(self)
+            try:
+                self._launch_read = LaunchRead(read_run=lambda: getattr(this(), "run", None))
+                self._launch_parked = True
+            except Exception:  # noqa: BLE001
+                self._launch_read = None
         self._launch_confirmed = False
         self.launch_read_seconds: float | None = None
         self._ring_counts = {
@@ -2694,20 +2707,40 @@ class Session:
                 )
         return {"width": width, "device": device.type, "metas": metas, "unread": unread}
 
-    def _launch_for_records(self) -> str | None:
-        """The launch the records carry. On the writer thread only: the first call reads it a
-        second time (`tracker.read_launch_again`: on a rank other than 0, one `check` then `get` on
-        the launch's key, waited for at most `tracker.LAUNCH_READ_SECONDS`, null if it fails) and
-        keeps what it gave, and how long that took (`launch_read_seconds`). Never on the training
-        thread, so a store that is slow or down costs the records a null launch, never a step."""
-        if not self._launch_confirmed:
-            self._launch_confirmed = True
-            began = time.perf_counter()
+    def _start_launch_read(self) -> LaunchRead:
+        """Begin the second read of the launch (`tracker.LaunchRead`), once: at the end of the first
+        step, so this rank has finished a step since `init` (contract 2), and rank 0 of its start has
+        had that long to set its launch. On a rank other than 0 the reader's thread was started at
+        `init`, parked; here it is let go, an `Event.set` (no thread is started on the training
+        thread: starting one there took up to 90 ms under a load average of 31). The store is read on
+        that thread, never on the training thread or the writer's. Rank 0 and a job of one rank have
+        no thread. A run replaced after `init` (tests do it) is read from a thread started here.
+        Never raises: a read that cannot start leaves the launch null."""
+        read = self._launch_read
+        if read is None:
             try:
-                self.launch = read_launch_again(self.run)
+                read = LaunchRead(self.run)
             except Exception:  # noqa: BLE001
-                self.launch = None
-            self.launch_read_seconds = time.perf_counter() - began
+                read = LaunchRead(None)
+            self._launch_read = read
+        elif self._launch_parked:
+            self._launch_parked = False
+            read.go()
+        return read
+
+    def _launch_for_records(self) -> str | None:
+        """The launch the records carry, on the writer thread, which never waits for it: what the
+        second read gave once it has returned (kept, with how long it took, `launch_read_seconds`),
+        and null while it is still out, so a record never carries the launch `init` read where the
+        second read would have replaced it. A store that hangs leaves every record's launch null; one
+        that fails, null; one that answers late, null until it does and its answer after."""
+        if not self._launch_confirmed:
+            done, launch = self._start_launch_read().result()
+            if not done:
+                return None
+            self._launch_confirmed = True
+            self.launch = launch
+            self.launch_read_seconds = self._launch_read.seconds
             self._drop_launch_source()
         return self.launch
 
@@ -2815,6 +2848,8 @@ class Session:
         if self._stopped:
             self._count_stopped(step)
             return
+        if self._launch_read is None or self._launch_parked:
+            self._start_launch_read()  # the end of the first step: the launch's second read (contract 2)
         current = self._next_step if step is None else step
         if self._probe_owed:
             self._run_owed_probe()  # the previous step's, before this one becomes the newest
@@ -3494,6 +3529,9 @@ class Session:
         # the process group: one that the job destroys is then not kept alive by a session object
         # the caller still holds. So of the store, once the writer can no longer read the launch.
         self._replica_group = None
+        if self._launch_parked and self._launch_read is not None:
+            self._launch_parked = False
+            self._launch_read.cancel()  # no step ended: the parked reader ends without reading
         if not self._worker.is_alive():
             self._drop_launch_source()
         if self._stopped or getattr(self._sink, "path", None) is None:
@@ -3594,8 +3632,8 @@ class Session:
         update_rows = updates.reshape(n, n_params, 2).tolist() if updates is not None and n_params > 0 else None
         obs_rows = obs.reshape(n, len(self.replica_names), FINGERPRINT_WIDTH + 1).tolist() if obs is not None else None
         sig_rows = obs_sig.reshape(n, len(self.replica_names)).tolist() if obs_sig is not None else None
-        # The launch, read a second time here on the writer thread before the first record that
-        # carries one (contract 2); never on the training thread.
+        # The launch, as the second read gave it once it has returned, else null (contract 2): the
+        # writer never waits for the store.
         needs_launch = (obs_rows is not None and any(obs_seen or ())) or any(
             scope is not None for scope in (scopes or ())
         )

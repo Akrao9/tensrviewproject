@@ -430,3 +430,188 @@ def test_the_checks_before_the_exchange_never_raise(monkeypatch):
 def test_a_long_reason_is_cut_to_the_rows_text_field():
     why = D._decide_gather([_row(), _row(problem="é" * 400)], [0, 1])
     assert why.startswith("rank 1 of the replica group cannot take part: é") and len(why) < 300
+
+
+# =============================================================================================
+# Item 2. The launch's second read never runs on, or holds up, the writer thread (decision 2).
+#
+# Before (on `2e2f4dc`): the writer thread made the read itself, waited for at most 5 s, before
+# decoding the first block that carried an observation, so a store that hung or failed slowly
+# held the writer, and `close()` waited with it. Now the read starts on a thread of its own at the
+# end of the first step, and until it returns the records carry `launch: null` (unknown), never the
+# launch `init` read, which the second read may replace.
+
+import dataclasses  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+from datetime import timedelta  # noqa: E402
+
+from torch import nn  # noqa: E402
+
+from tensorquill import tracker as T  # noqa: E402
+
+LAUNCH_KEY = "tensorquill/launch/0"
+OLD, NEW = "a" * 32, "c" * 32
+
+
+class GatedStore:
+    """A store whose `check` waits on `gate` (a hang until it is set), then fails or answers."""
+
+    timeout = timedelta(seconds=5)
+
+    def __init__(self, value=NEW, fail=False, delay=None):
+        self.gate = threading.Event()
+        if delay is not None:
+            threading.Timer(delay, self.gate.set).start()
+        self.value, self.fail = value, fail
+        self.threads: list[str] = []
+
+    def check(self, keys):
+        self.threads.append(threading.current_thread().name)
+        self.gate.wait(30)
+        if self.fail:
+            raise RuntimeError("store down")
+        return True
+
+    def get(self, key):
+        self.threads.append(threading.current_thread().name)
+        return self.value.encode()
+
+
+@pytest.fixture
+def world1(tmp_path):
+    dist = torch.distributed
+    if not dist.is_available():
+        pytest.skip("needs torch.distributed")
+    if dist.is_initialized():
+        pytest.skip("a process group is already initialized in this process")
+    dist.init_process_group("gloo", store=dist.FileStore(str(tmp_path / "store1"), 1), rank=0, world_size=1,
+                            timeout=timedelta(seconds=15))
+    try:
+        yield dist.group.WORLD
+    finally:
+        dist.destroy_process_group()
+
+
+def _small():
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
+
+
+def _steps(session, model, opt, n):
+    for _ in range(n):
+        opt.zero_grad()
+        model(torch.ones(2, 4)).sum().backward()
+        opt.step()
+
+
+def _as_rank_1(world1, store, monkeypatch, *, every=2):
+    """A session on a rank other than 0, as `init` makes it there: `resolve_run` gives what that rank
+    read at `init` (`OLD`, perhaps an earlier start's) and where the second read looks."""
+    from tensorquill import capture as C
+
+    model = _small()
+    sink = tensorquill.MemorySink()
+    run = T.RunInfo("aa1", "explicit", 1, OLD, (store, LAUNCH_KEY))
+    monkeypatch.setattr(C, "resolve_run", lambda run_id=None: run)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        session = tensorquill.init(model, run_id="aa1", sink=sink, replica_group=world1, every=every, replica_every=2,
+                                   heartbeat_seconds=None, stack_seconds=None)
+    assert session.run.rank == 1
+    return session, sink, model, torch.optim.SGD(model.parameters(), lr=0.1)
+
+
+def _launches(sink):
+    return [(r["step"], r["replica"]["launch"]) for r in sink.records if "replica" in r]
+
+
+def _until(condition, seconds=10.0):
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return condition()
+
+
+def test_a_store_that_hangs_holds_up_neither_the_writer_nor_close(world1, monkeypatch):
+    store = GatedStore()
+    try:
+        session, sink, model, opt = _as_rank_1(world1, store, monkeypatch)
+        _steps(session, model, opt, 40)
+        began = time.monotonic()
+        session.close()
+        closed = time.monotonic() - began
+        assert session.writer_error is None
+        assert closed < 2.0, closed  # before: the writer waited 5 s for the read
+        assert [s for s, _ in _launches(sink)] == list(range(1, 40, 2))
+        assert all(launch is None for _, launch in _launches(sink)), _launches(sink)
+        assert "tensorquill-launch" in store.threads and "MainThread" not in store.threads
+    finally:
+        store.gate.set()
+
+
+def test_a_store_that_fails_gives_null_and_holds_up_nothing(world1, monkeypatch):
+    store = GatedStore(fail=True, delay=1.5)  # a store that fails slowly, as one that times out does
+    session, sink, model, opt = _as_rank_1(world1, store, monkeypatch)
+    _steps(session, model, opt, 8)
+    began = time.monotonic()
+    session.close()
+    assert time.monotonic() - began < 1.0
+    assert _launches(sink) and all(launch is None for _, launch in _launches(sink))
+    assert _until(lambda: session._launch_read.done.is_set(), 5.0) and session._launch_read.launch is None
+
+
+def test_a_store_that_answers_late_gives_null_then_its_answer_never_the_launch_init_read(world1, monkeypatch):
+    store = GatedStore()
+    session, sink, model, opt = _as_rank_1(world1, store, monkeypatch)
+    _steps(session, model, opt, 5)  # the newest step is held until the next one ends
+    assert _until(lambda: len(sink.records) >= 4), len(sink.records)  # written while the read is out
+    early = _launches(sink)
+    assert early == [(1, None), (3, None)], early
+    store.gate.set()
+    assert session._launch_read.done.wait(5)
+    _steps(session, model, opt, 4)
+    session.close()
+    assert _launches(sink)[2:] == [(5, NEW), (7, NEW)], _launches(sink)
+    assert OLD not in {launch for _, launch in _launches(sink)}
+    assert session.launch == NEW and session.launch_read_seconds is not None
+    assert session.run.launch_source is None
+    assert set(store.threads) == {"tensorquill-launch"}
+
+
+def test_the_read_starts_at_the_end_of_the_first_step_not_at_init(world1, monkeypatch):
+    store = GatedStore(delay=0.0)
+    session, sink, model, opt = _as_rank_1(world1, store, monkeypatch)
+    assert session.launch is None  # unknown until the second read returns, never what init read
+    time.sleep(0.2)
+    assert store.threads == []  # nothing read at init, nor before a step has ended: the reader is parked
+    parked = [t for t in threading.enumerate() if t.name == "tensorquill-launch" and t.is_alive()]
+    assert parked  # started at init, so the step that lets it go starts no thread
+    _steps(session, model, opt, 1)
+    assert _until(lambda: store.threads != [], 5.0)
+    assert session._launch_read.done.wait(5)
+    _steps(session, model, opt, 3)
+    session.close()
+    assert _launches(sink) == [(1, NEW), (3, NEW)]
+
+
+def test_a_session_closed_before_any_step_lets_its_parked_reader_end_unread(world1, monkeypatch):
+    store = GatedStore(delay=0.0)
+    session, sink, model, opt = _as_rank_1(world1, store, monkeypatch)
+    session.close()
+    assert session._launch_read.done.wait(5) and store.threads == []
+
+
+def test_rank_0_and_a_job_of_one_rank_read_nothing_again(world1):
+    model = _small()
+    sink = tensorquill.MemorySink()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        session = tensorquill.init(model, run_id="aa1", sink=sink, replica_group=world1, every=2, replica_every=2,
+                                   heartbeat_seconds=None, stack_seconds=None)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    _steps(session, model, opt, 4)
+    session.close()
+    # A control (passes on `2e2f4dc` too): rank 0 writes its own nonce on every record from the first.
+    assert session.run.launch_source is None
+    assert _launches(sink) == [(1, session.run.launch), (3, session.run.launch)]

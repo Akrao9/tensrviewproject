@@ -38,9 +38,9 @@ _KEY = "tensorquill/run_id/{}"
 _LAUNCH_KEY = "tensorquill/launch/{}"
 _exchanges = itertools.count()
 
-#: At most how long the second read of the launch (`read_launch_again`) is waited for, in
-#: seconds, on the writer thread that does it. A store that has not answered by then leaves the
-#: launch null. It never runs on the training thread.
+#: At most how long `read_launch_again` waits for the second read of the launch, in seconds; a
+#: store that has not answered by then leaves the launch null. The session never waits for it: it
+#: starts the read (`LaunchRead`) and writes null until the read returns.
 LAUNCH_READ_SECONDS = 5.0
 
 
@@ -51,7 +51,7 @@ class RunInfo:
     rank: int
     # Which start of the job this process belongs to: 32 hex digits, or None when it could not be
     # learned (contract, section 2). On a rank other than 0 it is what `init` read, provisional
-    # until `read_launch_again` reads it a second time. Not part of equality: two RunInfo are
+    # until `LaunchRead` reads it a second time. Not part of equality: two RunInfo are
     # equal when they name the same run, as before the launch was added.
     launch: str | None = field(default=None, compare=False)
     # (store, key) for that second read, on a rank other than 0 that took rank 0's run ID.
@@ -85,33 +85,93 @@ def _look_for_launch(store: Any, key: str) -> str | None:
         return None
 
 
-def read_launch_again(run: RunInfo, timeout: float | None = None) -> str | None:
-    """The launch to write in this process's records (contract, section 2, the second read).
+class LaunchRead:
+    """The second read of the launch (contract, section 2), never waited for.
 
-    Rank 0, a job of one rank and a rank that never took rank 0's run ID keep what `init` gave
-    them. A rank other than 0 that did reads the launch's key once more, `check` then `get`, and
-    takes what that gives, None if it fails or finds nothing: what `init` read may be the entry an
-    earlier start left in a store torchrun kept across a restart. The look runs on a daemon thread
-    of its own and is waited for at most `timeout` (`LAUNCH_READ_SECONDS` by default), so a store
-    that hangs costs a null launch, never a wait without end. Never raises. Call it off the
-    training thread: the session calls it on its writer thread."""
-    source = run.launch_source
-    if run.rank == 0 or source is None:
-        return run.launch
+    Rank 0, a job of one rank and a rank that never took rank 0's run ID keep what `init` gave them:
+    the read is done at once, with no thread. A rank other than 0 that did take it reads the
+    launch's key once more, `check` then `get`, on a daemon thread of its own named
+    `tensorquill-launch`, and takes what that gives, None if it fails or finds nothing: what `init`
+    read may be the entry an earlier start left in a store torchrun kept across a restart.
+
+    `LaunchRead(run)` reads at once. `LaunchRead(read_run=fn)` starts its thread now, parked, and
+    reads when `go()` is called, from the run `fn()` gives then (None: nothing to read): the session
+    starts it at `init` and calls `go()` at the end of the first step, which only sets an event, so
+    the training thread never waits for a thread to start. `cancel()` lets a parked thread end
+    without reading.
+
+    `done` is set when the read has returned (`launch` then holds what it gave, and `seconds` how
+    long the store took). Until then `result()` says it is pending, and a caller writes the launch
+    as unknown (null), never what `init` read. Nothing joins the thread: a store that hangs leaves
+    the read pending for good, costs one parked daemon thread, and holds up nothing else. The
+    store's `check` and `get` release the GIL while they wait (PyTorch 2.6 binds both with
+    `gil_scoped_release`, `torch/csrc/distributed/c10d/init.cpp`), so a hung one does not stall the
+    other threads. Never raises."""
+
+    def __init__(self, run: RunInfo | None = None, *, read_run: Any = None) -> None:
+        self.done = threading.Event()
+        self.launch: str | None = None
+        self.seconds: float | None = None
+        self._go = threading.Event()
+        self._cancelled = False
+        if read_run is None:
+            if run is None or run.rank == 0 or run.launch_source is None:
+                self.launch, self.seconds = (run.launch if run is not None else None), 0.0
+                self.done.set()
+                return
+            read_run = lambda: run  # noqa: E731
+            self._go.set()
+
+        def look() -> None:
+            try:
+                self._go.wait()
+                found = None if self._cancelled else read_run()
+                if found is not None and found.rank != 0 and found.launch_source is not None:
+                    began = time.perf_counter()
+                    self.launch = _look_for_launch(*found.launch_source)
+                    self.seconds = time.perf_counter() - began
+                elif found is not None:
+                    self.launch, self.seconds = found.launch, 0.0
+            except Exception:  # noqa: BLE001
+                self.launch = None
+            finally:
+                self.done.set()
+
+        try:
+            threading.Thread(target=look, name="tensorquill-launch", daemon=True).start()
+        except Exception:  # noqa: BLE001  no thread to read with: the launch stays unknown
+            self.launch, self.seconds = None, 0.0
+            self.done.set()
+
+    def go(self) -> None:
+        """Let a parked read begin. An `Event.set`: it waits for nothing."""
+        self._go.set()
+
+    def cancel(self) -> None:
+        """Let a parked read end without reading; one already reading is left to finish."""
+        self._cancelled = True
+        self._go.set()
+
+    def result(self) -> tuple[bool, str | None]:
+        """(True, the launch or None) once the read has returned; (False, None) while it is pending."""
+        return (True, self.launch) if self.done.is_set() else (False, None)
+
+
+def read_launch_again(run: RunInfo, timeout: float | None = None) -> str | None:
+    """The second read of the launch (`LaunchRead`), waited for at most `timeout` seconds
+    (`LAUNCH_READ_SECONDS` by default): what it gave, or None if it failed, found nothing or had
+    not returned by then. For a caller that may wait; the session does not call it, it starts a
+    `LaunchRead` and never waits for it. Never raises."""
     try:
         limit = max(float(LAUNCH_READ_SECONDS if timeout is None else timeout), 0.0)
     except (TypeError, ValueError):
         limit = 5.0
-    found: list[str | None] = []
     try:
-        reader = threading.Thread(
-            target=lambda: found.append(_look_for_launch(*source)), name="tensorquill-launch", daemon=True
-        )
-        reader.start()
-        reader.join(limit)
+        read = LaunchRead(run)
+        read.done.wait(limit)
+        return read.result()[1]
     except Exception:  # noqa: BLE001
         return None
-    return found[0] if found else None
 
 
 def _rank() -> int:
@@ -243,8 +303,8 @@ def _shared_run(dist: Any, rank: int, run_id: str | None) -> RunInfo:
             stacklevel=4,
         )
         return RunInfo(found[0], found[1], rank, None)
-    # The launch beside it: one look, no wait (contract 2). Provisional: read again before this
-    # rank's first observation (`read_launch_again`).
+    # The launch beside it: one look, no wait (contract 2). Provisional: read again after this
+    # rank's first step (`LaunchRead`).
     launch = _look_for_launch(store, launch_key)
     if run_id and str(run_id) != str(shared_id):
         _say(
