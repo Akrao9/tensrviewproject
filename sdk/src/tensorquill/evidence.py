@@ -933,12 +933,6 @@ def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str
     builds the same incidents (`progress_incidents` in `watchdog.rs`).
     The stacks themselves stay in the status file: an incident's `ranks` are without them.
     Each carries its `class`, as the server's `watchdog.json` writes it.
-
-    A rank whose capture stopped (contract 3: its entry carries `capture_stopped`) is not judged,
-    whatever state it reads, so it raises no progress incident and is in none of their lists: a
-    stopped capture stands its work counter still, and one that then reads `unresponsive` or
-    `lost` is not a stall of the job (C03, Nov 19, 2026; until then it raised `job_stalled` or
-    `rank_silent`). The other ranks are judged as before.
     """
     duplicates = status.get("duplicate_batches") if status else None
     found = [{"kind": "duplicate_batches", **duplicates}] if isinstance(duplicates, Mapping) else []
@@ -947,37 +941,10 @@ def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str
     return found
 
 
-def status_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]]:
-    """The incidents of the server's status, as copies: the list its `watchdog.json` writes, or
-    `detect_watchdog_incidents` for a status from a server that did not write one yet.
-
-    A status with a rank whose capture stopped has its progress incidents (`job_stalled`,
-    `rank_silent`) from `_progress_incidents` here, and its other incidents as written: a server
-    that still counts such a rank among the stopped ones would otherwise raise a stall for it
-    (C03, Nov 19, 2026). Without such a rank the server's list is taken as it is."""
-    if not status:
-        return []
-    listed = status.get("incidents")
-    if not isinstance(listed, list):
-        return detect_watchdog_incidents(status)
-    found = [dict(incident) for incident in listed if isinstance(incident, Mapping)]
-    if any(_capture_stopped(entry) for entry in status.get("ranks") or ()):
-        progress = _progress_incidents(status)
-        with_classes(progress)
-        found = progress + [i for i in found if i.get("kind") not in ("job_stalled", "rank_silent")]
-    return found
-
-
-def _capture_stopped(entry: Any) -> bool:
-    """Whether a status entry is of a rank whose capture stopped (contract 3), in any state."""
-    return isinstance(entry, Mapping) and entry.get("capture_stopped") is not None
-
-
 def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     if not status or status.get("summary") not in ("stalled", "degraded"):
         return []
-    # A rank whose capture stopped is not judged (contract 3, C03): it is left out of every list here.
-    full = [r for r in status.get("ranks", ()) if not _capture_stopped(r)]
+    full = list(status.get("ranks", ()))
     if not status.get("missing_ranks") and not any(r.get("state") in ("silent", "lost", "unresponsive") for r in full):
         # No rank stopped and none is missing: the summary's cause is not progress, as when a rank
         # whose capture stopped is beside an active one (contract 3). As `progress_incidents` in
@@ -2972,7 +2939,10 @@ def _report_evidence(
     report = look["report"]
     record_incidents = [dict(incident) for incident in report["incidents"]]
     incidents = [i for i in record_incidents if i.get("kind") != "replica_drift"]
-    stream_incidents = status_incidents(status)
+    if status is not None and isinstance(status.get("incidents"), list):
+        stream_incidents = [dict(incident) for incident in status["incidents"]]
+    else:  # a status from a server that did not write the list yet
+        stream_incidents = detect_watchdog_incidents(status)
     incidents.extend(stream_incidents)
     # The server lists these two as not checked in every report, since it never has their
     # files. Here they are checked when asked for, as in `build_evidence`.
@@ -3324,7 +3294,11 @@ def _grace_alert_key(status: Mapping[str, Any] | None, status_age: float | None,
     """Status/external-source changes that should surface immediately during `--report-grace`:
     stalls, silent/missing ranks, stopped/stale server status, and TrainCheck/FR updates, while
     ignoring routine `last_step` bumps on a healthy status."""
-    incidents = status_incidents(status)
+    incidents = (
+        status["incidents"]
+        if status and isinstance(status.get("incidents"), list)
+        else (detect_watchdog_incidents(status) if status else [])
+    )
     summary = status.get("summary") if status and status.get("summary") in ("stalled", "degraded", "server_stopped") else None
     return (
         summary,
@@ -4144,7 +4118,8 @@ def combine_rank_evidence(
             unknown[number] = f"{EARLIER_ATTEMPT}: {why}"
         per_rank = {n: found for n, found in per_rank.items() if n not in earlier}
     judged = sorted(per_rank)
-    stream = status_incidents(status)
+    stream = ((list(status["incidents"]) if isinstance(status.get("incidents"), list) else detect_watchdog_incidents(status))
+              if status is not None else [])
     looks = {n: {"report": {"incidents": [dict(i) for i in per_rank[n].get("incidents") or ()
                                           if isinstance(i, Mapping) and not (status is not None and i.get("kind") in _STATUS_INCIDENT_KINDS)]}}
              for n in judged}
@@ -4380,7 +4355,10 @@ def _all_ranks_evidence(
             entry["stream"] = streams[number]
         entries.append(entry)
 
-    stream_incidents = status_incidents(status)
+    if status is not None and isinstance(status.get("incidents"), list):
+        stream_incidents = [dict(i) for i in status["incidents"]]
+    else:  # a status from a server that did not write the list yet
+        stream_incidents = detect_watchdog_incidents(status)
     run_incidents = list(stream_incidents)
     # Cross-rank, so only here: each rank's report carries its latest memory reading.
     imbalance = detect_memory_imbalance({n: looks[n]["report"].get("memory") for n in judged})
