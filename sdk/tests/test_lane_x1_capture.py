@@ -13,6 +13,13 @@ Written before each fix, against the branch's base. Each test says whether it fa
   and the `indices=` path alike. Never a raise, and the same under `torch.compile`. One exception,
   kept because `test_router_guard.py` (`int-top_k-above`) guards it: on the default integer path a
   declared `top_k` above `n_experts` is only written down, and the router is counted as before.
+- C12 and TrainCheck B1, the part done here: an optimizer that holds only frozen parameters of the
+  model (B1, `init` called after the freezing loops), or a model whose every parameter is frozen at
+  `init`, looked like another job's optimizer, and no step was recorded. Now any of the model's
+  parameters at `init`, frozen ones included, makes an optimizer this model's. Recording a
+  parameter unfrozen after `init` is not done in this lane: both engines' `update_spike` would
+  read the growing parameter set as a spike (the lane's hand-over note has the patch and why);
+  such a parameter is still named once in a warning.
 """
 
 from __future__ import annotations
@@ -61,6 +68,25 @@ def test_l9_a_rebuilt_optimizer_whose_predecessor_stays_alive_ends_steps(set_to_
         _iterate(model, first, 3, set_to_none=set_to_none)
         second = torch.optim.SGD(model.parameters(), lr=0.01)  # `first` is still referenced
         _iterate(model, second, 4, set_to_none=set_to_none)
+    assert _steps(sink.records) == list(range(7))
+    assert [r["lr"] for r in sink.records] == [[0.1]] * 3 + [[0.01]] * 4
+    assert first is not None
+
+
+def test_l9_a_rebuilt_optimizer_over_a_model_whose_first_layer_is_frozen_ends_steps_from_its_first():
+    # guard: the usual fine-tuning shape, both optimizers over every parameter, the first layer frozen.
+    # The gradient marked at the lead's step must be one a backward writes, not a frozen parameter's
+    # (with ownership judged over every parameter, B1, the mark could fall on a frozen one).
+    model = _model()
+    model[0].requires_grad_(False)
+    sink = tensorquill.MemorySink()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with tensorquill.init(model, sink=sink, every=4):
+            first = torch.optim.SGD(model.parameters(), lr=0.1)
+            _iterate(model, first, 3)
+            second = torch.optim.SGD(model.parameters(), lr=0.01)
+            _iterate(model, second, 4)
     assert _steps(sink.records) == list(range(7))
     assert [r["lr"] for r in sink.records] == [[0.1]] * 3 + [[0.01]] * 4
     assert first is not None
@@ -380,3 +406,102 @@ def test_c06_more_ids_a_token_than_experts_get_the_usual_fix_not_a_top_k_above_t
     why = _refused(_route(ids, _spec("indices", 1)))
     assert why is not None and "5 for each" in why, why
     assert "Router(4, 5" not in why and "change its indices= function" in why, why
+
+
+# --- C12 and TrainCheck B1: parameters frozen at init -----------------------------------------------
+
+
+def _two_layers() -> nn.Sequential:
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Linear(4, 8), nn.Tanh(), nn.Linear(8, 1))
+
+
+def _train(model: nn.Module, opt: torch.optim.Optimizer, n: int) -> None:
+    for _ in range(n):
+        x, y = _batch()
+        opt.zero_grad()
+        (model(x) - y).pow(2).mean().backward()
+        opt.step()
+
+
+def test_b1_an_optimizer_that_holds_only_frozen_parameters_still_ends_steps():
+    # fail-before: TrainCheck B1 with `init` after the freezing loops recorded no step at all, and
+    # warned only of DeepSpeed and Megatron. Only the norm layer trains; the optimizer holds the head.
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 8), nn.BatchNorm1d(8), nn.Tanh(), nn.Linear(8, 1))
+    for name, p in model.named_parameters():
+        p.requires_grad_(name.startswith("1."))
+    opt = torch.optim.SGD(model[3].parameters(), lr=0.1)  # frozen parameters only
+    sink = tensorquill.MemorySink()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with tensorquill.init(model, sink=sink, every=5, weights=5):
+            for _ in range(20):
+                x, y = _batch()
+                opt.zero_grad()
+                (model(x) - y).pow(2).mean().backward()
+                opt.step()
+    records = sink.records
+    assert _steps(records) == list(range(20))
+    checked = [r for r in records if "weight_norms" in r]
+    assert checked and all(
+        r["optimizer_ownership"] == {"state": "known", "unheld": ["1.weight", "1.bias"], "unheld_count": 2}
+        for r in checked
+    )
+    incidents = tensorquill.build_evidence(records)["incidents"]
+    stalled = [i for i in incidents if i["kind"] == "stalled_weights"]
+    assert stalled, [i["kind"] for i in incidents]
+
+
+def test_c12_every_parameter_frozen_at_init_then_the_head_unfrozen_records_every_step():
+    # fail-before: with no trainable parameter at init no optimizer looked like this model's.
+    model = _two_layers()
+    model.requires_grad_(False)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with tensorquill.init(model, sink=sink, every=4, weights=1):
+            model[2].requires_grad_(True)
+            _train(model, opt, 5)
+    records = sink.records
+    assert _steps(records) == list(range(5))
+    # Not recorded (see the module's docstring), and said so once.
+    assert all(r["grad_norms"] == {} for r in records)
+    said = [str(w.message) for w in caught if "'2.weight'" in str(w.message)]
+    assert len(said) == 1 and "after tensorquill.init" in said[0], said
+
+
+def test_c12_every_parameter_frozen_at_init_and_never_unfrozen_still_records_steps():
+    # fail-before: no step recorded. The optimizer holds the model's parameters, all frozen: each
+    # step changes nothing, and the record says so by having no gradient and no weight to check.
+    model = _two_layers()
+    model.requires_grad_(False)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with tensorquill.init(model, sink=sink, every=4, weights=1) as session:
+            for _ in range(6):
+                x, y = _batch()
+                session.log({"train/loss": (model(x) - y).pow(2).mean()})
+                opt.zero_grad()
+                opt.step()
+    records = sink.records
+    assert _steps(records) == list(range(6))
+    assert all(r["grad_norms"] == {} for r in records)
+    assert not any("DeepSpeed" in str(w.message) for w in caught)
+
+
+def test_c12_guard_nothing_raises_under_warnings_as_errors_when_a_parameter_is_unfrozen():
+    model = _two_layers()
+    model[0].requires_grad_(False)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    sink = tensorquill.MemorySink()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with tensorquill.init(model, sink=sink, every=2, weights=1, updates=True):
+            _train(model, opt, 2)
+            model[0].requires_grad_(True)
+            _train(model, opt, 3)
+    assert _steps(sink.records) == list(range(5))

@@ -1278,11 +1278,19 @@ class Session:
         self._param_ids = {id(p) for p in self._params}
         self._param_index = {id(p): index for index, p in enumerate(self._params)}
         self.param_names = [name for name, _ in params]
+        # Every parameter of the model at `init`, frozen ones included: an optimizer that holds any
+        # of them is this model's (`_owns`), so one that holds only frozen parameters still ends
+        # steps (TrainCheck B1, and a model whose every parameter is frozen at `init`). The
+        # parameters recorded are still those trainable at `init` (`_say_new_trainable`).
+        everything = list(model.named_parameters())
+        self._model_param_ids = {id(p) for _, p in everything}
         # The parameters the cross-GPU drift check compares (`_plan_session`).
         replicas = plan.replicas
         self._replica_params = [p for _, p in replicas]
         self.replica_names = [name for name, _ in replicas]
-        self.device = _buffers_device(self._params)
+        # With no trainable parameter at `init`, the model's own device, so the layer statistics of a
+        # model on a GPU are read there rather than left out (`_output_unread`). Not run on a GPU.
+        self.device = _buffers_device(self._params or [p for _, p in everything])
 
         selected = plan.selected
         self.layer_names = [name for name, _ in selected]
@@ -1587,12 +1595,13 @@ class Session:
         # The global hooks fire for every optimizer in the process. What each holds is kept with the
         # size of each of its parameter groups, and judged again when those change: an optimizer
         # given this model's parameters by `add_param_group` after its first step ends steps then.
+        # Any of the model's parameters at `init` counts, frozen ones included (TrainCheck B1).
         groups = optimizer.param_groups
         sizes = tuple(len(group["params"]) for group in groups)
         found = self._owned.get(optimizer)
         if found is not None and found[1] == sizes:
             return found[0]
-        owned = any(id(p) in self._param_ids for group in groups for p in group["params"])
+        owned = any(id(p) in self._model_param_ids for group in groups for p in group["params"])
         self._owned[optimizer] = (owned, sizes)
         return owned
 
@@ -1611,7 +1620,7 @@ class Session:
         seen = False
         for optimizer in list(self._owned):
             ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
-            if ids & self._param_ids:
+            if ids & self._model_param_ids:
                 seen = True
                 held |= ids
         if not seen:
@@ -1785,13 +1794,18 @@ class Session:
         return self._shares_with_lead(optimizer, lead)
 
     def _mark_lead_grad(self, optimizer: Any) -> None:
-        """After the lead's step: one parameter it holds, the gradient that parameter had and that
-        gradient's version, for `_backward_since_lead`. The parameter is chosen once per lead."""
+        """After the lead's step: one of the model's parameters it holds that has a gradient, that
+        gradient and its version, for `_backward_since_lead`. The parameter is kept while it has a
+        gradient at the lead's step, and chosen again when it has none (a frozen one never does,
+        and a fine-tuned model's first parameters are often frozen); with none, nothing is marked."""
         try:
             chosen = self._lead_mark[0]() if self._lead_mark is not None else None
-            if chosen is None or self._lead_mark_of() is not optimizer:
+            if chosen is None or chosen.grad is None or self._lead_mark_of() is not optimizer:
                 chosen = next(
-                    (p for group in optimizer.param_groups for p in group["params"] if id(p) in self._param_ids),
+                    (
+                        p for group in optimizer.param_groups for p in group["params"]
+                        if id(p) in self._model_param_ids and p.grad is not None
+                    ),
                     None,
                 )
                 if chosen is None:
@@ -1799,11 +1813,7 @@ class Session:
                     return
                 self._lead_mark_of = weakref.ref(optimizer)
             grad = chosen.grad
-            self._lead_mark = (
-                weakref.ref(chosen),
-                None if grad is None else weakref.ref(grad),
-                None if grad is None else grad._version,
-            )
+            self._lead_mark = (weakref.ref(chosen), weakref.ref(grad), grad._version)
         except Exception:  # noqa: BLE001
             self._lead_mark = None
 
@@ -3823,7 +3833,8 @@ def init(
             `weights_unchanged`; an empty list means some were compared and none had an
             equal norm. Gradient norms and weight checks cover the
             parameters that are trainable (`requires_grad`) when `init` runs: one unfrozen
-            later is named once in a warning and not recorded.
+            later is named once in a warning and not recorded. An optimizer that holds any of
+            the model's parameters, frozen ones included, ends steps.
         auto_step: count optimizer steps with PyTorch's global optimizer hooks. With a
             `torch.amp.GradScaler`, pass it as `scaler=`: the step then ends at
             `scaler.update()`, so a step the scaler skipped is counted too. Pass False and call
