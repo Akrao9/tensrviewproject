@@ -5,6 +5,7 @@ One list of the open bugs known from the two code reviews and the fix lanes, as 
 - `CODEBASE_AUDIT.md`, the second audit: 70 finding groups with IDs C, RS and X. Its evidence-reader rows have no IDs, so they are numbered E1 to E8 here.
 - `codebase_review_findings.md`, the first outside review: 87 findings with IDs SDK, DET, CLI and RUST.
 - The open items the fix lanes raised themselves, numbered L1 to L18 here.
+- A cross-check of the pending-work list against the code, done on `main` at `a31dd37` (Nov 19, 2026) and kept in `PENDING_CODING_TASKS.md`, which is untracked. Its ten reproduced findings are numbered XC1 to XC10 here (section 10).
 
 Both audit files are untracked. The decision log for all of this is `TensorQuill v3 — Product and Build Plan.md`.
 
@@ -13,6 +14,7 @@ Both audit files are untracked. The decision log for all of this is `TensorQuill
 - *Run*: reproduced with a script, by a fix lane or by lane T6. *Run on main* means the script was run again on `main` on Nov 19, 2026, after wave U.
 - *Read*: seen in the code, not run.
 - *Audit*: the audit's claim, not checked again by this project's sessions.
+- *Cross-check*: reproduced by the cross-check's author with temporary files and CPU jobs, as that list records; not run again when it was copied here.
 
 Only the rows marked *Run on main* were run again when this file was written. Rows last checked before wave U may have moved.
 
@@ -139,11 +141,31 @@ Not from either review. Not counted in the 72.
 | Full capture costs +4.15% on the RTX PRO 6000 | Kept opt-in |
 | Headless screenshots have only been run on macOS | Blocks Gate 3's step 20 |
 
+## 10. Found in the cross-check of the pending-work list
+
+Not from either review or a fix lane, and not counted in the 72. From `PENDING_CODING_TASKS.md`, "Findings recovered in the cross-check", made on `main` at `a31dd37` before wave X was merged; none was run again after the merge. Where that list says "main and X5", the finding was also reproduced on lane X5's branch, so wave X did not fix it.
+
+| # | Where | Finding | Checked |
+|---|---|---|---|
+| XC1 | `sdk/examples/seeded_failures.py`, the healthy verdict | With a one-step healthy toy job and an injected sink write failure the driver returns PASS with zero JSONL rows: its only success condition is an empty incident list. A healthy verdict needs the expected step range, evidence that the relevant checks ran, and a successful capture; add truncated and empty controls. Matters before the healthy GPU control is trusted | Cross-check |
+| XC2 | `sdk/examples/replica_check.py` | The driver refuses any `WORLD_SIZE` but 2 at argument validation (line 20), before distributed initialization, so it cannot run the eight-rank proof or D1's attribution. It tests divergence on three planted steps but asserts only the parameter and the spread. Extend it or add a driver, and keep the two-rank inconclusive and three-rank majority controls | Cross-check; the `WORLD_SIZE` check read again on Nov 20, 2026 |
+| XC3 | `manifest.py`, `flight.py`, public `init` | Three recoverable metadata cases abort `init` under warnings-as-errors: a tracker or environment project that needs normalizing (`TENSORQUILL_PROJECT=my/project`), a failed manifest rename, and an oversized streaming manifest (a 70 KB config). Each should still train and record; explicit invalid-argument errors stay | Cross-check |
+| XC4 | `runs.py`, one rank file after a restart | A single rank file with (attempt, step) pairs (900,0), (900,100), (2,30), (900,101) lists last step 101; read with attempt resolution the steps are 0 and 30. CLI-13's several-file fix (lane X5) does not cover this single-file case | Cross-check (main and X5) |
+| XC5 | `runs.py`, rank coverage | A single `job.rank0.jsonl` with rows from ranks 0, 1, 0 lists only rank 0. The file-end shortcut is documented; decide whether to show the uncertainty or read the file before giving a definite count. Evidence beside a shared file also needs rank provenance | Cross-check (main and X5) |
+| XC6 | `runs.py`, very large world size | With one local rank file and healthy evidence for rank 0, a manifest declaring two ranks lists the run as unknown, and one declaring 100,001 lists it healthy with one rank. The 100,000-entry cap should stay; missing coverage should read as a count or unknown | Cross-check |
+| XC7 | `mcp_server.py`, the evidence cache | A run manifest created after a capture's first query is not picked up: the project stays `uncategorized` until the source is reopened. The cache should also watch for the manifest appearing or being replaced | Cross-check (main and X5) |
+| XC8 | `sdk/examples/seeded_failures.py`, the spike judge | With pre-seed totals 0, 0, 1 and a seed total of 20 the zero median gives a missing ratio and the verdict formatter raises `TypeError` | Cross-check |
+| XC9 | `data.py`, `divergence.py` | An unrelated mapping holding only `cached_embedding` tensors is classified as model state, which can falsely satisfy component presence (separate from B14 in section 9). Comparing two otherwise identical records with `grads_not_read` reports that metadata as an uncomparable series | Cross-check |
+| XC10 | `.github/workflows/ci.yml` | On `99c3b8f` the Linux extras job skipped lane V7's Rust-detector tests and lane W2's ownership tests because the server binary was absent; the server job builds the binary but runs a list of files that leaves those suites and lane W3's out. No Linux job has run them, and the same holds for wave X's server-dependent tests | Cross-check; the server job's file list read again on Nov 20, 2026: it names no `test_lane_v7`, `test_lane_w2`, `test_lane_w3` or `test_lane_x` file |
+
+That list also names work measured or specified earlier and missing from any active list (compiler and placement rechecks, a forced collective hang with real dumps, unexplained HTTP/2 stream ends in 3 of 22 scaling runs, detector blind spots B6 and B19, the GPU schedule, package metadata). Those are measurements and proofs, not bugs, and are not copied here.
+
 ## What to fix first
 
 - **First:** find why `test_a_stopped_rank_keeps_entering_the_drift_checks_gather` timed out once in CI on Python 3.12 with PyTorch 2.6 (Nov 19, 2026) and passed on a re-run. The log does not say where the two ranks stopped; a rank left waiting in a gather is what this project must not do, so a pass on re-run does not close it. Lane X2 (wave X) did not find the cause: 550 two-rank runs with no hang (300 under CPU load) and 3,600 randomized runs with no mismatch in the stopped rank's gather schedule, all on PyTorch 2.15 on macOS, which says little about PyTorch 2.6 on Linux. The test now prints each rank's progress and every thread's stack if it times out again.
-- **Before the GPU runs:** replica drift names the rank (D1 / Q4, the author's decision of Nov 19, 2026; pending, not started). L9, which stood here, is fixed (lane X1).
+- **Before the GPU runs:** replica drift names the rank (D1 / Q4, the author's decision of Nov 19, 2026; pending, not started). L9, which stood here, is fixed (lane X1). Also XC1 and XC2 (section 10): the healthy control can pass with nothing recorded, and the replica driver refuses eight ranks.
 - **Before a release:** the three P1 rows, each fixed in part: SDK-22, C03 and C06. SDK-22's open part needs the author's decision. C03's open part is now only the incident's wording (Nov 19, 2026).
+- **Found by the cross-check, not fixed, and not counted in the 16:** XC1 to XC10 (section 10). XC10 means the Linux CI result says less than it seems to: the server-dependent suites of lanes V7, W2 and W3 have not run there.
 - **Found during waves V, W and X, not fixed, and not counted in the 16:**
   - L13 to L18 (section 7), from wave X. L13 blocks the rest of C12.
   - `activation_drift` fires on healthy small trainings, now including single-leaf models (section 9). It needs thresholds checked on a real job.
