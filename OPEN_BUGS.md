@@ -43,7 +43,7 @@ There were 72 when this file was written. Waves V and W closed 51 of them in fou
 
 | ID | Issue | Checked | State |
 |---|---|---|---|
-| C03 | **Open part after M4, accepted for v1 by the author:** if every stop notice is lost and the server sees a clean close, the run reads `finished`. Also open: a stopped rank that then reads `unresponsive` or `lost` still raises `job_stalled` or `rank_silent` on the Python side. Fixed (lanes W1, W2, W3, contract 3): the heartbeat says capture stopped on every beat, the server has a state and a summary word of its own for it that survive a restart, and a run with such a rank never reads healthy | Run (W1, W2, W3; the lifecycle test) | Fixed in part |
+| C03 | **Open part after M4, accepted for v1 by the author:** if every stop notice is lost and the server sees a clean close, the run reads `finished`. Not a bug, by the author's decision of Nov 19, 2026 ("yes keep raising"): a stopped rank that then reads `unresponsive` or `lost` raises `job_stalled` or `rank_silent`, in both engines, as contract 3 has it; such a rank still sends heartbeats, so their stopping is new evidence. Still open from that decision: the incident does not say that capture had stopped earlier, at which step and why, so a reader cannot see that TensorQuill cannot tell whether training itself stalled (both engines, not started). Fixed (lanes W1, W2, W3, contract 3): the heartbeat says capture stopped on every beat, the server has a state and a summary word of its own for it that survive a restart, and a run with such a rank never reads healthy | Run (W1, W2, W3; the lifecycle test) | Fixed in part |
 | C06 | **Open part after M4:** the length check accepts any whole multiple of the token count, whatever `top_k` says. Fixed (lane W1): a negative index is no assignment, counted and written as `moe_unassigned`; an index at or above `n_experts` refuses the router with a reason; the `indices=` path follows the same rule; `moe_left_out` records the routing-map entries left out, per expert | Run (W1) | Fixed in part |
 
 ### P2, P3, Medium and Low
@@ -143,7 +143,7 @@ Not from either review. Not counted in the 72.
 
 - **First:** find why `test_a_stopped_rank_keeps_entering_the_drift_checks_gather` timed out once in CI on Python 3.12 with PyTorch 2.6 (Nov 19, 2026) and passed on a re-run. The log does not say where the two ranks stopped; a rank left waiting in a gather is what this project must not do, so a pass on re-run does not close it.
 - **Before the GPU runs:** L9 (section 7). The lead optimizer is held by a weak reference to the first optimizer that ever stepped; a user who rebuilds an optimizer and keeps the old one gets no steps counted, silently.
-- **Before a release:** the three P1 rows, each fixed in part: SDK-22, C03 and C06. SDK-22's open part needs the author's decision.
+- **Before a release:** the three P1 rows, each fixed in part: SDK-22, C03 and C06. SDK-22's open part needs the author's decision. C03's open part is now only the incident's wording (Nov 19, 2026).
 - **Found during waves V and W, not fixed, and not counted in the 20:**
   - L9, above.
   - `activation_drift` fires on healthy small trainings, now including single-leaf models (section 9). It needs thresholds checked on a real job.
