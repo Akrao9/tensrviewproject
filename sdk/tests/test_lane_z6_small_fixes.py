@@ -353,9 +353,12 @@ def test_z6_a_resume_from_a_checkpoint_holding_only_a_dotted_cache_finds_the_mod
 def test_z6_known_limit_a_cache_under_a_name_that_is_not_cache_is_still_the_model(key, entries):
     """KNOWN LIMIT, not closed (today's behaviour, pinned). Only a name that says `cache` vetoes
     the key evidence; a mapping of non-parameter tensors under any other name with a dotted or
-    `*_weight` key, or under a model's name, is still the model. Narrowing the dotted or suffix
-    rule would make real models (a ViT's `encoder.cls_token`, `MultiheadAttention(kdim=...)`'s
-    `q_proj_weight`) missed instead."""
+    `*_weight` key, or under a model's name, is still the model. Narrowing the dotted rule (a
+    dotted key counting only when its last part is a parameter name) was not tried: it would
+    close `layers.0.k` but miss a model whose every key is a custom name in a submodule
+    (`blocks.0.scale`). `loss_weight` cannot be told from a custom `pos_weight` parameter by
+    its name. (Real `torch.nn` modules have other keys that qualify, so neither change would
+    flip the module sweep below; that is not measured.)"""
     assert checkpoint_manifest({key: entries})["components"]["model"]["keys"] == [key]
 
 
