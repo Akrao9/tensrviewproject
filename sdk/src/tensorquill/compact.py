@@ -36,8 +36,13 @@ COMPACT_VERSION = 1
 # alone, the least that leaves `incident_summary` unchanged (it quotes that step's counts).
 DEFAULT_WINDOW = 5
 # The kinds read from `samples`. The window is taken around each one's `step`: for
-# `starved_experts` that is the first step any expert was starved, not every expert's own.
+# `starved_experts` that is the first step any expert was starved. Each later step an expert's
+# starvation began on gets a window too, up to ONSET_WINDOWS of them, the earliest first (lane X5,
+# DET-13: on the recorded Granite runs 14 experts start at step 49 and six more at 53 to 131,
+# and only 44-54 was kept, so an agent could see none of those six begin). The marker counts the
+# onsets past the bound.
 MOE_KINDS = ("moe_imbalance", "starved_experts")
+ONSET_WINDOWS = 16
 _REBUILD = (
     "The full evidence has them: python -m tensorquill <records> without --compact, or build_evidence()"
 )
@@ -93,6 +98,12 @@ def compact_evidence(evidence: Mapping[str, Any], window: int = DEFAULT_WINDOW) 
                        the full evidence and the last step one had (the server's report has the
                        same key); an incident names only the first
         moe_starved    the same for samples with a starved expert
+        unrouted_before  `[[step, layer], ...]`: a kept range's first step and a router that
+                       routed no token on any step before it in the full evidence, so its
+                       expert-load table there compares with a step that routed none (that
+                       step's sample is kept, with no token to show)
+        starved_onsets_without_window  `{"steps", "first_step"}`, only when later starvation
+                       onsets were past `ONSET_WINDOWS`: how many got no window, and the first
 
     Evidence with no samples (a run without routers, a server's report, the all-ranks view)
     comes back whole, with the marker and nothing left out. Evidence that is already compact
@@ -110,6 +121,14 @@ def compact_evidence(evidence: Mapping[str, Any], window: int = DEFAULT_WINDOW) 
         for i in (incidents if isinstance(incidents, list) else ())
         if isinstance(i, Mapping) and i.get("kind") in MOE_KINDS and isinstance(i.get("step"), int)
     ]
+    anchored = {a["step"] for a in around}
+    onsets = sorted({
+        e["step"] for i in (incidents if isinstance(incidents, list) else ())
+        if isinstance(i, Mapping) and i.get("kind") == "starved_experts" and isinstance(i.get("experts"), list)
+        for e in i["experts"]
+        if isinstance(e, Mapping) and isinstance(e.get("step"), int) and not isinstance(e.get("step"), bool)
+    } - anchored)
+    around += [{"kind": "starved_expert_onset", "step": step} for step in onsets[:ONSET_WINDOWS]]
     flagged = [s for s in samples if _flagged(s)]
     if flagged:
         # `incident_summary` quotes the earliest flagged sample (`first_incident`), incident or not.
@@ -123,19 +142,24 @@ def compact_evidence(evidence: Mapping[str, Any], window: int = DEFAULT_WINDOW) 
         positions.update(range(max(0, at - window), min(len(steps), at + window + (1 if exact else 0))))
     kept_positions = sorted(positions)
     kept_steps = {steps[p] for p in kept_positions}
-    kept = [s for s in samples if int(s["step"]) in kept_steps]
+    ranges = _ranges(steps, kept_positions)
+    unrouted, before = _unrouted_before(samples, [first for first, _ in ranges if first != steps[0]])
+    kept = [s for s in samples if int(s["step"]) in kept_steps or id(s) in before]
     starved = [s for s in samples if s.get("starved")]
     marker = {
         "version": COMPACT_VERSION,
         "window": window,
         "around": around,
-        "kept_steps": _ranges(steps, kept_positions),
+        "kept_steps": ranges,
         "steps": {"total": len(steps), "kept": len(kept_steps), "omitted": len(steps) - len(kept_steps)},
         "samples": {"total": len(samples), "kept": len(kept), "omitted": len(samples) - len(kept)},
         "sampled_steps": [steps[0], steps[-1]] if steps else None,
         "moe_flagged": {"samples": len(flagged), "last_step": max((int(s["step"]) for s in flagged), default=None)},
         "moe_starved": {"samples": len(starved), "last_step": max((int(s["step"]) for s in starved), default=None)},
+        "unrouted_before": unrouted,
     }
+    if onsets[ONSET_WINDOWS:]:
+        marker["starved_onsets_without_window"] = {"steps": len(onsets) - ONSET_WINDOWS, "first_step": onsets[ONSET_WINDOWS]}
     out: dict[str, Any] = {}
     for key, value in evidence.items():
         if key == "samples":
@@ -145,6 +169,39 @@ def compact_evidence(evidence: Mapping[str, Any], window: int = DEFAULT_WINDOW) 
             out[key] = value
     out.setdefault("compact", marker)
     return out
+
+
+def _routed(sample: Mapping[str, Any]) -> bool:
+    """As `expert_load_table` picks the step it compares with: not missing, and tokens routed."""
+    return not sample.get("missing") and sample.get("routed_tokens", 0) > 0
+
+
+def _unrouted_before(samples: list[Mapping[str, Any]], firsts: list[int]) -> tuple[list[list[int]], set[int]]:
+    """For each kept range's first step (`firsts`) and each router, whether the router routed a
+    token on any earlier step of the full evidence. Where it did not, the pair is listed and the
+    router's last earlier sample, which routed none, is kept (by `id`): `expert_load_table`
+    compares the range's steps with it, as on the full evidence, with no delta to show, and no
+    other reader of the samples takes a step with no token routed for one (lane X5, DET-13: the
+    table at such a step was refused although nothing was missing for it)."""
+    by_layer: dict[int, list[Mapping[str, Any]]] = {}
+    for sample in sorted(samples, key=lambda s: int(s["step"])):
+        by_layer.setdefault(int(sample["layer"]), []).append(sample)
+    pairs: list[list[int]] = []
+    keep: set[int] = set()
+    for layer, held in sorted(by_layer.items()):
+        at_steps = [int(s["step"]) for s in held]
+        routed_so_far: list[bool] = []
+        seen = False
+        for sample in held:
+            seen = seen or _routed(sample)
+            routed_so_far.append(seen)
+        for first in firsts:
+            at = bisect_left(at_steps, first)
+            if at == 0 or not routed_so_far[at - 1]:
+                pairs.append([first, layer])
+                if at > 0:
+                    keep.add(id(held[at - 1]))
+    return sorted(pairs), keep
 
 
 def _span(first: int, last: int) -> str:
@@ -163,9 +220,11 @@ def describe(evidence: Mapping[str, Any]) -> str | None:
         return f"compact evidence; all {samples.get('total'):,} per-step samples fit the window, none left out"
     ranges = marker.get("kept_steps") or []
     window = marker.get("window")
+    onset = any(isinstance(a, Mapping) and a.get("kind") == "starved_expert_onset" for a in marker.get("around") or ())
     where = (
         "steps " + ", ".join(_span(a, b) for a, b in ranges)
-        + f" ({window} recorded step{'s' if window != 1 else ''} each side of a MoE incident)"
+        + f" ({window} recorded step{'s' if window != 1 else ''} each side of a MoE incident"
+        + (" or of a later starved expert's onset" if onset else "") + ")"
         if ranges else "no step, since no MoE incident is listed"
     )
     return (
@@ -195,7 +254,9 @@ def require_table(evidence: Mapping[str, Any], step: int, layer: int) -> None:
 
     The table compares a step with the last earlier one on which the router routed tokens.
     At the first step a window keeps, that one is among the steps left out (so with
-    `window=0` no table can be made, and with any larger window the incident's own step can).
+    `window=0` no table can be made, and with any larger window the incident's own step can),
+    unless the router routed no token before the window (`unrouted_before`): then nothing is
+    left out that the table uses.
     """
     marker = _omits(evidence)
     if marker is None:
@@ -208,6 +269,8 @@ def require_table(evidence: Mapping[str, Any], step: int, layer: int) -> None:
     sampled = marker.get("sampled_steps") or [None]
     if found[0] == sampled[0]:
         return  # the run's first steps: nothing was left out before them
+    if [found[0], layer] in (marker.get("unrouted_before") or ()):
+        return  # nothing routed before the window: the step compared with is kept, with no token
     for sample in evidence.get("samples", ()):
         if (
             int(sample["layer"]) == layer and found[0] <= int(sample["step"]) < step

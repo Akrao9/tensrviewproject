@@ -284,3 +284,73 @@ def test_cli14_an_attention_incident_points_at_the_attention_series():
     assert call["arguments"] == {"name": ATTN, "kind": "attention", "stat": "entropy_share", "rank": 1}
     growth = {"kind": "attention_logit_growth", "step": 40, "modules": [{"module": ATTN, "value": 90.0, "baseline": 9.0}]}
     assert mcp_server._look_next(growth)[0]["arguments"] == {"name": ATTN, "kind": "attention", "stat": "max_logit"}
+
+
+# --- DET-13 -----------------------------------------------------------------------------------
+#
+# Hand-built evidence of two routers of four experts over 200 steps, with an imbalance at 100.
+# Router 1 routes no token before step 97; router 2 routes from step 0.
+
+
+def sample(step: int, layer: int, counts: list[int], **flags: Any) -> dict[str, Any]:
+    return {"step": step, "layer": layer, "router": f"model.layers.{layer}.mlp.router", "counts": counts,
+            "routed_tokens": sum(counts), "diversity": 0.9, "overloaded": [], "dead": [], "starved": [], **flags}
+
+
+def moe_evidence(*, quiet_until: int = 97, incidents: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    samples = []
+    for step in range(200):
+        samples.append(sample(step, 1, [0, 0, 0, 0] if step < quiet_until else [10 + step % 3, 10, 10, 10]))
+        samples.append(sample(step, 2, [12, 9 + step % 2, 10, 10]))
+    return {"run_id": RUN, "expert_count": 4, "layer_count": 2, "samples": samples,
+            "incidents": incidents if incidents is not None else [{"kind": "moe_imbalance", "step": 100, "layer": 2}]}
+
+
+def test_det13_a_window_whose_router_routed_nothing_before_it_still_has_its_table():
+    from tensorquill.compact import SamplesOmitted, compact_evidence
+
+    full = moe_evidence()
+    small = json.loads(json.dumps(compact_evidence(full, window=3)))  # as read back from the file
+    assert small["compact"]["kept_steps"] == [[97, 103]]
+    # Router 1 routed no token before the window: the full evidence compares step 97 with the
+    # last earlier step, which routed none ("n/a" deltas). The compact file gives that table.
+    for step in (97, 98, 103):
+        assert tensorquill.expert_load_table(small, step, 1) == tensorquill.expert_load_table(full, step, 1)
+    assert tensorquill.expert_load_table(small, 97, 1).splitlines()[0] == "**Layer 01 expert load** · step 97 vs. 96"
+    # The step it is compared with routed nothing, so it is none of the samples other readers use.
+    from tensorquill import mcp_server
+
+    assert [s for s, _ in mcp_server._sample_rows("model.layers.1.mlp.router", small, None)] == list(range(97, 104))
+    # Router 2 routed before the window, and that step is left out: still refused, never +0.00.
+    with pytest.raises(SamplesOmitted, match="compared with the last earlier step"):
+        tensorquill.expert_load_table(small, 97, 2)
+    assert tensorquill.expert_load_table(small, 98, 2) == tensorquill.expert_load_table(full, 98, 2)
+    # A compact file written before the marker said so refuses as it did.
+    old = json.loads(json.dumps(small))
+    old["compact"].pop("unrouted_before")
+    with pytest.raises(SamplesOmitted, match="compared with"):
+        tensorquill.expert_load_table(old, 97, 1)
+
+
+def test_det13_a_later_starvation_onset_gets_a_window_of_its_own():
+    from tensorquill.compact import ONSET_WINDOWS, compact_evidence
+
+    experts = [{"layer": 2, "expert": 1, "step": 40, "window_share": 0.001},
+               {"layer": 2, "expert": 2, "step": 40, "window_share": 0.002},
+               {"layer": 1, "expert": 3, "step": 150, "window_share": 0.003}]
+    starved = {"kind": "starved_experts", "step": 40, "experts": experts}
+    full = moe_evidence(quiet_until=0, incidents=[{"kind": "moe_imbalance", "step": 100, "layer": 2}, starved])
+    marker = compact_evidence(full, window=2)["compact"]
+    assert marker["around"] == [{"kind": "moe_imbalance", "step": 100}, {"kind": "starved_experts", "step": 40},
+                                {"kind": "starved_expert_onset", "step": 150}]
+    assert marker["kept_steps"] == [[38, 42], [98, 102], [148, 152]]
+    assert "starved_onsets_without_window" not in marker
+
+    # Onsets are bounded: past ONSET_WINDOWS later onset steps, the marker counts the rest.
+    many = [{"layer": 1, "expert": 1, "step": 40, "window_share": 0.0}] + [
+        {"layer": 1, "expert": 2 + n, "step": 50 + 4 * n, "window_share": 0.0} for n in range(ONSET_WINDOWS + 3)]
+    full = moe_evidence(quiet_until=0, incidents=[{"kind": "starved_experts", "step": 40, "experts": many}])
+    marker = compact_evidence(full, window=0)["compact"]
+    onsets = [a["step"] for a in marker["around"] if a["kind"] == "starved_expert_onset"]
+    assert onsets == [50 + 4 * n for n in range(ONSET_WINDOWS)]
+    assert marker["starved_onsets_without_window"] == {"steps": 3, "first_step": 50 + 4 * ONSET_WINDOWS}
