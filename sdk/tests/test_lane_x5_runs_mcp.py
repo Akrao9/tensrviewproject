@@ -169,3 +169,118 @@ def test_det17_a_store_with_a_stray_rank_folder_is_not_listed_as_a_run(tmp_path)
     (store / "real" / "rank=0").mkdir(parents=True)
     (store / "stray" / "rank=٣").mkdir(parents=True)
     assert [run["run_id"] for run in runs_module.discover_runs(tmp_path / "store")] == ["real"]
+
+
+# --- CLI-14 -----------------------------------------------------------------------------------
+#
+# The probe's head numbers (`probe.head`) and attention statistics (`probe.attention`) are
+# served by `get_series` as kinds `head` and `attention`, read from the rank's step records as
+# every other series is: the same rank and attempt handling, `max_points`, `start` and `end`.
+
+HEAD, ATTN = "lm_head", "model.layers.0.self_attn"
+
+
+def probed(attempt: int, steps: range, first_ts: float, *, rank: int = 0, scale: float = 1.0,
+           every: int = 5) -> list[dict[str, Any]]:
+    out = rows(attempt, steps, first_ts, rank=rank)
+    for record in out:
+        step = record["step"]
+        if step % every:
+            continue
+        head = {"module": HEAD, "found_by": "output_embeddings", "positions": 64, "nonfinite_positions": 0,
+                "vocab": 100, "calls": 1, "input_dtype": "bfloat16", "weight_dtype": "bfloat16",
+                "norm": scale * (10.0 + step), "mean": -0.5, "log_z": 4.0, "gap": 0.01, "gap_relative": 0.001}
+        if step == 15:
+            head = {"module": HEAD, "found_by": "output_embeddings", "not_read": "the head was not called"}
+        record["probe"] = {
+            "histograms": {},
+            "head": head,
+            "attention": {ATTN: {"max_logit": [scale * step, 2.0, float("-inf")], "entropy": [1.0, 1.0, 1.0],
+                                 "entropy_share": [0.2, 0.4, float("nan")], "masked_rows": 0, "invalid_rows": 0,
+                                 "rows": 96, "query_len": 8, "key_len": 8, "map": [[0.5, 0.5], [0.5, 0.5]]}},
+        }
+    return out
+
+
+def series(path: Path, **arguments: Any) -> dict[str, Any]:
+    from tensorquill import mcp_server
+
+    return mcp_server.get_series(mcp_server.Source(path), arguments)
+
+
+def series_error(path: Path, **arguments: Any) -> str:
+    from tensorquill import mcp_server
+
+    with pytest.raises(mcp_server.ToolError) as error:
+        mcp_server.get_series(mcp_server.Source(path), arguments)
+    return str(error.value)
+
+
+def test_cli14_the_head_series_is_served_from_the_probes_that_read_the_head(tmp_path):
+    capture = write(tmp_path / "x.jsonl", probed(1, range(0, 50), 1000.0))
+    answer = series(capture, name=HEAD)
+    assert answer["kind"] == "head"
+    # Probes at every fifth step; the one at 15 did not read the head, so it is not a point.
+    assert answer["steps"] == [0, 5, 10, 20, 25, 30, 35, 40, 45]
+    assert answer["values"]["norm"][:3] == [10.0, 15.0, 20.0]
+    assert {"norm", "mean", "log_z", "gap", "gap_relative", "positions"} <= set(answer["values"])
+    # Text fields are not series: no column counted as not finite.
+    assert not {"module", "found_by", "input_dtype", "weight_dtype"} & set(answer["values"])
+    assert answer["over_range"]["norm"]["max"] == 55.0 and "not_finite" not in answer["over_range"]["norm"]
+    assert series(capture, name=HEAD, kind="head", stat="gap")["values"] == {"gap": [0.01] * 9}
+
+
+def test_cli14_the_attention_series_is_the_numbers_the_detectors_judge(tmp_path):
+    capture = write(tmp_path / "x.jsonl", probed(1, range(0, 50), 1000.0))
+    answer = series(capture, name=ATTN)
+    assert answer["kind"] == "attention" and len(answer["steps"]) == 10
+    # The mean of the heads' finite entropy shares, the largest finite logit, the heads counted.
+    assert answer["values"]["entropy_share"][0] == pytest.approx(0.3)
+    assert answer["values"]["max_logit"][:3] == [2.0, 5.0, 10.0]
+    assert answer["values"]["heads"] == [2] * 10
+    assert "map" not in answer["values"] and "entropy" not in answer["values"]
+
+
+def test_cli14_probe_series_keep_the_bounds_errors_rank_and_attempt_handling(tmp_path):
+    # Thinned to max_points with the stride said, and start and end narrow the range.
+    long = write(tmp_path / "long.jsonl", probed(1, range(0, 400), 1000.0, every=1))
+    thinned = series(long, name=HEAD, max_points=10)
+    assert thinned["points"] <= 10 and thinned["stride"] > 1 and "note" in thinned
+    assert series(long, name=ATTN, start=100, end=104)["steps"] == [100, 101, 102, 103, 104]
+    # A resume from step 22 rolls back attempt 1's later probes: they are not the run's.
+    resumed = write(tmp_path / "resumed.jsonl", probed(1, range(0, 40), 1000.0) + probed(2, range(22, 40), 2000.0, scale=-1.0))
+    answer = series(resumed, name=HEAD, stat="norm")
+    assert answer["steps"] == [0, 5, 10, 20, 25, 30, 35]
+    assert answer["values"]["norm"] == [10.0, 15.0, 20.0, 30.0, -35.0, -40.0, -45.0]
+    # rank= reads that rank's own records.
+    two = write(tmp_path / "two.jsonl", probed(1, range(0, 20), 1000.0) + probed(1, range(0, 20), 1000.0, rank=1, scale=3.0))
+    assert series(two, name=HEAD, rank=1, stat="norm")["values"]["norm"][:2] == [30.0, 45.0]
+    assert series(two, name=HEAD, stat="norm")["values"]["norm"][:2] == [10.0, 15.0]
+    # The errors other series give.
+    assert "is a head here, not a layer" in series_error(two, name=HEAD, kind="layer")
+    assert "no head is named 'lm_heads'" in series_error(two, name="lm_heads", kind="head")
+    assert f"{HEAD} (head)" in series_error(two, name="lm_heads", kind="head")
+    assert "has no `max`" in series_error(two, name=ATTN, stat="max")
+    assert "`expert` is for a router's series" in series_error(two, name=ATTN, expert=1)
+    assert "rank 4 is not in the capture" in series_error(two, name=HEAD, rank=4)
+
+
+def test_cli14_a_name_that_is_also_a_layer_stays_the_layer_unless_kind_says_otherwise(tmp_path):
+    records = probed(1, range(0, 20), 1000.0)
+    for record in records:
+        record["layers"] = {ATTN: {"mean": 1.0, "std": 2.0, "abs_max": 3.0, "zero_frac": 0.0}}
+    capture = write(tmp_path / "x.jsonl", records)
+    layer = series(capture, name=ATTN)
+    assert layer["kind"] == "layer" and len(layer["steps"]) == 20  # as before the probe kinds were served
+    assert "kind='attention'" in layer["also"]
+    assert series(capture, name=ATTN, kind="attention")["kind"] == "attention"
+
+
+def test_cli14_an_attention_incident_points_at_the_attention_series():
+    from tensorquill import mcp_server
+
+    incident = {"kind": "attention_collapse", "step": 40, "modules": [{"module": ATTN, "value": 0.01, "baseline": 0.3}]}
+    (call,) = mcp_server._look_next(incident, rank=1)
+    assert call["arguments"] == {"name": ATTN, "kind": "attention", "stat": "entropy_share", "rank": 1}
+    growth = {"kind": "attention_logit_growth", "step": 40, "modules": [{"module": ATTN, "value": 90.0, "baseline": 9.0}]}
+    assert mcp_server._look_next(growth)[0]["arguments"] == {"name": ATTN, "kind": "attention", "stat": "max_logit"}
