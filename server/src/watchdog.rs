@@ -1511,6 +1511,18 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
             .iter()
             .map(|incident| incident["kind"].as_str().unwrap_or_default().to_string()),
     );
+    // A `replica_drift` the server raised from the ranks' observations (contract 5) is a finding
+    // about the run, carried in the status's `replica` object, not in any rank's report. One raised
+    // from a gathered spread (`source: "replica_spread"`) is not counted here: the per-rank rule
+    // raises it in that rank's report, which is counted above.
+    listed.extend(
+        status["replica"]["replica_drift"]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .filter(|incident| incident["source"] == "replica")
+            .map(|_| "replica_drift".to_string()),
+    );
     let (observed, counted): (Vec<String>, Vec<String>) = listed
         .into_iter()
         .partition(|kind| crate::detect::incident_class(kind) == Some("observation"));

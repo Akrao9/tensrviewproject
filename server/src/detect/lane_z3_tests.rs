@@ -316,3 +316,28 @@ fn a_fingerprint_written_as_a_string_is_read() {
     let result = compare(&[a, b], 1e-6);
     assert_eq!(result["steps"][0]["fingerprints"], "drift");
 }
+
+/// The server's run state counts a drift raised from observations, once each; one raised from a
+/// gathered spread is counted from the rank's own report, as before, and not again.
+#[test]
+fn the_run_state_counts_a_drift_raised_from_observations() {
+    let reports = std::collections::BTreeMap::new();
+    let mut status = json!({"summary": "active", "server_running": true, "ranks": [], "incidents": [],
+        "replica": {"v": 1, "tolerance": 1e-6, "steps": [], "replica_drift": [
+            {"step": 99, "parameters": ["w"], "source": "replica", "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47", "group": [0, 1]},
+            {"step": 99, "parameters": ["w"], "source": "replica_spread"}]}});
+    let state = crate::watchdog::run_state(&status, &reports, true);
+    assert_eq!(state["state"], "unhealthy");
+    assert_eq!(state["reasons"][0]["kinds"], json!(["replica_drift"]));
+    assert_eq!(state["reasons"][0]["detail"], "1 incident listed: replica_drift");
+    status["replica"]["replica_drift"] = json!([{"step": 99, "parameters": ["w"], "source": "replica_spread"}]);
+    let state = crate::watchdog::run_state(&status, &reports, true);
+    assert!(
+        state["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["code"] != "incidents"),
+        "{state}"
+    );
+}

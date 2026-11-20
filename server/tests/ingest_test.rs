@@ -1124,6 +1124,9 @@ mod store {
         /// new attempt and read once per rank a server takes up.
         pub order_gets: AtomicUsize,
         pub order_puts: AtomicUsize,
+        /// Reads of a run's `watchdog.json`, also counted in `gets`: a server reads it once per run to
+        /// take up the replica result it carries (lane Z3, Nov 20, 2026).
+        pub status_gets: AtomicUsize,
         /// The next this-many writes of an `attempts.json` fail (and are not stored).
         pub fail_order_puts: AtomicUsize,
         /// The next this-many writes of an `incidents.json` fail (and are not stored); other writes
@@ -1267,6 +1270,9 @@ mod store {
                     self.knobs.order_gets.fetch_add(1, Ordering::SeqCst);
                     self.wait().await;
                     return self.inner.get_opts(location, options).await;
+                }
+                if location.as_ref().ends_with("watchdog.json") {
+                    self.knobs.status_gets.fetch_add(1, Ordering::SeqCst);
                 }
                 let whole = !matches!(options.range, Some(GetRange::Suffix(_) | GetRange::Bounded(_)));
                 if whole {
@@ -3465,7 +3471,10 @@ async fn a_report_whose_write_failed_is_written_again_without_a_later_part() {
         assert!(tokio::time::Instant::now() < deadline, "the report was never written");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let rebuilds_before = store.knobs.gets.load(Ordering::SeqCst);
+    // Reads of parts and reports; not the one read of the run's status that takes up its replica
+    // result (lane Z3).
+    let reads = || store.knobs.gets.load(Ordering::SeqCst) - store.knobs.status_gets.load(Ordering::SeqCst);
+    let rebuilds_before = reads();
     // Nothing more is sent. The flusher's pass, about once a second here, writes the report again.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -3487,7 +3496,7 @@ async fn a_report_whose_write_failed_is_written_again_without_a_later_part() {
         "{report}"
     );
     // The report came from the detectors held, not from a rebuild that read the rank's parts again.
-    assert_eq!(store.knobs.gets.load(Ordering::SeqCst), rebuilds_before);
+    assert_eq!(reads(), rebuilds_before);
     put.finish().await;
 }
 
