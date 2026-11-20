@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, StringArray};
+use arrow::array::{Int32Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Map, Value};
 
@@ -457,8 +457,53 @@ pub fn detect_run(batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Resu
         "ranks_compared": compared,
         "duplicate_batches": found,
         "incidents": incidents,
+        "replica": replica(&by_rank, thresholds.drift_tolerance),
         "reports": reports,
     }))
+}
+
+/// The run's replica result (contract 8), as the live server writes it under `replica` in the run's
+/// `watchdog.json`: `{"v", "tolerance", "steps", "replica_drift"}`, with `legacy` when there is one,
+/// from the same rows through the same comparison (`replica::Comparison`), and the empty result for
+/// a run with no observation, as the live server writes it (lane AA3, Nov 20, 2026; until then only
+/// the live server computed it). An attempt's place in its rank's order is where it first appears in
+/// the rank's rows (contract 1; the inputs are grouped by attempt in the order first seen, which
+/// is how the SDK's `stream_order` sends them).
+///
+/// No bound is applied, as for any reader of a finished list of records (`replica::compare`, the
+/// Python reader): the result is the live server's for every run whose bounds dropped nothing, and
+/// lists every step where the live server keeps the last 256 and says what it let go under
+/// `omitted`, which a reader comparing the two leaves out (contract 8).
+fn replica(by_rank: &BTreeMap<i32, Vec<RecordBatch>>, tolerance: f64) -> Value {
+    use super::replica::{records_from_batch, Bounds, Comparison};
+    let mut first_seen: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    for (rank, pieces) in by_rank {
+        let seen = first_seen.entry(i64::from(*rank)).or_default();
+        for piece in pieces {
+            let Some(attempts) = column::<Int64Array>(piece, "attempt") else {
+                continue; // no attempt column: no observation is read from it (`records_from_batch`)
+            };
+            for attempt in attempts.iter().flatten() {
+                if !seen.contains(&attempt) {
+                    seen.push(attempt);
+                }
+            }
+        }
+    }
+    let place = |rank: i64, attempt: i64| {
+        first_seen
+            .get(&rank)
+            .and_then(|seen| seen.iter().position(|known| *known == attempt))
+    };
+    let mut comparison = Comparison::new(tolerance, Bounds::none());
+    for (rank, pieces) in by_rank {
+        for piece in pieces {
+            for record in records_from_batch(piece, i64::from(*rank), tolerance) {
+                comparison.insert(record, &place);
+            }
+        }
+    }
+    comparison.status_object()
 }
 
 // --- resumes -------------------------------------------------------------------------------

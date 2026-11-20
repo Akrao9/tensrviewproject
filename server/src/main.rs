@@ -124,9 +124,11 @@ enum Command {
         samples: bool,
         /// Read every rank of one run, not one rank: the rows are grouped by their rank
         /// column, however the ranks are spread over the inputs, and each rank is judged as
-        /// `detect` judges one. Prints the run's document: each rank's report (`reports`), and
-        /// the comparison of the ranks' batch hashes that the server makes for a run's status
-        /// (`duplicate_batches`, and `ranks_compared` for the ranks that had hashes).
+        /// `detect` judges one. Prints the run's document: each rank's report (`reports`), the
+        /// comparison of the ranks' batch hashes that the server makes for a run's status
+        /// (`duplicate_batches`, and `ranks_compared` for the ranks that had hashes), and the
+        /// ranks' replica comparison the server writes under `replica` (`v`, `tolerance`, `steps`,
+        /// `replica_drift`, and `legacy` when there is one), with no bound on the steps listed.
         #[arg(long)]
         run: bool,
     },
