@@ -290,7 +290,10 @@ def _open_local_all_ranks(run: Mapping[str, Any], files: Mapping[int, Path], fir
     per_rank = {}
     for number, own in sorted(by_rank.items()):
         per_rank[number] = {**build_evidence(own, run_manifest=run.get("manifest") or {}), "last_step": _last_step(own)}
-    combined = combine_rank_evidence(per_rank, unknown_ranks=unknown)
+    # SDK-22: the ranks' replica observations are compared across ranks from every rank's records
+    # as written (each rank's in its own order, a rank of several files in its attempts' order).
+    combined = combine_rank_evidence(per_rank, unknown_ranks=unknown,
+                                     replica_records=[r for n in sorted(by_rank) for r in by_rank[n]])
     last = combined.get("last_step")
     ranks = sorted(set(per_rank) | set(unknown))
     over = _world_over_cap(run.get("manifest"))
