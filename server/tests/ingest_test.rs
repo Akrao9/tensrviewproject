@@ -3490,3 +3490,64 @@ async fn a_report_whose_write_failed_is_written_again_without_a_later_part() {
     assert_eq!(store.knobs.gets.load(Ordering::SeqCst), rebuilds_before);
     put.finish().await;
 }
+
+/// RS10's stderr line. Each rank of each run has its own limit on the dropped-row line: a second
+/// rank that drops rows inside the first rank's 10 s gets a line of its own. Until Nov 20, 2026 one
+/// limit served every rank, and the second rank's drop showed only in a later line's total, if a
+/// later line came.
+#[cfg(unix)]
+#[tokio::test]
+async fn each_rank_gets_its_own_dropped_row_line_on_stderr() {
+    use std::io::{BufRead, BufReader, Read};
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
+        .args(["--listen", "127.0.0.1:0", "--watchdog-seconds", "0", "--no-detect"])
+        .arg("--store")
+        .arg(dir.path())
+        .env_remove("TENSORQUILL_TOKEN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let address = line
+        .trim()
+        .strip_prefix("tensorquill-server listening on ")
+        .unwrap_or_else(|| panic!("{line}"))
+        .to_string();
+    let address = format!("http://{address}");
+    // Both batches are sent before either is acknowledged, which the binary does at its timed
+    // flush (10 s), so the two drops come well inside one interval.
+    let mut puts = Vec::new();
+    for rank in [0, 1] {
+        let mut put = open_with(&address, RUN, rank, None, nullable_key_schema()).await;
+        put.send(
+            nullable_key_batch(&[
+                (Some(RUN), Some(rank), Some(1), Some(0)),
+                (Some(RUN), Some(rank), Some(1), None),
+            ]),
+            10,
+        )
+        .await;
+        puts.push(put);
+    }
+    for (rank, mut put) in puts.into_iter().enumerate() {
+        assert_eq!(put.ack().await, Ok(10), "rank {rank}");
+        put.finish().await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    for rank in [0, 1] {
+        assert!(
+            stderr.contains(&format!(
+                "{RUN} rank {rank}: dropped rows that cannot be stored: 1 with a null step"
+            )),
+            "no line for rank {rank}: {stderr}"
+        );
+    }
+}

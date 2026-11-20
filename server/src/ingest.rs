@@ -364,9 +364,10 @@ pub struct Ingest {
     /// Streams that ended in an error, and the lines written about them (RUST-18).
     stream_errors: std::sync::atomic::AtomicU64,
     error_log: Mutex<ErrorLog>,
-    /// Rows dropped for a null key, by the key, and the lines written about them (RS10).
+    /// Rows dropped for a null key, by the key, and the lines written about them, held per rank so
+    /// one rank's line never holds back another's (RS10).
     dropped_rows: Mutex<BTreeMap<&'static str, u64>>,
-    dropped_log: Mutex<ErrorLog>,
+    dropped_log: Mutex<HashMap<Key, ErrorLog>>,
     /// Runs whose status has read finished or abandoned, and been written so (or, with the file
     /// off, has read so), since when: let go of after `evict_after` (see `evict_settled`).
     settled: Mutex<HashMap<String, Instant>>,
@@ -401,7 +402,7 @@ impl Ingest {
             stream_errors: std::sync::atomic::AtomicU64::new(0),
             error_log: Mutex::new(ErrorLog::default()),
             dropped_rows: Mutex::new(BTreeMap::new()),
-            dropped_log: Mutex::new(ErrorLog::default()),
+            dropped_log: Mutex::new(HashMap::new()),
             settled: Mutex::new(HashMap::new()),
             order_locks: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
@@ -425,8 +426,9 @@ impl Ingest {
     }
 
     /// Rows of `key`'s batch were dropped for a null key (RS10): counted, and written to stderr at
-    /// most once per `STREAM_ERROR_LOG_INTERVAL` with the run, rank, the keys and how many rows,
-    /// never a value the sender sent.
+    /// most once per `STREAM_ERROR_LOG_INTERVAL` per rank with the run, rank, the keys and how many
+    /// rows, never a value the sender sent. (Until Nov 20, 2026 one limit served every rank, and a
+    /// second rank's drop inside the interval showed only in a later line's total.)
     fn rows_dropped(&self, key: &Key, dropped: &[(&'static str, u64)]) {
         let totals = {
             let mut totals = self.dropped_rows.lock().unwrap();
@@ -435,7 +437,14 @@ impl Ingest {
             }
             totals.values().sum::<u64>()
         };
-        let Some(held) = self.dropped_log.lock().unwrap().due(Instant::now()) else {
+        let due = self
+            .dropped_log
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .due(Instant::now());
+        let Some(held) = due else {
             return;
         };
         let which: Vec<String> = dropped
@@ -500,6 +509,7 @@ impl Ingest {
         runs.extend(self.data_windows.lock().unwrap().keys().cloned());
         runs.extend(self.manifests.lock().unwrap().keys().cloned());
         runs.extend(self.written.lock().unwrap().keys().cloned());
+        runs.extend(self.dropped_log.lock().unwrap().keys().map(|key| key.0.clone()));
         runs.len()
     }
 
@@ -1413,6 +1423,7 @@ impl Ingest {
         self.manifests.lock().unwrap().remove(run_id);
         self.written.lock().unwrap().remove(run_id);
         self.order_locks.lock().unwrap().retain(|key, _| key.0 != run_id);
+        self.dropped_log.lock().unwrap().retain(|key, _| key.0 != run_id);
         drop(buffers);
         true
     }
