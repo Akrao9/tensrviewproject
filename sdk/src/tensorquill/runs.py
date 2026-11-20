@@ -269,9 +269,13 @@ def _rank_across_files(paths: list[Path], rank: int, run_id: str | None = None) 
 
 
 def _is_run_folder(folder: Path) -> bool:
+    # `rank=<n>` read as the evidence readers read it, ASCII digits only (lane X5, DET-17: any
+    # folder whose name began `rank=` made a run folder here).
+    from .evidence import _rank_number
+
     try:
         return (folder / _manifest.STORE_MANIFEST).is_file() or (folder / "watchdog.json").is_file() or any(
-            entry.is_dir() and entry.name.startswith("rank=") for entry in os.scandir(folder)
+            entry.is_dir() and _rank_number(entry.name) is not None for entry in os.scandir(folder)
         )
     except OSError:
         return False

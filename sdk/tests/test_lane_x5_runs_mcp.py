@@ -16,6 +16,7 @@ The records are built here, so nothing depends on another lane's test file.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -130,3 +131,41 @@ def test_cli13_the_end_cell_is_the_newest_attempts_file(tmp_path):
     assert write_end_marker(closed, run_id=RUN, rank=0, attempt=1)
     (copy / "x.bak.jsonl").write_bytes(closed.read_bytes())
     assert only_row(copy)["end"]["state"] == "closed"
+
+
+# --- DET-17 -----------------------------------------------------------------------------------
+#
+# `rank=<n>` is ASCII digits, as the server writes it (`server/src/storage.rs`) and as the
+# evidence readers read it (`evidence._rank_number`). `rank=٣` (Arabic-Indic three) passed
+# `isdecimal()` in these modules and was read as rank 3; `²` and `--1` already failed it.
+
+STRAY = ["rank=٣", "rank=²", "rank=--1", "rank=+1", "rank= 1", "rank=x"]
+
+
+def test_det17_every_module_reads_rank_folders_with_the_evidence_readers_parser(tmp_path):
+    from tensorquill import manifest as manifest_module
+    from tensorquill import mcp_server
+    from tensorquill.evidence import _rank_number
+
+    for name in [*STRAY, "rank=3", "rank=0"]:
+        folder = tmp_path / "runs" / "r" / name
+        folder.mkdir(parents=True)
+        is_rank = _rank_number(name) is not None
+        # The manifest of a rank folder is its run folder's; any other folder's is its own.
+        (where,) = manifest_module.manifest_candidates(folder)
+        assert where == (folder.parent if is_rank else folder) / manifest_module.STORE_MANIFEST, name
+        # The MCP server started on a rank folder reads that rank of its run folder.
+        kind, path, rank = mcp_server.Source(folder).locate()
+        assert (kind, path, rank) == (("store", folder.parent, _rank_number(name)) if is_rank else ("store", folder, None)), name
+        # A folder that holds only such a folder is a run folder only for a real rank folder.
+        lone = tmp_path / "lone" / name.replace("=", "_") / "runid"
+        (lone / name).mkdir(parents=True)
+        assert runs_module._is_run_folder(lone) is is_rank, name
+        shutil.rmtree(folder)
+
+
+def test_det17_a_store_with_a_stray_rank_folder_is_not_listed_as_a_run(tmp_path):
+    store = tmp_path / "store" / "runs"
+    (store / "real" / "rank=0").mkdir(parents=True)
+    (store / "stray" / "rank=٣").mkdir(parents=True)
+    assert [run["run_id"] for run in runs_module.discover_runs(tmp_path / "store")] == ["real"]

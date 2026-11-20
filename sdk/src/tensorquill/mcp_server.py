@@ -54,6 +54,7 @@ from .evidence import (
     SERVER_KINDS,
     _discover_rank_folders,
     _parquet_parts,
+    _rank_number,  # the one reader of `rank=<n>`: ASCII digits (lane X5, DET-17: `isdecimal()` took `rank=٣`)
     all_ranks_evidence,
     all_ranks_kinds,
     build_evidence,
@@ -137,11 +138,6 @@ def _parts_stamp(folder: Path, rank: int) -> tuple[tuple[str, int | None, int | 
         else:
             found.append((str(part), stat.st_mtime_ns, stat.st_size))
     return tuple(found)
-
-
-def _rank_number(name: str) -> int | None:
-    key, _, value = name.partition("=")
-    return int(value) if key == "rank" and value.isdecimal() else None
 
 
 def _rank_of(record: Mapping[str, Any]) -> int:
