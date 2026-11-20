@@ -1126,6 +1126,9 @@ mod store {
         pub order_puts: AtomicUsize,
         /// The next this-many writes of an `attempts.json` fail (and are not stored).
         pub fail_order_puts: AtomicUsize,
+        /// The next this-many writes of an `incidents.json` fail (and are not stored); other writes
+        /// are not touched (L17).
+        pub fail_incident_puts: AtomicUsize,
     }
 
     #[derive(Debug)]
@@ -1191,6 +1194,18 @@ mod store {
                     } else {
                         self.inner.put_opts(location, payload, opts).await
                     };
+                }
+                if location.as_ref().ends_with("incidents.json")
+                    && self
+                        .knobs
+                        .fail_incident_puts
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                        .is_ok()
+                {
+                    return Err(object_store::Error::Generic {
+                        store: "TestStore",
+                        source: "injected failure of a report".into(),
+                    });
                 }
                 self.knobs.puts.fetch_add(1, Ordering::SeqCst);
                 let now = self.knobs.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3424,4 +3439,54 @@ async fn rows_dropped_for_a_null_key_are_counted_in_their_own_runs_status() {
         serde_json::json!({"run_id": 1, "step": 2})
     );
     assert_eq!(statuses[other]["ranks"][0]["dropped_rows"], 1, "{}", statuses[other]);
+}
+
+/// L17. When writing a rank's `incidents.json` fails, the report is written again by the timed
+/// flush once a short wait has passed, from the detectors the rank holds: no later part has to
+/// come. Until Nov 20, 2026 the rank kept its detectors and had no report, and only its next part
+/// wrote one; a rank that sent nothing more stayed unjudged for good.
+#[tokio::test]
+async fn a_report_whose_write_failed_is_written_again_without_a_later_part() {
+    use std::sync::atomic::Ordering;
+    let store = TestStore::new();
+    let config = IngestConfig {
+        flush_steps: 10,
+        replay_backoff: Duration::from_millis(100),
+        ..manual()
+    };
+    let server = start_on(store.clone(), config, None).await;
+    store.knobs.fail_incident_puts.store(1, Ordering::SeqCst);
+    let mut put = open_with(&server.address, RUN, 0, None, data_attempt_schema()).await;
+    put.send(data_attempt_batch(1, 0..10), 1).await;
+    assert_eq!(put.ack().await, Ok(1), "the part is stored and acknowledged");
+    // The part was judged and its report's write failed.
+    let deadline = tokio::time::Instant::now() + SLOW_BOUND;
+    while store.knobs.fail_incident_puts.load(Ordering::SeqCst) > 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the report was never written");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let rebuilds_before = store.knobs.gets.load(Ordering::SeqCst);
+    // Nothing more is sent. The flusher's pass, about once a second here, writes the report again.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = written_status(&server, &store).await;
+        if judged(&status) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never judged without a later part: {}",
+            status["run_state"]
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let report = json_in(&store, &format!("runs/{RUN}/rank=0/incidents.json")).await;
+    assert_eq!(
+        (&report["attempt"], &report["last_step"]),
+        (&serde_json::json!(1), &serde_json::json!(9)),
+        "{report}"
+    );
+    // The report came from the detectors held, not from a rebuild that read the rank's parts again.
+    assert_eq!(store.knobs.gets.load(Ordering::SeqCst), rebuilds_before);
+    put.finish().await;
 }

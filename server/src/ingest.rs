@@ -139,7 +139,8 @@ pub struct IngestConfig {
     pub report_grace: Duration,
     /// After a rebuild of a rank's detectors from the store fails, the wait before it is tried
     /// again, at the rank's next part or by the timed flush, whichever comes first; it doubles with
-    /// each failure in a row (see `Ingest::detect`).
+    /// each failure in a row (see `Ingest::detect`). The same wait, doubled the same way, is kept
+    /// after a failed write of a rank's `incidents.json`, which the timed flush then tries again.
     pub replay_backoff: Duration,
     /// A run whose status has read finished or abandoned, and been written so, for this long is
     /// let go of: nothing of it is held in memory (see `Ingest::evict_settled`).
@@ -281,6 +282,11 @@ struct RankBuffer {
     /// Rebuilds that failed in a row, and the time before which none is tried again (RUST-16).
     replay_failures: u32,
     replay_after: Option<Instant>,
+    /// Writes of the rank's `incidents.json` that failed in a row, and the time before which none
+    /// is tried again (L17): the timed flush writes the report again from the detectors held,
+    /// with no new part and no rebuild.
+    report_failures: u32,
+    report_after: Option<Instant>,
     /// Set when writing the buffer as a part failed. A `PUT` that reports failure may have
     /// stored the object (a timeout after the store committed it), so the buffer takes no more
     /// rows until a write of it succeeds: the retry is then the same part under the same name,
@@ -296,6 +302,15 @@ impl RankBuffer {
             && self.replay_failures > 0
             && !self.detect_off
             && self.replay_after.is_none_or(|after| now >= after)
+    }
+
+    /// Writing the rank's report failed, the detectors that judged it are held, and the wait has
+    /// passed: the report is due again.
+    fn report_due(&self, now: Instant) -> bool {
+        self.detectors.is_some()
+            && self.report_failures > 0
+            && !self.detect_off
+            && self.report_after.is_none_or(|after| now >= after)
     }
 }
 
@@ -773,8 +788,20 @@ impl Ingest {
                 }
             };
         }
-        let Some(detectors) = &buffer.detectors else {
+        if buffer.detectors.is_none() {
             self.forget_report(key);
+            return;
+        }
+        self.write_report(key, buffer).await;
+    }
+
+    /// Writes the rank's `incidents.json` from the detectors it holds, and keeps what it says for
+    /// the run state once it is stored. When the write fails, the report is dropped from the run
+    /// state and written again by the timed flush after a wait that doubles with each failure in a
+    /// row (L17; until Nov 20, 2026 only the rank's next part wrote it, so a rank that sent nothing
+    /// more stayed without a report).
+    async fn write_report(&self, key: &Key, buffer: &mut RankBuffer) {
+        let Some(detectors) = &buffer.detectors else {
             return;
         };
         {
@@ -812,6 +839,8 @@ impl Ingest {
         };
         match self.storage.write_incidents(&key.0, key.1, &document).await {
             Ok(()) => {
+                buffer.report_failures = 0;
+                buffer.report_after = None;
                 let at = reported(&report);
                 self.reports.lock().unwrap().insert(key.clone(), report);
                 if let Some(stored) = self.stored.lock().unwrap().get_mut(key) {
@@ -824,9 +853,14 @@ impl Ingest {
                 // What the store holds is now behind what was judged: a reader finds the report
                 // behind, and the run state does not call the rank judged either.
                 self.reports.lock().unwrap().remove(key);
+                buffer.report_failures = buffer.report_failures.saturating_add(1);
+                let wait = replay_wait(self.config.replay_backoff, buffer.report_failures);
+                buffer.report_after = Instant::now().checked_add(wait);
                 eprintln!(
-                    "tensorquill-server: cannot write incidents.json for {} rank {}: {error}",
-                    key.0, key.1
+                    "tensorquill-server: cannot write incidents.json for {} rank {}: {error} (tried again in {:.0} s)",
+                    key.0,
+                    key.1,
+                    wait.as_secs_f64()
                 );
             }
         }
@@ -873,6 +907,10 @@ impl Ingest {
                 // tried, and a rank that sent nothing more stayed without a report for good).
                 if self.config.detect && buffer.rebuild_due(Instant::now()) {
                     self.detect(&key, &mut buffer, &[]).await;
+                }
+                // A report whose write failed is written again from the detectors held (L17).
+                if self.config.detect && buffer.report_due(Instant::now()) {
+                    self.write_report(&key, &mut buffer).await;
                 }
             })
             .await;
