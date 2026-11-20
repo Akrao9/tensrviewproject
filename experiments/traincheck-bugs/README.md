@@ -106,7 +106,7 @@ Because `activation_drift` fires on almost every small run that learns, it never
 
 **Gaps found in TensorQuill (not fixed here)**
 - **Where `init` is called decides B1.** `init` tracks the parameters that need gradients at that moment.
-  - Called just before the training loop, after the freezing loops, it treats the optimizer, which holds only frozen parameters, as another job's. It records no step at all (an empty file, run state `unknown`), and its one warning names only DeepSpeed ZeRO and Megatron as causes.
+  - Called just before the training loop, after the freezing loops, it treats the optimizer, which holds only frozen parameters, as another job's. It records no step at all (an empty file, run state `unknown`), and its one warning names only DeepSpeed ZeRO and Megatron as causes. **Fixed since (Nov 19, 2026, wave X, lane X1):** an optimizer that holds only frozen parameters of the model now ends steps, and so does a model whose every parameter is frozen at `init`, so this placement records steps and B1's case is caught as `stalled_weights` (`sdk/tests/test_lane_x1_capture.py`). The four configurations of this page were not run again after the fix, so the table above still shows the result measured before it.
   - Called right after `model.to(device)`, which in `84911.py` comes before the freezing, it catches the bug.
   - The guide ("after the model is on its device and before `torch.compile`") allows both.
 - **`init` raises when Dynamo traces it** (B8).
