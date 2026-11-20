@@ -781,7 +781,10 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
         in_tail = {r for r in map(_record_rank, tail) if r is not None} if named is not None else set()
         # The part before the last megabyte, scanned for the attempts (and so the ranks) its lines
         # name (L21). `complete`: every whole line of the file was read, by the scan or the tail.
-        scanned, complete = _scan_file(path, tail_starts) if not whole else ({}, True)
+        # A split rank's file of a name of its own is read whole anyway and not counted by its
+        # lines, so it is not scanned: the scan adds no read where it was not made before.
+        scan = not whole and (number not in split_ranks or named is not None)
+        scanned, complete = _scan_file(path, tail_starts) if scan else ({}, whole)
         if number not in split_ranks:  # a rank's several files are read whole anyway (`split`)
             by_attempt = _attempts_by_rank(tail)
             restarted = [r for r, attempts in by_attempt.items() if len(attempts) > 1]
