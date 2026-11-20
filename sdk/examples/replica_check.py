@@ -15,6 +15,10 @@ What it asserts, from that result object and never from one rank's record:
 - a planted step reads drift on exactly the planted parameter and raises one `replica_drift` naming
   that parameter, the step, the launch and the group; a clean step reads agree and raises nothing;
 - `add`, `neg` and `swap` move the norm, the sum, and only the projection, across ranks;
+- the two bits-only plants, `ulp` (one element moved by the smallest step of its dtype) and
+  `negzero` (a 0.0 made -0.0), leave fingerprints `agree` and signatures `differ` on exactly the
+  planted parameter, and raise no `replica_drift` (contract 5: a signature-only difference is
+  evidence); one that raises an incident, or is not seen, fails with that reason;
 - the clock (section 7): from the last required observation's arrival (the file holds the line, or
   the server acknowledged it) to the first look or status holding the step's verdict, at most one
   look or status interval plus `--latency-margin`. Both times and the difference are printed.
@@ -27,8 +31,14 @@ in the driver's own sink (`replica_proof.ProofSink`), never in the SDK:
 - `--release never` (a rank that never reports): the steps stay `insufficient` naming R, nothing is
   raised for them, and training runs to its end on every rank.
 
-Which rank drifted is printed as evidence and not asserted: D1 is held. With two ranks the default
-plants are two ranks that disagree; with three or more, one outlier among the rest.
+Which rank drifted is printed as evidence and not asserted: D1 is released and not built. With two
+ranks the default plants are two ranks that disagree; with three or more, one outlier among the rest.
+
+At the end rank 0 prints, and writes into `verdict.json` under `healthy_signatures`, how many
+compared steps had no plant and on how many of those the signatures differed, by parameter. That
+is reported, not failed, unless `--healthy-mismatch fail`: how often it happens on healthy steps is
+what the eight-GPU run measures. Every step resets the weights to one base with `lr=0`, so the count
+says whether equal bits read as equal on those devices, not whether training keeps them equal.
 
 Exit status: 0 PASS, 1 FAIL, 2 bad arguments, 3 NOT PROVEN (the reader could not be found).
 
@@ -223,7 +233,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"run {run_id}:")
         for line in verdict.lines:
             print(line)
-        _write_json(work / "verdict.json", {"code": verdict.code, "failures": verdict.failures})
+        _write_json(work / "verdict.json", {"code": verdict.code, "failures": verdict.failures,
+                                            "healthy_signatures": verdict.healthy})
         return verdict.code
     finally:
         dist.destroy_process_group()
