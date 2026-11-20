@@ -161,6 +161,27 @@ def test_xc1_a_healthy_toy_run_whose_sink_fails_is_a_fail_not_a_pass(tmp_path, m
     assert (tmp_path / "out" / "healthy.jsonl").read_text() == ""
 
 
+def test_xc1_a_healthy_toy_run_whose_sink_fails_part_way_is_a_fail_that_says_where_it_stopped(tmp_path, monkeypatch):
+    """The cut-short control: the first write lands, every later one fails, so the file holds a prefix."""
+    pytest.importorskip("transformers")
+    real = tensorquill.JsonlSink.write
+    calls = []
+
+    def write(self, records):
+        calls.append(len(records))
+        if len(calls) > 1:
+            raise OSError("injected sink write failure after the first write")
+        real(self, records)
+
+    monkeypatch.setattr(tensorquill.JsonlSink, "write", write)
+    code, printed = run_main(["--toy", "--case", "healthy", "--out", str(tmp_path / "out")])
+    written = tensorquill.load_records(tmp_path / "out" / "healthy.jsonl")
+    assert 0 < len(written) < 350, len(written)
+    assert code == 1, printed
+    assert f"expected steps are missing, from step {len(written)}" in printed, printed
+    assert "the capture stopped" in printed and "not known to have closed cleanly (not_closed)" in printed
+
+
 def test_xc1_a_healthy_toy_run_at_the_shortest_allowed_length_passes_with_both_kinds_checked(tmp_path):
     """`HEALTHY_MIN_STEPS` is enough for the detectors' own `kind_checks`, so the parser's refusal
     above and the verdict agree."""
