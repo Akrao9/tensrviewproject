@@ -4642,7 +4642,9 @@ def watch_all_ranks(
     A rank's incidents count only while its report is current (`read_server_report`); a rank
     that is behind, stale, missing, unreadable, unusable, on other thresholds or has nothing
     stored is `unknown`, with its state and why, and is never listed among the ranks with no
-    incidents. Rank folders may appear or disappear between looks. `server_reports=False`
+    incidents. So is a rank whose report is current while the server's status shows the job
+    started again on it (`earlier_attempt`: marked `attempt_without_steps`, or at another
+    attempt than its report's; L6). Rank folders may appear or disappear between looks. `server_reports=False`
     (`--recompute`) is refused, because it asks for the detectors to run here, a rank at a
     time and for the whole run each time; use `rank=<n>` for that. Each rank's report is taken
     with the thresholds its server applied, which the evidence lists (`thresholds`); any of the
