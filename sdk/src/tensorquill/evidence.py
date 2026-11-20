@@ -4556,15 +4556,20 @@ def all_ranks_evidence(
     report is taken with what its server applied, which the evidence lists under `thresholds`.
     A first look has no memory of earlier ones, so a rank whose report is behind its store is
     `behind` here where a running watcher would wait `report_grace` for it.
+    A threshold given here that no server can apply (`check_thresholds`: the Rust detectors'
+    contract, so not finite, negative, a window or `top_k` below 1, not a number, a bool) raises
+    `ValueError` before anything is read; None is "not given".
     The evidence is `{"view": "all_ranks", ...}`: see `_all_ranks_evidence` and the README.
     """
-    source = _all_ranks_source(source)
-    status = read_watchdog(_all_ranks_status_file(source, watchdog))
-    thresholds = _given_thresholds({
+    given = {
         "overload_threshold": overload_threshold, "drift_tolerance": drift_tolerance,
         "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": top_k,
         "update_window": update_window,
-    })
+    }
+    check_thresholds(**given)
+    source = _all_ranks_source(source)
+    status = read_watchdog(_all_ranks_status_file(source, watchdog))
+    thresholds = _given_thresholds(given)
     folders, looks, _ = _look_at_ranks(source, status, {}, thresholds, REPORT_GRACE_SECONDS)
     other_sources = {"traincheck": traincheck, "flight_recorder": flight_recorder,
                      "flight_recorder_prefix": flight_recorder_prefix}
@@ -4621,6 +4626,8 @@ def watch_all_ranks(
             " another, on every change (about 8 s a rank at 10,000 steps); recompute one rank with rank=<n>"
         )
     status_file = _all_ranks_status_file(source, build_options.pop("watchdog", None))
+    # Said before the first look, as `watch` says it: this one may be called directly.
+    check_thresholds(**{name: build_options[name] for name in THRESHOLD_NAMES if name in build_options})
     thresholds = _given_thresholds(build_options)
     other_sources = {
         name: build_options.get(name) for name in ("traincheck", "flight_recorder", "flight_recorder_prefix")

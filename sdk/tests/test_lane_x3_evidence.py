@@ -157,3 +157,60 @@ def test_det14_a_one_step_run_has_its_table_without_a_comparison():
     lines = ev.expert_load_table(_moe([[5, 5]]), 0, 1).splitlines()
     assert lines[0].endswith("(no earlier step to compare with)")
     assert all("| n/a |" in row for row in lines[4:])
+
+
+# --- Thresholds given to the all-ranks reader are checked at the call ---------------------------
+
+REFUSED = [
+    ({"overload_threshold": -0.1}, "overload_threshold must be a finite number of at least 0"),
+    ({"overload_threshold": float("nan")}, "overload_threshold must be a finite number"),
+    ({"overload_threshold": True}, "overload_threshold must be"),
+    ({"overload_threshold": "0.5"}, "overload_threshold must be"),
+    ({"drift_tolerance": float("inf")}, "drift_tolerance must be a finite number"),
+    ({"drift_tolerance": -1}, "drift_tolerance must be a finite number of at least 0"),
+    ({"starve_ratio": -0.5}, "starve_ratio must be a finite number of at least 0"),
+    ({"starve_ratio": float("-inf")}, "starve_ratio must be a finite number"),
+    ({"starve_window": 0}, "starve_window must be at least 1"),
+    ({"starve_window": 2.0}, "starve_window must be at least 1 and a whole number"),
+    ({"starve_window": True}, "starve_window must be"),
+    ({"update_window": -3}, "update_window must be at least 1"),
+    ({"top_k": 0}, "top_k must be at least 1"),
+    ({"top_k": 2.5}, "top_k must be a whole number"),
+    ({"top_k": "2"}, "top_k must be a whole number"),
+    ({"top_k": {"router": 0}}, "top_k must be at least 1"),
+    ({"top_k": {"router": 1.5}}, "top_k must be a whole number"),
+]
+
+
+@pytest.mark.parametrize("option, reason", REFUSED)
+def test_thresholds_a_value_no_server_applies_is_refused_at_the_call(tmp_path, option, reason):
+    run = _store(tmp_path, [{"rank": 0, "attempt": 1, "last_step": 9}])
+    with pytest.raises(ValueError, match=f"the detectors refuse these thresholds: {reason}"):
+        ev.all_ranks_evidence(run, **option)
+
+
+@pytest.mark.parametrize("option, reason", REFUSED[:3])
+def test_thresholds_are_refused_before_anything_is_read(tmp_path, option, reason):
+    # The source does not exist: the threshold is what is refused, not the folder.
+    with pytest.raises(ValueError, match=reason):
+        ev.all_ranks_evidence(tmp_path / "nowhere", **option)
+
+
+@pytest.mark.parametrize("option, reason", REFUSED[8:11])
+def test_thresholds_watch_all_ranks_called_directly_refuses_them_before_its_first_look(tmp_path, option, reason):
+    run = _store(tmp_path, [{"rank": 0, "attempt": 1, "last_step": 9}])
+    out = tmp_path / "all.json"
+    with pytest.raises(ValueError, match=reason):
+        ev.watch_all_ranks(run, out, interval=0.0, polls=1, **option)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("option", [
+    {}, {"overload_threshold": 0.0}, {"overload_threshold": 2}, {"drift_tolerance": 0}, {"starve_ratio": 0.0},
+    {"starve_window": 1}, {"update_window": 1}, {"top_k": 1}, {"top_k": {"router": 2}},
+    {"overload_threshold": None, "top_k": None},
+])
+def test_thresholds_the_values_a_server_applies_are_taken(tmp_path, option):
+    run = _store(tmp_path, [{"rank": 0, "attempt": 1, "last_step": 9}])
+    evidence = ev.all_ranks_evidence(run, **option)
+    assert evidence["rank_count"] == 1
