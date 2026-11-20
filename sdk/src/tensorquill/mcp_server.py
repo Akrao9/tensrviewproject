@@ -641,6 +641,34 @@ def _rank_entry(evidence: Mapping[str, Any], rank: int) -> dict[str, Any]:
     raise ToolError(f"rank {rank} is not in this run. Its ranks are: {known or 'none yet'}.")
 
 
+def _dropped(opened: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The rows the server dropped for a null key, from the run folder's `watchdog.json` (L22,
+    lane Z5, Nov 20, 2026; `runs.dropped_rows`): None for any other source, and when no rank
+    dropped a row, so every answer of such a run is as before. The evidence's own `watchdog`
+    block does not carry them. An upper bound: a batch sent again after a lost acknowledgement
+    is counted again."""
+    if opened["source"].get("kind") != "store":
+        return None
+    return _runs.dropped_rows(read_watchdog(Path(opened["source"]["path"]) / "watchdog.json"))
+
+
+def _dropped_shown(dropped: Any) -> Any:
+    """`dropped_rows` as an answer shows it: the total and the keys whole, and the ranks up to
+    `PER_RANK_ROWS` (`ranks_omitted` counts the rest; `rank=` gives one rank's). A null key
+    usually hits every rank, so the list would otherwise grow with the run."""
+    if not isinstance(dropped, dict) or len(dropped.get("ranks") or ()) <= PER_RANK_ROWS:
+        return dropped
+    return {**dropped, "ranks": dropped["ranks"][:PER_RANK_ROWS], "ranks_omitted": len(dropped["ranks"]) - PER_RANK_ROWS}
+
+
+def _rank_dropped(dropped: Mapping[str, Any] | None, rank: int) -> dict[str, Any] | None:
+    """One rank's part of `_dropped`: `{"rows", "by_key"}`, or None when it dropped none."""
+    for item in (dropped or {}).get("ranks") or ():
+        if item.get("rank") == rank:
+            return {key: value for key, value in item.items() if key != "rank"}
+    return None
+
+
 def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]:
     rank = _integer(arguments, "rank", minimum=0)
     limit = _integer(arguments, "limit", minimum=1, maximum=MAX_INCIDENTS) or DEFAULT_INCIDENTS
@@ -665,6 +693,9 @@ def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, An
                     "this rank's report is not current, so nothing is said about incidents on it; an empty list"
                     " here does not mean it has none (get_all_ranks_status with rank= gives its last report)"
                 )
+            mine = _rank_dropped(_dropped(opened), rank)
+            if mine is not None:  # L22: no key when the rank dropped none
+                answer["rank"]["dropped_rows"] = mine
     state = evidence.get("run_state")
     answer["run_state"] = state if isinstance(state, dict) else None
     if not isinstance(state, dict):
@@ -1246,8 +1277,14 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
         answer["watchdog"] = evidence["watchdog"]
     if isinstance(evidence.get("stopped_stacks"), dict):
         answer["stopped_stacks"] = evidence["stopped_stacks"]
+    dropped = _dropped(opened)
+    if dropped is not None:  # L22: no key when no rank dropped a row
+        answer["dropped_rows"] = _dropped_shown(dropped)
     if rank is not None:
         answer["rank"] = _rank_entry(evidence, rank)
+        mine = _rank_dropped(dropped, rank)
+        if mine is not None:
+            answer["rank"] = {**answer["rank"], "dropped_rows": mine}  # a copy: the entry is the kept evidence's
     elif len(rows) <= PER_RANK_ROWS:
         answer["per_rank"] = [
             {"rank": number, "report": (entry.get("detection") or {}).get("state"),
@@ -1259,7 +1296,8 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
              **({"kinds": {key: entry["kind_counts"].get(key) for key in (
                  "checked", "not_enough_history", "not_configured", "unavailable")}}
                 if isinstance(entry.get("kind_counts"), dict) else {}),
-             **({"stream": entry["stream"]} if isinstance(entry.get("stream"), dict) else {})}
+             **({"stream": entry["stream"]} if isinstance(entry.get("stream"), dict) else {}),
+             **({"dropped_rows": mine["rows"]} if (mine := _rank_dropped(dropped, number)) is not None else {})}
             for number, entry in sorted(rows.items(), key=lambda item: item[0] if isinstance(item[0], int) else -1)
         ]
     else:
@@ -1274,7 +1312,7 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
 
 _ROW_KEYS = ("project", "name", "run_id", "group", "tags", "has_manifest", "source", "started", "run_state", "last_step",
              "incidents", "first_incident", "kinds_checked", "ranks", "evidence", "rank_count", "ranks_with_incidents",
-             "kinds_not_stated", "rank_count_not_known", "end")
+             "kinds_not_stated", "rank_count_not_known", "end", "dropped_rows")
 
 
 def _text_argument(arguments: Mapping[str, Any], name: str) -> str | None:
@@ -1309,7 +1347,8 @@ def list_runs(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]:
            if len(shown) < len(rows) else {}),
         # A row says nothing it did not read: `run_state` null with `evidence.state` "missing"
         # means no evidence file was written for that run, not that the run is clean.
-        "runs": [{key: row[key] for key in _ROW_KEYS if key in row} for row in shown],
+        "runs": [{key: _dropped_shown(row[key]) if key == "dropped_rows" else row[key] for key in _ROW_KEYS if key in row}
+                 for row in shown],
     }
 
 
@@ -1358,7 +1397,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " reason), what was checked is not stated: do not infer it. A not_checked entry or an unknown rank"
             " means that part was not judged."
             " For a run folder the incidents are grouped across ranks, and `rank` keeps one rank's; `kinds` is"
-            " then the whole run's, read as get_all_ranks_status describes. For a local .jsonl file, `run_end` says"
+            " then the whole run's, read as get_all_ranks_status describes; `rank.dropped_rows`, only when the server"
+            " dropped rows of that rank for a null key, counts them (an upper bound). For a local .jsonl file, `run_end` says"
             " whether its session closed it: any state but `closed` means not known to have finished (still running,"
             " killed or never closed look the same)."
             " Where one rank's evidence has them, `head_trends` gives the probe's language-model head numbers over"
@@ -1455,8 +1495,11 @@ TOOLS: tuple[dict[str, Any], ...] = (
             f" and nothing is to be inferred. `per_rank[].kinds` counts each rank's own {len(SERVER_KINDS)} kinds. While ranks are"
             " stopped, `stopped_stacks` groups those that sent a stack by where their main thread was and names an odd"
             " group only when one is clearly apart (`verdict`); it is an observation, never the cause (see its"
-            " `caveats`), and the ranks with no stack are listed, not compared. `rank`"
-            " gives one rank's entry in full. On one rank's capture or evidence file this is an error that says so."
+            " `caveats`), and the ranks with no stack are listed, not compared. `dropped_rows`, only when the"
+            " server dropped rows of the run because a key of theirs was null (they were never stored): how many in"
+            " all, by null key and by rank (`per_rank[].dropped_rows`, and in the `rank` entry). It is an upper"
+            " bound: a batch sent again after a lost acknowledgement is counted again. With no key, none was dropped."
+            " `rank` gives one rank's entry in full. On one rank's capture or evidence file this is an error that says so."
         ),
         "inputSchema": {
             "type": "object",
@@ -1471,8 +1514,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "description": (
             "The runs kept in the same folder or store as this one, by project: each run's name, run ID, run state,"
             " last step, incidents by class, first incident (kind and step), how many of the kinds were checked, and"
-            " start time. The run ID is the identity; a name is a label and may repeat. It reads each run's manifest"
-            " and its small evidence or report files only, and runs no detector: a local run whose evidence file was"
+            " start time. The run ID is the identity; a name is a label and may repeat. It reads each run's manifest,"
+            " its small evidence or report files and the ends of its .jsonl files (one over a megabyte is scanned"
+            " for the attempts its lines name), and runs no detector: a local run whose evidence file was"
             " never written has `run_state` null and `evidence.state` \"missing\", which is not \"clean\". A run"
             " with `has_manifest` false was recorded before runs had a project, and is listed under"
             " `uncategorized` with its run ID as its name. `rank_count` is how many ranks the run has, or null when the"
@@ -1480,7 +1524,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " several ranks the row is the whole run's, by the all-ranks rules: the incidents of every judged rank"
             " (`ranks_with_incidents` names them), and a kind counts as checked only when every judged rank checked"
             " it. A rank without a current report or evidence file is unknown (`evidence.unknown_ranks`), never"
-            " clean; `kinds_not_stated` says why there is no count."
+            " clean; `kinds_not_stated` says why there is no count. `dropped_rows`, on a store run's row only when"
+            " the server dropped rows of it because a key of theirs was null (never stored): how many in all, by null"
+            " key and by rank; an upper bound, since a batch sent again after a lost acknowledgement is counted"
+            " again. No key means none was dropped."
         ),
         "inputSchema": {
             "type": "object",

@@ -41,7 +41,19 @@ recorded capture here, and only for such a rank; what is kept is each attempt's 
 each file and its steps, never the records. A file whose last megabyte shows a rank in more
 than one attempt is read whole the same way, for that rank's last step (XC4, lane
 Y3, Nov 20, 2026: a late row of an attempt that a later one replaced was taken as the last step).
-An attempt seen only in the middle of a file larger than a megabyte is still not seen there.
+The part of a file larger than a megabyte before its last megabyte is scanned for the attempts
+its lines name, from each line's start and without parsing it (`_attempts_in_file`): when an
+attempt newer than the last megabyte's is there, the file is read whole the same way (L21, lane
+Z5, Nov 20, 2026: an attempt seen only in the middle of such a file was not seen, and a late row of
+the attempt it replaced was taken as the last step). That scan reads every byte of each such file
+at each listing, about 1.5 GB a second on the recorded captures here from the page cache, and as
+slowly as a full parse for some files (the notes above `_RECORD_HEAD`);
+within one process a file that only grew is scanned from where the last scan stopped.
+
+A store's run whose server dropped rows for a null key (`dropped_rows` and `dropped_row_keys` on
+a rank's entry of `watchdog.json`) has `dropped_rows` on its row, in all, by key and by rank, and
+the printed listing a note. The count is an upper bound: a batch sent again after a lost
+acknowledgement is counted again (L22, lane Z5). A run that dropped none has no such key.
 
 How many ranks: a file named `<run_id>.rank<N>.jsonl` holds rank N alone when its first record
 and every record of its last megabyte are rank N's; one of which a record read names another
@@ -74,6 +86,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,17 +131,209 @@ def _first_record(path: Path) -> dict[str, Any] | None:
 def _tail(path: Path) -> tuple[list[bytes], bool]:
     """The whole lines of a `.jsonl` file's last megabyte, last line last, and whether that is
     the whole file (no line before them is left unread)."""
+    lines, whole, _ = _tail_from(path)
+    return lines, whole
+
+
+def _tail_from(path: Path) -> tuple[list[bytes], bool, int]:
+    """`_tail`, and the byte where its first line starts: every line that starts before it is
+    in the part of the file the last megabyte leaves out."""
     try:
         size = path.stat().st_size
         with path.open("rb") as file:
-            file.seek(max(0, size - _TAIL_BYTES))
+            at = max(0, size - _TAIL_BYTES)
+            file.seek(at)
             tail = file.read()
     except OSError:
-        return [], False
+        return [], False, 0
     lines = tail.split(b"\n")
     if size > _TAIL_BYTES:
-        lines = lines[1:]  # the first piece starts mid-line
-    return lines[:-1], size <= _TAIL_BYTES  # what follows the last newline is not finished
+        cut = len(lines[0]) + 1  # the first piece starts mid-line
+        lines = lines[1:]
+        at = at + cut if len(lines) > 1 else size  # no whole line in the window: all of it is before
+    return lines[:-1], size <= _TAIL_BYTES, at  # what follows the last newline is not finished
+
+
+# --- The attempts in the part of a file before its last megabyte (L21) ---------------------
+#
+# A rank's last line stands only when its attempt is the newest in the file, and an attempt seen
+# only in the middle of a file larger than a megabyte was not seen (L21, lane Z5, Nov 20, 2026).
+# The part before the last megabyte is read for the attempts its lines name, without parsing the
+# lines: a record as the sink writes it starts with `schema_version`, `run_id`, `rank` and
+# `attempt`, in that order (`json.dumps` of the record, with or without spaces), and those four
+# are read from the line's start. Each line after it that starts with the same bytes is of the
+# same rank, run and attempt, and one search in C passes over them all. A line that does not start
+# so (another writer's order, no `attempt`, a value of another type) is parsed whole, as `compare`
+# reads it, so the attempts found are the ones a full parse finds. The two differ only for a line
+# that is not JSON whose start reads as a record (a killed process's half line with the next
+# record written onto it): its attempt is counted here and not by a reader. That can only add an
+# attempt, and so only make the file be read whole (slower, never wrong). A record that names
+# `rank` or `attempt` twice is read by its first here and by its last by a reader; no writer of
+# ours does that.
+#
+# Cost (measured here, the files in the page cache; from disk it is the disk's read rate): every
+# byte of each file larger than a megabyte is read at each listing, about 1.5 GB a second on the
+# recorded 6 to 17 MB captures (a full parse is about 120 MB a second) and 0.9 GB a second on a
+# file of a million 114-byte lines of one rank. A file whose ranks change from one line to the
+# next is stepped a line at a time: 8 or 2,000 ranks line by line, about 0.6 times a full parse's
+# time; a new rank or attempt on nearly every line (100,000 ranks), about 1.3 times. Lines that
+# start in another order are each parsed, at a full parse's rate. Within one process (the MCP server lists the
+# runs at each call) a file that only grew is read from where the last scan stopped (`_SCANNED`).
+# The file is read whole, parsed, only when an attempt newer than the last megabyte's is in the
+# part before it.
+
+_JSON_STRING = rb'"(?:[^"\\\r\n]|\\.)*"'
+_SPACE = rb"[ \t\r]*"  # JSON's spaces within a line
+# The start of a line as the sink writes a record, to the character after `attempt`'s value: its
+# groups are the run ID, rank and attempt as JSON.
+_RECORD_HEAD = re.compile(
+    rb"\{" + _SPACE + rb'"schema_version"' + _SPACE + rb":" + _SPACE + rb"-?\d+" + _SPACE + rb"," + _SPACE
+    + rb'"run_id"' + _SPACE + rb":" + _SPACE + rb"(" + _JSON_STRING + rb")" + _SPACE + rb"," + _SPACE
+    + rb'"rank"' + _SPACE + rb":" + _SPACE + rb"(-?\d+)" + _SPACE + rb"," + _SPACE
+    + rb'"attempt"' + _SPACE + rb":" + _SPACE + rb"(-?\d+|" + _JSON_STRING + rb")" + _SPACE + rb"[,}]"
+)
+_SCAN_BLOCK = 8 << 20  # read and matched at a time
+_CHECK_BYTES = 256  # the bytes before where a scan stopped, kept to see the file is the one scanned
+_SCANNED: dict[str, tuple[tuple[int, int], int, bytes, bytes, dict[int, dict[Any, None]]]] = {}
+_SCANNED_MOST = 4096
+_SKIPS_MOST = 1024
+
+
+def _decode_head(groups: tuple[bytes, bytes, bytes], decoded: dict[Any, Any]) -> Any:
+    """`(rank, (run, attempt))` from a line's three groups, or None when one is not JSON."""
+    found = decoded.get(groups, decoded)
+    if found is decoded:
+        try:
+            run, rank, attempt = (json.loads(group) for group in groups)
+            found = (rank, (run if isinstance(run, str) else "", attempt))
+        except ValueError:
+            found = None
+        decoded[groups] = found
+    return found
+
+
+def _scan_block(block: bytes, found: dict[int, dict[Any, None]], decoded: dict[Any, Any],
+                skips: dict[bytes, Any]) -> None:
+    """Add the keys of the lines of `block` (whole lines, the last ending in a newline) to
+    `found`. A line that starts as a record is read from its start, and every line after it that
+    starts with the same bytes, to the character after the attempt, is of the same rank, run and
+    attempt: they are passed over by one search for the next line that does not (in C). A line
+    that does not start as a record is parsed whole."""
+    from .evidence import _run_of
+
+    at, size = 0, len(block)
+    while at < size:
+        head = _RECORD_HEAD.match(block, at)
+        key = _decode_head(head.groups(), decoded) if head is not None else None
+        if key is None:
+            end = block.index(b"\n", at) + 1
+            record = _record_of(block[at:end])
+            rank = _record_rank(record)
+            if record is not None and rank is not None:
+                key = (rank, (_run_of(record), record.get("attempt", 0)))
+            at = end
+        else:
+            start = block[at:head.end()]
+            at = block.index(b"\n", at) + 1
+            # The search pays only where the next line starts the same way: a file whose ranks
+            # change from line to line is stepped a line at a time, never a pattern a line.
+            if block.startswith(start, at):
+                skip = skips.get(start)
+                if skip is None:
+                    if len(skips) >= _SKIPS_MOST:
+                        skips.clear()
+                    skip = skips[start] = re.compile(rb"\n(?!" + re.escape(start) + rb")")
+                after = skip.search(block, at)
+                at = after.end() if after is not None else size
+        if key is not None:
+            try:
+                found.setdefault(key[0], {}).setdefault(key[1], None)
+            except TypeError:  # an attempt that is not a number or a string: no reader orders it
+                continue
+
+
+def _scan_lines(file: Any, start: int, before: int, found: dict[int, dict[Any, None]]) -> int:
+    """Read the lines of `file` from byte `start` (a line's start) that start before `before`,
+    and add each rank's `(run, attempt)` keys to `found` in the order they first appear. The byte
+    after the last line read is returned. A last line with no newline is not read."""
+    decoded: dict[Any, Any] = {}
+    skips: dict[bytes, Any] = {}
+    file.seek(start)
+    at = start
+    while at < before:
+        block = file.read(min(_SCAN_BLOCK, before - at))
+        if not block:
+            break
+        if not block.endswith(b"\n"):
+            block += file.readline()  # the line that starts in the block, whole
+            if not block.endswith(b"\n"):  # the file's last line, not finished
+                block = block[: block.rfind(b"\n") + 1]
+                if block:
+                    _scan_block(block, found, decoded, skips)
+                    at += len(block)
+                break
+        _scan_block(block, found, decoded, skips)
+        at += len(block)
+    return at
+
+
+def _attempts_in_file(path: Path, before: int) -> dict[int, list[tuple[str, Any]]]:
+    """Each rank's `(run, attempt)` keys among the lines of `path` that start before byte
+    `before`, in the order they first appear (see the notes above `_RECORD_HEAD`). Never raises:
+    a file that cannot be read gives what was read of it."""
+    found: dict[int, dict[Any, None]] = {}
+    try:
+        stat = path.stat()
+        name = os.path.abspath(path)
+        ident = (stat.st_dev, stat.st_ino)
+        with path.open("rb") as file:
+            head = file.read(_CHECK_BYTES)
+            start = 0
+            held = _SCANNED.get(name)
+            if held is not None and held[0] == ident and held[1] <= min(before, stat.st_size) and held[3] == head[:len(held[3])]:
+                file.seek(max(0, held[1] - _CHECK_BYTES))
+                if file.read(held[1] - max(0, held[1] - _CHECK_BYTES)) == held[2]:
+                    start = held[1]
+                    found = {rank: dict(keys) for rank, keys in held[4].items()}
+            end = _scan_lines(file, start, before, found)
+            file.seek(max(0, end - _CHECK_BYTES))
+            check = file.read(end - max(0, end - _CHECK_BYTES))
+        _SCANNED.pop(name, None)
+        if len(_SCANNED) >= _SCANNED_MOST:
+            _SCANNED.pop(next(iter(_SCANNED)))
+        _SCANNED[name] = (ident, end, check, head, {rank: dict(keys) for rank, keys in found.items()})
+    except OSError:
+        pass
+    return {rank: list(keys) for rank, keys in found.items()}
+
+
+def _hidden_attempts(path: Path, before: int, tail: list[dict[str, Any]], by_rank: Mapping[int, set[Any]]) -> list[int]:
+    """The ranks of `tail` (the records of a file's last megabyte) that show one attempt there
+    while a newer one, of the same run, is in the part of the file before it (L21): the newest is
+    the last to first appear in the file (contract 1), and only reading the file whole says where
+    such a rank stands."""
+    from .evidence import _run_of
+
+    order = _attempts_in_file(path, before)
+    for record in tail:
+        rank = _record_rank(record)
+        if rank is None:
+            continue
+        try:
+            key = (_run_of(record), record.get("attempt", 0))
+            if key not in order.setdefault(rank, []):
+                order[rank].append(key)
+        except TypeError:
+            continue
+    hidden = []
+    for rank, keys in by_rank.items():
+        if len(keys) != 1:
+            continue
+        (only,) = keys
+        same_run = [key for key in order.get(rank, ()) if key[0] == only[0]]
+        if same_run and same_run[-1] != only:
+            hidden.append(rank)
+    return hidden
 
 
 def _tail_lines(path: Path) -> list[bytes]:
@@ -515,9 +720,10 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     `held` gives each file of its own name (or misnamed) the ranks it is seen to hold, and
     `several` the files among them that hold several; `last_steps` the ranks' last steps
     (`_steps_by_rank`) of each file that holds or may hold several, where the row uses them.
-    `resolved` has, for each file whose last megabyte shows a rank in more than one attempt, that
+    `resolved` has, for each file whose last megabyte shows a rank in more than one attempt (XC4),
+    or in one attempt while a newer one is in the part before it (`_hidden_attempts`, L21), that
     rank's last step as `resolve_attempts` keeps it, the file read whole
-    (`_rank_across_files`, XC4): a late row of a replaced attempt does not move it.
+    (`_rank_across_files`): a late row of a replaced attempt does not move it.
 
     `more` are a rank's other files (`discover_runs`' `more_files`): read as the others are for
     the count. `split` has, for each rank in `more`, its files read whole (`_rank_across_files`):
@@ -537,7 +743,7 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     split_ranks = {number for number, paths in (more or {}).items() if number in files and paths}
     pairs = [*files.items(), *((number, path) for number, paths in (more or {}).items() for path in paths)]
     for number, path in pairs:
-        lines, whole = _tail(path)
+        lines, whole, tail_starts = _tail_from(path)
         read[path] = first, last = _first_record(path), _last_of(lines)  # kept: the row reads them too
         tail = [r for r in map(_record_of, lines) if r is not None]
         ends = {r for r in (_record_rank(first), _record_rank(last)) if r is not None}
@@ -546,7 +752,11 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
         # own is counted from its ends as before: the files never settle its count either way.
         in_tail = {r for r in map(_record_rank, tail) if r is not None} if named is not None else set()
         if number not in split_ranks:  # a rank's several files are read whole anyway (`split`)
-            restarted = [r for r, attempts in _attempts_by_rank(tail).items() if len(attempts) > 1]
+            by_attempt = _attempts_by_rank(tail)
+            restarted = [r for r, attempts in by_attempt.items() if len(attempts) > 1]
+            if not whole:
+                # L21: an attempt newer than the last megabyte's, in the part before it.
+                restarted += [r for r in _hidden_attempts(path, tail_starts, tail, by_attempt) if r not in restarted]
             if restarted:
                 resolved[path] = {r: _rank_across_files([path], r, run_id)["last_step"] for r in restarted}
         if named is not None and (ends | in_tail) <= {named}:
@@ -940,12 +1150,72 @@ def _all_ranks_cells(row: dict[str, Any], view: Mapping[str, Any]) -> None:
         row["kinds_not_stated"] = view["kind_checks_not_stated"].get("detail")
 
 
+DROPPED_ROWS_NOTE = (
+    "rows the server dropped because a key of theirs was null, so they were never stored; a batch sent again after a "
+    "lost acknowledgement is counted again, so this is an upper bound on the rows dropped"
+)
+
+
+def _count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def dropped_rows(status: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The rows the server dropped for a null key (RS10), from its status (`watchdog.json`): on
+    each rank's entry, `dropped_rows` (the rank's total) and `dropped_row_keys` (by the first
+    null key of each row). `{"rows", "by_key", "ranks", "upper_bound", "note"}`, or None when
+    no rank dropped any (a rank that dropped none has neither key, and the row is as before).
+
+    The count is an upper bound (L22, lane Z5, Nov 20, 2026): a batch whose acknowledgement was
+    lost and that was sent again is counted again, since its rows were never stored and nothing
+    dedupes them. Only the rank entries are read; `restart[]` carries the same counts for the
+    server's next start and is not added. A value that is not a count above zero is left out;
+    nothing here raises."""
+    entries = status.get("ranks") if isinstance(status, Mapping) else None
+    if not isinstance(entries, list):
+        return None
+    ranks: list[dict[str, Any]] = []
+    by_key: dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        rank, rows = entry.get("rank"), entry.get("dropped_rows")
+        if not (isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0) or not _count(rows):
+            continue
+        keys = entry.get("dropped_row_keys")
+        keys = {str(k): v for k, v in sorted(keys.items()) if isinstance(k, str) and _count(v)} if isinstance(keys, Mapping) else {}
+        for key, count in keys.items():
+            by_key[key] = by_key.get(key, 0) + count
+        ranks.append({"rank": rank, "rows": rows, **({"by_key": keys} if keys else {})})
+    if not ranks:
+        return None
+    ranks.sort(key=lambda item: item["rank"])
+    return {"rows": sum(item["rows"] for item in ranks), **({"by_key": dict(sorted(by_key.items()))} if by_key else {}),
+            "ranks": ranks, "upper_bound": True, "note": DROPPED_ROWS_NOTE}
+
+
+def _dropped_text(dropped: Mapping[str, Any]) -> str:
+    """The listing's note for `dropped_rows`."""
+    rows, ranks = dropped["rows"], dropped["ranks"]
+    shown = ", ".join(f"rank {item['rank']}: {item['rows']:,}" for item in ranks[:8])
+    shown += f" and {len(ranks) - 8} more ranks" if len(ranks) > 8 else ""
+    keys = dropped.get("by_key") or {}
+    by_key = "; by null key: " + ", ".join(f"{key} {count:,}" for key, count in keys.items()) if keys else ""
+    return (f"the server dropped at most {rows:,} row{'s' if rows != 1 else ''} with a null key and stored none of them "
+            f"({shown}{by_key}); a batch sent again after a lost acknowledgement is counted again, so this is an upper "
+            "bound")
+
+
 def _store_row(run: Mapping[str, Any]) -> dict[str, Any]:
     """From each rank's `incidents.json`, the names of the newest parts and `watchdog.json`."""
     from .evidence import _report_evidence, all_ranks_evidence, read_server_report, read_watchdog
 
     folder = Path(run["path"])
     row: dict[str, Any] = {}
+    # L22: the rows the server dropped, when it dropped any (no key otherwise).
+    dropped = dropped_rows(read_watchdog(folder / "watchdog.json"))
+    if dropped is not None:
+        row["dropped_rows"] = dropped
     try:
         view = all_ranks_evidence(folder)
     except (OSError, ValueError) as error:
@@ -1147,6 +1417,8 @@ def listing_text(rows: list[Mapping[str, Any]], source: str | Path, project: str
                              "files, which hold every record")
             if row.get("rank_count_not_known"):
                 notes.append(f"{row['run_id']}: ranks not counted: {row['rank_count_not_known']}")
+            if isinstance(row.get("dropped_rows"), Mapping):
+                notes.append(f"{row['run_id']}: {_dropped_text(row['dropped_rows'])}")
             if not row["has_manifest"]:
                 notes.append(f"{row['run_id']}: no run manifest (recorded before there was one, or by a sink with no "
                              f"file), so it is listed under {_manifest.DEFAULT_PROJECT!r} with its run ID as its name")
