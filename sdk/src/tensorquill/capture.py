@@ -850,25 +850,38 @@ def _leaf_layers(named: list[tuple[str, nn.Module]]) -> list[tuple[str, nn.Modul
 
 
 def _block_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
-    """The model's repeated blocks: the children of its largest `ModuleList` of composite
-    modules that share one class, such as a transformer's decoder layers.
+    """The model's repeated blocks, such as a transformer's decoder layers: the children of every
+    outermost `ModuleList` of two or more composite modules, in the model's order.
+
+    A list counts when its children share one class and the first is composite (as before), or,
+    for a list that mixes classes, when every child is composite: a hybrid stack of attention and
+    state-space layers is one stack (SDK-23). Every such list is taken, not only the largest, so
+    an encoder-decoder's two stacks are both watched. A list inside a block already taken (an MoE
+    layer's experts, a stage's blocks) is not, and a module reachable from two lists is watched
+    once, under its first name: no block is watched twice, so no block's hooks run inside
+    another's. A list whose items are whole sub-models (`ModuleList([encoder, decoder])`) is taken
+    as two blocks, not their layers.
 
     This is the unit PyTorch's FSDP `transformer_auto_wrap_policy` wraps. One hook per
     block locates a problem to a block at a fraction of the cost of one per leaf module.
     """
-    best: list[tuple[str, nn.Module]] = []
-    best_params = 0
+    blocks: list[tuple[str, nn.Module]] = []
+    inside: set[int] = set()  # every module in a block taken so far, the blocks themselves included
     for name, module in model.named_modules():
-        if not isinstance(module, nn.ModuleList) or len(module) < 2:
+        if not isinstance(module, nn.ModuleList) or len(module) < 2 or id(module) in inside:
             continue
         children = list(module)
-        if len({type(c) for c in children}) != 1 or not any(children[0].children()):
+        if len({type(c) for c in children}) == 1:
+            if not any(children[0].children()):
+                continue
+        elif not all(any(c.children()) for c in children):
             continue
-        count = sum(p.numel() for p in module.parameters())
-        if count > best_params:
-            best_params = count
-            best = [(f"{name}.{i}" if name else str(i), child) for i, child in enumerate(children)]
-    return best
+        for i, child in enumerate(children):
+            if id(child) in inside:
+                continue
+            blocks.append((f"{name}.{i}" if name else str(i), child))
+            inside.update(id(m) for m in child.modules())
+    return blocks
 
 
 def _root_leaf(model: nn.Module) -> list[tuple[str, nn.Module]]:
