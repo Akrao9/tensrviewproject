@@ -8,7 +8,8 @@ over stdio and offers six tools:
 
     list_incidents         what the detectors found, with the run state and what was not checked
     get_incident           one incident in full
-    get_series             one layer's, parameter's, router's or logged scalar's values over a step range
+    get_series             one layer's, parameter's, router's, logged scalar's, or the probe's head's or
+                           attention module's values over a step range
     get_all_ranks_status   every rank of a run folder: judged, unknown, clean, with incidents
     list_runs              the runs kept beside this one, by project
     compare_runs           two or more of those runs: setup, what was checked, incidents
@@ -51,9 +52,13 @@ from . import runs as _runs
 from .sink import read_end_marker
 from .evidence import (
     ALL_RANKS_VIEW,
+    ATTN_KINDS,
+    HEAD_NUMBERS,
     SERVER_KINDS,
+    _attention_values,
     _discover_rank_folders,
     _parquet_parts,
+    _rank_number,  # the one reader of `rank=<n>`: ASCII digits (lane X5, DET-17: `isdecimal()` took `rank=٣`)
     all_ranks_evidence,
     all_ranks_kinds,
     build_evidence,
@@ -85,7 +90,15 @@ MAX_COMPARED = 8
 
 PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS = -32700, -32600, -32601, -32602
 
-SERIES_KINDS = ("layer", "parameter", "router", "scalar")
+SERIES_KINDS = ("layer", "parameter", "router", "scalar", "head", "attention")
+# The probe's series (`probe=`, lane X5, CLI-14): its language-model head numbers (`probe.head`)
+# and each attention module's statistics (`probe.attention`). Named in an error's list of kinds
+# only where the records hold some, and never chosen over another kind for a name both hold
+# unless `kind` says so: a call that read a layer before these were served reads it still.
+PROBE_KINDS = ("head", "attention")
+KIND_WORDS = {"attention": "attention module"}
+# The head's numbers a series shows: the five `head_logit_trends` reads and the positions counted.
+HEAD_COLUMNS = (*HEAD_NUMBERS, "positions", "nonfinite_positions", "overflow_positions")
 # Values a step record carries once for the whole model, readable as scalars.
 RUN_LEVEL = ("grad_norm", "clip_grad_norm", "grad_scale", "lr", "data_wait", "step_time")
 CLASS_MEANINGS = {
@@ -97,7 +110,7 @@ CLASS_MEANINGS = {
 INSTRUCTIONS = (
     "Read-only evidence about one PyTorch training run, from TensorQuill. Call list_incidents first: it gives"
     " the run state, the incidents and what was not checked. Then get_incident for the one you are explaining,"
-    " and get_series for the layer, parameter or router it names. For a run folder with several ranks,"
+    " and get_series for the layer, parameter, router or attention module it names. For a run folder with several ranks,"
     " get_all_ranks_status says which ranks are judged and which are unknown; an unknown rank is not a clean one."
     " To set this run against another, list_runs gives the runs kept beside it and compare_runs compares them by"
     " run ID or name: read what differs in what was checked before the incidents, since a kind one run did not"
@@ -137,11 +150,6 @@ def _parts_stamp(folder: Path, rank: int) -> tuple[tuple[str, int | None, int | 
         else:
             found.append((str(part), stat.st_mtime_ns, stat.st_size))
     return tuple(found)
-
-
-def _rank_number(name: str) -> int | None:
-    key, _, value = name.partition("=")
-    return int(value) if key == "rank" and value.isdecimal() else None
 
 
 def _rank_of(record: Mapping[str, Any]) -> int:
@@ -744,6 +752,10 @@ def _look_next(incident: Mapping[str, Any], rank: int | None = None) -> list[dic
             add(name=name, kind="parameter")
     for item in (incident.get("modules") or [])[:2] if isinstance(incident.get("modules"), list) else ():
         if isinstance(item, Mapping) and isinstance(item.get("module"), str):
+            if incident.get("kind") in ATTN_KINDS:  # the probe's attention module, not a layer (CLI-14)
+                stat = "max_logit" if incident["kind"] == "attention_logit_growth" else "entropy_share"
+                add(name=item["module"], kind="attention", stat=stat)
+                continue
             stat = item.get("stat")
             add(name=item["module"], kind="layer", **({"stat": stat} if isinstance(stat, str) else {}))
     for name in (incident.get("layers") or [])[:2] if isinstance(incident.get("layers"), list) else ():
@@ -828,6 +840,13 @@ def _names(records: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, None]]:
         for field in RUN_LEVEL:
             if record.get(field) is not None:
                 found["scalar"].setdefault(field)
+        probe = record.get("probe")
+        if isinstance(probe, Mapping) and "error" not in probe:
+            head, attention = probe.get("head"), probe.get("attention")
+            if isinstance(head, Mapping) and isinstance(head.get("module"), str):
+                found["head"].setdefault(head["module"])
+            if isinstance(attention, Mapping):
+                found["attention"].update(dict.fromkeys(k for k, v in attention.items() if isinstance(v, Mapping)))
     return found
 
 
@@ -839,25 +858,40 @@ def _sample_names(evidence: Mapping[str, Any]) -> dict[str, dict[str, None]]:
     return found
 
 
+def _word(kind: str) -> str:
+    return KIND_WORDS.get(kind, kind)
+
+
+def _a(kind: str) -> str:
+    word = _word(kind)
+    return f"{'an' if word[0] in 'aeiou' else 'a'} {word}"
+
+
 def _resolve(name: str, kind: str | None, names: Mapping[str, Mapping[str, None]], what: str) -> str:
-    """The kind of series `name` is, or a `ToolError` that says what the names here are."""
+    """The kind of series `name` is, or a `ToolError` that says what the names here are. Without
+    `kind`, a name a probe kind shares with one other kind is that other kind (`PROBE_KINDS`)."""
     holders = [k for k in SERIES_KINDS if name in names[k]]
     if kind is not None and kind in holders:
         return kind
+    if kind is None and len([k for k in holders if k not in PROBE_KINDS]) == 1:
+        return next(k for k in holders if k not in PROBE_KINDS)
     if kind is None and len(holders) == 1:
         return holders[0]
     if kind is None and holders:
-        raise ToolError(f"{name!r} is the name of a {' and of a '.join(holders)} here: pass kind= to choose.")
+        raise ToolError(f"{name!r} is the name of {' and of '.join(map(_a, holders))} here: pass kind= to choose.")
     if holders:
-        raise ToolError(f"{name!r} is a {holders[0]} here, not a {kind}: pass kind={holders[0]!r}, or leave kind out.")
-    pool = {n: k for k in ([kind] if kind else SERIES_KINDS) for n in names[k]}
+        raise ToolError(f"{name!r} is {_a(holders[0])} here, not {_a(kind)}: pass kind={holders[0]!r}, or leave kind out.")
+    # The probe's kinds are listed where the records hold them, or where they were asked for.
+    shown = [k for k in SERIES_KINDS if k not in PROBE_KINDS or names[k] or k == kind]
+    pool = {n: k for k in ([kind] if kind else shown) for n in names[k]}
     close = difflib.get_close_matches(name, list(pool), n=5, cutoff=0.5)
-    counts = ", ".join(f"{len(names[k])} {k}{'s' if len(names[k]) != 1 else ''}" for k in SERIES_KINDS)
-    text = f"no {kind or 'layer, parameter, router or scalar'} is named {name!r} in {what}, which has {counts}."
+    counts = ", ".join(f"{len(names[k])} {_word(k)}{'s' if len(names[k]) != 1 else ''}" for k in shown)
+    kinds = ", ".join(map(_word, shown[:-1])) + f" or {_word(shown[-1])}"
+    text = f"no {_word(kind) if kind else kinds} is named {name!r} in {what}, which has {counts}."
     if close:
         text += " Closest names: " + ", ".join(f"{n} ({pool[n]})" for n in close) + "."
     else:
-        first = [f"{n} ({k})" for k in ([kind] if kind else SERIES_KINDS) for n in list(names[k])[:4]]
+        first = [f"{n} ({k})" for k in ([kind] if kind else shown) for n in list(names[k])[:4]]
         text += (" Names here start: " + ", ".join(first) + ".") if first else ""
     raise ToolError(text + " Names are the ones an incident's `where` gives; a router is named, not numbered.")
 
@@ -905,6 +939,8 @@ def _rows(kind: str, name: str, records: Iterable[Mapping[str, Any]], expert: in
             stats = (record.get("moe_stats") or {}).get(name)
             diversity = stats.get("diversity") if isinstance(stats, Mapping) else None
             point = _router_point((record.get("moe") or {}).get(name), diversity, expert)
+        elif kind in PROBE_KINDS:
+            point = _probe_point(kind, name, record.get("probe"))
         else:
             logged = record.get("scalars")
             value = logged[name] if isinstance(logged, Mapping) and name in logged else record.get(name) if name in RUN_LEVEL else None
@@ -912,6 +948,49 @@ def _rows(kind: str, name: str, records: Iterable[Mapping[str, Any]], expert: in
         if point:
             rows.append((step, point))
     return rows
+
+
+def _probe_point(kind: str, name: str, probe: Any) -> dict[str, Any] | None:
+    """One probe's point of the head or of an attention module, or None where the probe failed,
+    did not read the head, or did not see the module. The head gives its numbers
+    (`HEAD_COLUMNS`); an attention module what the detectors judge (`_attention_values`): the
+    mean of its heads' finite entropy shares, its largest finite logit and how many heads had a
+    share, with the rows counted. Never the per-head lists or the attention map, which are not
+    one value a step, nor the head's text fields (its module, dtypes)."""
+    if not isinstance(probe, Mapping) or "error" in probe:
+        return None
+    if kind == "head":
+        head = probe.get("head")
+        if not isinstance(head, Mapping) or head.get("module") != name or "not_read" in head:
+            return None
+        return {column: head[column] for column in HEAD_COLUMNS
+                if column in head and (head[column] is None or _is_number(head[column]))} or None
+    attention = probe.get("attention")
+    stats = attention.get(name) if isinstance(attention, Mapping) else None
+    if not isinstance(stats, Mapping):
+        return None
+    share, logit, heads = _attention_values(stats)
+    point: dict[str, Any] = {"entropy_share": share, "max_logit": logit, "heads": heads}
+    for column in ("masked_rows", "invalid_rows", "rows"):
+        if _is_number(stats.get(column)):
+            point[column] = stats[column]
+    return point
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _not_read(kind: str, name: str, records: Iterable[Mapping[str, Any]]) -> str:
+    """Why the probe's head has no point: the first probe's reason, when one gave one."""
+    if kind != "head":
+        return ""
+    for record in records:
+        probe = record.get("probe")
+        head = probe.get("head") if isinstance(probe, Mapping) else None
+        if isinstance(head, Mapping) and head.get("module") == name and "not_read" in head:
+            return f" The probe did not read it: {head['not_read']} (step {record.get('step')})."
+    return ""
 
 
 def _sample_rows(name: str, evidence: Mapping[str, Any], expert: int | None) -> list[tuple[int, dict[str, Any]]]:
@@ -968,7 +1047,8 @@ def _over_range(rows: list[tuple[int, dict[str, Any]]], column: str) -> dict[str
 def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dict[str, Any]], bool] = lambda _: True) -> dict[str, Any]:
     name = arguments.get("name")
     if not isinstance(name, str) or not name:
-        raise ToolError("`name` is required: a layer (module), parameter, router or logged scalar, as an incident's `where` names it.")
+        raise ToolError("`name` is required: a layer (module), parameter, router, logged scalar, or the probe's head or"
+                        " attention module, as an incident's `where` names it.")
     kind = arguments.get("kind")
     kind = "layer" if kind == "module" else kind
     if kind is not None and kind not in SERIES_KINDS:
@@ -1042,9 +1122,11 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
                         + (" this series and its flags are from the detectors run on those records."
                            if evidence is not None else " this series is from those records, with no flags.")
                     )
+    asked = kind
     kind = _resolve(name, kind, names, what)
+    also = [k for k in PROBE_KINDS if k != kind and name in names[k]] if asked is None else []
     if expert is not None and kind != "router":
-        raise ToolError(f"`expert` is for a router's series; {name!r} is a {kind}.")
+        raise ToolError(f"`expert` is for a router's series; {name!r} is {_a(kind)}.")
     if evidence is not None and any(isinstance(s, dict) and s.get("router") == name for s in evidence.get("samples") or ()):
         rows = _sample_rows(name, evidence, expert)
     else:
@@ -1063,13 +1145,14 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
                 f" {_compact.describe(window)}."
             )
     if not rows:
-        raise ToolError(f"no step carries values for the {kind} {name!r} yet.")
+        raise ToolError(f"no step carries values for the {_word(kind)} {name!r} yet."
+                        + _not_read(kind, name, records if held is not None else ()))
     columns = list(dict.fromkeys(column for _, point in rows for column in point))
     if expert is not None and all(point.get("expert_share") is None for _, point in rows):
         raise ToolError(f"the router {name!r} has no expert {expert}: its experts are numbered from 1.")
     if stat is not None:
         if stat not in columns:
-            raise ToolError(f"the {kind} {name!r} has no `{stat}`. It has: {', '.join(columns)}.")
+            raise ToolError(f"the {_word(kind)} {name!r} has no `{stat}`. It has: {', '.join(columns)}.")
         columns = [stat]
     else:  # asked for by name only: the token count is the same at every step of most runs
         columns = [column for column in columns if column != "routed_tokens"]
@@ -1077,7 +1160,7 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
     inside = [row for row in rows if (start is None or row[0] >= start) and (end is None or row[0] <= end)]
     if not inside:
         raise ToolError(
-            f"the {kind} {name!r} has no recorded step between {start if start is not None else first} and"
+            f"the {_word(kind)} {name!r} has no recorded step between {start if start is not None else first} and"
             f" {end if end is not None else last}: it is recorded at {len(rows)} steps, from {first} to {last}."
             + (f" {compact_note}" if compact_note is not None and held is None else "")
         )
@@ -1101,6 +1184,9 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
             answer["compact"] = compact_note
         if other_note is not None:
             answer["evidence_file"] = other_note
+        if also:
+            answer["also"] = (f"{name!r} is also the name of {' and of '.join(map(_a, also))} of the probe: pass "
+                              + " or ".join(f"kind={k!r}" for k in also) + " for that series")
         if stride > 1:
             answer["note"] = (
                 f"every {stride}th recorded step is shown; over_range covers every recorded step in the range, so a"
@@ -1301,8 +1387,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "description": (
             "The recorded values of one layer (module: mean, std, abs_max, zero_frac), parameter (grad_norm, update_rms,"
             " weight_norm), MoE router (diversity, largest share and expert, experts with no tokens; `expert` adds"
-            " that expert's share) or logged scalar (such as the loss, or grad_norm and lr for the whole model) over"
-            f" a step range. At most `max_points` points come back (default {DEFAULT_POINTS}): a longer range is"
+            " that expert's share), logged scalar (such as the loss, or grad_norm and lr for the whole model), or,"
+            " from the probe, its language-model head (kind head: norm, mean, log_z, gap, gap_relative, positions)"
+            " or an attention module (kind attention: entropy_share, the mean of its heads' finite shares; max_logit;"
+            " heads; the rows counted) over a step range. A name that is also a layer's is the layer unless"
+            " kind says otherwise, and the answer's `also` says so."
+            f" At most `max_points` points come back (default {DEFAULT_POINTS}): a longer range is"
             " thinned to every nth recorded step, with the stride reported, and `over_range` gives the minimum,"
             " maximum (with their steps) and median over every recorded step in the range, so a one-step spike is"
             " not lost. Narrow `start` and `end` to see each step. Numbers have six significant digits; a NaN or"
@@ -1313,7 +1403,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "type": "object",
             "properties": {
                 "name": {"type": "string",
-                         "description": "The layer (module), parameter, router or scalar name, as an incident's `where` gives it."},
+                         "description": "The layer (module), parameter, router, scalar, head or attention module name,"
+                                        " as an incident's `where` gives it."},
                 "kind": {"type": "string", "enum": list(SERIES_KINDS), "description": "Only needed when one name is used for two kinds."},
                 "stat": {"type": "string", "description": "One column only, such as abs_max or grad_norm. Default: all of them."},
                 "expert": {"type": "integer", "minimum": 1,

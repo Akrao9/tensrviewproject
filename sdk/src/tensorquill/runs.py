@@ -21,9 +21,11 @@ found by its files:
 
 A run kept both as local files and in a store under one folder is one row, read from its local
 files, and the row says where its store copy is (`also_in_store`). A rank whose records are in
-several files (a restart that wrote a file of a name of its own) keeps them all: its last step
-is read from each file's ends with the attempts resolved, its files are named, and it is not
-judged by the listing (an evidence file is of one file); `compare` reads every file of it.
+several files (a restart that wrote a file of a name of its own) keeps them all: every record of
+those files is read, as `compare` reads them, so its attempts are in contract 1's order (each
+file's own order first, then `ts`, then number; never path order) and its last step and `end`
+cell are the newest attempt's; its files are named, and it is not judged by the listing (an
+evidence file is of one file).
 A store run with no judged rank lists its incidents as not known (`?`), never as none.
 
 The listing reads the manifest and the small evidence or report files only. It never opens a
@@ -31,7 +33,12 @@ Parquet part and never runs a detector, so a local run whose evidence file was n
 is listed with its state unknown and a note saying how to write it. A local run of several
 ranks reads each rank's evidence file. Of a `.jsonl` file it
 reads the first line and the last megabyte (for the run ID, the start time, the last step and
-the ranks they name).
+the ranks they name), except the files of a rank whose records are in several files, which are
+read whole, line by line (lane X5, CLI-13, Nov 19, 2026: from their first and last records
+alone, an attempt seen only in the middle of a file was not seen, and the order across the
+files could be wrong). That costs a JSON parse of every line, about 120 MB a second on a
+recorded capture here, and only for such a rank; what is kept is each attempt's first record in
+each file and its steps, never the records.
 
 How many ranks: a file named `<run_id>.rank<N>.jsonl` holds rank N alone when its first and
 last records are rank N's; one whose first or last record names another rank is read as a file
@@ -162,10 +169,116 @@ def _rank_of_file(path: Path, first: Mapping[str, Any] | None) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def _file_lines(path: Path) -> Iterable[tuple[bytes, dict[str, Any]]]:
+    """Each record of a `.jsonl` file with its line, as `compare` reads the file (`_read_local`):
+    every line that is a JSON object. A line that is not one (torn by a killed process) is left
+    out, and then so is a last line with no newline, as the watcher reads the file; otherwise
+    that last line is read when it is whole. Read a line at a time: no file is held whole."""
+    torn = False
+    held: bytes | None = None
+    try:
+        with path.open("rb") as file:
+            for line in file:
+                if not line.endswith(b"\n"):
+                    held = line  # the last line, with no newline
+                    break
+                record = _record_of(line)
+                if record is None:
+                    torn = torn or bool(line.strip())
+                    continue
+                yield line, record
+    except OSError:
+        return
+    if held is not None and not torn and (record := _record_of(held)) is not None:
+        yield held, record
+
+
+def _record_of(line: bytes) -> dict[str, Any] | None:
+    if not line.strip():
+        return None
+    try:
+        found = json.loads(line)
+    except ValueError:
+        return None
+    return found if isinstance(found, dict) else None
+
+
+def _rank_across_files(paths: list[Path], rank: int, run_id: str | None = None) -> dict[str, Any]:
+    """One rank's records in several files, read as `compare` reads them (lane X5, CLI-13): every
+    record of every file, a record identical, line for line, to one of an earlier file read once
+    (`compare._not_read_yet`), the attempts in contract 1's order across the files
+    (`attempt_order_report`), and the last step the highest that `resolve_attempts` keeps.
+
+    What is kept is each attempt's first record in each file (all the order needs) and its
+    steps, 8 bytes each; never the records. `last_step` (None for no step), `order` (oldest
+    first), `report` (`attempt_order_report`'s entry for the rank) and `holders`, the files that
+    hold the newest attempt's records, in the order given."""
+    from array import array
+    from bisect import bisect_left
+
+    from .evidence import _run_of, attempt_order_report, resolve_attempts
+
+    seen: set[int] = set()
+    firsts: list[list[dict[str, Any]]] = []
+    steps: dict[tuple[str, Any], array] = {}
+    holders: dict[tuple[str, Any], list[Path]] = {}
+    for path in paths:
+        mine: set[int] = set()
+        here: dict[tuple[str, Any], dict[str, Any]] = {}
+        for line, record in _file_lines(path):
+            if _record_rank(record) != rank:
+                continue
+            attempt = record.get("attempt", 0)
+            try:
+                found = (_run_of(record), attempt)
+                hash(found)
+            except TypeError:  # an attempt that is not a number or a string: `compare` cannot read it either
+                continue
+            # A file holds the attempt whether or not its lines were read from an earlier file:
+            # a copy sorting first leaves the file the attempt wrote, and its end marker, a holder.
+            if path not in holders.setdefault(found, []):
+                holders[found].append(path)
+            line_key = hash(line.strip())
+            mine.add(line_key)
+            if line_key in seen:
+                continue
+            if found not in here:
+                here[found] = {"run_id": found[0], "rank": rank, "attempt": attempt, "ts": record.get("ts")}
+            step = record.get("step")
+            if isinstance(step, int) and not isinstance(step, bool) and -(1 << 63) <= step < (1 << 63):
+                steps.setdefault(found, array("q")).append(step)
+        seen |= mine
+        firsts.append(list(here.values()))
+    report = attempt_order_report(firsts, [p.name for p in paths])
+    keys = list(report)
+    picked = next((k for k in keys if k[0] == run_id), keys[0] if keys else None)
+    if picked is None:
+        return {"last_step": None, "order": [], "report": None, "holders": []}
+    order = report[picked]["order"]
+    # The furthest step `resolve_attempts` keeps, from a few of each attempt's steps: its first
+    # and last, and its last below each other attempt's first, where every cut it can make falls.
+    chosen: list[dict[str, Any]] = []
+    for (run, attempt), held in steps.items():
+        if run != picked[0]:
+            continue
+        ordered = sorted(set(held))
+        cuts = {min(other) for (r, a), other in steps.items() if r == run and a != attempt}
+        keep = {ordered[0], ordered[-1]} | {ordered[at - 1] for cut in cuts if (at := bisect_left(ordered, cut)) > 0}
+        chosen += [{"run_id": run, "rank": rank, "attempt": attempt, "step": step} for step in sorted(keep)]
+    kept = resolve_attempts(chosen, order={(picked[0], rank): order})
+    newest = order[-1] if order else None
+    return {"last_step": max((r["step"] for r in kept), default=None), "order": order, "report": report[picked],
+            "holders": holders.get((picked[0], newest), [])}
+
+
 def _is_run_folder(folder: Path) -> bool:
+    # `rank=<n>` read as the evidence readers read it, ASCII digits only (lane X5, DET-17: any
+    # folder whose name began `rank=` made a run folder here).
+    from .evidence import _rank_number
+
     try:
         return (folder / _manifest.STORE_MANIFEST).is_file() or (folder / "watchdog.json").is_file() or any(
-            entry.is_dir() and entry.name.startswith("rank=") for entry in os.scandir(folder)
+            entry.is_dir() and _rank_number(entry.name) is not None for entry in os.scandir(folder)
         )
     except OSError:
         return False
@@ -347,10 +460,10 @@ def _record_rank(record: Mapping[str, Any] | None) -> int | None:
 
 
 def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, given: bool = False,
-                 more: Mapping[int, list[Path]] | None = None) -> dict[str, Any]:
+                 more: Mapping[int, list[Path]] | None = None, run_id: str | None = None) -> dict[str, Any]:
     """The ranks of a local run, from what the listing reads anyway: the file names, the first
     line and the last megabyte of each file, and the manifest's `world_size`. No file is read
-    whole.
+    whole to count them.
 
     A file named `<run_id>.rank<N>.jsonl` holds rank N alone (`tensorquill.init` writes one
     such file a rank), when its first and last records are rank N's; a file so named whose first
@@ -369,7 +482,9 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     `several` the files among them that hold several; `last_steps` the ranks' last steps
     (`_steps_by_rank`) of each file that holds or may hold several, where the row uses them.
 
-    `more` are a rank's other files (`discover_runs`' `more_files`): read as the others are.
+    `more` are a rank's other files (`discover_runs`' `more_files`): read as the others are for
+    the count. `split` has, for each rank in `more`, its files read whole (`_rank_across_files`):
+    the attempts' order across them, the last step and the files of the newest attempt.
     """
     from .evidence import MAX_EXPECTED_RANKS
 
@@ -418,7 +533,9 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     found: dict[str, Any] = {"ranks": sorted(seen | set(missing)), "ends": read, "held": held, "several": several,
                              "last_steps": last_steps, "missing": missing,
                              "missing_verb": ("was not read", "were not read") if given else ("has no file", "have no file"),
-                             "shared": shared}
+                             "shared": shared,
+                             "split": {number: _rank_across_files([files[number], *paths], number, run_id)
+                                       for number, paths in (more or {}).items() if number in files and paths}}
     if unsettled and world != len(seen):
         clauses = []
         if own_name:
@@ -595,13 +712,11 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
     rank's own (`_steps_by_rank`).
 
     A rank whose records are in several files (`more`) is unknown: an evidence file is of one
-    file, and the listing reads no file whole. Its last step is the furthest of the files'
-    first and last records that `resolve_attempts` keeps, so an attempt that a later one
-    replaced does not count (lane V4, CLI-13). The files are named."""
-    from .evidence import (
-        RUN_STATES, _incident_identity, _rank_ranges, attempt_order_report, combine_rank_evidence,
-        resolve_attempts_across, run_state,
-    )
+    file. Its last step is the furthest that `resolve_attempts` keeps of every record of its
+    files, the attempts in contract 1's order across them (`known["split"]`), so an attempt that
+    a later one replaced does not count (lane V4, CLI-13), and one seen only in the middle of a
+    file is seen (lane X5). The files are named."""
+    from .evidence import RUN_STATES, _incident_identity, _rank_ranges, combine_rank_evidence, run_state
 
     def ranks(numbers: list[int]) -> str:
         return f"rank{'s' if len(numbers) != 1 else ''} {_rank_ranges(numbers, 8)}"
@@ -616,19 +731,15 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
         records = files[number]
         if number in (more or {}):
             paths = [records, *more[number]]
-            # Each file's ends kept apart: the attempts are ordered across the files by contract 1
-            # (each file's own order first, then `ts`, then number; never path order; lane W3).
-            ends = [[end for end in known["ends"][path]
-                     if end is not None and _record_rank(end) == number and isinstance(end.get("step"), int)
-                     and not isinstance(end.get("step"), bool)] for path in paths]
-            kept = resolve_attempts_across(ends)
-            if kept:
-                steps.append(max(r["step"] for r in kept))
-            order = [info for info in attempt_order_report(ends, [p.name for p in paths]).values()
-                     if info["attempt_order"] == "numeric"]
+            # Every record of the files, the attempts in contract 1's order across them (each
+            # file's own order first, then `ts`, then number; never path order; lanes W3, X5).
+            across = known["split"][number]
+            if across["last_step"] is not None:
+                steps.append(across["last_step"])
+            report = across["report"] or {}
             split[number] = (f"its records are in {len(paths)} files ({', '.join(p.name for p in paths)}), and an evidence "
                              "file is of one file: compare it (python -m tensorquill compare reads them all)"
-                             + "".join(f"; {info['reason']}" for info in order))
+                             + (f"; {report['reason']}" if report.get("attempt_order") == "numeric" else ""))
             continue
         _, last = known["ends"][records]
         step = (last or {}).get("step")
@@ -803,10 +914,11 @@ def run_row(run: Mapping[str, Any]) -> dict[str, Any]:
         row["also_in_store"] = str(run["also_in_store"])
     if run["source"] == "local":
         files = run.get("files") or {}
-        known = _local_ranks(files, manifest, bool(run.get("files_given")), run.get("more_files")) if files else None
+        known = (_local_ranks(files, manifest, bool(run.get("files_given")), run.get("more_files"), run["run_id"])
+                 if files else None)
         row.update(_local_row(run, known))
         if known is not None:
-            row["end"] = _local_end(files, known["missing"], known["missing_verb"][0])
+            row["end"] = _local_end(files, known["missing"], known["missing_verb"][0], known["split"])
     else:
         row.update(_store_row(run))
     # None when the files cannot say without being read whole; `rank_count_not_known` says why.
@@ -818,13 +930,16 @@ def run_row(run: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _local_end(files: Mapping[int, Path], missing: Mapping[int, str] | None = None,
-               verb: str = "has no file") -> dict[str, Any]:
+               verb: str = "has no file", split: Mapping[int, Mapping[str, Any]] | None = None) -> dict[str, Any]:
     """Whether every rank's session closed its file (`sink.read_end_marker`). `closed` only when
     each file has a marker that matches it; otherwise `not_closed`, with the ranks: still running,
     killed or never closed look the same from the files. A rank the manifest's world size counts
     and that has no file, or whose file was not read (`missing`, with why), is not known to have
-    closed one. A store's run has no such cell: the server's status says how each stream ended."""
-    ends = {number: read_end_marker(path) for number, path in files.items()}
+    closed one. A rank whose records are in several files (`split`, `_rank_across_files`) is read
+    from the file its newest attempt wrote (`_newest_end`). A store's run has no such cell: the
+    server's status says how each stream ended."""
+    ends = {number: _newest_end(split[number]) if number in (split or {}) else read_end_marker(path)
+            for number, path in files.items()}
     closed = sorted(n for n, end in ends.items() if end["state"] == "closed")
     raised = sorted(n for n, end in ends.items() if end["state"] == "closed" and end.get("outcome") == "raised")
     other = sorted({n for n in ends if n not in closed} | set(missing or ()))
@@ -836,6 +951,28 @@ def _local_end(files: Mapping[int, Path], missing: Mapping[int, str] | None = No
         found["detail"] = (ends[other[0]]["detail"] if other[0] in ends
                            else f"rank {other[0]} {verb}: {(missing or {})[other[0]]}")
     return found
+
+
+def _newest_end(across: Mapping[str, Any]) -> dict[str, Any]:
+    """How a rank whose records are in several files ended: by the end marker of a file that
+    holds its newest attempt, in contract 1's order (lane X5, CLI-13: the first file's marker was
+    read, which may be an attempt the resume replaced). `closed` when one of those files has a
+    marker of that attempt (or one that names none); a copy of the file has no marker of its own,
+    and the marker of an older attempt's file says nothing of the newest."""
+    order, holding = across.get("order") or [], across.get("holders") or []
+    if not holding:
+        return {"state": "not_closed", "detail": "no file holds a step of the rank's newest attempt, so it is not known"
+                " to have closed"}
+    newest = order[-1]
+    read = [(path, read_end_marker(path)) for path in holding]
+    for _, end in read:
+        if end["state"] == "closed" and end.get("attempt") in (None, newest):
+            return end
+    path, end = read[0]
+    other = next((end.get("attempt") for _, end in read if end["state"] == "closed"), None)
+    detail = (f"the end marker beside it is attempt {other}'s" if other is not None else end["detail"])
+    return {**end, "state": "not_closed" if end["state"] == "closed" else end["state"],
+            "detail": f"{path.name}, the file of the rank's newest attempt ({newest}): {detail}"}
 
 
 def list_runs(source: str | Path = DEFAULT_SOURCE, project: str | None = None) -> list[dict[str, Any]]:
