@@ -3118,3 +3118,113 @@ async fn w2_a_new_attempt_whose_rows_beat_its_first_heartbeat_owns_the_rank_with
         "{entry}"
     );
 }
+
+// --- Lane X6 (Nov 19, 2026): the server's watchdog and ingest ----------------------------------
+
+/// `attempt_schema()` with every key column nullable, as a sender other than the SDK may send it.
+fn nullable_key_schema() -> Arc<Schema> {
+    let fields: Vec<Field> = attempt_schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone().with_nullable(true))
+        .collect();
+    Arc::new(Schema::new(fields))
+}
+
+/// Rows of rank 0 in `nullable_key_schema()`: `(run_id, rank, attempt, step)`, any of them null.
+#[allow(clippy::type_complexity)]
+fn nullable_key_batch(rows: &[(Option<&str>, Option<i32>, Option<i64>, Option<i64>)]) -> RecordBatch {
+    let n = rows.len();
+    RecordBatch::try_new(
+        nullable_key_schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1; n])),
+            Arc::new(StringArray::from(rows.iter().map(|row| row.0).collect::<Vec<_>>())),
+            Arc::new(Int32Array::from(rows.iter().map(|row| row.1).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(rows.iter().map(|row| row.2).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(rows.iter().map(|row| row.3).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(vec![0.5; n])),
+            Arc::new(StringArray::from(vec!["{}"; n])),
+        ],
+    )
+    .unwrap()
+}
+
+/// RS10, live half. A row whose run, rank, step or attempt is null is dropped and counted by the
+/// key, and the other rows of its batch are stored and acknowledged: the stream goes on. Until
+/// Nov 19, 2026 the whole batch was refused with `INVALID_ARGUMENT`, which ended the stream, and
+/// the sender, which sends the same rows again from its offset, could store nothing more for the
+/// rank. A column that is missing or of another type is still refused: no row of it can be read.
+#[tokio::test]
+async fn a_row_with_a_null_key_is_dropped_and_counted_and_the_rest_of_its_batch_is_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        flush_steps: 1,
+        ..manual()
+    };
+    let server = start(dir.path(), config, None).await;
+    let mut put = open_with(&server.address, RUN, 0, None, nullable_key_schema()).await;
+    let good = |step: i64| (Some(RUN), Some(0), Some(1), Some(step));
+    put.send(
+        nullable_key_batch(&[
+            good(0),
+            good(1),
+            (Some(RUN), Some(0), Some(1), None), // no step
+            good(3),
+            (None, Some(0), Some(1), Some(4)), // no run
+            good(5),
+            (Some(RUN), None, Some(1), Some(6)), // no rank
+            (Some(RUN), Some(0), None, Some(7)), // no attempt
+            (None, Some(0), Some(1), None),      // no run and no step: counted once, by the run
+            good(9),
+        ]),
+        100,
+    )
+    .await;
+    assert_eq!(put.ack().await, Ok(100), "the batch was refused");
+    // A batch whose every row is dropped is acknowledged, so its sender does not send it forever.
+    put.send(nullable_key_batch(&[(Some(RUN), Some(0), Some(1), None)]), 200)
+        .await;
+    assert_eq!(put.ack().await, Ok(200));
+    // The stream goes on.
+    put.send(nullable_key_batch(&[good(10), good(11)]), 300).await;
+    assert_eq!(put.ack().await, Ok(300));
+    put.finish().await;
+    assert_eq!(stored_steps(dir.path())[&0], vec![0, 1, 3, 5, 9, 10, 11]);
+    assert_eq!(
+        server.ingest.dropped_rows(),
+        BTreeMap::from([
+            ("attempt".to_string(), 1),
+            ("rank".to_string(), 1),
+            ("run_id".to_string(), 2),
+            ("step".to_string(), 2),
+        ])
+    );
+    // A key column of another type is refused, as before, naming the column.
+    let mut put = open_with(&server.address, RUN, 0, None, put_schema_of_mistyped_attempt()).await;
+    let mistyped = RecordBatch::try_new(
+        put_schema_of_mistyped_attempt(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec![RUN])),
+            Arc::new(Int32Array::from(vec![0])),
+            Arc::new(StringArray::from(vec!["1"])),
+            Arc::new(Int64Array::from(vec![20])),
+        ],
+    )
+    .unwrap();
+    put.send(mistyped, 400).await;
+    assert_eq!(put.ack().await, Err(Code::InvalidArgument));
+    assert_eq!(stored_steps(dir.path())[&0], vec![0, 1, 3, 5, 9, 10, 11]);
+}
+
+/// The key columns, with `attempt` as text.
+fn put_schema_of_mistyped_attempt() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("schema_version", DataType::Int32, false),
+        Field::new("run_id", DataType::Utf8, false),
+        Field::new("rank", DataType::Int32, false),
+        Field::new("attempt", DataType::Utf8, false),
+        Field::new("step", DataType::Int64, false),
+    ]))
+}
