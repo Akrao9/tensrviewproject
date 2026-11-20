@@ -72,7 +72,8 @@ SPIKE_MIN_HISTORY = 10
 SPIKE_SUSTAIN = 3
 # A jump in the size of the optimizer's update (`update_spike`), by the rule of Altenbernd et
 # al. (arXiv 2604.00726, eqs. 8 to 13). R is the largest RMS update over the parameters on a
-# step (`update_rms`, with `init(..., updates=True)`). A step is flagged when R changed from
+# step (`update_rms`, with `init(..., updates=True)`), taken on both steps over the parameters
+# both name (L13). A step is flagged when R changed from
 # the step before by more than `baseline / (UPDATE_ALPHA * sqrt(rise))`: `rise` is how far the
 # total gradient norm before clipping rose from the step before (a norm that did not rise
 # flags nothing), and `baseline` is the mean of that change over the last UPDATE_WINDOW steps
@@ -436,10 +437,12 @@ def detect_update_spikes(
     """Return the first jump in the size of the optimizer's update and the parameters whose
     own update moved most, or None.
 
-    Each record's `update_rms` gives the RMS of Adam's update to each parameter; `R` is the
-    largest of them. A record is compared with the last one before it that could be judged, in
-    the same attempt: `change` is how far `R` moved (either way) and `rise` how far the total
-    gradient norm rose (0 when it fell). The first `window` changes are not judged. After that
+    Each record's `update_rms` gives the RMS of Adam's update to each parameter. A record is
+    compared with the last one before it that could be judged, in the same attempt, and `R` is
+    the largest update over the parameters both of them name, on each side (a parameter recorded
+    from a later step on is not a jump, L13): `change` is how far `R` moved (either way) and
+    `rise` how far the total gradient norm rose (0 when it fell). Two records that share no
+    parameter are not compared. The first `window` changes are not judged. After that
     `baseline` is the mean of the last `window` changes that were not flagged, and a record is
     flagged when `rise > 0` and `change > baseline / (alpha * sqrt(rise))` (Altenbernd et al.,
     arXiv 2604.00726, eq. 13). A flagged change stays out of the baseline, so a fault that lasts
@@ -456,7 +459,7 @@ def detect_update_spikes(
     record before, largest first, so the incident says where the jump is.
     """
     key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
-    before: tuple[Any, float, float, dict[str, float]] | None = None  # attempt, R, total, each parameter's
+    before: tuple[Any, float, dict[str, float]] | None = None  # attempt, total, each parameter's
     recent: deque[float] = deque(maxlen=window)  # the last `window` changes that were not flagged
     first: dict[str, Any] | None = None
     spikes: list[int] = []
@@ -470,10 +473,16 @@ def detect_update_spikes(
         own = {str(name): size for name, size in ((n, _finite(v)) for n, v in sizes.items()) if size is not None}
         if not own:
             continue
-        largest = max(own.values())
         attempt = record.get("attempt", 0)
-        if before is not None and before[0] == attempt:
-            change, rise = abs(largest - before[1]), max(0.0, total - before[2])
+        # R on both sides is the largest update over the parameters both records name (L13, Nov 20,
+        # 2026): a parameter recorded from a later step on (unfrozen after `init`), or one that is
+        # left out of this record, is not a jump. Records that share no parameter are not compared,
+        # and their change joins no baseline. The gradient total stays the whole record's: a
+        # pre-clipping `clip_grad_norm` cannot be split by parameter.
+        shared = [name for name in own if name in before[2]] if before is not None and before[0] == attempt else []
+        if shared:
+            largest, was = max(own[name] for name in shared), max(before[2][name] for name in shared)
+            change, rise = abs(largest - was), max(0.0, total - before[1])
             if len(recent) < window:
                 recent.append(change)
             else:
@@ -486,17 +495,17 @@ def detect_update_spikes(
                     spikes.append(step)
                     if first is None:
                         moved = sorted(
-                            ({"name": name, "update_rms": size, "previous": before[3][name],
-                              "change": abs(size - before[3][name])}
-                             for name, size in own.items() if name in before[3]),
+                            ({"name": name, "update_rms": own[name], "previous": before[2][name],
+                              "change": abs(own[name] - before[2][name])}
+                             for name in shared),
                             key=lambda p: (-p["change"], p["name"]),
                         )
                         first = {
-                            "step": step, "update_rms": largest, "previous": before[1], "change": change,
+                            "step": step, "update_rms": largest, "previous": was, "change": change,
                             "baseline": baseline, "threshold": threshold, "grad_norm": total,
-                            "grad_norm_before": before[2], "grad_rise": rise, "parameters": moved[:10],
+                            "grad_norm_before": before[1], "grad_rise": rise, "parameters": moved[:10],
                         }
-        before = (attempt, largest, total, own)
+        before = (attempt, total, own)
     if first is None:
         return None
     return {"kind": "update_spike", **first, "spike_count": len(spikes), "spike_steps": spikes[:20]}

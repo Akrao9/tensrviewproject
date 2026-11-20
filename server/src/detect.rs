@@ -77,6 +77,8 @@ mod lane_v7_tests;
 mod lane_w3_tests;
 #[cfg(test)]
 mod lane_x4_tests;
+#[cfg(test)]
+mod lane_y2_tests;
 
 // The same values as the constants of the same names in evidence.py.
 pub const OVERLOAD_THRESHOLD: f64 = 0.35;
@@ -1866,8 +1868,17 @@ impl Updates {
             return;
         }
         let largest = own.iter().map(|(_, size)| *size).fold(f64::NEG_INFINITY, f64::max);
-        if let Some(before) = self.before.as_ref().filter(|before| before.attempt == attempt) {
-            let (change, rise) = ((largest - before.largest).abs(), (total - before.total).max(0.0));
+        // R on both sides is the largest update over the parameters both rows name (L13, Nov 20,
+        // 2026), as in Python: a parameter recorded from a later step on, or one left out of this
+        // row, is not a jump. Rows that share no parameter are not compared, and add no change to
+        // the baseline. The gradient total stays the whole row's.
+        let compared = self
+            .before
+            .as_ref()
+            .filter(|before| before.attempt == attempt)
+            .and_then(|before| shared_largest(&own, largest, before).map(|sides| (before, sides)));
+        if let Some((before, (largest, was))) = compared {
+            let (change, rise) = ((largest - was).abs(), (total - before.total).max(0.0));
             if self.recent.len() < window {
                 self.recent.push_back(change);
             } else {
@@ -1903,7 +1914,7 @@ impl Updates {
                             "kind": "update_spike",
                             "step": step,
                             "update_rms": largest,
-                            "previous": before.largest,
+                            "previous": was,
                             "change": change,
                             "baseline": baseline,
                             "threshold": threshold,
@@ -1953,6 +1964,26 @@ impl Updates {
             "step": step,
         }))
     }
+}
+
+/// The largest update over the parameters both `own` and `before` name, on this row's side and
+/// on the row before's, or None when they share none. `largest` is the largest over all of `own`:
+/// rows that name the same parameters in the same order (every row but a few) are not searched.
+fn shared_largest(own: &[(String, f64)], largest: f64, before: &UpdateRow) -> Option<(f64, f64)> {
+    if own.len() == before.own.len() && own.iter().zip(&before.own).all(|((a, _), (b, _))| a == b) {
+        return Some((largest, before.largest));
+    }
+    let mut sides: Option<(f64, f64)> = None;
+    for (at, (name, size)) in own.iter().enumerate() {
+        let was = match before.own.get(at) {
+            Some((known, was)) if known == name => Some(*was),
+            _ => before.own.iter().find(|(known, _)| known == name).map(|(_, was)| *was),
+        };
+        if let Some(was) = was {
+            sides = Some(sides.map_or((*size, was), |(now, then)| (now.max(*size), then.max(was))));
+        }
+    }
+    sides
 }
 
 // --- activation_spike, activation_drift, dead_activations --------------------------------
