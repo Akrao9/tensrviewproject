@@ -621,6 +621,13 @@ def head_logit_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     BF16-to-FP32 `gap` needs real failing runs to set. Probes that did not read the head
     are counted under `not_read` with the first one's step and reason. Returns None when
     no probe carries a `head` entry (no probe, a failed one, or `probe_head=False`).
+
+    `overflow_positions` is there when a probe counted positions whose FP32 logits are finite
+    but whose sums overflow (the probe's `overflow_positions`, which leaves them out of the four
+    numbers, apart from positions with a NaN or an Inf): how many probes did, how many positions
+    in all, the most in one probe, and the first and latest step of one, over every probe that
+    has a `head` entry, read or not (C22, Nov 19, 2026; until then the count was in the records
+    only, so a number taken over fewer positions than the probe saw did not say so).
     """
     seen: list[tuple[int, dict[str, Any]]] = []
     for record in sorted(records, key=lambda r: r["step"]):
@@ -645,6 +652,14 @@ def head_logit_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     if skipped:
         trends["not_read"] = {"probes": len(skipped), "first_step": skipped[0][0],
                               "reason": str(skipped[0][1]["not_read"])}
+    overflowed = [(step, count) for step, head in seen
+                  if isinstance(count := head.get("overflow_positions"), int) and not isinstance(count, bool) and count > 0]
+    if overflowed:
+        trends["overflow_positions"] = {
+            "probes": len(overflowed), "positions": sum(count for _, count in overflowed),
+            "most": max(count for _, count in overflowed),
+            "first_step": overflowed[0][0], "latest_step": overflowed[-1][0],
+        }
     return trends
 
 

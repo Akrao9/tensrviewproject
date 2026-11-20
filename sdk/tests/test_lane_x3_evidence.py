@@ -302,3 +302,57 @@ def test_c03_the_all_ranks_evidence_and_the_watcher_raise_no_stall_for_it(tmp_pa
     assert _stalls(json.loads(out.read_text())["incidents"]) == []
     combined = ev.combine_rank_evidence({0: _per_rank(0, 1), 1: _per_rank(1, 1)}, status=status, status_expected=True)
     assert _stalls(combined["run_incidents"]) == []
+
+
+# --- C22, the evidence half: the probe's overflow count is in the evidence -----------------------
+
+
+def _head(**numbers) -> dict:
+    return {"module": "lm_head", "positions": 8, "nonfinite_positions": 0, "vocab": 32, "calls": 1,
+            "input_dtype": "float32", "weight_dtype": "float32", **numbers}
+
+
+READ = {"norm": 4.0, "mean": 0.1, "log_z": 3.0, "gap": 0.01, "gap_relative": 0.002}
+
+
+def _probed(heads: list[dict]) -> list[dict]:
+    return [{"run_id": "p", "step": step, "probe": {"head": head}} for step, head in enumerate(heads)]
+
+
+def test_c22_the_overflow_count_is_in_the_head_trends():
+    heads = [_head(**READ), _head(**READ, overflow_positions=2), _head(**READ),
+             _head(overflow_positions=8, positions=0, not_read="every position's FP32 logits are finite but too large:"
+                                                                " their sums overflow"),
+             _head(**READ, overflow_positions=1)]
+    trends = ev.head_logit_trends(_probed(heads))
+    assert trends["overflow_positions"] == {"probes": 3, "positions": 11, "most": 8, "first_step": 1, "latest_step": 4}
+    assert trends["read"] == 4 and trends["not_read"]["probes"] == 1
+    # And so in the evidence a reader opens.
+    evidence = tensorquill.build_evidence(_probed(heads), detectors="python")
+    assert evidence["head_trends"]["overflow_positions"]["positions"] == 11
+
+
+def test_c22_without_an_overflow_the_key_is_absent():
+    trends = ev.head_logit_trends(_probed([_head(**READ), _head(**READ, overflow_positions=0)]))
+    assert "overflow_positions" not in trends
+
+
+@pytest.mark.parametrize("count", [True, 2.5, "3", None, -1])
+def test_c22_a_count_that_is_not_a_whole_number_of_positions_is_not_counted(count):
+    trends = ev.head_logit_trends(_probed([_head(**READ, overflow_positions=count)]))
+    assert "overflow_positions" not in trends
+
+
+def test_c22_the_count_survives_a_stored_part(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    from tensorquill import flight
+
+    # The rows the sender sends and the server stores, written as a part and read back as a reader does.
+    records = [{**r, "rank": 0} for r in _probed([_head(**READ, overflow_positions=3), _head(**READ)])]
+    part = tmp_path / "part.parquet"
+    pq.write_table(pa.Table.from_batches([flight.records_to_batch(records)]), part)
+    back = ev._read_part(part)
+    assert back[0]["probe"]["head"]["overflow_positions"] == 3
+    assert ev.head_logit_trends(back)["overflow_positions"]["positions"] == 3
