@@ -203,3 +203,7 @@ You explain. You take no action on the run.
 - If you believe the run should be stopped or changed, say so in the diagnosis and leave the decision to a person.
 
 The TensorQuill tools cannot do any of these things. The rule also covers every other tool you have, such as a shell.
+
+- A rank whose state is `capture_stopped` was not judged after its capture stopped: training went on, the records did not. Treat the run as `unknown`, never as healthy, and give the reason it carries (`sink_error`, `writer_behind`, `close_timeout`).
+- `moe_unassigned` and `moe_left_out` are 0 (or all zeros) when the check ran and found nothing. When they are absent, the check did not run or the record is older than the fields: that is unknown, not zero.
+- In a stalled-weights incident, `trained_before` counts parameters that were changed or not compared at an earlier check. It is not proof that a weight ever moved.
