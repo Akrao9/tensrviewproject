@@ -22,7 +22,7 @@ import threading
 import time
 import warnings
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -2697,7 +2697,17 @@ class Session:
             except Exception:  # noqa: BLE001
                 self.launch = None
             self.launch_read_seconds = time.perf_counter() - began
+            self._drop_launch_source()
         return self.launch
+
+    def _drop_launch_source(self) -> None:
+        """Let go of the store the second read used, once it is made (or the session closed), so a
+        session the caller still holds does not keep the process group's store alive."""
+        try:
+            if self.run.launch_source is not None:
+                self.run = _replace(self.run, launch_source=None)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _observation_record(self, fp: list[list[float]], sums: list[int], seen: dict[str, Any],
                             launch: str | None) -> dict[str, Any]:
@@ -3470,8 +3480,10 @@ class Session:
                 self._stop(error, reason="sink_error")
         # A closed session issues no collective again (its optimizer hooks are off), so it lets go of
         # the process group: one that the job destroys is then not kept alive by a session object
-        # the caller still holds.
+        # the caller still holds. So of the store, once the writer can no longer read the launch.
         self._replica_group = None
+        if not self._worker.is_alive():
+            self._drop_launch_source()
         if self._stopped or getattr(self._sink, "path", None) is None:
             return
         try:

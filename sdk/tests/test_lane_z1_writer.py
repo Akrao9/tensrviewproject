@@ -661,6 +661,16 @@ def test_the_session_reads_the_launch_again_on_its_writer_thread_before_the_firs
     assert [(w, k) for w, k, _ in store.calls] == [("check", LAUNCH_KEY), ("get", LAUNCH_KEY)]  # once
     assert {thread for _, _, thread in store.calls} == {"tensorquill-launch"}
     assert session.launch == "c" * 32 and session.launch_read_seconds is not None
+    assert session.run.launch_source is None  # the store is not kept once read
+
+
+def test_a_closed_session_keeps_no_store_it_never_read(world1):
+    model = _model()
+    session, _ = _init(model, world1, every=2, replica_every=50)
+    session.run = dataclasses.replace(session.run, rank=1, launch_source=(Store(), LAUNCH_KEY))
+    _train(session, model, 2)
+    session.close()
+    assert session.run.launch_source is None
 
 
 # ---------------------------------------------------------------------------------------------
