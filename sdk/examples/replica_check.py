@@ -60,6 +60,15 @@ on healthy steps is what the eight-GPU run measures.
 
 Exit status: 0 PASS, 1 FAIL, 2 bad arguments, 3 NOT PROVEN (the reader could not be found).
 
+How a run ended, when it left no `verdict.json` (lane AD6): each rank says on stderr each stage it
+reaches (`replica_check rank R: <stage>`), and a rank that raises leaves `failed.rankR.json` in the
+run's folder (or in `--out`, before the folder is known) with the stage, the error and its
+traceback, then raises as before. Every rank but 0 stays in `main()` after its `done` file until
+rank 0 has written `verdict.json` or its own `failed.rank0.json` (at most the time rank 0 may take
+to judge), so that a rank that ends early with a nonzero status, which makes torchrun stop every
+rank, cannot stop rank 0 before it judged. The verdict and every file the driver writes are written
+by a scratch file and a rename.
+
     python -m torch.distributed.run --nproc-per-node=3 --master-addr 127.0.0.1 --master-port 29531 \\
         examples/replica_check.py --cpu --out runs/replica
     python -m torch.distributed.run --nproc-per-node=3 --master-addr 127.0.0.1 --master-port 29532 \\
@@ -73,6 +82,7 @@ import os
 import secrets
 import sys
 import time
+import traceback
 from datetime import timedelta
 from pathlib import Path
 
@@ -88,6 +98,37 @@ from tensorquill.flight import offset_path  # noqa: E402
 
 
 SHARED_BYTES = 2048  # room for the run ID and one message, sent as one tensor
+REPORTS_SECONDS = 120.0  # how long rank 0 waits for every rank's `done` file
+VERDICT_MARGIN = 60.0  # what rank 0 may take, beyond its waits, to judge and write the verdict
+
+
+class _Trace:
+    """Where this rank is in the driver: said on stderr at each stage, and written with the error
+    to `failed.rank<R>.json` when the rank raises. Neither ever raises."""
+
+    def __init__(self, rank: object, folder: Path) -> None:
+        self.rank, self.folder, self.stage = rank, folder, "starting"
+
+    def reached(self, stage: str) -> None:
+        self.stage = stage
+        try:
+            print(f"replica_check rank {self.rank}: {stage}", file=sys.stderr, flush=True)
+        except Exception:  # noqa: BLE001  a closed stream: the stage is still kept for the failure file
+            pass
+
+    def failed(self, error: BaseException) -> None:
+        why = f"{type(error).__name__}: {error}"
+        try:
+            print(f"replica_check rank {self.rank}: failed at stage {self.stage!r}: {why}", file=sys.stderr,
+                  flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            path = self.folder / f"failed.rank{self.rank}.json"
+            _write_json(path, {"rank": self.rank, "stage": self.stage, "error": why, "at": time.time(),
+                               "traceback": "".join(traceback.format_exception(error))})
+        except Exception:  # noqa: BLE001  the stderr line above is what is left
+            pass
 
 
 def _share_run(plan: proof.Plan, rank: int, device: torch.device) -> tuple[str, Path, str | None]:
@@ -138,6 +179,20 @@ def _wait_for_reports(work: Path, world: int, seconds: float) -> dict[int, dict]
         time.sleep(0.05)
 
 
+def _wait_for_verdict(work: Path, seconds: float) -> str:
+    """On every rank but 0, after its `done` file: until rank 0 has judged. Files only, no
+    collective. "verdict", "rank 0 failed", or "timed out"."""
+    deadline = time.time() + seconds
+    while True:
+        if (work / "verdict.json").exists():
+            return "verdict"
+        if (work / "failed.rank0.json").exists():
+            return "rank 0 failed"
+        if time.time() > deadline:
+            return "timed out"
+        time.sleep(0.05)
+
+
 def _last_arrival(reports: dict[int, dict], plan: proof.Plan) -> float | None:
     times = [proof.arrival(report, step, plan.mode) for report in reports.values() for step in plan.scheduled
              if not (plan.hold_rank == report.get("rank") and plan.never_judged(step))]
@@ -173,18 +228,31 @@ def main(argv: list[str] | None = None) -> int:
     except proof.UsageError as error:
         print(f"replica_check.py: {error}", file=sys.stderr)
         return proof.EXIT_USAGE
+    trace = _Trace(os.environ.get("RANK", "unknown"), plan.out)
+    try:
+        return _run(plan, trace)
+    except BaseException as error:
+        trace.failed(error)
+        raise
+
+
+def _run(plan: proof.Plan, trace: _Trace) -> int:
     if plan.cpu:
         device, device_ids, backend = torch.device("cpu"), None, "gloo"
     else:
         torch.cuda.set_device(plan.local_rank)
         device, device_ids, backend = torch.device("cuda", plan.local_rank), [plan.local_rank], "nccl"
+    trace.reached(f"starting the {backend} process group")
     dist.init_process_group(backend, timeout=timedelta(seconds=60))
     try:
         rank = dist.get_rank()
+        trace.rank = rank
+        trace.reached("sharing the run")
         run_id, work, problem = _share_run(plan, rank, device)
         if problem:
             print(f"replica_check.py: {problem}", file=sys.stderr)
             return proof.EXIT_USAGE
+        trace.folder = work
         model = proof.build_model(device)
         base = proof.base_values(model)
         proof.reset_and_plant(model, base, ())  # both arms start from one base on every rank
@@ -210,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
             observer.start()
 
         durations: list[float] = []
+        trace.reached(f"training {plan.steps} steps in run {run_id}")
         with tensorquill.init(
             model, run_id=run_id, sink=sink, every=1, auto_step=False, replica_group=dist.group.WORLD,
             replica_every=plan.replica_every, endpoint=plan.endpoint if plan.mode == "server" else None,
@@ -234,17 +303,27 @@ def main(argv: list[str] | None = None) -> int:
                     time.sleep(plan.step_seconds)
                 durations.append(time.perf_counter() - started)
                 progress.step = step
+            trace.reached(f"trained {len(durations)} steps; closing the session")
+        trace.reached("session closed")
         sink.stop()
         _fingerprint_time(model, device, rank)
         done = {"rank": rank, "steps_done": len(durations), "durations": durations, **sink.report()}
         if learning:
             done["weights"] = weights
         _write_json(work / f"done.rank{rank}.json", done)
+        trace.reached("done file written")
         if rank != 0:
-            print(f"rank {rank}: trained {len(durations)} steps; rank 0 reads the verdict")
+            print(f"rank {rank}: trained {len(durations)} steps; rank 0 reads the verdict", flush=True)
+            # Not gone before rank 0 has judged: a rank that ends with a nonzero status (at its own
+            # exit, say) makes torchrun stop every rank, rank 0 among them (lane AD6).
+            bound = REPORTS_SECONDS + plan.final_seconds + VERDICT_MARGIN
+            trace.reached(f"waiting up to {bound:g} s for rank 0's verdict")
+            trace.reached(f"rank 0's verdict: {_wait_for_verdict(work, bound)}")
             return proof.EXIT_PASS
 
-        reports = _wait_for_reports(work, plan.world, seconds=120)
+        trace.reached(f"waiting for the done files of {plan.world} ranks")
+        reports = _wait_for_reports(work, plan.world, seconds=REPORTS_SECONDS)
+        trace.reached(f"done files of ranks {sorted(reports)} of {plan.world}; judging")
         if plan.mode == "server":
             # The last status must come after the server acknowledged every rank's last observation,
             # and may list steps a later one leaves out: keep looking until both hold or time runs out.
@@ -265,7 +344,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"run {run_id}:")
         for line in verdict.lines:
             print(line)
+        sys.stdout.flush()  # a pipe: the lines are out before the file says the run was judged
         _write_json(work / "verdict.json", verdict.document())
+        trace.reached(f"verdict written (exit {verdict.code})")
         return verdict.code
     finally:
         dist.destroy_process_group()

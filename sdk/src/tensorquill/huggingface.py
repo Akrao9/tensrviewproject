@@ -58,6 +58,12 @@ class TensorQuillCallback(TrainerCallback):
       with) and `TrainEndNotReached` otherwise. Nothing is raised into the program and the
       exception is not touched; in a process that goes on (a notebook, a caught
       `KeyboardInterrupt`), call `callback.close()` to close it at once.
+    - **A `close()` made on purpose while training runs** (from another callback, from
+      `compute_loss`, or from another thread while `train()` is under way) is a clean close:
+      the end marker's `outcome` is `"closed"`, and the steps after it are not recorded. A
+      `close()` is taken as made during training when the `train()` that opened the session is
+      still running on one of the process's threads; when that cannot be read, it is closed
+      as raised, as above.
 
     Other keyword arguments go to `tensorquill.init`, for example `routers=`, `capture=`
     or `probe=`.
@@ -71,10 +77,13 @@ class TensorQuillCallback(TrainerCallback):
         # While a session is open and its train() has not reached on_train_end: the frame that
         # called on_train_begin, as (id, code), to tell an exception that came out of it.
         self._training: tuple[int, Any] | None = None
+        # The `self` of that frame (the Trainer), held while `_training` is: a frame found running
+        # later is that train() only if it has this same object (a freed frame's id can be reused).
+        self._trainer: Any = None
         self._pid: int | None = None  # the process that registered the atexit hook
 
     def on_train_begin(self, args: Any, state: Any, control: Any, model: Any = None, optimizer: Any = None, **_: Any) -> None:
-        self.close()  # a previous train() that raised leaves its session open: closed as raised
+        self._close()  # a previous train() that raised leaves its session open: closed as raised
         # The run ID, a `run_id=` given here included, is init's to resolve: rank 0's goes to
         # every rank through the process group's store, so every rank takes the same path
         # whatever it was given.
@@ -87,7 +96,7 @@ class TensorQuillCallback(TrainerCallback):
         kwargs.setdefault("data_wait", True)
         self.session = init(model, **kwargs)
         self._watch = watch_accelerator(self.session, loss_name=self.loss_name, checkpoints=False, data_wait=False)
-        self._training = _training_frame(self)
+        self._training, self._trainer = _training_frame(self)
         self._pid = os.getpid()
         atexit.register(self._at_exit)
         if state.global_step > 0:
@@ -132,17 +141,26 @@ class TensorQuillCallback(TrainerCallback):
 
     def on_train_end(self, args: Any, state: Any, control: Any, **_: Any) -> None:
         self._training = None  # the loop finished: a clean close
-        self.close()
+        self._close()
 
     def close(self) -> None:
         """Write what was captured and stop. Safe to call twice; never raises.
 
-        Called while a `train()` is open (it began and did not reach `on_train_end`, so it
-        raised), it closes the session as raised: the end marker names the exception being
-        handled where `close()` is called, or the uncaught one the process ends with, when that
-        exception came out of this `train()`, and `TrainEndNotReached` otherwise."""
-        exception = self._stopped_by() if self.session is not None and self._training is not None else None
-        self._training = None
+        Called while the `train()` that opened the session is still running (on any thread), it
+        is a close made on purpose: a clean close, `outcome: "closed"`. Called after that
+        `train()` stopped without reaching `on_train_end` (so it raised), it closes the session
+        as raised: the end marker names the exception being handled where `close()` is called,
+        or the uncaught one the process ends with, when that exception came out of this
+        `train()`, and `TrainEndNotReached` otherwise."""
+        self._close(on_purpose=self.session is not None and self._train_running())
+
+    def _close(self, on_purpose: bool = False) -> None:
+        """`close()`, from the callback's own events and the exit hook too, which are never a close
+        made on purpose during training (`on_purpose`): the next `train()`'s `on_train_begin`
+        closes the one before, and at exit no `train()` is left running."""
+        raised = self.session is not None and self._training is not None and not on_purpose
+        exception = self._stopped_by() if raised else None
+        self._training = self._trainer = None
         if self._pid is not None:
             self._pid = None
             try:
@@ -161,9 +179,32 @@ class TensorQuillCallback(TrainerCallback):
         if self._pid != os.getpid():
             return  # a forked child (a DataLoader worker) that runs atexit hooks: not its session
         try:
-            self.close()
+            self._close()
         except BaseException:  # noqa: BLE001  a second Ctrl-C during the close: the exit goes on
             pass
+
+    def _train_running(self) -> bool:
+        """Whether the `train()` that opened the session is still running, on this thread or
+        another: its frame (`_training`) is on a thread's stack, with the same `self`. False when
+        the frame could not be read, or on any error."""
+        training = self._training
+        if training is None or training[1] is None:
+            return False
+        frame = None
+        try:
+            frames = [inspect.currentframe(), *sys._current_frames().values()]
+            for frame in frames:
+                while frame is not None:
+                    if (id(frame) == training[0] and frame.f_code is training[1]
+                            and (self._trainer is None or frame.f_locals.get("self") is self._trainer)):
+                        return True
+                    frame = frame.f_back
+        except Exception:  # noqa: BLE001  not known: closed as raised, never stops the program
+            return False
+        finally:
+            del frame
+            frames = None
+        return False
 
     def _stopped_by(self) -> BaseException:
         """The exception that ended this `train()`, if one can be told, else `TrainEndNotReached`.
@@ -199,10 +240,11 @@ class TrainEndNotReached(Exception):
 _UNKNOWN_FRAME: tuple[int, Any] = (0, None)
 
 
-def _training_frame(callback: TensorQuillCallback) -> tuple[int, Any]:
+def _training_frame(callback: TensorQuillCallback) -> tuple[tuple[int, Any], Any]:
     """The frame that called `on_train_begin` through the `Trainer`'s `CallbackHandler`
     (`Trainer._inner_training_loop`, or what called the callback directly), as (id, code),
-    or `_UNKNOWN_FRAME`. The frame itself is not kept, so its locals are not held after a raise."""
+    or `_UNKNOWN_FRAME`; and that frame's `self` (the `Trainer`), or None. The frame itself is not
+    kept, so its other locals are not held after a raise."""
     handler = CallbackHandler.call_event.__code__.co_filename
     frame = inspect.currentframe()
     try:
@@ -211,9 +253,11 @@ def _training_frame(callback: TensorQuillCallback) -> tuple[int, Any]:
             or frame.f_code is _training_frame.__code__
         ):
             frame = frame.f_back
-        return _UNKNOWN_FRAME if frame is None else (id(frame), frame.f_code)
+        if frame is None:
+            return _UNKNOWN_FRAME, None
+        return (id(frame), frame.f_code), frame.f_locals.get("self")
     except Exception:  # noqa: BLE001  without it, an exception is not named: TrainEndNotReached
-        return _UNKNOWN_FRAME
+        return _UNKNOWN_FRAME, None
     finally:
         del frame
 
