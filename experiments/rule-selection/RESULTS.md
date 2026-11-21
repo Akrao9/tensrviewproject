@@ -92,3 +92,49 @@ What it gives up: a router that is collapsed from its first step is reported 10 
 - No healthy run here has a learning-rate restart or a resume, either of which could move activations within 60 records.
 - The three GPU faults are all step changes of about 100 times. No recorded fault is small or gradual.
 - The spike, diversity, starvation and stall thresholds were not re-measured in this pass.
+
+## A robust local trend, for Q1 and B4 (the author's request, Nov 21, 2026)
+
+`measure_trend.py`. The candidate is `robust_local_trend` of the sibling repository LLM-Training-Debugger (`src/training_debugger/detectors/base.py`), written again here from its description: a line through the median of a window's first third and the median of its last third, each placed at the median of its own step numbers. It uses the actual step numbers, so probes 1,000 steps apart and records one step apart are both read rightly. Under six points it gives no trend. Nothing is judged and no threshold is set.
+
+Recorded per series: `growth` (last-third median over first-third median), the slope as a share of the first anchor per 100 steps, and the longest stretch of steps over which the trailing window's trend stayed up.
+
+**B4, the total gradient norm.**
+
+| Run | First third to last third | Growth | Longest rise |
+|---|---|---|---|
+| Granite, healthy | 15.19 to 15.40 | 1.01 | 221 steps |
+| nanoMoE, both arms | 0.77 to 0.75 | 0.98 | 235 and 252 steps |
+| Seeded-failure toy, healthy | 2.31 to 2.29 | 0.99 | 151 steps |
+| B1 long, healthy / buggy | 0.32 to 0.58 / 0.69 to 3.56 | 1.82 / 5.20 | 180 / 194 steps |
+| B9, healthy / buggy | 1.54 to 1.69 / 2.02 to 2.46 | 1.09 / 1.21 | 190 / 192 steps |
+| B14, healthy / buggy | 0.33 to 0.77 / 0.33 to 0.46 | 2.32 / 1.39 | 174 / 174 steps |
+| **B4, healthy / buggy** | 1.76 to 1.81 / **38.45 to 38.45** | 1.03 / **1.00** | 81 / 16 steps |
+| The three GPU activation faults | 2.0 to 7.8, 10.1 and 22.3 | 3.45, 5.14, 11.35 | 127 to 130 steps |
+
+- **It does not show B4's re-creation.** Without `zero_grad()` the gradient norm goes 5.2, 32.1, 38.4 in three steps and then stays at 38.45 for a hundred. The climb is over before any window holds six points, and the plateau is flat. What marks that run is its level, 360 times the healthy run's, and one run alone has no healthy level to compare with.
+- **It does show a sustained rise where there is one** (B1's buggy long run: 5.2 times, rising for 194 of 200 steps).
+- **A healthy run can rise more than a buggy one** (B14: 2.32 healthy, 1.39 buggy; B1 healthy 1.82). So the number is a description of the run and not evidence of a fault, which is why it carries no threshold.
+
+**Q1, an attention module's largest logit.**
+
+- **No capture on the allowlist can show it.** The three captures with attention probes have four probes each (steps 99, 199, 299, 399), under the six a trend needs.
+- On the review's own series, written by hand (a logit from 10 rising by a fixed share at each probe, 1,000 steps apart): at 25% a probe, where `attention_logit_growth` says nothing, the trend reads growth 3.81 after 8 probes and 108 after 31; at 5% a probe, 1.34 and 2.79; flat reads 1.00. So it measures what the moving baseline cannot. That is arithmetic on a made-up series, not a finding about a real run.
+
+## S6, the median-and-MAD score, on these captures
+
+`measure_score.py`. Each record's total gradient norm, and each module's `abs_max` and `std`, scored against the 50 records before it: `(value - median) / (1.4826 * MAD)`, beside the ratio `value / median`. Also the same on residuals from the window's robust local trend.
+
+| Series | Largest healthy ratio | Largest healthy score | At the seeded faults: ratio | Score |
+|---|---|---|---|---|
+| Total gradient norm | 4.91 (Granite, step 136) | 75.9 (the same step) | 4.3, 5.6, 25.8 | 31, 54, 360 |
+| A module's `abs_max` | 7.81 (B4 healthy, step 31) | 11.9 | about 780 | about 4,100 |
+| A module's `std` | 7.37 (B4 healthy, step 31) | 24.3 (nanoMoE, step 11) | about 100 | 2,500 to 2,800 |
+
+- **For activations the score separates by a wide margin**: at most 24 on 28 healthy record sets, thousands on the faults. The ratio separates them too.
+- **For the total gradient norm neither number separates.** A healthy Granite step scores 76, above two of the three faults (31 and 54), and its ratio of 4.91 is above one fault's 4.3. The sibling's default line of 6 would fire on every healthy run here: their largest scores run from 4 to 76.
+- **Detrending changes little on these runs.** Largest healthy scores of 75.5, 8.8 and 13.7 against 75.9, 11.9 and 24.3. Its one large effect is at the very start of a from-scratch run (nanoMoE's `std` at step 11: 24.3 to 9.6).
+- **A zero MAD did not happen in any real capture**: 0 of about 144,000 scored windows. It happens in the hand-written record set (290 of 580 windows of one statistic), where values repeat exactly.
+- **Asking for 10 or 20 earlier values** gives the same largest healthy scores, except that 20 leaves out nanoMoE's step 11 (24.3 becomes 19.6).
+
+So the score is worth recording beside the ratio, and these captures give no line to draw on it.
