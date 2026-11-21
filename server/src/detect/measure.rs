@@ -17,10 +17,16 @@
 //!
 //! - The two trends need every point of their series, since the median of the first third moves
 //!   as the series grows: one step and one value per row with a total gradient norm, and per
-//!   attention module one per probe that read its largest logit.
+//!   attention module one per probe that read its largest logit. That memory grows with the run,
+//!   so only detectors made for a run read once from start to end keep it
+//!   ([`RankDetectors::whole_run`](super::RankDetectors::whole_run): `tensorquill-server detect`,
+//!   `detect --run`, `--samples`). The live server's detectors, which it holds for the whole run,
+//!   keep no series, and their report has neither trend: the block is absent, never a trend over
+//!   fewer points under the same name.
 //! - `update_trends` keeps each parameter's last [`WINDOW`] finite update sizes and its lowest
 //!   ratio so far, and `weight_jumps` the previous weight check's norms and each tensor's largest
-//!   change so far. Both are bounded by the number of parameters.
+//!   change so far. Both are bounded by the number of parameters, are kept everywhere, and are the
+//!   same on the live path as in `detect`.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -123,6 +129,8 @@ type Listed<'a> = (Option<f64>, &'a str, serde_json::Map<String, Value>);
 /// The state of the four measurements over a rank's rows.
 #[derive(Default)]
 pub(super) struct Measurements {
+    /// Whether the two trends' series are kept (see the module's note); off by default.
+    pub(super) series: bool,
     /// Whether any row so far had `clip_grad_norm`: the trend is read from it from then on.
     clips: bool,
     gradient: Series,
@@ -150,6 +158,9 @@ impl Measurements {
     /// record when one has it (so the rows before clipping began have none and are left out),
     /// `grad_norm` before that; a skipped step and a value that is not finite are left out.
     fn gradient_row(&mut self, step: i64, columns: &Columns, row: usize) {
+        if !self.series {
+            return;
+        }
         if !self.clips && value(columns.clip_grad_norm, row).is_some() {
             self.clips = true;
             self.gradient.clear();
@@ -174,6 +185,9 @@ impl Measurements {
     /// `attention_trends` reads them. Of a module named twice, the last entry counts, as
     /// `json.loads` keeps it.
     pub(super) fn probe(&mut self, step: i64, attention: &[(std::borrow::Cow<'_, str>, AttentionStats)]) {
+        if !self.series {
+            return;
+        }
         let mut last: BTreeMap<&str, Option<f64>> = BTreeMap::new();
         for (name, stats) in attention {
             last.insert(name.as_ref(), stats.logit);

@@ -6,7 +6,8 @@ Each of the ten `measurements` cases of `fixtures/rules/cases.json` is one rank'
 given to `tensorquill-server detect` (`server_detect.server_report`), and streamed to a running
 server, whose `incidents.json` is read after a first stretch, and again after a restart and the last
 record, which the server judges by rebuilding the rank from its store. An `expected` of null is a
-block that must be absent from the report: a missing key, never null. Numbers agree to one part in
+block that must be absent from the report: a missing key, never null. The live server's detectors
+keep no trend series, so its report has `update_trends` and `weight_jumps` and neither trend. Numbers agree to one part in
 1e12, everything else exactly.
 
 It is the server's document that is read, not `build_evidence`: the Python reader of the report is
@@ -87,9 +88,25 @@ def test_every_measurement_case_holds_in_the_report_of_tensorquill_server_detect
     assert out == []
 
 
-def test_every_measurement_case_holds_in_a_live_servers_report_across_a_restart(tmp_path):
+TRENDS = ("gradient_trend", "attention_trends")  # the series grow with the run: `detect` only
+BOUNDED = ("update_trends", "weight_jumps")
+
+
+def live_differs(name: str, document: dict[str, Any], detect: dict[str, Any], *, whole: bool) -> list[str]:
+    """A live report has neither trend, and the bounded blocks as `detect` gives them on the same
+    records and, once it covers the `whole` case, as the case gives them."""
+    out = [f"{name}: the live report has {block}" for block in TRENDS if block in document]
+    if whole and any(block in CASES[name]["expected"] for block in BOUNDED):
+        out += case_differs(name, {block: document[block] for block in BOUNDED if block in document})
+    out += [f"{name}: {block} differs from detect's" for block in BOUNDED if document.get(block) != detect.get(block)]
+    return out
+
+
+def test_a_live_servers_report_has_the_bounded_blocks_and_no_trend_across_a_restart(tmp_path):
     """The live path appends each stored part to the rank's detectors, and rebuilds them from the
-    store after a restart: the blocks are the same either way, and those of `detect`."""
+    store after a restart. Those detectors keep no trend series (their memory would grow with the
+    run), so the report has no `gradient_trend` and no `attention_trends`, never a shorter one; its
+    `update_trends` and `weight_jumps` are the case's and `detect`'s, either way."""
     assert len(CASES) == 10
     server = Server(tmp_path / "store", 0, *FAST)
     streams: dict[str, Stream] = {}
@@ -101,22 +118,21 @@ def test_every_measurement_case_holds_in_a_live_servers_report_across_a_restart(
         stream = streams[name] = Stream(tmp_path / name, *FAST, run=run, server=server)
         stream.store = tmp_path / "store"
         if len(records) > 1:
-            # The first stretch, appended part by part: its blocks are those of `detect` on it.
-            first = stream.send(records[:-1])
-            out += [f"{name}: the first stretch differs from detect on {block}" for block in BLOCKS
-                    if first.get(block) != server_report(stream.sent).get(block)]
+            # The first stretch, appended part by part.
+            out += live_differs(name, stream.send(records[:-1]), server_report(stream.sent), whole=False)
     assert server.terminate() == 0
     server = Server(tmp_path / "store", 0, *FAST)
+    present = 0
     for name, body in CASES.items():
         stream = streams[name]
         stream.server = server
         run = name.replace("_", "-")
         last = {"schema_version": 1, "run_id": run, "rank": 0, "attempt": 1, **body["records"][-1]}
         document = stream.send([last])
-        out += case_differs(name, document)
         # A part after the restart rebuilds the rank from the store; a one-record case has no first part.
         assert document["rebuilds"] == 1, (name, document["rebuilds"])
-        out += [f"{name}: detect differs from the live report on {block}" for block in BLOCKS
-                if document.get(block) != server_report(stream.sent).get(block)]
+        out += live_differs(name, document, server_report(stream.sent), whole=True)
+        present += sum(block in document for block in BOUNDED)
     assert server.terminate() == 0
+    assert present == 2  # the two cases that expect a bounded block
     assert out == []

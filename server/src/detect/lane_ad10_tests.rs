@@ -6,7 +6,9 @@
 //! [`judge`], and the rank's [`report`] is compared with the case's `expected`. An `expected` of
 //! null is a block that must be absent: a missing key, never `null`. Numbers agree to one part in
 //! 1e12; everything else is exact. The tests after the cases pin what no case states, with numbers
-//! worked out by hand from `make_cases.py`'s functions.
+//! worked out by hand from `make_cases.py`'s functions. `judge` and `detect_run` keep the two
+//! trends' series ([`RankDetectors::whole_run`]); the live path's detectors do not, and one test
+//! holds them to that.
 
 use std::sync::Arc;
 
@@ -129,17 +131,18 @@ fn every_measurement_case_holds_through_detect_run() {
     assert_eq!(held, 10);
 }
 
-/// The live path reads a rank part by part ([`RankDetectors::append`]): the blocks after every
-/// row read one at a time are those of the whole read at once, and are there.
+/// Detectors that keep the trend series ([`RankDetectors::whole_run`], as `judge` makes them) and
+/// read a rank one batch per row give the blocks of the whole read as one batch, and they are there.
 #[test]
 fn a_rank_read_row_by_row_gives_the_blocks_of_the_whole() {
     let mut out = Vec::new();
     for (name, body) in measurement_cases() {
         let records = body["records"].as_array().unwrap();
-        let mut detectors = RankDetectors::new(&Arc::new(Thresholds::default()));
-        for record in records {
-            detectors.append(0, &stored(std::slice::from_ref(record)));
-        }
+        let pieces: Vec<_> = records
+            .iter()
+            .map(|record| stored(std::slice::from_ref(record)))
+            .collect();
+        let detectors = judge(0, &pieces, &Arc::new(Thresholds::default())).unwrap();
         let piecewise = report("ad10", 0, &detectors, 0);
         let whole = judged(records);
         for block in BLOCKS {
@@ -155,6 +158,39 @@ fn a_rank_read_row_by_row_gives_the_blocks_of_the_whole() {
             }
         }
     }
+    assert!(out.is_empty(), "{}", out.join("\n"));
+}
+
+/// The live server's detectors ([`RankDetectors::new`], which `replay` makes and the live path
+/// appends to) keep no trend series: their report has no `gradient_trend` and no
+/// `attention_trends`, never a shorter trend, and the two bounded blocks as `detect` gives them.
+#[test]
+fn the_live_paths_detectors_keep_no_trend_series_and_give_the_bounded_blocks() {
+    let mut out = Vec::new();
+    let mut bounded = 0;
+    for (name, body) in measurement_cases() {
+        let records = body["records"].as_array().unwrap();
+        let mut detectors = RankDetectors::new(&Arc::new(Thresholds::default()));
+        for record in records {
+            detectors.append(0, &stored(std::slice::from_ref(record)));
+        }
+        let live = report("ad10", 0, &detectors, 0);
+        for block in ["gradient_trend", "attention_trends"] {
+            if let Some(got) = live.get(block) {
+                out.push(format!("{name}: the live report has {block} {got}"));
+            }
+        }
+        for block in ["update_trends", "weight_jumps"] {
+            if let Some(expected) = body["expected"].get(block) {
+                block_differs(&name, &live, block, expected, &mut out);
+                bounded += usize::from(!expected.is_null());
+            }
+            if live.get(block) != judged(records).get(block) {
+                out.push(format!("{name}: {block} differs from detect's"));
+            }
+        }
+    }
+    assert_eq!(bounded, 2);
     assert!(out.is_empty(), "{}", out.join("\n"));
 }
 
