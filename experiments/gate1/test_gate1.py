@@ -659,3 +659,96 @@ def test_the_complete_design_gets_its_verdict_and_no_provisional_mark(built):
         assert verdict == f"Gate (C against R, amendment of Nov 17, 2026): {expected}. Both parts must hold."
         assert not any(line.startswith("Provisional") or "preregistered design" in line for line in lines)
     assert harness.design_gaps(*[[r for r in harness.score(key, files) if r["arm"] == arm] for arm in ("C", "R")]) == []
+
+
+# --- The speed line's ratio with a zero denominator (amendment of Nov 20, 2026) ------------------
+# Hand-built score rows, so none of these needs the fixture build. Arm R is compared with arm B,
+# which is one of the pairs the plan's speed line is checked on.
+
+
+def row(arm, *, calls=None, seconds=None, agent=True, correct=True, trial=1, fixture="unseen-1"):
+    """One row as `harness.score` makes it: a held-out trial, right on every question when `correct`."""
+    marks = {q: True for q in harness.QUESTION_IDS}
+    if not correct:
+        marks["step"] = False
+    return {"file": f"{arm}-{fixture}-{trial}", "fixture": fixture, "arm": arm, "trial": trial,
+            "participant": "agent:model-x" if agent else "human:author", "held_out": True, "agent": agent,
+            "seconds": seconds, "tool_calls": calls, "marks": marks,
+            "right": sum(marks.values()), "scored": len(marks), "correct": correct}
+
+
+CALLS = "Median agent tool calls to a correct answer"
+SECONDS = "Median human time to a correct answer"
+
+
+def speed(rows):
+    """The speed lines of B against R: each measure's line, and the verdict line or None."""
+    lines = harness.gate_checks(rows)
+    calls = next(line for line in lines if line.startswith(CALLS))
+    seconds = next(line for line in lines if line.startswith(SECONDS))
+    verdict = next((line for line in lines if line.startswith("Speed line against R")), None)
+    return calls, seconds, verdict
+
+
+def test_zero_tool_calls_over_zero_is_not_measured():
+    calls, _, verdict = speed([row("B", calls=0), row("R", calls=0)])
+    assert calls == (f"{CALLS}, R over B: 0 / 0: not measured (arm B's median is zero, so the ratio is "
+                     f"undefined; it counts neither for nor against the speed line).")
+    # Nothing else is measured, so the speed line has no verdict (as when no measure has correct trials).
+    assert verdict is None
+
+
+def test_a_positive_count_over_zero_is_not_measured_and_does_not_meet_the_line():
+    calls, _, verdict = speed([row("B", calls=0), row("R", calls=7)])
+    assert calls.startswith(f"{CALLS}, R over B: 7 / 0: not measured")
+    assert "meets" not in calls and "inf" not in calls
+    assert verdict is None
+
+
+def test_zero_over_a_positive_count_is_an_ordinary_ratio_below_the_line():
+    calls, _, verdict = speed([row("B", calls=5), row("R", calls=0)])
+    assert calls == f"{CALLS}, R over B: 0 / 5 = 0.00× (below 2.0×)."
+    assert verdict.startswith("Speed line against R (not met)")
+
+
+@pytest.mark.parametrize("r_calls,ratio,meets", [(20, "2.00", True), (15, "1.50", False)])
+def test_an_ordinary_ratio_meets_the_line_at_two_and_not_below(r_calls, ratio, meets):
+    calls, _, verdict = speed([row("B", calls=10), row("R", calls=r_calls)])
+    assert calls == f"{CALLS}, R over B: {r_calls} / 10 = {ratio}× ({'meets' if meets else 'below'} 2.0×)."
+    assert verdict.startswith(f"Speed line against R ({'met' if meets else 'not met'})")
+
+
+def test_a_missing_count_beside_an_observed_zero():
+    # A count of null is left out of the median and is not read as zero; the observed zero is kept.
+    calls, _, _ = speed([row("B", calls=None), row("B", calls=0, trial=2), row("R", calls=6)])
+    assert calls.startswith(f"{CALLS}, R over B: 6 / 0: not measured (arm B's median is zero")
+    # With only a missing count, B has no median at all: the line says so, and it is not the zero's line.
+    calls, _, _ = speed([row("B", calls=None), row("R", calls=6)])
+    assert calls == f"{CALLS}, B against R: not measured (no correct trials in both arms)."
+    # The missing count is not turned into a zero: B's median over [null, 0, 4] is 2, not 0.
+    calls, _, _ = speed([row("B", calls=None), row("B", calls=0, trial=2), row("B", calls=4, trial=3),
+                         row("R", calls=6)])
+    assert calls == f"{CALLS}, R over B: 6 / 2.0 = 3.00× (meets 2.0×)."
+    # Every file's own count is shown as it is: 0 as 0 and null as a dash.
+    table = harness.results_table([row("B", calls=None), row("B", calls=0, trial=2), row("R", calls=6)])
+    assert "| unseen-1 | B | 1 | agent:model-x | 6 / 6 | yes | – | – | – |" in table
+    assert "| unseen-1 | B | 2 | agent:model-x | 6 / 6 | yes | – | 0 | – |" in table
+    assert "R over B: 6 / 0: not measured" in table
+
+
+def test_a_zero_human_seconds_denominator_is_not_measured():
+    _, seconds, verdict = speed([row("B", seconds=0.0, agent=False), row("R", seconds=90.0, agent=False)])
+    assert seconds.startswith(f"{SECONDS}, R over B: 90.0 / 0.0: not measured")
+    assert verdict is None
+
+
+@pytest.mark.parametrize("r_seconds,met", [(180.0, True), (90.0, False)])
+def test_the_speed_line_is_judged_on_the_measured_measure_alone(r_seconds, met):
+    # Tool calls not measured (B's median is zero); human seconds measured, 3.0× or 1.5×.
+    rows = [row("B", calls=0), row("R", calls=9),
+            row("B", seconds=60.0, agent=False, trial=2), row("R", seconds=r_seconds, agent=False, trial=2)]
+    calls, seconds, verdict = speed(rows)
+    assert calls.startswith(f"{CALLS}, R over B: 9 / 0: not measured")
+    assert seconds.endswith(f"({'meets' if met else 'below'} 2.0×).")
+    assert verdict == (f"Speed line against R ({'met' if met else 'not met'}): arm B must cut either measure "
+                       f"by at least 2.0× against arm R.")
