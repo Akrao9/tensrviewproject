@@ -66,20 +66,46 @@ def test_both_engines_give_the_same_evidence_on_a_rule_case(name):
 # --- 2 ------------------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="found at wave AD's trial: a sender that returns with a saved offset first sends an empty "
-                   "batch to ask for the store, the real server refuses that batch for its columns too, and the refusal "
-                   "names no range of the sender's, so the sender holds its offset and the refused rows are never sent")
-def test_rs10_joined_the_real_server_refuses_and_the_production_sender_resumes_at_the_right_byte(tmp_path, monkeypatch):
-    """The author's run with the production sender on both ends of each disconnect: A is stored;
-    the sender returns and sends B, whose `step` column is text; it returns again and sends C.
-    Intended: only A and C are stored, B is counted once on each side, and the sender's offset
-    ends at the end of C.
+def test_a_store_query_is_answered_whatever_its_columns_and_is_not_a_refused_batch(tmp_path):
+    """The narrow fix of wave AD's trial. A batch of no rows with an end offset of 0 is the sender's
+    question for the store. It is answered before any column is looked at, counts no refusal and
+    moves no offset; a batch with rows and the same columns is refused as before.
+    Fail before the fix: the query's stream ended with the refusal, and it was counted."""
+    import pyarrow as pa
+    import pyarrow.flight as pa_flight
 
-    What happens on the trial tree (Nov 21, 2026): the second sender's first batch is the empty one
-    that asks the server for its store. Its schema is the stream's, so the server refuses it; the
-    refusal does not name bytes the sender sent, so by its own rule the sender keeps its offset and
-    tries again. B's rows never leave, the server counts one refused batch (the empty one), and when
-    the sender's rows are readable again B and C are both stored."""
+    store = tmp_path / "store"
+    server = Server(store, 0, *FAST)
+    text = pa.schema([pa.field("step", pa.string(), nullable=False) if f.name == "step" else f for f in flight.flight_schema()])
+    client = pa_flight.FlightClient(server.endpoint)
+    try:
+        writer, reader = client.do_put(pa_flight.FlightDescriptor.for_path("runs", "query", "rank=0"), text,
+                                       pa_flight.FlightCallOptions(timeout=30.0))
+        metadata = {"schema_version": 1, "run_id": "query", "rank": 0, "end_byte_offset": 0, "min_step": None, "max_step": None}
+        writer.write_with_metadata(pa.RecordBatch.from_pylist([], schema=text), pa.py_buffer(json.dumps(metadata).encode()))
+        answer = json.loads(reader.read().to_pybytes())
+        assert answer["end_byte_offset"] == 0 and "refused" not in answer and answer.get("store_id")
+        writer.done_writing()
+        while reader.read() is not None:
+            pass
+        writer.close()
+    finally:
+        client.close()
+        server.terminate()
+    status_file = store / "runs" / "query" / "watchdog.json"
+    if status_file.exists():
+        assert all("refused_batches" not in rank for rank in json.loads(status_file.read_text()).get("ranks", []))
+
+
+def test_rs10_joined_the_real_server_refuses_and_the_production_sender_resumes_at_the_right_byte(tmp_path, monkeypatch):
+    """The author's run with the production sender on both sides of each disconnect, against the
+    real server. A is stored. The sender returns with its saved offset: its store query is answered,
+    and it sends B, whose `step` column is text; the server confirms the refusal of exactly B's
+    bytes, and the sender moves its offset across those bytes and no further. It returns again and
+    sends C, which is stored. Only A and C are stored, and B is counted once on each side.
+
+    The sender builds every batch from one schema, so B is made by giving it, for the life of the
+    second sender, a schema whose `step` is text; everything else is the production path."""
     import pyarrow as pa
 
     store, path = tmp_path / "store", tmp_path / "run-a.rank0.jsonl"
@@ -104,12 +130,16 @@ def test_rs10_joined_the_real_server_refuses_and_the_production_sender_resumes_a
         monkeypatch.setattr(flight, "rows_to_send", text_rows)
         append(path, [sender_record(step) for step in range(3, 5)])
         after_b = path.stat().st_size
-        second = sender()
+        after_a = saved()
+        second = sender()                                                                   # starts with a saved offset: it asks first
         try:
-            wait_for(lambda: second.refused_batches == 1, timeout=8.0)
+            wait_for(lambda: second.refused_batches == 1, timeout=15.0)
+            assert second.last_refused == {**second.last_refused, "start_byte_offset": after_a, "end_byte_offset": after_b,
+                                           "column": "step"}
+            assert saved() == after_b                                                      # across the refused bytes, and no further
         finally:
-            second.close(timeout=1.0)
-        assert saved() == after_b                                                          # resumed past the refused bytes
+            second.close(timeout=2.0)
+        assert second.refused_batches == 1 and saved() == after_b
         monkeypatch.setattr(flight, "flight_schema", good_schema)                          # C, from a sender that returned again
         monkeypatch.setattr(flight, "rows_to_send", good_rows)
         append(path, [sender_record(step) for step in range(5, 8)])

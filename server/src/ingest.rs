@@ -805,19 +805,31 @@ impl Ingest {
         self.store_id()
             .await
             .map_err(|error| Status::unavailable(format!("cannot read the store's ID: {error}")))?;
-        // Rows that cannot be stored are dropped before anything of the batch is placed or kept, and
-        // a batch none of whose rows can be read is refused and counted (RS10).
-        let (batch, dropped) = match drop_unstorable_rows(batch) {
-            Ok(kept) => kept,
-            Err(refused) => {
-                if let Some(column) = refused.column {
-                    self.batch_refused(key, column, end_byte_offset).await;
-                    self.confirm_refusal(key, column, end_byte_offset, ack).await;
+        // The store query (no rows and an end offset of 0: the first batch of a sender that returns
+        // with a saved offset) holds nothing to store, so no column of it is looked at. It is
+        // answered as it always was, with the offset held and the store's ID, after the stream's
+        // identity and the store's ID were checked above. Until wave AD's trial its columns were
+        // checked like a data batch's: a sender whose rows the server refuses had its query refused
+        // too, counted as a refused batch though it held no row, and the refusal named no bytes of
+        // the sender's, so the sender kept its offset and its rows never left (RS10).
+        let question = batch.num_rows() == 0 && end_byte_offset == 0;
+        let (pieces, dropped) = if question {
+            (Vec::new(), Dropped::new())
+        } else {
+            // Rows that cannot be stored are dropped before anything of the batch is placed or kept,
+            // and a batch none of whose rows can be read is refused and counted (RS10).
+            let (batch, dropped) = match drop_unstorable_rows(batch) {
+                Ok(kept) => kept,
+                Err(refused) => {
+                    if let Some(column) = refused.column {
+                        self.batch_refused(key, column, end_byte_offset).await;
+                        self.confirm_refusal(key, column, end_byte_offset, ack).await;
+                    }
+                    return Err(refused.status);
                 }
-                return Err(refused.status);
-            }
+            };
+            (split_by_attempt(batch)?, dropped)
         };
-        let pieces = split_by_attempt(batch)?;
         // Every attempt of the batch has its place in the store's order before any row of it is
         // taken (contract 1): a batch that cannot have it is refused, and its sender sends it again.
         let attempts: Vec<i64> = pieces.iter().map(|(attempt, _)| *attempt).collect();
@@ -866,8 +878,16 @@ impl Ingest {
         }
         buffer.ack = Some(ack.clone());
         buffer.pending_offset = Some(end_byte_offset.max(buffer.pending_offset.unwrap_or(0)));
+        // The query's answer names offset 0 on its stream. That is not an offset the rank's rows were
+        // acknowledged to, so what the server last acknowledged for the rank stays as it was: a
+        // refusal that follows the query names it as where the refused bytes began, which is the
+        // offset the returning sender saved (RS10, wave AD's trial).
+        let held = buffer.acknowledged;
         if buffer.batches.is_empty() || buffer.rows >= self.config.flush_steps {
             self.flush(key, &mut buffer).await?;
+        }
+        if question && held.is_some() {
+            buffer.acknowledged = held;
         }
         Ok(())
     }
