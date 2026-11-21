@@ -364,7 +364,7 @@ def test_the_manifest_rides_on_the_first_batch_of_each_stream_and_a_sender_witho
         before = len(store.batches)
         assert fast_sender(other, server.endpoint).close() is True
         assert set(store.batches[before]) == {"schema_version", "run_id", "rank", "min_step", "max_step",
-                                              "end_byte_offset", "rows"}
+                                              "end_byte_offset", "start_byte_offset", "rows"}
     finally:
         server.stop()
 

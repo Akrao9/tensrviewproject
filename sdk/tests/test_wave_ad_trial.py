@@ -6,8 +6,8 @@ author asked the trial to show.
    the right byte. The sender builds every batch from one schema, so the refused batch is made by
    giving it, for that one batch, a schema whose `step` column is text; everything else is the
    production path on both sides. Reconnecting to a running server passes. The same run across a
-   restart of the server itself is here too, as the regression for the follow-up: its safe half
-   passes, and the half the follow-up must fix is an expected failure.
+   restart of the server itself is here too, stopped and killed, as the regression for the
+   follow-up: its safe half passed before it, and the half it fixed (wave AE) passes now.
 3. A Rust-backed `--watch` on a file gives, at every look, what a fresh judgment of the file gives,
    through a step appended, a new attempt, late rows of an old attempt and an attempt that replaces
    judged steps, and again under another threshold.
@@ -154,19 +154,20 @@ def test_rs10_joined_the_real_server_refuses_and_the_production_sender_resumes_a
     assert (entry.get("refused_batches"), entry.get("refused_batch_keys")) == (1, {"step": 1})
 
 
-@pytest.fixture(scope="module")
-def across_a_server_restart(tmp_path_factory):
-    """RS10's open part, as one run (the regression for the follow-up). A is stored and the sender's
-    offset saved. The server stops and a new one starts on the same store. The sender returns and
-    sends B, whose `step` column is text, which the server refuses. Then a sender returns once more
-    with C. What each side said is returned; the two tests below read it.
+@pytest.fixture(scope="module", params=["terminate", "kill"])
+def across_a_server_restart(tmp_path_factory, request):
+    """RS10's open part, as one run (the regression for the follow-up, built in wave AE). A is
+    stored and the sender's offset saved. The server stops (SIGTERM, or SIGKILL: whatever was only
+    in its memory is gone) and a new one starts on the same store. The sender returns and sends B,
+    whose `step` column is text, which the server refuses. Then a sender returns once more with C.
+    What each side said is returned; the two tests below read it.
 
     B is made as in the joined test above, by a schema given to the second sender alone, so the
     third sender, which has the real schema, can send B's bytes again if its offset still stands
     before them: that is how a sender that did not move shows in what is stored."""
     import pyarrow as pa
 
-    tmp = tmp_path_factory.mktemp("rs10-restart")
+    tmp = tmp_path_factory.mktemp(f"rs10-restart-{request.param}")
     store, path = tmp / "store", tmp / "run-a.rank0.jsonl"
     good_schema, good_rows, refusal = flight.flight_schema, flight.rows_to_send, FlightSender._refusal
     text = pa.schema([pa.field("step", pa.string(), nullable=False) if f.name == "step" else f for f in good_schema()])
@@ -195,7 +196,7 @@ def across_a_server_restart(tmp_path_factory):
             assert sender(server).close(timeout=10.0) is True
             seen["after_a"] = saved()
             assert seen["after_a"] == path.stat().st_size
-            server.terminate()                                                              # the server itself restarts
+            getattr(server, request.param)()                                                # the server itself restarts
             seen["stored_at_restart"] = sorted(int(r["step"]) for r in stored_records(store, "run-a"))
             server = Server(store, 0, *FAST)
             patch.setattr(flight, "flight_schema", lambda: text)                            # B, from a sender that returned
@@ -236,16 +237,15 @@ def test_rs10_across_a_server_restart_the_refusal_is_told_and_nothing_is_lost(ac
     assert seen["counted_by_server"] == 1
 
 
-@pytest.mark.xfail(strict=True, reason="RS10, open part (the follow-up to wave AD): a restarted server has forgotten the rank's "
-                   "last acknowledged offset, so its refusal names a range from byte 0; the sender, whose range begins at its "
-                   "saved offset, holds there and sends the refused bytes again")
 def test_rs10_across_a_server_restart_the_sender_moves_across_the_refused_bytes(across_a_server_restart):
-    """What the follow-up must make true. The refusal names exactly B's bytes, from the offset the
-    sender saved before the restart; the sender counts it and moves across those bytes and no
-    further; and only A and C are stored.
-    Today: the refusal names byte 0 as its start, the sender counts nothing and stays before B, and
-    B's bytes go again (here they are then stored, since the third sender has the real schema; a
-    batch the server can never take would be sent without end, with nothing behind it stored)."""
+    """What the follow-up made true (wave AE). The refusal names exactly B's bytes, from the offset
+    the sender saved before the restart; the sender counts it and moves across those bytes and no
+    further; and only A and C are stored. B's metadata states where B begins (`start_byte_offset`),
+    and the restarted server, which holds no acknowledged offset for the rank, names the range from
+    there.
+    Before: the refusal named byte 0 as its start, the sender counted nothing and stayed before B,
+    and B's bytes went again (here they were then stored, since the third sender has the real
+    schema; a batch the server can never take was sent without end, with nothing behind it stored)."""
     seen = across_a_server_restart
     assert [r.get("start_byte_offset") for r in seen["named"]] == [seen["after_a"]]
     assert seen["counted_by_sender"] == 1 and seen["saved_after_b"] == seen["after_b"]

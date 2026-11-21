@@ -32,7 +32,10 @@
 //! the refused bytes: `{"end_byte_offset": S, "refused": {"start_byte_offset": S, "end_byte_offset": E,
 //! "column"}, "store_id"}` (`DETECTOR_RULES_CONTRACT.md` part 8, from Nov 21, 2026; see
 //! `Ingest::confirm_refusal` for S). A sender that sent exactly bytes S to E may take E as its offset
-//! and not send them again; any other sender reads it as an acknowledgement of S, which it has.
+//! and not send them again; any other sender reads it as an acknowledgement of S, which it has. A
+//! batch's metadata may also claim where it begins, `start_byte_offset` (senders from wave AE on):
+//! a server that has acknowledged nothing for the rank since it started names the refused range
+//! from there, and acknowledges 0, as it does without the claim.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -291,6 +294,11 @@ struct BatchMetadata {
     /// attempt, and an attempt first seen in this stream's rows is placed just before it.
     #[serde(default)]
     sender_attempt: Option<i64>,
+    /// Where the batch begins in the sender's file (senders from wave AE on; RS10). A claim, read
+    /// only to name a refused batch's bytes when the server knows nothing of where they began (see
+    /// `Ingest::confirm_refusal`); never an acknowledgement and never a position the server keeps.
+    #[serde(default)]
+    start_byte_offset: Option<i64>,
 }
 
 /// One `DoPut` stream of a rank: the attempt its first batch named, and whether it counts for the
@@ -613,18 +621,33 @@ impl Ingest {
     /// Tells the sender, before the status that ends its stream, which bytes were refused for good
     /// (RS10, `DETECTOR_RULES_CONTRACT.md` part 8): one message on the acknowledgement channel,
     /// `{"end_byte_offset": S, "refused": {"start_byte_offset": S, "end_byte_offset": E, "column"},
-    /// "store_id"}`, E being the end the refused batch claimed. First everything the rank holds is
+    /// "store_id"}`, E being the end the refused batch claimed (the outer offset is 0, not S, when S
+    /// is the sender's own claim; below). First everything the rank holds is
     /// stored, so S, and every row the stream sent before the refused batch, are stored: nothing is
     /// acknowledged past the refused batch, and a sender that takes E as its offset loses no row the
     /// server could have stored. S is where the refused batch began, as far as the server can know it:
     /// the end of the last batch this stream sent that the server accepted; for a stream none of
     /// whose batches was accepted yet, the last offset this server acknowledged for the rank (the one
-    /// the sender saved, if that acknowledgement reached it); with neither, 0. A sender confirms the
-    /// refusal only when S and E are the bytes it sent, so a wrong guess moves nothing. When the store
+    /// the sender saved, if that acknowledgement reached it); with neither, the start the refused
+    /// batch's metadata claims (`start_byte_offset`, senders from wave AE on), when it is below E;
+    /// else 0. The claim names the range only: the message's own `end_byte_offset`, which every
+    /// sender reads as an acknowledgement, stays at what the server holds (the stream's accepted end,
+    /// the rank's last acknowledged offset, or 0), so the server never vouches for bytes on a
+    /// sender's word. (Until wave AE a server that had started again since the sender's last
+    /// acknowledgement named the range from byte 0, and the sender, whose range begins at its saved
+    /// offset, sent the batch again at every stream.) A sender confirms the refusal only when S and
+    /// E are the bytes it sent, so a wrong guess, or a wrong claim, moves nothing. When the store
     /// cannot be written nothing is said, and the sender keeps its offset. `store_id` is there because
     /// a sender reads every message on the channel as an acknowledgement, and the first one names
     /// the store it binds to (L3).
-    async fn confirm_refusal(&self, key: &Key, column: &'static str, end_byte_offset: i64, ack: &AckSender) {
+    async fn confirm_refusal(
+        &self,
+        key: &Key,
+        column: &'static str,
+        end_byte_offset: i64,
+        claimed: Option<i64>,
+        ack: &AckSender,
+    ) {
         let Ok(store_id) = self.store_id().await else {
             return;
         };
@@ -633,17 +656,26 @@ impl Ingest {
         if self.flush(key, &mut buffer).await.is_err() {
             return;
         }
-        let start = match ack.tally.accepted.load(Ordering::SeqCst) {
+        let accepted = ack.tally.accepted.load(Ordering::SeqCst);
+        let held = match accepted {
             accepted if accepted >= 0 => accepted,
             _ => buffer.acknowledged.unwrap_or(0),
         };
+        let start = match claimed {
+            Some(claimed)
+                if accepted < 0 && buffer.acknowledged.is_none() && (0..end_byte_offset).contains(&claimed) =>
+            {
+                claimed
+            }
+            _ => held,
+        };
         let reply = serde_json::json!({
-            "end_byte_offset": start,
+            "end_byte_offset": held,
             "refused": {"start_byte_offset": start, "end_byte_offset": end_byte_offset, "column": column},
             "store_id": store_id,
         });
         ack.acknowledge(
-            start,
+            held,
             PutResult {
                 app_metadata: reply.to_string().into(),
             },
@@ -796,11 +828,11 @@ impl Ingest {
         &self,
         key: &Key,
         batch: RecordBatch,
-        end_byte_offset: i64,
-        world_size: Option<i32>,
-        sender: Option<i64>,
+        metadata: &BatchMetadata,
         ack: &AckSender,
     ) -> Result<(), Status> {
+        let (end_byte_offset, claimed_start) = (metadata.end_byte_offset, metadata.start_byte_offset);
+        let (world_size, sender) = (metadata.world_size, metadata.sender_attempt);
         // No batch is taken before the store's ID is known, so every acknowledgement can carry it (L3).
         self.store_id()
             .await
@@ -823,7 +855,8 @@ impl Ingest {
                 Err(refused) => {
                     if let Some(column) = refused.column {
                         self.batch_refused(key, column, end_byte_offset).await;
-                        self.confirm_refusal(key, column, end_byte_offset, ack).await;
+                        self.confirm_refusal(key, column, end_byte_offset, claimed_start, ack)
+                            .await;
                     }
                     return Err(refused.status);
                 }
@@ -881,12 +914,14 @@ impl Ingest {
         // The query's answer names offset 0 on its stream. That is not an offset the rank's rows were
         // acknowledged to, so what the server last acknowledged for the rank stays as it was: a
         // refusal that follows the query names it as where the refused bytes began, which is the
-        // offset the returning sender saved (RS10, wave AD's trial).
+        // offset the returning sender saved (RS10, wave AD's trial). A server that has acknowledged
+        // nothing for the rank (one that started again since) still holds nothing after the query
+        // (wave AE; until then the query's 0 was kept, and a refusal named its bytes from byte 0).
         let held = buffer.acknowledged;
         if buffer.batches.is_empty() || buffer.rows >= self.config.flush_steps {
             self.flush(key, &mut buffer).await?;
         }
-        if question && held.is_some() {
+        if question {
             buffer.acknowledged = held;
         }
         Ok(())
@@ -1437,15 +1472,7 @@ impl Ingest {
                 self.reconcile_streams(key);
             }
             let question = batch.num_rows() == 0 && metadata.end_byte_offset == 0;
-            self.accept(
-                key,
-                batch,
-                metadata.end_byte_offset,
-                metadata.world_size,
-                metadata.sender_attempt,
-                ack,
-            )
-            .await?;
+            self.accept(key, batch, &metadata, ack).await?;
             if !question {
                 tally.accepted.store(metadata.end_byte_offset, Ordering::SeqCst);
             }
