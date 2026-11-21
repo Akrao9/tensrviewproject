@@ -3263,7 +3263,15 @@ def _not_current_by_status(status: Mapping[str, Any], judged: Mapping[int, int |
     the file is rewritten only every `--watchdog-seconds` (10 by default), so that entry can stand
     for seconds beside a report on steps the rank has stored since. Read as "attempt 0", it left
     the first rank to send out of the all-ranks view (CI, Nov 20, 2026). The server's own rule
-    compares in memory, where the two are never out of step."""
+    compares in memory, where the two are never out of step.
+
+    Nor, for the same reason, is an entry marked `attempt_without_steps` for the very attempt that
+    was judged (lane AD1, Nov 21, 2026). The server marks a new attempt so from its first heartbeat
+    until its first batch is stored; a report of that attempt, current with the store, was made
+    from batches it stored since, so the entry is a file written before them, whichever of the two
+    files was written last. Read as "started again", it left the rank unjudged for up to
+    `--watchdog-seconds`. A mark for another attempt than the one judged, or beside a judgment
+    whose attempt is not known, is read as before: an earlier attempt's."""
     found: dict[int, str] = {}
     for entry in status.get("ranks") or ():
         if not isinstance(entry, Mapping):
@@ -3272,6 +3280,8 @@ def _not_current_by_status(status: Mapping[str, Any], judged: Mapping[int, int |
         if not isinstance(rank, int) or isinstance(rank, bool) or rank not in judged:
             continue
         shown, was = _whole_attempt(entry.get("attempt")), judged[rank]
+        if entry.get("attempt_without_steps") is True and shown is not None and shown == was:
+            continue  # written before this attempt's first batch, which the judgment covers
         if entry.get("attempt_without_steps") is True:
             found[rank] = (f"started again{f' as attempt {shown}' if shown is not None else ''}, which has stored no"
                            " step yet: what was judged is an earlier attempt's")
