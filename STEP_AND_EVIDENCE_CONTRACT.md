@@ -2,6 +2,8 @@
 
 Written Nov 20, 2026, from the author's decisions of that day (v3 plan, "The author's decisions on the wave's calls"), and approved by the author the same day with two amendments, made here: who reported a skipped update (section 1) and the last step of a rank that was started again (section 3). Three smaller rules of section 1, this page's own reading of the first amendment, were signed off by the author the same day, and the second was then amended by the author: what a caller's skip does to the scaler's streak depends on whether the SDK saw the scaler apply the update. It covers four small things that the Python detectors and the Rust server must say alike, so each is written once here, with cases, before either engine is changed. The cases are in `sdk/tests/fixtures/behaviour/cases.json`, checked by `sdk/tests/test_step_and_evidence_contract.py`.
 
+Built in both engines in wave AB (Nov 20, 2026, `main` at `ac0159a`). The marks below say what each case was when the page was written: every case over records now runs against the real code, in `sdk/tests/test_lane_ab1_detectors.py` for the Python detectors, in `server/src/detect/lane_ab2_tests.rs` for the server, and for the two together in `sdk/tests/test_wave_ab_seams.py`, which holds both engines to the same answer on each. The record's side is in `sdk/tests/test_lane_ab3_step.py`.
+
 Each case is marked. A **pin** is behaviour today's Python detectors already have; the test runs it, so it cannot move unnoticed. A **new** case is not built: its expectation is the target, in the words used here, and the lane that builds it turns it into a test of its own engine. A new case over records also states what today's Python detector answers on them, which is not the target, and the test runs that: the case cannot pass before its rule is built.
 
 Outside this page: the checkpoint-to-model check (B14), the median-and-MAD score (S6), the cross-rank activation compare, and replica attribution, which is section 4a of `REPLICA_OBSERVATION_CONTRACT.md`.
@@ -26,9 +28,9 @@ Outside this page: the checkpoint-to-model check (B14), the median-and-MAD score
 
 The step is skipped when either the caller or the scaler says so. `step_skipped_by` is written only on a record whose `step_skipped` is true, and it is not a column of the Arrow schema: it travels in `extra_json`, as `grads_not_read` does, so no schema changes. `skipped` takes only `True`, `False` or nothing; anything else is refused at the call, as a wrong `lr` is, and never inside training's own step.
 
-**What the scaler did on a caller's skip.** A record whose `step_skipped_by` is `"caller"` covers two cases that `loss_scale_trouble` reads differently, so the record keeps them apart. When the SDK observed the scaler apply the update, the record also carries `scaler_applied: true`. When the scaler's outcome is unknown (there is no scaler, or it did not act on this update), the record has no such key. The key is written on no other record, and it travels in `extra_json` too.
+**What the scaler did on a caller's skip.** A record whose `step_skipped_by` is `"caller"` covers two cases that `loss_scale_trouble` reads differently, so the record keeps them apart. When the SDK observed the scaler apply the update, the record also carries `scaler_applied: true`. When the scaler's outcome is unknown, the record has no such key: there is no scaler, or it did not act on this update, or `scaler.update()` comes after `session.step()` in the loop, so the verdict is not there yet when the step ends (the scaler's own `step_skipped` and `grad_scale` then land on the next record, one step late, as they did before the argument). The key is written on no other record, and it travels in `extra_json` too.
 
-**A capture written before this key.** A record with `step_skipped: true` and no `step_skipped_by` was written by a scaler, the only thing that could write it then, and is read as `"scaler"`. Every kind reads such a capture as it did before (`ten_skips_in_a_row_with_no_loss_scale`, `a_gradient_not_finite_on_a_skipped_step`, `an_activation_not_finite_on_a_skipped_step`, pins). Its evidence has no `skipped_updates` (`a_capture_written_before_the_key`, new).
+**A capture written before this key.** A record with `step_skipped: true` and no `step_skipped_by` was written by a scaler, the only thing that could write it then, and is read as `"scaler"`. Every kind but one reads such a capture as it did before (`ten_skips_in_a_row_with_no_loss_scale`, `a_gradient_not_finite_on_a_skipped_step`, `an_activation_not_finite_on_a_skipped_step`, pins). The one is `stalled_weights`. A skipped update cannot advance a stall's streak whoever reported it, the scaler included, so a stall whose streak ran through steps a scaler skipped is still raised but counts fewer steps than it did. In the golden capture `sdk/tests/golden/everything.json` the incident's `stalled_steps` is 9 where it was 11: steps 265 and 270, both skipped by the scaler in the records, no longer count. Nothing else in the 72 golden files changed. Its evidence has no `skipped_updates` (`a_capture_written_before_the_key`, new).
 
 **What may judge a skipped step.**
 
@@ -51,7 +53,7 @@ The step is skipped when either the caller or the scaler says so. `step_skipped_
 }
 ```
 
-`steps` is how many such steps there were, and `gradients` names what was not finite at the first of them, as a `non_finite` incident names it (a parameter, `<total>` or `<total before clipping>`). The key raises nothing, and changes neither the value `non_finite` reads nor the run's state. When a layer statistic is not finite on the same step, `non_finite` is raised for the layer with an empty `gradients`, as on any skipped step, and the gradient is kept here (`an_activation_and_a_gradient_not_finite_on_a_skip_the_caller_reported`, new). The Python reader writes the key in `build_evidence`; the server writes the same object in the rank's report beside `not_checked`, and a reader of that report passes it on unchanged. How the all-ranks view shows it is the Python lane's call, and it must not drop it.
+`steps` is how many such steps there were, and `gradients` names what was not finite at the first of them, as a `non_finite` incident names it (a parameter, `<total>` or `<total before clipping>`). The key raises nothing, and changes neither the value `non_finite` reads nor the run's state. When a layer statistic is not finite on the same step, `non_finite` is raised for the layer with an empty `gradients`, as on any skipped step, and the gradient is kept here (`an_activation_and_a_gradient_not_finite_on_a_skip_the_caller_reported`, new). The Python reader writes the key in `build_evidence`; the server writes the same object in the rank's report beside `not_checked`, and a reader of that report passes it on unchanged. The all-ranks view lists each rank's under `skipped_updates_by_rank`.
 
 **Three rules the amendment does not state, signed off by the author on Nov 20, 2026.** The two engines would part on each, so each is fixed here with a case, and both engines use the same words and counters:
 
@@ -106,7 +108,7 @@ The status does not carry the step at which capture stopped apart from the last 
 
 | Section | SDK | Python detectors | Rust server |
 |---|---|---|---|
-| 1 | `capture.py`: the argument, and `step_skipped_by` and `scaler_applied` on the record | `stalled_weights`, `loss_scale_trouble`, the evidence's `skipped_updates`, and the labels that say a skip is the scaler's | The same, reading `step_skipped_by` and `scaler_applied` from `extra_json` |
+| 1 | `capture.py`: the argument, and `step_skipped_by` and `scaler_applied` on the record | `stalled_weights`, `loss_scale_trouble`, and the evidence's `skipped_updates`. The kind's label stays `step_skipped (scaler=)`: only a scaler given to `init` feeds it, and the label is part of what Gate 1's arms are shown | The same, reading `step_skipped_by` and `scaler_applied` from `extra_json` |
 | 2, unread gradients | Nothing | The three kinds' entries | Reading `grads_not_read`, which it does not do today, and the same entries |
 | 2, a rank with no peer | Nothing | The words | `ranks_compared` |
 | 3 | Nothing | The incident's two keys and text | The same keys in its incident |
@@ -114,6 +116,5 @@ The status does not carry the step at which capture stopped apart from the last 
 
 ## 6. Not settled here
 
-- How the all-ranks view shows `skipped_updates`.
 - Whether the first step of a comparison, while its last rank's record is still on its way, should be given a short grace before the kind reads `unavailable`. Today it is visible at once and clears when the record arrives.
 - Whether the heartbeat should carry the step at which capture stopped, where it can differ from the last step stored.

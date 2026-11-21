@@ -128,7 +128,7 @@ Coverage says who sent a record. It does not say anything was compared. Only a s
 
 ## 4a. Which rank (D1)
 
-Released by the author on Nov 20, 2026; written here on the same day, and not built. Its cases are in `sdk/tests/fixtures/replica/attribution_cases.json`, checked by `sdk/tests/test_replica_attribution_contract.py`.
+Released by the author on Nov 20, 2026; written here on the same day, and built in both engines and the driver in wave AB (`main` at `ac0159a`): the same planted run read from local files and from a live server gave the same parameter, the same outlier ranks and one incident on 2, 3 and 8 CPU ranks. Its cases are in `sdk/tests/fixtures/replica/attribution_cases.json`, checked by `sdk/tests/test_replica_attribution_contract.py`.
 
 **What it is.** Where the ranks of a step differ on a parameter, attribution says which ranks stand apart from the rest, when a strict majority does not. The two readings word that differently, and the difference is meant. For fingerprints: a strict majority lies within the tolerance of the median in every compared column. For signatures, which are exact: a strict majority holds one value. The two can give different results on the same ranks (`three_of_four_within_tolerance_of_the_median`). It describes a difference. It raises nothing and silences nothing: section 5 alone decides what raises, and the count of incidents is the same with or without it.
 
