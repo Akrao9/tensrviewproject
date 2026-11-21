@@ -87,9 +87,9 @@ def test_a_rank_that_ends_nonzero_after_its_done_file_does_not_stop_rank_0_befor
     assert "PASS files on 2 ranks" in done.stdout, said
     # Rank 1 really ended with 1: the run's status says so, as torchrun reports it.
     assert done.returncode != 0, said
-    # Each stage is said on stderr, by rank.
+    # Each stage is said on stderr, by rank: only lines said before the verdict file exists, since
+    # rank 0 may be stopped once rank 1 has seen the file and ended.
     for line in ("replica_check rank 0: done files of ranks [0, 1] of 2; judging",
-                 "replica_check rank 0: verdict written (exit 0)",
                  "replica_check rank 1: done file written",
                  "replica_check rank 1: rank 0's verdict: verdict"):
         assert line in done.stderr, said
