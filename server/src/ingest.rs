@@ -217,6 +217,43 @@ struct Heartbeat {
     /// the reason, a short word. Any other value that is not null is a stop for an unknown reason.
     #[serde(default)]
     capture_stopped: Option<serde_json::Value>,
+    /// Beside `capture_stopped` (senders from Nov 21, 2026 on, `DETECTOR_RULES_CONTRACT.md` part 7):
+    /// the last step the session committed before it stopped, or null when it committed none.
+    /// Absent (an older sender) and null are kept apart: absent is None, null is `Some(Null)`.
+    #[serde(default, deserialize_with = "present")]
+    capture_stopped_step: Option<serde_json::Value>,
+}
+
+/// A key that is present, whatever its value, null included: `Option<Value>` alone reads null as
+/// absent.
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+/// The step a heartbeat says capture stopped at ([`crate::watchdog::StoppedAt`]): None when the
+/// beat has no `capture_stopped_step` (a sender older than the key), a step for a whole number of
+/// at least 0, and null for null or any other value, as the SDK's sender sends anything that is not
+/// a step (a bool, a negative number, a float, a string): the key says the sender knows it, and the
+/// value names no step.
+fn stopped_at(value: Option<&serde_json::Value>) -> crate::watchdog::StoppedAt {
+    let value = value?;
+    Some(value.as_i64().filter(|step| *step >= 0))
+}
+
+impl Heartbeat {
+    /// The capture stop this beat says, as the server keeps it: the reason and the step it
+    /// stopped at. None when it says nothing stopped.
+    fn stop(&self) -> Option<(String, crate::watchdog::StoppedAt)> {
+        let reason = capture_reason(self.capture_stopped.as_ref())?;
+        Some((reason, stopped_at(self.capture_stopped_step.as_ref())))
+    }
+}
+
+/// The capture stop a heartbeat's body says ([`Heartbeat::stop`]), read as the `heartbeat` action
+/// reads it: for tests of the status, which take it from there.
+#[cfg(test)]
+pub(crate) fn heartbeat_stop(body: &[u8]) -> Option<(String, crate::watchdog::StoppedAt)> {
+    serde_json::from_slice::<Heartbeat>(body).ok()?.stop()
 }
 
 /// The reason a heartbeat's `capture_stopped` gives, none when it says nothing stopped.
@@ -1575,8 +1612,8 @@ impl Ingest {
             return Ok(());
         }
         let phase: String = beat.phase.chars().take(40).collect();
-        if let Some(reason) = capture_reason(beat.capture_stopped.as_ref()) {
-            self.watchdog.capture_stopped(&key, &reason, Instant::now());
+        if let Some((reason, step)) = beat.stop() {
+            self.watchdog.capture_stopped_at(&key, &reason, step, Instant::now());
         }
         self.heartbeat(
             &beat.run_id,
