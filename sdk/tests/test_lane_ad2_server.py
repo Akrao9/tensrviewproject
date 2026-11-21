@@ -261,3 +261,86 @@ def test_a_stream_that_names_no_run_is_said_to_have_ended_too(tmp_path):
     assert len(lines) == 1, lines
     line = parsed(lines[0])
     assert (line["run"], line["code"], line["acked"]) == (None, "InvalidArgument", "nothing acknowledged"), lines
+
+
+# RS10's transport (`DETECTOR_RULES_CONTRACT.md` part 8). The author's open question: does a pyarrow
+# Flight client read the server's last message, the one naming the refused bytes, before the error
+# status ends the call? Each pattern below refuses a batch REPEATS times, each on a stream of its own,
+# and counts how often the message was read first.
+
+REPEATS = 250
+
+
+def _refused_batch(run_id: str, steps: list[int]):
+    batch = records_to_batch([rec(run_id, 0, step) for step in steps])
+    at = batch.schema.get_field_index("step")
+    table = pa.Table.from_batches([batch]).set_column(at, pa.field("step", pa.string(), nullable=False),
+                                                      pa.array([str(s) for s in steps], pa.string()))
+    return table.to_batches()[0]
+
+
+def _refusal(endpoint: str, run_id: str, end: int, pattern: str) -> tuple[dict | None, str | None]:
+    """One refused batch on a stream of its own, read as `pattern`: `half_close` (write, half-close,
+    read until the status, as the acceptance run does), `read` (write and read with the request
+    still open) or `thread` (a reader thread from the start and the batch written after, as the
+    production sender reads). The refusal message, if read before the status, and the status."""
+    import threading
+
+    client = flight.FlightClient(endpoint)
+    batch = _refused_batch(run_id, [3, 4])
+    writer, reader = client.do_put(flight.FlightDescriptor.for_path("runs", run_id, "rank=0"), batch.schema,
+                                   flight.FlightCallOptions(timeout=30.0))
+    metadata = {"schema_version": 1, "run_id": run_id, "rank": 0, "min_step": 3, "max_step": 4, "end_byte_offset": end}
+    answers: list[dict] = []
+    status: list[str] = []
+
+    def read() -> None:
+        try:
+            while (buffer := reader.read()) is not None:
+                answers.append(json.loads(buffer.to_pybytes()))
+        except (flight.FlightError, pa.ArrowException) as error:
+            status.append(str(error))
+
+    try:
+        if pattern == "thread":
+            thread = threading.Thread(target=read)
+            thread.start()
+            writer.write_with_metadata(batch, pa.py_buffer(json.dumps(metadata).encode()))
+            thread.join(30)
+        else:
+            writer.write_with_metadata(batch, pa.py_buffer(json.dumps(metadata).encode()))
+            if pattern == "half_close":
+                writer.done_writing()
+            read()
+        try:
+            writer.close()
+        except (flight.FlightError, pa.ArrowException) as error:
+            status.append(str(error))
+    finally:
+        client.close()
+    return next((a for a in answers if "refused" in a), None), (status[0] if status else None)
+
+
+@pytest.mark.parametrize("pattern", ["half_close", "read", "thread"])
+def test_a_pyarrow_client_reads_the_refusal_before_the_status_every_time(tmp_path, pattern):
+    server = Server(tmp_path)
+    run_id = f"ad2-refusal-{pattern}"
+    read_first = 0
+    wrong: list[Any] = []
+    try:
+        stream = Stream(server.endpoint, run_id)
+        stream.send([0, 1, 2], 300)
+        assert stream.ack() == 300
+        stream.finish()
+        for _ in range(REPEATS):
+            refusal, status = _refusal(server.endpoint, run_id, 500, pattern)
+            assert status and "`step`" in status and "refused" in status, status
+            if refusal is not None:
+                read_first += 1
+                if refusal["end_byte_offset"] != 300 or {k: refusal["refused"][k] for k in ("start_byte_offset", "end_byte_offset", "column")} != {
+                        "start_byte_offset": 300, "end_byte_offset": 500, "column": "step"}:
+                    wrong.append(refusal)
+    finally:
+        assert server.stop() == 0
+    print(f"{pattern}: the refusal was read before the status {read_first} of {REPEATS} times")
+    assert (read_first, wrong) == (REPEATS, [])

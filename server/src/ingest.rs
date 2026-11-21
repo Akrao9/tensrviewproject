@@ -27,7 +27,12 @@
 //! has to end: a `DoPut` tells its sender of a refusal only by the status that ends the call, every
 //! later batch of the stream has the same schema and would be refused too, and a batch that is not
 //! acknowledged stays with its sender, which sends it again from its offset, to a server that can
-//! read it once there is one. Nothing is acknowledged past a refused batch.
+//! read it once there is one. Nothing is acknowledged past a refused batch. Before the status, the
+//! server stores what the rank holds and writes one message on the acknowledgement channel that names
+//! the refused bytes: `{"end_byte_offset": S, "refused": {"start_byte_offset": S, "end_byte_offset": E,
+//! "column"}, "store_id"}` (`DETECTOR_RULES_CONTRACT.md` part 8, from Nov 21, 2026; see
+//! `Ingest::confirm_refusal` for S). A sender that sent exactly bytes S to E may take E as its offset
+//! and not send them again; any other sender reads it as an acknowledgement of S, which it has.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -276,6 +281,10 @@ struct StreamTally {
     bytes: AtomicU64,
     /// The last offset acknowledged on the stream, or -1 for none.
     acknowledged: std::sync::atomic::AtomicI64,
+    /// The end offset of the last batch this stream sent that the server accepted, or -1 for none. The
+    /// empty batch with offset 0 that a sender sends first to ask what the server holds is a question,
+    /// not a position, and is not counted.
+    accepted: std::sync::atomic::AtomicI64,
     /// The request stream ended before the stream did: the sender half-closed, or reset the stream in
     /// a way hyper ends a request body for alike (a reset with `NO_ERROR`; a call whose deadline passed
     /// was seen so, with the response already closed).
@@ -345,6 +354,9 @@ struct RankBuffer {
     /// The key column and end offset of the rank's last batch refused because no row of it could be
     /// read (RS10): the same batch sent again is not counted again.
     last_refused: Option<(&'static str, i64)>,
+    /// The last offset this server acknowledged for the rank, on any of its streams: where a stream
+    /// whose own batches have not been accepted yet is taken to have begun (RS10's refusal).
+    acknowledged: Option<i64>,
 }
 
 impl RankBuffer {
@@ -561,6 +573,46 @@ impl Ingest {
         self.watchdog.refused(key, column, Instant::now());
     }
 
+    /// Tells the sender, before the status that ends its stream, which bytes were refused for good
+    /// (RS10, `DETECTOR_RULES_CONTRACT.md` part 8): one message on the acknowledgement channel,
+    /// `{"end_byte_offset": S, "refused": {"start_byte_offset": S, "end_byte_offset": E, "column"},
+    /// "store_id"}`, E being the end the refused batch claimed. First everything the rank holds is
+    /// stored, so S, and every row the stream sent before the refused batch, are stored: nothing is
+    /// acknowledged past the refused batch, and a sender that takes E as its offset loses no row the
+    /// server could have stored. S is where the refused batch began, as far as the server can know it:
+    /// the end of the last batch this stream sent that the server accepted; for a stream none of
+    /// whose batches was accepted yet, the last offset this server acknowledged for the rank (the one
+    /// the sender saved, if that acknowledgement reached it); with neither, 0. A sender confirms the
+    /// refusal only when S and E are the bytes it sent, so a wrong guess moves nothing. When the store
+    /// cannot be written nothing is said, and the sender keeps its offset. `store_id` is there because
+    /// a sender reads every message on the channel as an acknowledgement, and the first one names
+    /// the store it binds to (L3).
+    async fn confirm_refusal(&self, key: &Key, column: &'static str, end_byte_offset: i64, ack: &AckSender) {
+        let Ok(store_id) = self.store_id().await else {
+            return;
+        };
+        let buffer = self.buffer(key);
+        let mut buffer = buffer.lock().await;
+        if self.flush(key, &mut buffer).await.is_err() {
+            return;
+        }
+        let start = match ack.tally.accepted.load(Ordering::SeqCst) {
+            accepted if accepted >= 0 => accepted,
+            _ => buffer.acknowledged.unwrap_or(0),
+        };
+        let reply = serde_json::json!({
+            "end_byte_offset": start,
+            "refused": {"start_byte_offset": start, "end_byte_offset": end_byte_offset, "column": column},
+            "store_id": store_id,
+        });
+        ack.acknowledge(
+            start,
+            PutResult {
+                app_metadata: reply.to_string().into(),
+            },
+        );
+    }
+
     /// Streams that ended in an error since the server started.
     pub fn stream_errors(&self) -> u64 {
         self.stream_errors.load(Ordering::SeqCst)
@@ -723,6 +775,7 @@ impl Ingest {
             Err(refused) => {
                 if let Some(column) = refused.column {
                     self.batch_refused(key, column, end_byte_offset).await;
+                    self.confirm_refusal(key, column, end_byte_offset, ack).await;
                 }
                 return Err(refused.status);
             }
@@ -896,6 +949,7 @@ impl Ingest {
                 app_metadata: reply.to_string().into(),
             };
             ack.acknowledge(offset, result);
+            buffer.acknowledged = Some(offset);
         }
         if self.config.detect && !stored.is_empty() {
             self.take_replicas(key, &stored).await;
@@ -1325,6 +1379,7 @@ impl Ingest {
                 named = true;
                 self.reconcile_streams(key);
             }
+            let question = batch.num_rows() == 0 && metadata.end_byte_offset == 0;
             self.accept(
                 key,
                 batch,
@@ -1334,6 +1389,9 @@ impl Ingest {
                 ack,
             )
             .await?;
+            if !question {
+                tally.accepted.store(metadata.end_byte_offset, Ordering::SeqCst);
+            }
             // After the rows, which matter more: a manifest that cannot be stored never
             // refuses a batch.
             if let Some(manifest) = metadata.run_manifest {
@@ -2129,6 +2187,7 @@ impl FlightService for IngestService {
             responses,
             tally: Arc::new(StreamTally {
                 acknowledged: std::sync::atomic::AtomicI64::new(-1),
+                accepted: std::sync::atomic::AtomicI64::new(-1),
                 ..StreamTally::default()
             }),
         };
