@@ -1,6 +1,6 @@
 # Skipped steps, due checks and wording: what both engines say
 
-Written Nov 20, 2026, from the author's decisions of that day (v3 plan, "The author's decisions on the wave's calls"), and approved by the author the same day with two amendments, made here: who reported a skipped update (section 1) and the last step of a rank that was started again (section 3). Three smaller rules of section 1 are this page's own reading of the first amendment and are marked "awaiting the author". It covers four small things that the Python detectors and the Rust server must say alike, so each is written once here, with cases, before either engine is changed. The cases are in `sdk/tests/fixtures/behaviour/cases.json`, checked by `sdk/tests/test_step_and_evidence_contract.py`.
+Written Nov 20, 2026, from the author's decisions of that day (v3 plan, "The author's decisions on the wave's calls"), and approved by the author the same day with two amendments, made here: who reported a skipped update (section 1) and the last step of a rank that was started again (section 3). Three smaller rules of section 1, this page's own reading of the first amendment, were signed off by the author the same day, with one wording for the second. It covers four small things that the Python detectors and the Rust server must say alike, so each is written once here, with cases, before either engine is changed. The cases are in `sdk/tests/fixtures/behaviour/cases.json`, checked by `sdk/tests/test_step_and_evidence_contract.py`.
 
 Each case is marked. A **pin** is behaviour today's Python detectors already have; the test runs it, so it cannot move unnoticed. A **new** case is not built: its expectation is the target, in the words used here, and the lane that builds it turns it into a test of its own engine. A new case over records also states what today's Python detector answers on them, which is not the target, and the test runs that: the case cannot pass before its rule is built.
 
@@ -50,11 +50,11 @@ The step is skipped when either the caller or the scaler says so. `step_skipped_
 
 `steps` is how many such steps there were, and `gradients` names what was not finite at the first of them, as a `non_finite` incident names it (a parameter, `<total>` or `<total before clipping>`). The key raises nothing, and changes neither the value `non_finite` reads nor the run's state. When a layer statistic is not finite on the same step, `non_finite` is raised for the layer with an empty `gradients`, as on any skipped step, and the gradient is kept here (`an_activation_and_a_gradient_not_finite_on_a_skip_the_caller_reported`, new). The Python reader writes the key in `build_evidence`; the server writes the same object in the rank's report beside `not_checked`, and a reader of that report passes it on unchanged. How the all-ranks view shows it is the Python lane's call, and it must not drop it.
 
-**Three rules awaiting the author.** The amendment does not say these, and the two engines would part on each, so each is fixed here with a case:
+**Three rules the amendment does not state, signed off by the author on Nov 20, 2026.** The two engines would part on each, so each is fixed here with a case, and both engines use the same words and counters:
 
-1. *A skipped step and a stall's streak.* A skipped step, whoever reported it, is read by `stalled_weights` as a row whose total gradient norm is not finite already is: it adds nothing to a streak, and its resets apply. So two unchanged checks, a skipped one and a third unchanged check raise the stall at the third, not at the skipped step (`a_stall_across_a_skipped_step`, new).
-2. *A caller's skip inside a run of the scaler's.* `loss_scale_trouble` passes over a skip only the caller reported: it neither adds to the streak nor ends it, and is in neither `skipped_steps` nor `recorded_steps`. Five scaler skips, three caller skips and five more scaler skips are ten in a row (`caller_skips_inside_a_run_of_scaler_skips`, new).
-3. *The loss scale on a caller's skip.* A loss scale recorded on such a step is still read against the floor: it is the scale's own reading, not the skip's (`a_low_loss_scale_on_a_skip_only_the_caller_reported`, pin).
+1. *A skipped step and a stall's streak.* A skipped update cannot advance a stall's streak, whoever reported it. A streak that exists carries across it, and the usual resets still apply, as for a row whose total gradient norm is not finite. So two qualifying unchanged checks, a skip and a third qualifying check raise the stall at the third check, not at the skip (`a_stall_across_a_skipped_step`, new).
+2. *A caller's skip inside a run of the scaler's.* A skip only the caller reported is not an observation `loss_scale_trouble` judges: it adds to neither `skipped_steps` nor `recorded_steps`, and neither adds to the streak nor ends it. A recorded applied update ends the streak. The streak is described as "10 consecutive scaler-confirmed skips among observations judged by this rule", which says that it can span more training steps than it counts: five scaler-confirmed skips, three caller-only skips and five more scaler-confirmed skips raise the rule at the last of 13 training steps, with `consecutive_skips` 10 (`caller_skips_inside_a_run_of_scaler_skips`, new).
+3. *The loss scale on a caller's skip.* A measured `grad_scale` below the floor on a skip only the caller reported raises `loss_scale_trouble` with reason `scale`: the low measurement is the evidence, whoever reported the skip. That step still adds nothing to the scaler's skip counts (`a_low_loss_scale_on_a_skip_only_the_caller_reported`, pin).
 
 A step with `step_skipped: false`, or with no key, is judged by every kind as today (`a_spike_on_an_applied_step`, `a_spike_with_nothing_said`, pins).
 
@@ -104,7 +104,6 @@ The status does not carry the step at which capture stopped apart from the last 
 
 ## 6. Not settled here
 
-- The three rules of section 1 marked "awaiting the author".
 - How the all-ranks view shows `skipped_updates`.
 - Whether the first step of a comparison, while its last rank's record is still on its way, should be given a short grace before the kind reads `unavailable`. Today it is visible at once and clears when the record arrives.
 - Whether the heartbeat should carry the step at which capture stopped, where it can differ from the last step stored.
