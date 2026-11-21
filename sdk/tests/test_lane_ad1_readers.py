@@ -201,3 +201,50 @@ def test_item1_the_combined_view(tmp_path):
     assert ev.combine_rank_evidence({0: per_rank(2)}, status=status, status_expected=True)["judged_ranks"] == [0]
     control = ev.combine_rank_evidence({0: per_rank(1)}, status=status, status_expected=True)
     assert control["judged_ranks"] == [] and control["unknown_ranks"] == [0]
+
+
+# --- Item 2: the rows a server dropped and the batches it refused, in the combined view (L22, L28) ---
+
+DROPPED = {"dropped_rows": 7, "dropped_row_keys": {"step": 7}, "refused_batches": 2, "refused_batch_keys": {"rank": 2}}
+
+
+def _counted_status() -> dict:
+    return _status([{"rank": 0, "attempt": 1, "last_step": 9, **DROPPED}, OTHER])
+
+
+def _judged(rank: int) -> dict:
+    return {"rank": rank, "incidents": [], "last_step": 9,
+            "detection": {"source": "server", "state": "current", "report_attempt": 1}}
+
+
+def test_item2_the_combined_view_carries_the_watchdog_block_with_the_counts():
+    status = _counted_status()
+    combined = ev.combine_rank_evidence({0: _judged(0), 1: _judged(1)}, status=status, status_expected=True)
+    # fail-before: KeyError, no `watchdog` key at all
+    block = combined["watchdog"]
+    # The all-ranks view's own block, keys and wording, from the same status.
+    assert block == {k: status[k] for k in ("summary", "written_at_ms", "world_size", "pauses",
+                                            "recommended_silent_seconds") if k in status} | ev._dropped_rows_said(status)
+    assert block["dropped_rows"]["rows"] == 7 and block["dropped_rows"]["upper_bound"] is True
+    assert block["dropped_rows"]["rank_ranges"] == "0" and "upper bound" in block["dropped_rows"]["note"]
+    assert block["refused_batches"]["batches"] == 2 and "upper_bound" not in block["refused_batches"]
+    # Without such counts there is no block, as before; nor without a status (local files).
+    quiet = _status([{"rank": 0, "attempt": 1, "last_step": 9}, OTHER])
+    assert "watchdog" not in ev.combine_rank_evidence({0: _judged(0), 1: _judged(1)}, status=quiet, status_expected=True)
+    assert "watchdog" not in ev.combine_rank_evidence({0: _judged(0), 1: _judged(1)})
+
+
+def test_item2_the_store_path_of_compare_through_the_combined_view(tmp_path):
+    """A rank `compare` cannot judge (its report is an earlier attempt's) goes through
+    `combine_rank_evidence`, and its evidence now says what the server dropped and refused."""
+    from tensorquill import compare
+
+    run = _run(tmp_path)
+    _part(run, 0, 1, 0, 9)
+    _write_report(run, _report(0, 1, 9))
+    _write_status(run, _status([{**WITHOUT_STEPS, **DROPPED}]))
+    opened = compare._open_store({"path": str(run), "run_id": RUN, "manifest": None}, None, True)
+    assert opened["read_from"]["unknown_ranks"] == [0]
+    # fail-before: no `watchdog` block
+    assert opened["evidence"]["watchdog"]["dropped_rows"]["rows"] == 7
+    assert opened["evidence"]["watchdog"]["refused_batches"]["batches"] == 2

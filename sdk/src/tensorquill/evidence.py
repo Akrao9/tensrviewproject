@@ -4393,6 +4393,13 @@ def combine_rank_evidence(
             {n: per_rank[n].get("skipped_updates") for n in judged})) else {}),
         **({"checkpoint_tensors_by_rank": blocks} if (blocks := _checkpoint_tensors_by_rank(
             {n: per_rank[n].get("checkpoint_tensors") for n in judged})) else {}),
+        # The rows the server dropped and the batches it refused, as the all-ranks view's `watchdog`
+        # block gives them (L22, lane AD1): only when the status holds such counts, so the
+        # evidence of a run that dropped and refused none is what it was.
+        **({"watchdog": {**{k: status[k] for k in (
+            "summary", "written_at_ms", "world_size", "pauses", "recommended_silent_seconds",
+            "silent_floor_seconds", "critical_seconds",
+        ) if k in status}, **said}} if (said := _dropped_rows_said(status)) else {}),
     }
     stated = {n: found for n in judged if (found := stated_kind_checks(per_rank[n])) is not None}
     silent = [n for n in judged if n not in stated]
