@@ -338,7 +338,9 @@ def test_a_router_only_run_against_a_full_capture_run_says_what_was_checked_befo
     result = tensorquill.compare_runs("cheap", "debug", source=folder)
     differs = {item["kind"]: item["looked"] for item in result["checked"]["differs"]}
     for kind in ("non_finite", "grad_spike", "activation_spike", "activation_drift", "dead_activations"):
-        assert differs[kind] == {"A": "not_configured", "B": "checked"}, kind
+        # `activation_drift` needs 110 records since the rules contract (part 2), and run B is shorter.
+        looked = "not_enough_history" if kind == "activation_drift" else "checked"
+        assert differs[kind] == {"A": "not_configured", "B": looked}, kind
     assert "moe_imbalance" not in differs and "starved_experts" not in differs  # both runs watch the router
     assert result["checked"]["ranks_read"] == {"A": 0, "B": 0}
     assert result["checked"]["same"] + len(differs) == 33

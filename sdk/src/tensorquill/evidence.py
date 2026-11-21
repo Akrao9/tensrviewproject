@@ -4187,7 +4187,7 @@ def _grace_alert_key(status: Mapping[str, Any] | None, status_age: float | None,
     )
 
 
-def _detectors_option(detectors: Any, server_binary: Any = None) -> str:
+def _detectors_option(detectors: Any, server_binary: Any = None, *, stacklevel: int = 3) -> str:
     """`detectors` as "python" or "rust". "auto" is decided here, once: Rust when the server
     binary and `pyarrow` are there, and otherwise Python with one `RuntimeWarning` that says
     what is missing and what installs it (`server_detect.resolve_detectors`)."""
@@ -4199,7 +4199,7 @@ def _detectors_option(detectors: Any, server_binary: Any = None) -> str:
 
     chosen, why = resolve_detectors("auto", server_binary)
     if why is not None:
-        warnings.warn(why, RuntimeWarning, stacklevel=3)
+        warnings.warn(why, RuntimeWarning, stacklevel=stacklevel)  # at the caller of the public function
     return chosen
 
 
@@ -7014,7 +7014,9 @@ def _build_evidence(
 ) -> dict[str, Any]:
     """`build_evidence`, with the states of the detectors that read every record kept in `memo` when
     one is given (`watch`), and else in a state made for this read (lane AD11)."""
-    detectors = _detectors_option(detectors, server_binary)  # "auto" becomes one of the two here
+    # "auto" becomes one of the two here. One frame deeper than before lane AD11 put `build_evidence`
+    # in front of this function, so the warning still names the caller's file (wave AD's seam).
+    detectors = _detectors_option(detectors, server_binary, stacklevel=4)
     # Both detectors judge by one contract, the Rust one's: refused here before anything is read.
     check_thresholds(overload_threshold=overload_threshold, drift_tolerance=drift_tolerance,
                      starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,

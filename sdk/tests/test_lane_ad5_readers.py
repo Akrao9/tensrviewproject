@@ -532,7 +532,10 @@ def test_the_learning_rate_on_update_spike_and_the_measurements_are_carried_as_d
     assert call(path, "get_incident", {"id": "grad_spike@60"})["gradient_trend"] == blocks["gradient_trend"]
     # A case whose block is absent (`gradient_trend` under six points): no key.
     assert expected("gradient_trend_under_six_points")["gradient_trend"] is None
-    assert not set(blocks) & set(call(served(tmp_path, document(), "bare"), "list_incidents"))
+    # (On the merged tree `build_evidence` itself gives a `gradient_trend` for `document()`'s rows,
+    # so the document that lacks the blocks is made by taking them out.)
+    bare = {key: value for key, value in document().items() if key not in blocks}
+    assert not set(blocks) & set(call(served(tmp_path, bare, "bare"), "list_incidents"))
     # The compact file keeps every one of these keys unchanged (it keeps every key but `samples`).
     whole = document(incidents=[spike, grad], **blocks)
     kept = compact.compact_evidence(whole)

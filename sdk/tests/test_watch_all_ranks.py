@@ -264,7 +264,8 @@ def test_an_incident_on_one_rank_only_is_named_and_the_others_are_listed_as_havi
     assert without_count(summary) == [
         "1 distinct incident on 1 of 4 ranks; every rank's report from tensorquill-server is current through step 59.",
         "Only on some ranks:",
-        "  - rank 2 only: Gradient spike at step 40: norm 8, 8× the median of recent steps",
+        # The score's words follow the ratio (rules contract, part 1; wave AD's trial).
+        "  - rank 2 only: Gradient spike at step 40: norm 8, 8× the median of recent steps (score 85.8)",
         "No incidents on ranks 0-1, 3 (3 of 4 judged).",
         "By class: anomaly grad_spike",
     ]
