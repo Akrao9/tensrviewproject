@@ -793,12 +793,13 @@ def test_a_path_that_does_not_exist_is_an_error_until_it_does(start, tmp_path):
     assert "grad_spike" in kinds["checked"] and "job_stalled" in kinds["not_configured"] and kinds["unavailable"] == {}
     # Thirty steps are enough for a gradient spike and too few for activation drift, which is
     # checked and listed apart: "nothing found" is no verdict for it yet.
-    assert kinds["not_enough_history"] == dict.fromkeys(
-        ("activation_drift", "dead_activations"), {"records": 30, "records_needed": 60})
+    # Activation drift needs 110 records (DETECTOR_RULES_CONTRACT.md, part 2), dead outputs still 60.
+    assert kinds["not_enough_history"] == {"activation_drift": {"records": 30, "records_needed": 110},
+                                           "dead_activations": {"records": 30, "records_needed": 60}}
     assert not set(kinds["checked"]) & set(kinds["not_enough_history"]) and "history_not_stated" not in kinds
     assert len(kinds["checked"]) + len(kinds["not_enough_history"]) + len(kinds["not_configured"]) == 33
     assert (f"{len(kinds['checked']) + 2} of 33 kinds checked, 2 of them without enough history yet"
-            " (activation_drift 30 of 60 records, dead_activations 30 of 60)") in listed["summary"]
+            " (activation_drift 30 of 110 records, dead_activations 30 of 60)") in listed["summary"]
     assert client.call("get_series", name="loss")["range"]["end"] == 29
 
     client = start(tmp_path)  # a folder that is no run folder

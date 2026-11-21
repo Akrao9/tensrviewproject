@@ -96,9 +96,12 @@ UPDATE_WINDOW = 100
 ACT_SPIKE_FACTOR = 5.0  # abs_max or std vs the median of the previous ACT_WINDOW records
 ACT_WINDOW = 50
 ACT_MIN_HISTORY = 10
-ACT_DRIFT_FACTOR = 3.0  # recent median of std or abs_max/std vs the first ACT_WINDOW records
+ACT_DRIFT_FACTOR = 3.0  # recent median of std or abs_max/std vs the ACT_WINDOW records before them
 ACT_RECENT = 10
 ACT_DEAD_RISE = 0.25  # zero fraction above its baseline, as a recent median
+# Records a module needs before drift is judged: the ACT_WINDOW of the baseline and the ACT_RECENT
+# after it, with the module's first ACT_WINDOW records before both (rules contract, part 2).
+ACT_DRIFT_NEEDS = 2 * ACT_WINDOW + ACT_RECENT
 # Attention rules over the probe's per-head statistics (`probe=`, every `probe_every` steps,
 # 1,000 by default). Probes are sparse, so each attention module (a block's attention call) is
 # judged against the median of its own last ATTN_WINDOW earlier probes that showed nothing,
@@ -302,6 +305,52 @@ def _median(values: list[float]) -> float:
     return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
 
 
+# The score beside a ratio (DETECTOR_RULES_CONTRACT.md, part 1): how far a value is from the
+# median of the earlier values its ratio was taken against, in units of their spread. A
+# description only: no rule reads it.
+SCORE_MIN_HISTORY = 10  # earlier finite values a score needs
+SCORE_SCALE = 1.4826  # the median absolute deviation to a standard deviation, for normal data
+SCORE_NOTES = ("short_history", "no_dispersion")
+_SCORE_WORDS = {
+    "short_history": f"no score: fewer than {SCORE_MIN_HISTORY} earlier values",
+    # Not "the earlier values did not vary": six equal values and four others have a zero MAD.
+    "no_dispersion": "no score: the earlier values had zero median absolute deviation",
+}
+
+
+def robust_score(value: float, window: Iterable[Any]) -> dict[str, Any]:
+    """`{"score": number}`, or `{"score": None, "score_note": why}`: `(value - median) / (1.4826 *
+    MAD)` over the finite values of `window`, which never holds `value` itself. With fewer than
+    SCORE_MIN_HISTORY finite values the note is `short_history`; with a MAD of 0 (more than half the
+    window one value) nothing is divided and the note is `no_dispersion`."""
+    earlier = [v for v in (_finite(x) for x in window) if v is not None]
+    if len(earlier) < SCORE_MIN_HISTORY:
+        return {"score": None, "score_note": "short_history"}
+    centre = _median(earlier)
+    spread = _median([abs(v - centre) for v in earlier])
+    if spread == 0:
+        return {"score": None, "score_note": "no_dispersion"}
+    return {"score": (value - centre) / (SCORE_SCALE * spread)}
+
+
+def score_words(entry: Mapping[str, Any]) -> str | None:
+    """What a reader shows for an entry's score: "score 31.2", or why there is none. None only
+    when the entry has no `score` key at all (evidence written before it): a null score is
+    never shown as 0, and its words are never left out."""
+    if not isinstance(entry, Mapping) or "score" not in entry:
+        return None
+    score = _finite(entry.get("score"))
+    if score is not None:
+        return f"score {score:.1f}"
+    return _SCORE_WORDS.get(entry.get("score_note"), "no score")  # type: ignore[arg-type]
+
+
+def _with_score(entry: Mapping[str, Any]) -> str:
+    """" (score 31.2)" after a printed ratio, or "" for an entry without the key."""
+    words = score_words(entry)
+    return f" ({words})" if words else ""
+
+
 def scalar_context(
     records: list[dict[str, Any]], step: int, *, window: int = SPIKE_WINDOW
 ) -> dict[str, dict[str, Any]]:
@@ -404,6 +453,8 @@ def detect_grad_spikes(
                     "grad_norm": total,
                     "baseline": baseline,
                     "ratio": total / baseline,
+                    # Against the same earlier totals as `baseline` (part 1 of the rules contract).
+                    **robust_score(total, totals[-window:]),
                     "parameters": _spiking_parameters(record, per_param, factor, window),
                 }
         totals.append(total)
@@ -422,8 +473,12 @@ def detect_grad_spikes(
                     if own.count == 0:
                         own.start = {
                             "step": step, "total": total, "total_baseline": baseline,
+                            # The totals `baseline` was taken over: those before this one.
+                            "total_window": totals[-(window + 1):-1],
+                            # Scored against the parameter's own window, which its `baseline` is.
                             "parameter": {"name": name, "grad_norm": norm, "baseline": usual,
-                                          "ratio": norm / usual, "rising_since": step},
+                                          "ratio": norm / usual, **robust_score(norm, own.values),
+                                          "rising_since": step},
                         }
                     own.count += 1
                     if own.count == sustain and own.start is not None:
@@ -443,6 +498,8 @@ def detect_grad_spikes(
                 "grad_norm": starts[0]["total"],
                 "baseline": usual,
                 "ratio": starts[0]["total"] / usual if usual else None,
+                # A score only beside a ratio, and over the totals that ratio's baseline was taken over.
+                **(robust_score(starts[0]["total"], starts[0]["total_window"]) if usual else {}),
                 "parameters": parameters[:10],
                 "trigger": "parameter",
                 "sustained": sustain,
@@ -478,11 +535,14 @@ def detect_update_spikes(
     `non_finite`'s to report, not this rule's.
 
     `parameters` names up to ten parameters by how far their own RMS update moved from the
-    record before, largest first, so the incident says where the jump is.
+    record before, largest first, so the incident says where the jump is. `lr` and `lr_before`
+    are the learning rates of the flagged record and of the record it was compared with, each
+    only when that record carries `lr`.
     """
     key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
-    # attempt, total, each parameter's update size, each parameter's gradient norm (or None)
-    before: tuple[Any, float, dict[str, float], Mapping[str, Any] | None] | None = None
+    # attempt, total, each parameter's update size, each parameter's gradient norm (or None), the
+    # learning rates the record carries (or None)
+    before: tuple[Any, float, dict[str, float], Mapping[str, Any] | None, list[float] | None] | None = None
     recent: deque[float] = deque(maxlen=window)  # the last `window` changes that were not flagged
     first: dict[str, Any] | None = None
     spikes: list[int] = []
@@ -525,15 +585,31 @@ def detect_update_spikes(
                              for name in shared),
                             key=lambda p: (-p["change"], p["name"]),
                         )
+                        lr, lr_before = _lr_list(record), before[4]
                         first = {
                             "step": step, "update_rms": largest, "previous": was, "change": change,
                             "baseline": baseline, "threshold": threshold, "grad_norm": now,
                             "grad_norm_before": then, "grad_rise": rise, "parameters": moved[:10],
+                            # The learning rates at the flagged record and at the one it was compared
+                            # with, each only where that record carries them (rules contract, part 4).
+                            # The rule does not read them.
+                            **({"lr": lr} if lr is not None else {}),
+                            **({"lr_before": lr_before} if lr_before is not None else {}),
                         }
-        before = (attempt, total, own, grads)
+        before = (attempt, total, own, grads, _lr_list(record))
     if first is None:
         return None
     return {"kind": "update_spike", **first, "spike_count": len(spikes), "spike_steps": spikes[:20]}
+
+
+def _lr_list(record: Mapping[str, Any]) -> list[float] | None:
+    """A record's `lr` list (one rate a parameter group), or None when it carries none, or one
+    that is not a list of finite numbers."""
+    lr = record.get("lr")
+    if not isinstance(lr, list) or not lr:
+        return None
+    values = [_finite(v) for v in lr]
+    return None if any(v is None for v in values) else values  # type: ignore[return-value]
 
 
 def _shared_totals(
@@ -648,6 +724,86 @@ def name_gradients_not_judged(checks: dict[str, dict[str, Any]], not_checked: It
         check["parameters_not_judged"] = names
 
 
+# `layers_not_read` (DETECTOR_RULES_CONTRACT.md, part 7): modules whose output the capture cannot
+# read at all, said once for the run. With some modules read (`coverage` "partial") the activation
+# kinds stay checked for those and name the others under `modules_not_judged`; with none read on any
+# record ("none") they are `unavailable`. A module read on some records and not on others is not
+# named (v1 does not represent an intermittent gap): it is judged on the records that hold it.
+LAYERS_NOT_READ_KINDS = ("activation_spike", "activation_drift", "dead_activations")
+
+
+def layers_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The `layers` entry of `not_checked`: the modules the capture said it could not read, under
+    `layers_not_read` (module to why), with `coverage` "partial" when some record carried layer
+    statistics and "none" when none did, and then the activation kinds under `kinds`."""
+    first: dict[str, tuple[int, str]] = {}
+    read = False
+    for record in records:
+        read = read or (isinstance(record.get("layers"), Mapping) and bool(record["layers"]))
+        said = record.get("layers_not_read")
+        if not isinstance(said, Mapping):
+            continue
+        for name, why in said.items():
+            first.setdefault(str(name), (int(record["step"]), str(why)))
+    if not first:
+        return None
+    names = sorted(first)
+    return {
+        "check": "layers",
+        "coverage": "partial" if read else "none",
+        **({} if read else {"kinds": list(LAYERS_NOT_READ_KINDS)}),
+        "modules": names,
+        "reason": "layer not read: " + "; ".join(f"{name}: {first[name][1]}" for name in names),
+        "step": min(step for step, _ in first.values()),
+    }
+
+
+def name_modules_not_judged(checks: dict[str, dict[str, Any]], not_checked: Iterable[Mapping[str, Any]]) -> None:
+    """Name the modules the capture could not read on each activation kind's entry of `checks`,
+    as `modules_not_judged`, when a `layers` entry of `not_checked` lists them with coverage
+    "partial" and the kind is not itself `unavailable`, as `stalled_weights` names parameters."""
+    names = sorted({str(name) for item in not_checked if isinstance(item, Mapping) and item.get("check") == "layers"
+                    and item.get("coverage") == "partial" for name in item.get("modules") or ()})
+    for kind in LAYERS_NOT_READ_KINDS:
+        check = checks.get(kind)
+        if names and isinstance(check, dict) and check.get("value") != "unavailable":
+            check["modules_not_judged"] = names
+
+
+# `moe_source` (part 7): how each router's counts reached the capture (`form`) and where in the model
+# they were taken (`point`). A reader says "dispatched" only when `point` says so.
+MOE_SOURCE_WORDS = {
+    "requested": "the assignments the router asked for",
+    "dispatched": "the dispatched assignments",
+    "unknown": "the assignments the model gave; whether a capacity limit was applied before this point is not known",
+}
+
+
+def moe_source(records: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]] | None:
+    """Each router's `moe_source` as the capture said it, once (the first record that names the
+    router), or None when no record carries the key (a capture from before it)."""
+    found: dict[str, dict[str, Any]] = {}
+    for record in records:
+        said = record.get("moe_source")
+        if not isinstance(said, Mapping):
+            continue
+        for router, source in said.items():
+            if isinstance(source, Mapping) and str(router) not in found:
+                found[str(router)] = {key: source[key] for key in ("form", "point") if key in source}
+    return found or None
+
+
+def moe_source_words(evidence: Mapping[str, Any]) -> dict[str, str]:
+    """What a reader says each router's counts are, from the evidence's `moe_source`: by `point`,
+    and "the assignments the model gave" with "not known" for any point but `requested` and
+    `dispatched`. Empty when the evidence has no `moe_source`: a reader makes no claim."""
+    found = evidence.get("moe_source")
+    if not isinstance(found, Mapping):
+        return {}
+    return {str(router): MOE_SOURCE_WORDS.get(source.get("point"), MOE_SOURCE_WORDS["unknown"])  # type: ignore[arg-type]
+            for router, source in found.items() if isinstance(source, Mapping)}
+
+
 def _spiking_parameters(
     record: dict[str, Any],
     per_param: dict[str, list[tuple[int, float]]],
@@ -671,7 +827,7 @@ def _spiking_parameters(
                 break
         found.append(
             {"name": name, "grad_norm": norm, "baseline": baseline,
-             "ratio": norm / baseline, "rising_since": rising}
+             "ratio": norm / baseline, **robust_score(norm, [v for _, v in past]), "rising_since": rising}
         )
     found.sort(key=lambda p: (p["rising_since"], -p["ratio"]))
     return found[:10]
@@ -722,6 +878,133 @@ def weight_norm_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
             "highest": {"name": highest[0], "ratio": highest[1]},
         }
     return {"baseline_step": int(first["step"]), "latest_step": int(last["step"]), "kinds": summary}
+
+
+# Four measurements with no incident and no threshold (DETECTOR_RULES_CONTRACT.md, part 6). Each is
+# a block of numbers in one rank's evidence, as `weight_trends` is: present when the records hold
+# what it reads, read by no rule, changing no run state. Nothing is judged from them in this wave.
+TREND_MIN_POINTS = 6  # points a trend needs
+MEASUREMENTS_LISTED = 10  # entries a measurement lists
+MEASUREMENT_BLOCKS = ("gradient_trend", "attention_trends", "update_trends", "weight_jumps")
+
+
+def robust_trend(steps: list[int], values: list[float]) -> dict[str, Any] | None:
+    """The robust local trend of a series (written again from the description of
+    LLM-Training-Debugger's `robust_local_trend`): a line through the median of the first third of
+    the values and the median of the last third, each placed at the median of its own step
+    numbers, which are the series' actual steps. `growth` is the last third's median over the
+    first's, `per_100_steps` the slope over 100 steps as a share of the first. None under
+    TREND_MIN_POINTS points, or when the two thirds sit at one step."""
+    n = len(values)
+    if n < TREND_MIN_POINTS:
+        return None
+    k = max(1, n // 3)
+    left_step, left = _median([float(v) for v in steps[:k]]), _median(values[:k])
+    right_step, right = _median([float(v) for v in steps[-k:]]), _median(values[-k:])
+    if right_step - left_step <= 0:
+        return None
+    slope = (right - left) / (right_step - left_step)
+    return {"points": n, "first_step": steps[0], "last_step": steps[-1], "first": left, "last": right,
+            "growth": right / left if left > 0 else None,
+            "per_100_steps": 100 * slope / left if left > 0 else None}
+
+
+def gradient_trend(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The trend of the total gradient norm (gap B4): the pre-clipping `clip_grad_norm` when the
+    run clips, `grad_norm` otherwise, as `grad_spike` reads it; a skipped step and a value that
+    is not finite are left out. `series` names the norm read. None under TREND_MIN_POINTS."""
+    rows = sorted(records, key=lambda r: r["step"])
+    key = "clip_grad_norm" if any("clip_grad_norm" in r for r in rows) else "grad_norm"
+    pairs = [(int(r["step"]), value) for r in rows if not r.get("step_skipped")
+             and (value := _finite(r.get(key))) is not None]
+    found = robust_trend([step for step, _ in pairs], [value for _, value in pairs])
+    return {"series": key, **found} if found is not None else None
+
+
+def attention_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The trend of each attention module's largest logit, probe by probe (gap Q1): `modules`
+    with a trend, and `listed`, the MEASUREMENTS_LISTED with the largest `growth`, each with its
+    `module`. None when no module has TREND_MIN_POINTS probes."""
+    series: dict[str, tuple[list[int], list[float]]] = {}
+    for record in sorted(records, key=lambda r: r["step"]):
+        probe = record.get("probe")
+        attention = probe.get("attention") if isinstance(probe, Mapping) else None
+        if not isinstance(attention, Mapping):
+            continue
+        for module, stats in attention.items():
+            _, logit, _ = _attention_values(stats)
+            if logit is not None:
+                steps, values = series.setdefault(str(module), ([], []))
+                steps.append(int(record["step"]))
+                values.append(logit)
+    found = [{"module": module, **trend} for module, (steps, values) in series.items()
+             if (trend := robust_trend(steps, values)) is not None]
+    if not found:
+        return None
+    found.sort(key=lambda t: (-(t["growth"] if t["growth"] is not None else -math.inf), t["module"]))
+    return {"statistic": "max_logit", "modules": len(found), "listed": found[:MEASUREMENTS_LISTED]}
+
+
+def update_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Each parameter's lowest update against its own earlier ones (gap Q2): `update_rms` over the
+    median of the parameter's ACT_WINDOW records before, from SCORE_MIN_HISTORY earlier finite
+    values on. `parameters` with an update size, `judged`, and `lowest`: the MEASUREMENTS_LISTED
+    whose update fell furthest, each with `name`, `ratio`, `step`, `baseline` and `update_rms`.
+    None when no record carries `update_rms`."""
+    past: dict[str, list[float]] = {}
+    lowest: dict[str, dict[str, Any]] = {}
+    for record in sorted(records, key=lambda r: r["step"]):
+        sizes = record.get("update_rms")
+        if not isinstance(sizes, Mapping):
+            continue
+        for name, value in sizes.items():
+            now = _finite(value)
+            if now is None:
+                continue
+            name = str(name)
+            earlier = past.setdefault(name, [])
+            if len(earlier) >= SCORE_MIN_HISTORY:
+                base = _median(earlier[-ACT_WINDOW:])
+                if base > 0 and (name not in lowest or now / base < lowest[name]["ratio"]):
+                    lowest[name] = {"name": name, "ratio": now / base, "step": int(record["step"]),
+                                    "baseline": base, "update_rms": now}
+            earlier.append(now)
+    if not past:
+        return None
+    return {"parameters": len(past), "judged": len(lowest),
+            "lowest": sorted(lowest.values(), key=lambda p: (p["ratio"], p["name"]))[:MEASUREMENTS_LISTED]}
+
+
+def weight_jumps(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The largest change of each tensor's norm between two consecutive weight checks (gap Q3),
+    either way: `checks`, `parameters` compared, and `largest`, the MEASUREMENTS_LISTED largest,
+    each with `name`, `ratio`, `step`, `previous_step`, `before` and `after`. None with fewer than
+    two weight checks, or no tensor with a positive finite norm at two of them."""
+    checks = [r for r in sorted(records, key=lambda r: r["step"]) if isinstance(r.get("weight_norms"), Mapping) and r["weight_norms"]]
+    if len(checks) < 2:
+        return None
+    best: dict[str, dict[str, Any]] = {}
+    for before, after in zip(checks, checks[1:]):
+        for name, value in after["weight_norms"].items():
+            a, b = _finite(before["weight_norms"].get(name)), _finite(value)
+            if a is None or b is None or a <= 0 or b <= 0:
+                continue
+            ratio = max(b / a, a / b)
+            name = str(name)
+            if name not in best or ratio > best[name]["ratio"]:
+                best[name] = {"name": name, "ratio": ratio, "step": int(after["step"]),
+                              "previous_step": int(before["step"]), "before": a, "after": b}
+    if not best:
+        return None
+    return {"checks": len(checks), "parameters": len(best),
+            "largest": sorted(best.values(), key=lambda p: (-p["ratio"], p["name"]))[:MEASUREMENTS_LISTED]}
+
+
+def measurement_blocks(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """The four measurements of one rank's records, each only where the records hold what it reads."""
+    found = {"gradient_trend": gradient_trend(records), "attention_trends": attention_trends(records),
+             "update_trends": update_trends(records), "weight_jumps": weight_jumps(records)}
+    return {name: block for name, block in found.items() if block is not None}
 
 
 HEAD_NUMBERS = ("norm", "mean", "log_z", "gap", "gap_relative")
@@ -1140,6 +1423,21 @@ def _capture_stopped_keys(ranks: list[dict[str, Any]]) -> dict[str, Any]:
     return {"capture_stopped": stopped[0]["capture_stopped"], "capture_last_step": stopped[0]["capture_last_step"]}
 
 
+def capture_stopped_step_words(said: Any) -> str | None:
+    """The step a rank's capture stopped at, as the server's status gives it inside the rank's
+    `capture_stopped` (`step`, from the heartbeat's `capture_stopped_step`, rules contract, part 7):
+    "after committing step N", "before committing any step" for null, and None for a status
+    without the key (a sender older than it), which says nothing of the step."""
+    if not isinstance(said, Mapping) or "step" not in said:
+        return None
+    step = said["step"]
+    if step is None:
+        return "before committing any step"
+    if isinstance(step, int) and not isinstance(step, bool):
+        return f"after committing step {step}"
+    return None
+
+
 def _capture_stopped_text(incident: Mapping[str, Any]) -> str:
     """The sentence for a silence incident whose rank's capture had stopped (`_capture_stopped_keys`)."""
     if incident.get("capture_stopped") is None:
@@ -1152,7 +1450,10 @@ def _capture_stopped_text(incident: Mapping[str, Any]) -> str:
     ago = _finite(said.get("seconds")) if isinstance(said, Mapping) else None
     why = f"{reason}" + (f", {ago:.0f} s ago" if ago is not None else "")
     last = incident.get("capture_last_step")
-    when = f"after step {last}" if last is not None else "before this attempt stored a step"
+    # The step the capture itself said it stopped at, where the status carries it; else the last
+    # step this attempt stored.
+    when = capture_stopped_step_words(said) or (
+        f"after step {last}" if last is not None else "before this attempt stored a step")
     who = f"Rank {named['rank']}'s capture" if "rank" in named else "Capture"
     return (f" {who} had stopped {when} ({why}) while training went on: TensorQuill cannot tell from this rank"
             " whether training itself stalled.")
@@ -1304,20 +1605,28 @@ def detect_activation_anomalies(records: list[dict[str, Any]]) -> list[dict[str,
     - `activation_spike`: `abs_max` or `std` at least ACT_SPIKE_FACTOR times its median
       over the previous ACT_WINDOW records. The first module in the model leads the list
       (where it showed first), then the rest by ratio.
-    - `activation_drift`: the median of the last ACT_RECENT records of `std`, or of the
-      outlier ratio `abs_max / std`, moved ACT_DRIFT_FACTOR times above or below its
-      median over the module's first ACT_WINDOW records.
+    - `activation_drift` (DETECTOR_RULES_CONTRACT.md, part 2): the median of the last
+      ACT_RECENT records of `std`, or of the outlier ratio `abs_max / std`, in that order,
+      moved ACT_DRIFT_FACTOR times above or below its median over the ACT_WINDOW records
+      before those ACT_RECENT. A module is judged from its ACT_DRIFT_NEEDS-th record, so that
+      the baseline holds none of its first ACT_WINDOW records: a model trained from scratch
+      grows its activations for as long as it trains, and against its first records that
+      ratio has no ceiling. A slow drift is not seen, and after a shift the new level becomes
+      the baseline within ACT_WINDOW records.
     - `dead_activations`: the recent median `zero_frac` rose ACT_DEAD_RISE above its
-      baseline, as when units stop firing.
+      median over the module's first ACT_WINDOW records, as when units stop firing.
+
+    Each ratio of a spike or a drift has its `score` beside it, over the same values as its
+    baseline (`robust_score`).
 
     Returns at most one incident per kind: the first step it happened, the modules
     affected at that step, and how many steps were affected in all.
     """
     history: dict[str, list[tuple[float, float, float]]] = {}
-    # Each module's baseline for drift, from its first ACT_WINDOW records. A module's history
-    # only grows, so those records never change once the drift check starts; they are
+    # Each module's baseline for dead outputs, from its first ACT_WINDOW records. A module's
+    # history only grows, so those records never change once the check starts; they are
     # summarized once, not again for every later record.
-    baselines: dict[str, tuple[float, float, float]] = {}
+    baselines: dict[str, float] = {}
     found: dict[str, dict[str, Any]] = {}
     counts: dict[str, int] = {}
     outlier = lambda rows: _median([a / s for s, a, _ in rows if s > 0] or [0.0])
@@ -1339,29 +1648,35 @@ def detect_activation_anomalies(records: list[dict[str, Any]]) -> list[dict[str,
             past = history.setdefault(name, [])
             if len(past) >= ACT_MIN_HISTORY:
                 recent = past[-ACT_WINDOW:]
-                for key, value, base in (
-                    ("abs_max", amax, _median([p[1] for p in recent])),
-                    ("std", std, _median([p[0] for p in recent])),
+                for key, value, earlier in (
+                    ("abs_max", amax, [p[1] for p in recent]),
+                    ("std", std, [p[0] for p in recent]),
                 ):
+                    base = _median(earlier)
                     if base > 0 and value >= ACT_SPIKE_FACTOR * base:
                         spikes.append({"module": name, "stat": key, "value": value,
-                                       "baseline": base, "ratio": value / base})
+                                       "baseline": base, "ratio": value / base, **robust_score(value, earlier)})
                         break
             past.append((std, amax, zfrac))
-            if len(past) >= ACT_WINDOW + ACT_RECENT:
-                last = past[-ACT_RECENT:]
-                if name not in baselines:
-                    first = past[:ACT_WINDOW]
-                    baselines[name] = (_median([p[0] for p in first]), outlier(first), _median([p[2] for p in first]))
-                base_std, base_outlier, base_zero = baselines[name]
-                for key, base, now in (
-                    ("std", base_std, _median([p[0] for p in last])),
-                    ("abs_max/std", base_outlier, outlier(last)),
+            if len(past) >= ACT_DRIFT_NEEDS:
+                # The trailing baseline (rules contract, part 2): the last ACT_RECENT records against
+                # the ACT_WINDOW before them, from the record whose baseline holds none of the first
+                # ACT_WINDOW. The score is over the same ACT_WINDOW values as the baseline.
+                last, trail = past[-ACT_RECENT:], past[-(ACT_WINDOW + ACT_RECENT):-ACT_RECENT]
+                for key, base, now, earlier in (
+                    ("std", _median([p[0] for p in trail]), _median([p[0] for p in last]), [p[0] for p in trail]),
+                    ("abs_max/std", outlier(trail), outlier(last), [a / s for s, a, _ in trail if s > 0]),
                 ):
                     if base > 0 and now > 0 and max(now / base, base / now) >= ACT_DRIFT_FACTOR:
                         drifts.append({"module": name, "stat": key, "baseline": base,
-                                       "recent": now, "ratio": now / base})
+                                       "recent": now, "ratio": now / base, **robust_score(now, earlier)})
                         break
+            if len(past) >= ACT_WINDOW + ACT_RECENT:
+                # `dead_activations` keeps the module's first ACT_WINDOW records as its baseline.
+                last = past[-ACT_RECENT:]
+                if name not in baselines:
+                    baselines[name] = _median([p[2] for p in past[:ACT_WINDOW]])
+                base_zero = baselines[name]
                 now_zero = _median([p[2] for p in last])
                 if now_zero - base_zero >= ACT_DEAD_RISE:
                     dead.append({"module": name, "baseline": base_zero, "recent": now_zero})
@@ -1479,7 +1794,7 @@ def detect_attention_anomalies(
                     if last != index - 1:
                         length, onset = 0, {
                             "step": step, "value": value, "baseline": base, "baseline_probes": len(series.baseline),
-                            "heads": heads,
+                            "heads": heads, "earlier": list(series.baseline),
                         }
                     length += 1
                     series.runs[kind] = (index, length, onset)
@@ -1492,6 +1807,9 @@ def detect_attention_anomalies(
                             hit["rise"] = onset["value"] - onset["baseline"]
                         else:
                             hit["ratio"] = onset["value"] / onset["baseline"]
+                            # Over the earlier probes of the baseline: at most ATTN_WINDOW, so always
+                            # `short_history` (rules contract, part 1). Said so that no reader leaves it out.
+                            hit.update(robust_score(onset["value"], onset["earlier"]))
                         hit.update(baseline_probes=onset["baseline_probes"], heads=onset["heads"])
                         confirmed.setdefault(kind, []).append(hit)
                 if not flagged:
@@ -2385,8 +2703,10 @@ KIND_INPUTS: dict[str, str] = {
 #   epoch_order_repeated  the shortest pass that can be repeated has two different batches,
 #                         and the next pass must match both
 #   activation_spike      ACT_MIN_HISTORY earlier records and the one judged
-#   activation_drift, dead_activations
-#                         the first ACT_WINDOW records as the baseline and ACT_RECENT more
+#   activation_drift      ACT_DRIFT_NEEDS: the module's first ACT_WINDOW records, which are never
+#                         its baseline, then ACT_WINDOW records as the baseline and ACT_RECENT
+#                         more (rules contract, part 2)
+#   dead_activations      the first ACT_WINDOW records as the baseline and ACT_RECENT more
 #   the attention kinds   ATTN_MIN_HISTORY probes as the baseline, then ATTN_SUSTAIN in a row
 #   memory_growth         MEMORY_GROWTH_READINGS readings, each above the one before
 #   hardware_errors       an Xid 1; an ECC count above the attempt's first reading 2
@@ -2421,7 +2741,7 @@ RECORDS_NEEDED: dict[str, int] = {
     "data_stalled": DATA_STALL_STEPS + 1,
     "epoch_order_repeated": 4,
     "activation_spike": ACT_MIN_HISTORY + 1,
-    "activation_drift": ACT_WINDOW + ACT_RECENT,
+    "activation_drift": ACT_DRIFT_NEEDS,
     "dead_activations": ACT_WINDOW + ACT_RECENT,
     "attention_collapse": ATTN_MIN_HISTORY + ATTN_SUSTAIN,
     "attention_uniform": ATTN_MIN_HISTORY + ATTN_SUSTAIN,
@@ -2747,12 +3067,21 @@ def checked_line(evidence: Mapping[str, Any]) -> str | None:
     line = f"{counts['checked']} of {counts['kinds']} kinds checked"
     if counts["not_enough_history"]:
         checks, reported = evidence["kind_checks"], _reported_kinds(evidence)
-        each = []
-        for at, kind in enumerate(counts["not_enough_history_kinds"]):
+        each: list[str] = []
+        unit = False  # " records" after the first count only
+        for kind in counts["not_enough_history_kinds"]:
             seen, needed = checks[kind].get("records"), checks[kind].get("records_needed")
-            said = f"{kind} {seen} of {needed}" if seen is not None and needed is not None else kind
-            if at == 0 and " of " in said:
-                said += " records"
+            starting = checks[kind].get("starting_state")
+            if isinstance(starting, list) and starting and all(isinstance(r, Mapping) for r in starting):
+                # A router still in the state it started in (rules contract, part 3): the kind's
+                # records may be past its need, so their count would not say why it is short.
+                said = f"{kind}: " + ", ".join(
+                    f"router {r.get('router')} flagged since step 0 on {r.get('samples')} of {MOE_START_GRACE} samples"
+                    for r in starting)
+            else:
+                said = f"{kind} {seen} of {needed}" if seen is not None and needed is not None else kind
+                if not unit and " of " in said:
+                    said, unit = said + " records", True
             each.append(said + (" but reported by a faster rule" if kind in reported else ""))
         line += f", {counts['not_enough_history']} of them without enough history yet ({', '.join(each)})"
     if counts["history_not_stated"]:
@@ -3235,6 +3564,8 @@ def _report_evidence(
         # The server's `checkpoint_tensors` block (CHECKPOINT_TENSOR_CONTRACT.md, section 4), unchanged.
         **({"checkpoint_tensors": dict(served)} if isinstance(served := report.get("checkpoint_tensors"), Mapping) else {}),
         **({"head_trends": dict(heads)} if isinstance(heads := report.get("head_trends"), Mapping) and heads else {}),
+        # The four measurements (rules contract, part 6) where the server's report has them, unchanged.
+        **{name: dict(block) for name in MEASUREMENT_BLOCKS if isinstance(block := report.get(name), Mapping) and block},
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
         **({"traincheck": traincheck_summary} if traincheck_summary else {}),
         **({"watchdog": {**{k: status[k] for k in (
@@ -3438,11 +3769,17 @@ def run_state(
         if stopped:
             ranks = sorted(stopped, key=str)
             why = {rank: (stop.get("reason") if isinstance(stop, Mapping) else None) or "unknown" for rank, stop in stopped.items()}
+            # The step each capture stopped at, where the status says (rules contract, part 7): step 0
+            # and null ("before any step") stay apart, and a status without the key gives none.
+            at = {rank: stop["step"] for rank, stop in stopped.items() if isinstance(stop, Mapping) and "step" in stop}
+            said = {rank: f"{why[rank]}, {words}" if (words := capture_stopped_step_words(stopped[rank])) else why[rank]
+                    for rank in ranks}
             reasons.append(_reason(
                 "unknown", "capture_stopped",
                 f"capture stopped on {len(ranks)} rank{'s' if len(ranks) != 1 else ''} while training went on"
-                f" ({', '.join(f'rank {rank}: {why[rank]}' for rank in ranks)}): nothing is judged there since",
-                ranks=ranks, reasons={str(rank): why[rank] for rank in ranks}))
+                f" ({', '.join(f'rank {rank}: {said[rank]}' for rank in ranks)}): nothing is judged there since",
+                ranks=ranks, reasons={str(rank): why[rank] for rank in ranks},
+                **({"steps": {str(rank): at[rank] for rank in ranks if rank in at}} if at else {})))
         strange = {r.get("rank"): r.get("state") for r in entries if r.get("state") not in RANK_STATES}
         if strange:
             ranks = sorted(strange, key=str)
@@ -4123,6 +4460,8 @@ def _incident_identity(incident: Mapping[str, Any]) -> str:
     if kind == "moe_imbalance":
         parts: Any = [incident.get("layer"), incident.get("router"), sorted(incident.get("overloaded") or ()),
                       sorted(incident.get("dead") or ())]
+        if incident.get("since_start"):  # when it became reportable is a step, not a measurement
+            parts.append(incident.get("reportable_step"))
     elif kind == "starved_experts":
         parts = sorted(([e.get("layer"), e.get("router"), e.get("expert")] for e in incident.get("experts") or ()), key=repr)
     elif kind in ("grad_spike", "update_spike"):
@@ -4323,6 +4662,22 @@ def _run_check(by_rank: Mapping[int, Mapping[str, Any]], needs: str) -> dict[str
     }
 
 
+def _run_parameters_not_judged(check: dict[str, Any], by_rank: Mapping[int, Mapping[str, Any]]) -> None:
+    """The run's `stalled_weights` entry names the parameters some rank did not judge (rules
+    contract, part 5): the sorted union of the ranks' `parameters_not_judged`, and
+    `parameters_not_judged_by_rank` (rank, as a string, to its list) when the judged ranks' lists
+    differ. A judged rank without the key judged every parameter it read: its list is empty, and
+    it is in the map only through that difference, by its absence."""
+    lists = {rank: sorted({str(name) for name in found.get("parameters_not_judged") or ()})
+             for rank, found in by_rank.items() if isinstance(found, Mapping)}
+    union = sorted({name for names in lists.values() for name in names})
+    if not union:
+        return
+    check["parameters_not_judged"] = union
+    if len({tuple(names) for names in lists.values()}) > 1:
+        check["parameters_not_judged_by_rank"] = {str(rank): names for rank, names in sorted(lists.items()) if names}
+
+
 def _cross_rank_check(kind: str, brings: Mapping[int, Mapping[str, Any]]) -> dict[str, Any]:
     """A kind that compares ranks, from what each judged rank brings to the comparison
     (rule 5): the worst rank gives the value, and one rank alone compares with nothing."""
@@ -4353,6 +4708,7 @@ def run_kind_checks(
         kind: _run_check({rank: found[kind] for rank, found in rank_checks.items()}, INPUT_NEEDS[KIND_INPUTS[kind]])
         for kind in SERVER_KINDS
     }
+    _run_parameters_not_judged(checks[GRADS_NOT_READ_NAMED], {rank: found[GRADS_NOT_READ_NAMED] for rank, found in rank_checks.items()})
     checks.update({kind: dict(check) for kind, check in others.items()})
 
     def brings(has: Any, kind: str) -> dict[int, dict[str, Any]]:
@@ -6352,6 +6708,9 @@ def build_evidence(
                     "diversity": moe_hit["diversity"],
                     "overloaded": moe_hit["overloaded"],
                     "dead": moe_hit["dead"],
+                    # A router collapsed since its first step: when it began is `step`, when it
+                    # became reportable is `reportable_step` (rules contract, part 3).
+                    **{key: moe_hit[key] for key in ("since_start", "reportable_step") if key in moe_hit},
                 }
             )
         starved_hit = detect_starved_experts(samples)
@@ -6391,9 +6750,14 @@ def build_evidence(
         grads_unread = grads_not_read_not_checked(records)
         if grads_unread is not None:
             not_checked.append(grads_unread)
+        layers_unread = layers_not_read_not_checked(records)
+        if layers_unread is not None:
+            not_checked.append(layers_unread)
         rank_checks = kind_checks(
             input_counts(records), not_checked, starve_window=starve_window, update_window=update_window)
+        name_starting_state(rank_checks, samples)
     name_gradients_not_judged(rank_checks, not_checked)
+    name_modules_not_judged(rank_checks, not_checked)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
     # A status is expected where a server stores the run (a directory of its parts, or one
     # part) or when one was named. A local file or a list of records has no server to miss.
@@ -6461,6 +6825,8 @@ def build_evidence(
         "layer_count": len(routers),
         "expert_count": expert_count,
         "router_names": routers,
+        # How each router's counts reached the capture (rules contract, part 7), where it said.
+        **({"moe_source": sourced} if (sourced := moe_source(records)) else {}),
         "overload_threshold": overload_threshold,
         "top_k": router_top_k,
         "starve_window": starve_window,
@@ -6492,6 +6858,9 @@ def build_evidence(
         # Rows of an attempt after a later attempt's first row (contract 1): kept, not progress.
         **({"superseded_rows": late} if (late := superseded_rows(every_attempt)) else {}),
         **({"weight_trends": trends} if trends else {}),
+        # The four measurements (rules contract, part 6), made here from the records under either
+        # detectors, as `weight_trends` is.
+        **measurement_blocks(records),
         **({"head_trends": head_trends} if head_trends else {}),
         **({"memory": memory} if memory else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
@@ -6536,18 +6905,89 @@ def run_end_line(evidence: Mapping[str, Any]) -> str | None:
     return f"Run end: not known to have finished: {end.get('detail', end.get('state'))}."
 
 
+# Samples a router may stay flagged in the state it started in, from step 0, before it is
+# reported (DETECTOR_RULES_CONTRACT.md, part 3).
+MOE_START_GRACE = 10
+
+
+def _routed_by_router(samples: Iterable[Mapping[str, Any]]) -> list[list[Mapping[str, Any]]]:
+    """Each router's samples that routed tokens, in step order, routers in their layer's order.
+    A missing sample is not one of them: a router's first sample is its first that routed."""
+    by_layer: dict[Any, list[Mapping[str, Any]]] = {}
+    for sample in samples:
+        if isinstance(sample, Mapping) and not sample.get("missing") and sample.get("routed_tokens", 0) > 0:
+            by_layer.setdefault(sample.get("layer"), []).append(sample)
+    return [sorted(seq, key=lambda s: s["step"]) for _, seq in sorted(
+        by_layer.items(), key=lambda item: (0, item[0], "") if isinstance(item[0], int) else (1, 0, repr(item[0])))]
+
+
+def _flagged_sample(sample: Mapping[str, Any]) -> bool:
+    return bool(sample.get("overloaded") or sample.get("dead"))
+
+
+def _leading_start(seq: list[Mapping[str, Any]]) -> int:
+    """How many of a router's first samples are flagged in a row, when its first is at step 0:
+    the state it started in. 0 for a router whose first sample is at another step."""
+    if not seq or seq[0]["step"] != 0:
+        return 0
+    leading = 0
+    while leading < len(seq) and _flagged_sample(seq[leading]):
+        leading += 1
+    return leading
+
+
 def first_incident(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Return the earliest MoE sample with an overloaded or dead expert, or None."""
-    flagged = [
-        sample
-        for sample in evidence.get("samples", ())
-        if not sample.get("missing")
-        and sample.get("routed_tokens", 0) > 0
-        and (sample.get("overloaded") or sample.get("dead"))
-    ]
-    if not flagged:
+    """The MoE sample the `moe_imbalance` incident reports, or None (rules contract, part 3).
+
+    The samples are as they were: each says which experts are overloaded or dead. A router whose
+    first sample is at step 0 and is flagged is in the state it started in, and that leading run
+    of flagged samples is not reported while it is shorter than MOE_START_GRACE samples. Once it
+    reaches that many it is: the sample returned is the first of them, with `since_start` true
+    and `reportable_step`, the step of the MOE_START_GRACE-th. When it began and when it became
+    reportable are two facts. Any flagged sample after the leading run ends is reported as
+    before, and a router whose first sample is at another step is judged as before.
+
+    Among routers the one that could be reported first wins: by `reportable_step` for a router
+    collapsed since its start, by its step otherwise, then by layer. The sample is a copy; the
+    evidence's samples are not changed.
+    """
+    found: list[tuple[int, Any, dict[str, Any]]] = []
+    for seq in _routed_by_router(evidence.get("samples", ())):
+        leading = _leading_start(seq)
+        if leading >= MOE_START_GRACE:
+            reportable = int(seq[MOE_START_GRACE - 1]["step"])
+            found.append((reportable, seq[0]["layer"],
+                          {**seq[0], "since_start": True, "reportable_step": reportable}))
+            continue
+        later = next((sample for sample in seq[leading:] if _flagged_sample(sample)), None)
+        if later is not None:
+            found.append((int(later["step"]), later["layer"], dict(later)))
+    if not found:
         return None
-    return min(flagged, key=lambda sample: (sample["step"], sample["layer"]))
+    return min(found, key=lambda item: (item[0], item[1]))[2]
+
+
+def name_starting_state(checks: dict[str, dict[str, Any]], samples: Iterable[Mapping[str, Any]]) -> None:
+    """Name the routers still in their starting state (`moe_starting_state`) on the
+    `moe_imbalance` entry of `checks`, as `starting_state`, with `enough_history` false: a
+    short capture of a router flagged since step 0 reads as checked without enough history, not
+    as checked and clean (rules contract, part 3). Not on an entry that is `unavailable`, as
+    `parameters_not_judged` is not."""
+    check = checks.get("moe_imbalance")
+    starting = moe_starting_state(samples)
+    if starting and isinstance(check, dict) and check.get("value") != "unavailable":
+        check["starting_state"] = starting
+        check["enough_history"] = False
+
+
+def moe_starting_state(samples: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The routers still in the state they started in when the samples end: flagged on every
+    sample since step 0, and fewer than MOE_START_GRACE of them, so nothing is reported for
+    them yet. `{"router", "samples"}` each, in layer order (the `starting_state` of the
+    `moe_imbalance` entry of `kind_checks`)."""
+    return [{"router": seq[0].get("router", f"layer-{seq[0]['layer']:02}"), "samples": len(seq)}
+            for seq in _routed_by_router(samples)
+            if _leading_start(seq) == len(seq) < MOE_START_GRACE]
 
 
 def _missing_sample(step: int, layer: int, expert_count: int) -> dict[str, Any]:
@@ -6790,13 +7230,13 @@ def _describe_attention(incident: Mapping[str, Any]) -> str:
     more = f", and {incident['affected'] - 1} more modules" if incident["affected"] > 1 else ""
     if kind == "attention_collapse":
         what = (f"Attention entropy collapse at step {incident['step']} in {top['module']}: mean entropy share"
-                f" {top['value']:.2f}, {top['ratio']:.2f}× its earlier probes ({top['baseline']:.2f})")
+                f" {top['value']:.2f}, {top['ratio']:.2f}× its earlier probes ({top['baseline']:.2f}){_with_score(top)}")
     elif kind == "attention_uniform":
         what = (f"Attention gone uniform at step {incident['step']} in {top['module']}: mean entropy share"
                 f" {top['baseline']:.2f} → {top['value']:.2f} (1.0 is uniform over every key)")
     else:
         what = (f"Attention logit growth at step {incident['step']} in {top['module']}: largest logit"
-                f" {top['value']:.3g}, {top['ratio']:.2g}× its earlier probes ({top['baseline']:.3g})")
+                f" {top['value']:.3g}, {top['ratio']:.2g}× its earlier probes ({top['baseline']:.3g}){_with_score(top)}")
     probes = incident["affected_probes"]
     return (
         f"{what}{more}; held on the probe at step {incident['confirmed_step']} too ({probes} probe"
@@ -6846,12 +7286,12 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             others = len(incident["parameters"]) - 1
             ratio = incident.get("ratio")
             total = (
-                f"the total norm, {incident['grad_norm']:.3g}, was {ratio:.1f}× its median"
+                f"the total norm, {incident['grad_norm']:.3g}, was {ratio:.1f}× its median{_with_score(incident)}"
                 if isinstance(ratio, (int, float)) else f"the total norm was {incident['grad_norm']:.3g}"
             )
             return (
                 f"Gradient spike in one parameter from step {incident['step']}: {top['name']} at"
-                f" {top['ratio']:.0f}× its own median, and still at {SPIKE_FACTOR:g}× or more"
+                f" {top['ratio']:.0f}× its own median{_with_score(top)}, and still at {SPIKE_FACTOR:g}× or more"
                 f" {incident['sustained']} recorded steps in a row"
                 + (f" ({others} more parameter{'s' if others > 1 else ''} from the same step)" if others > 0 else "")
                 + f"; {total}, so the total alone did not show it"
@@ -6861,13 +7301,14 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             top = incident["parameters"][0]
             where = (
                 f", first in {top['name']} ({top['ratio']:.0f}× its median"
+                + (f", {words}" if (words := score_words(top)) else "")
                 + (f", rising since step {top['rising_since']}" if top["rising_since"] != incident["step"] else "")
                 + ")"
             )
         more = incident["spike_count"] - 1
         return (
             f"Gradient spike at step {incident['step']}: norm {incident['grad_norm']:.3g},"
-            f" {incident['ratio']:.0f}× the median of recent steps{where}"
+            f" {incident['ratio']:.0f}× the median of recent steps{_with_score(incident)}{where}"
             + (f"; {more} more spike{'s' if more > 1 else ''}" if more > 0 else "")
         )
     if kind == "stalled_weights":
@@ -6929,10 +7370,11 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             largest = max(incident["modules"], key=lambda m: m["ratio"])
             more = f", and {incident['affected'] - 1} more modules"
             if largest["module"] != top["module"]:
-                more += f" (the largest, {largest['stat']} {largest['ratio']:.0f}×, is in {largest['module']})"
+                more += (f" (the largest, {largest['stat']} {largest['ratio']:.0f}×"
+                         + (f", {words}" if (words := score_words(largest)) else "") + f", is in {largest['module']})")
         return (
             f"Activation spike at step {incident['step']} {'first ' if more else ''}in {top['module']}: {top['stat']}"
-            f" {top['ratio']:.0f}× its recent median{more}"
+            f" {top['ratio']:.0f}× its recent median{_with_score(top)}{more}"
             f"; {incident['affected_steps']} step{'s' if incident['affected_steps'] != 1 else ''} affected"
         )
     if kind == "activation_drift":
@@ -6940,7 +7382,8 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         direction = "grew" if top["ratio"] > 1 else "shrank"
         return (
             f"Activation drift from step {incident['step']} in {top['module']}: {top['stat']}"
-            f" {direction} to {top['ratio']:.2g}× its early level"
+            f" {direction} to {top['ratio']:.2g}× its level over the {ACT_WINDOW} records before its last {ACT_RECENT}"
+            f"{_with_score(top)}"
             + (f", and {incident['affected'] - 1} more modules" if incident["affected"] > 1 else "")
         )
     if kind == "dead_activations":
@@ -7117,10 +7560,20 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
     lines: list[str] = []
     incidents = evidence.get("incidents", ())
     moe_incident = next((i for i in incidents if i["kind"] == "moe_imbalance"), None)
-    # Evidence built from the server's report has the incident but no per-step samples.
-    moe = first_incident(evidence) or moe_incident
+    # The incident listed, with its sample's counts where the samples hold it; evidence built from
+    # the server's report has the incident but no per-step samples. A compacted file keeps only
+    # windows of samples, so the incident is read first, not worked out again from what was kept.
+    if moe_incident is not None:
+        sample = next((s for s in evidence.get("samples", ()) if isinstance(s, Mapping)
+                       and s.get("step") == moe_incident.get("step") and s.get("layer") == moe_incident.get("layer")), None)
+        moe: Mapping[str, Any] | None = {**sample, **moe_incident} if sample is not None else moe_incident
+    else:
+        moe = first_incident(evidence)
     if moe is not None:
         lines += _moe_lines(evidence, moe)
+        source = moe_source_words(evidence).get(str(moe.get("router")))
+        if source is not None:  # what the counts are, only where the capture said (rules contract, part 7)
+            lines.append(f"  The counts of router {moe.get('router')} are {source}.")
         if moe_incident is not None:
             lines += _scalar_lines(moe_incident)
     starved = _starved_line(evidence)
@@ -7174,7 +7627,10 @@ def _group_line(group: Mapping[str, Any]) -> str:
     if kind == "moe_imbalance":
         overloaded = ", ".join(str(e) for e in incident.get("overloaded", ())[:6]) or "none"
         dead = ", ".join(str(e) for e in incident.get("dead", ())[:6]) or "none"
-        text = (f"MoE imbalance at step {group['step']}, layer {incident.get('layer', 0):02}:"
+        when = (f"collapsed since step {group['step']}, reportable at step {incident['reportable_step']}"
+                if incident.get("since_start") and incident.get("reportable_step") is not None
+                else f"at step {group['step']}")
+        text = (f"MoE imbalance {when}, layer {incident.get('layer', 0):02}:"
                 f" overloaded experts {overloaded}; dead experts {dead}")
     elif kind == "starved_experts":
         experts = incident.get("experts", ())
@@ -7376,6 +7832,14 @@ def _scalar_lines(incident: Mapping[str, Any]) -> list[str]:
     return [f"  Logged at step {incident['step']}: " + ", ".join(parts)]
 
 
+def _moe_when(incident: Mapping[str, Any], first: str = "First sampled bad step") -> str:
+    """When an MoE incident began, and for a router collapsed since its first step when it became
+    reportable too (rules contract, part 3): never that it was found at step 0."""
+    if incident.get("since_start") and incident.get("reportable_step") is not None:
+        return f"Collapsed since step {incident['step']}, reportable at step {incident['reportable_step']}"
+    return f"{first} {incident['step']}"
+
+
 def _moe_lines(evidence: Mapping[str, Any], incident: Mapping[str, Any]) -> list[str]:
     counts, tokens = incident.get("counts"), incident.get("routed_tokens") or 1
     overloaded = ", ".join(
@@ -7385,7 +7849,7 @@ def _moe_lines(evidence: Mapping[str, Any], incident: Mapping[str, Any]) -> list
     dead = ", ".join(f"{expert:02}" for expert in incident["dead"])
     diversity = float(incident.get("diversity") or 0.0)
     return [
-        f"First sampled bad step {incident['step']}  ·  Layer {incident['layer']:02}"
+        f"{_moe_when(incident)}  ·  Layer {incident['layer']:02}"
         f"  ·  Diversity {diversity:.2f}",
         f"Overloaded: {overloaded or 'none'}  ·  Dead experts: {dead or 'none'}",
     ]

@@ -420,9 +420,11 @@ def test_top_k_collapse_keeps_its_baseline_until_recovery():
 def test_dead_experts_do_not_lower_the_share_threshold(top_k, count, overloaded):
     rest, remainder = divmod(10_000 - count, 5)
     counts = [count, *[rest + (i < remainder) for i in range(5)], 0, 0]
-    sample = tensorquill.first_incident(tensorquill.build_evidence(
+    # The sample itself: one flagged sample at step 0 is a router's starting state, which is not
+    # reported (DETECTOR_RULES_CONTRACT.md, part 3), so `first_incident` does not return it.
+    sample = tensorquill.build_evidence(
         [{"step": 0, "moe": {"r": counts}, "moe_top_k": {"r": top_k}}],
-    ))
+    )["samples"][0]
     assert sample["dead"] == [7, 8]
     assert sample["overloaded"] == overloaded
     assert sample["overload_rule"] == {"rule": "share", "threshold": 0.35}
@@ -625,7 +627,9 @@ def _act_records(steps=120, spike=None, drift_from=None, dead_from=None):
             if spike == (step, b):
                 amax *= 20
             if drift_from is not None and b == 2 and step >= drift_from:
-                std *= 1.03 ** (step - drift_from)
+                # A shift to four times the level (DETECTOR_RULES_CONTRACT.md, part 2): a growth of a
+                # few percent a step is the slow drift the trailing baseline does not see.
+                std *= 4.0
                 amax = 10.0 * std
             if dead_from is not None and b == 3 and step >= dead_from:
                 zero = 0.6
@@ -642,10 +646,12 @@ def test_activation_detectors_on_planted_failures():
         ("activation_spike", 70, "blocks.0")
     ]
 
-    drift = tensorquill.detect_activation_anomalies(_act_records(drift_from=60))
+    # Past the module's 110th record, so that the 50 records of the trailing baseline hold none of
+    # its first 50 (part 2).
+    drift = tensorquill.detect_activation_anomalies(_act_records(steps=240, drift_from=150))
     hit = next(h for h in drift if h["kind"] == "activation_drift")
     assert hit["modules"][0]["module"] == "blocks.2" and hit["modules"][0]["ratio"] >= 3
-    assert 60 < hit["step"] < 120
+    assert 150 < hit["step"] < 240
 
     dead = tensorquill.detect_activation_anomalies(_act_records(dead_from=80))
     hit = next(h for h in dead if h["kind"] == "dead_activations")
@@ -653,7 +659,7 @@ def test_activation_detectors_on_planted_failures():
 
     evidence = tensorquill.build_evidence(_act_records(spike=(70, 0), dead_from=80))
     summary = tensorquill.incident_summary(evidence)
-    assert "Activation spike at step 70 in blocks.0: abs_max 19× its recent median; 1 step affected" in summary
+    assert "Activation spike at step 70 in blocks.0: abs_max 19× its recent median (score 485.6); 1 step affected" in summary
     assert "Outputs going dead from step 85 in blocks.3: zero fraction 10% → 60%" in summary
 
 
@@ -683,8 +689,9 @@ def test_an_activation_spike_that_travels_down_the_stack_leads_with_its_first_bl
     assert names[2:] == ["blocks.6", "blocks.5", "blocks.4", "blocks.3"]
     summary = tensorquill.incident_summary(tensorquill.build_evidence(
         _propagating_records(2, [6, 8, 10, 14, 20, 30])))
-    assert "Activation spike at step 40 first in blocks.2: abs_max 6× its recent median, and 5 more modules " \
-           "(the largest, abs_max 30×, is in blocks.7); 1 step affected" in summary
+    zero_mad = "no score: the earlier values had zero median absolute deviation"
+    assert f"Activation spike at step 40 first in blocks.2: abs_max 6× its recent median ({zero_mad}), and 5 more modules " \
+           f"(the largest, abs_max 30×, {zero_mad}, is in blocks.7); 1 step affected" in summary
 
 
 def test_the_first_block_in_the_model_leads_when_names_do_not_sort_in_model_order(tmp_path):
@@ -710,7 +717,8 @@ def test_the_first_block_leads_even_when_it_is_also_the_largest():
                  if h["kind"] == "activation_spike")
     assert [m["module"] for m in spike["modules"]][:2] == ["blocks.3", "blocks.4"]
     summary = tensorquill.incident_summary(tensorquill.build_evidence(_propagating_records(3, [30, 12, 10, 8, 6])))
-    assert "first in blocks.3: abs_max 30× its recent median, and 4 more modules; 1 step affected" in summary
+    assert ("first in blocks.3: abs_max 30× its recent median (no score: the earlier values had zero median absolute"
+            " deviation), and 4 more modules; 1 step affected") in summary
     assert "the largest" not in summary
 
 
