@@ -1,6 +1,6 @@
-# Draft of a Gate 1 amendment, for the author to approve
+# Draft of a Gate 1 amendment
 
-**Not entered.** `experiments/gate1/PREREGISTRATION.md` is the author's. This is the text proposed for its "Amendments" section, with what was measured. It is entered only on the author's approval of these words, and before the trial.
+**Entered on Nov 21, 2026**, in `experiments/gate1/PREREGISTRATION.md` on the branch `contracts/wave-ad`, on the author's approval with two edits: the author's own words for how the score is read, and for what was verified. The text below is the draft as it was proposed; the entered text is the preregistration's.
 
 ## What was measured (Nov 21, 2026)
 

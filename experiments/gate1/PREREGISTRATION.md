@@ -240,3 +240,26 @@ Entered on the author's word on Nov 20, 2026, before the scorer was changed. The
 - **What does not change.** The fixtures and `generate.py`. The accuracy line. The tool-call part of the Nov 17 amendment, which compares two medians and divides nothing. The case that amendment left open, one arm with `tool_calls` `null`, stays open.
 - **Not built yet.** `harness.py score` still computes the infinite ratio. It is changed after this entry, with tests for zero over zero, a positive count over zero, and an ordinary ratio.
   - *Built and tested Nov 20, 2026, after this entry (commits `5ebf07f` and `bf398ba`, in `main` since `ac0159a`).* In `gate_checks`, a speed ratio whose denominator, arm B's median, is zero now reads "not measured" with both arms' medians shown, for tool calls and for human seconds, and is left out of the speed line's verdict. A `null` count is still left out of the median and never read as zero. Nine tests in `test_gate1.py`, on rows written by hand with no fixture build: zero over zero, a positive count over zero, zero over a positive count, a ratio that meets 2.0× and one that does not, a missing count beside an observed zero, a zero human-seconds denominator, and the line's verdict when one measure is not measured and the other is (two cases). Six of them fail on the scorer as it was. All 71 tests of the file pass, and the two validation sets still score 32 of 32 and 21 of 32. Two consequences of the application as built: when neither measure can be measured, no speed-line verdict is printed, as when no measure has correct trials in both arms; and with one measure not measured and the other below 2.0×, the line reads "not met". The fixtures and `generate.py` are unchanged, and every `evidence.json` and `summary.txt` the arms are shown is byte for byte what it was before the wave this change came in with (the trial folders were built from `282d3f9`, the commit before the wave, and from `ac0159a`, and compared; the Rerun recordings differ between any two builds, two of `282d3f9` included). Not run: a trial with an agent, so the zero-denominator path has only run on rows written by hand.
+
+### Nov 21, 2026: a score beside a ratio, a gradient trend, and 110 records for `activation_drift`
+
+Entered before any trial was run, on the author's approval of this text. It changes what arms C and R are shown (`evidence.json` and `summary.txt`), and the evidence file arm B's app opens. It changes no question, no answer key and no scoring.
+
+- **What changed.** Three things, from the detector rules contract of Nov 21, 2026 (`DETECTOR_RULES_CONTRACT.md`):
+  - An incident that records a `ratio` against a window of earlier values also records a `score`. The summary line says it in words after the ratio. This shows on the two fixtures whose incident carries such a ratio.
+  - The evidence gains a block `gradient_trend` where the records hold gradient norms: the trend of the total gradient norm over the run. This shows on the same two fixtures.
+  - `activation_drift` is judged against a trailing baseline and needs 110 records, where it needed 60. On every fixture its entry in `kind_checks` says 110.
+- **The measured changes, fixture by fixture.**
+
+  | Fixtures | What differs in `evidence.json` | What differs in `summary.txt` |
+  |---|---|---|
+  | All seven | `kind_checks.activation_drift.records_needed`: 60 becomes 110 | Nothing |
+  | `unseen-2` | The one incident and its first parameter each gain `score`. The evidence gains the block `gradient_trend` | Line 1 gains the two scores in words |
+  | `unseen-5` | The one incident's first module gains `score`. The evidence gains the block `gradient_trend` | Line 1 gains the score in words |
+
+  Arm A: no file differs. Arm B: its trial folder is unchanged, and the evidence file its app opens is the changed one.
+- **What did not change.** The incidents' kinds, steps and locations, the per-step samples and the run state of all seven fixtures. The fixtures and `generate.py`. The answer key.
+- **Fairness.** Arms C and R are shown byte-identical `evidence.json` and `summary.txt`, as before.
+- **Score interpretation.** The ratio shows the value relative to its baseline. The score shows its distance from the earlier median in units of 1.4826 × MAD. The score and `gradient_trend` are descriptive. Neither triggers an incident or changes Gate 1 scoring.
+- **Verification.** All four arms were built at `9a78db1` and `586181f`. At each revision, arms C and R received byte-identical `evidence.json` and `summary.txt` on all seven fixtures. In arm R's `run.rrd`, the comparison covered score text only. It appeared on `unseen-2` and `unseen-5` only. No agent trial was run.
+- **Still to be confirmed (the author's instruction, Nov 21, 2026).** At the wave AD trial merge the final tree is compared with `eb5a71b`. Any additional participant-visible difference, or any approved difference that is missing, needs review before the fast-forward.
