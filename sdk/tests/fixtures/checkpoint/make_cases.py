@@ -70,8 +70,10 @@ OTHER_MODEL = {f"encoder.layer.{i}.{part}": [4, 4] for i in range(4) for part in
 OPTIMIZER = "an optimizer's state"  # stands for {"state": {...}, "param_groups": [...]}
 
 
-def compared(model, entry, checkpoint, matched, **lists):
-    out = {"state": "compared", "entry": entry, "model": len(model),
+def compared(model, entry, checkpoint, matched, by="name", **lists):
+    """`by`: "loader" (the loader named the entry), "name" (the one entry whose key names a model
+    and no copy), "names" (the one entry whose tensor names are the model's)."""
+    out = {"state": "compared", "entry": entry, "by": by, "model": len(model),
            "trainable": sum(tensor[2] == "p" for tensor in model), "checkpoint": checkpoint, "matched": matched}
     for key, found in lists.items():
         if key == "prefix":
@@ -114,10 +116,11 @@ def coverage_today(given):
 
 
 def coverage(status, says, given, tensors, model_component, **more):
+    if model_component == "as today":  # coverage is unavailable for a reason that leaves `components` alone
+        model_component = coverage_today(given)["model_component"]
     expected = {"model_component": model_component, **({"tensors": tensors} if tensors is not None else {"tensors_key": False})}
     case = {"group": "coverage", "status": status, "says": says, "given": given, "expected": {**expected, **more}}
-    if "raises" not in given:
-        case["today"] = coverage_today(given)
+    case["today"] = coverage_today(given)
     return case
 
 
@@ -163,7 +166,7 @@ def entry(tensors):
     """The evidence's entry for the resume at step 10: the `tensors` object as the readers pass it
     on (numbers, and each list's count and names)."""
     out = {"step": 10, "rank": 0, "attempt": SECOND}
-    for key in ("state", "why", "entry", "model", "trainable", "checkpoint", "matched"):
+    for key in ("state", "why", "entry", "by", "model", "trainable", "checkpoint", "matched"):
         if key in tensors:
             out[key] = tensors[key]
     for key in ("missing", "missing_frozen", "missing_buffers", "unexpected", "shape_differs"):
@@ -184,7 +187,7 @@ def records(says, rows, fires, findings=(), block=None, **more):
 COMPLETE = compared(LSTM, "model", 7, 7)
 TWO_MISSING = compared(LSTM, "model", 5, 5, missing=["lstm.weight_hh_l0", "lstm.bias_hh_l0"])
 MANY_MISSING = compared(DEEP, "model", 1, 1, missing=[n for n, _, _ in DEEP if n != "head.weight"])
-FROZEN_MISSING = compared(ADAPTED, "adapter", 2, 2, missing_frozen=names(ADAPTED, "f"))
+FROZEN_MISSING = compared(ADAPTED, "adapter", 2, 2, by="loader", missing_frozen=names(ADAPTED, "f"))
 BUFFERS_MISSING = compared(NORMED, "model", 3, 3, missing_buffers=names(NORMED, "b"))
 UNEXPECTED = compared(LSTM, "model", 9, 7, unexpected=["old_head.weight", "old_head.bias"])
 SHAPE = compared(LSTM, "model", 7, 7, shape_differs=["head.weight"],
@@ -222,12 +225,12 @@ cases = {
     "a_bare_state_dict": coverage(
         "new", "`torch.save(model.state_dict())`: the tensors sit directly in the checkpoint, under no key."
         " Today no entry is taken for the model; compared with the model, the checkpoint itself is.",
-        {"model": LSTM, "bare": held(LSTM)}, compared(LSTM, None, 7, 7), True),
+        {"model": LSTM, "bare": held(LSTM)}, compared(LSTM, None, 7, 7, by="names"), True),
     "unusual_names_under_a_plain_key": coverage(
         "new", "L23's first limit: a model whose parameters have no dotted or PyTorch name, saved under a"
         " key that names no model. Today it is passed over; its names are the model's, so it is the model's.",
         {"model": PLAIN, "checkpoint": {"state": held(PLAIN), "optimizer": OPTIMIZER}},
-        compared(PLAIN, "state", 2, 2), True),
+        compared(PLAIN, "state", 2, 2, by="names"), True),
     "a_cache_with_parameter_like_names": coverage(
         "new", "L23's second limit: a cache under another name with dotted keys, and no model in the"
         " checkpoint. Today it is taken for the model; it shares no name with the model, so no entry is.",
@@ -237,9 +240,44 @@ cases = {
         "new", "The same cache beside the model's state: the entry with the model's names is compared.",
         {"model": LSTM, "checkpoint": {"model": held(LSTM), "features": CACHE}}, COMPLETE, True),
     "an_ema_copy_beside_the_model": coverage(
-        "new", "Two entries hold every name of the model. A tie goes to the entry the name rule already"
-        " takes for the model, then to the first in the checkpoint's order.",
+        "new", "Two entries hold every name of the model. `ema` is an averaged copy by its name; the"
+        " conventional entry, `model`, is the one compared.",
         {"model": LSTM, "checkpoint": {"ema": held(LSTM), "model": held(LSTM)}}, COMPLETE, True),
+    "an_incomplete_model_beside_a_complete_ema": coverage(
+        "new", "B14 with an averaged copy beside it: `model` lacks the two LSTM tensors and `ema` holds"
+        " every name. The fuller copy must not hide the loss: `model` is compared and both are named.",
+        {"model": LSTM, "checkpoint": {"model": held(LSTM, ("lstm.weight_hh_l0", "lstm.bias_hh_l0")),
+                                       "ema": held(LSTM), "optimizer": OPTIMIZER}}, TWO_MISSING, True),
+    "a_complete_ema_before_an_incomplete_model": coverage(
+        "new", "The same checkpoint with `ema` first. The order of the entries decides nothing.",
+        {"model": LSTM, "checkpoint": {"ema": held(LSTM), "optimizer": OPTIMIZER,
+                                       "model": held(LSTM, ("lstm.weight_hh_l0", "lstm.bias_hh_l0"))}}, TWO_MISSING, True),
+    "the_loader_names_the_ema_copy": coverage(
+        "new", "The loader says it loaded `ema` into the model. The loader's word comes first, so `ema` is"
+        " compared, and it is complete.",
+        {"model": LSTM, "loader": "ema", "checkpoint": {"model": held(LSTM, ("lstm.weight_hh_l0", "lstm.bias_hh_l0")),
+                                                        "ema": held(LSTM)}},
+        compared(LSTM, "ema", 7, 7, by="loader"), True),
+    "two_unnamed_entries_alike": coverage(
+        "new", "Two entries hold every name of the model and neither key names a model. Nothing says which"
+        " was loaded, so tensor coverage is unavailable and nothing is named as missing.",
+        {"model": LSTM, "checkpoint": {"a": held(LSTM), "b": held(LSTM, ("lstm.weight_hh_l0",))}},
+        unavailable("ambiguous", candidates=["a", "b"]), "as today"),
+    "two_unnamed_entries_alike_in_the_other_order": coverage(
+        "new", "The same two entries in the other order: the same answer.",
+        {"model": LSTM, "checkpoint": {"b": held(LSTM, ("lstm.weight_hh_l0",)), "a": held(LSTM)}},
+        unavailable("ambiguous", candidates=["a", "b"]), "as today"),
+    "a_cache_sharing_one_name": coverage(
+        "new", "An entry under no model's name whose one tensor has a name of the model's. It passes the"
+        " half filter on its own side and holds one of the model's seven names: too little to call the"
+        " other six missing.",
+        {"model": LSTM, "checkpoint": {"features": {"head.bias": [65]}, "optimizer": OPTIMIZER}},
+        unavailable("weak_match", closest={"entry": "features", "checkpoint": 1, "matched": 1}), "as today"),
+    "the_loader_names_an_entry_of_another_model": coverage(
+        "new", "The loader names an entry that shares no name with the model. It is the model's entry by"
+        " the loader's word, but the names follow another scheme, so nothing is named as missing.",
+        {"model": LSTM, "loader": "model", "checkpoint": {"model": OTHER_MODEL}},
+        unavailable("names_differ", closest={"entry": "model", "checkpoint": 8, "matched": 0}), True),
     "a_checkpoint_of_another_model": coverage(
         "new", "An entry named `model` that shares no name with the model. It is not this model's state.",
         {"model": LSTM, "checkpoint": {"model": OTHER_MODEL}}, unavailable("not_identified"), False),
@@ -268,9 +306,15 @@ cases = {
         {"model": TIED, "checkpoint": {"model": held(TIED, ("lm_head.weight",))}},
         compared(TIED, "model", 2, 2, tied=["lm_head.weight"]), True),
     "an_adapter_only_checkpoint": coverage(
-        "new", "Only the trainable adapter was saved. The frozen base is not in the checkpoint; a frozen"
-        " parameter is counted and named apart, and is not a missing tensor.",
-        {"model": ADAPTED, "checkpoint": {"adapter": held(ADAPTED, names(ADAPTED, "f"))}}, FROZEN_MISSING, True),
+        "new", "Only the trainable adapter was saved, and the loader names its entry. The frozen base is"
+        " not in the checkpoint; a frozen parameter is counted and named apart, and is not a missing tensor.",
+        {"model": ADAPTED, "loader": "adapter", "checkpoint": {"adapter": held(ADAPTED, names(ADAPTED, "f"))}},
+        FROZEN_MISSING, True),
+    "an_adapter_only_checkpoint_the_loader_did_not_name": coverage(
+        "new", "The same checkpoint with nothing said by the loader. The entry's key names no model and it"
+        " holds two of the model's five names, so coverage is unavailable. Nothing is raised.",
+        {"model": ADAPTED, "checkpoint": {"adapter": held(ADAPTED, names(ADAPTED, "f"))}},
+        unavailable("weak_match", closest={"entry": "adapter", "checkpoint": 2, "matched": 2}), "as today"),
     "buffers_left_out": coverage(
         "new", "The parameters are all there and BatchNorm's three buffers are not. Buffers are counted"
         " and named apart.",
@@ -294,10 +338,21 @@ cases = {
         {"model": LSTM, "folder": ["model.safetensors", "optimizer.pt", "rng_state.pth", "trainer_state.json"]},
         unavailable("folder"), True),
     "the_comparison_raises": coverage(
-        "new", "Reading the model's names raises. The load is recorded as it is today, the reason is"
+        "new", "Reading a parameter's shape raises. The load is recorded as it is today, the reason is"
         " `error`, and nothing is raised into training.",
-        {"model": "a model whose state_dict() raises", "checkpoint": {"model": held(LSTM)}, "raises": True},
-        unavailable("error"), True),
+        {"model": "the LSTM, with one parameter whose shape raises when read", "checkpoint": {"model": held(LSTM)}},
+        unavailable("error"), "as today"),
+    "a_model_whose_state_export_gathers": coverage(
+        "new", "A distributed wrapper's `state_dict()` gathers state from other ranks, and a state-dict hook"
+        " may do anything. The comparison reads the modules' own parameter and buffer tables and calls"
+        " neither: the stand-in's `state_dict()` and its hook record any call, and none is made.",
+        {"model": LSTM, "model_note": "its state_dict() and a state-dict hook record being called",
+         "checkpoint": {"model": held(LSTM)}}, COMPLETE, True, state_dict_called=False, state_dict_hook_called=False),
+    "a_model_that_replaces_its_parameter_walk": coverage(
+        "new", "A module that replaces `named_parameters` with its own. What that call would do is not"
+        " known, so it is not made, and coverage is unavailable.",
+        {"model": LSTM, "model_note": "one module overrides named_parameters, and records being called",
+         "checkpoint": {"model": held(LSTM)}}, unavailable("model_not_readable"), "as today", override_called=False),
     "a_save_is_not_compared": coverage(
         "pin", "`event=\"save\"`: the manifest of a save carries no `tensors` key.",
         {"model": LSTM, "checkpoint": {"model": held(LSTM, ("lstm.weight_hh_l0",))}, "event": "save"},
@@ -353,6 +408,11 @@ cases = {
         "The folder's own finding is unchanged, and tensor coverage is unavailable beside it.",
         resumed({"components": without(FILES, "optimizer"), "tensors": unavailable("folder")}), True,
         [{"component": "optimizer", "finding": "missing"}], block=[entry(unavailable("folder"))]),
+    "a_resume_from_an_ambiguous_checkpoint": records(
+        "Two entries could be the model's and nothing says which. Nothing is raised; the evidence says"
+        " tensor coverage is unavailable and why.",
+        resumed({"components": COMPONENTS, "tensors": unavailable("ambiguous", candidates=["a", "b"])}), False,
+        block=[entry(unavailable("ambiguous"))]),
     "a_resume_whose_comparison_raised": records(
         "The SDK could not read the model's names. Nothing is raised from it.",
         resumed({"components": COMPONENTS, "tensors": unavailable("error")}), False, block=[entry(unavailable("error"))]),

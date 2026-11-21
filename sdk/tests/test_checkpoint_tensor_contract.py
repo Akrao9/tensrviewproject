@@ -29,7 +29,7 @@ LISTS = ("missing", "missing_frozen", "missing_buffers", "unexpected", "shape_di
 
 def test_the_file_holds_the_cases_the_page_names():
     page = (ROOT / "CHECKPOINT_TENSOR_CONTRACT.md").read_text()
-    assert len(COVERAGE) == 24 and len(RECORDS) == 16
+    assert len(COVERAGE) == 34 and len(RECORDS) == 17
     assert sum(body["status"] == "pin" for body in CASES.values()) == 4
     for name, body in CASES.items():
         assert f"`{name}`" in page, f"{name} is not named on the page"
@@ -66,15 +66,12 @@ def _manifest_today(given):
     return checkpoint_manifest({
         key: ({"state": {0: {"step": torch.tensor(9.0)}}, "param_groups": [{"lr": 1e-3}]}
               if isinstance(value, str) else _tensors(value))
-        for key, value in given["checkpoint"].items()
+        for key, value in given["checkpoint"].items()  # `loader` and `model_note` are not read today
     })
 
 
 @pytest.mark.parametrize("name,body", COVERAGE, ids=[n for n, _ in COVERAGE])
 def test_a_coverage_case_states_what_the_manifest_says_today(name, body):
-    if "today" not in body:  # a model whose state_dict() raises: nothing to run before it is built
-        assert body["given"].get("raises") and body["status"] == "new"
-        return
     manifest = _manifest_today(body["given"])
     assert body["today"] == {"model_component": "model" in manifest["components"], "tensors": "tensors" in manifest}
     built = "tensors" in body["expected"] and body["today"]["tensors"]

@@ -1,44 +1,75 @@
 # A checkpoint's tensors against the model's: what the SDK records and what both engines say
 
-Written Nov 20, 2026, for the author's sign-off. **Nothing on this page is built.** It is TrainCheck's B14: a checkpoint that left two LSTM tensors out, a resume that loaded it with `strict=False`, and no finding, because `resume_incomplete` looks only at which components a checkpoint holds (`experiments/traincheck-bugs/README.md`). The page is written once, with cases, before either engine changes, as the other two contract pages were. The cases are in `sdk/tests/fixtures/checkpoint/cases.json`, checked by `sdk/tests/test_checkpoint_tensor_contract.py`.
+Written Nov 20, 2026, and signed by the author on Nov 21, 2026 with the amendments below. **Nothing on this page is built yet;** lanes AC1 and AC2 build it. It is TrainCheck's B14: a checkpoint that left two LSTM tensors out, a resume that loaded it with `strict=False`, and no finding, because `resume_incomplete` looks only at which components a checkpoint holds (`experiments/traincheck-bugs/README.md`). The page is written once, with cases, before either engine changes, as the other two contract pages were. The cases are in `sdk/tests/fixtures/checkpoint/cases.json`, checked by `sdk/tests/test_checkpoint_tensor_contract.py`.
 
 Each case is marked. A **pin** is what the code already answers, and the test runs it. A **new** case is not built: its expectation is the target, and the case also states what the code answers today, which the test runs, so the case cannot pass before its rule is built. The lane that builds a rule turns the case into a test of its own engine.
 
-## Awaiting the author
+## The author's decisions
 
-Each of these is written into the page as proposed, with cases. A different answer changes the cases named beside it.
+Approved as proposed (Nov 21, 2026):
 
-1. **Which missing tensors raise.** Proposed: only trainable parameters. A frozen parameter or a buffer that is not in the checkpoint is counted and named in the evidence and raises nothing, because an adapter-only checkpoint leaves the frozen base out on purpose and the record cannot tell that from a loss. The cost: BatchNorm statistics lost at a resume are named but not raised. (`an_adapter_only_checkpoint`, `buffers_left_out`.)
-2. **Shapes.** Proposed: a name both hold with another shape is raised as `shape_differs`. PyTorch's own `load_state_dict` raises on such a tensor whatever `strict` is (read in `torch/nn/modules/module.py`), so it reaches a running job only through a loader that drops what does not fit; then it was not restored. The data type is not compared. (`a_shape_that_differs`.)
-3. **Unexpected tensors.** Proposed: a tensor the checkpoint holds and the model does not is named in the evidence and never raised. (`tensors_the_model_does_not_have`.)
-4. **Which entry is the model's, at a load.** Proposed: the entry whose names are the model's, in place of today's rule over names and keys (section 2). It closes both of L23's known limits and reads a bare state dict, which today is not taken for the model at all. Five cases change what `components` says of the model, and two of them newly raise `not_identified` where today is silent: a checkpoint whose `model` entry shares no name, or almost none, with the model (section 2 lists all five). It needs one number, chosen here and not measured: half. As proposed, an entry is the model's when at least half of its names are the model's, or at least half of the model's names are in it. The second half of that rule is for a session that watches one part of a larger saved model (`one_part_of_a_larger_model`); with the entry's side alone, such a job would read `not_identified` at every resume.
-5. **A save.** Proposed: not compared in this wave. A save has the model too, and comparing there would name the left-out tensors before any resume, but nothing is raised at a save today and that would be a new kind.
-6. **Lightning.** `lightning.py` builds its load manifest before the session exists, so it must pass the module it is given. Proposed: add `lightning.py` to lane AC1's files. Without that, a Lightning load carries no `tensors` and nothing is said of its tensors.
-7. **Tied weights.** Proposed: a name of the model that is the same parameter as a name the entry holds is not missing. safetensors' `save_model` writes a tied weight once (read in its source), so without this rule a healthy checkpoint of a model with tied embeddings would name `lm_head.weight` as missing. (`a_tied_weight_saved_once`.)
-8. **The class.** `resume_incomplete` is an observation ("a component left out or reset on purpose looks the same"). Proposed: it stays one in this wave, also when a trainable tensor is verified missing.
+1. **Which missing tensors raise:** only trainable parameters. A frozen parameter or a buffer that is not in the checkpoint is counted and named in the evidence and raises nothing, because an adapter-only checkpoint leaves the frozen base out on purpose and the record cannot tell that from a loss. The cost: BatchNorm statistics lost at a resume are named but not raised.
+2. **Shapes:** a name both hold with another shape is raised as `shape_differs`. PyTorch's own `load_state_dict` raises on such a tensor whatever `strict` is (read in `torch/nn/modules/module.py`), so it reaches a running job only through a loader that drops what does not fit; then it was not restored. The data type is not compared.
+3. **Unexpected tensors:** named in the evidence, never raised.
+4. **A save** is not compared in this wave.
+5. **Lightning:** `lightning.py` joins lane AC1's files, so a Lightning load passes its module and the entry it loads.
+6. **Tied weights:** a name of the model that is the same parameter as a name the entry holds is not missing. safetensors' `save_model` writes a tied weight once (read in its source).
+7. **The class:** `resume_incomplete` stays an observation, also when a trainable tensor is verified missing.
+
+Amended by the author (Nov 21, 2026), and written into sections 1 and 2:
+
+- **Which entry is compared.** The entry the loader identifies is used when that is known. A conventional checkpoint with a credible `model` entry and a fuller `ema` copy compares `model`. Where the source is genuinely ambiguous, tensor coverage is unavailable. The half-overlap rule stays as a filter on candidates, not as the decision: a cache that matches one common name, or a tie settled by the order of a dictionary, is too little evidence to call tensors missing.
+- **No device waits, kept by construction.** `model.state_dict()` can run custom hooks or a distributed wrapper's state export, so it is not called. The model is read by a path known to touch local metadata only, and coverage is unavailable where that cannot be guaranteed.
+- **Regressions,** now cases: an incomplete `model` beside a complete `ema` names both missing LSTM tensors whichever comes first; two equally plausible unnamed entries give unavailable coverage in either order; and no gathering export is called.
+
+This page's own reading of "when that is known", for the author to overrule: the Lightning adapter knows the entry (`state_dict`), and a hand-written loop can say it with a new optional keyword, `session.checkpoint(state, event="load", model_state=state["model"])`, given the very mapping it passes to `load_state_dict`. Without the keyword the rules of section 2 decide.
 
 ## 1. Where the comparison is made
 
 Only the training process has the live model, so the SDK compares and records, and the two engines only read the record.
 
 - **When.** Inside `session.checkpoint(state, event="load")`, once, before the first step of the resumed attempt. Nothing is added to a training step. A save is not compared (`a_save_is_not_compared`, a pin).
-- **What is read.** The names and shapes of the model's `state_dict()`, which leaves out buffers that are not saved; which parameters are trainable (`requires_grad`) at the moment of the call; and the names and shapes of the checkpoint entry's tensors. No tensor's values are read and nothing waits on a device.
+- **How the model is read.** By walking its modules and reading each one's own parameter and buffer tables, as `torch.nn.Module.named_parameters` and `named_buffers` do: names, shapes, `requires_grad` at the moment of the call, and which names are one parameter. `model.state_dict()` is never called and no state-dict hook runs (`a_model_whose_state_export_gathers`). No tensor's values are read.
+- **Where that cannot be guaranteed.** A module that replaces `named_parameters`, `named_buffers` or `named_modules` with its own could do anything in that call, so the call is not made and coverage is `unavailable`, why `model_not_readable` (`a_model_that_replaces_its_parameter_walk`).
+- **Buffers that are not saved.** A buffer registered with `persistent=False` is left out, as `state_dict()` leaves it out. That is read from the module's `_non_persistent_buffers_set`, the one attribute here that is not public; where a module does not have it, its buffers are not listed. Buffers raise nothing either way.
+- **What is read of the checkpoint.** The names and shapes of the tensors in the mapping it was given, which is already in memory.
 - **The model** is the one given to `tensorquill.init`.
-- **Nothing is raised into training.** If reading the model's names raises, the load is recorded as it is today with `"tensors": {"state": "unavailable", "why": "error"}` (`the_comparison_raises`).
-- **Public API only**, so the same on PyTorch 2.6.
+- **Nothing is raised into training.** If anything in the comparison raises, the load is recorded as it is today with `"tensors": {"state": "unavailable", "why": "error"}` (`the_comparison_raises`).
 - **Not measured:** the time of the call on a model of many thousands of tensors. The lane that builds it measures it and reports the number.
 
 ## 2. Which entry is compared
 
-The candidates are every mapping in the checkpoint that holds tensors under string keys, at the top level or one level down (as `checkpoint_manifest` already looks), and the checkpoint itself when tensors sit directly in it (`a_bare_state_dict`). An entry already recognised as an optimizer's, a scheduler's or a scaler's state is not a candidate.
+**Making names comparable.** Before any counting:
 
 1. **Wrappers.** A leading `module.` (DDP) or `_orig_mod.` (`torch.compile`), repeated or not, is removed from every name on both sides (`saved_from_a_ddp_wrapped_model`, `saved_from_a_compiled_model`).
-2. **One prefix.** If an entry is then not the model's by point 4, one leading dotted path is tried: each leading path of the entry's names (`net.`, `net.lstm.`) removed from the entry's names that start with it, and each leading path of the model's names removed from the model's. The removal that leaves the most names in common is kept when it makes the entry the model's by point 4. The path removed is recorded as `prefix` (`the_session_watches_an_inner_module`, `the_checkpoint_was_saved_from_an_inner_module`).
-3. **The entry** is the candidate with the most names in common with the model. A tie goes to the entry today's name rule takes for the model, then to the first in the checkpoint's order (`an_ema_copy_beside_the_model`, `a_cache_beside_the_model`).
-4. **Identified or not.** The entry is the model's state when at least half of its names are the model's (`exactly_half_the_names_are_the_models`), or at least half of the model's names are in it (`one_part_of_a_larger_model`). Otherwise no entry is identified: the names follow another scheme, or it is another model's state, and naming every tensor of the model as missing would be a guess (`a_checkpoint_of_another_model`, `names_that_mostly_differ`, `a_cache_with_parameter_like_names`).
-5. **Tied weights.** A name of the model that is the same parameter as a name the entry holds counts as held, and is listed under `tied` (`a_tied_weight_saved_once`).
+2. **One prefix.** If an entry then fails the filter below, one leading dotted path is tried: each leading path of the entry's names (`net.`, `net.lstm.`) removed from the entry's names that start with it, and each leading path of the model's names removed from the model's. The removal that leaves the most names in common is kept when the entry then passes the filter. The path removed is recorded as `prefix` (`the_session_watches_an_inner_module`, `the_checkpoint_was_saved_from_an_inner_module`, `one_part_of_a_larger_model`).
 
-At a load, this decides whether the manifest's `components` holds `model`. Five cases answer differently from today, each stated in the case's `today`:
+**The filter.** An entry is a candidate when at least half of its names are the model's, or at least half of the model's names are in it (`exactly_half_the_names_are_the_models`, `one_part_of_a_larger_model`). The filter only rules entries out. Passing it does not make an entry the model's.
+
+**The entries looked at** are every mapping in the checkpoint that holds tensors under string keys, at the top level or one level down (as `checkpoint_manifest` already looks), and the checkpoint itself when tensors sit directly in it. An entry recognised as an optimizer's, a scheduler's or a scaler's state is not looked at.
+
+**The decision,** in this order. The first rule that applies decides, and `by` records which:
+
+| | Rule | Outcome | Cases |
+|---|---|---|---|
+| 1 | **The loader named the entry** (`model_state=`, or the Lightning adapter) | Compared, `by: "loader"`, when it passes the filter. When it does not, `unavailable`, why `names_differ`: it is the model's entry by the loader's word, but its names follow another scheme | `an_adapter_only_checkpoint`, `the_loader_names_the_ema_copy`, `the_loader_names_an_entry_of_another_model` |
+| 2 | **Exactly one conventional entry passes the filter.** Conventional: its key names a model by today's name rule (`model`, `state_dict`, `net`, `module`, `network`, `weights`) and is not an averaged copy (a key with the word `ema`, `swa`, `shadow`, `avg`, `average` or `averaged`) | Compared, `by: "name"`, whatever other entries hold | `an_ema_copy_beside_the_model`, `an_incomplete_model_beside_a_complete_ema`, `a_complete_ema_before_an_incomplete_model`, `a_cache_beside_the_model` |
+| 3 | **More than one conventional entry passes** | `unavailable`, why `ambiguous` | none; the rule is stated for completeness |
+| 4 | **No conventional entry passes, and exactly one other entry does** | Compared, `by: "names"`, when it holds at least half of the model's names. Otherwise `unavailable`, why `weak_match` | `a_bare_state_dict`, `unusual_names_under_a_plain_key`; `a_cache_sharing_one_name`, `an_adapter_only_checkpoint_the_loader_did_not_name` |
+| 5 | **No conventional entry passes, and more than one other entry does** | `unavailable`, why `ambiguous`, with `candidates`, sorted. Neither their order nor which holds more names decides | `two_unnamed_entries_alike`, `two_unnamed_entries_alike_in_the_other_order` |
+| 6 | **No entry passes** | `unavailable`, why `not_identified` | `a_cache_with_parameter_like_names`, `a_checkpoint_of_another_model`, `names_that_mostly_differ` |
+
+**Tied weights.** In a compared entry, a name of the model that is the same parameter as a name the entry holds counts as held, and is listed under `tied` (`a_tied_weight_saved_once`).
+
+**What `components` then says of the model, at a load.**
+
+| Outcome | `components.model` |
+|---|---|
+| Compared, or `names_differ` | Present: the entry compared, or the one the loader named |
+| `not_identified` | Absent, so `resume_incomplete` says `not_identified` as it does today |
+| `ambiguous`, `weak_match`, `model_not_readable`, `error` | Whatever today's rule gives. Weak evidence changes nothing |
+
+Five cases answer differently from today, each stated in the case's `today`. Three of them newly raise `not_identified`:
 
 | Case | `components.model` today | With this page | At a resume |
 |---|---|---|---|
@@ -57,14 +88,14 @@ One new key, `tensors`, on the manifest of a load. It rides in `checkpoint_json`
 Compared:
 
 ```json
-"tensors": {"state": "compared", "entry": "model", "model": 7, "trainable": 7, "checkpoint": 5, "matched": 5,
+"tensors": {"state": "compared", "entry": "model", "by": "name", "model": 7, "trainable": 7, "checkpoint": 5, "matched": 5,
             "missing": {"count": 2, "names": ["lstm.bias_hh_l0", "lstm.weight_hh_l0"]}}
 ```
 
 | Key | Meaning |
 |---|---|
-| `entry` | The checkpoint key compared; null for a bare state dict |
-| `model`, `trainable` | How many tensors the model's `state_dict()` has, and how many of them are trainable parameters |
+| `entry`, `by` | The checkpoint key compared (null for a bare state dict), and which rule of section 2 chose it: `loader`, `name` or `names` |
+| `model`, `trainable` | How many tensors the model has (parameters and saved buffers), and how many of them are trainable parameters |
 | `checkpoint`, `matched` | How many tensors the entry holds, and how many names both hold |
 | `missing` | Trainable parameters not in the entry |
 | `missing_frozen`, `missing_buffers` | Frozen parameters and buffers not in the entry |
@@ -75,18 +106,23 @@ Compared:
 
 A list is present only when it is not empty. Each has `count`, the whole number, and `names`, sorted, at most 50 (`more_missing_than_are_named`). Names are written as the model has them, wrappers removed; an unexpected tensor's name is written as the entry has it.
 
-Not compared:
+Not compared, `{"state": "unavailable", "why": ...}`:
 
-| `tensors` | When | Case |
+| `why` | When | Case |
 |---|---|---|
-| `{"state": "unavailable", "why": "not_identified"}` | No entry is identified (section 2). `closest` names the best candidate and its counts when one shares any name. `components` holds no `model` | `a_checkpoint_of_another_model` |
-| `{"state": "unavailable", "why": "folder"}` | `session.checkpoint_files`: file names only, no file opened. Hugging Face's `Trainer` and Accelerate record their checkpoints this way | `a_checkpoint_folder` |
-| `{"state": "unavailable", "why": "error"}` | The comparison raised | `the_comparison_raises` |
-| no key | A capture written before this page, a save, or a load recorded by an adapter that passes no model | `a_resume_recorded_before_this_check` |
+| `not_identified` | No entry passes the filter. `closest` names the best one and its counts when one shares any name | `a_checkpoint_of_another_model` |
+| `ambiguous` | More than one entry could be the model's and nothing says which. `candidates` names them | `two_unnamed_entries_alike` |
+| `weak_match` | The one candidate has no model's name for a key and holds under half of the model's names | `a_cache_sharing_one_name` |
+| `names_differ` | The loader named an entry that fails the filter | `the_loader_names_an_entry_of_another_model` |
+| `model_not_readable` | The model cannot be read by the local path (section 1) | `a_model_that_replaces_its_parameter_walk` |
+| `folder` | `session.checkpoint_files`: file names only, no file opened. Hugging Face's `Trainer` and Accelerate record their checkpoints this way | `a_checkpoint_folder` |
+| `error` | The comparison raised | `the_comparison_raises` |
+
+No `tensors` key at all: a capture written before this page, or a save (`a_resume_recorded_before_this_check`).
 
 ## 4. What both engines say at a resume
 
-`resume_incomplete` is judged where it is today: at the first step of a later attempt that starts after the run's first step. The engines read `tensors` from the load's manifest only. A resume judged from a save, because no load was recorded, reads no `tensors` even if the save carries one (`a_resume_judged_from_a_save`, a pin).
+`resume_incomplete` is judged where it is today: at the first step of a later attempt that starts after the run's first step. The engines read `tensors` from the load's manifest only, and read `why` as a word to pass on, not one to act on. A resume judged from a save, because no load was recorded, reads no `tensors` even if the save carries one (`a_resume_judged_from_a_save`, a pin).
 
 **Findings.** Today's findings are computed as today, from `components` and the rest, in today's order. Then, from `tensors` with `state` `compared`:
 
@@ -97,27 +133,28 @@ Not compared:
 
 `count` and `tensors` are the list's `count` and `names`, unchanged. A list is read only when its `count` is a positive whole number (`a_missing_list_with_no_count`); a `tensors` that is not an object is ignored (`a_tensors_entry_that_is_not_an_object`). `missing_frozen`, `missing_buffers` and `unexpected` add no finding. Beside another finding, the tensors come last (`missing_tensors_beside_a_missing_component`).
 
-**The three readings the author asked to keep apart**, and the two beside them:
+**The three readings the author asked to keep apart**, and those beside them:
 
 | What the load recorded | `resume_incomplete` | The evidence's `checkpoint_tensors` | Case |
 |---|---|---|---|
 | Compared, a trainable tensor missing | `missing_tensors`, naming each | `compared`, with the lists | `a_resume_with_two_tensors_verified_missing` |
 | No entry identified as the model's | `not_identified`, as today, once | `unavailable`, `not_identified` | `a_resume_whose_model_was_not_identified` |
 | A folder | Nothing from tensors; the folder's own findings as today | `unavailable`, `folder` | `a_resume_from_a_folder`, `a_resume_from_a_folder_with_no_optimizer_file` |
+| An ambiguous source | Nothing from tensors | `unavailable`, `ambiguous` | `a_resume_from_an_ambiguous_checkpoint` |
 | Compared, every trainable tensor there | Nothing | `compared`, with what was counted | `a_resume_with_every_tensor_verified` |
 | No `tensors` | Nothing from tensors | No entry | `a_resume_recorded_before_this_check` |
 
-So silence from `resume_incomplete` means every tensor was verified only where `checkpoint_tensors` says `compared` for that resume. For a folder, and for a load with no `tensors`, the evidence does not say the tensors are there.
+So silence from `resume_incomplete` means every trainable tensor was verified only where `checkpoint_tensors` says `compared` for that resume. For a folder, an ambiguous source, and a load with no `tensors`, the evidence does not say the tensors are there.
 
 **The evidence block.** `checkpoint_tensors` is a top-level key of a rank's evidence, present only when at least one judged resume has a `tensors` object with `state` `compared` or `unavailable`:
 
 ```json
 "checkpoint_tensors": {"resumes": 1, "entries": [{"step": 10, "rank": 0, "attempt": 2000, "state": "compared",
-    "entry": "model", "model": 7, "trainable": 7, "checkpoint": 5, "matched": 5,
+    "entry": "model", "by": "name", "model": 7, "trainable": 7, "checkpoint": 5, "matched": 5,
     "missing": {"count": 2, "names": ["lstm.bias_hh_l0", "lstm.weight_hh_l0"]}}]}
 ```
 
-An entry carries the step, rank and attempt of the resume, then `state`, `why`, `entry`, `model`, `trainable`, `checkpoint` and `matched` where the record has them, and each of five lists (`missing`, `missing_frozen`, `missing_buffers`, `unexpected`, `shape_differs`) as its `count` and `names`. `tied`, `prefix`, `shapes` and `closest` stay in the record. `resumes` counts them all; `entries` lists the first five by step, as `resume_incomplete` lists its changes. The all-ranks view carries each judged rank's block with its rank, as it does `skipped_updates`. Cases for a list that raises nothing: `a_resume_with_only_frozen_tensors_missing`, `a_resume_with_only_buffers_missing`, `a_resume_with_only_unexpected_tensors`; for an error: `a_resume_whose_comparison_raised`; for the cap: `a_resume_with_more_missing_than_named`.
+An entry carries the step, rank and attempt of the resume, then `state`, `why`, `entry`, `by`, `model`, `trainable`, `checkpoint` and `matched` where the record has them, and each of five lists (`missing`, `missing_frozen`, `missing_buffers`, `unexpected`, `shape_differs`) as its `count` and `names`. `tied`, `prefix`, `shapes`, `closest` and `candidates` stay in the record. `resumes` counts them all; `entries` lists the first five by step, as `resume_incomplete` lists its changes. The all-ranks view carries each judged rank's block with its rank, as it does `skipped_updates`. Cases for a list that raises nothing: `a_resume_with_only_frozen_tensors_missing`, `a_resume_with_only_buffers_missing`, `a_resume_with_only_unexpected_tensors`; for an error: `a_resume_whose_comparison_raised`; for the cap: `a_resume_with_more_missing_than_named`.
 
 **Words.** In the incident's sentence, after the component's name: `missing_tensors` reads "2 trainable tensors not in the checkpoint: lstm.bias_hh_l0, lstm.weight_hh_l0", and `shape_differs` reads "1 tensor with another shape in the checkpoint: head.weight". A sentence names at most five and then says "and 55 more"; the finding keeps every name it was given.
 
@@ -131,28 +168,33 @@ A capture written after it is different, and that is expected, not a regression.
 - **A checkpoint folder.** Hugging Face's `Trainer` and Accelerate resume from one, and its tensors are not read. Reading the names from a `safetensors` header would open a file, which `checkpoint_files` promises not to do; not proposed here.
 - **A load that is not recorded,** and a first load at the run's first step, which is not a resume and is not judged today either.
 - **A parameter frozen after the call.** It is counted as trainable, so it is raised if missing.
-- **An entry with fewer than half its names the model's.** Nothing is named as missing; the finding is `not_identified`.
+- **A source that is ambiguous or a weak match.** Nothing is named as missing, and the evidence says coverage is unavailable. Naming the entry with `model_state=` resolves it.
+- **A model whose modules replace PyTorch's own walk of parameters.** Coverage is unavailable.
 
 ## 6. Who builds what
 
 | Part | Lane AC1, Python | Lane AC2, Rust |
 |---|---|---|
-| Sections 1 to 3 | `data.py`: the comparison and the entry rule. `capture.py`: `checkpoint()` passes the model on a load, `checkpoint_files()` marks a folder load. `lightning.py`, if point 6 is signed | Nothing |
+| Sections 1 to 3 | `data.py`: reading the model, the entry rules and the comparison. `capture.py`: `checkpoint()` takes `model_state=`, passes the model on a load, and `checkpoint_files()` marks a folder load. `lightning.py`: passes the module and its `state_dict` entry | Nothing |
 | Section 4, findings | `data_checks.py` | `detect/data.rs` |
 | Section 4, the block and the words | `evidence.py`, with the all-ranks view | The block in its report, from `detect.rs` or `detect/data.rs` |
 
 `accelerator.py` and `huggingface.py` need no change: both record a folder through `checkpoint_files`.
 
-At the trial merge both engines are run on every `records` case and held to the same findings and the same block, in the seam test that already holds them together, and `experiments/traincheck-bugs/b14_tf29903.py` is run again: the buggy variant must raise `resume_incomplete` naming `lstm.weight_hh_l0` and `lstm.bias_hh_l0`, and the healthy one must not.
+At the trial merge both engines are run on every `records` case and held to the same findings and the same block, in the seam test that already holds them together. The real B14 workloads are run again beside that, `experiments/traincheck-bugs/b14_tf29903.py` in both variants: the healthy run must have no missing-tensor finding, and the buggy run must name `lstm.weight_hh_l0` and `lstm.bias_hh_l0`.
 
 ## 7. The coverage cases, by what they show
 
 | Shows | Cases |
 |---|---|
 | Complete and missing | `every_tensor_is_in_the_checkpoint`, `two_lstm_tensors_left_out`, `more_missing_than_are_named` |
-| Names made comparable | `saved_from_a_ddp_wrapped_model`, `saved_from_a_compiled_model`, `the_session_watches_an_inner_module`, `the_checkpoint_was_saved_from_an_inner_module` |
-| Which entry | `a_bare_state_dict`, `unusual_names_under_a_plain_key`, `a_cache_beside_the_model`, `an_ema_copy_beside_the_model`, `exactly_half_the_names_are_the_models`, `one_part_of_a_larger_model` |
+| Names made comparable | `saved_from_a_ddp_wrapped_model`, `saved_from_a_compiled_model`, `the_session_watches_an_inner_module`, `the_checkpoint_was_saved_from_an_inner_module`, `one_part_of_a_larger_model`, `exactly_half_the_names_are_the_models` |
+| The loader's word | `an_adapter_only_checkpoint`, `the_loader_names_the_ema_copy`, `the_loader_names_an_entry_of_another_model` |
+| A conventional entry beside others | `an_ema_copy_beside_the_model`, `an_incomplete_model_beside_a_complete_ema`, `a_complete_ema_before_an_incomplete_model`, `a_cache_beside_the_model` |
+| One entry, by its names | `a_bare_state_dict`, `unusual_names_under_a_plain_key` |
+| Too little evidence | `two_unnamed_entries_alike`, `two_unnamed_entries_alike_in_the_other_order`, `a_cache_sharing_one_name`, `an_adapter_only_checkpoint_the_loader_did_not_name` |
 | No entry | `a_cache_with_parameter_like_names`, `a_checkpoint_of_another_model`, `names_that_mostly_differ` |
-| Lists that raise nothing | `an_adapter_only_checkpoint`, `buffers_left_out`, `tensors_the_model_does_not_have`, `a_tied_weight_saved_once` |
+| Lists that raise nothing | `buffers_left_out`, `tensors_the_model_does_not_have`, `a_tied_weight_saved_once` |
 | A shape | `a_shape_that_differs` |
-| Not compared | `a_checkpoint_folder`, `the_comparison_raises`, `a_save_is_not_compared` |
+| Reading the model | `a_model_whose_state_export_gathers`, `a_model_that_replaces_its_parameter_walk`, `the_comparison_raises` |
+| Not compared | `a_checkpoint_folder`, `a_save_is_not_compared` |
