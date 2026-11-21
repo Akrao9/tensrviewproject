@@ -5067,6 +5067,13 @@ def _all_ranks_whole(
     when that is too old, and the run state. A rank whose current report the status shows to be
     an earlier attempt's is `earlier_attempt` here (`_earlier_attempt_looks`)."""
     looks = _earlier_attempt_looks(looks, status)
+    # A rank whose report was made under other thresholds than the reader gives (`other_thresholds`)
+    # was judged, under thresholds not in force: `thresholds_changed` beside the state's own name.
+    looks = {n: ({**look, "freshness": freshness_block(
+                 (look.get("report") or {}).get("last_step"), (look.get("stored") or (None, None))[1],
+                 "thresholds_changed")}
+                 if look.get("state") == "other_thresholds" and not look.get("freshness") else look)
+             for n, look in looks.items()}
     evidence = _all_ranks_evidence(source, folders, looks, status, **other_sources)
     if status_age is not None and "watchdog" in evidence:
         evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
@@ -5079,10 +5086,11 @@ def _all_ranks_whole(
 def _all_ranks_freshness(evidence: Mapping[str, Any], looks: Mapping[int, Mapping[str, Any]]) -> dict[str, Any] | None:
     """The all-ranks view's `freshness` block (CLI-10, lane AD1), or None when every judged rank's
     report covers its newest stored step: `thresholds_changed` when a rank's server judges by other
-    thresholds since its last current report, `nothing_judged` when no rank is judged and steps are
+    thresholds since its last current report or the rank is `other_thresholds`, `nothing_judged` when no rank is judged and steps are
     stored, `records_newer` when a judged rank is inside its wait with steps stored since. The steps
-    are the lowest judged and the highest stored over the ranks that are not current; each such
-    rank has its own block on its entry in `ranks`."""
+    are the lowest judged and the highest stored over the ranks with a block of their own, on their
+    entries in `ranks` (a rank inside its wait, or judged under thresholds not in force). Other
+    unjudged ranks beside judged ones give no block: they are unknown by their state."""
     blocks = [look["freshness"] for look in looks.values() if isinstance(look.get("freshness"), Mapping)]
     judged = [b["judged_to_step"] for b in blocks if isinstance(b.get("judged_to_step"), int)]
     stored = [b["records_to_step"] for b in blocks if isinstance(b.get("records_to_step"), int)]
@@ -5185,10 +5193,14 @@ def watch_all_ranks(
     `top_k`) must be the one a rank's server applied, or that rank is `other_thresholds`.
     `flight_recorder` and `traincheck` are read once for the run and their incidents are run-level.
     A rank inside its wait reads as its last current report, with the steps stored since on its
-    entry (`freshness`, `records_newer`), and the view has a `freshness` block of its own while any
-    rank is not current: `records_newer`, `thresholds_changed` (a rank whose server lists other
-    thresholds than in its last current report, not judged until current again) or
-    `nothing_judged` (CLI-10, lane AD1; `_all_ranks_freshness`).
+    entry (`freshness`, `records_newer`), and the view has a `freshness` block of its own in three
+    cases: a rank inside its wait (`records_newer`), a rank judged under thresholds not in force
+    (`thresholds_changed`: its server lists other thresholds than in its last current report, so it
+    is not judged until current again, or the rank is `other_thresholds`), or no rank judged while
+    steps are stored (`nothing_judged`) (CLI-10, lane AD1; `_all_ranks_freshness`). A rank that is
+    `behind` on a first look, `stale`, `missing` or otherwise unjudged beside judged ranks gets no
+    block: it is unknown by its state, so the block's absence does not mean every rank's judgment
+    covers its store.
     `detectors` ("auto", "python" or "rust") is accepted and changes nothing: every rank's incidents are
     the Rust detectors' already, from its server's report, and no detector runs here, so the
     server binary is not needed. Returns the evidence path, or None if nothing was written.

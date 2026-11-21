@@ -9,7 +9,8 @@
 - Item 5: steps newer than the last judgment (CLI-10), in `watch` and `watch_all_ranks`.
 - Item 7: `run_of`, the public name of `_run_of`.
 
-None needs `pyarrow` or the server binary: the stores are written by hand, and no part is opened.
+None needs the server binary: the stores are written by hand. One test writes real Parquet parts
+(it needs `pyarrow`, and skips without it); every other part is an empty file whose name is read.
 """
 
 from __future__ import annotations
@@ -420,3 +421,38 @@ def test_item5_nothing_judged(tmp_path):
     current = _run(tmp_path / "current")
     _store_at_attempt_1(current)
     assert "freshness" not in ev.all_ranks_evidence(current)
+
+
+def test_item5_ranks_judged_under_other_thresholds_than_the_reader_gives(tmp_path):
+    run = _run(tmp_path)
+    _store_at_attempt_1(run)
+    # The reports list no thresholds but spike_sustain, so they read as the defaults; the reader asks for 20.
+    evidence = ev.all_ranks_evidence(run, starve_window=20)
+    assert evidence["ranks_by_state"] == {"other_thresholds": [0, 1]}
+    block = {"current": False, "judged_to_step": 9, "records_to_step": 9, "why": "thresholds_changed"}
+    # fail-before (on 6a93e82 and on ef84131): no block, then `nothing_judged`
+    assert evidence["freshness"] == block
+    assert [e["freshness"] for e in evidence["ranks"]] == [block, block]
+    assert evidence["run_state"]["state"] == "unknown"
+
+
+def test_item5_the_single_rank_watcher_judges_here_when_the_server_s_thresholds_move(tmp_path):
+    from test_watchdog import _write_rank_part
+
+    run = _run(tmp_path)
+    _write_rank_part(run, 0, range(0, 10))  # real parts: the detectors read them here (skips without pyarrow)
+    _write_report(run, _report(0, 1, 9))
+    _write_status(run, _status([{"rank": 0, "attempt": 1, "last_step": 9}]))
+
+    def moved():
+        _write_rank_part(run, 0, range(10, 20))
+        _write_report(run, _report(0, 1, 14) | {"thresholds": {**LISTED, "spike_sustain": ev.SPIKE_SUSTAIN}})
+
+    trigger = _Steps(lambda: None, moved)
+    ev.watch(run / "rank=0", tmp_path / "out.json", interval=0.0, polls=2, trigger=trigger, report_grace=3600.0)
+    first, last = trigger.seen[0][1], trigger.seen[-1][1]
+    assert first["detection"]["source"] == "server" and first["detection"]["state"] == "current"
+    # fail-before: no second write (the wait kept the last current report, under the old thresholds)
+    assert len(trigger.seen) == 2
+    assert last["detection"]["source"] == "python" and last["detection"]["thresholds"] == LISTED
+    assert "freshness" not in last  # judged here through the newest stored step
