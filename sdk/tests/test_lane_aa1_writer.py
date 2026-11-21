@@ -658,7 +658,10 @@ def _agent_store():
 
 
 def _start_rank(tmp_path, port, rank, restart, tag, plan=None, agents="1"):
-    script = tmp_path / "exchange_rank.py"
+    # One script file for each rank of each start. One file shared by every rank was rewritten while the
+    # rank started just before was still opening it (CI on `aa27b8e`, Python 3.13: that rank ran an
+    # empty file, exited 0 with no output and wrote no result).
+    script = tmp_path / f"exchange_rank_{tag}_{rank}.py"
     script.write_text(_EXCHANGE_RANK)
     env = {k: v for k, v in os.environ.items() if k not in SCRUBBED}
     source = str(Path(tensorquill.__file__).resolve().parents[1])
