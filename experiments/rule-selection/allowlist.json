@@ -1,0 +1,29 @@
+{
+  "what": "Every input the choice of a detector rule in wave AD may read. Written and committed before the first measurement (Nov 21, 2026). `inputs.py` loads by id from this file and refuses anything else.",
+  "kept_off": [
+    "Gate 1's six held-out cases, unseen-1 to unseen-6, in any form",
+    "sdk/tests/golden/gate-1-unseen-*.json",
+    "anything experiments/moe-bakeoff/generate.py builds for unseen-1 to unseen-6",
+    "experiments/moe-bakeoff/artifacts/",
+    "any output of experiments/gate1/harness.py build",
+    "sdk/tests/test_server_detect.py and sdk/tests/test_golden.py as imports: both build the held-out records when imported"
+  ],
+  "refused_words": ["unseen", "gate1", "moe-bakeoff/artifacts"],
+  "inputs": [
+    {"id": "granite-full", "kind": "file", "path": "~/Downloads/runs/moe-rtx/granite-full.jsonl", "role": "healthy", "note": "Granite 3.0 1B MoE fine-tune, GPU, 650 steps, full capture"},
+    {"id": "granite", "kind": "file", "path": "~/Downloads/runs/moe-rtx/granite.jsonl", "role": "healthy", "note": "the same job, default capture"},
+    {"id": "granite-no-grads", "kind": "file", "path": "~/Downloads/runs/moe-rtx/granite-no-grads.jsonl", "role": "healthy", "note": "the same job, gradients off"},
+    {"id": "granite-router-only", "kind": "file", "path": "~/Downloads/runs/moe-rtx/granite-router-only.jsonl", "role": "healthy", "note": "the same job, routers only: no layers"},
+    {"id": "dense-layer8", "kind": "file", "path": "~/Downloads/runs/dense-layer8/dense.jsonl", "role": "seeded", "fault_step": 250, "note": "SmolLM2-360M fine-tune, activation fault seeded in block 8 at step 250"},
+    {"id": "trainer-check", "kind": "file", "path": "~/Downloads/runs/trainer-check/trainer.jsonl", "role": "seeded", "fault_step": 250, "note": "Hugging Face Trainer, fault at step 250"},
+    {"id": "trainer-check-block", "kind": "file", "path": "~/Downloads/runs/trainer-check-block/trainer.jsonl", "role": "seeded", "fault_step": 253, "note": "Hugging Face Trainer, fault at step 253"},
+    {"id": "nanomoe-balance-on", "kind": "glob", "path": "experiments/nanomoe/out/balance-on/*.rank0.jsonl", "root": "main", "role": "healthy", "note": "nanoMoE from scratch, 2,000 steps, its own settings"},
+    {"id": "nanomoe-balance-off", "kind": "glob", "path": "experiments/nanomoe/out/balance-off/*.rank0.jsonl", "root": "main", "role": "seeded", "fault_step": 0, "note": "the same without the balance loss: starved experts expected, nothing else"},
+    {"id": "traincheck", "kind": "glob-many", "path": "experiments/traincheck-bugs/out/*/*.rank*.jsonl", "root": "worktree", "role": "by-name", "note": "the TrainCheck re-creations run on the contract branch: a run whose name ends -healthy (or holds -healthy-) is healthy, the others carry the bug of their catalog entry"},
+    {"id": "synthetic-everything", "kind": "python", "module": "sdk/tests/test_server_detectors.py", "call": "everything", "role": "seeded", "note": "the parity suite's record set that reaches every kind; written by hand"},
+    {"id": "synthetic-moe-edges", "kind": "python", "module": "sdk/tests/test_server_detectors.py", "call": "moe_edges", "role": "seeded", "note": "the parity suite's MoE edge cases; written by hand"},
+    {"id": "gate1-practice-seeded", "kind": "python", "module": "experiments/moe-bakeoff/generate.py", "call": "BY_NAME['seeded'].records", "role": "seeded", "note": "Gate 1's visible practice fixture, never counted; only this one name is built"},
+    {"id": "toy-moe", "kind": "generated", "command": "sdk/examples/toy_moe.py", "role": "seeded", "fault_step": 200, "note": "8 experts from scratch on CPU; the router's bias is pushed to one expert at step 200"},
+    {"id": "toy-seeded-healthy", "kind": "generated", "command": "sdk/examples/seeded_failures.py --case healthy --toy", "role": "healthy", "note": "the seeded-failure toy with nothing planted, from scratch on CPU"}
+  ]
+}
