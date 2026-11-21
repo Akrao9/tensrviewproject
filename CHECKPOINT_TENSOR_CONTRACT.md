@@ -142,6 +142,15 @@ No `tensors` key at all: a capture written before this page, or a save (`a_resum
 
 `count` and `tensors` are the list's `count` and `names`, unchanged. A list is read only when its `count` is a positive whole number (`a_missing_list_with_no_count`); a `tensors` that is not an object is ignored (`a_tensors_entry_that_is_not_an_object`). `missing_frozen`, `missing_buffers` and `unexpected` add no finding. Beside another finding, the tensors come last (`missing_tensors_beside_a_missing_component`).
 
+**Records no case states.** Lane AC2 met these while building the server and gave each a test; they are written here so the Python reader answers the same. They are this page's rules from Nov 21, 2026, not the author's words.
+
+- The scalar keys of an entry (`state`, `why`, `entry`, `by`, `model`, `trainable`, `checkpoint`, `matched`) are copied as the record has them, whatever their type, null included.
+- A `tensors` whose `state` is `unavailable` and that carries lists has them in its entry. They raise nothing.
+- A `state` that is neither `compared` nor `unavailable`, or no `state`, gives no entry and no finding. `resumes` counts the entries.
+- A `count` is read as `_int` in `data_checks.py` reads a whole number: an integer, never a float, a boolean or a string, and here also not above 9,223,372,036,854,775,807, which the server cannot hold. A list that is not an object is not read.
+- `names` that is not a list reads as an empty list; the finding is still raised with its `count`.
+- The tensor findings come after every finding of today's, the optimizer snapshot's and the scaler's included.
+
 **The three readings the author asked to keep apart**, and those beside them:
 
 | What the load recorded | `resume_incomplete` | The evidence's `checkpoint_tensors` | Case |
