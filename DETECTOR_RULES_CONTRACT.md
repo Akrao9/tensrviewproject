@@ -1,5 +1,7 @@
 # Detector rules contract, wave AD
 
+**Built and in `main` at `99e2e26` (Nov 21, 2026), in the SDK and both engines; the rest of this page is as it was signed and says "proposed" and "today" of the tree before it.** Part 8's transport is built and joined with the real server and the production sender, and is still not signed: a refusal after a restart of the server itself is open, with its regression in `sdk/tests/test_wave_ad_trial.py`, and the two expected failures part 8's table names now pass. Gate 1 was read once after the freeze and its amendment entered.
+
 **Signed by the author on Nov 21, 2026, as written at `b195236`, but for the transport of part 8. Nothing here is built.** This commit adds to `b195236` only the record of that signature, the author's clarification of `layers_not_read`, and one case for it; no rule and no other case differs. It is on the branch `contracts/wave-ad`, cut from `eb5a71b`. Both engines (the Python detectors in `sdk/src/tensorquill/evidence.py` and the server in `server/src/detect.rs`) build from this page and from the cases in `sdk/tests/fixtures/rules/cases.json`, and must give each case's `expected`.
 
 What was measured before any rule was proposed is in `experiments/rule-selection/RESULTS.md`. Every input to that is on `experiments/rule-selection/allowlist.json`. Gate 1's six held-out cases have not been read, and stay held out.
