@@ -93,3 +93,89 @@ def test_each_step_logs_the_table_expert_load_table_gives(tmp_path, monkeypatch)
         assert [text for _, text in logged] == [ev.expert_load_table(evidence, step, layer) for step in steps]
         if layer == 2:  # a step compared with an earlier one than the step before, past a gap
             assert any(f"step {step} vs. " in text and f"vs. {step - 1}" not in text for step, text in logged[1:])
+
+
+# --- 3. Histories bounded to what the rules read ---------------------------------------------
+
+
+def _grad_records(steps: int, spikes=(), params: int = 3) -> list[dict]:
+    rng = random.Random(7)
+    records = []
+    for step in range(steps):
+        norms = {f"p{i}": 1.0 + 0.1 * rng.random() for i in range(params)}
+        if step in spikes:
+            norms["p0"] *= 40
+        records.append({"run_id": "g", "step": step, "grad_norm": math.sqrt(sum(v * v for v in norms.values())),
+                        "grad_norms": norms})
+    return records
+
+
+def test_the_gradient_detector_keeps_only_its_window():
+    state = ev._GradSpikes("grad_norm")
+    state.feed(_grad_records(600))
+    assert len(state.totals) == ev.SPIKE_WINDOW + 1 and state.total_count == 600
+    assert {len(kept) for kept in state.per_param.values()} == {ev.SPIKE_WINDOW}
+
+
+def test_the_activation_detector_keeps_only_its_windows():
+    state = ev._ActivationAnomalies()
+    state.feed([{"step": s, "layers": {"m": {"std": 1.0, "abs_max": 5.0, "zero_frac": 0.0}}} for s in range(400)])
+    assert len(state.history["m"]) == ev.ACT_WINDOW + ev.ACT_RECENT and state.rows["m"] == 400
+
+
+def test_more_spikes_than_are_listed_are_still_counted():
+    """Same answer: 30 spikes on the total, the first 20 listed, all 30 counted."""
+    spikes = list(range(100, 400, 10))
+    found = ev.detect_grad_spikes(_grad_records(450, spikes))
+    assert found["spike_count"] == 30 and found["spike_steps"] == spikes[:20]
+
+
+def _finite(values):
+    return [v for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
+
+
+@pytest.mark.parametrize("name", [n for n, b in CASES.items() if b["part"] == "score_records"])
+def test_each_score_over_records_reads_every_value_of_its_window(name):
+    """Same answer: on the `score_records` cases, the score beside each ratio is `robust_score` over
+    the values its window holds, taken here from the records themselves, as a whole history would
+    hold them: the totals before the step (at most SPIKE_WINDOW), or the module's statistic over its
+    ACT_WINDOW records before."""
+    records = sorted(CASES[name]["records"], key=lambda r: r["step"])
+    found = ev.build_evidence(records, detectors="python")
+    expected = CASES[name]["expected"]["incident"]
+    incident = next(i for i in found["incidents"] if i["kind"] == expected["kind"])
+    step = incident["step"]
+    before = [r for r in records if r["step"] < step]
+    if incident["kind"] == "grad_spike":
+        key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
+        totals = _finite(r.get(key) for r in before if not r.get("step_skipped"))[-ev.SPIKE_WINDOW:]
+        assert incident["score"] == ev.robust_score(incident["grad_norm"], totals)["score"]
+        assert incident["baseline"] == ev._median(totals)
+    else:
+        module = incident["modules"][0]
+        rows = [r["layers"][module["module"]] for r in before if module["module"] in r.get("layers", {})]
+        window = [row[module["stat"]] for row in rows][-ev.ACT_WINDOW:]
+        assert module["score"] == ev.robust_score(module["value"], window)["score"]
+    assert {k: incident[k] for k in expected if k in incident and k != "class"} == {
+        k: v for k, v in expected.items() if k in incident}
+
+
+def test_update_trends_reads_the_same_window_it_did():
+    """Same answer: `update_trends` against a whole-history reading of its rule."""
+    rng = random.Random(3)
+    records = [{"step": s, "update_rms": {f"w{i}": 1e-3 * (1 + rng.random()) * (0.2 if (s, i) == (300, 1) else 1)
+                                          for i in range(4)}} for s in range(400)]
+    lowest = {}
+    past = {}
+    for record in records:
+        for name, value in record["update_rms"].items():
+            earlier = past.setdefault(name, [])
+            if len(earlier) >= ev.SCORE_MIN_HISTORY:
+                base = ev._median(earlier[-ev.ACT_WINDOW:])
+                if name not in lowest or value / base < lowest[name]["ratio"]:
+                    lowest[name] = {"name": name, "ratio": value / base, "step": record["step"],
+                                    "baseline": base, "update_rms": value}
+            earlier.append(value)
+    found = ev.update_trends(records)
+    assert found["lowest"] == sorted(lowest.values(), key=lambda p: (p["ratio"], p["name"]))[:ev.MEASUREMENTS_LISTED]
+    assert found["lowest"][0]["name"] == "w1" and found["lowest"][0]["step"] == 300

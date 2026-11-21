@@ -11,6 +11,7 @@ parameter drift.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -429,84 +430,127 @@ def detect_grad_spikes(
     total is judged. The total is the pre-clipping `clip_grad_norm` whenever the run clips,
     since per-parameter norms are read after clipping, and `grad_norm` otherwise.
     """
-    totals: list[float] = []
-    per_param: dict[str, list[tuple[int, float]]] = {}
-    baselines: dict[str, _Baseline] = {}
-    first: dict[str, Any] | None = None
-    spikes: list[int] = []
     # One series for the whole run. When the run clips, the pre-clipping norm is used:
     # the per-parameter norms are read after clipping, so a clipped spike stays flat there.
     key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
-    for record in sorted(records, key=lambda r: r["step"]):
-        if record.get("step_skipped"):
-            continue  # a loss-scaler overflow step: its gradients are Inf or NaN by design
-        total = _finite(record.get(key))
-        if total is None:
-            continue
-        step = int(record["step"])
-        baseline = _median(totals[-window:]) if len(totals) >= min_history else None
-        if baseline is not None and baseline > 0 and total >= factor * baseline:
-            spikes.append(step)
-            if first is None:
-                first = {
-                    "step": step,
-                    "grad_norm": total,
-                    "baseline": baseline,
-                    "ratio": total / baseline,
-                    # Against the same earlier totals as `baseline` (part 1 of the rules contract).
-                    **robust_score(total, totals[-window:]),
-                    "parameters": _spiking_parameters(record, per_param, factor, window),
-                }
-        totals.append(total)
-        lasted: list[dict[str, Any]] = []
-        for name, value in record.get("grad_norms", {}).items():
-            norm = _finite(value)
-            if norm is None:
+    state = _GradSpikes(key, factor=factor, window=window, min_history=min_history, sustain=sustain)
+    state.feed(records)
+    return state.result()
+
+
+def _window_store(window: int) -> Any:
+    """Where a rule keeps the values it reads `[-window:]` of: the last `window` of them (lane AD11:
+    the whole run was kept). A `window` below 1 reads a slice that is not a trailing window
+    (`values[-0:]` is all of them), so then everything is kept, as before."""
+    return deque(maxlen=window) if window > 0 else []
+
+
+class _GradSpikes:
+    """`detect_grad_spikes`'s state, fed records in step order (`feed`, any number of times, each
+    batch at or after the steps fed before) and read by `result`. The function feeds every record
+    at once; the `--watch` path (`_Incremental`) feeds each look's new records to the state it kept.
+
+    Only what the rules read is kept (lane AD11): the last `window + 1` totals (`baseline` and the
+    score read `[-window:]`, and the parameter path's `total_window` the `window` before the
+    newest), each parameter's last `window` norms (`_spiking_parameters`), its `_Baseline`, the
+    count of totals for `min_history`, and the first 20 spike steps with their count."""
+
+    def __init__(self, key: str, *, factor: float = SPIKE_FACTOR, window: int = SPIKE_WINDOW,
+                 min_history: int = SPIKE_MIN_HISTORY, sustain: int = SPIKE_SUSTAIN) -> None:
+        self.key, self.factor, self.window, self.min_history, self.sustain = key, factor, window, min_history, sustain
+        self.totals: Any = deque(maxlen=window + 1) if window > 0 else []
+        self.total_count = 0  # every total kept, for `min_history`
+        self.per_param: dict[str, Any] = {}
+        self.baselines: dict[str, _Baseline] = {}
+        self.first: dict[str, Any] | None = None
+        self.spike_count = 0
+        self.spike_steps: list[int] = []  # the first 20
+
+    def feed(self, records: Iterable[Mapping[str, Any]]) -> None:
+        key, factor, window, min_history, sustain = self.key, self.factor, self.window, self.min_history, self.sustain
+        per_param, baselines = self.per_param, self.baselines
+        for record in sorted(records, key=lambda r: r["step"]):
+            if record.get("step_skipped"):
+                continue  # a loss-scaler overflow step: its gradients are Inf or NaN by design
+            total = _finite(record.get(key))
+            if total is None:
                 continue
-            per_param.setdefault(name, []).append((step, norm))
-            own = baselines.get(name)
-            if own is None:
-                own = baselines[name] = _Baseline()
-            if len(own.values) >= min_history and norm >= factor * own.low:
-                usual = _median(list(own.values))
-                if usual > 0 and norm >= factor * usual:
-                    if own.count == 0:
-                        own.start = {
-                            "step": step, "total": total, "total_baseline": baseline,
-                            # The totals `baseline` was taken over: those before this one.
-                            "total_window": totals[-(window + 1):-1],
-                            # Scored against the parameter's own window, which its `baseline` is.
-                            "parameter": {"name": name, "grad_norm": norm, "baseline": usual,
-                                          "ratio": norm / usual, **robust_score(norm, own.values),
-                                          "rising_since": step},
-                        }
-                    own.count += 1
-                    if own.count == sustain and own.start is not None:
-                        lasted.append(own.start)
+            step = int(record["step"])
+            totals = list(self.totals)
+            baseline = _median(totals[-window:]) if self.total_count >= min_history else None
+            if baseline is not None and baseline > 0 and total >= factor * baseline:
+                self.spike_count += 1
+                if len(self.spike_steps) < 20:
+                    self.spike_steps.append(step)
+                if self.first is None:
+                    self.first = {
+                        "step": step,
+                        "grad_norm": total,
+                        "baseline": baseline,
+                        "ratio": total / baseline,
+                        # Against the same earlier totals as `baseline` (part 1 of the rules contract).
+                        **robust_score(total, totals[-window:]),
+                        "parameters": _spiking_parameters(record, per_param, factor, window),
+                    }
+            self.totals.append(total)
+            self.total_count += 1
+            totals.append(total)
+            lasted: list[dict[str, Any]] = []
+            for name, value in record.get("grad_norms", {}).items():
+                norm = _finite(value)
+                if norm is None:
                     continue
-            own.count = 0
-            own.keep(norm, window)
-        if lasted and first is None:
-            # Usually every excursion that lasts to this record began on the same step; if
-            # not, the incident is the earliest, with the parameters that began there.
-            began = min(start["step"] for start in lasted)
-            starts = [start for start in lasted if start["step"] == began]
-            parameters = sorted((start["parameter"] for start in starts), key=lambda p: (-p["ratio"], p["name"]))
-            usual = starts[0]["total_baseline"]
-            first = {
-                "step": began,
-                "grad_norm": starts[0]["total"],
-                "baseline": usual,
-                "ratio": starts[0]["total"] / usual if usual else None,
-                # A score only beside a ratio, and over the totals that ratio's baseline was taken over.
-                **(robust_score(starts[0]["total"], starts[0]["total_window"]) if usual else {}),
-                "parameters": parameters[:10],
-                "trigger": "parameter",
-                "sustained": sustain,
-            }
-    if first is None:
-        return None
-    return {"kind": "grad_spike", **first, "spike_count": len(spikes), "spike_steps": spikes[:20]}
+                past = per_param.get(name)
+                if past is None:
+                    past = per_param[name] = _window_store(window)
+                past.append((step, norm))
+                own = baselines.get(name)
+                if own is None:
+                    own = baselines[name] = _Baseline()
+                if len(own.values) >= min_history and norm >= factor * own.low:
+                    usual = _median(list(own.values))
+                    if usual > 0 and norm >= factor * usual:
+                        if own.count == 0:
+                            own.start = {
+                                "step": step, "total": total, "total_baseline": baseline,
+                                # The totals `baseline` was taken over: those before this one.
+                                "total_window": totals[-(window + 1):-1],
+                                # Scored against the parameter's own window, which its `baseline` is.
+                                "parameter": {"name": name, "grad_norm": norm, "baseline": usual,
+                                              "ratio": norm / usual, **robust_score(norm, own.values),
+                                              "rising_since": step},
+                            }
+                        own.count += 1
+                        if own.count == sustain and own.start is not None:
+                            lasted.append(own.start)
+                        continue
+                own.count = 0
+                own.keep(norm, window)
+            if lasted and self.first is None:
+                # Usually every excursion that lasts to this record began on the same step; if
+                # not, the incident is the earliest, with the parameters that began there.
+                began = min(start["step"] for start in lasted)
+                starts = [start for start in lasted if start["step"] == began]
+                parameters = sorted((start["parameter"] for start in starts), key=lambda p: (-p["ratio"], p["name"]))
+                usual = starts[0]["total_baseline"]
+                self.first = {
+                    "step": began,
+                    "grad_norm": starts[0]["total"],
+                    "baseline": usual,
+                    "ratio": starts[0]["total"] / usual if usual else None,
+                    # A score only beside a ratio, and over the totals that ratio's baseline was taken over.
+                    **(robust_score(starts[0]["total"], starts[0]["total_window"]) if usual else {}),
+                    "parameters": parameters[:10],
+                    "trigger": "parameter",
+                    "sustained": sustain,
+                }
+
+    def result(self) -> dict[str, Any] | None:
+        """The incident `detect_grad_spikes` returns for the records fed so far, a new copy each time."""
+        if self.first is None:
+            return None
+        return copy.deepcopy({"kind": "grad_spike", **self.first, "spike_count": self.spike_count,
+                              "spike_steps": list(self.spike_steps)})
 
 
 def detect_update_spikes(
@@ -545,7 +589,7 @@ def detect_update_spikes(
     before: tuple[Any, float, dict[str, float], Mapping[str, Any] | None, list[float] | None] | None = None
     recent: deque[float] = deque(maxlen=window)  # the last `window` changes that were not flagged
     first: dict[str, Any] | None = None
-    spikes: list[int] = []
+    spike_count, spikes = 0, []  # every flagged record counted; the first 20 kept (lane AD11)
     for record in sorted(records, key=lambda r: r["step"]):
         if record.get("step_skipped"):
             continue
@@ -577,7 +621,9 @@ def detect_update_spikes(
                     recent.append(change)
                 else:
                     step = int(record["step"])
-                    spikes.append(step)
+                    spike_count += 1
+                    if len(spikes) < 20:
+                        spikes.append(step)
                     if first is None:
                         moved = sorted(
                             ({"name": name, "update_rms": own[name], "previous": before[2][name],
@@ -599,7 +645,7 @@ def detect_update_spikes(
         before = (attempt, total, own, grads, _lr_list(record))
     if first is None:
         return None
-    return {"kind": "update_spike", **first, "spike_count": len(spikes), "spike_steps": spikes[:20]}
+    return {"kind": "update_spike", **first, "spike_count": spike_count, "spike_steps": spikes}
 
 
 def _lr_list(record: Mapping[str, Any]) -> list[float] | None:
@@ -806,14 +852,14 @@ def moe_source_words(evidence: Mapping[str, Any]) -> dict[str, str]:
 
 def _spiking_parameters(
     record: dict[str, Any],
-    per_param: dict[str, list[tuple[int, float]]],
+    per_param: Mapping[str, Iterable[tuple[int, float]]],
     factor: float,
     window: int,
 ) -> list[dict[str, Any]]:
     found = []
     for name, value in record.get("grad_norms", {}).items():
         norm = _finite(value)
-        past = per_param.get(name, [])[-window:]
+        past = list(per_param.get(name, ()))[-window:]
         if norm is None or len(past) < 2:
             continue
         baseline = _median([v for _, v in past])
@@ -951,7 +997,9 @@ def update_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     values on. `parameters` with an update size, `judged`, and `lowest`: the MEASUREMENTS_LISTED
     whose update fell furthest, each with `name`, `ratio`, `step`, `baseline` and `update_rms`.
     None when no record carries `update_rms`."""
-    past: dict[str, list[float]] = {}
+    # Each parameter's last ACT_WINDOW values, which is all the rule reads (lane AD11: the whole run
+    # was kept), and never fewer than SCORE_MIN_HISTORY, so that its length still counts them.
+    past: dict[str, deque[float]] = {}
     lowest: dict[str, dict[str, Any]] = {}
     for record in sorted(records, key=lambda r: r["step"]):
         sizes = record.get("update_rms")
@@ -962,9 +1010,11 @@ def update_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
             if now is None:
                 continue
             name = str(name)
-            earlier = past.setdefault(name, [])
+            earlier = past.get(name)
+            if earlier is None:
+                earlier = past[name] = deque(maxlen=max(ACT_WINDOW, SCORE_MIN_HISTORY))
             if len(earlier) >= SCORE_MIN_HISTORY:
-                base = _median(earlier[-ACT_WINDOW:])
+                base = _median(list(earlier)[-ACT_WINDOW:])
                 if base > 0 and (name not in lowest or now / base < lowest[name]["ratio"]):
                     lowest[name] = {"name": name, "ratio": now / base, "step": int(record["step"]),
                                     "baseline": base, "update_rms": now}
@@ -1622,70 +1672,95 @@ def detect_activation_anomalies(records: list[dict[str, Any]]) -> list[dict[str,
     Returns at most one incident per kind: the first step it happened, the modules
     affected at that step, and how many steps were affected in all.
     """
-    history: dict[str, list[tuple[float, float, float]]] = {}
-    # Each module's baseline for dead outputs, from its first ACT_WINDOW records. A module's
-    # history only grows, so those records never change once the check starts; they are
-    # summarized once, not again for every later record.
-    baselines: dict[str, float] = {}
-    found: dict[str, dict[str, Any]] = {}
-    counts: dict[str, int] = {}
-    outlier = lambda rows: _median([a / s for s, a, _ in rows if s > 0] or [0.0])
+    state = _ActivationAnomalies()
+    state.feed(records)
+    return state.result()
 
-    def report(kind: str, step: int, hits: list[dict[str, Any]]) -> None:
+
+class _ActivationAnomalies:
+    """`detect_activation_anomalies`'s state, fed records in step order (`feed`, any number of times,
+    each batch at or after the steps fed before) and read by `result`, as `_GradSpikes` is.
+
+    Only what the rules read is kept (lane AD11: every module's whole history was): each module's
+    last ACT_WINDOW + ACT_RECENT rows (the spike reads the last ACT_WINDOW, the drift the last
+    ACT_RECENT and the ACT_WINDOW before them), how many rows it has had, and its dead-output
+    baseline, the median `zero_frac` of its first ACT_WINDOW rows, taken when it has
+    ACT_WINDOW + ACT_RECENT rows, when those are all still kept."""
+
+    def __init__(self) -> None:
+        self.history: dict[str, deque[tuple[float, float, float]]] = {}
+        self.rows: dict[str, int] = {}  # rows each module has had
+        # Each module's baseline for dead outputs, from its first ACT_WINDOW records. A module's
+        # history only grows, so those records never change once the check starts; they are
+        # summarized once, not again for every later record.
+        self.baselines: dict[str, float] = {}
+        self.found: dict[str, dict[str, Any]] = {}
+        self.counts: dict[str, int] = {}
+
+    def _report(self, kind: str, step: int, hits: list[dict[str, Any]]) -> None:
         if not hits:
             return
-        counts[kind] = counts.get(kind, 0) + 1
-        if kind not in found:
-            found[kind] = {"kind": kind, "step": step, "modules": hits[:20], "affected": len(hits)}
+        self.counts[kind] = self.counts.get(kind, 0) + 1
+        if kind not in self.found:
+            self.found[kind] = {"kind": kind, "step": step, "modules": hits[:20], "affected": len(hits)}
 
-    for record in sorted(records, key=lambda r: r["step"]):
-        step = int(record["step"])
-        spikes, drifts, dead = [], [], []
-        for name, stats in record.get("layers", {}).items():
-            std, amax, zfrac = (_finite(stats.get(k)) for k in ("std", "abs_max", "zero_frac"))
-            if std is None or amax is None or zfrac is None:
-                continue
-            past = history.setdefault(name, [])
-            if len(past) >= ACT_MIN_HISTORY:
-                recent = past[-ACT_WINDOW:]
-                for key, value, earlier in (
-                    ("abs_max", amax, [p[1] for p in recent]),
-                    ("std", std, [p[0] for p in recent]),
-                ):
-                    base = _median(earlier)
-                    if base > 0 and value >= ACT_SPIKE_FACTOR * base:
-                        spikes.append({"module": name, "stat": key, "value": value,
-                                       "baseline": base, "ratio": value / base, **robust_score(value, earlier)})
-                        break
-            past.append((std, amax, zfrac))
-            if len(past) >= ACT_DRIFT_NEEDS:
-                # The trailing baseline (rules contract, part 2): the last ACT_RECENT records against
-                # the ACT_WINDOW before them, from the record whose baseline holds none of the first
-                # ACT_WINDOW. The score is over the same ACT_WINDOW values as the baseline.
-                last, trail = past[-ACT_RECENT:], past[-(ACT_WINDOW + ACT_RECENT):-ACT_RECENT]
-                for key, base, now, earlier in (
-                    ("std", _median([p[0] for p in trail]), _median([p[0] for p in last]), [p[0] for p in trail]),
-                    ("abs_max/std", outlier(trail), outlier(last), [a / s for s, a, _ in trail if s > 0]),
-                ):
-                    if base > 0 and now > 0 and max(now / base, base / now) >= ACT_DRIFT_FACTOR:
-                        drifts.append({"module": name, "stat": key, "baseline": base,
-                                       "recent": now, "ratio": now / base, **robust_score(now, earlier)})
-                        break
-            if len(past) >= ACT_WINDOW + ACT_RECENT:
-                # `dead_activations` keeps the module's first ACT_WINDOW records as its baseline.
-                last = past[-ACT_RECENT:]
-                if name not in baselines:
-                    baselines[name] = _median([p[2] for p in past[:ACT_WINDOW]])
-                base_zero = baselines[name]
-                now_zero = _median([p[2] for p in last])
-                if now_zero - base_zero >= ACT_DEAD_RISE:
-                    dead.append({"module": name, "baseline": base_zero, "recent": now_zero})
-        report("activation_spike", step, _first_in_forward_pass_leads(spikes))
-        report("activation_drift", step, drifts)
-        report("dead_activations", step, dead)
-    for kind, incident in found.items():
-        incident["affected_steps"] = counts[kind]
-    return list(found.values())
+    def feed(self, records: Iterable[Mapping[str, Any]]) -> None:
+        history, rows, baselines = self.history, self.rows, self.baselines
+        outlier = lambda kept: _median([a / s for s, a, _ in kept if s > 0] or [0.0])
+        for record in sorted(records, key=lambda r: r["step"]):
+            step = int(record["step"])
+            spikes, drifts, dead = [], [], []
+            for name, stats in record.get("layers", {}).items():
+                std, amax, zfrac = (_finite(stats.get(k)) for k in ("std", "abs_max", "zero_frac"))
+                if std is None or amax is None or zfrac is None:
+                    continue
+                kept = history.get(name)
+                if kept is None:
+                    kept = history[name] = deque(maxlen=ACT_WINDOW + ACT_RECENT)
+                if rows.get(name, 0) >= ACT_MIN_HISTORY:
+                    recent = list(kept)[-ACT_WINDOW:]
+                    for key, value, earlier in (
+                        ("abs_max", amax, [p[1] for p in recent]),
+                        ("std", std, [p[0] for p in recent]),
+                    ):
+                        base = _median(earlier)
+                        if base > 0 and value >= ACT_SPIKE_FACTOR * base:
+                            spikes.append({"module": name, "stat": key, "value": value,
+                                           "baseline": base, "ratio": value / base, **robust_score(value, earlier)})
+                            break
+                kept.append((std, amax, zfrac))
+                count = rows[name] = rows.get(name, 0) + 1
+                past = list(kept) if count >= ACT_WINDOW + ACT_RECENT or count >= ACT_DRIFT_NEEDS else None
+                if count >= ACT_DRIFT_NEEDS:
+                    # The trailing baseline (rules contract, part 2): the last ACT_RECENT records against
+                    # the ACT_WINDOW before them, from the record whose baseline holds none of the first
+                    # ACT_WINDOW. The score is over the same ACT_WINDOW values as the baseline.
+                    last, trail = past[-ACT_RECENT:], past[-(ACT_WINDOW + ACT_RECENT):-ACT_RECENT]
+                    for key, base, now, earlier in (
+                        ("std", _median([p[0] for p in trail]), _median([p[0] for p in last]), [p[0] for p in trail]),
+                        ("abs_max/std", outlier(trail), outlier(last), [a / s for s, a, _ in trail if s > 0]),
+                    ):
+                        if base > 0 and now > 0 and max(now / base, base / now) >= ACT_DRIFT_FACTOR:
+                            drifts.append({"module": name, "stat": key, "baseline": base,
+                                           "recent": now, "ratio": now / base, **robust_score(now, earlier)})
+                            break
+                if count >= ACT_WINDOW + ACT_RECENT:
+                    # `dead_activations` keeps the module's first ACT_WINDOW records as its baseline,
+                    # taken at its ACT_WINDOW + ACT_RECENT-th row, while all of them are still kept.
+                    last = past[-ACT_RECENT:]
+                    if name not in baselines:
+                        baselines[name] = _median([p[2] for p in past[:ACT_WINDOW]])
+                    base_zero = baselines[name]
+                    now_zero = _median([p[2] for p in last])
+                    if now_zero - base_zero >= ACT_DEAD_RISE:
+                        dead.append({"module": name, "baseline": base_zero, "recent": now_zero})
+            self._report("activation_spike", step, _first_in_forward_pass_leads(spikes))
+            self._report("activation_drift", step, drifts)
+            self._report("dead_activations", step, dead)
+
+    def result(self) -> list[dict[str, Any]]:
+        """The incidents `detect_activation_anomalies` returns for the records fed so far, new copies."""
+        return [{**copy.deepcopy(incident), "affected_steps": self.counts[kind]} for kind, incident in self.found.items()]
 
 
 def _attention_values(stats: Any) -> tuple[float | None, float | None, int]:
