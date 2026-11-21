@@ -60,6 +60,18 @@ Batches the server refused whole, because a key column was missing or of another
 rows: they are `refused_batches` on the row, in all, by column and by rank, with a note of their
 own, and are never added to the rows dropped (lane AB5, Nov 20, 2026). A run that refused none
 has no such key.
+Rows the server received and did not store because their step was not above the highest step
+it had kept for their attempt (`rows_not_newer`, and beside it `late_steps_confirmed`, on a rank's
+entry, L30, WAVE_AE_CONTRACT.md, section 6) are `rows_not_newer` on the row, in all and by rank,
+with the page's sentence as its note and in the listing: a row sent again is counted again, so it
+is not a number of steps lost, and the confirmed late steps are a lower bound. Never added to the
+rows dropped. A run with neither key has no such key.
+
+A records file of which a rank holds more than one run ID (two jobs that wrote one file) is not
+one run's: its run's row has `evidence.state` `several_run_ids`, with the IDs and the files, no
+run state, last step or incident, and an evidence file beside it is not read (WAVE_AE_CONTRACT.md,
+section 5). The run ID of every line is read for it by what the listing reads anyway: the last
+megabyte, parsed, and the scan of the part before it, whose keys are each line's run ID and attempt.
 
 How many ranks: a file named `<run_id>.rank<N>.jsonl` holds the ranks its lines name. Every
 line of it is read for that: the last megabyte parsed, and the part before it scanned for each
@@ -525,10 +537,15 @@ def _rank_across_files(paths: list[Path], rank: int, run_id: str | None = None) 
         seen |= mine
         firsts.append(list(here.values()))
     report = attempt_order_report(firsts, [p.name for p in paths])
+    # The run IDs of the rank's lines in each file, every line read (WAVE_AE_CONTRACT.md, section 5).
+    run_ids: dict[Path, set[str]] = {}
+    for (run, _), held_by in holders.items():
+        for path in held_by:
+            run_ids.setdefault(path, set()).add(run)
     keys = list(report)
     picked = next((k for k in keys if k[0] == run_id), keys[0] if keys else None)
     if picked is None:
-        return {"last_step": None, "order": [], "report": None, "holders": []}
+        return {"last_step": None, "order": [], "report": None, "holders": [], "run_ids": run_ids}
     order = report[picked]["order"]
     # The furthest step `resolve_attempts` keeps, from a few of each attempt's steps: its first
     # and last, and its last below each other attempt's first, where every cut it can make falls.
@@ -543,7 +560,7 @@ def _rank_across_files(paths: list[Path], rank: int, run_id: str | None = None) 
     kept = resolve_attempts(chosen, order={(picked[0], rank): order})
     newest = order[-1] if order else None
     return {"last_step": max((r["step"] for r in kept), default=None), "order": order, "report": report[picked],
-            "holders": holders.get((picked[0], newest), [])}
+            "holders": holders.get((picked[0], newest), []), "run_ids": run_ids}
 
 
 def _is_run_folder(folder: Path) -> bool:
@@ -682,6 +699,31 @@ def find_run(source: str | Path, wanted: str, project: str | None = None,
     return next((run for run, _ in named if run["source"] == "local"), named[0][0])
 
 
+def files_holding_run(source: str | Path, wanted: str) -> list[dict[str, Any]]:
+    """The local files at `source` of which a rank holds `wanted` among more than one run ID, each
+    as `{"path", "ranks", "run_ids"}` (`_several_run_ids`): where a run that is not found by its
+    ID may be (WAVE_AE_CONTRACT.md, section 5). Every line of each file is read for its run ID, as
+    the listing reads it (the last megabyte parsed and the scan of the part before it). Only for a
+    run not found, so a lookup that finds its run reads nothing more. Never raises."""
+    try:
+        found_runs = discover_runs(source)
+    except (OSError, ValueError):
+        return []
+    paths: list[Path] = []
+    for run in found_runs:
+        if run.get("source") != "local":
+            continue
+        paths += list((run.get("files") or {}).values())
+        paths += [path for more in (run.get("more_files") or {}).values() for path in more]
+    run_ids: dict[Path, dict[int, set[str]]] = {}
+    for path in dict.fromkeys(paths):
+        lines, whole, tail_starts = _tail_from(path)
+        tail = [r for r in map(_record_of, lines) if r is not None]
+        scanned = _scan_file(path, tail_starts)[0] if not whole else {}
+        run_ids[path] = _run_ids_by_rank(tail, scanned)
+    return [item for item in _several_run_ids(run_ids, paths) if wanted in item["run_ids"]]
+
+
 # --- One row a run ------------------------------------------------------------------------
 
 
@@ -738,6 +780,39 @@ def _record_rank(record: Mapping[str, Any] | None) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _run_ids_by_rank(tail: Iterable[Mapping[str, Any]], scanned: Mapping[int, list[tuple[str, Any]]]) -> dict[int, set[str]]:
+    """Each rank's run IDs among the records of a file's last megabyte (`tail`, every line parsed)
+    and the scan of the part before it (`scanned`, `_scan_file`, whose keys are `(run, attempt)`
+    read from every line's start): "" for a line that names none. No line is read again for this
+    (WAVE_AE_CONTRACT.md, section 5)."""
+    from .evidence import run_of
+
+    found: dict[int, set[str]] = {rank: {key[0] for key in keys} for rank, keys in scanned.items()}
+    for record in tail:
+        rank = _record_rank(record)
+        if rank is not None:
+            found.setdefault(rank, set()).add(run_of(record))
+    return found
+
+
+def _several_run_ids(run_ids: Mapping[Path, Mapping[int, set[str]]], order: Iterable[Path]) -> list[dict[str, Any]]:
+    """The files of which a rank holds more than one run ID, each as `{"path", "ranks", "run_ids"}`
+    (the ranks that do, and the run IDs of those ranks, sorted, null for lines that name none), in
+    the order given. Empty when every rank of every file holds one run ID (WAVE_AE_CONTRACT.md,
+    section 5)."""
+    found = []
+    for path in dict.fromkeys(order):
+        mixed = {rank: ids for rank, ids in (run_ids.get(path) or {}).items() if len(ids) > 1}
+        if mixed:
+            ids = sorted(set().union(*mixed.values()))
+            found.append({"path": path, "ranks": sorted(mixed), "run_ids": [None if run == "" else run for run in ids]})
+    return found
+
+
+def _run_ids_text(ids: Iterable[str | None]) -> str:
+    return ", ".join("no run_id" if run is None else str(run) for run in ids)
+
+
 def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, given: bool = False,
                  more: Mapping[int, list[Path]] | None = None, run_id: str | None = None) -> dict[str, Any]:
     """The ranks of a local run, from what the listing reads anyway: the file names, the first
@@ -788,6 +863,7 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     middle_not_read: list[str] = []
     every_line: set[Path] = set()  # files named for a rank, of several ranks, read on every line
     held: dict[Path, list[int]] = {}
+    run_ids: dict[Path, dict[int, set[str]]] = {}  # each file's ranks' run IDs, from every line read
     tails: dict[Path, list[dict[str, Any]]] = {}
     read: dict[Path, tuple[dict[str, Any] | None, dict[str, Any] | None]] = {}
     resolved: dict[Path, dict[int, int | None]] = {}
@@ -808,6 +884,7 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
         # lines, so it is not scanned: the scan adds no read where it was not made before.
         scan = not whole and (number not in split_ranks or named is not None)
         scanned, complete = _scan_file(path, tail_starts) if scan else ({}, whole)
+        run_ids[path] = _run_ids_by_rank(tail, scanned)
         if number not in split_ranks:  # a rank's several files are read whole anyway (`split`)
             by_attempt = _attempts_by_rank(tail)
             restarted = [r for r, attempts in by_attempt.items() if len(attempts) > 1]
@@ -868,12 +945,16 @@ def _local_ranks(files: Mapping[int, Path], manifest: Mapping[str, Any] | None, 
     # where `resolve_attempts` leaves it (XC4).
     last_steps = {path: {**_steps_by_rank(tail), **{r: s for r, s in resolved.get(path, {}).items() if s is not None}}
                   for path, tail in tails.items() if path in several or shared}
+    split = {number: _rank_across_files([files[number], *paths], number, run_id)
+             for number, paths in (more or {}).items() if number in files and paths}
+    for number, across in split.items():  # a split rank's files are read whole: every line's run ID
+        for path, runs_here in (across.get("run_ids") or {}).items():
+            run_ids.setdefault(path, {}).setdefault(number, set()).update(runs_here)
     found: dict[str, Any] = {"ranks": sorted(seen | set(missing)), "ends": read, "held": held, "several": several,
                              "last_steps": last_steps, "missing": missing, "beyond": beyond, "resolved": resolved,
                              "missing_verb": ("was not read", "were not read") if given else ("has no file", "have no file"),
-                             "shared": shared, "every_line": every_line,
-                             "split": {number: _rank_across_files([files[number], *paths], number, run_id)
-                                       for number, paths in (more or {}).items() if number in files and paths}}
+                             "shared": shared, "every_line": every_line, "split": split,
+                             "several_run_ids": _several_run_ids(run_ids, [path for _, path in pairs])}
     clauses = []
     if unsettled and world != len(seen):
         if own_name:
@@ -932,6 +1013,8 @@ def _local_row(run: Mapping[str, Any], known: Mapping[str, Any] | None) -> dict[
     row["ranks"] = known["ranks"]
     if "why" in known:
         row["rank_count_not_known"] = known["why"]
+    if known["several_run_ids"]:
+        return _several_run_ids_row(known["several_run_ids"], row)
     more = run.get("more_files") or {}
     if len(files) > 1 or known["missing"] or known["beyond"] or more:
         return _local_all_ranks_row(files, row, known, more)
@@ -963,6 +1046,26 @@ def _local_row(run: Mapping[str, Any], known: Mapping[str, Any] | None) -> dict[
     row["first_incident"] = _first(incidents)
     row["kinds_checked"] = _kinds_checked(evidence.get("kind_checks"))
     return _with_freshness(row, freshness([(evidence, look, step)], step))
+
+
+def _several_run_ids_row(several: list[Mapping[str, Any]], row: dict[str, Any]) -> dict[str, Any]:
+    """A run one of whose files holds, for a rank, the records of more than one run ID
+    (WAVE_AE_CONTRACT.md, section 5): its rows are not one run's, so the row claims no run state, no
+    last step and no incident, and an evidence file beside the file is not read, whatever it says.
+    `evidence.state` is `several_run_ids`, with the run IDs and the files that hold them."""
+    first = several[0]
+    ids = sorted({run for item in several for run in item["run_ids"]}, key=lambda run: (run is not None, run or ""))
+    ranks = first["ranks"]
+    more = f" (and {len(several) - 1} more file{'s' if len(several) > 2 else ''} like it)" if len(several) > 1 else ""
+    row["evidence"] = {
+        "state": "several_run_ids", "run_ids": ids,
+        "files": [{"path": str(item["path"]), "ranks": item["ranks"], "run_ids": item["run_ids"]} for item in several],
+        "detail": f"{Path(first['path']).name}{more} holds, for {_rank_list(ranks)}, the records of more than one run "
+                  f"({_run_ids_text(first['run_ids'])}): they are not one run's, so no run state, last step or incident is "
+                  "claimed for it, and an evidence file beside it is not read. Read each run's records on their own; "
+                  "python -m tensorquill refuses the file for the same reason",
+    }
+    return row
 
 
 def _file_step(path: Path, last: Mapping[str, Any] | None, known: Mapping[str, Any]) -> int | None:
@@ -1451,6 +1554,71 @@ def refused_batches(status: Mapping[str, Any] | None) -> dict[str, Any] | None:
             "ranks": ranks, "note": REFUSED_BATCHES_NOTE}
 
 
+def rows_not_newer_note(rows: int, late: int) -> str:
+    """The page's words for the rows the server did not store because their step was not above
+    one it had kept for their attempt (WAVE_AE_CONTRACT.md, section 6, L30), with `rows` the
+    server's `rows_not_newer` and `late` its `late_steps_confirmed` (0 when the status has none),
+    "(s)" kept as the page writes it. The same words as lane AE6's `evidence.rows_not_newer_note`."""
+    head = (f"The server received {rows} row(s) whose step was not above a step it had already kept for their"
+            f" attempt, and did not store them. A row sent again is counted again, so {rows} is not a number of"
+            " steps lost.")
+    if late:
+        middle = (f" {late} distinct step(s) among them are confirmed to have arrived out of order inside one stored"
+                  f" part, and are not stored. {late} is a lower bound: a late step that crosses a part boundary is"
+                  f" not in it, so the same rows can give another {late} when the parts are cut elsewhere.")
+    else:
+        middle = " None is confirmed as a step that arrived out of order."
+    return head + middle + " The other rows are not told apart from rows sent again."
+
+
+def rows_not_newer(status: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The rows the server received and did not store because their step was not above the
+    highest step it had kept for their attempt (L30, WAVE_AE_CONTRACT.md, section 6), from its
+    status (`watchdog.json`): on each rank's entry, `rows_not_newer` and, beside it,
+    `late_steps_confirmed`, each written only when above zero. `{"rows", "late_steps_confirmed"?,
+    "ranks", "includes_replays", "note"}`, each rank as `{"rank", "rows", "late_steps_confirmed"?}`,
+    or None when no rank has `rows_not_newer`, so a status without the keys gives every row as
+    before.
+
+    `rows` counts a row sent again again, so it is not a number of steps lost; `late_steps_confirmed`
+    is a lower bound of distinct steps that arrived out of order inside one stored part, and the
+    rest of the rows are not classified. Summed over the ranks, a step number confirmed late on two
+    ranks counts twice (each rank's step is its own). Neither is added to `dropped_rows`. Only the
+    rank entries are read (`restart[]` carries the same counts); a value that is not a count above
+    zero is left out, and a `late_steps_confirmed` on a rank without `rows_not_newer` is not read,
+    since every confirmed step is among those rows (lane AE6 reads it the same way); nothing here
+    raises."""
+    entries = status.get("ranks") if isinstance(status, Mapping) else None
+    if not isinstance(entries, list):
+        return None
+    ranks: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        rank, rows = entry.get("rank"), entry.get("rows_not_newer")
+        if not (isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0) or not _count(rows):
+            continue
+        late = entry.get("late_steps_confirmed")
+        ranks.append({"rank": rank, "rows": rows, **({"late_steps_confirmed": late} if _count(late) else {})})
+    if not ranks:
+        return None
+    ranks.sort(key=lambda item: item["rank"])
+    rows = sum(item["rows"] for item in ranks)
+    late = sum(item.get("late_steps_confirmed", 0) for item in ranks)
+    return {"rows": rows, **({"late_steps_confirmed": late} if late else {}), "ranks": ranks,
+            "includes_replays": True, "note": rows_not_newer_note(rows, late)}
+
+
+def _not_newer_text(found: Mapping[str, Any]) -> str:
+    """The listing's and `compare`'s note for `rows_not_newer`: the page's sentence, and the ranks."""
+    ranks = found["ranks"]
+    shown = ", ".join(f"rank {item['rank']}: {item['rows']:,}"
+                      + (f", {item['late_steps_confirmed']:,} confirmed late" if item.get("late_steps_confirmed") else "")
+                      for item in ranks[:8])
+    shown += f" and {len(ranks) - 8} more ranks" if len(ranks) > 8 else ""
+    return f"{rows_not_newer_note(found['rows'], found.get('late_steps_confirmed', 0))} ({shown})"
+
+
 def _refused_text(refused: Mapping[str, Any]) -> str:
     """The listing's note for `refused_batches`, apart from the dropped rows'."""
     batches, ranks = refused["batches"], refused["ranks"]
@@ -1494,6 +1662,10 @@ def _store_row(run: Mapping[str, Any]) -> dict[str, Any]:
     refused = refused_batches(status)
     if refused is not None:
         row["refused_batches"] = refused
+    # L30: the rows not stored because their step was not newer (no key when none).
+    not_newer = rows_not_newer(status)
+    if not_newer is not None:
+        row["rows_not_newer"] = not_newer
     try:
         view = all_ranks_evidence(folder)
     except (OSError, ValueError) as error:
@@ -1703,6 +1875,8 @@ def listing_text(rows: list[Mapping[str, Any]], source: str | Path, project: str
                 notes.append(f"{row['run_id']}: {_dropped_text(row['dropped_rows'])}")
             if isinstance(row.get("refused_batches"), Mapping):
                 notes.append(f"{row['run_id']}: {_refused_text(row['refused_batches'])}")
+            if isinstance(row.get("rows_not_newer"), Mapping):
+                notes.append(f"{row['run_id']}: {_not_newer_text(row['rows_not_newer'])}")
             if not row["has_manifest"]:
                 notes.append(f"{row['run_id']}: no run manifest (recorded before there was one, or by a sink with no "
                              f"file), so it is listed under {_manifest.DEFAULT_PROJECT!r} with its run ID as its name")

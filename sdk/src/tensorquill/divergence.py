@@ -169,6 +169,8 @@ class _Run:
     """One rank's series of one run: `series[id][step] = value`."""
 
     def __init__(self, records: Iterable[Mapping[str, Any]], rank: int, resolved: bool = False) -> None:
+        from .evidence import run_of
+
         self.series: dict[str, dict[int, float]] = {}
         self.about: dict[str, dict[str, Any]] = {}
         self.layer_order: dict[str, int] = {}
@@ -178,6 +180,9 @@ class _Run:
         self.wall_clock: set[str] = set()
         self.not_compared: set[str] = set()
         self.records = 0
+        # Every run ID of the rank's rows, read from every row and not its first and last, before any
+        # row is resolved away (WAVE_AE_CONTRACT.md, section 5): "" for a row that names none.
+        self.every_run_id: set[str] = set()
         own: list[Mapping[str, Any]] = []
         for record in records:
             record_rank = record.get("rank", 0)
@@ -185,6 +190,7 @@ class _Run:
             if record_rank != rank or record.get("step") is None:
                 continue
             own.append(record)
+            self.every_run_id.add(run_of(record))
         kept = own if resolved else _resolved(own)
         self.replaced = len(own) - len(kept)
         for record in kept:
@@ -462,6 +468,11 @@ def first_divergence(
     - `series`: for each series, what was compared, on how many common steps, and how it ended.
     - `not_comparable`: series in one run only, too short, or not agreeing early, each with why.
     - `thresholds`, `rank`, `runs`, `common_steps`, `early`, `agreement`, `left_out`.
+    - `several_run_ids`, only when an input's rows of the rank hold more than one run ID: a map
+      from the side (`"a"`, `"b"`) to its sorted run IDs (null for rows that name none), with
+      `answer` `"no_answer"` and a `reason` that names the side and the IDs. Each input is checked
+      on its own over every row of the rank, so two clean runs of different IDs are compared
+      (WAVE_AE_CONTRACT.md, section 5).
     - `runs.a` / `runs.b` hold `replaced_records`, the rows of that rank a later attempt
       replaced and that were left out, only when there were some.
     """
@@ -493,6 +504,25 @@ def first_divergence(
     def no_answer(reason: str) -> dict[str, Any]:
         result["reason"] = reason
         return result
+
+    # An input of more than one run ID is not one run, whatever the other input is (WAVE_AE_CONTRACT.md,
+    # section 5, the author: "If either input itself contains multiple run IDs, return no_answer and
+    # identify the side and IDs"). Each input is checked on its own, over every row of the rank, so two
+    # clean inputs of different run IDs are still compared. A row with no run ID is of no named run
+    # (null in `several_run_ids`) and joins only rows that have none, as `check_one_run` reads it.
+    several = {side: [None if run == "" else run for run in sorted(run.every_run_id)]
+               for side, run in (("a", a), ("b", b)) if len(run.every_run_id) > 1}
+    if several:
+        result["several_run_ids"] = several
+        said = "; ".join(
+            f"run {side.upper()}'s rows of rank {rank} hold {len(ids)} run IDs ("
+            + ", ".join("no run_id" if run is None else repr(run) for run in ids) + ")"
+            for side, ids in several.items()
+        )
+        return no_answer(
+            f"No answer: {said}. An input is one run's records, so its rows are not read as one run: give each "
+            "run's records on their own. A row with no run_id is of no named run, and joins only rows that have none."
+        )
 
     for label, run in (("A", a), ("B", b)):
         if not run.records:
