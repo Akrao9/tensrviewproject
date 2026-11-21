@@ -41,6 +41,12 @@ def unchanged(steps, by=None):
     return [{"step": s, "step_skipped": True, **({"step_skipped_by": by} if by else {}),
              "weights_unchanged": ["blk.weight"], "grad_norms": {"blk.weight": 0.5}} for s in range(steps)]
 
+def around_a_caller_skip(middle, after=5):
+    """Two applied steps, five skips the scaler reported, one only the caller reported (with
+    `middle` on it), then `after` more the scaler reported."""
+    return skips(5, "scaler", before=2) + [{"step": 7, "step_skipped": True, "step_skipped_by": "caller", **middle}] + \
+           [{"step": 8 + k, "step_skipped": True, "step_skipped_by": "scaler"} for k in range(after)]
+
 NAN_LAYER = {"blk": {"mean": "nan", "std": 1.0, "abs_max": 1.0}}
 
 cases = {
@@ -64,9 +70,12 @@ cases = {
  "an_update_due_and_skipped": new(1, "The caller says an update was due and was skipped, and there is no scaler.",
     {"init": {"auto_step": False}, "calls": ["session.step(skipped=True)"]},
     {"records_carry": [{"step_skipped": True, "step_skipped_by": "caller"}]}),
- "a_skip_only_the_caller_reported": new(1, "The caller says the update was skipped; the scaler given to `init` applied the step.",
+ "a_skip_only_the_caller_reported": new(1, "The caller says the update was skipped; the SDK observed the scaler given to `init` apply it. The record says both.",
     {"init": {"auto_step": False, "scaler": "a GradScaler that applied this step"}, "calls": ["session.step(skipped=True)"]},
-    {"records_carry": [{"step_skipped": True, "step_skipped_by": "caller"}]}),
+    {"records_carry": [{"step_skipped": True, "step_skipped_by": "caller", "scaler_applied": True}]}),
+ "a_skip_the_caller_reported_with_no_scaler_outcome": new(1, "The caller says the update was skipped; a scaler was given to `init`, and it did not act on this update, so its outcome is unknown. The record does not say the scaler applied it.",
+    {"init": {"auto_step": False, "scaler": "a GradScaler whose `step` was not called for this update"}, "calls": ["session.step(skipped=True)"]},
+    {"records_carry": [{"step_skipped": True, "step_skipped_by": "caller"}], "records_lack": ["scaler_applied"]}),
  "a_skip_only_the_scaler_reported": new(1, "The caller says the update was applied; the scaler skipped it. Either one saying so makes it skipped.",
     {"init": {"auto_step": False, "scaler": "a GradScaler that skipped this step"}, "calls": ["session.step(skipped=False)"]},
     {"records_carry": [{"step_skipped": True, "step_skipped_by": "scaler"}]}),
@@ -132,6 +141,20 @@ cases = {
  "a_capture_written_before_the_key": new(1, "A skipped step with nothing that says who reported it, as every capture had before. The evidence has no `skipped_updates`, and is what it was.",
     {"records": [{"step": 3, "grad_norm": "nan", "step_skipped": True}]},
     {"incident_kinds_absent": ["non_finite"], "evidence_lacks": ["skipped_updates"]}),
+ "a_caller_skip_of_unknown_scaler_outcome_inside_scaler_skips": new(1, "Two applied steps, five skips the scaler reported, one only the caller reported with the scaler's outcome unknown, five more the scaler reported. The streak is left as it is across the caller's skip and reaches ten at the last step.",
+    {"records": around_a_caller_skip({})},
+    {"incident_kinds_present": ["loss_scale_trouble"],
+     "incident_carries": {"step": 12, "reason": "skips", "consecutive_skips": 10, "skipped_steps": 10, "recorded_steps": 12}},
+    today("detect_loss_scale_trouble", True, kind="loss_scale_trouble", step=11, skipped_steps=11, recorded_steps=13)),
+ "a_caller_skip_the_scaler_applied_inside_scaler_skips": new(1, "The same steps, but the SDK observed the scaler apply the update the caller reported as skipped. The streak ends at five there, and five more do not raise the rule.",
+    {"records": around_a_caller_skip({"scaler_applied": True})},
+    {"incident_kinds_absent": ["loss_scale_trouble"]},
+    today("detect_loss_scale_trouble", True, kind="loss_scale_trouble", step=11)),
+ "ten_scaler_skips_after_a_caller_skip_the_scaler_applied": new(1, "Awaiting the author for one count. Two applied steps, five scaler skips, a caller's skip the scaler was seen to apply, then ten scaler skips. Raised at the last step with ten in a row; the caller's skip adds no skip and counts as a recorded observation of the scaler.",
+    {"records": around_a_caller_skip({"scaler_applied": True}, after=10)},
+    {"incident_kinds_present": ["loss_scale_trouble"],
+     "incident_carries": {"step": 17, "reason": "skips", "consecutive_skips": 10, "skipped_steps": 15, "recorded_steps": 18}},
+    today("detect_loss_scale_trouble", True, kind="loss_scale_trouble", step=11)),
  "a_nan_layer_beside_an_unread_gradient": new(2, "One parameter's gradient could not be read, and an unrelated layer's statistic is not finite. The finding stands, and the kind reads checked.",
     {"records": [{"step": 0, "grads_not_read": {"emb.weight": "a sparse gradient"}, "grad_norm": 1.0},
                  {"step": 1, "grad_norm": 1.0, "layers": {"blk": {"mean": "nan", "std": 1.0, "abs_max": 1.0}}}]},
