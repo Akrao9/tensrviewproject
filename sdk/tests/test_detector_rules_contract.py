@@ -22,7 +22,7 @@ ROOT = Path(__file__).parents[2]
 FOLDER = Path(__file__).parent / "fixtures" / "rules"
 DOCUMENT = json.loads((FOLDER / "cases.json").read_text())
 CASES = DOCUMENT["cases"]
-PARTS = {"score": 8, "score_records": 4, "activation_drift": 9, "moe_imbalance": 11, "measurements": 10, "evidence": 4, "wire": 9}
+PARTS = {"score": 8, "score_records": 4, "activation_drift": 9, "moe_imbalance": 11, "measurements": 10, "evidence": 4, "wire": 10}
 
 
 def of(part):

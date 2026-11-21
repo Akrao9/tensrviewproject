@@ -553,6 +553,311 @@
     "step": null
    }
   },
+  "a_module_missing_on_some_records_is_judged_on_the_rest": {
+   "expected": {
+    "kind_checks": {
+     "activation_drift": {
+      "value": "checked"
+     },
+     "activation_spike": {
+      "value": "checked"
+     },
+     "dead_activations": {
+      "value": "checked"
+     }
+    },
+    "not_checked": []
+   },
+   "part": "wire",
+   "records": [
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 0
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 1
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 2
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 3
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 4
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 5
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 6
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 7
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 8
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 9
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 10
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 11
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 12
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 13
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 14
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 15
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 16
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 17
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 18
+    },
+    {
+     "layers": {
+      "blk0": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      },
+      "blk1": {
+       "abs_max": 4.0,
+       "std": 1.0,
+       "zero_frac": 0.0
+      }
+     },
+     "step": 19
+    }
+   ],
+   "says": "a module read on most records and absent from three, with no `layers_not_read`: nothing is unavailable, and the readable records keep their evidence. v1 does not represent the gap"
+  },
   "a_start_and_an_earlier_reportable_failure": {
    "expected": {
     "incident": {

@@ -511,6 +511,10 @@ def wire_cases():
             "expected": {"not_checked": [{"check": "layers", "coverage": "none", "modules": ["blk0", "blk1"], "step": 0, "kinds": kinds,
                                           "reason": "layer not read: blk0: its output is not a tensor; blk1: its output is not a tensor"}],
                          "kind_checks": {kind: {"value": "unavailable"} for kind in kinds}}},
+        "a_module_missing_on_some_records_is_judged_on_the_rest": {
+            "part": "wire", "says": "a module read on most records and absent from three, with no `layers_not_read`: nothing is unavailable, and the readable records keep their evidence. v1 does not represent the gap",
+            "records": [{"step": i, "layers": {"blk0": layers["blk0"], **({} if i in (5, 6, 7) else {"blk1": layers["blk0"]})}} for i in range(20)],
+            "expected": {"not_checked": [], "kind_checks": {kind: {"value": "checked"} for kind in kinds}}},
         "moe_source_scores_are_what_the_router_asked_for": {
             "part": "wire", "says": "counts taken as the top-k of the hooked scores: the router's requests, whatever is applied after",
             "records": moe({"form": "scores", "point": "requested"}),

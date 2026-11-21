@@ -1,6 +1,6 @@
 # Detector rules contract, wave AD
 
-**Signed in part by the author on Nov 21, 2026. Nothing here is built.** It is on the branch `contracts/wave-ad`, cut from `eb5a71b`. Both engines (the Python detectors in `sdk/src/tensorquill/evidence.py` and the server in `server/src/detect.rs`) build from this page and from the cases in `sdk/tests/fixtures/rules/cases.json`, and must give each case's `expected`.
+**Signed by the author on Nov 21, 2026, as written at `b195236`, but for the transport of part 8. Nothing here is built.** This commit adds to `b195236` only the record of that signature, the author's clarification of `layers_not_read`, and one case for it; no rule and no other case differs. It is on the branch `contracts/wave-ad`, cut from `eb5a71b`. Both engines (the Python detectors in `sdk/src/tensorquill/evidence.py` and the server in `server/src/detect.rs`) build from this page and from the cases in `sdk/tests/fixtures/rules/cases.json`, and must give each case's `expected`.
 
 What was measured before any rule was proposed is in `experiments/rule-selection/RESULTS.md`. Every input to that is on `experiments/rule-selection/allowlist.json`. Gate 1's six held-out cases have not been read, and stay held out.
 
@@ -8,15 +8,15 @@ What was measured before any rule was proposed is in `experiments/rule-selection
 
 | # | Decision | The author's word, Nov 21, 2026 |
 |---|---|---|
-| 1 | The `activation_drift` rule (part 2) | **Not signed.** Frozen as proposed, pending the fresh run, which is now reported in part 2 |
-| 2 | `moe_imbalance` on a router that has not been trained (part 3) | **Approved**, with when the incident began kept apart from when it became reportable |
+| 1 | The `activation_drift` rule (part 2) | **Signed as written at `b195236`**, after the fresh run was reported |
+| 2 | `moe_imbalance` on a router that has not been trained (part 3) | **Approved and kept closed**, with when the incident began kept apart from when it became reportable, and the first reportable router winning |
 | 3 | At least 10 earlier finite values for a score (part 1) | **Approved** |
 | 4 | What a reader shows when the MAD is zero (part 1) | **Approved with other words:** "no score: the earlier values had zero median absolute deviation" |
 | 5 | The four measurements and their names (part 6) | **Approved.** They and the score stay descriptive |
-| 6 | What a refused batch does to its stream (part 8) | **Approved in intent. The transport is not signed** |
+| 6 | What a refused batch does to its stream (part 8) | **Approved in intent. The transport is not signed:** lanes AD2 and AD4 build and test the proposed one; final acceptance needs the real server to deliver the refusal and the production sender to resume at the right byte |
 | 7 | Three keys on the wire (part 7) | **Approved**, with two clarifications that are now in part 7 |
 
-No engine lane starts, and no lane is sent a commit hash, until decision 1 is signed and the transport of decision 6 is settled or split off.
+Released on the author's word: this contract to lanes AD3, AD4 and AD5 for the wire keys, to AD2 and AD4 to build and test the proposed transport of part 8, and to the engine lanes AD7 and AD8 once the lanes they are cut from have reported.
 
 ## 1. The score beside a ratio (S6)
 
@@ -74,7 +74,7 @@ Cases over records, where each expected incident is today's with the score added
 | Did any fire | No. The largest ratio was 1.44, at step 122 |
 | Today's rule on the same run | Fires at step 114, and reaches 5.28 |
 
-So the rule was tested on this run, and it was quiet where today's rule fires. It is one run of one seed, on a model of the same family as one already on the allowlist.
+The author's reading, recorded as given: one seed from a familiar model family. It exercised the rule and showed a difference from the current detector. B4's short healthy run remains unjudged.
 
 **What it gives up, stated so it is signed knowingly.**
 
@@ -102,6 +102,8 @@ Cases: `drift_growth_from_scratch_is_not_a_shift`, `drift_a_step_change_is_named
 **While a router is still in its starting state.** A short capture must not read as checked and clean. When the records end with a router flagged on every sample since step 0 and fewer than 10 of them, nothing is reported for it, and the `moe_imbalance` entry of `kind_checks` carries `starting_state`: a list of `{"router", "samples"}`. With that key present `enough_history` is false, so the kind reads as checked without enough history (`start_and_the_capture_ends`).
 
 **The public function.** `first_incident()` follows this rule, since `build_evidence` and the Rerun export both take the incident from it. The per-step samples it reads are unchanged.
+
+**A positive case, and what stays open.** On the fresh run of part 2 the routing collapsed in all four routers, and both today's rule and this one reported it. Healthy-router coverage on a model of another shape remains open.
 
 **What it gives up.** A router collapsed from its first step is reported 10 samples later than today.
 
@@ -152,14 +154,16 @@ None changes the Arrow schema or the protocol number: the two record keys travel
 
 - **`layers_not_read`** on a record, said once on the first record written after the capture knows: a map from module name to why it could not be read. In evidence it is a `not_checked` entry with `check: "layers"`, `modules`, `reason`, `step` and `coverage`. The two coverages are different things and read differently:
   - `"partial"`: some modules were read. No kind becomes `unavailable`: the activation kinds stay `checked` for the modules read and name the others under `modules_not_judged`, as `stalled_weights` does for parameters.
-  - `"none"`: no module was readable. The activation kinds are `unavailable` and the entry lists them under `kinds`. Nothing was looked at, so nothing reads as clean.
+  - `"none"`: no module was readable on any record. The activation kinds are `unavailable` and the entry lists them under `kinds`. Nothing was looked at, so nothing reads as clean.
+  - **It describes a persistent limitation of the capture, by the author's word.** The note is said once for the run, so it names a module the capture cannot read at all. A step on which a module could not be read, in a run where it otherwise is, must not make the run or the kind `unavailable`.
+  - **A limit of v1, stated:** an intermittent gap is not represented. A module that is read on some records and not on others is not named in `layers_not_read`; its records simply lack it on those steps, and it is judged on the records that hold it (`a_module_missing_on_some_records_is_judged_on_the_rest`). A reader of v1 cannot tell such a gap from a module that was not watched on those steps.
 - **`moe_source`** on a record, said once: for each router, `form` and `point`.
   - `form` is how the routing reached the capture: `"scores"` (TensorQuill took the top-k of the hooked module's output), `"indices"` (the model gave the chosen experts) or `"map"` (a routing map). It describes the representation and nothing else.
   - `point` is where in the model it was taken: `"requested"` (before any capacity limit, bias or noise that follows), `"dispatched"` (after the model has finished assigning), or `"unknown"`.
   - Indices and maps can be produced before or after capacity handling, so the form never tells a reader which. **A reader says "dispatched assignments" only when `point` is `"dispatched"`**, which the capture writes only where the capture point establishes it. Scores are always `"requested"`. With `"unknown"` a reader says the assignments are as the model gave them and that it is not known whether a capacity limit came first.
 - **The step capture stopped at**, on the heartbeat. A beat that carries `capture_stopped` also carries `capture_stopped_step`: the last step the session committed before it stopped, or null when it committed none. Step 0 and null are different and stay different all the way to a reader. The server's status shows it as `step` inside the rank's `capture_stopped`, beside `reason`; a beat from a sender older than the key gives no `step` key.
 
-Cases, each from what is written on the wire to what a reader holds: `layers_not_read_some_modules`, `layers_not_read_no_module`, `moe_source_scores_are_what_the_router_asked_for`, `moe_source_indices_at_an_unknown_point`, `moe_source_a_map_after_dispatch`, `moe_source_absent`, `capture_stopped_at_step_0`, `capture_stopped_before_any_step`, `capture_stopped_from_an_older_sender`.
+Cases, each from what is written on the wire to what a reader holds: `layers_not_read_some_modules`, `layers_not_read_no_module`, `a_module_missing_on_some_records_is_judged_on_the_rest`, `moe_source_scores_are_what_the_router_asked_for`, `moe_source_indices_at_an_unknown_point`, `moe_source_a_map_after_dispatch`, `moe_source_absent`, `capture_stopped_at_step_0`, `capture_stopped_before_any_step`, `capture_stopped_from_an_older_sender`.
 
 ## 8. RS10: what a refused batch does to its stream
 
@@ -203,7 +207,7 @@ The tests, and what each one shows today:
 
 ## What has cases, and what is still owed
 
-- **55 shared cases:** the score's arithmetic (8) and over records (4), `activation_drift` (9), `moe_imbalance` (11), the four measurements (10), the learning rate and `parameters_not_judged` (4), the wire keys (9).
+- **56 shared cases:** the score's arithmetic (8) and over records (4), `activation_drift` (9), `moe_imbalance` (11), the four measurements (10), the learning rate and `parameters_not_judged` (4), the wire keys (10).
 - **Five RS10 tests** in two files.
 - **On the wave's checklist, not done:** the spike, diversity, starvation and stall thresholds are still to be read on the development runs, as measurement only.
 
