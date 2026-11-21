@@ -93,6 +93,9 @@ INDEX_CACHE_SIZE = 32
 # class name, or one of these two.
 UPDATES_HOOKS_OFF = "auto_step=False"
 UPDATES_NO_OPTIMIZER = "no optimizer"
+# The key under which `step(skipped=...)` keeps the caller's verdict from `_commit` to `_decode`;
+# never written to a record, which says `step_skipped` and `step_skipped_by` instead.
+_CALLER_SKIPPED = "caller_skipped"
 # Settings per capture mode. Router load is the always-on signal; layer statistics and
 # gradient and weight norms are a debugging mode, as in Composer's ActivationMonitor,
 # wandb.watch and Lightning's grad_norm.
@@ -2802,7 +2805,12 @@ class Session:
             "unread": dict(seen["unread"]),
         }
 
-    def step(self, step: int | None = None, lr: float | Sequence[float] | None = None) -> None:
+    def step(
+        self,
+        step: int | None = None,
+        lr: float | Sequence[float] | None = None,
+        skipped: bool | None = None,
+    ) -> None:
         """Mark the end of one optimizer step. Only for `auto_step=False`.
 
         Use this when the optimizer hooks cannot see the step, as when a framework steps copies
@@ -2810,7 +2818,20 @@ class Session:
         `optimizer.step()` on overflow, needs neither: pass it to `init` as `scaler=` and the
         step ends at `scaler.update()`. Pass `lr` (one value per parameter group, or a single
         value) to record the learning rate.
+
+        Call it once per optimizer update that was due, not at an accumulation microstep: a
+        microstep is not a step. Pass `skipped=True` when the update was due and did not happen
+        (Megatron-LM's `skipped=not update_successful`), `skipped=False` when it was applied.
+        The record's `step_skipped` is then true when either you or the scaler given to `init`
+        says so, and `step_skipped_by` says who: `"caller"`, `"scaler"` or `"both"`. Left out,
+        the record says what the scaler said, as before, and nothing without a scaler. `skipped`
+        takes only `True`, `False` or `None`; anything else raises `TypeError` here, before
+        anything of the step is recorded.
         """
+        if skipped is not None and not isinstance(skipped, bool):
+            # A bool only: not 1 or 0, and not a tensor, whose truth would be a device sync (and so
+            # is its repr: the message names the type alone).
+            raise TypeError(f"skipped must be True, False or None, not {type(skipped).__name__}")
         if self._closed_call("step()"):
             if self._stopped and not self._closed and not self.auto_step:
                 self._count_stopped(step)  # the drift check's schedule goes on (`_count_stopped`)
@@ -2821,7 +2842,7 @@ class Session:
             self.record_grads()
         if lr is not None:
             self._pending_lr = [float(lr)] if isinstance(lr, (int, float)) else [float(v) for v in lr]
-        self._commit(step)
+        self._commit(step, caller_skipped=skipped)
 
     def _router_refusals(self) -> dict[str, str]:
         """Each refused router's reason: why, and the fixes for how it was named (`_refusal`)."""
@@ -2866,7 +2887,7 @@ class Session:
             offset += size
 
     @torch.no_grad()
-    def _commit(self, step: int | None) -> None:
+    def _commit(self, step: int | None, caller_skipped: bool | None = None) -> None:
         if self._error is not None and not self._stopped:
             self._stop(self._error)  # the sink failed on the writer thread: said here, on this one
         if self._stopped:
@@ -2897,7 +2918,7 @@ class Session:
                 observed = self._observe_replicas(len(self._steps))
         # A step `scaler.update()` ended with no optimizer stepping is one the scaler skipped: its
         # weights are the previous step's. Told on the host, with no sync. (The record's own
-        # `step_skipped` is the scaler's verdict, read at the flush.)
+        # `step_skipped` is the scaler's verdict, read at the flush, or the caller's, `step()`.)
         skipped = self._commit_on_update and not self._stepped and not self._foreign_stepped
         self._stepped = self._foreign_stepped = False
         # A weight check is not made on a skipped step, so that an unchanged weight always means
@@ -2980,6 +3001,10 @@ class Session:
         self._ring_ts.append(time.time())  # when the step ended, Unix seconds
         self._pending_lr = None
         self._ring_scalars.append(self._pending_scalars)
+        if caller_skipped is not None:
+            # What `step(skipped=...)` said, a Python bool beside the scaler's verdict (still on the
+            # device): the two are combined when the record is written (`_decode`).
+            self._pending_amp = {**self._pending_amp, _CALLER_SKIPPED: caller_skipped}
         self._ring_amp.append(self._pending_amp)
         if self._data_timing:
             clock = time.perf_counter()
@@ -3814,8 +3839,18 @@ class Session:
             if lrs[i] is not None:
                 record["lr"] = lrs[i]
             if amps is not None and amps[i]:
-                record["step_skipped"] = bool(amps[i]["step_skipped"])
-                record["grad_scale"] = amps[i]["grad_scale"]
+                # The scaler's verdict and the loss scale, when an optimizer went through the
+                # scaler; the caller's, when `step(skipped=...)` was given one. Skipped when either
+                # says so, and `step_skipped_by` (on a skipped step only) says which did.
+                amp = amps[i]
+                by_scaler = "step_skipped" in amp and bool(amp["step_skipped"])
+                by_caller = bool(amp.get(_CALLER_SKIPPED))
+                if "step_skipped" in amp or _CALLER_SKIPPED in amp:
+                    record["step_skipped"] = by_scaler or by_caller
+                if "grad_scale" in amp:
+                    record["grad_scale"] = amp["grad_scale"]
+                if by_scaler or by_caller:
+                    record["step_skipped_by"] = "both" if by_scaler and by_caller else "scaler" if by_scaler else "caller"
             if scalars is not None and scalars[i]:
                 record["scalars"] = scalars[i]
             if waits is not None and waits[i] is not None:
@@ -4239,7 +4274,9 @@ def init(
         scaler: the run's `torch.amp.GradScaler`. Each record then says whether the scaler
             skipped the optimizer step on Inf or NaN gradients (`step_skipped`) and the loss
             scale used (`grad_scale`), and with `auto_step` the step ends at
-            `scaler.update()`, so skipped steps are counted too.
+            `scaler.update()`, so skipped steps are counted too. A skipped step's record
+            also says who reported it (`step_skipped_by`): `"scaler"`, or `"caller"` or
+            `"both"` when `session.step(skipped=True)` said so.
         replica_params: which parameters the cross-GPU drift check compares across
             `replica_group`: every trainable parameter by default, as under data
             parallelism. Under tensor parallelism only some weights, such as LayerNorm, are
