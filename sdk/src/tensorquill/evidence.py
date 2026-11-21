@@ -4710,32 +4710,50 @@ def _dropped_rows_said(status: Mapping[str, Any] | None) -> dict[str, Any]:
     `dropped_row_keys` in the status): the total, by null key, and the ranks that dropped any,
     as ranges (the first 8 and a count of the rest), so the block stays small however many ranks
     there are; the MCP answers give each rank's count. An upper bound: a
-    batch sent again after a lost acknowledgement is counted again."""
-    from .runs import dropped_rows
+    batch sent again after a lost acknowledgement is counted again.
 
+    And `{"refused_batches": ...}` beside it, or nothing when no rank had a batch refused: the
+    batches the server refused whole for a key column that was missing or of another type
+    (`runs.refused_batches`, lane AB5), with the same ranges. Its own key, never added to the
+    rows, and not an upper bound: the server counts a batch sent again once (wave AB's seam)."""
+    from .runs import dropped_rows, refused_batches
+
+    said: dict[str, Any] = {}
     found = dropped_rows(status)
-    if found is None:
-        return {}
-    return {"dropped_rows": {"rows": found["rows"], **({"by_key": found["by_key"]} if found.get("by_key") else {}),
-                             "rank_ranges": _rank_ranges((item["rank"] for item in found["ranks"]), 8),
-                             "upper_bound": True, "note": found["note"]}}
+    if found is not None:
+        said["dropped_rows"] = {"rows": found["rows"], **({"by_key": found["by_key"]} if found.get("by_key") else {}),
+                                "rank_ranges": _rank_ranges((item["rank"] for item in found["ranks"]), 8),
+                                "upper_bound": True, "note": found["note"]}
+    refused = refused_batches(status)
+    if refused is not None:
+        said["refused_batches"] = {"batches": refused["batches"], **({"by_key": refused["by_key"]} if refused.get("by_key") else {}),
+                                   "rank_ranges": _rank_ranges((item["rank"] for item in refused["ranks"]), 8),
+                                   "note": refused["note"]}
+    return said
 
 
 def _rank_dropped_rows_said(status: Mapping[str, Any] | None, rank: Any) -> dict[str, Any]:
     """`{"dropped_rows": ...}` for one rank's evidence built from a server report: the rows the
     server dropped from this rank for a null key, from its entry in the status (`runs.dropped_rows`
     over that entry alone), or nothing when it dropped none, so the block is as before. An upper
-    bound, as in the all-ranks view (`_dropped_rows_said`)."""
-    from .runs import dropped_rows
+    bound, as in the all-ranks view (`_dropped_rows_said`). And `{"refused_batches": ...}` beside
+    it for the batches the server refused whole from this rank, on the same terms as there."""
+    from .runs import dropped_rows, refused_batches
 
     entries = status.get("ranks") if isinstance(status, Mapping) else None
     if not isinstance(rank, int) or not isinstance(entries, list):
         return {}
-    found = dropped_rows({"ranks": [e for e in entries if isinstance(e, Mapping) and e.get("rank") == rank]})
-    if found is None:
-        return {}
-    return {"dropped_rows": {"rows": found["rows"], **({"by_key": found["by_key"]} if found.get("by_key") else {}),
-                             "upper_bound": True, "note": found["note"]}}
+    own = {"ranks": [e for e in entries if isinstance(e, Mapping) and e.get("rank") == rank]}
+    said: dict[str, Any] = {}
+    found = dropped_rows(own)
+    if found is not None:
+        said["dropped_rows"] = {"rows": found["rows"], **({"by_key": found["by_key"]} if found.get("by_key") else {}),
+                                "upper_bound": True, "note": found["note"]}
+    refused = refused_batches(own)
+    if refused is not None:
+        said["refused_batches"] = {"batches": refused["batches"], **({"by_key": refused["by_key"]} if refused.get("by_key") else {}),
+                                   "note": refused["note"]}
+    return said
 
 
 def _all_ranks_run_state(evidence: Mapping[str, Any], looks: Mapping[int, Mapping[str, Any]],
