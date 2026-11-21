@@ -1526,9 +1526,17 @@ def detect_loss_scale_trouble(
     it is passed over: it neither adds to the streak nor ends it, and is in neither
     `skipped_steps` nor `recorded_steps`, so a streak can span more training steps than it
     counts. Where the SDK observed the scaler apply that update (`scaler_applied: true`) it ends
-    the streak, as a recorded applied update does, and counts in `recorded_steps` (that count
-    awaits the author). A loss scale recorded on a caller's skip is still read against `floor`,
+    the streak, as a recorded applied update does, and counts in `recorded_steps`. A loss scale recorded on a caller's skip is still read against `floor`,
     and raises with reason `scale` and the skip counts unchanged."""
+    return _loss_scale_judged(records, run=run, floor=floor)[0]
+
+
+def _loss_scale_judged(
+    records: list[dict[str, Any]], *, run: int = SCALE_SKIP_RUN, floor: float = SCALE_FLOOR
+) -> tuple[dict[str, Any] | None, dict[str, int]]:
+    """`detect_loss_scale_trouble`'s incident, and the rule's own counters after the last record:
+    `{"recorded_steps", "skipped_steps", "streak"}`, as the behaviour cases' `counters_at_end`
+    states them whether or not anything was raised."""
     streak, skipped, total, first = 0, 0, 0, None
     for record in sorted(records, key=lambda r: r["step"]):
         if "step_skipped" not in record:
@@ -1553,7 +1561,7 @@ def detect_loss_scale_trouble(
     if first is not None:
         first["skipped_steps"] = skipped
         first["recorded_steps"] = total
-    return first
+    return first, {"recorded_steps": total, "skipped_steps": skipped, "streak": streak}
 
 
 def detect_repeated_steps(records: list[dict[str, Any]]) -> dict[str, Any] | None:

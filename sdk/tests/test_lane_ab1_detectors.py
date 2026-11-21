@@ -243,6 +243,8 @@ def test_each_new_case_over_records_is_what_the_evidence_gives(name, body):
         assert evidence.get(key) == value, key
     for key in expected.get("evidence_lacks", ()):
         assert key not in evidence, key
+    if "counters_at_end" in expected:  # the rule's own running counters after the last record
+        assert ev._loss_scale_judged(rows)[1] == expected["counters_at_end"]
 
 
 @pytest.mark.parametrize("record,by", [
@@ -517,10 +519,10 @@ def test_the_loss_scale_streak_is_worded_as_scaler_confirmed_skips():
 
 def test_a_caller_skip_the_scaler_applied_ends_the_streak_and_is_a_recorded_observation():
     """The author's amended rule 2: with `scaler_applied: true` the caller's skip ends the scaler's
-    streak and counts in `recorded_steps` (that count awaits the author); with the outcome unknown
-    it is passed over."""
+    streak and counts in `recorded_steps` (signed off by the author); with the outcome
+    unknown it is passed over."""
     unknown = ev.detect_loss_scale_trouble(_rows(BEHAVIOUR["a_caller_skip_of_unknown_scaler_outcome_inside_scaler_skips"]["given"]["records"]))
-    assert (unknown["step"], unknown["consecutive_skips"], unknown["skipped_steps"], unknown["recorded_steps"]) == (12, 10, 10, 12)
+    assert (unknown["step"], unknown["consecutive_skips"], unknown["skipped_steps"], unknown["recorded_steps"]) == (10, 10, 10, 10)
     applied = _rows(BEHAVIOUR["a_caller_skip_the_scaler_applied_inside_scaler_skips"]["given"]["records"])
     assert ev.detect_loss_scale_trouble(applied) is None
     after = ev.detect_loss_scale_trouble(_rows(BEHAVIOUR["ten_scaler_skips_after_a_caller_skip_the_scaler_applied"]["given"]["records"]))

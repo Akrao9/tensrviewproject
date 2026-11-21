@@ -4,10 +4,10 @@
 
 Written by hand from the page. `status` is `pin` for behaviour today's Python detectors already
 have (the test runs those) or `new` for what is not built: there `expected` is the target, in the
-page's words, for the lane that builds it. A `new` case over records said, under `today`, what the
-Python detector answered on them before its rule was built; lane AB1 (wave AB) built the rules of
-sections 1 and 2 that are read from records, removed `today` from their cases, and runs each
-against the real code in `sdk/tests/test_lane_ab1_detectors.py`. A value that is not finite is written as the string "nan", as JSON has no such number;
+page's words, for the lane that builds it. A `new` case over records also says, under `today`, what
+today's Python detector answers on them, which is not the target: the test runs that, so the case
+cannot pass before its rule is built. The lane that builds the rule removes `today` and makes the
+case a pin. A value that is not finite is written as the string "nan", as JSON has no such number;
 the test turns it back.
 """
 import json
@@ -41,11 +41,12 @@ def unchanged(steps, by=None):
     return [{"step": s, "step_skipped": True, **({"step_skipped_by": by} if by else {}),
              "weights_unchanged": ["blk.weight"], "grad_norms": {"blk.weight": 0.5}} for s in range(steps)]
 
-def around_a_caller_skip(middle, after=5):
-    """Two applied steps, five skips the scaler reported, one only the caller reported (with
+def around_a_caller_skip(middle, after=5, before=0):
+    """`before` applied steps, five skips the scaler reported, one only the caller reported (with
     `middle` on it), then `after` more the scaler reported."""
-    return skips(5, "scaler", before=2) + [{"step": 7, "step_skipped": True, "step_skipped_by": "caller", **middle}] + \
-           [{"step": 8 + k, "step_skipped": True, "step_skipped_by": "scaler"} for k in range(after)]
+    return skips(5, "scaler", before=before) + \
+           [{"step": before + 5, "step_skipped": True, "step_skipped_by": "caller", **middle}] + \
+           [{"step": before + 6 + k, "step_skipped": True, "step_skipped_by": "scaler"} for k in range(after)]
 
 NAN_LAYER = {"blk": {"mean": "nan", "std": 1.0, "abs_max": 1.0}}
 
@@ -136,15 +137,17 @@ cases = {
  "a_capture_written_before_the_key": new(1, "A skipped step with nothing that says who reported it, as every capture had before. The evidence has no `skipped_updates`, and is what it was.",
     {"records": [{"step": 3, "grad_norm": "nan", "step_skipped": True}]},
     {"incident_kinds_absent": ["non_finite"], "evidence_lacks": ["skipped_updates"]}),
- "a_caller_skip_of_unknown_scaler_outcome_inside_scaler_skips": new(1, "Two applied steps, five skips the scaler reported, one only the caller reported with the scaler's outcome unknown, five more the scaler reported. The streak is left as it is across the caller's skip and reaches ten at the last step.",
+ "a_caller_skip_of_unknown_scaler_outcome_inside_scaler_skips": new(1, "Five skips the scaler reported, one only the caller reported with the scaler's outcome unknown, five more the scaler reported. The streak is left as it is across the caller's skip and reaches ten at the last step: 10 recorded, 10 skipped, a streak of 10.",
     {"records": around_a_caller_skip({})},
     {"incident_kinds_present": ["loss_scale_trouble"],
-     "incident_carries": {"step": 12, "reason": "skips", "consecutive_skips": 10, "skipped_steps": 10, "recorded_steps": 12}}),
- "a_caller_skip_the_scaler_applied_inside_scaler_skips": new(1, "The same steps, but the SDK observed the scaler apply the update the caller reported as skipped. The streak ends at five there, and five more do not raise the rule.",
+     "incident_carries": {"step": 10, "reason": "skips", "consecutive_skips": 10, "skipped_steps": 10, "recorded_steps": 10},
+     "counters_at_end": {"recorded_steps": 10, "skipped_steps": 10, "streak": 10}}),
+ "a_caller_skip_the_scaler_applied_inside_scaler_skips": new(1, "The same steps, but the SDK observed the scaler apply the update the caller reported as skipped. The streak ends at five there, and five more do not raise the rule: 11 recorded, 10 skipped, a streak of 5.",
     {"records": around_a_caller_skip({"scaler_applied": True})},
-    {"incident_kinds_absent": ["loss_scale_trouble"]}),
- "ten_scaler_skips_after_a_caller_skip_the_scaler_applied": new(1, "Awaiting the author for one count. Two applied steps, five scaler skips, a caller's skip the scaler was seen to apply, then ten scaler skips. Raised at the last step with ten in a row; the caller's skip adds no skip and counts as a recorded observation of the scaler.",
-    {"records": around_a_caller_skip({"scaler_applied": True}, after=10)},
+    {"incident_kinds_absent": ["loss_scale_trouble"],
+     "counters_at_end": {"recorded_steps": 11, "skipped_steps": 10, "streak": 5}}),
+ "ten_scaler_skips_after_a_caller_skip_the_scaler_applied": new(1, "Two applied steps, five scaler skips, a caller's skip the scaler was seen to apply, then ten scaler skips. Raised at the last step with ten in a row; the caller's skip adds no skip and counts as a recorded observation of the scaler.",
+    {"records": around_a_caller_skip({"scaler_applied": True}, after=10, before=2)},
     {"incident_kinds_present": ["loss_scale_trouble"],
      "incident_carries": {"step": 17, "reason": "skips", "consecutive_skips": 10, "skipped_steps": 15, "recorded_steps": 18}}),
  "a_nan_layer_beside_an_unread_gradient": new(2, "One parameter's gradient could not be read, and an unrelated layer's statistic is not finite. The finding stands, and the kind reads checked.",
