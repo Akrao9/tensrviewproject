@@ -35,7 +35,8 @@ REFUSED = "column `step` is Utf8, not Int64; the batch is refused"
 class Refusing(pa_flight.FlightServerBase):
     """Stores each batch and answers it with its end offset, but refuses the batch that holds
     step `refuse`. `answer` says what it tells the sender first: `"exact"` names the byte range it
-    was sent, `"other"` names another range, and `None` says nothing before the status."""
+    was sent; `"other"` names another range, `"start"` a range whose start alone is wrong, `"end"` one
+    whose end alone is wrong; and `None` says nothing before the status."""
 
     def __init__(self, refuse: int, answer: str | None) -> None:
         super().__init__("grpc://127.0.0.1:0")
@@ -69,7 +70,8 @@ class Refusing(pa_flight.FlightServerBase):
                 self.batches.append({"steps": steps, "start": begin, "end": end})
                 if self.refuse in steps:
                     if self.answer is not None:
-                        named = (begin, end) if self.answer == "exact" else (begin + 1, end + 1)
+                        named = {"exact": (begin, end), "other": (begin + 1, end + 1),
+                                 "start": (begin + 1, end), "end": (begin, end + 1)}[self.answer]
                         writer.write(pa.py_buffer(json.dumps({"end_byte_offset": self.held, "refused": {
                             "start_byte_offset": named[0], "end_byte_offset": named[1], "column": "step"}}).encode()))
                     raise pa.ArrowInvalid(REFUSED)
@@ -132,7 +134,8 @@ def test_a_confirmed_refusal_moves_the_offset_to_the_end_of_the_refused_bytes(tm
     assert run["sender"].refused_batches == 1
 
 
-@pytest.mark.parametrize("answer", [None, "other"], ids=["no_answer", "an_answer_for_another_range"])
+@pytest.mark.parametrize("answer", [None, "other", "start", "end"],
+                         ids=["no_answer", "an_answer_for_another_range", "only_the_start_is_wrong", "only_the_end_is_wrong"])
 def test_a_refusal_that_is_lost_or_names_another_range_keeps_the_last_confirmed_offset(tmp_path, server, answer):
     """Holds today, and must go on holding: nothing but a confirmation that names the sender's own
     byte range moves its offset past bytes the server did not store."""

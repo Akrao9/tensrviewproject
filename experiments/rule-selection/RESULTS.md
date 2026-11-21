@@ -153,6 +153,15 @@ So the score is worth recording beside the ratio, and these captures give no lin
 
 **`activation_drift`.** 4 modules have layer statistics. All 4 reached 110 records (901 each) and all 4 were judged, from step 109, on 792 records each. None fired: the largest ratio was 1.44 (`transformer.h.0`, step 122). Today's rule fires on this run at step 114 and reaches 5.28. So the proposed rule was exercised here, not skipped for want of history.
 
-**`moe_imbalance`.** Not quiet, under either rule. 3,340 of 3,604 samples are flagged: on router `h.2` one of four experts is over the line from step 0 and stays there. Today's rule reports step 0. The proposed rule reports the same router as collapsed since step 0 and reportable at its tenth sample. Whether a top-1 router of four experts with one expert over 37.5% for most of a healthy run is an imbalance worth an incident is a question this run raises and does not answer: it was run with nanoMoE's balance loss on, and it is one seed.
+**`moe_imbalance`.** This run does not test the starting-state rule, because its routing collapsed for real. All four routers are flagged on most of their 901 samples:
+
+| Router | Samples flagged | With a dead expert | Median share of the busiest expert | Flagged from step 0 for |
+|---|---|---|---|---|
+| `h.0` | 791 | 2 | 57% | 0 samples |
+| `h.1` | 848 | 231 | 81% | 0 samples |
+| `h.2` | 812 | 330 | 91% | 25 samples |
+| `h.3` | 889 | 714 | 97% | 0 samples |
+
+With four experts at top-1 an even share is 25%. One expert takes most of every router's tokens for most of the run, though nanoMoE's balance loss was on at its own weight of 0.01. Today's rule reports step 0 on `h.2`. The proposed rule reports step 5 on `h.3`, the first incident that can be reported; `h.2`, collapsed since step 0, becomes reportable at its tenth sample. Both are right to report. What the run cannot say is whether the rule stays quiet on a healthy router of another shape: for that it would need a run whose routing did not collapse.
 
 **The trend.** The gradient norm's growth is 1.14 over the run.

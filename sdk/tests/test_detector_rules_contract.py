@@ -38,6 +38,10 @@ def test_the_file_holds_the_cases_the_page_names():
 
 
 def test_the_file_is_what_its_generator_writes():
+    """True at `eb5a71b`, where the generator ran. Several cases take today's incident from the
+    detectors and add the contract's keys to it (the score over records, the learning rate,
+    `parameters_not_judged`), so the generator's output moves once those are built. `cases.json` is
+    then the frozen record, and lane AD7 removes this one test when it builds the rules."""
     spec = importlib.util.spec_from_file_location("make_rule_cases", FOLDER / "make_cases.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
