@@ -149,6 +149,7 @@ No `tensors` key at all: a capture written before this page, or a save (`a_resum
 - A `state` that is neither `compared` nor `unavailable`, or no `state`, gives no entry and no finding. `resumes` counts the entries.
 - A `count` is read as `_int` in `data_checks.py` reads a whole number: an integer, never a float, a boolean or a string, and here also not above 9,223,372,036,854,775,807, which the server cannot hold. A list that is not an object is not read.
 - `names` that is not a list reads as an empty list; the finding is still raised with its `count`.
+- Of a list of `names`, only the strings are kept; `count` is unchanged. Found at the wave's merge: the server dropped the others and the Python reader kept them, and no case or lane test held a name that is not a string.
 - The tensor findings come after every finding of today's, the optimizer snapshot's and the scaler's included.
 
 **The three readings the author asked to keep apart**, and those beside them:

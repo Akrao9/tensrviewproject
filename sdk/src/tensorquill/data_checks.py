@@ -388,14 +388,17 @@ TENSOR_COUNT_MAX = 2**63 - 1  # the largest count the server can hold; a larger 
 def tensor_list(value: Any) -> tuple[int, list[Any]] | None:
     """A list of `tensors` as `(count, names)`, read only when it is an object whose `count` is a
     whole number as `_int` reads one (never a float, a boolean or a string), above 0 and not above
-    `TENSOR_COUNT_MAX`; names that are not a list are read as none, and the list is still read."""
+    `TENSOR_COUNT_MAX`; names that are not a list are read as none, and the list is still read.
+    Of a list of names only the strings are kept."""
     if not isinstance(value, Mapping):
         return None
     count = _int(value.get("count"))
     if count is None or not 0 < count <= TENSOR_COUNT_MAX:
         return None
     names = value.get("names")
-    return count, list(names) if isinstance(names, list) else []
+    # A tensor's name is a string: anything else in the list is dropped, as the server drops it
+    # (found at the wave's merge, where the two engines differed on `["a", 7, None, "b"]`).
+    return count, [name for name in names if isinstance(name, str)] if isinstance(names, list) else []
 
 
 def listed_as(listed: tuple[int, list[Any]], names_key: str) -> dict[str, Any]:
