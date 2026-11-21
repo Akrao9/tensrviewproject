@@ -3323,6 +3323,17 @@ async fn a_row_with_a_null_key_is_dropped_and_counted_and_the_rest_of_its_batch_
     )
     .unwrap();
     put.send(mistyped, 400).await;
+    // RS10's transport (DETECTOR_RULES_CONTRACT.md part 8): the refused bytes are named first.
+    let refusal = tokio::time::timeout(Duration::from_secs(20), put.acks.next())
+        .await
+        .expect("no reply")
+        .expect("a reply")
+        .expect("the refusal before the status");
+    let refusal: serde_json::Value = serde_json::from_slice(&refusal.app_metadata).unwrap();
+    assert_eq!(
+        refusal["refused"],
+        serde_json::json!({"start_byte_offset": 300, "end_byte_offset": 400, "column": "attempt"})
+    );
     assert_eq!(put.ack().await, Err(Code::InvalidArgument));
     assert_eq!(stored_steps(dir.path())[&0], vec![0, 1, 3, 5, 9, 10, 11]);
 }

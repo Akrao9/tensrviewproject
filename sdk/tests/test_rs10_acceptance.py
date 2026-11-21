@@ -9,10 +9,10 @@ The client here is a raw Flight client that plays the sender by the contract's r
 byte offset as the sender does. Each batch claims 100 bytes a row: A ends at 300, B at 500, C at
 800.
 
-`TODAY` is what the server of `eb5a71b` answers, pinned so that the change is seen. `EXPECTED` is
-what the contract states: after a confirmed refusal of B at bytes 300 to 500 the client restarts
-at 500, sends C directly, and only A and C are stored. Its test is marked as an expected failure,
-strictly, until lane AD2 builds the server's side. The production sender's own handling, and a
+`TODAY` is what the server of `eb5a71b` answered, kept as the base `EXPECTED` is written from (the
+test that pinned it was removed when lane AD2 built the server's side). `EXPECTED` is what the
+contract states: after a confirmed refusal of B at bytes 300 to 500 the client restarts at 500,
+sends C directly, and only A and C are stored. The production sender's own handling, and a
 refusal that is lost or names another range, are in `test_rs10_sender.py`. Sending the refused
 bytes again is a case of its own here.
 """
@@ -169,11 +169,6 @@ def the_run(tmp_path: Path) -> dict[str, Any]:
     return seen
 
 
-def test_the_run_as_the_server_answers_today(tmp_path):
-    assert the_run(tmp_path) == TODAY
-
-
-@pytest.mark.xfail(strict=True, reason="wave AD: the server's side is lane AD2's; the sender's side is in test_rs10_sender.py")
 def test_the_run_as_the_contract_states_it(tmp_path):
     assert the_run(tmp_path) == EXPECTED
 

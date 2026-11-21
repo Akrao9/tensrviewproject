@@ -284,7 +284,7 @@ pub struct Pauses {
     pub ended: Option<Instant>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Progress {
     phase: String,
     phase_since: Instant,
@@ -893,6 +893,13 @@ impl Watchdog {
             return Ok(false);
         }
         let world_size = status["world_size"].as_i64().and_then(|size| i32::try_from(size).ok());
+        // Each rank's first carry, found once: a search per entry is quadratic in the world size.
+        let mut carries: HashMap<i64, &Value> = HashMap::new();
+        for carry in carried {
+            if let Some(rank) = carry["rank"].as_i64() {
+                carries.entry(rank).or_insert(carry);
+            }
+        }
         let mut restored = Vec::new();
         for entry in entries {
             let bad = || format!("the entry of rank {} cannot be read", entry["rank"]);
@@ -901,9 +908,7 @@ impl Watchdog {
                 .and_then(|rank| i32::try_from(rank).ok())
                 .filter(|rank| *rank >= 0);
             let rank = rank.ok_or_else(bad)?;
-            let carry = carried
-                .iter()
-                .find(|carry| carry["rank"].as_i64() == Some(i64::from(rank)));
+            let carry = carries.get(&i64::from(rank)).copied();
             let progress = carry
                 .and_then(|carry| Progress::restored(entry, carry, world_size, now, &self.config))
                 .ok_or_else(bad)?;
@@ -1275,9 +1280,13 @@ impl Watchdog {
         let written_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_millis() as i64);
-        let ranks = self.ranks.lock().unwrap();
+        // The ranks are copied out under the lock and the documents built after it is let go, so a
+        // stream or a beat waits only for the copy (lane AD2; until Nov 21, 2026 the lock was held
+        // while every run's status was built, 21 ms at 4,096 ranks in a release build). A document is
+        // of the ranks as they were at one moment, as before.
+        let held = self.snapshot();
         let mut runs: BTreeMap<&str, Vec<(i32, &Progress)>> = BTreeMap::new();
-        for ((run_id, rank), progress) in ranks.iter() {
+        for ((run_id, rank), progress) in &held {
             runs.entry(run_id.as_str()).or_default().push((*rank, progress));
         }
         runs.into_iter()
@@ -1288,6 +1297,16 @@ impl Watchdog {
                     run_status(run_id, &members, now, written_at_ms, &self.config, running),
                 )
             })
+            .collect()
+    }
+
+    /// Every rank held, copied under the progress lock: all a status pass does while it holds it.
+    fn snapshot(&self) -> Vec<(Key, Progress)> {
+        self.ranks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, progress)| (key.clone(), progress.clone()))
             .collect()
     }
 }
@@ -1304,7 +1323,8 @@ pub fn run_status(
     let world_size = members.iter().filter_map(|(_, p)| p.world_size).max();
     let highest = members.iter().map(|(rank, _)| *rank).max().unwrap_or(-1);
     let expected = world_size.map_or(highest + 1, |size| size.max(highest + 1));
-    let seen: Vec<i32> = members.iter().map(|(rank, _)| *rank).collect();
+    // A set: a search of the ranks seen for every expected rank is quadratic in the world size.
+    let seen: std::collections::HashSet<i32> = members.iter().map(|(rank, _)| *rank).collect();
     // Ranks start a moment apart, so a rank is missing only once the run has been seen for
     // longer than the silence floor.
     let first_seen = members.iter().map(|(_, p)| p.created).min();
@@ -1502,18 +1522,23 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
     // the rank (a status entry without one is attempt 0, as a sender that names none), and not of a
     // rank whose new attempt has stored nothing yet.
     let entries = status["ranks"].as_array().map_or(&[][..], Vec::as_slice);
+    // Each rank's first entry, found once (lane AD2: a search per rank was quadratic in the world
+    // size, 77 to 143 ms at 4,096 ranks in a release build).
+    let mut entry_of: HashMap<i64, &Value> = HashMap::new();
+    for entry in entries {
+        if let Some(rank) = entry["rank"].as_i64() {
+            entry_of.entry(rank).or_insert(entry);
+        }
+    }
     let current = |rank: &i32| -> bool {
         let Some(report) = reports.get(rank).filter(|report| !report.behind) else {
             return false;
         };
-        entries
-            .iter()
-            .find(|entry| entry["rank"].as_i64() == Some(i64::from(*rank)))
-            .is_some_and(|entry| {
-                entry["attempt"].as_i64().unwrap_or(0) == report.attempt
-                    && entry["attempt_without_steps"] != true
-                    && entry.get("capture_stopped").is_none_or(Value::is_null)
-            })
+        entry_of.get(&i64::from(*rank)).is_some_and(|entry| {
+            entry["attempt"].as_i64().unwrap_or(0) == report.attempt
+                && entry["attempt_without_steps"] != true
+                && entry.get("capture_stopped").is_none_or(Value::is_null)
+        })
     };
     // Ranks whose owner attempt stopped capturing (contract 3): never judged, whatever state they read.
     let capture_stopped: Vec<i32> = entries
@@ -1573,7 +1598,12 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
     if judged.is_empty() {
         reasons.push(json!({"state": "unknown", "code": "no_steps", "detail": "no step has been judged yet"}));
     }
-    let mut unknown: Vec<i32> = ranks.iter().copied().filter(|rank| !judged.contains(rank)).collect();
+    let judged_set: std::collections::HashSet<i32> = judged.iter().copied().collect();
+    let mut unknown: Vec<i32> = ranks
+        .iter()
+        .copied()
+        .filter(|rank| !judged_set.contains(rank))
+        .collect();
     unknown.extend(
         status["missing_ranks"]
             .as_array()
@@ -1587,7 +1617,8 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
         .as_i64()
         .filter(|size| (1..=100_000).contains(size))
     {
-        unknown.extend((0..world_size as i32).filter(|rank| !ranks.contains(rank)));
+        let listed: std::collections::HashSet<i32> = ranks.iter().copied().collect();
+        unknown.extend((0..world_size as i32).filter(|rank| !listed.contains(rank)));
     }
     unknown.sort_unstable();
     unknown.dedup();
@@ -1836,6 +1867,9 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
     }
     vec![incident]
 }
+
+#[cfg(test)]
+mod lane_ad2_tests;
 
 #[cfg(test)]
 mod tests {

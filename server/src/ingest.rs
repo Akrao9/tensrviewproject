@@ -27,10 +27,15 @@
 //! has to end: a `DoPut` tells its sender of a refusal only by the status that ends the call, every
 //! later batch of the stream has the same schema and would be refused too, and a batch that is not
 //! acknowledged stays with its sender, which sends it again from its offset, to a server that can
-//! read it once there is one. Nothing is acknowledged past a refused batch.
+//! read it once there is one. Nothing is acknowledged past a refused batch. Before the status, the
+//! server stores what the rank holds and writes one message on the acknowledgement channel that names
+//! the refused bytes: `{"end_byte_offset": S, "refused": {"start_byte_offset": S, "end_byte_offset": E,
+//! "column"}, "store_id"}` (`DETECTOR_RULES_CONTRACT.md` part 8, from Nov 21, 2026; see
+//! `Ingest::confirm_refusal` for S). A sender that sent exactly bytes S to E may take E as its offset
+//! and not send them again; any other sender reads it as an acknowledgement of S, which it has.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -265,7 +270,47 @@ struct OpenStream {
 pub const MANIFEST_MAX_BYTES: usize = 64 * 1024;
 
 type Key = (String, i32);
-type AckSender = mpsc::UnboundedSender<Result<PutResult, Status>>;
+
+/// What one `DoPut` stream received and was told, for the line on stderr when it ends (lane AD2).
+/// Shared between the stream's task and whichever task acknowledges on it (a timed flush does too).
+#[derive(Default)]
+struct StreamTally {
+    batches: AtomicU64,
+    rows: AtomicU64,
+    /// Bytes of every Flight message received: header, body and metadata.
+    bytes: AtomicU64,
+    /// The last offset acknowledged on the stream, or -1 for none.
+    acknowledged: std::sync::atomic::AtomicI64,
+    /// The end offset of the last batch this stream sent that the server accepted, or -1 for none. The
+    /// empty batch with offset 0 that a sender sends first to ask what the server holds is a question,
+    /// not a position, and is not counted.
+    accepted: std::sync::atomic::AtomicI64,
+    /// The request stream ended before the stream did: the sender half-closed, or reset the stream in
+    /// a way hyper ends a request body for alike (a reset with `NO_ERROR`; a call whose deadline passed
+    /// was seen so, with the response already closed).
+    half_closed: AtomicBool,
+}
+
+/// The response of one `DoPut` stream, and the tally of what was acknowledged on it.
+#[derive(Clone)]
+struct AckSender {
+    responses: mpsc::UnboundedSender<Result<PutResult, Status>>,
+    tally: Arc<StreamTally>,
+}
+
+impl AckSender {
+    fn same_channel(&self, other: &AckSender) -> bool {
+        self.responses.same_channel(&other.responses)
+    }
+
+    /// Acknowledges `offset`, counted as acknowledged only if the response is still open.
+    fn acknowledge(&self, offset: i64, result: PutResult) {
+        // The sender may be gone; it resends from its offset.
+        if self.responses.send(Ok(result)).is_ok() {
+            self.tally.acknowledged.fetch_max(offset, Ordering::SeqCst);
+        }
+    }
+}
 
 #[derive(Default)]
 struct RankBuffer {
@@ -309,6 +354,9 @@ struct RankBuffer {
     /// The key column and end offset of the rank's last batch refused because no row of it could be
     /// read (RS10): the same batch sent again is not counted again.
     last_refused: Option<(&'static str, i64)>,
+    /// The last offset this server acknowledged for the rank, on any of its streams: where a stream
+    /// whose own batches have not been accepted yet is taken to have begun (RS10's refusal).
+    acknowledged: Option<i64>,
 }
 
 impl RankBuffer {
@@ -393,6 +441,9 @@ pub struct Ingest {
     /// Streams that ended in an error, and the lines written about them (RUST-18).
     stream_errors: std::sync::atomic::AtomicU64,
     error_log: Mutex<ErrorLog>,
+    /// The lines written about ended streams, per rank and by whether the stream ended in an error,
+    /// so one rank's clean ends never hold back its own error line or another rank's (lane AD2).
+    end_log: Mutex<HashMap<(Key, bool), ErrorLog>>,
     /// Rows dropped for a null key, by the key, and the lines written about them, held per rank so
     /// one rank's line never holds back another's (RS10).
     dropped_rows: Mutex<BTreeMap<&'static str, u64>>,
@@ -431,6 +482,7 @@ impl Ingest {
             replays: tokio::sync::Semaphore::new(REPLAY_CONCURRENCY),
             stream_errors: std::sync::atomic::AtomicU64::new(0),
             error_log: Mutex::new(ErrorLog::default()),
+            end_log: Mutex::new(HashMap::new()),
             dropped_rows: Mutex::new(BTreeMap::new()),
             dropped_log: Mutex::new(HashMap::new()),
             settled: Mutex::new(HashMap::new()),
@@ -521,39 +573,142 @@ impl Ingest {
         self.watchdog.refused(key, column, Instant::now());
     }
 
+    /// Tells the sender, before the status that ends its stream, which bytes were refused for good
+    /// (RS10, `DETECTOR_RULES_CONTRACT.md` part 8): one message on the acknowledgement channel,
+    /// `{"end_byte_offset": S, "refused": {"start_byte_offset": S, "end_byte_offset": E, "column"},
+    /// "store_id"}`, E being the end the refused batch claimed. First everything the rank holds is
+    /// stored, so S, and every row the stream sent before the refused batch, are stored: nothing is
+    /// acknowledged past the refused batch, and a sender that takes E as its offset loses no row the
+    /// server could have stored. S is where the refused batch began, as far as the server can know it:
+    /// the end of the last batch this stream sent that the server accepted; for a stream none of
+    /// whose batches was accepted yet, the last offset this server acknowledged for the rank (the one
+    /// the sender saved, if that acknowledgement reached it); with neither, 0. A sender confirms the
+    /// refusal only when S and E are the bytes it sent, so a wrong guess moves nothing. When the store
+    /// cannot be written nothing is said, and the sender keeps its offset. `store_id` is there because
+    /// a sender reads every message on the channel as an acknowledgement, and the first one names
+    /// the store it binds to (L3).
+    async fn confirm_refusal(&self, key: &Key, column: &'static str, end_byte_offset: i64, ack: &AckSender) {
+        let Ok(store_id) = self.store_id().await else {
+            return;
+        };
+        let buffer = self.buffer(key);
+        let mut buffer = buffer.lock().await;
+        if self.flush(key, &mut buffer).await.is_err() {
+            return;
+        }
+        let start = match ack.tally.accepted.load(Ordering::SeqCst) {
+            accepted if accepted >= 0 => accepted,
+            _ => buffer.acknowledged.unwrap_or(0),
+        };
+        let reply = serde_json::json!({
+            "end_byte_offset": start,
+            "refused": {"start_byte_offset": start, "end_byte_offset": end_byte_offset, "column": column},
+            "store_id": store_id,
+        });
+        ack.acknowledge(
+            start,
+            PutResult {
+                app_metadata: reply.to_string().into(),
+            },
+        );
+    }
+
     /// Streams that ended in an error since the server started.
     pub fn stream_errors(&self) -> u64 {
         self.stream_errors.load(Ordering::SeqCst)
     }
 
-    /// A stream ended in an error, which its sender is told. Counted, and written to stderr at most
-    /// once per `STREAM_ERROR_LOG_INTERVAL` with the run, rank and code: the message of a refused
-    /// request only up to its first `: `, after which a decoder's or JSON parser's words can quote
-    /// the bytes the sender sent (RUST-18; until Nov 19, 2026 the server said nothing).
-    fn stream_failed(&self, key: Option<&Key>, status: &Status) {
-        self.stream_errors.fetch_add(1, Ordering::SeqCst);
-        let Some(held) = self.error_log.lock().unwrap().due(Instant::now()) else {
+    /// A `DoPut` stream ended, with `status` (`None`: cleanly, once the request had ended). One line
+    /// on stderr per ended stream (lane AD2; until Nov 21, 2026 only a stream that ended in an error
+    /// had one, at most one per `STREAM_ERROR_LOG_INTERVAL` across the server, and the three runs in the
+    /// plan whose streams ended with an h2 error were left with no cause): the run, the rank, the gRPC
+    /// code and message, the cause the transport gave, the batches, rows and bytes received, the
+    /// last offset acknowledged on the stream, whether the request had ended first (a half-close,
+    /// or a reset hyper reads as one: a call whose deadline passed reads so, with the response
+    /// closed, and is passed to the watchdog as a clean end, as before), whether the response was
+    /// still open, and how long the stream was open. A rank's clean ends get at most one
+    /// line per `STREAM_ERROR_LOG_INTERVAL`, and its errors, apart, as many; the ones held back are
+    /// counted in the next. A stream that never named its rank shares one limit with every other.
+    /// The message of a refused request is cut at its first `: `, after which a decoder's or JSON
+    /// parser's words can quote the bytes the sender sent (RUST-18), and has no cause. An error is
+    /// also counted in `stream_errors`.
+    fn stream_closed(
+        &self,
+        key: Option<&Key>,
+        status: Option<&Status>,
+        tally: &StreamTally,
+        open: Duration,
+        response_open: bool,
+    ) {
+        if status.is_some() {
+            self.stream_errors.fetch_add(1, Ordering::SeqCst);
+        }
+        let now = Instant::now();
+        let due = match key {
+            Some(key) => self
+                .end_log
+                .lock()
+                .unwrap()
+                .entry((key.clone(), status.is_some()))
+                .or_default()
+                .due(now),
+            None => self.error_log.lock().unwrap().due(now),
+        };
+        let Some(held) = due else {
             return;
         };
         let stream = key.map_or_else(
-            || "a stream".to_string(),
+            || "a stream that named no run".to_string(),
             |(run_id, rank)| format!("the stream of {run_id} rank {rank}"),
         );
-        let message = status.message();
-        let message = if status.code() == tonic::Code::InvalidArgument {
-            message.split(": ").next().unwrap_or_default()
-        } else {
-            message
+        let how = match status {
+            None => "ended (code Ok)".to_string(),
+            Some(status) => {
+                let message = status.message();
+                let refused = status.code() == tonic::Code::InvalidArgument;
+                let message = if refused {
+                    message.split(": ").next().unwrap_or_default()
+                } else {
+                    message
+                };
+                let message: String = message.chars().take(200).collect();
+                // The transport's own errors under the status: hyper's, then h2's or the socket's. A
+                // status can wrap another whose words hold the whole message again; it is left out.
+                let mut causes: Vec<String> = Vec::new();
+                let mut source = std::error::Error::source(status);
+                while let (false, Some(error)) = (refused, source) {
+                    let words = error.to_string();
+                    if !words.contains(status.message()) && !causes.contains(&words) {
+                        causes.push(words);
+                    }
+                    source = error.source();
+                }
+                let cause: String = causes.join(": ").chars().take(300).collect();
+                let cause = if cause.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (cause: {cause})")
+                };
+                format!("ended in an error (code {:?}): {message}{cause}", status.code())
+            }
         };
-        let message: String = message.chars().take(200).collect();
-        let held = if held > 0 {
-            format!(" ({held} more stream errors since the last line)")
-        } else {
-            String::new()
+        let acknowledged = match tally.acknowledged.load(Ordering::SeqCst) {
+            offset if offset >= 0 => format!("acknowledged to offset {offset}"),
+            _ => "nothing acknowledged".to_string(),
+        };
+        let held = match (held, status.is_some()) {
+            (0, _) => String::new(),
+            (held, true) => format!("; {held} more stream errors of this rank since the last line"),
+            (held, false) => format!("; {held} more clean ends of this rank since the last line"),
         };
         eprintln!(
-            "tensorquill-server: {stream} ended in an error (code {:?}): {message}{held}",
-            status.code()
+            "tensorquill-server: {stream} {how}; received {} batches, {} rows, {} bytes; {acknowledged}; the request {} ended first; the response was {}; open {:.1} s{held}",
+            tally.batches.load(Ordering::SeqCst),
+            tally.rows.load(Ordering::SeqCst),
+            tally.bytes.load(Ordering::SeqCst),
+            if tally.half_closed.load(Ordering::SeqCst) { "had" } else { "had not" },
+            if response_open { "open" } else { "closed" },
+            open.as_secs_f64(),
         );
     }
 
@@ -568,6 +723,7 @@ impl Ingest {
         runs.extend(self.manifests.lock().unwrap().keys().cloned());
         runs.extend(self.written.lock().unwrap().keys().cloned());
         runs.extend(self.dropped_log.lock().unwrap().keys().map(|key| key.0.clone()));
+        runs.extend(self.end_log.lock().unwrap().keys().map(|(key, _)| key.0.clone()));
         runs.len()
     }
 
@@ -619,6 +775,7 @@ impl Ingest {
             Err(refused) => {
                 if let Some(column) = refused.column {
                     self.batch_refused(key, column, end_byte_offset).await;
+                    self.confirm_refusal(key, column, end_byte_offset, ack).await;
                 }
                 return Err(refused.status);
             }
@@ -791,7 +948,8 @@ impl Ingest {
             let result = PutResult {
                 app_metadata: reply.to_string().into(),
             };
-            let _ = ack.send(Ok(result)); // the sender may be gone; it resends from its offset
+            ack.acknowledge(offset, result);
+            buffer.acknowledged = Some(offset);
         }
         if self.config.detect && !stored.is_empty() {
             self.take_replicas(key, &stored).await;
@@ -1159,11 +1317,15 @@ impl Ingest {
     ) -> Result<(), Status> {
         let mut decoder = FlightDataDecoder::new(stream.map_err(FlightError::from));
         let mut named = false;
+        let tally = &ack.tally;
         while let Some(message) = decoder.next().await {
             let message = message.map_err(|error| match error {
                 FlightError::Tonic(status) => *status,
                 other => Status::invalid_argument(other.to_string()),
             })?;
+            let inner = &message.inner;
+            let bytes = inner.data_header.len() + inner.data_body.len() + inner.app_metadata.len();
+            tally.bytes.fetch_add(bytes as u64, Ordering::SeqCst);
             if key.is_none() {
                 if let Some(descriptor) = &message.inner.flight_descriptor {
                     let parsed = parse_descriptor(descriptor)?;
@@ -1184,6 +1346,8 @@ impl Ingest {
             let DecodedPayload::RecordBatch(batch) = message.payload else {
                 continue;
             };
+            tally.batches.fetch_add(1, Ordering::SeqCst);
+            tally.rows.fetch_add(batch.num_rows() as u64, Ordering::SeqCst);
             let key = key
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("the first message needs a FlightDescriptor"))?;
@@ -1215,6 +1379,7 @@ impl Ingest {
                 named = true;
                 self.reconcile_streams(key);
             }
+            let question = batch.num_rows() == 0 && metadata.end_byte_offset == 0;
             self.accept(
                 key,
                 batch,
@@ -1224,12 +1389,16 @@ impl Ingest {
                 ack,
             )
             .await?;
+            if !question {
+                tally.accepted.store(metadata.end_byte_offset, Ordering::SeqCst);
+            }
             // After the rows, which matter more: a manifest that cannot be stored never
             // refuses a batch.
             if let Some(manifest) = metadata.run_manifest {
                 self.store_manifest(&key.0, manifest).await;
             }
         }
+        tally.half_closed.store(true, Ordering::SeqCst);
         if let Some(key) = key {
             self.flush_key(key).await?; // end of stream
         }
@@ -1607,6 +1776,7 @@ impl Ingest {
         self.written.lock().unwrap().remove(run_id);
         self.order_locks.lock().unwrap().retain(|key, _| key.0 != run_id);
         self.dropped_log.lock().unwrap().retain(|key, _| key.0 != run_id);
+        self.end_log.lock().unwrap().retain(|(key, _), _| key.0 != run_id);
         drop(buffers);
         true
     }
@@ -1942,6 +2112,45 @@ fn batch_bytes(batch: &RecordBatch) -> Result<usize, Status> {
     Ok(bytes)
 }
 
+/// Says on stderr how a `DoPut` stream ended (`Ingest::stream_closed`), once: when its task gives the
+/// status, or, if the task panicked or was dropped before it could, when it goes.
+struct StreamEnd {
+    ingest: Arc<Ingest>,
+    key: Option<Key>,
+    ack: AckSender,
+    opened: Instant,
+    said: bool,
+}
+
+impl StreamEnd {
+    fn say(&mut self, status: Option<&Status>) {
+        if std::mem::replace(&mut self.said, true) {
+            return;
+        }
+        let response_open = !self.ack.responses.is_closed();
+        self.ingest.stream_closed(
+            self.key.as_ref(),
+            status,
+            &self.ack.tally,
+            self.opened.elapsed(),
+            response_open,
+        );
+    }
+}
+
+impl Drop for StreamEnd {
+    fn drop(&mut self) {
+        if !self.said {
+            let status = if std::thread::panicking() {
+                Status::internal("the stream's task panicked")
+            } else {
+                Status::aborted("the stream's task was dropped before it ended")
+            };
+            self.say(Some(&status));
+        }
+    }
+}
+
 /// The Flight service. Only `DoPut` is implemented.
 pub struct IngestService {
     ingest: Arc<Ingest>,
@@ -1973,18 +2182,32 @@ impl FlightService for IngestService {
     async fn do_put(&self, request: Request<Streaming<FlightData>>) -> Reply<Self::DoPutStream> {
         let ingest = self.ingest.clone();
         let stream = request.into_inner();
-        let (ack, acks) = mpsc::unbounded_channel();
+        let (responses, acks) = mpsc::unbounded_channel();
+        let ack = AckSender {
+            responses,
+            tally: Arc::new(StreamTally {
+                acknowledged: std::sync::atomic::AtomicI64::new(-1),
+                accepted: std::sync::atomic::AtomicI64::new(-1),
+                ..StreamTally::default()
+            }),
+        };
         tokio::spawn(async move {
-            let mut key = None;
+            let mut end = StreamEnd {
+                ingest: ingest.clone(),
+                key: None,
+                ack: ack.clone(),
+                opened: Instant::now(),
+                said: false,
+            };
             let stream_id = ingest.next_stream.fetch_add(1, Ordering::SeqCst);
-            let result = ingest.run_stream(stream, &mut key, stream_id, &ack).await;
-            if let Some(key) = &key {
+            let result = ingest.run_stream(stream, &mut end.key, stream_id, &ack).await;
+            if let Some(key) = &end.key {
                 ingest.stream_ended(key, stream_id, result.is_ok());
                 ingest.detach(key, &ack).await;
             }
+            end.say(result.as_ref().err());
             if let Err(status) = result {
-                ingest.stream_failed(key.as_ref(), &status);
-                let _ = ack.send(Err(status));
+                let _ = ack.responses.send(Err(status));
             }
         });
         Ok(Response::new(UnboundedReceiverStream::new(acks).boxed()))
