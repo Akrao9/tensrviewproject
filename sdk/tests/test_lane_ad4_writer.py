@@ -108,8 +108,11 @@ def _two_at_once(monkeypatch, target, *, where: str):
                 a_out.set()
 
     threads = [threading.Thread(target=run, args=(n,), name=n) for n in ("A", "B")]
-    for t in threads:
-        t.start()
+    # B starts once A is inside `build_db`, so everything A does before it (on `eb5a71b`, swapping
+    # the logger's handler list) is done before B begins: A in, B in, A out, B out, every time.
+    threads[0].start()
+    assert a_in.wait(10)
+    threads[1].start()
     for t in threads:
         t.join(30)
     return results, errors
@@ -208,7 +211,9 @@ def test_fr_an_analysis_that_raises_alone_or_beside_another_leaves_the_logger_as
                 a_out.set()
 
     threads = [threading.Thread(target=run, args=(n,), name=n) for n in ("A", "B")]
-    [t.start() for t in threads]
+    threads[0].start()
+    assert a_in.wait(10)  # B starts once A is inside `build_db` (see `_two_at_once`)
+    threads[1].start()
     [t.join(30) for t in threads]
     assert results == {"A": "the analyzer failed", "B": alone}
     assert _state(logger) == before and seen.messages == []
@@ -273,7 +278,8 @@ def test_fr_two_imports_at_once_leave_stdout_and_stderr_as_they_were(tmp_path):
                     a_out.set()
 
         threads = [threading.Thread(target=run, args=(n,), name=n) for n in "AB"]
-        [t.start() for t in threads]; [t.join(30) for t in threads]
+        threads[0].start(); a_in.wait(10); threads[1].start()  # B begins once A is held at the import
+        [t.join(30) for t in threads]
         print("stdout kept" if sys.stdout is out else "stdout swapped", file=sys.__stdout__)
         print("stderr kept" if sys.stderr is err else "stderr swapped", file=sys.__stdout__)
     """)
