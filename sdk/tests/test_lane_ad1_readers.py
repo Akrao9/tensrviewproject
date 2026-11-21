@@ -330,3 +330,93 @@ def test_item7_run_of_is_public_and_the_private_name_still_works():
     from tensorquill.evidence import _run_of  # what divergence.py imports until the merge
 
     assert _run_of({"run_id": "b"}) == "b"
+
+
+# --- Item 5: steps newer than the last judgment (CLI-10) --------------------------------------------
+
+THROTTLED = {"kind": "gpu_throttled", "step": 15, "reasons": ["power"]}  # an observation: it decides no state
+
+
+def _awaited(run: Path):
+    """Look 1: rank 0's report covers steps 0-9, the whole store. Look 2: steps 10-19 are stored and
+    not reported yet, and the status gives an observation, which is news inside the wait."""
+    def first():
+        _store_at_attempt_1(run)
+        _write_status(run, _status([{"rank": 0, "attempt": 1, "last_step": 9}, OTHER]))
+
+    def second():
+        _part(run, 0, 1, 10, 19)
+        status = _status([{"rank": 0, "attempt": 1, "last_step": 19}, OTHER])
+        status["incidents"] = [THROTTLED]
+        _write_status(run, status)
+    return first, second
+
+
+def test_item5_both_watchers_show_the_last_result_with_the_steps_it_does_not_cover(tmp_path):
+    one = _run(tmp_path / "one")
+    _store_at_attempt_1(one)
+    seen_one = _watch_one(one, tmp_path / "one.json", *_awaited(one))
+    every = _run(tmp_path / "all")
+    seen_all = _watch_all(every, tmp_path / "all.json", *_awaited(every))
+    # Look 1 is current: no block, as today.
+    assert "freshness" not in seen_one[0][1] and "freshness" not in seen_all[0][1]
+    single, view = seen_one[-1][1], seen_all[-1][1]
+    assert single["detection"]["state"] == "behind" and [i["kind"] for i in single["incidents"]] == ["gpu_throttled"]
+    block = {"current": False, "judged_to_step": 9, "records_to_step": 19, "why": "records_newer"}
+    # fail-before: no block; and the single-rank watcher said unknown where the all-ranks one said healthy
+    assert single["freshness"] == block and view["freshness"] == block
+    assert next(e for e in view["ranks"] if e["rank"] == 0)["freshness"] == block
+    assert "freshness" not in next(e for e in view["ranks"] if e["rank"] == 1)
+    assert single["run_state"]["state"] == view["run_state"]["state"] == "healthy"
+    # The reason the code already names is kept, and decides nothing inside the wait.
+    [awaited] = [r for r in single["run_state"]["reasons"] if r["code"] == "report_not_current"]
+    assert awaited["state"] == "healthy"
+    for evidence in (single, view):
+        assert ev.run_state_line(evidence).endswith("; as of step 9; records reach step 19")
+    # Outside the wait nothing changed: a report that is not current is unknown, as before.
+    assert ev.run_state(incidents=[], steps_judged=True, status=None, status_expected=False,
+                        detection={"source": "server", "state": "behind", "reason": "x"})["state"] == "unknown"
+
+
+def test_item5_a_server_started_again_with_other_thresholds_carries_no_earlier_result_over(tmp_path):
+    run = _run(tmp_path)
+
+    def first():
+        _store_at_attempt_1(run)
+        _write_status(run, _status([{"rank": 0, "attempt": 1, "last_step": 9}, OTHER]))
+
+    def second():
+        # The server comes back with other thresholds: it reports on steps 0-14 with them, and has
+        # stored 10-19 since.
+        _part(run, 0, 1, 10, 19)
+        _write_report(run, _report(0, 1, 14) | {"thresholds": {**LISTED, "spike_sustain": ev.SPIKE_SUSTAIN}})
+
+    seen = _watch_all(run, tmp_path / "all.json", first, second)
+    last = seen[-1][1]
+    # fail-before: rank 0 kept reading as its last current report (judged [0, 1]) under the old thresholds
+    assert last["judged_ranks"] == [1] and last["ranks_by_state"] == {"behind": [0], "current": [1]}
+    block = {"current": False, "judged_to_step": 9, "records_to_step": 19, "why": "thresholds_changed"}
+    assert last["freshness"] == block
+    assert next(e for e in last["ranks"] if e["rank"] == 0)["freshness"] == block
+    assert last["run_state"]["state"] == "unknown"
+    assert ev.run_state_line(last).endswith(
+        "; as of step 9; records reach step 19 (judged under other thresholds than those in force)")
+    # The single-rank watcher's rule is the same one: the wait ends for such a report.
+    look = {"state": "behind", "report": _report(0, 1, 14) | {"thresholds": {**LISTED, "spike_sustain": 3}}}
+    assert ev._thresholds_moved(look, _report(0, 1, 9))
+    assert not ev._thresholds_moved({**look, "report": _report(0, 1, 14)}, _report(0, 1, 9))
+
+
+def test_item5_nothing_judged(tmp_path):
+    run = _run(tmp_path)
+    _part(run, 0, 1, 0, 9)  # a part, and no report (the server runs with --no-detect)
+    evidence = ev.all_ranks_evidence(run)
+    # fail-before: no block
+    assert evidence["freshness"] == {"current": False, "judged_to_step": None, "records_to_step": 9,
+                                     "why": "nothing_judged"}
+    assert evidence["run_state"]["state"] == "unknown"
+    assert ev.run_state_line(evidence).endswith("; nothing judged yet; records reach step 9")
+    # A store whose every rank is current has none, so today's output is unchanged there.
+    current = _run(tmp_path / "current")
+    _store_at_attempt_1(current)
+    assert "freshness" not in ev.all_ranks_evidence(current)

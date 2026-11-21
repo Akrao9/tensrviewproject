@@ -3358,8 +3358,14 @@ def run_state(
     judged_ranks: Iterable[int] = (),
     status_expected: bool = True,
     judged_attempts: Mapping[int, int | None] | None = None,
+    report_awaited: bool = False,
 ) -> dict[str, Any]:
     """The run's state from what the evidence holds: `{"state", "reasons"}`.
+
+    `report_awaited`: the watcher is inside its wait for the server's next report
+    (`report_grace`), so a `detection` that is not current lists `report_not_current` with the
+    state `healthy`, which decides nothing, and the last current result stands (lane AD1). Outside
+    the wait it is `unknown`, as before.
 
     `status` is the server's whole `watchdog.json` (None when there is none) and `status_age`
     how long ago it was last written when that is too long (`_status_age`). A missing status
@@ -3399,8 +3405,16 @@ def run_state(
     if not steps_judged:
         reasons.append(_reason("unknown", "no_steps", "no step has been judged yet"))
     if detection is not None and detection.get("source") == "server" and detection.get("state") != "current":
-        reasons.append(_reason("unknown", "report_not_current",
-                               f"the incidents are from the server's last current report: {detection.get('reason')}"))
+        if report_awaited:
+            # Inside the watcher's wait for a report (lane AD1, CLI-10): the last current result is
+            # shown as it is, as the all-ranks watcher shows it, beside a `freshness` block when the
+            # store holds steps it does not cover. Listed, and not deciding.
+            reasons.append(_reason("healthy", "report_not_current",
+                                   f"the incidents are from the server's last current report, while its next one is"
+                                   f" awaited: {detection.get('reason')}"))
+        else:
+            reasons.append(_reason("unknown", "report_not_current",
+                                   f"the incidents are from the server's last current report: {detection.get('reason')}"))
     unknown = dict(unknown_ranks or {})
     if status is not None:
         judged = set(judged_ranks)
@@ -3471,11 +3485,45 @@ def run_state_line(evidence: Mapping[str, Any]) -> str | None:
         return None
     state = found.get("state")
     deciding = [r["detail"] for r in found.get("reasons") or () if r.get("state") == state]
-    return f"Run state: {state}" + (f" ({'; '.join(deciding)})" if deciding else "")
+    fresh = freshness_text(evidence.get("freshness"))
+    return f"Run state: {state}" + (f" ({'; '.join(deciding)})" if deciding else "") + (f"; {fresh}" if fresh else "")
+
+
+# --- Steps newer than the last judgment (CLI-10, lane AD1) ---------------------------------------
+#
+# `evidence["freshness"]`, present only when the judgment does not cover the newest stored step
+# under the thresholds in force (the same names as `runs.py`'s rows):
+#   {"current": false, "judged_to_step": <int or null>, "records_to_step": <int or null>, "why": ...}
+#   records_newer       the store holds steps the last judgment does not cover. The last result is
+#                       shown as it is, and its state is not made unknown for it
+#   thresholds_changed  the last judgment was made under other thresholds than those in force: no
+#                       earlier result is carried over, and the state is unknown
+#   nothing_judged      steps are stored and none is judged: the state is unknown
+FRESHNESS_WHY = ("records_newer", "thresholds_changed", "nothing_judged")
+
+
+def freshness_block(judged_to_step: Any, records_to_step: Any, why: str) -> dict[str, Any]:
+    """The `freshness` block (see above): a whole step or None for each of the two steps."""
+    whole = lambda step: step if isinstance(step, int) and not isinstance(step, bool) else None  # noqa: E731
+    return {"current": False, "judged_to_step": whole(judged_to_step), "records_to_step": whole(records_to_step),
+            "why": why}
+
+
+def freshness_text(block: Any) -> str | None:
+    """`as of step {judged_to_step}; records reach step {records_to_step}` for a `freshness` block,
+    with "nothing judged yet" or "records reach no step" for a step that is null; None without one."""
+    if not isinstance(block, Mapping) or block.get("current") is not False:
+        return None
+    judged, stored = block.get("judged_to_step"), block.get("records_to_step")
+    first = f"as of step {judged}" if isinstance(judged, int) else "nothing judged yet"
+    second = f"records reach step {stored}" if isinstance(stored, int) else "records reach no step"
+    text = f"{first}; {second}"
+    return text + (" (judged under other thresholds than those in force)" if block.get("why") == "thresholds_changed" else "")
 
 
 def _per_rank_run_state(evidence: Mapping[str, Any], status: Mapping[str, Any] | None,
-                        status_age: float | None, steps_judged: bool, attempt: int | None = None) -> dict[str, Any]:
+                        status_age: float | None, steps_judged: bool, attempt: int | None = None,
+                        report_awaited: bool = False) -> dict[str, Any]:
     """`run_state` of one rank's evidence. `attempt` is the attempt its incidents were judged
     from: the report's, or the newest of the records the detectors read here."""
     # Evidence that says what was checked says whether a status was expected at all; without
@@ -3487,6 +3535,7 @@ def _per_rank_run_state(evidence: Mapping[str, Any], status: Mapping[str, Any] |
         not_checked=evidence.get("not_checked", ()), detection=evidence.get("detection"),
         status_expected=not (isinstance(stall, Mapping) and stall.get("value") == "not_configured"),
         judged_attempts={rank: attempt} if isinstance(rank := evidence.get("rank"), int) and steps_judged else None,
+        report_awaited=report_awaited,
     )
 
 
@@ -3644,6 +3693,32 @@ def _other_sources_stamp(
     return (tc_key, fr_key)
 
 
+def _thresholds_moved(look: Mapping[str, Any], judged: Mapping[str, Any] | None) -> bool:
+    """Whether the rank's newest report, `behind` its store, lists other thresholds than the report
+    `judged` that was last current: its server was started again with others, so a result judged
+    under the old ones is not the run's under those in force (`thresholds_changed`, lane AD1)."""
+    newest = look.get("report")
+    if look.get("state") != "behind" or not isinstance(newest, Mapping) or not isinstance(judged, Mapping):
+        return False
+    now, then = applied_thresholds(newest), applied_thresholds(judged)
+    return any(not _same_threshold(now[name], then[name]) for name in THRESHOLD_NAMES)
+
+
+def _report_freshness(look: Mapping[str, Any], judged: bool) -> dict[str, Any] | None:
+    """The `freshness` block of evidence built from `look`'s report (CLI-10, lane AD1), or None when
+    the report covers the newest stored step: `records_newer` beside a report kept while the next
+    one is awaited, `nothing_judged` when it judged no step and steps are stored. Read from the
+    report and the newest part's name (`look["stored"]`): no part is opened."""
+    report, stored = look.get("report") or {}, look.get("stored")
+    if not judged:
+        return freshness_block(None, stored[1], "nothing_judged") if stored else None
+    if look.get("state") == "current" or not stored:
+        return None
+    if (report.get("attempt"), report.get("last_step")) == tuple(stored):
+        return None  # e.g. a report torn for a moment, with nothing stored since the last current one
+    return freshness_block(report.get("last_step"), stored[1], "records_newer")
+
+
 def watch(
     source: str | Path,
     output: str | Path | None = None,
@@ -3682,6 +3757,13 @@ def watch(
     rank if a watched run directory ends up holding more than one `rank=*` folder.
     `evidence["detection"]` says which happened and why. `server_reports=False` always
     works the incidents out here.
+
+    Inside the wait, the last current report is shown as it is and its state is not made unknown
+    for the wait, as the all-ranks watcher shows it; the steps stored since are said beside it,
+    `freshness` with `why: "records_newer"` (CLI-10, lane AD1; see `freshness_block`). A report
+    that lists other thresholds than the last current one ends the wait at once
+    (`thresholds_changed`): that result is not carried over, and the parts are judged here.
+    When the report covers the newest stored step there is no `freshness` key.
 
     The five thresholds (`overload_threshold`, `drift_tolerance`, `starve_window`,
     `starve_ratio`, `top_k`) are the caller's only when given. For a server's store, one left
@@ -3807,8 +3889,14 @@ def watch(
                     # A watcher that has not seen a current report yet does not wait at all.
                     waiting_since = time.monotonic() if waiting_since is None else waiting_since
                     if time.monotonic() - waiting_since < report_grace:
-                        in_grace = True
-                        report_look = {**look, "report": last_current_report}
+                        if _thresholds_moved(look, last_current_report):
+                            # The server judges by other thresholds since the last current report
+                            # (lane AD1): that result is not carried over, and the parts are judged
+                            # here with the thresholds in force (`adopted`), as after the wait.
+                            pass
+                        else:
+                            in_grace = True
+                            report_look = {**look, "report": last_current_report}
                     elif look["state"] == "behind":
                         look["state"] = "stale"
             grace_key = _grace_alert_key(status, status_age, other_stamp)
@@ -3880,7 +3968,10 @@ def watch(
             judged = bool(report_look["report"].get("steps")) if report_look is not None else bool(tail.records)
             attempt = (_whole_attempt(report_look["report"].get("attempt")) if report_look is not None
                        else newest_attempt(tail.records))
-            evidence["run_state"] = _per_rank_run_state(evidence, status, status_age, steps_judged=judged, attempt=attempt)
+            if report_look is not None and (block := _report_freshness(report_look, judged)) is not None:
+                evidence["freshness"] = block  # absent when the report covers the newest stored step
+            evidence["run_state"] = _per_rank_run_state(evidence, status, status_age, steps_judged=judged, attempt=attempt,
+                                                        report_awaited=in_grace)
             emitted = seen
             emitted_grace = grace_key
             written = _write_output(evidence, path, output is not None, compact_window)
@@ -4724,6 +4815,8 @@ def _all_ranks_evidence(
             with_classes(entry["last_report"]["incidents"])
         if number in streams:
             entry["stream"] = streams[number]
+        if isinstance(look.get("freshness"), Mapping):
+            entry["freshness"] = dict(look["freshness"])  # a rank inside its wait (lane AD1)
         entries.append(entry)
 
     if status is not None and isinstance(status.get("incidents"), list):
@@ -4919,12 +5012,22 @@ def _look_at_ranks(
         if look["state"] == "current":
             held.last_current_look = look
         elif in_grace and held.last_current_look is not None:
-            # A rank inside its wait is a moment between a part and its report, as the
-            # single-rank watcher treats it: it alone does not cause a write, and in a write
-            # that another rank or the status causes it reads as its last current report, as
-            # the single-rank watcher writes from its last current report. Before Nov 18, 2026
-            # it was written as not judged for that moment.
-            look = held.last_current_look
+            last = held.last_current_look
+            if _thresholds_moved(look, last.get("report")):
+                # Its server judges by other thresholds since its last current report (lane AD1):
+                # that result is not carried over, and the rank is not judged until it is current.
+                look = {**look, "freshness": freshness_block(
+                    (last.get("report") or {}).get("last_step"), (look.get("stored") or (None, None))[1],
+                    "thresholds_changed")}
+            else:
+                # A rank inside its wait is a moment between a part and its report, as the
+                # single-rank watcher treats it: it alone does not cause a write, and in a write
+                # that another rank or the status causes it reads as its last current report, as
+                # the single-rank watcher writes from its last current report. Before Nov 18, 2026
+                # it was written as not judged for that moment. Since lane AD1 the steps stored
+                # since are said beside it (`freshness`), and the key compared is the same.
+                block = _report_freshness({**last, "state": look["state"], "stored": look.get("stored")}, True)
+                look = {**last, **({"freshness": block} if block else {})}
         looks[number] = look
         keys.append((number, _rank_key(look)))
     return folders, looks, tuple(keys)
@@ -4967,8 +5070,30 @@ def _all_ranks_whole(
     evidence = _all_ranks_evidence(source, folders, looks, status, **other_sources)
     if status_age is not None and "watchdog" in evidence:
         evidence["watchdog"]["not_written_for_seconds"] = round(status_age, 1)
+    if (block := _all_ranks_freshness(evidence, looks)) is not None:
+        evidence["freshness"] = block
     evidence["run_state"] = _all_ranks_run_state(evidence, looks, status, status_age)
     return evidence
+
+
+def _all_ranks_freshness(evidence: Mapping[str, Any], looks: Mapping[int, Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The all-ranks view's `freshness` block (CLI-10, lane AD1), or None when every judged rank's
+    report covers its newest stored step: `thresholds_changed` when a rank's server judges by other
+    thresholds since its last current report, `nothing_judged` when no rank is judged and steps are
+    stored, `records_newer` when a judged rank is inside its wait with steps stored since. The steps
+    are the lowest judged and the highest stored over the ranks that are not current; each such
+    rank has its own block on its entry in `ranks`."""
+    blocks = [look["freshness"] for look in looks.values() if isinstance(look.get("freshness"), Mapping)]
+    judged = [b["judged_to_step"] for b in blocks if isinstance(b.get("judged_to_step"), int)]
+    stored = [b["records_to_step"] for b in blocks if isinstance(b.get("records_to_step"), int)]
+    if any(b.get("why") == "thresholds_changed" for b in blocks):
+        return freshness_block(min(judged, default=None), max(stored, default=None), "thresholds_changed")
+    if not evidence.get("judged_ranks"):
+        steps = [look["stored"][1] for look in looks.values() if look.get("stored")]
+        return freshness_block(None, max(steps), "nothing_judged") if steps else None
+    if blocks:
+        return freshness_block(min(judged, default=None), max(stored, default=None), "records_newer")
+    return None
 
 
 def all_ranks_evidence(
@@ -5059,6 +5184,11 @@ def watch_all_ranks(
     five given here (`overload_threshold`, `drift_tolerance`, `starve_window`, `starve_ratio`,
     `top_k`) must be the one a rank's server applied, or that rank is `other_thresholds`.
     `flight_recorder` and `traincheck` are read once for the run and their incidents are run-level.
+    A rank inside its wait reads as its last current report, with the steps stored since on its
+    entry (`freshness`, `records_newer`), and the view has a `freshness` block of its own while any
+    rank is not current: `records_newer`, `thresholds_changed` (a rank whose server lists other
+    thresholds than in its last current report, not judged until current again) or
+    `nothing_judged` (CLI-10, lane AD1; `_all_ranks_freshness`).
     `detectors` ("auto", "python" or "rust") is accepted and changes nothing: every rank's incidents are
     the Rust detectors' already, from its server's report, and no detector runs here, so the
     server binary is not needed. Returns the evidence path, or None if nothing was written.
