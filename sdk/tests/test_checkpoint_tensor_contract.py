@@ -1,10 +1,12 @@
 """The cases of `CHECKPOINT_TENSOR_CONTRACT.md` (TrainCheck B14): whether a checkpoint holds the
 model's tensors, and what a resume says of it.
 
-Nothing of the page is built when this file is written. It checks that every case is named on the
-page and well formed, and that each case's `today` is what the code answers now: a `pin` already
-has its expectation, and a `new` case does not, so it cannot pass before its rule is built. The
-lane that builds a rule turns the case into a test of its own engine and takes its `today` out.
+It checks that every case is named on the page and well formed. A coverage case's `today` is what
+the manifest says without a model (`checkpoint_manifest(state)`, as for a save), which the page
+keeps as it was, so it is still run here as a pin of that rule. The records cases are built in the
+Python detectors (lane AC1, Nov 21, 2026): each is held to its `expected`, and its `today`, what
+the detector answered before, is kept in `cases.json` as the record of what changed. Each coverage
+case is run through a session against its `expected` in `test_lane_ac1_checkpoint.py`.
 """
 
 from __future__ import annotations
@@ -81,16 +83,16 @@ def test_a_coverage_case_states_what_the_manifest_says_today(name, body):
 
 
 @pytest.mark.parametrize("name,body", RECORDS, ids=[n for n, _ in RECORDS])
-def test_a_records_case_states_what_the_python_detector_says_today(name, body):
+def test_a_records_case_is_what_the_python_detector_says(name, body):
     found = detect_resume_state([dict(record) for record in body["records"]])[1]
-    today = {"fires": found is not None, **({"findings": found["changes"][0]["findings"]} if found else {})}
-    assert today == body["today"]
+    answer = {"fires": found is not None, **({"findings": found["changes"][0]["findings"]} if found else {})}
     expected = body["expected"]
-    same = (today["fires"] == expected["fires"] and today.get("findings", []) == expected.get("findings", [])
-            and expected["checkpoint_tensors"] is None)
-    assert same == (body["status"] == "pin")
-    # The evidence has no such block before the page is built, for any capture.
-    assert "checkpoint_tensors" not in ev.build_evidence(body["records"], detectors="python")
+    assert answer == {"fires": expected["fires"], **({"findings": expected["findings"]} if expected["fires"] else {})}
+    # A pin's `today` was already its expectation; a new case's was not, so this lane changed it.
+    was = body["today"]["fires"] == expected["fires"] and body["today"].get("findings", []) == expected.get(
+        "findings", []) and expected["checkpoint_tensors"] is None
+    assert was == (body["status"] == "pin")
+    assert ev.build_evidence(body["records"], detectors="python").get("checkpoint_tensors") == expected["checkpoint_tensors"]
 
 
 def test_a_finding_names_what_its_record_names():

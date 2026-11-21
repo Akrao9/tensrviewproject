@@ -20,7 +20,9 @@ first step) is never dated again.
   was drawn before: repeated or skipped). The second says what the resume did not bring
   back: components the checkpoint did not hold, an optimizer that starts empty or with its
   step counter at 1, a scheduler whose `last_epoch` is far from the step, a loss scale back
-  at its initial value. Both are observations: some resumes do these things on purpose.
+  at its initial value, and, where the load compared the checkpoint's tensors with the model
+  (`tensors`, CHECKPOINT_TENSOR_CONTRACT.md), trainable tensors not in it or held with another
+  shape. Both are observations: some resumes do these things on purpose.
 """
 
 from __future__ import annotations
@@ -356,11 +358,64 @@ def _state_findings(
         if scale == first_scale and previous_scale != first_scale:
             findings.append({"component": "scaler", "finding": "initial_scale", "scale": scale,
                              "expected_scale": previous_scale})
+    # Then the tensors the load compared with the model (CHECKPOINT_TENSOR_CONTRACT.md, section 4):
+    # from a load only, and only where it compared.
+    tensors = load_tensors(load) if source == "load" else None
+    if tensors is not None and tensors.get("state") == "compared":
+        for key, finding in TENSOR_FINDINGS:
+            listed = tensor_list(tensors.get(key))
+            if listed is not None:
+                findings.append({"component": "model", "finding": finding, **listed_as(listed, "tensors")})
     return findings, source, checked
 
 
+# The lists of a load's `tensors` that raise, and the finding each gives; the five the evidence
+# passes on (`missing_frozen`, `missing_buffers` and `unexpected` raise nothing).
+TENSOR_FINDINGS = (("missing", "missing_tensors"), ("shape_differs", "shape_differs"))
+TENSOR_LISTS = ("missing", "missing_frozen", "missing_buffers", "unexpected", "shape_differs")
+_TENSOR_FIELDS = ("state", "why", "entry", "by", "model", "trainable", "checkpoint", "matched")
+
+
+def load_tensors(load: Any) -> Mapping[str, Any] | None:
+    """A load manifest's `tensors`, when it is an object."""
+    tensors = load.get("tensors") if isinstance(load, Mapping) else None
+    return tensors if isinstance(tensors, Mapping) else None
+
+
+def tensor_list(value: Any) -> tuple[int, list[Any]] | None:
+    """A list of `tensors` as `(count, names)`, read only when its `count` is a positive whole
+    number; names that are not a list are read as none."""
+    if not isinstance(value, Mapping):
+        return None
+    count = value.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        return None
+    names = value.get("names")
+    return count, list(names) if isinstance(names, list) else []
+
+
+def listed_as(listed: tuple[int, list[Any]], names_key: str) -> dict[str, Any]:
+    return {"count": listed[0], names_key: listed[1]}
+
+
+def tensor_entry(step: int, rank: Any, attempt: Any, tensors: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The evidence's `checkpoint_tensors` entry for one judged resume: its step, rank and attempt,
+    the fields the record has, and each list read as its count and names. None when `state` is
+    neither `compared` nor `unavailable`."""
+    if tensors.get("state") not in ("compared", "unavailable"):
+        return None
+    out: dict[str, Any] = {"step": step, "rank": rank, "attempt": attempt}
+    out.update({key: tensors[key] for key in _TENSOR_FIELDS if key in tensors})
+    for key in TENSOR_LISTS:
+        listed = tensor_list(tensors.get(key))
+        if listed is not None:
+            out[key] = listed_as(listed, "names")
+    return out
+
+
 def detect_resume_state(
-    records: list[dict[str, Any]], *, not_checked: list[dict[str, Any]] | None = None
+    records: list[dict[str, Any]], *, not_checked: list[dict[str, Any]] | None = None,
+    tensors: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """`resume_data_mismatch` and `resume_incomplete` over every attempt
     (`load_records(..., all_attempts=True)`), or None for either.
@@ -370,6 +425,8 @@ def detect_resume_state(
     as it stood before that attempt (every earlier attempt with each rollback applied) is
     the reference. A resume that cannot be compared is listed in `not_checked`, only for a run
     that records the field at all, so a run without data or checkpoint capture adds nothing.
+    Each judged resume whose load recorded a `tensors` object that is `compared` or
+    `unavailable` is added to `tensors` (`tensor_entry`), whether or not anything fires.
     """
     by_rank: dict[Any, dict[int, dict[int, dict[str, Any]]]] = {}
     for record in records:
@@ -416,6 +473,10 @@ def detect_resume_state(
                 findings, source, checked = _state_findings(
                     first, resumed_at, run_start, saved, len(set(lrs.values())) > 1, first_scale, previous_scale
                 )
+                loaded = load_tensors(first["checkpoint"].get("load")) if (
+                    tensors is not None and source == "load") else None
+                if loaded is not None and (found := tensor_entry(resumed_at, rank, attempt, loaded)) is not None:
+                    tensors.append(found)
                 if findings:
                     change: dict[str, Any] = {"step": resumed_at, "rank": rank, "attempt": attempt, "source": source,
                                               "findings": findings}
