@@ -1390,9 +1390,11 @@ class Session:
         f32 = {"dtype": torch.float32, "device": self.device}
         self._act = torch.zeros(n_layers, _SEEN + 1, **f32)
         self._stat_idx = torch.arange(_SEEN + 1, dtype=torch.int64, device=self.device)
-        # gradient norm, seen, weight norm, weight unchanged since the previous record
-        # (1 = exactly unchanged, 0 = changed, -1 = not known)
-        self._grad = torch.zeros(n_params, 4, **f32)
+        # gradient norm, seen, and with the weight check on, weight norm, weight unchanged since the
+        # previous record (1 = exactly unchanged, 0 = changed, -1 = not known). Only the columns of the
+        # signals that are on (lane AD3): without the weight check its two columns are not made, so
+        # `_decode` reads the width from the block, never from this session.
+        self._grad = torch.zeros(n_params, 4 if weight_every > 0 else 2, **f32)
         # Float64 weight norms of the previous record, to tell exactly whether a step changed
         # each weight. A float32 norm misses the few-element changes typical of bf16 weights
         # under small updates. Apple MPS has no float64, so there only float32 norms are kept.
@@ -1414,7 +1416,12 @@ class Session:
             for name, spec in self._routers.items()
         }
         self._ring_act = torch.zeros(every, n_layers, _SEEN + 1, **f32)
-        self._ring_grad = torch.zeros(every, *self._grad.shape, **f32)
+        # The ring's gradient rows. In the router-only mode, which reads no gradient on its own, none
+        # are made until a step whose gradients were read by hand (`record_grads`) is committed
+        # (`_grad_ring`); before lane AD3 they were `every` rows of four floats a parameter whatever was on.
+        self._ring_grad: torch.Tensor | None = (
+            torch.zeros(every, *self._grad.shape, **f32) if grad_every > 0 or weight_every > 0 else None
+        )
         self._ring_grad_seen: list[bool] = []
         self._ring_weight_seen: list[Any] = []  # False, or the weight check's optimizer ownership and dtypes
         # Squared total gradient norm reported by gradient clipping this step (summed over
@@ -2219,6 +2226,13 @@ class Session:
                 )
         self._grads_recorded = True
 
+    def _grad_ring(self) -> torch.Tensor:
+        """The ring's gradient rows, made the first time a step with gradients read is committed in
+        the router-only mode (`record_grads` called by hand); made at `init` in every other mode."""
+        if self._ring_grad is None:
+            self._ring_grad = torch.zeros(self.every, *self._grad.shape, dtype=self._grad.dtype, device=self._grad.device)
+        return self._ring_grad
+
     def _grad_not_read(self, index: int, why: str) -> None:
         """Keep why parameter `index`'s gradient was not read, for `grads_not_read` (`_flush`)."""
         self._grad_why.setdefault(self.param_names[index], why)
@@ -2996,13 +3010,13 @@ class Session:
         hooked = ([self._act] if has_act else []) + self._counts_list
         hooked_versions = [buf._version for buf in hooked]
         if has_act and self._grads_recorded:
-            torch._foreach_copy_((self._ring_act[row], self._ring_grad[row]), (self._act, self._grad))
+            torch._foreach_copy_((self._ring_act[row], self._grad_ring()[row]), (self._act, self._grad))
             torch._foreach_zero_((self._act, self._grad))
         elif has_act:
             self._ring_act[row].copy_(self._act)
             self._act.zero_()
         elif self._grads_recorded:
-            self._ring_grad[row].copy_(self._grad)
+            self._grad_ring()[row].copy_(self._grad)
             self._grad.zero_()
         self._ring_grad_seen.append(self._grads_recorded)
         self._ring_weight_seen.append(
@@ -3226,9 +3240,11 @@ class Session:
         self._param_ids = {id(p) for p in self._params}
         self._param_index = {id(p): index for index, p in enumerate(self._params)}
         self._grad = torch.cat([self._grad, self._grad.new_zeros(k, self._grad.shape[1])])
-        self._ring_grad = torch.cat(
-            [self._ring_grad, self._ring_grad.new_zeros(self._ring_grad.shape[0], k, self._ring_grad.shape[2])], dim=1
-        )
+        if self._ring_grad is not None:
+            self._ring_grad = torch.cat(
+                [self._ring_grad, self._ring_grad.new_zeros(self._ring_grad.shape[0], k, self._ring_grad.shape[2])],
+                dim=1,
+            )
         if self.updates:
             self._update = torch.cat([self._update, self._update.new_zeros(k, self._update.shape[1])])
             self._ring_update = torch.cat(
@@ -3288,7 +3304,7 @@ class Session:
             return
         # One transfer for the float statistics, one for the integer expert counts.
         has_act = self._act.numel() > 0
-        has_grads = any(self._ring_grad_seen) and self._grad.numel() > 0
+        has_grads = any(self._ring_grad_seen) and self._grad.numel() > 0 and self._ring_grad is not None
         if has_act and has_grads:
             floats: torch.Tensor | None = torch.cat(
                 [self._ring_act[:n].reshape(-1), self._ring_grad[:n].reshape(-1)]
@@ -3450,7 +3466,8 @@ class Session:
             block["scalars"] = _scalars_to_cpu(self._ring_scalars)
         if "update" in dirty:
             block["updates"] = _cpu_copy(self._ring_update[:1])
-        if "grad" in dirty and block["floats"] is not None:
+        if "grad" in dirty and block["floats"] is not None and self._ring_grad is not None:
+            # Marked only by a weight check read again (`_follow`), so the rows are four wide here.
             weights = block["floats"][held["act_size"] :].view(-1, 4)
             weights[:, 2:] = self._ring_grad[0, :, 2:].cpu()
         update_why = {name: why for name, why in self._update_why.items() if name not in self._update_why_written}
@@ -3811,9 +3828,11 @@ class Session:
             if n_layers > 0 and floats is not None
             else None
         )
+        # Two columns a parameter, or four with the weight check (`Session.__init__`): read from the
+        # block's own size, so a block is decoded as it was made.
         grad = (
-            floats[split:].reshape(n, n_params, 4).tolist()
-            if any(grad_seen) and n_params > 0 and floats is not None
+            floats[split:].reshape(n, n_params, -1).tolist()
+            if any(grad_seen) and n_params > 0 and floats is not None and floats.numel() > split
             else None
         )
         spread_rows = (
@@ -3845,7 +3864,7 @@ class Session:
         records = []
         for i, step in enumerate(steps):
             grad_norms = (
-                {name: norm for name, (norm, seen, _, _) in zip(names, grad[i]) if seen}
+                {name: row[0] for name, row in zip(names, grad[i]) if row[1]}
                 if grad is not None and grad_seen[i]
                 else {}
             )

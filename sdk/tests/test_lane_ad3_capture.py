@@ -316,3 +316,94 @@ def test_router_counts_under_aot_and_inductor_match_eager_and_make_no_matrix(dev
     assert [r["moe"]["router"] for r in records] == [r["moe"]["router"] for r in eager]
     assert [r["moe_unassigned"]["router"] for r in records] == [r["moe_unassigned"]["router"] for r in eager]
     assert largest.largest <= TOKENS * K * 2
+
+
+# --- The ring allocates only the signals that are on -----------------------------------------------
+
+
+class _Two(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList([nn.Sequential(nn.Linear(4, 4), nn.ReLU()) for _ in range(2)])
+        self.out = nn.Linear(4, 1)
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return self.out(x).pow(2).mean()
+
+
+def _steps(model, n, optimizers):
+    for _ in range(n):
+        model(torch.randn(3, 4)).backward()
+        for opt in optimizers:
+            opt.step()
+        for opt in optimizers:
+            opt.zero_grad()
+
+
+def _router_net():
+    torch.manual_seed(0)
+    return _Net(lambda logits: logits)
+
+
+def _router_steps(model, n):
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    for _ in range(n):
+        model(torch.randn(6, 20, 4)).backward()
+        opt.step()
+        opt.zero_grad()
+
+
+ROUTER = {"router": Router(E, K)}
+
+
+def test_the_router_only_mode_makes_no_gradient_rows_in_the_ring():
+    model = _router_net()
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=8, capture="routers", routers=ROUTER)
+    assert session._ring_grad is None  # before: 8 rows of four floats for each of 5 parameters
+    _router_steps(model, 3)
+    assert session._ring_grad is None
+    session.close()
+    assert [r["step"] for r in sink.records] == [0, 1, 2]
+    assert all(r["grad_norms"] == {} and r["grad_norm"] is None and "weight_norms" not in r for r in sink.records)
+    assert all(sum(r["moe"]["router"]) == TOKENS * K for r in sink.records)
+
+
+def test_gradients_read_by_hand_in_the_router_only_mode_are_still_recorded():
+    model = _router_net()
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=4, capture="routers", routers=ROUTER, auto_step=False)
+    assert session._ring_grad is None
+    for step in range(3):
+        model(torch.randn(6, 20, 4)).backward()
+        if step == 1:
+            session.record_grads()
+        session.step()
+        model.zero_grad()
+    assert session._ring_grad is not None and session._ring_grad.shape == (4, 5, 2)
+    session.close()
+    records = sink.records
+    assert [bool(r["grad_norms"]) for r in records] == [False, True, False]
+    expected = {"embed.weight", "embed.bias", "head.weight", "head.bias"}  # the router's output is not in the loss
+    assert set(records[1]["grad_norms"]) == expected and records[1]["grad_norm"] > 0
+
+
+def test_gradients_without_the_weight_check_take_two_columns_and_read_as_before():
+    model = _Two()
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=3, grads=True, weights=False, layers="blocks")
+    assert session._ring_grad.shape == (3, 6, 2) and session._grad.shape == (6, 2)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    norms = []
+    for _ in range(5):
+        model(torch.randn(3, 4)).backward()
+        norms.append({n: float(p.grad.norm()) for n, p in model.named_parameters()})
+        opt.step()
+        opt.zero_grad()
+    session.close()
+    assert [r["step"] for r in sink.records] == list(range(5))
+    for record, expected in zip(sink.records, norms):
+        assert record["grad_norms"] == pytest.approx(expected, rel=1e-6)
+        assert "weight_norms" not in record and set(record["layers"]) == {"blocks.0", "blocks.1"}
