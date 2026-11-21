@@ -55,6 +55,7 @@ from .evidence import (
     ALL_RANKS_VIEW,
     ATTN_KINDS,
     HEAD_NUMBERS,
+    NO_PEER_WORDS,
     SERVER_KINDS,
     _attention_values,
     _discover_rank_folders,
@@ -63,6 +64,7 @@ from .evidence import (
     all_ranks_evidence,
     all_ranks_kinds,
     build_evidence,
+    check_one_run,
     incident_class,
     incident_summary,
     kinds_by_value,
@@ -386,6 +388,14 @@ class Source:
                 records = sorted(read(), key=lambda r: int(r["step"]))
             except (KeyError, TypeError, ValueError) as error:
                 raise ToolError(f"the records under {where} are not TensorQuill step records ({error!r}).") from None
+            # A series is of one run: records of several run IDs are refused, as list_incidents and
+            # get_incident refuse them through the detectors (lane AD5, Nov 21, 2026: the series held
+            # both runs' rows, a step twice where both had it). The refusal is the readers' common
+            # answer today, not a ruling on whether one run should be picked instead.
+            try:
+                check_one_run(records)
+            except ValueError as error:
+                raise ToolError(f"rank {picked}'s step records in {where} cannot give a series: {error}.") from None
             return records, _names(records)
 
         records, names = self._keep(("records", where, picked), stamp, index)
@@ -682,6 +692,66 @@ def _rank_dropped(dropped: Mapping[str, Any] | None, rank: int) -> dict[str, Any
     return None
 
 
+# What the evidence says beside its incidents that an agent with only these tools could not see
+# (L29, lane AD5, Nov 21, 2026): each under the evidence's own key and in its shape, only where the
+# evidence has it, and as the evidence caps it. One rank's evidence has `skipped_updates` and
+# `checkpoint_tensors`; the all-ranks view has `skipped_updates_by_rank` and
+# `checkpoint_tensors_by_rank` (STEP_AND_EVIDENCE_CONTRACT.md, section 1;
+# CHECKPOINT_TENSOR_CONTRACT.md, section 4).
+EVIDENCE_BLOCKS = ("skipped_updates", "skipped_updates_by_rank", "checkpoint_tensors", "checkpoint_tensors_by_rank")
+# Of a kind's entry in `kind_checks`, what `kinds` (names by value) leaves out: the parameters a
+# stall did not judge for want of their gradient, and the replica observations' coverage. And the
+# entry's `note` when it is the words for a rank with no peer (contract, section 2); a kind's other
+# notes are not carried.
+KIND_CHECK_KEYS = ("parameters_not_judged", "coverage")
+# The blocks an incident's own answer carries, by its kind: what bears on reading that incident.
+_SKIPS = ("skipped_updates", "skipped_updates_by_rank")
+INCIDENT_BLOCKS = {
+    "resume_incomplete": ("checkpoint_tensors", "checkpoint_tensors_by_rank"),
+    **{kind: _SKIPS for kind in ("non_finite", "grad_spike", "update_spike", "stalled_weights", "loss_scale_trouble")},
+}
+
+
+def _kind_check_keys(evidence: Mapping[str, Any], kinds: Iterable[Any] | None = None) -> dict[str, Any] | None:
+    """`{kind: {...}}`: of each kind's entry in the evidence's `kind_checks` (of `kinds`, when
+    given), the keys of `KIND_CHECK_KEYS` it has and its `note` when it is `NO_PEER_WORDS`, as the
+    entry has them; None when no entry has any, so the answer has no such key."""
+    checks = evidence.get("kind_checks")
+    if not isinstance(checks, Mapping):
+        return None
+    wanted = set(kinds) if kinds is not None else None
+    found: dict[str, Any] = {}
+    for kind, check in checks.items():
+        if not isinstance(check, Mapping) or (wanted is not None and kind not in wanted):
+            continue
+        kept = {key: copy.deepcopy(check[key]) for key in KIND_CHECK_KEYS if key in check}
+        if check.get("note") == NO_PEER_WORDS:
+            kept["note"] = NO_PEER_WORDS
+        if kept:
+            found[kind] = kept
+    return found or None
+
+
+def _carry_blocks(evidence: Mapping[str, Any], answer: dict[str, Any], keys: Iterable[str] = EVIDENCE_BLOCKS,
+                  ranks: Iterable[Any] | None = None) -> None:
+    """Put the evidence's blocks of `keys` into `answer`, copied, each only where the evidence has
+    it. `ranks` keeps an all-ranks list's entries of those ranks only, with no key when none is
+    left. An all-ranks list has one entry a judged rank, so it is listed up to `PER_RANK_ROWS`
+    entries, with `<key>_omitted` counting the rest (`rank=` gives any rank's), as the dropped
+    rows' ranks are. The evidence is the kept one, so nothing of it is changed."""
+    wanted = set(ranks) if ranks is not None else None
+    for key in keys:
+        value = evidence.get(key)
+        if isinstance(value, Mapping) and value:
+            answer[key] = copy.deepcopy(dict(value))
+        elif isinstance(value, list) and value:
+            kept = [e for e in value if isinstance(e, Mapping) and (wanted is None or e.get("rank") in wanted)]
+            if kept:
+                answer[key] = copy.deepcopy(kept[:PER_RANK_ROWS])
+            if len(kept) > PER_RANK_ROWS:
+                answer[f"{key}_omitted"] = len(kept) - PER_RANK_ROWS
+
+
 def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]:
     rank = _integer(arguments, "rank", minimum=0)
     limit = _integer(arguments, "limit", minimum=1, maximum=MAX_INCIDENTS) or DEFAULT_INCIDENTS
@@ -737,6 +807,12 @@ def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, An
         # whose sums overflow), wherever the evidence has them (L15, lane Y3): one rank's evidence
         # built from its records. No key where it has none, so other answers stay as they were.
         answer["head_trends"] = evidence["head_trends"]
+    # L29 (lane AD5): skipped updates, the checkpoint's tensors, and what `kinds` leaves out of a
+    # kind's entry. With `rank` on a run folder, that rank's entries of the all-ranks lists.
+    _carry_blocks(evidence, answer, ranks=[rank] if opened["shape"] == "all_ranks" and rank is not None else None)
+    kind_keys = _kind_check_keys(evidence)
+    if kind_keys is not None:
+        answer["kind_checks"] = kind_keys
     summary = _summary(evidence)
     if summary:
         answer["summary"] = summary
@@ -874,6 +950,14 @@ def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
     elif entry.get("run_level"):
         answer["ranks"] = {"on_ranks": "the run as a whole"}
     answer["incident"] = incident
+    # L29 (lane AD5): what the evidence says beside this incident that bears on it, by its kind: the
+    # skipped updates, the checkpoint's tensors, and its own kind's entry's keys `kinds` leaves out.
+    # An all-ranks list keeps the ranks that show the incident.
+    _carry_blocks(opened["evidence"], answer, INCIDENT_BLOCKS.get(str(incident.get("kind")), ()),
+                  ranks=(group.get("ranks") or []) if group is not None else None)
+    kind_keys = _kind_check_keys(opened["evidence"], [incident.get("kind")])
+    if kind_keys is not None:
+        answer["kind_checks"] = kind_keys
     if incident.get("kind") == "moe_imbalance":
         sample = _sample_context(opened["evidence"], incident)
         if sample is not None:
@@ -1326,6 +1410,12 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
         ]
     else:
         answer["per_rank_note"] = f"{len(rows)} ranks: pass rank= for one rank's entry"
+    # L29 (lane AD5): each judged rank's skipped updates and checkpoint tensors, and what `kinds`
+    # leaves out of a kind's entry for the run (replica coverage, the no-peer words).
+    _carry_blocks(evidence, answer, ranks=[rank] if rank is not None else None)
+    kind_keys = _kind_check_keys(evidence)
+    if kind_keys is not None:
+        answer["kind_checks"] = kind_keys
     summary = _summary(evidence)
     if summary:
         answer["summary"] = summary
@@ -1336,7 +1426,7 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
 
 _ROW_KEYS = ("project", "name", "run_id", "group", "tags", "has_manifest", "source", "started", "run_state", "last_step",
              "incidents", "first_incident", "kinds_checked", "ranks", "evidence", "rank_count", "ranks_with_incidents",
-             "kinds_not_stated", "rank_count_not_known", "end", "dropped_rows", "refused_batches")
+             "kinds_not_stated", "rank_count_not_known", "end", "dropped_rows", "refused_batches", "freshness")
 _BOUNDED_ROW_KEYS = ("dropped_rows", "refused_batches")  # their ranks listed up to PER_RANK_ROWS
 
 
@@ -1400,6 +1490,50 @@ def compare_runs(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
 
 # --- The tools, as the protocol lists them --------------------------------------------------
 
+# What the L29 blocks mean, and what their absence means, said once for the three tools (lane AD5).
+_SKIPS_WORDS = (
+    "`skipped_updates`, only where a step record says who skipped an update: the updates skipped by who"
+    " reported them (`caller`, `scaler`, `both`) and, under `non_finite_gradients` (`steps`, `first_step`,"
+    " `gradients`), the steps where a skip the caller reported had a gradient that was not finite. Such a"
+    " gradient raises no incident (a skipped update is not judged on its gradient), so this is the only place it"
+    " shows. With no key, no record says who skipped an update: none was skipped, or the capture was written"
+    " before that was recorded."
+)
+_TENSORS_WORDS = (
+    " `checkpoint_tensors`, only where a judged resume's load recorded what it found of the checkpoint's tensors:"
+    " `resumes` counts those loads and `entries` gives the first five by step, each with its `step`, `rank`,"
+    " `attempt` and `state`. `compared` means the checkpoint entry named by `entry` was matched with the model's"
+    " tensors (`by` says how the entry was found; `model`, `trainable`, `checkpoint`, `matched` count them; `missing`, `missing_frozen`, `missing_buffers`,"
+    " `unexpected` and `shape_differs` each give a `count` and `names`); `unavailable` means they could not be,"
+    " and `why` says why (for example a folder, an ambiguous source, a model state not identified). No"
+    " resume_incomplete incident means every trainable tensor was there only for a resume whose entry says"
+    " `compared`. With no key, no load recorded its tensors, so nothing is said of them."
+)
+_BY_RANK_WORDS = (
+    " For a run folder they are `skipped_updates_by_rank` and `checkpoint_tensors_by_rank`: one entry"
+    " (`{\"rank\", ...}`) for each judged rank whose report has the block, listed up to"
+    f" {PER_RANK_ROWS} (`skipped_updates_by_rank_omitted` or `checkpoint_tensors_by_rank_omitted` counts the rest),"
+    " and with `rank`, that rank's entry only; a rank with no entry has no such block, and a rank that is not"
+    " judged is in neither."
+)
+_KIND_KEYS_WORDS = (
+    " `kind_checks`, only for kinds whose entry has one of them, gives what `kinds` leaves out of the entry:"
+    " `stalled_weights.parameters_not_judged`, the parameters whose gradient could not be read, so no stall was"
+    " looked for on them (the kind is still checked on the rest); `replica_drift.coverage`, how many of the ranks'"
+    " replica step entries compared fingerprints (`steps`, `compared`), the ranks missing from any"
+    " (`missing_ranks`), and the latest steps not compared with why (`not_compared`, `not_compared_omitted` the"
+    f" rest); and `note` \"{NO_PEER_WORDS}\" on a cross-rank kind (`duplicate_batches`, `replica_drift`) that saw"
+    " one rank and had no other to compare it with, which is why it reads not_configured. With no `kind_checks`,"
+    " no kind's entry has any of these."
+)
+_INCIDENT_BLOCKS_WORDS = (
+    " By its kind, and only where the evidence has them, it also carries what bears on it, as list_incidents"
+    " describes each: `skipped_updates` for non_finite, grad_spike, update_spike, stalled_weights and"
+    " loss_scale_trouble, `checkpoint_tensors` for resume_incomplete (for a run folder the `_by_rank` lists, of the"
+    " ranks that show the incident), and `kind_checks` with its own kind's `parameters_not_judged`, `coverage` or"
+    " the no-peer `note`."
+)
+
 _RANK = {
     "type": "integer", "minimum": 0,
     "description": "The rank to read, when the path holds several. Default: the path's own rank, else the lowest.",
@@ -1434,7 +1568,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " For a local .jsonl file, `run_end` says whether its session closed it: any state but `closed` means not"
             " known to have finished (still running, killed or never closed look the same)."
             " Where one rank's evidence has them, `head_trends` gives the probe's language-model head numbers over"
-            " the run: values with no threshold, never an incident (get_series with kind head gives each probe's)."
+            " the run: values with no threshold, never an incident (get_series with kind head gives each probe's). "
+            + _SKIPS_WORDS + _TENSORS_WORDS + _BY_RANK_WORDS + _KIND_KEYS_WORDS
         ),
         "inputSchema": {
             "type": "object",
@@ -1455,7 +1590,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " detector recorded, what its class means, the ranks that show it, for an MoE incident the sample it"
             " points at (largest expert shares, and the sample before; from compact evidence that left the steps"
             " between out, the last earlier one it keeps is `previous_kept_sample` instead), and the get_series"
-            " calls that show the data behind it, with the rank to read."
+            " calls that show the data behind it, with the rank to read." + _INCIDENT_BLOCKS_WORDS
         ),
         "inputSchema": {
             "type": "object",
@@ -1484,7 +1619,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " maximum (with their steps) and median over every recorded step in the range, so a one-step spike is"
             " not lost. Narrow `start` and `end` to see each step. Numbers have six significant digits; a NaN or"
             ' Inf is the string "nan", "inf" or "-inf". A router\'s series from compact evidence that left steps'
-            " out says under `compact` which steps it covers."
+            " out says under `compact` which steps it covers. A rank's records that hold more than one run ID are"
+            " refused with the IDs, as list_incidents refuses them: a series is of one run."
         ),
         "inputSchema": {
             "type": "object",
@@ -1537,6 +1673,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " and in the `rank` entry). A count of batches, not rows, never added to `dropped_rows`; the same batch"
             " sent again is not counted again. With no key, none was refused."
             " `rank` gives one rank's entry in full. On one rank's capture or evidence file this is an error that says so."
+            " Each judged rank's skipped updates and checkpoint tensors, as list_incidents describes them for one rank:"
+            + _BY_RANK_WORDS + " " + _SKIPS_WORDS.replace("`skipped_updates`", "A rank's `skipped_updates`", 1)
+            + _TENSORS_WORDS.replace(" `checkpoint_tensors`", " A rank's `checkpoint_tensors`", 1) + _KIND_KEYS_WORDS
         ),
         "inputSchema": {
             "type": "object",
@@ -1567,7 +1706,13 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " after a lost acknowledgement is counted again. No key means none was dropped. `refused_batches`, on a"
             " store run's row only when the server refused whole batches of it because a key column was missing or of"
             " another type: how many batches in all, by key column and by rank, never added to `dropped_rows`. No key"
-            " means none was refused."
+            " means none was refused. `freshness`, on a local run's row only when its evidence files do not cover the"
+            " newest step its records reach: `current` false, `judged_to_step` (the step the evidence says it judged to,"
+            " null when the file does not name one, as a file the command line writes does not), `records_to_step` and"
+            " `why`. With `why` `records_newer` the row's state and incidents are the evidence's, as of that judgment, and"
+            " say nothing of the steps after it; with `nothing_judged` (the evidence judged no step) or"
+            " `thresholds_changed` no earlier result is shown and the state is unknown. No key means the evidence covers"
+            " the newest step (a store's row never has it: a rank whose report is behind its stored parts is unknown)."
         ),
         "inputSchema": {
             "type": "object",

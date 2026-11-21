@@ -1014,7 +1014,8 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_
     except (OSError, ValueError, ImportError) as error:  # ImportError: a store's parts need pyarrow
         return {"state": "no_records", "detail": f"the step records could not be read for where the runs part ({error})"}
     left_out = {label: [rank] for label, rank, (_, torn) in zip(labels, ranks, read) if torn}
-    found = first_divergence(read[0][0], read[1][0], rank=ranks[0])
+    # Resolved already (`_step_records`): not resolved a second time (lane AD5).
+    found = first_divergence(read[0][0], read[1][0], rank=ranks[0], resolved=True)
     lines = divergence_summary(found)
     series = found.get("series") or {}
     kept = {name: entry for name, entry in series.items() if entry.get("status") != "agrees"}
@@ -1131,7 +1132,7 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
                 torn_in.setdefault(label, []).append(rank)
         pair = [records for records, _ in read]
         del read
-        found = first_divergence(pair[0], pair[1], rank=rank)
+        found = first_divergence(pair[0], pair[1], rank=rank, resolved=True)  # `_step_records` resolved them
         summaries[rank] = divergence_summary(found)
         series = found.get("series") or {}
         answers[rank] = {**found, "series": {name: e for name, e in series.items() if e.get("status") != "agrees"},
