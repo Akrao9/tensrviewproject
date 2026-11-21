@@ -3067,12 +3067,21 @@ def checked_line(evidence: Mapping[str, Any]) -> str | None:
     line = f"{counts['checked']} of {counts['kinds']} kinds checked"
     if counts["not_enough_history"]:
         checks, reported = evidence["kind_checks"], _reported_kinds(evidence)
-        each = []
-        for at, kind in enumerate(counts["not_enough_history_kinds"]):
+        each: list[str] = []
+        unit = False  # " records" after the first count only
+        for kind in counts["not_enough_history_kinds"]:
             seen, needed = checks[kind].get("records"), checks[kind].get("records_needed")
-            said = f"{kind} {seen} of {needed}" if seen is not None and needed is not None else kind
-            if at == 0 and " of " in said:
-                said += " records"
+            starting = checks[kind].get("starting_state")
+            if isinstance(starting, list) and starting and all(isinstance(r, Mapping) for r in starting):
+                # A router still in the state it started in (rules contract, part 3): the kind's
+                # records may be past its need, so their count would not say why it is short.
+                said = f"{kind}: " + ", ".join(
+                    f"router {r.get('router')} flagged since step 0 on {r.get('samples')} of {MOE_START_GRACE} samples"
+                    for r in starting)
+            else:
+                said = f"{kind} {seen} of {needed}" if seen is not None and needed is not None else kind
+                if not unit and " of " in said:
+                    said, unit = said + " records", True
             each.append(said + (" but reported by a faster rule" if kind in reported else ""))
         line += f", {counts['not_enough_history']} of them without enough history yet ({', '.join(each)})"
     if counts["history_not_stated"]:
@@ -7558,8 +7567,12 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
         sample = next((s for s in evidence.get("samples", ()) if isinstance(s, Mapping)
                        and s.get("step") == moe_incident.get("step") and s.get("layer") == moe_incident.get("layer")), None)
         moe: Mapping[str, Any] | None = {**sample, **moe_incident} if sample is not None else moe_incident
-    else:
+    elif "compact" not in evidence:
         moe = first_incident(evidence)
+    else:
+        # A compacted file keeps windows of samples, from which a starting state cannot be told
+        # from a later flag: with no incident listed, nothing is worked out again from what was kept.
+        moe = None
     if moe is not None:
         lines += _moe_lines(evidence, moe)
         source = moe_source_words(evidence).get(str(moe.get("router")))
