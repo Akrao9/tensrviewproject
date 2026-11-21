@@ -101,7 +101,8 @@
    "today": {
     "update_spike_step": 5,
     "clip_groups_entry": null,
-    "update_spike_check": "checked"
+    "update_spike_check": "checked",
+    "not_checked_checks": []
    }
   },
   "a_split_pair_whose_earlier_record_had_two_clip_calls": {
@@ -203,7 +204,8 @@
    "today": {
     "update_spike_step": 5,
     "clip_groups_entry": null,
-    "update_spike_check": "checked"
+    "update_spike_check": "checked",
+    "not_checked_checks": []
    }
   },
   "after_a_pair_that_is_not_compared_the_next_is": {
@@ -320,7 +322,8 @@
    "today": {
     "update_spike_step": 5,
     "clip_groups_entry": null,
-    "update_spike_check": "checked"
+    "update_spike_check": "checked",
+    "not_checked_checks": []
    }
   },
   "two_pairs_that_are_not_compared": {
@@ -435,7 +438,8 @@
    "today": {
     "update_spike_step": 5,
     "clip_groups_entry": null,
-    "update_spike_check": "checked"
+    "update_spike_check": "checked",
+    "not_checked_checks": []
    }
   },
   "every_pair_needs_a_split_and_none_is_compared": {
@@ -547,7 +551,120 @@
    "today": {
     "update_spike_step": null,
     "clip_groups_entry": null,
-    "update_spike_check": "checked"
+    "update_spike_check": "checked",
+    "not_checked_checks": []
+   }
+  },
+  "clip_groups_beside_other_entries": {
+   "section": 1,
+   "status": "new",
+   "says": "The same pair, in a run whose capture also said a parameter's gradient was not read. The `clip_groups` entry comes before `gradients` (and right after `update_size`, the other entry of `update_spike`, when there is one): one order from both engines.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.0,
+       "b": 0.5
+      },
+      "grads_not_read": {
+       "q": "sparse"
+      }
+     },
+     {
+      "step": 1,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.01,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.02,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.03,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 4,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.04,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 5,
+      "clip_grad_norm": 2.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8,
+       "c": 1.0
+      },
+      "update_rms": {
+       "a": 2.0,
+       "b": 0.5,
+       "c": 0.1
+      },
+      "clip_calls": 2
+     }
+    ],
+    "window": 3
+   },
+   "expected": {
+    "update_spike_step": null,
+    "clip_groups_entry": {
+     "check": "clip_groups",
+     "kinds": [
+      "update_spike"
+     ],
+     "comparisons": 1,
+     "compared": 4,
+     "step": 5
+    },
+    "not_checked_checks": [
+     "clip_groups",
+     "gradients"
+    ]
+   },
+   "today": {
+    "update_spike_step": 5,
+    "clip_groups_entry": null,
+    "update_spike_check": "checked",
+    "not_checked_checks": [
+     "gradients"
+    ]
    }
   },
   "a_pair_that_cannot_be_split_is_compared_whatever_the_clip_calls": {

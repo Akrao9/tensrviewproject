@@ -55,8 +55,8 @@ def _incident(evidence: dict, kind: str) -> dict | None:
 
 
 def test_the_cases_of_the_three_sections_are_all_here():
-    assert len(CASES) == 30
-    assert sum(body["status"] == "new" for body in CASES.values()) == 11
+    assert len(CASES) == 31
+    assert sum(body["status"] == "new" for body in CASES.values()) == 12
 
 
 # --- every case, through the detector and through `build_evidence` ---------------------------
@@ -88,8 +88,10 @@ def test_each_case_gives_its_expected_answer_through_build_evidence(name):
             assert check["value"] == expected.get("update_spike_check", "checked")
             if check["value"] == "unavailable":
                 assert (check["check"], check["reason"]) == ("clip_groups", words)
-            assert {"state": "degraded", "code": "not_checked", "checks": ["clip_groups"],
-                    "detail": "not checked: clip_groups"} in evidence["run_state"]["reasons"]
+            assert any(r["state"] == "degraded" and r["code"] == "not_checked" and "clip_groups" in r["checks"]
+                       for r in evidence["run_state"]["reasons"])
+            if "not_checked_checks" in expected:  # where the entry sits among the others (added at the trial merge)
+                assert [e["check"] for e in evidence["not_checked"]] == expected["not_checked_checks"]
     if "stalled_weights_step" in expected:
         hit = _incident(evidence, "stalled_weights")
         assert (None if hit is None else hit["step"]) == expected["stalled_weights_step"]
@@ -384,8 +386,7 @@ SENTENCE = ("The server received 12 row(s) whose step was not above a step it ha
             " and did not store them. A row sent again is counted again, so 12 is not a number of steps lost."
             " 12 distinct step(s) among them are confirmed to have arrived out of order inside one stored part, and"
             " are not stored. 12 is a lower bound: a late step that crosses a part boundary is not in it, so the same"
-            " rows can give another 12 when the parts are cut elsewhere. The other rows are not told apart from rows"
-            " sent again.")
+            " rows can give another 12 when the parts are cut elsewhere.")
 ZERO = ("The server received 3 row(s) whose step was not above a step it had already kept for their attempt, and"
         " did not store them. A row sent again is counted again, so 3 is not a number of steps lost. None is"
         " confirmed as a step that arrived out of order. The other rows are not told apart from rows sent again.")

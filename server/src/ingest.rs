@@ -2268,6 +2268,10 @@ fn batch_bytes(batch: &RecordBatch) -> Result<usize, Status> {
     Ok(bytes)
 }
 
+/// How long a stream whose request ended cleanly waits for its response to close before its ending
+/// is said (`do_put`): long enough for the transport to drop the response of a call that was reset.
+const RESPONSE_CLOSE_WAIT: Duration = Duration::from_millis(50);
+
 /// Says on stderr how a `DoPut` stream ended (`Ingest::stream_closed`), once: when its task gives the
 /// status, or, if the task panicked or was dropped before it could, when it goes.
 struct StreamEnd {
@@ -2360,6 +2364,16 @@ impl FlightService for IngestService {
             if let Some(key) = &end.key {
                 ingest.stream_ended(key, stream_id, result.is_ok());
                 ingest.detach(key, &ack).await;
+            }
+            if result.is_ok() && !ack.responses.is_closed() {
+                // The request ended with no error. A client whose deadline passed resets the call,
+                // which ends the request and drops the response, but the transport drops the
+                // response on its own task, a moment after this one sees the request end. Sampled at
+                // once, such a call read as a half-close about one time in four (seen at the trial
+                // of wave AE, on `main` and on the trial tree alike). So the response is given a
+                // bounded moment to close before the line says which it was. A true half-close
+                // waits it out: its response ends that much later, and nothing else changes.
+                let _ = tokio::time::timeout(RESPONSE_CLOSE_WAIT, ack.responses.closed()).await;
             }
             end.say(result.as_ref().err());
             if let Err(status) = result {

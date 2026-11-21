@@ -2,7 +2,7 @@
 
 **Approved by the author on Nov 21, 2026, all five for implementation, with amendments to items 1, 4 and 5, which are made here. Nothing on this page is built.** Amended the same day on the author's second word: this page's five readings stand, with one addition to section 1 (a run where no pair was compared), a condition on section 3's warning, and section 6 for late rows (L30), which the author chose then. It is on the branch `contracts/wave-ae`, cut from `265311c`, the base of wave AE. The Python detectors (`sdk/src/tensorquill/evidence.py`) and the server (`server/src/detect.rs`) build sections 1, 2 and 4 from this page and from the cases in `sdk/tests/fixtures/wave_ae/cases.json`, each from the cases alone, and must give each case's `expected`. The capture (`sdk/src/tensorquill/capture.py`) builds the record's side of sections 1, 3 and 4. Section 5 is the readers' and starts once lane AE1 has released their files.
 
-Each case is a **pin** (behaviour the base has and this page keeps; `sdk/tests/test_wave_ae_contract.py` runs it on every tree) or **new** (not built on the base; its `expected` is the target, and its `today` is a record of what `265311c` answers, written once by `make_cases.py` and never recomputed). 35 cases: 21 pins, 14 new. A new case's `expected` is written by hand from this page; the generator shows only that the base does not meet it.
+Each case is a **pin** (behaviour the base has and this page keeps; `sdk/tests/test_wave_ae_contract.py` runs it on every tree) or **new** (not built on the base; its `expected` is the target, and its `today` is a record of what `265311c` answers, written once by `make_cases.py` and never recomputed). 36 cases: 21 pins, 15 new. A new case's `expected` is written by hand from this page; the generator shows only that the base does not meet it.
 
 Three rules hold for every section:
 
@@ -32,6 +32,7 @@ Where this page states something the author's words do not, it says "this page's
 - The later record of a pair that was not compared is still the record the next one is compared with (`after_a_pair_that_is_not_compared_the_next_is`, new).
 - **What the evidence says.** When at least one pair was not compared, `not_checked` gains one entry: `{"check": "clip_groups", "kinds": ["update_spike"], "comparisons": N, "step": S, "reason": ...}`, with `N` the pairs not compared and `S` the step of the later record of the first such pair (`two_pairs_that_are_not_compared`, new). The entry also carries `compared`, the pairs that were compared. While `compared` is above zero `update_spike` stays `checked` in `kind_checks`. The author: "if every eligible comparison was suppressed, the reader must make clear that zero were judged". So with `compared` at zero the kind reads `unavailable`, with the entry's reason, and the reason says that none of the comparisons was made (`every_pair_needs_a_split_and_none_is_compared`, new). As any `not_checked` entry does, it makes the run read `degraded` (approved by the author: "A suppressed clip comparison may mark coverage degraded"). The reason's words: "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter, so N comparison(s) of update_spike were not made".
 - A run whose records carry `clip_calls` and whose pairs never need a split has no entry and no other difference.
+- **Where the entry sits** (added at the trial merge, where the two engines had each chosen a place): right after `update_size`, the other entry of `update_spike`, and before `gradients` (`clip_groups_beside_other_entries`, new).
 
 **The record's side, in the capture lane's tests.**
 
@@ -143,7 +144,7 @@ The server keeps a row only when its step is above the last step it kept for the
 
 ## RS10's transport, the author's word (Nov 21, 2026)
 
-"I approve the sender supplying its batch start and the server using it to identify the refused range. A refusal confirms only the range rejected; it does not acknowledge those bytes as stored." Final sign-off of the transport waits for the joined restart regression on the merged tree.
+"I approve the sender supplying its batch start and the server using it to identify the refused range. A refusal confirms only the range rejected; it does not acknowledge those bytes as stored." The joined restart regression passed on the merged tree, and the author then approved the transport: "RS10 transport is approved." Its wording is part 8 of `DETECTOR_RULES_CONTRACT.md`.
 
 ## Who builds what
 

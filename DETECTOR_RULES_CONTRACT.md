@@ -169,7 +169,20 @@ Cases, each from what is written on the wire to what a reader holds: `layers_not
 
 ## 8. RS10: what a refused batch does to its stream
 
-**Approved in intent by the author. The transport is not signed.** The intent: a batch refused for good is counted once, is not sent again, and never costs rows the server could have stored. How the server tells the sender is still open, and is settled by the tests below.
+**The transport is approved by the author (Nov 21, 2026, wave AE): "RS10 transport is approved."** The sender supplies the start of its batch, the server confirms the exact refused range, and the sender advances only when that range matches its own. The author on what a refusal means: "A refusal confirms only the range rejected; it does not acknowledge those bytes as stored." Built by lane AE1 and joined on the merged tree with the real server and the production sender, across a restart of the server by SIGTERM and by SIGKILL (`sdk/tests/test_wave_ad_trial.py`).
+
+**The refused range, as approved.** Before the status that ends a stream refused for a key column, the server writes one message on the acknowledgement channel: `{"end_byte_offset": K, "refused": {"start_byte_offset": S, "end_byte_offset": E, "column": C}, "store_id": ...}`. E is the end the refused batch named. S is where the refused batch began, as far as the server knows it, in this order:
+
+1. the end of the last batch of the stream that the server accepted;
+2. else the last offset the server acknowledged for the rank since it started;
+3. else the start the refused batch states in its metadata (`start_byte_offset`, which every batch of rows carries from wave AE on), when that is at least 0 and below E;
+4. else 0.
+
+K is what the server itself holds: S in the first two cases, and 0 in the last two. The server never acknowledges a byte on a sender's word. The empty batch that asks for the store states no start. The sender's rule is unchanged: its saved offset moves only when the server confirmed it stored the bytes, or named exactly a range S to E that the sender sent beginning at its last confirmed offset. A sender older than the stated start holds and sends again, as before.
+
+What follows is the page as it stood before the transport was built: its table's "today" is `eb5a71b`, and the open questions under it are answered by the above.
+
+**Approved in intent by the author, when this part was written.** The intent: a batch refused for good is counted once, is not sent again, and never costs rows the server could have stored. How the server tells the sender is still open, and is settled by the tests below.
 
 One rank sends a batch the server can store (A, 3 rows, ending at byte 300), a batch whose `step` column is of another type (B, 2 rows, to 500), and another it can store (C, 3 rows, to 800), then disconnects and returns.
 

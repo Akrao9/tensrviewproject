@@ -253,7 +253,7 @@ def page_sentence(rows: int, late: int) -> str:
                  f" so the same rows can give another {late} when the parts are cut elsewhere. ")
     else:
         text += "None is confirmed as a step that arrived out of order. "
-    return text + "The other rows are not told apart from rows sent again."
+    return text.rstrip() if late >= rows else text + "The other rows are not told apart from rows sent again."
 
 
 def store(source: Path, run: str, entries: dict[int, dict[str, Any]] | None = None, ranks: int = 3) -> Path:
@@ -431,6 +431,6 @@ def test_each_tool_description_says_what_each_number_is_and_is_not():
         assert "rows_not_newer" in said and "late_steps_confirmed" in said, name
         assert "a row sent again is counted again, so it is not a number of steps lost" in said, name
         assert "It is a lower bound: a late step that crosses a part boundary is not in it" in said, name
-        assert "The other rows are not told apart from rows sent again." in said, name
+        assert "The other rows, if any, are not told apart from rows sent again." in said, name
         assert "Neither count is added to `dropped_rows`." in said, name
     assert "several_run_ids" in tools["list_runs"]

@@ -83,6 +83,9 @@ class Model(nn.Module):
         if self.calls == 6:  # steps 0 to 4 have ended
             if sys.argv[1] == "error":
                 raise RuntimeError("boom in forward")
+            # Still training (the sixth forward), and able to take the signal: said before it is sent.
+            print("READY sigint handler=" + getattr(signal.getsignal(signal.SIGINT), "__name__", str(signal.getsignal(signal.SIGINT)))
+                  + " call=" + str(self.calls), flush=True)
             os.kill(os.getpid(), signal.SIGINT)  # a real Ctrl-C, as the terminal sends it
         return {"loss": (self.net(x).squeeze(-1) - labels).pow(2).mean()}
 
@@ -102,8 +105,15 @@ def test_a_process_that_ends_with_train_s_raise_writes_every_step_and_says_it_ra
     script.write_text(textwrap.dedent(_SCRIPT))
     env = {**os.environ, "PYTHONPATH": SRC + os.pathsep + os.environ.get("PYTHONPATH", "")}
     env.pop("TENSORQUILL_ENDPOINT", None)
+    # The child sends itself SIGINT while training. A process started with SIGINT ignored (a test
+    # run put in the background by a shell without job control, or under nohup) hands that on to
+    # its children, and CPython then installs no handler: the signal is dropped, training runs to
+    # its end and the child exits 0 (seen once at the trial of wave AE). So the child is started
+    # with the default disposition, whatever this process inherited, and says it was ready.
     done = subprocess.run([sys.executable, str(script), how], cwd=tmp_path, env=env, capture_output=True,
-                          text=True, timeout=300)
+                          text=True, timeout=300, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+    if how == "sigint":
+        assert "READY sigint handler=default_int_handler call=6" in done.stdout, (done.stdout, done.stderr)
     # What the raise does to the program is unchanged: its traceback, and its exit status
     # (1 for the error; for Ctrl-C, CPython ends by SIGINT, as a shell's 130 shows).
     if how == "error":

@@ -65,6 +65,8 @@ def _answer(body: dict, evidence: dict) -> dict:
         out["clip_groups_entry"] = None if not entries else ({k: entries[0].get(k) for k in want} if want else entries[0])
     if "update_spike_check" in expected:
         out["update_spike_check"] = evidence["kind_checks"]["update_spike"]["value"]
+    if "not_checked_checks" in expected:
+        out["not_checked_checks"] = [e.get("check") for e in evidence.get("not_checked", [])]
     if "stalled_weights_step" in expected:
         found = _incident(evidence, "stalled_weights")
         out["stalled_weights_step"] = None if found is None else found["step"]

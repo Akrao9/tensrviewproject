@@ -1657,14 +1657,14 @@ _NOT_NEWER_WORDS = (
     " is how many distinct steps among them are confirmed to have arrived out of order inside one stored part, and"
     " are not stored. It is a lower bound: a late step that crosses a part boundary is not in it, so the same rows"
     " can give another count when the parts are cut elsewhere. With no `late_steps_confirmed`, none is confirmed"
-    " as a step that arrived out of order. The other rows are not told apart from rows sent again. `note` says"
+    " as a step that arrived out of order. The other rows, if any, are not told apart from rows sent again. `note` says"
     " this with the numbers. Neither count is added to `dropped_rows`. With no key, the server reported no such row."
 )
 
 # What the L29 blocks mean, and what their absence means, said once for the three tools (lane AD5).
 _SKIPS_WORDS = (
     "`skipped_updates`, only where a step record says who skipped an update: the updates skipped by who"
-    " reported them (`caller`, `scaler`, `both`) and, under `non_finite_gradients` (`steps`, `first_step`,"
+    " reported them (`caller`, `scaler`, `both`), with `partial`, only when above zero, for the steps on which the scaler skipped some optimizers and applied others (counted there and under no other name; an update occurred on such a step) and, under `non_finite_gradients` (`steps`, `first_step`,"
     " `gradients`), the steps where a skip the caller reported had a gradient that was not finite. Such a"
     " gradient raises no incident (a skipped update is not judged on its gradient), so this is the only place it"
     " shows. With no key, no record says who skipped an update: none was skipped, or the capture was written"

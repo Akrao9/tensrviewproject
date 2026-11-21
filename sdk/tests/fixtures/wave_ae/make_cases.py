@@ -47,7 +47,8 @@ def update_spike(given: dict) -> dict:
                .get("not_checked", []) if e.get("check") == "clip_groups"]
     built = ev.build_evidence(given["records"], update_window=given.get("window", ev.UPDATE_WINDOW))
     return {"update_spike_step": None if found is None else found["step"], "clip_groups_entry": entries[0] if entries else None,
-            "update_spike_check": built["kind_checks"]["update_spike"]["value"]}
+            "update_spike_check": built["kind_checks"]["update_spike"]["value"],
+            "not_checked_checks": [e.get("check") for e in built.get("not_checked", [])]}
 
 
 def stalled(given: dict) -> dict:
@@ -144,6 +145,16 @@ case("every_pair_needs_a_split_and_none_is_compared", 1, "new",
      "nothing was judged, so nothing reads as clean.",
      given, {"update_spike_step": None, "clip_groups_entry": {**ENTRY, "comparisons": 5, "compared": 0, "step": 1},
              "update_spike_check": "unavailable"}, update_spike(given))
+
+rows = clip_rows({5: 2})
+rows[0]["grads_not_read"] = {"q": "sparse"}
+given = {"records": rows, "window": 3}
+case("clip_groups_beside_other_entries", 1, "new",
+     "The same pair, in a run whose capture also said a parameter's gradient was not read. The `clip_groups` entry "
+     "comes before `gradients` (and right after `update_size`, the other entry of `update_spike`, when there is "
+     "one): one order from both engines.",
+     given, {"update_spike_step": None, "clip_groups_entry": ENTRY, "not_checked_checks": ["clip_groups", "gradients"]},
+     update_spike(given))
 
 given = {"records": clip_rows({5: 2}, no_norms_at_5=True), "window": 3}
 case("a_pair_that_cannot_be_split_is_compared_whatever_the_clip_calls", 1, "pin",

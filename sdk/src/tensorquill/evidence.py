@@ -5656,7 +5656,8 @@ def rows_not_newer_note(rows: int, late: int) -> str:
                   f" not in it, so the same rows can give another {late} when the parts are cut elsewhere.")
     else:
         middle = " None is confirmed as a step that arrived out of order."
-    return head + middle + " The other rows are not told apart from rows sent again."
+    # With every discarded row confirmed there are no other rows, and the sentence on them is left out.
+    return head + middle + ("" if late >= rows else " The other rows are not told apart from rows sent again.")
 
 
 def _rows_not_newer(entries: Iterable[Any]) -> dict[str, Any] | None:
@@ -7390,15 +7391,17 @@ def _build_evidence(
         not_read = update_not_read_not_checked(records)
         if not_read is not None:
             not_checked.append(not_read)
+        # Right after `update_size`, the other entry of `update_spike`, and before `gradients`: where
+        # the server puts it (WAVE_AE_CONTRACT.md, `clip_groups_beside_other_entries`).
+        clip_groups = update_spike_not_checked(update_judged[1])
+        if clip_groups is not None:
+            not_checked.append(clip_groups)
         grads_unread = grads_not_read_not_checked(records)
         if grads_unread is not None:
             not_checked.append(grads_unread)
         layers_unread = layers_not_read_not_checked(records)
         if layers_unread is not None:
             not_checked.append(layers_unread)
-        clip_groups = update_spike_not_checked(update_judged[1])
-        if clip_groups is not None:
-            not_checked.append(clip_groups)
         rank_checks = kind_checks(
             input_counts(records), not_checked, starve_window=starve_window, update_window=update_window)
         _name_starting_state(rank_checks, judged["starting"])

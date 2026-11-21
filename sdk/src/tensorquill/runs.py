@@ -1568,7 +1568,8 @@ def rows_not_newer_note(rows: int, late: int) -> str:
                   f" not in it, so the same rows can give another {late} when the parts are cut elsewhere.")
     else:
         middle = " None is confirmed as a step that arrived out of order."
-    return head + middle + " The other rows are not told apart from rows sent again."
+    # With every discarded row confirmed there are no other rows, and the sentence on them is left out.
+    return head + middle + ("" if late >= rows else " The other rows are not told apart from rows sent again.")
 
 
 def rows_not_newer(status: Mapping[str, Any] | None) -> dict[str, Any] | None:

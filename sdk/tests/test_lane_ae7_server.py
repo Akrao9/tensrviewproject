@@ -76,6 +76,9 @@ def answer(document: dict, expected: dict) -> dict:
             out[key] = document.get("skipped_updates")
         elif key == "update_spike_check":
             out[key] = document["kind_checks"]["update_spike"]["value"]
+        elif key == "not_checked_checks":  # where the entry sits among the others (added at the trial merge)
+            # The order among the entries the case names: a raw report also says what only a reader looks at.
+            out[key] = [e.get("check") for e in document.get("not_checked", []) if e.get("check") in want]
         elif key == "counters_at_end":
             shown = {"recorded_steps": document["kind_checks"]["loss_scale_trouble"]["records"]}
             if scale is not None:
