@@ -10,7 +10,6 @@ builds the rule. `today` in the file is a literal, so the generator's output doe
 
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 
@@ -37,26 +36,25 @@ def test_the_file_holds_the_cases_the_page_names():
         assert body["says"] and "expected" in body
 
 
-def test_the_file_is_what_its_generator_writes():
-    """True at `eb5a71b`, where the generator ran. Several cases take today's incident from the
-    detectors and add the contract's keys to it (the score over records, the learning rate,
-    `parameters_not_judged`), so the generator's output moves once those are built. `cases.json` is
-    then the frozen record, and lane AD7 removes this one test when it builds the rules."""
-    spec = importlib.util.spec_from_file_location("make_rule_cases", FOLDER / "make_cases.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    assert json.loads(json.dumps(module.build())) == DOCUMENT
-
-
 def test_the_constants_are_the_pages():
     assert DOCUMENT["constants"] == {"score_min": 10, "score_scale": 1.4826, "drift_factor": 3.0,
                                      "drift_records_needed": 110, "start_grace": 10, "trend_min": 6, "listed": 10}
 
 
+def _incident(evidence, kind):
+    found = next((dict(i) for i in evidence["incidents"] if i["kind"] == kind), None)
+    if found is not None:
+        found.pop("class", None)
+    return json.loads(json.dumps(found))
+
+
 @pytest.mark.parametrize("name,body", of("activation_drift"), ids=[n for n, _ in of("activation_drift")])
-def test_a_drift_case_records_what_the_rule_says_today(name, body):
-    today = next((i for i in ev.detect_activation_anomalies(body["records"]) if i["kind"] == "activation_drift"), None)
-    assert (today and today["step"]) == body["today"]["step"]
+def test_a_drift_case_gives_what_the_page_expects(name, body):
+    evidence = ev.build_evidence(body["records"], detectors="python")
+    expected = body["expected"]
+    assert _incident(evidence, "activation_drift") == expected["incident"], name
+    check = evidence["kind_checks"]["activation_drift"]
+    assert (check["records_needed"], check["enough_history"]) == (expected["records_needed"], expected["enough_history"]), name
 
 
 def test_the_reader_words_for_a_score_are_the_ones_the_author_gave():
@@ -68,12 +66,18 @@ def test_the_reader_words_for_a_score_are_the_ones_the_author_gave():
 
 
 @pytest.mark.parametrize("name,body", of("moe_imbalance"), ids=[n for n, _ in of("moe_imbalance")])
-def test_an_imbalance_case_records_what_the_rule_says_today(name, body):
-    records = body["records"]
-    sizes = ev._router_sizes(records)
-    samples = ev._moe_samples(records, sizes, ev._router_top_k(records, list(sizes), None), ev.OVERLOAD_THRESHOLD)
-    today = ev.first_incident({"samples": samples})
-    assert (today and today["step"]) == body["today"]["step"]
+def test_an_imbalance_case_gives_what_the_page_expects(name, body):
+    evidence = ev.build_evidence(body["records"], detectors="python")
+    expected = body["expected"]
+    assert _incident(evidence, "moe_imbalance") == expected["incident"], name
+    # The public function gives the same sample the incident is built from.
+    hit = ev.first_incident(evidence)
+    assert (hit and {k: hit[k] for k in expected["incident"] if k != "kind"}) == (
+        expected["incident"] and {k: v for k, v in expected["incident"].items() if k != "kind"}), name
+    check = evidence["kind_checks"]["moe_imbalance"]
+    assert check.get("starting_state", []) == expected["starting_state"], name
+    if expected["starting_state"]:
+        assert check["enough_history"] is False, name
 
 
 def test_the_cases_show_each_thing_the_page_says_a_rule_gives_up_or_keeps():
