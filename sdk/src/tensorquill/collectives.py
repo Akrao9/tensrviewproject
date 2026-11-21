@@ -19,11 +19,80 @@ match collectives confidently when a buffer does not start at the first collecti
 from __future__ import annotations
 
 import contextlib
-import io
 import logging
 import pickle
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+# The name of the logger the analyzer reports through (`fr_logger.FlightRecorderLogger`).
+_LOGGER_NAME = "Flight Recorder"
+
+# The threads running an analysis now, each with the list its messages go to. One filter on the
+# analyzer's logger (`_TAKE`) takes their records, and only theirs, while any of them runs.
+_lock = threading.Lock()
+_taking: dict[int, list[str]] = {}
+_users: dict[int, int] = {}  # id(logger) -> how many analyses are taking its messages now
+_lowered: dict[int, int] = {}  # id(logger) -> its level before an analysis lowered it to INFO
+
+
+class _TakeThreads(logging.Filter):
+    """A logger filter that keeps the records of a thread running an analysis, at INFO and above,
+    in that analysis's list and stops them there, so none reaches a handler or the root logger. A
+    filter runs on the thread that logs, before any handler, so it can tell the analyses apart; the
+    records of every other thread go on as if it were not there."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        messages = _taking.get(threading.get_ident())
+        if messages is None:
+            return True
+        if record.levelno >= logging.INFO:
+            try:
+                messages.append(record.getMessage())
+            except Exception:  # noqa: BLE001  a message that cannot be formatted is left out
+                pass
+        return False
+
+
+_TAKE = _TakeThreads()
+
+
+@contextlib.contextmanager
+def _messages_of_this_thread(logger: logging.Logger) -> Iterator[list[str]]:
+    """The messages `logger` gets from this thread while the block runs, kept from its handlers.
+
+    The logger's handler list and `propagate` are never touched, so two analyses in two threads,
+    or other code adding a handler meanwhile, cannot undo each other. `_TAKE` is added to the
+    logger when the first analysis on it starts and removed when the last one ends. The analyzer's culprit sentence is
+    logged at INFO: if the logger is set above INFO, it is lowered to INFO while any analysis runs
+    and set back when the last one ends, unless other code has set another level meanwhile; while
+    it is lowered, another thread's INFO records on that logger reach its handlers too."""
+    messages: list[str] = []
+    ident, key = threading.get_ident(), id(logger)
+    with _lock:
+        if not _users.get(key):
+            logger.addFilter(_TAKE)
+            if not logger.isEnabledFor(logging.INFO):
+                _lowered[key] = logger.level
+                logger.setLevel(logging.INFO)
+        _users[key] = _users.get(key, 0) + 1
+        outer = _taking.get(ident)
+        _taking[ident] = messages
+    try:
+        yield messages
+    finally:
+        with _lock:
+            if outer is None:
+                _taking.pop(ident, None)
+            else:
+                _taking[ident] = outer
+            _users[key] -= 1
+            if not _users[key]:
+                del _users[key]
+                logger.removeFilter(_TAKE)
+                level = _lowered.pop(key, None)
+                if level is not None and logger.level == logging.INFO:
+                    logger.setLevel(level)
 
 
 def _by_rank(item: tuple[str, Any]) -> tuple[int, int, str]:
@@ -46,8 +115,12 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
     it goes (`incomplete_dumps` says so).
     """
     try:
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            # The analyzer prints a note at import when `tabulate` is not installed.
+        # The analyzer logs a note at import when `tabulate` is not installed, on the logger it then
+        # reports through; taken like its other messages (`_messages_of_this_thread`). Not by swapping
+        # `sys.stdout` and `sys.stderr`: they are the whole process's, so two analyses at once could
+        # leave either one a dead buffer, and the analyzer's own console handler, made at that import,
+        # would write into the buffer for good.
+        with _messages_of_this_thread(logging.getLogger(_LOGGER_NAME)):
             from torch.distributed.flight_recorder.components.builder import build_db
             from torch.distributed.flight_recorder.components.config_manager import JobConfig
             from torch.distributed.flight_recorder.components.fr_logger import FlightRecorderLogger
@@ -73,23 +146,10 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
     # It is no more right for that: with two ranks that disagree, nothing says which is at fault.
     details = dict(sorted(details.items(), key=_by_rank))
 
-    # The analyzer reports what it finds through a logger that prints to the console;
-    # take the messages instead of printing them.
-    logger = FlightRecorderLogger().logger
-    messages: list[str] = []
-
-    class Collect(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            messages.append(record.getMessage())
-
-    handlers, level, propagate = list(logger.handlers), logger.level, logger.propagate
-    logger.handlers, logger.propagate = [Collect()], False
-    logger.setLevel(logging.INFO)
-    try:
+    # The analyzer reports what it finds through a logger that prints to the console; take this
+    # thread's messages instead of printing them, leaving the logger's handlers alone.
+    with _messages_of_this_thread(FlightRecorderLogger().logger) as messages:
         db = build_db(details, config, version)
-    finally:
-        logger.handlers, logger.propagate = handlers, propagate
-        logger.setLevel(level)
 
     dumped = sorted(int(d["rank"]) for d in details.values())
     groups = {g.id: g for g in db.groups}
