@@ -102,6 +102,13 @@ _CALLER_SKIPPED = "caller_skipped"
 # had already ended that step (`step`, `_record_scaler`): it is not this record's update, so it never
 # says the scaler applied a caller's skip (`scaler_applied`). Never written to a record either.
 _SCALER_LATE = "scaler_verdict_late"
+# Kept in the same per-step dict from `_commit` to `_decode` (wave AE): the eager clipping calls of a
+# step that had more than one (written as `clip_calls`); and, with two or more optimizers through the
+# scaler, how many it skipped (a device scalar, read at the flush with `step_skipped`) and of how many
+# (a host count), written as `step_skipped_part` on a mixed outcome only.
+_CLIP_CALLS = "clip_calls"
+_SKIPPED_OPTIMIZERS = "scaler_skipped_optimizers"
+_SCALED_OPTIMIZERS = "scaler_optimizers"
 # Settings per capture mode. Router load is the always-on signal; layer statistics and
 # gradient and weight norms are a debugging mode, as in Composer's ActivationMonitor,
 # wandb.watch and Lightning's grad_norm.
@@ -1205,6 +1212,8 @@ def _plan_session(
     probe_head: str | bool | None,
     replica_params: Any,
     scaler: Any,
+    ends_step: Any = None,
+    auto_step: bool = True,
 ) -> _Plan:
     """Every check `init` and `Session` make of the model and the options, and what they work
     out from them, with nothing changed: no hook, thread, file or global. `init` runs it before
@@ -1231,6 +1240,17 @@ def _plan_session(
     if isinstance(probe_every, bool) or not isinstance(probe_every, int) or probe_every < 1:
         raise ValueError("probe_every must be a positive integer")
     probe_fn = probe_callable(probe) if probe is not None else None
+    if ends_step is not None:
+        # Wave AE, section 3, this page's reading: refused here, never inside a step.
+        if not isinstance(ends_step, torch.optim.Optimizer):
+            raise ValueError(f"ends_step must be a torch.optim.Optimizer, not {type(ends_step).__name__}")
+        model_ids = {id(p) for p in model.parameters()}
+        if not any(id(p) in model_ids for group in ends_step.param_groups for p in group["params"]):
+            raise ValueError("ends_step must be an optimizer that holds at least one of the model's parameters")
+        if not auto_step:
+            raise ValueError("ends_step cannot be combined with auto_step=False: session.step() ends each step there")
+        if scaler is not None and scaler.is_enabled():
+            raise ValueError("ends_step cannot be combined with scaler=: scaler.update() ends each step there")
     params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
     # The parameters the cross-GPU drift check compares: every trainable parameter by
     # default (data parallelism), or only the replicated ones under tensor parallelism.
@@ -1333,14 +1353,20 @@ class Session:
         data_wait: bool = False,
         updates: bool = False,
         probe_head: str | bool | None = None,
+        ends_step: Any = None,
         _plan: _Plan | None = None,
     ) -> None:
         # Every check first, with nothing changed (`_plan_session`); `init` has made them already.
         plan = _plan if _plan is not None else _plan_session(
             model, every=every, layers=layers, routers=routers, grads=grads, weights=weights,
             replica_every=replica_every, probe=probe, probe_every=probe_every, probe_head=probe_head,
-            replica_params=replica_params, scaler=scaler,
+            replica_params=replica_params, scaler=scaler, ends_step=ends_step, auto_step=auto_step,
         )
+        # The optimizer whose step ends each step (`init(ends_step=...)`, wave AE section 3), weakly
+        # held, or None for the default lead; and the steps of this model's other optimizers before it
+        # first stepped, for the one warning that it has not (`_before_optimizer_step`).
+        self._ends_step: weakref.ref[Any] | None = weakref.ref(ends_step) if ends_step is not None else None
+        self._ends_step_waiting = 0
         grad_every, weight_every = plan.grad_every, plan.weight_every
         self.run = run
         # When this session started, in Unix milliseconds. A job that resumes from an
@@ -1454,6 +1480,8 @@ class Session:
         # Lets an outer wrapper see that an inner one already recorded: a count, or a `_ClipCall` written
         # under `torch.compile`; compared for equality only.
         self._clip_calls: int | _ClipCall = 0
+        # The eager calls of `record_grad_norm` since the last step ended (`clip_calls`, `_commit`).
+        self._clip_step_calls = 0
         self._ring_clip_seen: list[bool] = []
         # The size of the optimizer's update to each parameter (`updates=True`): its RMS and
         # whether it was read this step, and the ring. Empty when the option is off.
@@ -1870,12 +1898,32 @@ class Session:
         # the real one, or an optimizer rebuilt while the old one is still referenced. Before, the
         # first lead kept leading while it lived, and the new one's steps were never counted.
         lead = self._lead() if self._lead is not None else None
-        if lead is None:
+        if self._ends_step is not None:
+            # `init(ends_step=...)`: that optimizer leads, from its first step, and no other ever does;
+            # nothing follows it (`_after_optimizer_step`). Another optimizer's step belongs to the step
+            # the named one ends next, so its update waits in the pending buffer until then.
+            ender = self._ends_step()
+            if ender is not None and optimizer is ender:
+                if lead is not ender:
+                    self._lead, lead = weakref.ref(ender), ender
+            elif lead is None and self._ends_step_waiting >= 0 and not self._stopped:
+                self._ends_step_waiting += 1
+                if self._ends_step_waiting == FOREIGN_STEPS_WARNING:
+                    self._ends_step_waiting = -1  # warn once
+                    _warn(
+                        f"TensorQuill has recorded no steps: {FOREIGN_STEPS_WARNING} steps of optimizers that hold "
+                        "this model's parameters ran, and the optimizer passed as ends_step= has not stepped. A "
+                        "step ends only when that optimizer's step returns; nothing is recorded until it does.",
+                        stacklevel=2,
+                    )
+            self._leading = ender is not None and optimizer is ender
+        elif lead is None:
             self._lead, lead = weakref.ref(optimizer), optimizer
         elif optimizer is not lead and self._takes_lead(optimizer, lead):
             self._lead, lead = weakref.ref(optimizer), optimizer
             self._followers = False  # the old lead's followers; a follower of the new one is found again
-        self._leading = optimizer is lead
+        if self._ends_step is None:
+            self._leading = optimizer is lead
         if self._leading:
             self._since_lead.clear()
         else:
@@ -1907,7 +1955,10 @@ class Session:
             return
         self._step_depth, self._outer_frame = 0, None
         self._stepped = True
-        if not self._leading and callable(kwargs.get("closure", args[1] if len(args) > 1 else None)):
+        if (
+            not self._leading and self._ends_step is None
+            and callable(kwargs.get("closure", args[1] if len(args) > 1 else None))
+        ):
             # Under `step(closure)` the backward runs inside the step, after `_before_optimizer_step`
             # judged whether this optimizer replaces the lead (L9): judged again now that it has run.
             lead = self._lead() if self._lead is not None else None
@@ -1925,8 +1976,9 @@ class Session:
         # that step, which is still the newest in the ring (when it filled the ring, `_commit` kept
         # it back): what it changes is written on that step's record, not the next one's. Under a
         # loss scaler, `scaler.update()` ends the step after every optimizer has stepped, so
-        # nothing follows there.
-        follows = not self._leading and not self._commit_on_update and bool(self._steps)
+        # nothing follows there; nor under `ends_step`, where another optimizer's step belongs to the
+        # step that ends next, so what it brings stays pending until then.
+        follows = not self._leading and not self._commit_on_update and bool(self._steps) and self._ends_step is None
         if self.updates:
             # Every optimizer that holds some of this model's parameters, not only the lead.
             if follows and not self._update_recorded:
@@ -2102,7 +2154,7 @@ class Session:
         lead = self._lead() if self._lead is not None else None
         return (
             lead is not None and optimizer is not lead and self.auto_step and not self._commit_on_update
-            and bool(self._steps) and not self._closed and not self._stopped and self._owns(optimizer)
+            and self._ends_step is None and bool(self._steps) and not self._closed and not self._stopped and self._owns(optimizer)
         )
 
     def _add_to_newest(self, name: str, value: Any) -> None:
@@ -2196,6 +2248,19 @@ class Session:
             return False
         skipped = torch.stack([f.to(scale.device).reshape(()) for f in found]).sum() > 0
         self._pending_amp = {"step_skipped": skipped.float(), "grad_scale": scale.detach().clone()}
+        verdicts = [
+            list(state["found_inf_per_device"].values()) for state in scaler._per_optimizer_states.values()
+            if state["found_inf_per_device"]
+        ]
+        if len(verdicts) > 1:
+            # Several optimizers through this scaler (wave AE, section 4): how many of them it skipped,
+            # each judged over all its devices, as `scaler.step` judges it. On the device until the flush,
+            # with `step_skipped`: no sync. One optimizer adds nothing, so its records are as before.
+            per_optimizer = torch.stack([
+                torch.stack([f.to(scale.device).reshape(()) for f in fs]).sum() > 0 for fs in verdicts
+            ])
+            self._pending_amp[_SKIPPED_OPTIMIZERS] = per_optimizer.sum().float()
+            self._pending_amp[_SCALED_OPTIMIZERS] = len(verdicts)
         if self._scaler_verdict_late:
             self._scaler_verdict_late = False
             self._pending_amp[_SCALER_LATE] = True
@@ -2542,6 +2607,10 @@ class Session:
         else:
             calls = self._clip_calls
             self._clip_calls = calls + 1 if type(calls) is int else 1
+            # This step's own count, for `clip_calls` on its record (wave AE, section 1). Eager calls
+            # only: under `torch.compile` nothing new is written, so a compiled step counts none and
+            # its record has no key, as the count is not known there.
+            self._clip_step_calls += 1
 
     def log(self, values: Mapping[str, Any] | None = None, **named: Any) -> None:
         """Record scalars such as the loss for the step in progress, without a GPU sync.
@@ -3132,6 +3201,12 @@ class Session:
             self._ring_clip[row].copy_(self._clip)
             self._clip.zero_()
         self._ring_clip_seen.append(self._clip_recorded)
+        if self._clip_step_calls > 1 and self._clip_recorded:
+            # Several clipping calls covered this model in the step (wave AE, section 1): the total
+            # in `clip_grad_norm` is right, but it was not made by one clip factor, so a reader must
+            # not split it by parameter. With one call, or none, or under compile, no key.
+            self._pending_amp = {**self._pending_amp, _CLIP_CALLS: self._clip_step_calls}
+        self._clip_step_calls = 0
         self._clip_recorded = False
         if self.updates:
             no_optimizer = False
@@ -4017,6 +4092,8 @@ class Session:
                     ]
             if clips is not None and clip_seen[i]:
                 record["clip_grad_norm"] = math.sqrt(float(clips[i]))
+                if amps is not None and amps[i] and _CLIP_CALLS in amps[i]:
+                    record["clip_calls"] = amps[i][_CLIP_CALLS]
             if update_rows is not None and update_seen and update_seen[i]:
                 # The RMS of the optimizer's update to each parameter it stepped (weight decay
                 # left out): the L2 norm of the update over the square root of its size.
@@ -4036,6 +4113,12 @@ class Session:
                     record["grad_scale"] = amp["grad_scale"]
                 if by_scaler or by_caller:
                     record["step_skipped_by"] = "both" if by_scaler and by_caller else "scaler" if by_scaler else "caller"
+                if by_scaler and _SCALED_OPTIMIZERS in amp:
+                    # Wave AE, section 4: the scaler skipped some of its optimizers and applied the
+                    # others in this update. Every one skipped, or none, has no key.
+                    of, part = amp[_SCALED_OPTIMIZERS], round(float(amp[_SKIPPED_OPTIMIZERS]))
+                    if 0 < part < of:
+                        record["step_skipped_part"] = {"skipped": part, "of": of}
                 if by_caller and not by_scaler and "step_skipped" in amp and not amp.get(_SCALER_LATE):
                     # A caller's skip on an update the scaler was seen to apply: an optimizer went
                     # through the scaler and `update()` found no Inf or NaN (`_record_scaler`), before
@@ -4350,6 +4433,7 @@ def init(
     system: bool = False,
     data_wait: bool = False,
     updates: bool = False,
+    ends_step: Any = None,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -4430,6 +4514,16 @@ def init(
             `scaler.update()`, so a step the scaler skipped is counted too. Pass False and call
             `session.step()` yourself when the hooks cannot see the step, as when a framework
             steps copies of the weights (DeepSpeed ZeRO, Megatron-LM).
+        ends_step: with several optimizers on the model, the one whose step closes each
+            iteration. A step then ends when that optimizer's step returns, and only then; every
+            other optimizer's step since the last step ended belongs to the step it ends next (its
+            update and what it changed are on that record), and nothing is read as a follower of the
+            step before. An iteration in which another optimizer does not step has nothing of it on
+            its record. Left out, the first optimizer to step leads and the others are read as
+            stepping after it in each iteration, so one that steps before it has its update written
+            one step early. Refused here when it is not a `torch.optim.Optimizer` holding at least
+            one of the model's parameters, and with `scaler=` or `auto_step=False`, which end the
+            step themselves. The learning rate recorded is this optimizer's.
         replica_group: optional replication `ProcessGroup` (or precomputed spread tensor)
             for the cross-GPU parameter drift check. Each rank records its own observation of
             the replicated parameters on the scheduled steps (the `replica` key): no collective,
@@ -4474,7 +4568,9 @@ def init(
             `scaler.update()`, so skipped steps are counted too. A skipped step's record
             also says who reported it (`step_skipped_by`): `"scaler"`, or `"caller"` or
             `"both"` when `session.step(skipped=True)` said so, and a caller's skip that the
-            scaler was seen to apply says `scaler_applied: true`.
+            scaler was seen to apply says `scaler_applied: true`. With several optimizers through
+            the scaler, a step on which it skipped some and applied the others also says how many
+            (`step_skipped_part`: `{"skipped": n, "of": m}`), read at the flush with the rest.
         replica_params: which parameters the cross-GPU drift check compares across
             `replica_group`: every trainable parameter by default, as under data
             parallelism. Under tensor parallelism only some weights, such as LayerNorm, are
@@ -4489,7 +4585,10 @@ def init(
             A call counts when any parameter it is given is one of the model's trainable
             ones. Only an L2 norm (`norm_type` 2, the default) is recorded: a call with
             another norm type records nothing. Free when you clip anyway, and enough for
-            gradient-spike detection.
+            gradient-spike detection. A step on which more than one such call ran also says
+            how many (`clip_calls`): the total is right, but it was not made by one clipping
+            factor, so it cannot be split by parameter. An absent key means one call, or a count
+            that is not known: under `torch.compile` the calls are not counted.
         system: at each flush, add the CUDA caching allocator's counters (allocated,
             reserved and peak bytes, allocation retries and OOMs; host-side, no sync) and
             NVML's temperature, SM clock, power, ECC counters, throttle reasons and Xid
@@ -4531,7 +4630,7 @@ def init(
     plan = _plan_session(
         model, every=every, layers=layers, routers=routers, grads=grads, weights=weights,
         replica_every=replica_every, probe=probe, probe_every=probe_every, probe_head=probe_head,
-        replica_params=replica_params, scaler=scaler,
+        replica_params=replica_params, scaler=scaler, ends_step=ends_step, auto_step=auto_step,
     )
     # What `init` opens is undone if a later step fails (`_undo`): the default sink and its file,
     # the run manifest, the stream to a server. A sink the caller passed in is never closed here.
@@ -4590,6 +4689,7 @@ def init(
             system=system,
             data_wait=data_wait,
             updates=updates,
+            ends_step=ends_step,
             _plan=plan,
         )
     except BaseException:
