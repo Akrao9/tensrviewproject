@@ -674,6 +674,26 @@ def _refused(opened: Mapping[str, Any]) -> dict[str, Any] | None:
     return _runs.refused_batches(read_watchdog(Path(opened["source"]["path"]) / "watchdog.json"))
 
 
+def _not_newer(opened: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The rows the server received and did not store because their step was not above one it had
+    kept for their attempt, and the distinct steps among them confirmed late inside one stored part
+    (L30, WAVE_AE_CONTRACT.md, section 6; `runs.rows_not_newer`), from the run folder's
+    `watchdog.json`: None for any other source, and when no rank has `rows_not_newer`, so every
+    answer of such a run is as before. Never added to `_dropped`'s rows."""
+    if opened["source"].get("kind") != "store":
+        return None
+    return _runs.rows_not_newer(read_watchdog(Path(opened["source"]["path"]) / "watchdog.json"))
+
+
+def _rank_not_newer(found: Mapping[str, Any] | None, rank: int) -> dict[str, Any] | None:
+    """One rank's part of `_not_newer`, `{"rows", "late_steps_confirmed"?, "note"}` with the
+    page's sentence of that rank's counts, or None when the rank has none."""
+    mine = _rank_dropped(found, rank)
+    if mine is None:
+        return None
+    return {**mine, "note": _runs.rows_not_newer_note(mine["rows"], mine.get("late_steps_confirmed", 0))}
+
+
 def _capture_stopped(opened: Mapping[str, Any]) -> dict[int, dict[str, Any]]:
     """Each rank's `capture_stopped` from the run folder's `watchdog.json`, copied as written, by
     rank: empty for any other source and for a rank whose capture did not stop."""
@@ -884,6 +904,9 @@ def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, An
             refused = _rank_dropped(_refused(opened), rank)
             if refused is not None:  # RS10: no key when the rank refused none
                 answer["rank"]["refused_batches"] = refused
+            not_newer = _rank_not_newer(_not_newer(opened), rank)
+            if not_newer is not None:  # L30: no key when the rank has none
+                answer["rank"]["rows_not_newer"] = not_newer
     state = evidence.get("run_state")
     answer["run_state"] = state if isinstance(state, dict) else None
     if not isinstance(state, dict):
@@ -1499,6 +1522,9 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
     refused = _refused(opened)
     if refused is not None:  # RS10: no key when no rank refused a batch
         answer["refused_batches"] = _dropped_shown(refused)
+    not_newer = _not_newer(opened)
+    if not_newer is not None:  # L30: no key when no rank has rows not newer
+        answer["rows_not_newer"] = _dropped_shown(not_newer)
     if rank is not None:
         answer["rank"] = _rank_entry(evidence, rank)
         mine = _rank_dropped(dropped, rank)
@@ -1507,6 +1533,9 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
         theirs = _rank_dropped(refused, rank)
         if theirs is not None:
             answer["rank"] = {**answer["rank"], "refused_batches": theirs}
+        late = _rank_not_newer(not_newer, rank)
+        if late is not None:
+            answer["rank"] = {**answer["rank"], "rows_not_newer": late}
     elif len(rows) <= PER_RANK_ROWS:
         answer["per_rank"] = [
             {"rank": number, "report": (entry.get("detection") or {}).get("state"),
@@ -1521,7 +1550,11 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
              **({"stream": entry["stream"]} if isinstance(entry.get("stream"), dict) else {}),
              **({"dropped_rows": mine["rows"]} if (mine := _rank_dropped(dropped, number)) is not None else {}),
              **({"refused_batches": theirs["batches"]} if (theirs := _rank_dropped(refused, number)) is not None
-                else {})}
+                else {}),
+             # L30: each count as the status writes it, each only when the rank has it.
+             **({"rows_not_newer": late["rows"],
+                 **({"late_steps_confirmed": late["late_steps_confirmed"]} if "late_steps_confirmed" in late else {})}
+                if (late := _rank_dropped(not_newer, number)) is not None else {})}
             for number, entry in sorted(rows.items(), key=lambda item: item[0] if isinstance(item[0], int) else -1)
         ]
     else:
@@ -1550,8 +1583,9 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
 
 _ROW_KEYS = ("project", "name", "run_id", "group", "tags", "has_manifest", "source", "started", "run_state", "last_step",
              "incidents", "first_incident", "kinds_checked", "ranks", "evidence", "rank_count", "ranks_with_incidents",
-             "kinds_not_stated", "rank_count_not_known", "end", "dropped_rows", "refused_batches", "freshness")
-_BOUNDED_ROW_KEYS = ("dropped_rows", "refused_batches")  # their ranks listed up to PER_RANK_ROWS
+             "kinds_not_stated", "rank_count_not_known", "end", "dropped_rows", "refused_batches", "rows_not_newer",
+             "freshness")
+_BOUNDED_ROW_KEYS = ("dropped_rows", "refused_batches", "rows_not_newer")  # their ranks listed up to PER_RANK_ROWS
 
 
 def _text_argument(arguments: Mapping[str, Any], name: str) -> str | None:
@@ -1613,6 +1647,19 @@ def compare_runs(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
 
 
 # --- The tools, as the protocol lists them --------------------------------------------------
+
+# What the two counts of L30 are and are not (WAVE_AE_CONTRACT.md, section 6), in the page's words, said
+# once for the tools that show dropped rows. `{where}` is where the tool puts the block.
+_NOT_NEWER_WORDS = (
+    " `{where}`, only when the server received rows of {whose} and did not store them because their step was not"
+    " above a step it had already kept for their attempt: `rows` is how many such rows, and a row sent again is"
+    " counted again, so it is not a number of steps lost. `late_steps_confirmed`, beside it only when above zero,"
+    " is how many distinct steps among them are confirmed to have arrived out of order inside one stored part, and"
+    " are not stored. It is a lower bound: a late step that crosses a part boundary is not in it, so the same rows"
+    " can give another count when the parts are cut elsewhere. With no `late_steps_confirmed`, none is confirmed"
+    " as a step that arrived out of order. The other rows are not told apart from rows sent again. `note` says"
+    " this with the numbers. Neither count is added to `dropped_rows`. With no key, the server reported no such row."
+)
 
 # What the L29 blocks mean, and what their absence means, said once for the three tools (lane AD5).
 _SKIPS_WORDS = (
@@ -1722,6 +1769,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " dropped rows of that rank (for a null key or a schema version it does not support), counts them (an"
             " upper bound); `rank.refused_batches`, only when it refused whole batches of that rank because a key"
             " column was missing or of another type, counts those batches apart (never added to the rows)."
+            + _NOT_NEWER_WORDS.format(where="rank.rows_not_newer", whose="that rank") +
             " For a local .jsonl file, `run_end` says whether its session closed it: any state but `closed` means not"
             " known to have finished (still running, killed or never closed look the same)."
             " Where one rank's evidence has them, `head_trends` gives the probe's language-model head numbers over"
@@ -1834,6 +1882,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " (no row of them stored): how many batches in all, by key column and by rank (`per_rank[].refused_batches`,"
             " and in the `rank` entry). A count of batches, not rows, never added to `dropped_rows`; the same batch"
             " sent again is not counted again. With no key, none was refused."
+            + _NOT_NEWER_WORDS.format(where="rows_not_newer", whose="the run (by rank in `ranks`, in"
+                                      " `per_rank[].rows_not_newer` and `per_rank[].late_steps_confirmed`, and in the"
+                                      " `rank` entry)") +
             " `rank` gives one rank's entry in full. On one rank's capture or evidence file this is an error that says so."
             " Each judged rank's skipped updates and checkpoint tensors, as list_incidents describes them for one rank:"
             + _BY_RANK_WORDS + " " + _SKIPS_WORDS.replace("`skipped_updates`", "A rank's `skipped_updates`", 1)
@@ -1859,7 +1910,11 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " start time. The run ID is the identity; a name is a label and may repeat. It reads each run's manifest,"
             " its small evidence or report files and the ends of its .jsonl files (one over a megabyte is scanned"
             " for the attempts its lines name), and runs no detector: a local run whose evidence file was"
-            " never written has `run_state` null and `evidence.state` \"missing\", which is not \"clean\". A run"
+            " never written has `run_state` null and `evidence.state` \"missing\", which is not \"clean\"."
+            " `evidence.state` \"several_run_ids\" is a run one of whose .jsonl files holds, for a rank, the records"
+            " of more than one run ID (`evidence.run_ids`, and `evidence.files` with each file's ranks and IDs): its"
+            " rows are not one run's, so the row gives no run state, last step or incident, whatever evidence file"
+            " lies beside it, and compare_runs on another of those IDs names the file. A run"
             " with `has_manifest` false was recorded before runs had a project, and is listed under"
             " `uncategorized` with its run ID as its name. `rank_count` is how many ranks the run has, or null when the"
             " listing cannot count them without reading every record (`rank_count_not_known` says why). For a run of"
@@ -1872,7 +1927,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " after a lost acknowledgement is counted again. No key means none was dropped. `refused_batches`, on a"
             " store run's row only when the server refused whole batches of it because a key column was missing or of"
             " another type: how many batches in all, by key column and by rank, never added to `dropped_rows`. No key"
-            " means none was refused. `freshness`, on a local run's row only when its evidence files do not cover the"
+            " means none was refused."
+            + _NOT_NEWER_WORDS.format(where="rows_not_newer", whose="a store run, on its row, by rank in `ranks`") +
+            " `freshness`, on a local run's row only when its evidence files do not cover the"
             " newest step its records reach: `current` false, `judged_to_step` (the step the evidence says it judged to,"
             " null when the file does not name one, as a file the command line writes does not), `records_to_step` and"
             " `why`. With `why` `records_newer` the row's state and incidents are the evidence's, as of that judgment, and"
@@ -1922,6 +1979,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " `runs[].refused_batches`, only for such a run whose server refused whole batches because a key column"
             " was missing or of another type: the batches in all, by key column and by rank, bounded the same way;"
             " a count of batches, never added to `dropped_rows`. A run that refused none has no such key."
+            + _NOT_NEWER_WORDS.format(where="runs[].rows_not_newer", whose="such a run (with `rank`, that rank's)")
         ),
         "inputSchema": {
             "type": "object",

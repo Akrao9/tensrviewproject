@@ -61,6 +61,12 @@ shape counted in batches (`runs.refused_batches`), with a line of their own; the
 never added together (lane AB5). Both are read from `watchdog.json` on every store path: from
 the server's reports alone, and where a rank's parts are judged here. A run that dropped and
 refused none, and every local run, has neither key, and its result is as before.
+Rows the server received and did not store because their step was not above one it had kept
+for their attempt (`rows_not_newer` and `late_steps_confirmed` on a rank's entry, L30,
+WAVE_AE_CONTRACT.md, section 6) are `rows_not_newer` beside them (`runs.rows_not_newer`), with the
+page's sentence as their note and line; never added to the rows dropped, and absent when the
+status has neither key. A run named by an ID that is not found, which a file there holds among
+the records of several runs, is refused with that file and its IDs (section 5).
 
 `compare_runs` returns the result and writes nothing. The command line writes `compare.json`.
 """
@@ -588,7 +594,7 @@ def open_run(wanted: str | Path, source: str | Path | None = None, project: str 
         path = Path(wanted)
         if not paths or not path.exists():
             if lookup_error is not None:
-                raise lookup_error
+                raise _held_among_several(source, wanted, lookup_error)
             raise _runs.RunLookupError(f"{path} does not exist")
         if path.is_file() and path.suffix != ".jsonl":
             return _open_evidence_file(path, rank)
@@ -602,10 +608,29 @@ def open_run(wanted: str | Path, source: str | Path | None = None, project: str 
     read = opened["read_from"].get("rank") if rank is not None else None
     dropped = _store_dropped(Path(run["path"]), read) if run["source"] != "local" else None
     refused = _store_refused(Path(run["path"]), read) if run["source"] != "local" else None
+    not_newer = _store_not_newer(Path(run["path"]), read) if run["source"] != "local" else None
     return {"run_id": run["run_id"], "manifest": run.get("manifest"),
             "block": _manifest.run_block(run["run_id"], run.get("manifest")), **opened,
             **({"dropped_rows": dropped} if dropped is not None else {}),
-            **({"refused_batches": refused} if refused is not None else {})}
+            **({"refused_batches": refused} if refused is not None else {}),
+            **({"rows_not_newer": not_newer} if not_newer is not None else {})}
+
+
+def _held_among_several(source: Path, wanted: Any, error: Exception) -> Exception:
+    """A run that was not found by its ID, and a file at `source` that holds that ID among the
+    records of several runs: the error names the file and the IDs it holds (WAVE_AE_CONTRACT.md,
+    section 5; the file's run is listed as `several_run_ids`). Otherwise `error` as it is."""
+    if not isinstance(wanted, str) or isinstance(error, _runs.AmbiguousRunName):
+        return error
+    held = _runs.files_holding_run(source, wanted)
+    if not held:
+        return error
+    said = "; ".join(f"{Path(item['path']).name} holds, for {_runs._rank_list(item['ranks'])}, the records of runs "
+                     f"{_runs._run_ids_text(item['run_ids'])}" for item in held)
+    return _runs.RunLookupError(
+        f"{error}. {wanted!r} is in a file that holds more than one run's records: {said}. Its rows are not read as one "
+        "run: give each run's records in a file of its own"
+    )
 
 
 def _store_dropped(folder: Path, rank: int | None) -> dict[str, Any] | None:
@@ -654,6 +679,29 @@ def _store_refused(folder: Path, rank: int | None) -> dict[str, Any] | None:
     (item,) = mine
     return {"batches": item["batches"], **({"by_key": item["by_key"]} if item.get("by_key") else {}), "ranks": mine,
             "note": refused["note"]}
+
+
+def _store_not_newer(folder: Path, rank: int | None) -> dict[str, Any] | None:
+    """The rows a store run's server received and did not store because their step was not above
+    one it had kept for their attempt (`runs.rows_not_newer`, from its `watchdog.json`; L30,
+    WAVE_AE_CONTRACT.md, section 6): the whole run's, or with `rank` (the rank read) that rank's
+    alone, in the same shape with the note of its own counts. None when there are none (of that
+    rank), so such a run's result is as before. Never added to `_store_dropped`. Never raises."""
+    from .evidence import read_watchdog
+
+    try:
+        found = _runs.rows_not_newer(read_watchdog(folder / "watchdog.json"))
+    except (OSError, ValueError):
+        return None
+    if found is None or rank is None:
+        return found
+    mine = [item for item in found["ranks"] if item.get("rank") == rank]
+    if not mine:
+        return None
+    (item,) = mine
+    late = item.get("late_steps_confirmed", 0)
+    return {"rows": item["rows"], **({"late_steps_confirmed": late} if late else {}), "ranks": mine,
+            "includes_replays": True, "note": _runs.rows_not_newer_note(item["rows"], late)}
 
 
 # --- Part 1: the setup ----------------------------------------------------------------------
@@ -1250,6 +1298,8 @@ def compare_runs(*runs: str | Path, source: str | Path | None = None, project: s
             **({"dropped_rows": run["dropped_rows"]} if run.get("dropped_rows") else {}),
             # RS10 (lane AB5): the batches it refused whole, apart from the rows.
             **({"refused_batches": run["refused_batches"]} if run.get("refused_batches") else {}),
+            # L30: the rows not stored because their step was not newer, apart from both.
+            **({"rows_not_newer": run["rows_not_newer"]} if run.get("rows_not_newer") else {}),
         } for label, wanted, run in zip(labels, runs, opened)],
         # The order of the four parts is part of the format: what was checked is read before
         # the incidents.
@@ -1340,6 +1390,8 @@ def summary_text(result: Mapping[str, Any]) -> str:
             lines.append(f"      {run['label']}: {_runs._dropped_text(run['dropped_rows'])}")
         if run.get("refused_batches"):
             lines.append(f"      {run['label']}: {_runs._refused_text(run['refused_batches'])}")
+        if run.get("rows_not_newer"):
+            lines.append(f"      {run['label']}: {_runs._not_newer_text(run['rows_not_newer'])}")
 
     setup = result["setup"]
     lines.append(f"1. Setup: {len(setup['differs'])} difference{'s' if len(setup['differs']) != 1 else ''}")

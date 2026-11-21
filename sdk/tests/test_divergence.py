@@ -417,7 +417,8 @@ def test_one_rank_is_read_and_named():
 
 def test_a_step_written_twice_keeps_the_later_record():
     a = make()
-    twice = make(run_id="b") + [record for record in a if record["step"] == 40]
+    # Both rows of step 40 are of run `b` (WAVE_AE_CONTRACT.md, section 5): rows of two run IDs are not one run.
+    twice = make(run_id="b") + [{**record, "run_id": "b"} for record in a if record["step"] == 40]
     twice[40] = {**twice[40], "scalars": {"train/loss": 1e9}}
     assert first_divergence(a, twice)["answer"] == "no_divergence"
 
