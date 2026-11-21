@@ -386,8 +386,9 @@ def test_sdk21_unstorable_lines_are_skipped_and_counted_and_the_sender_moves_on(
     append(path, [record(7), record(8)])
     sender = fast(path, server.endpoint)
     assert sender.close() is True
-    assert store.steps() == [0, 6, 7, 8]
-    assert sender.skipped_lines == 5
+    # Lane AD4 (item 4): step 5 is sent, its `moe_top_k` in `extra_json`; before, [0, 6, 7, 8] and 5 skipped.
+    assert store.steps() == [0, 5, 6, 7, 8]
+    assert sender.skipped_lines == 4
     assert read_offset(offset_path(path)) == path.stat().st_size
 
 

@@ -78,14 +78,32 @@ class JsonlSink:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         torn = _ends_torn(self.path)
         self._file = self.path.open("a", encoding="utf-8")
+        self._failed = False  # the last write raised: the file may end in part of a line
         if torn:
             self._file.write("\n")
             self._file.flush()
 
     def write(self, records: list[dict[str, Any]]) -> None:
-        for record in records:
-            self._file.write(json.dumps(_finite(record), separators=(",", ":"), allow_nan=False) + "\n")
-        self._file.flush()
+        """Write `records`, one line each, and flush. A write that raises (a full disk, a file-size
+        limit, a value JSON cannot hold) may leave part of a line in the file. The next write on
+        this sink first flushes what Python kept of it, which may complete that line, and then, if
+        the file still ends in part of a line, starts a line of its own: so only the records of the
+        write that raised can be lost, never those of a write that returned. Before (lane AD4,
+        measured with a file-size limit), a record larger than Python's 8 KiB buffer lost its unwritten
+        rest at the failure, and the next record written was appended onto the fragment: a write
+        that returned, whose record no reader could read."""
+        if self._failed:
+            self._file.flush()
+            if _ends_torn(self.path):
+                self._file.write("\n")
+            self._failed = False
+        try:
+            for record in records:
+                self._file.write(json.dumps(_finite(record), separators=(",", ":"), allow_nan=False) + "\n")
+            self._file.flush()
+        except BaseException:
+            self._failed = True
+            raise
 
     def close(self) -> None:
         self._file.close()
