@@ -74,6 +74,8 @@ use system::{System, SystemColumns};
 #[cfg(test)]
 mod lane_ab2_tests;
 #[cfg(test)]
+mod lane_ac2_tests;
+#[cfg(test)]
 mod lane_v7_tests;
 #[cfg(test)]
 mod lane_w3_tests;
@@ -3962,6 +3964,13 @@ impl RankDetectors {
         self.skipped_updates.report()
     }
 
+    /// The rank's `checkpoint_tensors` (`CHECKPOINT_TENSOR_CONTRACT.md`, section 4), present only
+    /// when a judged resume's load recorded `tensors` that was compared or unavailable: written in
+    /// the report after `skipped_updates`.
+    pub fn checkpoint_tensors(&self) -> Option<Value> {
+        self.resumes.checkpoint_tensors()
+    }
+
     /// What was not checked, in the shape of the `not_checked` list in Python's evidence:
     /// the kinds whose sources the server does not have, and the resumes whose learning
     /// rate could not be compared.
@@ -4273,6 +4282,9 @@ pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64)
     });
     if let Some(skipped) = detectors.skipped_updates() {
         report["skipped_updates"] = skipped;
+    }
+    if let Some(tensors) = detectors.checkpoint_tensors() {
+        report["checkpoint_tensors"] = tensors;
     }
     report
 }
