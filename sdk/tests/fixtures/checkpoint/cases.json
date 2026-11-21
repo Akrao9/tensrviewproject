@@ -1,0 +1,6172 @@
+{
+ "contract": "CHECKPOINT_TENSOR_CONTRACT.md",
+ "names_listed": 50,
+ "cases": {
+  "every_tensor_is_in_the_checkpoint": {
+   "group": "coverage",
+   "status": "new",
+   "says": "A checkpoint that holds every tensor of the model, under the key `model`.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     },
+     "optimizer": "an optimizer's state"
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 7,
+     "trainable": 7,
+     "checkpoint": 7,
+     "matched": 7
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "two_lstm_tensors_left_out": {
+   "group": "coverage",
+   "status": "new",
+   "says": "TrainCheck's B14 as reproduced: the checkpointing function left the LSTM's hidden-to-hidden weight and bias out. Both are trainable, so both are named as missing.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     },
+     "optimizer": "an optimizer's state"
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 7,
+     "trainable": 7,
+     "checkpoint": 5,
+     "matched": 5,
+     "missing": {
+      "count": 2,
+      "names": [
+       "lstm.bias_hh_l0",
+       "lstm.weight_hh_l0"
+      ]
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "saved_from_a_ddp_wrapped_model": {
+   "group": "coverage",
+   "status": "new",
+   "says": "The checkpoint's names carry DDP's `module.`. The wrapper's prefix is removed before names are compared, so nothing reads as missing.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "module.embed.weight": [
+       65,
+       16
+      ],
+      "module.lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "module.lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "module.lstm.bias_ih_l0": [
+       128
+      ],
+      "module.lstm.bias_hh_l0": [
+       128
+      ],
+      "module.head.weight": [
+       65,
+       32
+      ],
+      "module.head.bias": [
+       65
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 7,
+     "trainable": 7,
+     "checkpoint": 7,
+     "matched": 7
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "saved_from_a_compiled_model": {
+   "group": "coverage",
+   "status": "new",
+   "says": "The checkpoint's names carry `torch.compile`'s `_orig_mod.`, removed the same way.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "_orig_mod.embed.weight": [
+       65,
+       16
+      ],
+      "_orig_mod.lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "_orig_mod.lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "_orig_mod.lstm.bias_ih_l0": [
+       128
+      ],
+      "_orig_mod.lstm.bias_hh_l0": [
+       128
+      ],
+      "_orig_mod.head.weight": [
+       65,
+       32
+      ],
+      "_orig_mod.head.bias": [
+       65
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 7,
+     "trainable": 7,
+     "checkpoint": 7,
+     "matched": 7
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "the_session_watches_an_inner_module": {
+   "group": "coverage",
+   "status": "new",
+   "says": "The checkpoint was saved from an outer module that holds the watched model as `net`, as a LightningModule does. One leading prefix is tried when fewer than half the names match; the one removed is recorded.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "state_dict": {
+      "net.embed.weight": [
+       65,
+       16
+      ],
+      "net.lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "net.lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "net.lstm.bias_ih_l0": [
+       128
+      ],
+      "net.lstm.bias_hh_l0": [
+       128
+      ],
+      "net.head.weight": [
+       65,
+       32
+      ],
+      "net.head.bias": [
+       65
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "state_dict",
+     "model": 7,
+     "trainable": 7,
+     "checkpoint": 7,
+     "matched": 7,
+     "prefix": {
+      "side": "checkpoint",
+      "removed": "net."
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "the_checkpoint_was_saved_from_an_inner_module": {
+   "group": "coverage",
+   "status": "new",
+   "says": "The other way round: the watched model holds the saved module as `net`.",
+   "given": {
+    "model": [
+     [
+      "net.embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "net.lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "net.lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "net.lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "net.lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "net.head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "net.head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 7,
+     "trainable": 7,
+     "checkpoint": 7,
+     "matched": 7,
+     "prefix": {
+      "side": "model",
+      "removed": "net."
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "a_bare_state_dict": {
+   "group": "coverage",
+   "status": "new",
+   "says": "`torch.save(model.state_dict())`: the tensors sit directly in the checkpoint, under no key. Today no entry is taken for the model; compared with the model, the checkpoint itself is.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "bare": {
+     "embed.weight": [
+      65,
+      16
+     ],
+     "lstm.weight_ih_l0": [
+      128,
+      16
+     ],
+     "lstm.weight_hh_l0": [
+      128,
+      32
+     ],
+     "lstm.bias_ih_l0": [
+      128
+     ],
+     "lstm.bias_hh_l0": [
+      128
+     ],
+     "head.weight": [
+      65,
+      32
+     ],
+     "head.bias": [
+      65
+     ]
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": null,
+     "model": 7,
+     "trainable": 7,
+     "checkpoint": 7,
+     "matched": 7
+    }
+   },
+   "today": {
+    "model_component": false,
+    "tensors": false
+   }
+  },
+  "unusual_names_under_a_plain_key": {
+   "group": "coverage",
+   "status": "new",
+   "says": "L23's first limit: a model whose parameters have no dotted or PyTorch name, saved under a key that names no model. Today it is passed over; its names are the model's, so it is the model's.",
+   "given": {
+    "model": [
+     [
+      "alpha",
+      [
+       4
+      ],
+      "p"
+     ],
+     [
+      "beta",
+      [
+       4
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "state": {
+      "alpha": [
+       4
+      ],
+      "beta": [
+       4
+      ]
+     },
+     "optimizer": "an optimizer's state"
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "state",
+     "model": 2,
+     "trainable": 2,
+     "checkpoint": 2,
+     "matched": 2
+    }
+   },
+   "today": {
+    "model_component": false,
+    "tensors": false
+   }
+  },
+  "a_cache_with_parameter_like_names": {
+   "group": "coverage",
+   "status": "new",
+   "says": "L23's second limit: a cache under another name with dotted keys, and no model in the checkpoint. Today it is taken for the model; it shares no name with the model, so no entry is.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "features": {
+      "layers.0.k": [
+       2,
+       2
+      ],
+      "layers.0.v": [
+       2,
+       2
+      ]
+     },
+     "optimizer": "an optimizer's state"
+    }
+   },
+   "expected": {
+    "model_component": false,
+    "tensors": {
+     "state": "unavailable",
+     "why": "not_identified"
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "a_cache_beside_the_model": {
+   "group": "coverage",
+   "status": "new",
+   "says": "The same cache beside the model's state: the entry with the model's names is compared.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     },
+     "features": {
+      "layers.0.k": [
+       2,
+       2
+      ],
+      "layers.0.v": [
+       2,
+       2
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 7,
+     "trainable": 7,
+     "checkpoint": 7,
+     "matched": 7
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "an_ema_copy_beside_the_model": {
+   "group": "coverage",
+   "status": "new",
+   "says": "Two entries hold every name of the model. A tie goes to the entry the name rule already takes for the model, then to the first in the checkpoint's order.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "ema": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     },
+     "model": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 7,
+     "trainable": 7,
+     "checkpoint": 7,
+     "matched": 7
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "a_checkpoint_of_another_model": {
+   "group": "coverage",
+   "status": "new",
+   "says": "An entry named `model` that shares no name with the model. It is not this model's state.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "encoder.layer.0.w": [
+       4,
+       4
+      ],
+      "encoder.layer.0.b": [
+       4,
+       4
+      ],
+      "encoder.layer.1.w": [
+       4,
+       4
+      ],
+      "encoder.layer.1.b": [
+       4,
+       4
+      ],
+      "encoder.layer.2.w": [
+       4,
+       4
+      ],
+      "encoder.layer.2.b": [
+       4,
+       4
+      ],
+      "encoder.layer.3.w": [
+       4,
+       4
+      ],
+      "encoder.layer.3.b": [
+       4,
+       4
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": false,
+    "tensors": {
+     "state": "unavailable",
+     "why": "not_identified"
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "names_that_mostly_differ": {
+   "group": "coverage",
+   "status": "new",
+   "says": "One of the entry's eight names is the model's. Under half: the names follow another scheme or another model, so nothing is named as missing. The closest entry is recorded.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "encoder.layer.0.w": [
+       4,
+       4
+      ],
+      "encoder.layer.0.b": [
+       4,
+       4
+      ],
+      "encoder.layer.1.w": [
+       4,
+       4
+      ],
+      "encoder.layer.1.b": [
+       4,
+       4
+      ],
+      "encoder.layer.2.w": [
+       4,
+       4
+      ],
+      "encoder.layer.2.b": [
+       4,
+       4
+      ],
+      "encoder.layer.3.w": [
+       4,
+       4
+      ],
+      "head.bias": [
+       65
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": false,
+    "tensors": {
+     "state": "unavailable",
+     "why": "not_identified",
+     "closest": {
+      "entry": "model",
+      "checkpoint": 8,
+      "matched": 1
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "exactly_half_the_names_are_the_models": {
+   "group": "coverage",
+   "status": "new",
+   "says": "Two of the entry's four names are the model's: half is enough for the entry to be compared.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ],
+      "old.weight": [
+       4
+      ],
+      "old.bias": [
+       4
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 7,
+     "trainable": 7,
+     "checkpoint": 4,
+     "matched": 2,
+     "missing": {
+      "count": 5,
+      "names": [
+       "embed.weight",
+       "lstm.bias_hh_l0",
+       "lstm.bias_ih_l0",
+       "lstm.weight_hh_l0",
+       "lstm.weight_ih_l0"
+      ]
+     },
+     "unexpected": {
+      "count": 2,
+      "names": [
+       "old.bias",
+       "old.weight"
+      ]
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "an_adapter_only_checkpoint": {
+   "group": "coverage",
+   "status": "new",
+   "says": "Only the trainable adapter was saved. The frozen base is not in the checkpoint; a frozen parameter is counted and named apart, and is not a missing tensor.",
+   "given": {
+    "model": [
+     [
+      "base.embed.weight",
+      [
+       65,
+       16
+      ],
+      "f"
+     ],
+     [
+      "base.proj.weight",
+      [
+       32,
+       16
+      ],
+      "f"
+     ],
+     [
+      "base.proj.bias",
+      [
+       32
+      ],
+      "f"
+     ],
+     [
+      "lora.down.weight",
+      [
+       4,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lora.up.weight",
+      [
+       32,
+       4
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "adapter": {
+      "lora.down.weight": [
+       4,
+       16
+      ],
+      "lora.up.weight": [
+       32,
+       4
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "adapter",
+     "model": 5,
+     "trainable": 2,
+     "checkpoint": 2,
+     "matched": 2,
+     "missing_frozen": {
+      "count": 3,
+      "names": [
+       "base.embed.weight",
+       "base.proj.bias",
+       "base.proj.weight"
+      ]
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "buffers_left_out": {
+   "group": "coverage",
+   "status": "new",
+   "says": "The parameters are all there and BatchNorm's three buffers are not. Buffers are counted and named apart.",
+   "given": {
+    "model": [
+     [
+      "conv.weight",
+      [
+       8,
+       3,
+       3,
+       3
+      ],
+      "p"
+     ],
+     [
+      "bn.weight",
+      [
+       8
+      ],
+      "p"
+     ],
+     [
+      "bn.bias",
+      [
+       8
+      ],
+      "p"
+     ],
+     [
+      "bn.running_mean",
+      [
+       8
+      ],
+      "b"
+     ],
+     [
+      "bn.running_var",
+      [
+       8
+      ],
+      "b"
+     ],
+     [
+      "bn.num_batches_tracked",
+      [],
+      "b"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "conv.weight": [
+       8,
+       3,
+       3,
+       3
+      ],
+      "bn.weight": [
+       8
+      ],
+      "bn.bias": [
+       8
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 6,
+     "trainable": 3,
+     "checkpoint": 3,
+     "matched": 3,
+     "missing_buffers": {
+      "count": 3,
+      "names": [
+       "bn.num_batches_tracked",
+       "bn.running_mean",
+       "bn.running_var"
+      ]
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "tensors_the_model_does_not_have": {
+   "group": "coverage",
+   "status": "new",
+   "says": "The checkpoint holds two tensors more than the model. They are counted and named as unexpected.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ],
+      "old_head.weight": [
+       10,
+       32
+      ],
+      "old_head.bias": [
+       10
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 7,
+     "trainable": 7,
+     "checkpoint": 9,
+     "matched": 7,
+     "unexpected": {
+      "count": 2,
+      "names": [
+       "old_head.bias",
+       "old_head.weight"
+      ]
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "a_shape_that_differs": {
+   "group": "coverage",
+   "status": "new",
+   "says": "A name both hold, with another shape in the checkpoint. It is matched by name and listed with both shapes.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       10,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 7,
+     "trainable": 7,
+     "checkpoint": 7,
+     "matched": 7,
+     "shape_differs": {
+      "count": 1,
+      "names": [
+       "head.weight"
+      ],
+      "shapes": {
+       "head.weight": {
+        "model": [
+         65,
+         32
+        ],
+        "checkpoint": [
+         10,
+         32
+        ]
+       }
+      }
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "more_missing_than_are_named": {
+   "group": "coverage",
+   "status": "new",
+   "says": "Sixty trainable tensors are missing and only the head was saved. The count is 60 and the first 50 names, sorted, are listed.",
+   "given": {
+    "model": [
+     [
+      "blocks.00.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.01.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.02.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.03.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.04.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.05.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.06.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.07.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.08.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.09.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.10.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.11.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.12.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.13.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.14.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.15.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.16.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.17.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.18.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.19.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.20.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.21.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.22.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.23.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.24.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.25.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.26.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.27.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.28.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.29.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.30.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.31.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.32.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.33.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.34.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.35.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.36.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.37.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.38.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.39.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.40.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.41.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.42.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.43.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.44.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.45.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.46.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.47.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.48.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.49.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.50.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.51.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.52.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.53.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.54.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.55.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.56.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.57.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.58.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.59.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       2,
+       4
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "head.weight": [
+       2,
+       4
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 61,
+     "trainable": 61,
+     "checkpoint": 1,
+     "matched": 1,
+     "missing": {
+      "count": 60,
+      "names": [
+       "blocks.00.weight",
+       "blocks.01.weight",
+       "blocks.02.weight",
+       "blocks.03.weight",
+       "blocks.04.weight",
+       "blocks.05.weight",
+       "blocks.06.weight",
+       "blocks.07.weight",
+       "blocks.08.weight",
+       "blocks.09.weight",
+       "blocks.10.weight",
+       "blocks.11.weight",
+       "blocks.12.weight",
+       "blocks.13.weight",
+       "blocks.14.weight",
+       "blocks.15.weight",
+       "blocks.16.weight",
+       "blocks.17.weight",
+       "blocks.18.weight",
+       "blocks.19.weight",
+       "blocks.20.weight",
+       "blocks.21.weight",
+       "blocks.22.weight",
+       "blocks.23.weight",
+       "blocks.24.weight",
+       "blocks.25.weight",
+       "blocks.26.weight",
+       "blocks.27.weight",
+       "blocks.28.weight",
+       "blocks.29.weight",
+       "blocks.30.weight",
+       "blocks.31.weight",
+       "blocks.32.weight",
+       "blocks.33.weight",
+       "blocks.34.weight",
+       "blocks.35.weight",
+       "blocks.36.weight",
+       "blocks.37.weight",
+       "blocks.38.weight",
+       "blocks.39.weight",
+       "blocks.40.weight",
+       "blocks.41.weight",
+       "blocks.42.weight",
+       "blocks.43.weight",
+       "blocks.44.weight",
+       "blocks.45.weight",
+       "blocks.46.weight",
+       "blocks.47.weight",
+       "blocks.48.weight",
+       "blocks.49.weight"
+      ]
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "a_checkpoint_folder": {
+   "group": "coverage",
+   "status": "new",
+   "says": "`session.checkpoint_files`: the components are read from file names and no file is opened, so no tensor name is known.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "folder": [
+     "model.safetensors",
+     "optimizer.pt",
+     "rng_state.pth",
+     "trainer_state.json"
+    ]
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "unavailable",
+     "why": "folder"
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "the_comparison_raises": {
+   "group": "coverage",
+   "status": "new",
+   "says": "Reading the model's names raises. The load is recorded as it is today, the reason is `error`, and nothing is raised into training.",
+   "given": {
+    "model": "a model whose state_dict() raises",
+    "checkpoint": {
+     "model": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     }
+    },
+    "raises": true
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "unavailable",
+     "why": "error"
+    }
+   }
+  },
+  "a_save_is_not_compared": {
+   "group": "coverage",
+   "status": "pin",
+   "says": "`event=\"save\"`: the manifest of a save carries no `tensors` key.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     }
+    },
+    "event": "save"
+   },
+   "expected": {
+    "model_component": true,
+    "tensors_key": false
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "a_resume_with_every_tensor_verified": {
+   "group": "records",
+   "status": "new",
+   "says": "The load compared the checkpoint with the model and every tensor is there. Nothing is raised, and the evidence says the comparison was made.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "compared",
+        "entry": "model",
+        "model": 7,
+        "trainable": 7,
+        "checkpoint": 7,
+        "matched": 7
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": false,
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "compared",
+       "entry": "model",
+       "model": 7,
+       "trainable": 7,
+       "checkpoint": 7,
+       "matched": 7
+      }
+     ]
+    }
+   },
+   "today": {
+    "fires": false
+   }
+  },
+  "a_resume_with_two_tensors_verified_missing": {
+   "group": "records",
+   "status": "new",
+   "says": "B14: two trainable tensors are not in the checkpoint. `resume_incomplete` names each.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "compared",
+        "entry": "model",
+        "model": 7,
+        "trainable": 7,
+        "checkpoint": 5,
+        "matched": 5,
+        "missing": {
+         "count": 2,
+         "names": [
+          "lstm.bias_hh_l0",
+          "lstm.weight_hh_l0"
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "findings": [
+     {
+      "component": "model",
+      "finding": "missing_tensors",
+      "count": 2,
+      "tensors": [
+       "lstm.bias_hh_l0",
+       "lstm.weight_hh_l0"
+      ]
+     }
+    ],
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "compared",
+       "entry": "model",
+       "model": 7,
+       "trainable": 7,
+       "checkpoint": 5,
+       "matched": 5,
+       "missing": {
+        "count": 2,
+        "names": [
+         "lstm.bias_hh_l0",
+         "lstm.weight_hh_l0"
+        ]
+       }
+      }
+     ]
+    },
+    "words": "model 2 trainable tensors not in the checkpoint: lstm.bias_hh_l0, lstm.weight_hh_l0",
+    "words_absent": "could not be identified"
+   },
+   "today": {
+    "fires": false
+   }
+  },
+  "missing_tensors_beside_a_missing_component": {
+   "group": "records",
+   "status": "new",
+   "says": "The checkpoint has no optimizer state and two tensors are missing. Today's findings come first, in today's order, then the tensors.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "compared",
+        "entry": "model",
+        "model": 7,
+        "trainable": 7,
+        "checkpoint": 5,
+        "matched": 5,
+        "missing": {
+         "count": 2,
+         "names": [
+          "lstm.bias_hh_l0",
+          "lstm.weight_hh_l0"
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "findings": [
+     {
+      "component": "optimizer",
+      "finding": "missing"
+     },
+     {
+      "component": "model",
+      "finding": "missing_tensors",
+      "count": 2,
+      "tensors": [
+       "lstm.bias_hh_l0",
+       "lstm.weight_hh_l0"
+      ]
+     }
+    ],
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "compared",
+       "entry": "model",
+       "model": 7,
+       "trainable": 7,
+       "checkpoint": 5,
+       "matched": 5,
+       "missing": {
+        "count": 2,
+        "names": [
+         "lstm.bias_hh_l0",
+         "lstm.weight_hh_l0"
+        ]
+       }
+      }
+     ]
+    }
+   },
+   "today": {
+    "fires": true,
+    "findings": [
+     {
+      "component": "optimizer",
+      "finding": "missing"
+     }
+    ]
+   }
+  },
+  "a_resume_with_more_missing_than_named": {
+   "group": "records",
+   "status": "new",
+   "says": "Sixty are missing and the record names fifty. The finding carries the count and the names it was given; the sentence names five and says how many more.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "compared",
+        "entry": "model",
+        "model": 61,
+        "trainable": 61,
+        "checkpoint": 1,
+        "matched": 1,
+        "missing": {
+         "count": 60,
+         "names": [
+          "blocks.00.weight",
+          "blocks.01.weight",
+          "blocks.02.weight",
+          "blocks.03.weight",
+          "blocks.04.weight",
+          "blocks.05.weight",
+          "blocks.06.weight",
+          "blocks.07.weight",
+          "blocks.08.weight",
+          "blocks.09.weight",
+          "blocks.10.weight",
+          "blocks.11.weight",
+          "blocks.12.weight",
+          "blocks.13.weight",
+          "blocks.14.weight",
+          "blocks.15.weight",
+          "blocks.16.weight",
+          "blocks.17.weight",
+          "blocks.18.weight",
+          "blocks.19.weight",
+          "blocks.20.weight",
+          "blocks.21.weight",
+          "blocks.22.weight",
+          "blocks.23.weight",
+          "blocks.24.weight",
+          "blocks.25.weight",
+          "blocks.26.weight",
+          "blocks.27.weight",
+          "blocks.28.weight",
+          "blocks.29.weight",
+          "blocks.30.weight",
+          "blocks.31.weight",
+          "blocks.32.weight",
+          "blocks.33.weight",
+          "blocks.34.weight",
+          "blocks.35.weight",
+          "blocks.36.weight",
+          "blocks.37.weight",
+          "blocks.38.weight",
+          "blocks.39.weight",
+          "blocks.40.weight",
+          "blocks.41.weight",
+          "blocks.42.weight",
+          "blocks.43.weight",
+          "blocks.44.weight",
+          "blocks.45.weight",
+          "blocks.46.weight",
+          "blocks.47.weight",
+          "blocks.48.weight",
+          "blocks.49.weight"
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "findings": [
+     {
+      "component": "model",
+      "finding": "missing_tensors",
+      "count": 60,
+      "tensors": [
+       "blocks.00.weight",
+       "blocks.01.weight",
+       "blocks.02.weight",
+       "blocks.03.weight",
+       "blocks.04.weight",
+       "blocks.05.weight",
+       "blocks.06.weight",
+       "blocks.07.weight",
+       "blocks.08.weight",
+       "blocks.09.weight",
+       "blocks.10.weight",
+       "blocks.11.weight",
+       "blocks.12.weight",
+       "blocks.13.weight",
+       "blocks.14.weight",
+       "blocks.15.weight",
+       "blocks.16.weight",
+       "blocks.17.weight",
+       "blocks.18.weight",
+       "blocks.19.weight",
+       "blocks.20.weight",
+       "blocks.21.weight",
+       "blocks.22.weight",
+       "blocks.23.weight",
+       "blocks.24.weight",
+       "blocks.25.weight",
+       "blocks.26.weight",
+       "blocks.27.weight",
+       "blocks.28.weight",
+       "blocks.29.weight",
+       "blocks.30.weight",
+       "blocks.31.weight",
+       "blocks.32.weight",
+       "blocks.33.weight",
+       "blocks.34.weight",
+       "blocks.35.weight",
+       "blocks.36.weight",
+       "blocks.37.weight",
+       "blocks.38.weight",
+       "blocks.39.weight",
+       "blocks.40.weight",
+       "blocks.41.weight",
+       "blocks.42.weight",
+       "blocks.43.weight",
+       "blocks.44.weight",
+       "blocks.45.weight",
+       "blocks.46.weight",
+       "blocks.47.weight",
+       "blocks.48.weight",
+       "blocks.49.weight"
+      ]
+     }
+    ],
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "compared",
+       "entry": "model",
+       "model": 61,
+       "trainable": 61,
+       "checkpoint": 1,
+       "matched": 1,
+       "missing": {
+        "count": 60,
+        "names": [
+         "blocks.00.weight",
+         "blocks.01.weight",
+         "blocks.02.weight",
+         "blocks.03.weight",
+         "blocks.04.weight",
+         "blocks.05.weight",
+         "blocks.06.weight",
+         "blocks.07.weight",
+         "blocks.08.weight",
+         "blocks.09.weight",
+         "blocks.10.weight",
+         "blocks.11.weight",
+         "blocks.12.weight",
+         "blocks.13.weight",
+         "blocks.14.weight",
+         "blocks.15.weight",
+         "blocks.16.weight",
+         "blocks.17.weight",
+         "blocks.18.weight",
+         "blocks.19.weight",
+         "blocks.20.weight",
+         "blocks.21.weight",
+         "blocks.22.weight",
+         "blocks.23.weight",
+         "blocks.24.weight",
+         "blocks.25.weight",
+         "blocks.26.weight",
+         "blocks.27.weight",
+         "blocks.28.weight",
+         "blocks.29.weight",
+         "blocks.30.weight",
+         "blocks.31.weight",
+         "blocks.32.weight",
+         "blocks.33.weight",
+         "blocks.34.weight",
+         "blocks.35.weight",
+         "blocks.36.weight",
+         "blocks.37.weight",
+         "blocks.38.weight",
+         "blocks.39.weight",
+         "blocks.40.weight",
+         "blocks.41.weight",
+         "blocks.42.weight",
+         "blocks.43.weight",
+         "blocks.44.weight",
+         "blocks.45.weight",
+         "blocks.46.weight",
+         "blocks.47.weight",
+         "blocks.48.weight",
+         "blocks.49.weight"
+        ]
+       }
+      }
+     ]
+    },
+    "words": "and 55 more"
+   },
+   "today": {
+    "fires": false
+   }
+  },
+  "a_resume_with_only_frozen_tensors_missing": {
+   "group": "records",
+   "status": "new",
+   "says": "An adapter-only checkpoint. Nothing is raised; the evidence names the frozen parameters.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "compared",
+        "entry": "adapter",
+        "model": 5,
+        "trainable": 2,
+        "checkpoint": 2,
+        "matched": 2,
+        "missing_frozen": {
+         "count": 3,
+         "names": [
+          "base.embed.weight",
+          "base.proj.bias",
+          "base.proj.weight"
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": false,
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "compared",
+       "entry": "adapter",
+       "model": 5,
+       "trainable": 2,
+       "checkpoint": 2,
+       "matched": 2,
+       "missing_frozen": {
+        "count": 3,
+        "names": [
+         "base.embed.weight",
+         "base.proj.bias",
+         "base.proj.weight"
+        ]
+       }
+      }
+     ]
+    }
+   },
+   "today": {
+    "fires": false
+   }
+  },
+  "a_resume_with_only_buffers_missing": {
+   "group": "records",
+   "status": "new",
+   "says": "Nothing is raised; the evidence names the buffers.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "compared",
+        "entry": "model",
+        "model": 6,
+        "trainable": 3,
+        "checkpoint": 3,
+        "matched": 3,
+        "missing_buffers": {
+         "count": 3,
+         "names": [
+          "bn.num_batches_tracked",
+          "bn.running_mean",
+          "bn.running_var"
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": false,
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "compared",
+       "entry": "model",
+       "model": 6,
+       "trainable": 3,
+       "checkpoint": 3,
+       "matched": 3,
+       "missing_buffers": {
+        "count": 3,
+        "names": [
+         "bn.num_batches_tracked",
+         "bn.running_mean",
+         "bn.running_var"
+        ]
+       }
+      }
+     ]
+    }
+   },
+   "today": {
+    "fires": false
+   }
+  },
+  "a_resume_with_only_unexpected_tensors": {
+   "group": "records",
+   "status": "new",
+   "says": "Nothing is raised; the evidence names the tensors the model does not have.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "compared",
+        "entry": "model",
+        "model": 7,
+        "trainable": 7,
+        "checkpoint": 9,
+        "matched": 7,
+        "unexpected": {
+         "count": 2,
+         "names": [
+          "old_head.bias",
+          "old_head.weight"
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": false,
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "compared",
+       "entry": "model",
+       "model": 7,
+       "trainable": 7,
+       "checkpoint": 9,
+       "matched": 7,
+       "unexpected": {
+        "count": 2,
+        "names": [
+         "old_head.bias",
+         "old_head.weight"
+        ]
+       }
+      }
+     ]
+    }
+   },
+   "today": {
+    "fires": false
+   }
+  },
+  "a_resume_with_a_shape_that_differs": {
+   "group": "records",
+   "status": "new",
+   "says": "A tensor the checkpoint holds with another shape. `resume_incomplete` names it.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "compared",
+        "entry": "model",
+        "model": 7,
+        "trainable": 7,
+        "checkpoint": 7,
+        "matched": 7,
+        "shape_differs": {
+         "count": 1,
+         "names": [
+          "head.weight"
+         ],
+         "shapes": {
+          "head.weight": {
+           "model": [
+            65,
+            32
+           ],
+           "checkpoint": [
+            10,
+            32
+           ]
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "findings": [
+     {
+      "component": "model",
+      "finding": "shape_differs",
+      "count": 1,
+      "tensors": [
+       "head.weight"
+      ]
+     }
+    ],
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "compared",
+       "entry": "model",
+       "model": 7,
+       "trainable": 7,
+       "checkpoint": 7,
+       "matched": 7,
+       "shape_differs": {
+        "count": 1,
+        "names": [
+         "head.weight"
+        ]
+       }
+      }
+     ]
+    },
+    "words": "model 1 tensor with another shape in the checkpoint: head.weight"
+   },
+   "today": {
+    "fires": false
+   }
+  },
+  "a_resume_whose_model_was_not_identified": {
+   "group": "records",
+   "status": "new",
+   "says": "No entry of the checkpoint shares enough names with the model. The finding is today's `not_identified`, once, and the evidence says why no tensor was compared.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "unavailable",
+        "why": "not_identified"
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "findings": [
+     {
+      "component": "model",
+      "finding": "not_identified"
+     }
+    ],
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "unavailable",
+       "why": "not_identified"
+      }
+     ]
+    },
+    "words": "model state could not be identified",
+    "words_absent": "not in the checkpoint"
+   },
+   "today": {
+    "fires": true,
+    "findings": [
+     {
+      "component": "model",
+      "finding": "not_identified"
+     }
+    ]
+   }
+  },
+  "a_resume_from_a_folder": {
+   "group": "records",
+   "status": "new",
+   "says": "A Hugging Face or Accelerate checkpoint folder with every component's file. Nothing is raised. The evidence says tensor coverage is unavailable, so the silence is not read as every tensor present.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "files": [
+          "model.safetensors"
+         ]
+        },
+        "optimizer": {
+         "files": [
+          "optimizer.pt"
+         ]
+        },
+        "rng": {
+         "files": [
+          "rng_state.pth"
+         ]
+        },
+        "data": {
+         "files": [
+          "trainer_state.json"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "unavailable",
+        "why": "folder"
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": false,
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "unavailable",
+       "why": "folder"
+      }
+     ]
+    }
+   },
+   "today": {
+    "fires": false
+   }
+  },
+  "a_resume_from_a_folder_with_no_optimizer_file": {
+   "group": "records",
+   "status": "new",
+   "says": "The folder's own finding is unchanged, and tensor coverage is unavailable beside it.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "files": [
+          "model.safetensors"
+         ]
+        },
+        "rng": {
+         "files": [
+          "rng_state.pth"
+         ]
+        },
+        "data": {
+         "files": [
+          "trainer_state.json"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "unavailable",
+        "why": "folder"
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "findings": [
+     {
+      "component": "optimizer",
+      "finding": "missing"
+     }
+    ],
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "unavailable",
+       "why": "folder"
+      }
+     ]
+    }
+   },
+   "today": {
+    "fires": true,
+    "findings": [
+     {
+      "component": "optimizer",
+      "finding": "missing"
+     }
+    ]
+   }
+  },
+  "a_resume_whose_comparison_raised": {
+   "group": "records",
+   "status": "new",
+   "says": "The SDK could not read the model's names. Nothing is raised from it.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "unavailable",
+        "why": "error"
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": false,
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "unavailable",
+       "why": "error"
+      }
+     ]
+    }
+   },
+   "today": {
+    "fires": false
+   }
+  },
+  "a_resume_recorded_before_this_check": {
+   "group": "records",
+   "status": "pin",
+   "says": "A load manifest with no `tensors` key, as every capture written before this page. Nothing is said about tensors: no finding, and no `checkpoint_tensors` in the evidence.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": false,
+    "checkpoint_tensors": null
+   },
+   "today": {
+    "fires": false
+   }
+  },
+  "a_resume_judged_from_a_save": {
+   "group": "records",
+   "status": "pin",
+   "says": "No load was recorded, so the resume is judged from the save after step 9, as today. A `tensors` object on a save is not read: tensors are judged from a load only.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "save": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "compared",
+        "entry": "model",
+        "model": 7,
+        "trainable": 7,
+        "checkpoint": 5,
+        "matched": 5,
+        "missing": {
+         "count": 2,
+         "names": [
+          "lstm.bias_hh_l0",
+          "lstm.weight_hh_l0"
+         ]
+        }
+       },
+       "after_step": 9
+      }
+     }
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "findings": [
+     {
+      "component": "rng",
+      "finding": "missing"
+     }
+    ],
+    "checkpoint_tensors": null
+   },
+   "today": {
+    "fires": true,
+    "findings": [
+     {
+      "component": "rng",
+      "finding": "missing"
+     }
+    ]
+   }
+  },
+  "a_tensors_entry_that_is_not_an_object": {
+   "group": "records",
+   "status": "pin",
+   "says": "`tensors` is a string. It is ignored: no finding, no entry.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": "compared"
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": false,
+    "checkpoint_tensors": null
+   },
+   "today": {
+    "fires": false
+   }
+  },
+  "a_missing_list_with_no_count": {
+   "group": "records",
+   "status": "new",
+   "says": "`missing` has names and a count of zero. A list is read only with a positive whole count, so there is no finding; the entry is written without the list.",
+   "records": [
+    {
+     "step": 0,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 1,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 2,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 3,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 4,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 5,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 6,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 7,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 8,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 9,
+     "rank": 0,
+     "attempt": 1000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 10,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0,
+     "checkpoint": {
+      "load": {
+       "components": {
+        "model": {
+         "tensors": 7,
+         "keys_hash": "c0ffee",
+         "keys": [
+          "model"
+         ]
+        },
+        "optimizer": {
+         "entries": 7,
+         "param_groups": 1,
+         "step": 10,
+         "keys": [
+          "optimizer"
+         ]
+        },
+        "rng": {
+         "keys": [
+          "rng"
+         ]
+        },
+        "data": {
+         "keys": [
+          "sampler"
+         ]
+        }
+       },
+       "tensors": {
+        "state": "compared",
+        "entry": "model",
+        "model": 7,
+        "trainable": 7,
+        "checkpoint": 7,
+        "matched": 7,
+        "missing": {
+         "count": 0,
+         "names": [
+          "head.bias"
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "step": 11,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 12,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 13,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    },
+    {
+     "step": 14,
+     "rank": 0,
+     "attempt": 2000,
+     "lr": [
+      0.001
+     ],
+     "grad_norm": 1.0
+    }
+   ],
+   "expected": {
+    "fires": false,
+    "checkpoint_tensors": {
+     "resumes": 1,
+     "entries": [
+      {
+       "step": 10,
+       "rank": 0,
+       "attempt": 2000,
+       "state": "compared",
+       "entry": "model",
+       "model": 7,
+       "trainable": 7,
+       "checkpoint": 7,
+       "matched": 7
+      }
+     ]
+    }
+   },
+   "today": {
+    "fires": false
+   }
+  }
+ }
+}
