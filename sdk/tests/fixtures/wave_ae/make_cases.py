@@ -76,13 +76,16 @@ def divergence(given: dict) -> dict:
 
 # --- 1. separately clipped groups -------------------------------------------------------------
 
-def clip_rows(calls_at: dict[int, Any] | None = None, *, split: bool = True, late_jump: bool = False) -> list[dict]:
+def clip_rows(calls_at: dict[int, Any] | None = None, *, split: bool = True, late_jump: bool = False,
+              back: bool = False, no_norms_at_5: bool = False) -> list[dict]:
     """Steps 0 to 4 name `a` and `b`, each update a hundredth larger than the last, with a
     pre-clipping total of 1. At step 5 `a`'s update jumps to 2.0 and the total to 2.0. With
     `split`, step 5 also names a third parameter `c` (unfrozen then), so the two records' totals
     are taken over `a` and `b` alone, which needs each record's total split by parameter; without
     it the two records name the same parameters and their totals are compared as recorded.
-    `late_jump` adds a step 6 naming what step 5 names, whose update jumps again."""
+    `late_jump` adds a step 6 naming what step 5 names, whose update jumps again. `back` adds a
+    step 6 that names `a` and `b` alone again, so the pair of steps 5 and 6 needs a split too.
+    `no_norms_at_5` leaves `grad_norms` out of step 5: its total cannot be split at all."""
     rows = []
     for step in range(5):
         rows.append({"step": step, "clip_grad_norm": 1.0, "grad_norms": {"a": 0.6, "b": 0.8},
@@ -93,6 +96,10 @@ def clip_rows(calls_at: dict[int, Any] | None = None, *, split: bool = True, lat
     if late_jump:
         rows.append({"step": 6, "clip_grad_norm": 4.0, "grad_norms": {k: 2 * v for k, v in names.items()},
                      "update_rms": {**sizes, "a": 6.0}})
+    if back:
+        rows.append({"step": 6, "clip_grad_norm": 2.0, "grad_norms": {"a": 1.2, "b": 1.6}, "update_rms": {"a": 2.0, "b": 0.5}})
+    if no_norms_at_5:
+        del rows[5]["grad_norms"]
     for step, calls in (calls_at or {}).items():
         rows[step]["clip_calls"] = calls
     return rows
@@ -118,6 +125,19 @@ case("after_a_pair_that_is_not_compared_the_next_is", 1, "new",
      "is compared with: they name the same parameters, so their totals are used as recorded, and step 6's jump is "
      "flagged. Today the incident is at step 5.",
      given, {"update_spike_step": 6, "clip_groups_entry": ENTRY}, update_spike(given))
+
+given = {"records": clip_rows({5: 2, 6: 2}, back=True), "window": 3}
+case("two_pairs_that_are_not_compared", 1, "new",
+     "Step 5 names a parameter more than step 4, and step 6 names one fewer than step 5; both were clipped by two "
+     "calls. Neither pair is compared. There is one entry, counting both and dated at the first.",
+     given, {"update_spike_step": None, "clip_groups_entry": {**ENTRY, "comparisons": 2}}, update_spike(given))
+
+given = {"records": clip_rows({5: 2}, no_norms_at_5=True), "window": 3}
+case("a_pair_that_cannot_be_split_is_compared_whatever_the_clip_calls", 1, "pin",
+     "Step 5 names another parameter in `update_rms` but carries no `grad_norms`, so its total cannot be split and "
+     "the base compares the totals as recorded. Two clip calls change nothing there: no split is needed, step 5 is "
+     "flagged, and there is no entry.",
+     given, {"update_spike_step": 5, "clip_groups_entry": None})
 
 given = {"records": clip_rows(), "window": 3}
 case("a_split_pair_with_one_clip_call_is_compared", 1, "pin",
@@ -161,12 +181,6 @@ case("a_stall_does_not_carry_across_a_resume", 2, "new",
      "attempt, so the stall is raised at 300. Today the two checks before the resume count, and it is raised at 200, "
      "on three comparisons with the interval from 100 to 150 never compared.",
      given, {"stalled_weights_step": 300}, stalled(given))
-
-given = {"records": stall_rows(1, [0, 50, 100], {50: P, 100: P}) + stall_rows(2, [101, 150, 200, 250], {150: P, 200: P, 250: P})}
-case("a_new_attempt_whose_first_check_compared", 2, "new",
-     "The same, but the new attempt's first weight check carries a list (a capture that could compare). It counts as "
-     "the first check of the new streak, so the stall is raised at 250. Today it is raised at 150.",
-     given, {"stalled_weights_step": 250}, stalled(given))
 
 given = {"records": stall_rows(1, [0, 50, 100, 150, 200], {50: P, 100: P, 150: P, 200: P})}
 case("a_stall_in_one_attempt", 2, "pin",
@@ -260,6 +274,26 @@ case("skipped_updates_counts_a_partial_step_apart", 4, "new",
      "The evidence's `skipped_updates` counts the partial step under `partial` and under no other name. The key "
      "`partial` is there only when its count is above zero.",
      given, {"skipped_updates": {"caller": 0, "scaler": 10, "both": 0, "partial": 1}}, skipped_block(given))
+
+given = {"records": full(range(5)) + [partial(5, "both")] + full(range(6, 11))}
+case("skipped_updates_counts_a_partial_step_both_reported_apart", 4, "new",
+     "A partial step the caller also reported is counted under `partial` too, and not under `both`.",
+     given, {"skipped_updates": {"caller": 0, "scaler": 10, "both": 0, "partial": 1}}, skipped_block(given))
+
+given = {"records": full(range(5)) + [skip(5, "caller", step_skipped_part=PART)] + full(range(6, 11))}
+case("a_part_key_on_a_skip_only_the_caller_reported_says_nothing", 4, "pin",
+     "`step_skipped_part` is the scaler's verdict. On a skip only the caller reported, with the scaler's outcome "
+     "unknown, it says nothing: the step is passed over as on the base, the ten scaler-confirmed skips around it are "
+     "a streak of ten, and the rule is raised at the last, step 10.",
+     given, {"loss_scale_trouble_step": 10, "reason": "skips", "consecutive_skips": 10,
+             "counters_at_end": {"recorded_steps": 10, "skipped_steps": 10, "streak": 10, "partial_steps": 0}})
+
+given = {"records": full(range(5)) + [{"step": 5, "step_skipped": False, "step_skipped_part": PART}] + full(range(6, 11))}
+case("a_part_key_on_an_applied_step_says_nothing", 4, "pin",
+     "On a record whose `step_skipped` is false the key says nothing: it is an applied update, which ends the streak "
+     "as on the base. 11 recorded, 10 skipped, no partial step, a streak of 5.",
+     given, {"loss_scale_trouble_step": None, "reason": None, "consecutive_skips": None,
+             "counters_at_end": {"recorded_steps": 11, "skipped_steps": 10, "streak": 5, "partial_steps": 0}})
 
 given = {"records": full(range(4)) + [skip(4, "caller"), skip(5, "both")]}
 case("skipped_updates_without_a_partial_step", 4, "pin",

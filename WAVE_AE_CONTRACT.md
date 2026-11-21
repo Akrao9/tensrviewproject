@@ -2,7 +2,7 @@
 
 **Approved by the author on Nov 21, 2026, all five for implementation, with amendments to items 1, 4 and 5, which are made here. Nothing on this page is built.** It is on the branch `contracts/wave-ae`, cut from `265311c`, the base of wave AE. The Python detectors (`sdk/src/tensorquill/evidence.py`) and the server (`server/src/detect.rs`) build sections 1, 2 and 4 from this page and from the cases in `sdk/tests/fixtures/wave_ae/cases.json`, each from the cases alone, and must give each case's `expected`. The capture (`sdk/src/tensorquill/capture.py`) builds the record's side of sections 1, 3 and 4. Section 5 is the readers' and starts once lane AE1 has released their files.
 
-Each case is a **pin** (behaviour the base has and this page keeps; `sdk/tests/test_wave_ae_contract.py` runs it on every tree) or **new** (not built on the base; its `expected` is the target, and its `today` is a record of what `265311c` answers, written once by `make_cases.py` and never recomputed). 30 cases: 18 pins, 12 new.
+Each case is a **pin** (behaviour the base has and this page keeps; `sdk/tests/test_wave_ae_contract.py` runs it on every tree) or **new** (not built on the base; its `expected` is the target, and its `today` is a record of what `265311c` answers, written once by `make_cases.py` and never recomputed). 34 cases: 21 pins, 13 new. A new case's `expected` is written by hand from this page; the generator shows only that the base does not meet it.
 
 Three rules hold for every section:
 
@@ -27,11 +27,20 @@ Where this page states something the author's words do not, it says "this page's
 |---|---|---|
 | Names different parameters, so the totals would be split | Yes | Not compared: nothing is flagged, and its change joins no baseline (`a_split_pair_with_two_clip_calls_is_not_compared`, `a_split_pair_whose_earlier_record_had_two_clip_calls`, new) |
 | Names different parameters | No | Split and compared, as on the base (`a_split_pair_with_one_clip_call_is_compared`, pin) |
-| Names the same parameters, or cannot be split for another reason the base already has | Either | Compared with the totals as recorded, as on the base (`a_pair_naming_the_same_parameters_is_compared_whatever_the_clip_calls`, pin) |
+| Names the same parameters, or cannot be split for another reason the base already has (a record without `grad_norms`, a norm that is not finite, no shared parameter, norms that are all 0) | Either | Compared with the totals as recorded, as on the base (`a_pair_naming_the_same_parameters_is_compared_whatever_the_clip_calls`, `a_pair_that_cannot_be_split_is_compared_whatever_the_clip_calls`, pins) |
 
 - The later record of a pair that was not compared is still the record the next one is compared with (`after_a_pair_that_is_not_compared_the_next_is`, new).
-- **What the evidence says.** When at least one pair was not compared, `not_checked` gains one entry: `{"check": "clip_groups", "kinds": ["update_spike"], "comparisons": N, "step": S, "reason": ...}`, with `N` the pairs not compared and `S` the step of the first. `update_spike` stays `checked` in `kind_checks`: every other pair was judged. As any `not_checked` entry does, it makes the run read `degraded` (this page's reading: it follows from the existing rule and was not asked for). The reason's words: "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter, so N comparison(s) of update_spike were not made".
+- **What the evidence says.** When at least one pair was not compared, `not_checked` gains one entry: `{"check": "clip_groups", "kinds": ["update_spike"], "comparisons": N, "step": S, "reason": ...}`, with `N` the pairs not compared and `S` the step of the later record of the first such pair (`two_pairs_that_are_not_compared`, new). `update_spike` stays `checked` in `kind_checks`: every other pair was judged. As any `not_checked` entry does, it makes the run read `degraded` (this page's reading: it follows from the existing rule and was not asked for). The reason's words: "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter, so N comparison(s) of update_spike were not made".
 - A run whose records carry `clip_calls` and whose pairs never need a split has no entry and no other difference.
+
+**The record's side, in the capture lane's tests.**
+
+| Test | Loop | Expected on the record |
+|---|---|---|
+| The regression | `lane-ad3/l20_two_clips.py`: group `a` (norm 0.40) and group `b` (16.0), one `clip_grad_norm_` call each | `clip_calls: 2`, and `clip_grad_norm` 16.0050 as on the base |
+| One call | The same groups clipped by one call over both | No `clip_calls`; the record is what it is on the base |
+| No clipping | A step that does not clip, after one that clipped twice | No `clip_calls` on it: the count is the step's own |
+| Compiled | The clipping inside a compiled step | No `clip_calls`, whatever the number of calls: the count is not known there |
 
 **Not built, stated:** an exact split from each call's own norm and parameters.
 
@@ -44,7 +53,7 @@ Where this page states something the author's words do not, it says "this page's
 - Over one rank's resolved records in step order, when a record's attempt differs from that of the record before it, every parameter's streak starts again at zero before that record is read. A record without `attempt` is of attempt 0.
 - Only the streak starts again. Which parameters were seen changing, and which were already reported, are kept: a stall raised before the resume stands, with its step (`a_stall_raised_before_the_resume_stands`, pin).
 - In the fixture the incident belongs at step 300 (`a_stall_does_not_carry_across_a_resume`, new). The uninterrupted control is raised at 150 as on the base (`a_stall_in_one_attempt`, pin), and a stall wholly inside the resumed attempt is raised where it was (`a_stall_wholly_inside_the_resumed_attempt`, pin).
-- **This page's reading:** a new attempt whose first weight check does carry a list (a capture that could compare) counts that check as the first of the new streak (`a_new_attempt_whose_first_check_compared`, new).
+- A row that carries `weights_unchanged` is a comparison the capture made; a process's first check makes none and carries no list. No case states a new attempt whose first check carries one: the capture does not write it.
 
 **What it gives up:** a parameter stalled right through a resume is reported up to three checks later, 150 steps at the default interval.
 
@@ -88,12 +97,23 @@ Where this page states something the author's words do not, it says "this page's
 
 - The paired regression: five full skips, one partial step and five full skips end at 11 recorded, 10 skipped, 1 partial and a streak of 5, and nothing is raised (`five_full_skips_one_partial_step_five_full_skips`, new). The same with the caller also reporting the partial step (`a_partial_step_the_caller_also_reported`, new).
 - A partial step and then ten full skips raise the rule at the tenth of them (`a_partial_step_then_ten_full_skips`, new). An incident carries `partial_steps` beside `skipped_steps` and `recorded_steps` only when it is above zero.
-- The controls stay: one optimizer (`eleven_full_skips_with_one_optimizer`, pin), and a key that does not state a mixed outcome, which is a full skip (`a_part_key_that_says_every_optimizer_skipped_is_a_full_skip`, `a_part_key_that_says_no_optimizer_skipped_is_a_full_skip`, `a_part_key_that_is_not_two_counts_is_a_full_skip`, pins). The cases of `STEP_AND_EVIDENCE_CONTRACT.md` are unchanged.
+- The controls stay: one optimizer (`eleven_full_skips_with_one_optimizer`, pin), and a key that does not state a mixed outcome, which is a full skip (`a_part_key_that_says_every_optimizer_skipped_is_a_full_skip`, `a_part_key_that_says_no_optimizer_skipped_is_a_full_skip`, `a_part_key_that_is_not_two_counts_is_a_full_skip`, pins).
+- The key is the scaler's verdict on a skip it confirmed. On a skip only the caller reported, and on a record whose `step_skipped` is false, it says nothing, and the record is counted as on the base (`a_part_key_on_a_skip_only_the_caller_reported_says_nothing`, `a_part_key_on_an_applied_step_says_nothing`, pins). The cases of `STEP_AND_EVIDENCE_CONTRACT.md` are unchanged.
 - A loss scale below the floor on a partial step raises the rule with reason `scale`, as on any step (`a_low_loss_scale_on_a_partial_step`, pin).
 
 **The kinds judged parameter by parameter.** The record does not say which optimizer's update was applied, so, in the author's words, "Keep parameter-level checks unavailable where the capture cannot attribute the outcome." `grad_spike`, `update_spike`, what counts as update history, and `stalled_weights` read a partial step as they read a skipped one today: not judged, and a stall's streak neither grows nor ends (`a_stall_across_a_partial_step`, pin). That can miss evidence from the optimizer that applied its update, and never invents any.
 
-**What the evidence keeps.** `skipped_updates` counts a partial step under `partial` and under no other name, with the key there only when its count is above zero (`skipped_updates_counts_a_partial_step_apart`, new; `skipped_updates_without_a_partial_step`, pin). Where a reader says skipped updates in words, a partial step is "N step(s) on which the scaler skipped some optimizers and applied others". The all-ranks view and the MCP tools pass the block on as they do today.
+**What the evidence keeps.** `skipped_updates` counts a partial step under `partial` and under no other name, with the key there only when its count is above zero (`skipped_updates_counts_a_partial_step_apart`, `skipped_updates_counts_a_partial_step_both_reported_apart`, new; `skipped_updates_without_a_partial_step`, pin). Where a reader says skipped updates in words, a partial step is "N step(s) on which the scaler skipped some optimizers and applied others". The all-ranks view and the MCP tools pass the block on as they do today.
+
+**The record's side, in the capture lane's tests.**
+
+| Test | Loop | Expected on the record |
+|---|---|---|
+| The regression | `lane-ad3/item5_b.py`: two optimizers through one scaler, an Inf only in the second's gradients at step 2 | `step_skipped: true`, `step_skipped_by: "scaler"`, `step_skipped_part: {"skipped": 1, "of": 2}`; the weight check on it as on the base (the second's parameters unchanged, the first's changed) |
+| Every optimizer skipped | An Inf in both optimizers' gradients | `step_skipped: true`, no `step_skipped_part` |
+| None skipped | Two optimizers, no overflow | `step_skipped: false`, no `step_skipped_part` |
+| One optimizer | One optimizer through the scaler, with and without an overflow | Every record byte for byte what it is on the base |
+| No sync | The regression's loop | No device sync added at the step: the verdicts are read at the flush, as `step_skipped` is |
 
 **Not built, stated:** which parameters each verdict covers, so that each could be judged by its own optimizer's outcome.
 

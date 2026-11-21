@@ -68,7 +68,7 @@ def matches(found: dict, expected: dict) -> bool:
 
 def test_the_file_holds_the_cases_the_page_names():
     page = (ROOT / "WAVE_AE_CONTRACT.md").read_text()
-    assert len(CASES) == 30 and len(PINS) == 18 and len(NEW) == 12
+    assert len(CASES) == 34 and len(PINS) == 21 and len(NEW) == 13
     assert DOCUMENT["base"] == "265311c"
     for name, body in CASES.items():
         assert f"`{name}`" in page, f"{name} is not named on the page"
