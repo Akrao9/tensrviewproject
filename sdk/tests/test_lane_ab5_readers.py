@@ -34,7 +34,6 @@ from typing import Any
 import pytest
 
 import tensorquill
-from tensorquill import compare as cmp
 from tensorquill import evidence as ev
 from tensorquill import mcp_server
 from tensorquill import runs as runs_module
@@ -436,9 +435,13 @@ def test_compare_of_a_live_servers_store_shows_its_dropped_rows_and_refused_batc
 
         status = _wait(counted, "the server's status to count the refused batches")
         for run in ("base", "after"):
-            for rank in (0, 1):
-                _wait(lambda: ev.read_server_report(root / "runs" / run / f"rank={rank}")["state"] == "current",
-                      f"{run} rank {rank}'s report to be current")
+            for rank, last in ((0, 13 if run == "after" else 11), (1, 11)):
+                # Current, and of every stored row: rank 0 of `after` stored two more steps later.
+                def judged(run: str = run, rank: int = rank, last: int = last) -> bool:
+                    look = ev.read_server_report(root / "runs" / run / f"rank={rank}")
+                    return look["state"] == "current" and (look.get("report") or {}).get("last_step") == last
+
+                _wait(judged, f"{run} rank {rank}'s report to be current at step {last}")
     finally:
         assert server.stop() == 0
 

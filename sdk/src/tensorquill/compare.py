@@ -609,8 +609,9 @@ def open_run(wanted: str | Path, source: str | Path | None = None, project: str 
 
 
 def _store_dropped(folder: Path, rank: int | None) -> dict[str, Any] | None:
-    """The rows a store run's server dropped for a null key (`runs.dropped_rows`, from its
-    `watchdog.json`; L22, lane AA5, Nov 20, 2026): the whole run's, or with `rank` (the rank
+    """The rows a store run's server dropped, for a null key or an unsupported schema version
+    (`runs.dropped_rows`, from its `watchdog.json`; L22, lane AA5, Nov 20, 2026): the whole
+    run's, or with `rank` (the rank
     read) that rank's alone, in the same shape. None when none was dropped (of that rank), so such a run's result
     is as before. An upper bound: a batch sent again after a lost acknowledgement is counted
     again. Never raises."""
