@@ -146,3 +146,13 @@ Recorded per series: `growth` (last-third median over first-third median), the s
 - **Asking for 10 or 20 earlier values** gives the same largest healthy scores, except that 20 leaves out nanoMoE's step 11 (24.3 becomes 19.6).
 
 So the score is worth recording beside the ratio, and these captures give no line to draw on it.
+
+## Validation: one fresh run, not used to choose either rule
+
+`validate.py`, Nov 21, 2026. nanoMoE from scratch in another shape than the allowlist's: 4 layers, width 128, 4 experts at top-1 with a router in every block, dropout 0.1, batch 12, block 96, 900 steps (901 records). Run once, after both rules were proposed, against the rules as the contract's generator states them.
+
+**`activation_drift`.** 4 modules have layer statistics. All 4 reached 110 records (901 each) and all 4 were judged, from step 109, on 792 records each. None fired: the largest ratio was 1.44 (`transformer.h.0`, step 122). Today's rule fires on this run at step 114 and reaches 5.28. So the proposed rule was exercised here, not skipped for want of history.
+
+**`moe_imbalance`.** Not quiet, under either rule. 3,340 of 3,604 samples are flagged: on router `h.2` one of four experts is over the line from step 0 and stays there. Today's rule reports step 0. The proposed rule reports the same router as collapsed since step 0 and reportable at its tenth sample. Whether a top-1 router of four experts with one expert over 37.5% for most of a healthy run is an imbalance worth an incident is a question this run raises and does not answer: it was run with nanoMoE's balance loss on, and it is one seed.
+
+**The trend.** The gradient norm's growth is 1.14 over the run.

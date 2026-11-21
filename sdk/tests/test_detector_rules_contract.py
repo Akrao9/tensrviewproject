@@ -22,7 +22,7 @@ ROOT = Path(__file__).parents[2]
 FOLDER = Path(__file__).parent / "fixtures" / "rules"
 DOCUMENT = json.loads((FOLDER / "cases.json").read_text())
 CASES = DOCUMENT["cases"]
-PARTS = {"score": 7, "activation_drift": 9, "moe_imbalance": 10, "measurements": 10}
+PARTS = {"score": 8, "score_records": 4, "activation_drift": 9, "moe_imbalance": 11, "measurements": 10, "evidence": 4, "wire": 9}
 
 
 def of(part):
@@ -55,6 +55,14 @@ def test_a_drift_case_records_what_the_rule_says_today(name, body):
     assert (today and today["step"]) == body["today"]["step"]
 
 
+def test_the_reader_words_for_a_score_are_the_ones_the_author_gave():
+    """A reader test for the pinned example: the words must be true of a window that varies."""
+    for name, body in of("score"):
+        expected = body["expected"]
+        if expected["score"] is None and expected["score_note"] == "no_dispersion":
+            assert expected["display"] == "no score: the earlier values had zero median absolute deviation", name
+
+
 @pytest.mark.parametrize("name,body", of("moe_imbalance"), ids=[n for n, _ in of("moe_imbalance")])
 def test_an_imbalance_case_records_what_the_rule_says_today(name, body):
     records = body["records"]
@@ -71,12 +79,27 @@ def test_the_cases_show_each_thing_the_page_says_a_rule_gives_up_or_keeps():
     assert not CASES["drift_not_judged_before_110_records"]["expected"]["enough_history"]
     start = {name: body["expected"]["incident"] for name, body in of("moe_imbalance")}
     assert start["start_two_samples_then_even"] is None and start["start_nine_samples_then_even"] is None
-    assert start["start_ten_samples_is_reported"] == {**start["start_ten_samples_is_reported"], "step": 0, "since_start": True}
+    assert start["start_ten_samples_is_reported"] == {**start["start_ten_samples_is_reported"], "step": 0, "since_start": True,
+                                                      "reportable_step": 9}
+    assert start["start_in_a_sparse_capture"]["reportable_step"] == 450
+    assert start["a_start_and_an_earlier_reportable_failure"]["router"] == "b"
+    assert "reportable_step" not in start["not_at_step_0_is_not_a_start"]
     assert start["not_at_step_0_is_not_a_start"]["step"] == 5 and "since_start" not in start["not_at_step_0_is_not_a_start"]
     assert start["one_router_starts_another_fails"]["router"] == "b"
     assert start["start_and_the_capture_ends"] is None
     assert CASES["start_and_the_capture_ends"]["expected"]["starting_state"] == [{"router": "r", "samples": 5}]
     assert CASES["start_two_samples_then_even"]["expected"]["starting_state"] == []
-    assert CASES["score_no_dispersion"]["expected"] == {"score": None, "score_note": "no_dispersion"}
-    assert CASES["score_nine_earlier_values"]["expected"] == {"score": None, "score_note": "short_history"}
+    zero_mad = "no score: the earlier values had zero median absolute deviation"
+    assert CASES["score_no_dispersion"]["expected"] == {"score": None, "score_note": "no_dispersion", "display": zero_mad}
+    # The author's example: six equal values and four different ones vary, and still have a zero MAD.
+    six_and_four = CASES["score_six_alike_and_four_different"]
+    assert len(set(six_and_four["window"])) == 5 and six_and_four["expected"]["display"] == zero_mad
+    assert "did not vary" not in json.dumps(DOCUMENT)
+    assert CASES["score_nine_earlier_values"]["expected"]["display"] == "no score: fewer than 10 earlier values"
+    assert CASES["score_above"]["expected"]["display"] == "score 49.6"
+    assert CASES["capture_stopped_at_step_0"]["expected"]["status"]["capture_stopped"]["step"] == 0
+    assert CASES["capture_stopped_before_any_step"]["expected"]["status"]["capture_stopped"]["step"] is None
+    assert "step" not in CASES["capture_stopped_from_an_older_sender"]["expected"]["status"]["capture_stopped"]
+    assert [body["expected"]["words"].get("r") for name, body in of("wire") if name.startswith("moe_source")].count(
+        "the dispatched assignments") == 1
     assert CASES["gradient_trend_a_plateau"]["expected"]["gradient_trend"]["growth"] == 1.0

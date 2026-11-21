@@ -1,20 +1,22 @@
 # Detector rules contract, wave AD
 
-**Draft for the author's signature, Nov 21, 2026. Nothing here is built.** It is on the branch `contracts/wave-ad`, cut from `eb5a71b`. Both engines (the Python detectors in `sdk/src/tensorquill/evidence.py` and the server in `server/src/detect.rs`) build from this page and from the cases in `sdk/tests/fixtures/rules/cases.json`, and must give each case's `expected`.
+**Signed in part by the author on Nov 21, 2026. Nothing here is built.** It is on the branch `contracts/wave-ad`, cut from `eb5a71b`. Both engines (the Python detectors in `sdk/src/tensorquill/evidence.py` and the server in `server/src/detect.rs`) build from this page and from the cases in `sdk/tests/fixtures/rules/cases.json`, and must give each case's `expected`.
 
-What was measured before any rule was proposed is in `experiments/rule-selection/RESULTS.md`. Every input to that is on `experiments/rule-selection/allowlist.json`. Gate 1's six held-out cases were not read, and are not read until this page is signed.
+What was measured before any rule was proposed is in `experiments/rule-selection/RESULTS.md`. Every input to that is on `experiments/rule-selection/allowlist.json`. Gate 1's six held-out cases have not been read, and stay held out.
 
-## What the author is asked to decide
+## Where each decision stands
 
-| # | Decision | Proposed |
+| # | Decision | The author's word, Nov 21, 2026 |
 |---|---|---|
-| 1 | The `activation_drift` rule | A trailing baseline that never uses a module's first 50 records (part 2) |
-| 2 | The `moe_imbalance` rule for a router that has not been trained | The state a router starts in is excused for up to 10 samples (part 3) |
-| 3 | The least number of earlier finite values for a score | 10 (part 1) |
-| 4 | What a reader shows when the MAD is zero | No score, with the words "the earlier values did not vary" (part 1) |
-| 5 | The four measurements and their names | `gradient_trend`, `attention_trends`, `update_trends`, `weight_jumps` (part 6) |
-| 6 | What a refused batch does to its stream, by RS10's acceptance run | The server says which bytes it refused for good, then ends the stream; the sender goes on from their end (part 8) |
-| 7 | Three keys on the wire | `layers_not_read`, `moe_source`, and the step on `capture_stopped` (part 7) |
+| 1 | The `activation_drift` rule (part 2) | **Not signed.** Frozen as proposed, pending the fresh run, which is now reported in part 2 |
+| 2 | `moe_imbalance` on a router that has not been trained (part 3) | **Approved**, with when the incident began kept apart from when it became reportable |
+| 3 | At least 10 earlier finite values for a score (part 1) | **Approved** |
+| 4 | What a reader shows when the MAD is zero (part 1) | **Approved with other words:** "no score: the earlier values had zero median absolute deviation" |
+| 5 | The four measurements and their names (part 6) | **Approved.** They and the score stay descriptive |
+| 6 | What a refused batch does to its stream (part 8) | **Approved in intent. The transport is not signed** |
+| 7 | Three keys on the wire (part 7) | **Approved**, with two clarifications that are now in part 7 |
+
+No engine lane starts, and no lane is sent a commit hash, until decision 1 is signed and the transport of decision 6 is settled or split off.
 
 ## 1. The score beside a ratio (S6)
 
@@ -23,7 +25,9 @@ Wherever an incident records a `ratio` that was taken against a window of earlie
 - **The arithmetic.** `score = (value - median) / (1.4826 * MAD)`. The median is the rules' own (`_median`: the mean of the two middle values of an even count). The MAD is the median of the absolute distances from that median. Both are taken over the same earlier values the ratio's baseline was taken over, and never over the value itself.
 - **How many earlier values it needs.** At least 10 finite values in the window. With fewer the score is `null` and `score_note` is `"short_history"`. A value that is not a finite number does not count.
 - **A zero MAD.** When more than half the window is the same value the MAD is 0. Nothing is divided by it: the score is `null` and `score_note` is `"no_dispersion"`.
-- **What a reader shows.** A number to one decimal place ("score 31.2"). For `short_history`: "no score: fewer than 10 earlier values". For `no_dispersion`: "no score: the earlier values did not vary". A reader never shows a null score as 0 and never leaves the line out.
+- **What a reader shows.** A number to one decimal place ("score 31.2"). For `short_history`: "no score: fewer than 10 earlier values". For `no_dispersion`: "no score: the earlier values had zero median absolute deviation". A reader never shows a null score as 0 and never leaves the line out.
+- **Why those words.** Six equal values and four different ones have a zero MAD, though the values vary. "The earlier values did not vary" would be false there. That example is a case (`score_six_alike_and_four_different`), and each case carries the words a reader shows as `display`, which a reader test in each lane pins.
+- **It is a description.** By the author's word the score and the four measurements of part 6 stay descriptive: nothing is judged from them in this wave.
 - **No trend is removed first.** The sibling repository scores residuals from a local trend. On TensorQuill's own captures that changed the largest healthy score from 75.9, 11.9 and 24.3 to 75.5, 8.8 and 13.7, so it is left out of this wave.
 - **It raises nothing.** No rule reads the score. On these captures it separates activation faults from healthy runs by a wide margin and does not separate the total gradient norm (a healthy Granite step scores 76, two seeded faults 31 and 54).
 
@@ -37,7 +41,9 @@ Where the key appears, each beside its `ratio`:
 | `activation_drift` | Each of `modules` | The 50 records the baseline is taken from (part 2) |
 | `attention_collapse`, `attention_logit_growth` | Each of `modules` | The earlier probes of the baseline. There are at most 5, so the score is always `null`, `short_history` |
 
-Cases: `score_above`, `score_below_is_negative`, `score_ten_earlier_values`, `score_nine_earlier_values`, `score_values_that_are_not_finite_do_not_count`, `score_no_dispersion`, `score_all_equal`.
+Cases of the arithmetic: `score_above`, `score_below_is_negative`, `score_ten_earlier_values`, `score_nine_earlier_values`, `score_values_that_are_not_finite_do_not_count`, `score_no_dispersion`, `score_all_equal`, `score_six_alike_and_four_different`.
+
+Cases over records, where each expected incident is today's with the score added, and the generator checks each window against the baseline today's rule reports: `score_on_grad_spike_by_the_total`, `score_on_grad_spike_by_one_parameter` (the second parameter path, whose baseline is the parameter's own earlier norms outside an excursion), `score_on_grad_spike_with_twelve_earlier_records`, `score_on_activation_spike`.
 
 ## 2. `activation_drift`
 
@@ -56,7 +62,19 @@ Cases: `score_above`, `score_below_is_negative`, `score_ten_earlier_values`, `sc
 - **It is in-sample.** The plain trailing baseline was tried first and fired on one healthy run at step 59. "Never use a module's first 50 records" was added after seeing that. So the result on these runs is a fit to them, not a test.
 - **22 of the 28 healthy record sets are judged at all.** The other six have no layers or fewer than 110 records. B4's healthy run, the one the plain trailing rule fired on, has 102 records: it is quiet here because it is never judged, not because it was judged and passed.
 - **The 22 are about ten distinct workloads.** Granite in three capture modes is one job. B9, B10 and the hardware simulation share one model and give the same numbers. The two nanoMoE arms share a model and a seed.
-- **One fresh run is the check.** A from-scratch MoE job of another shape, not used to choose the rule, is run once against this rule as written. Its result is in `RESULTS.md` under "Validation".
+- **Six development sets were never judged:** too short, or without layers. One of them is the healthy run that prompted the warm-up change.
+
+**The fresh run** (Nov 21, 2026; not used to choose the rule; run once against it as written). nanoMoE from scratch in another shape: 4 layers, width 128, 4 experts at top-1 with a router in every block, dropout 0.1, 900 steps, 901 records.
+
+| | |
+|---|---|
+| Modules with layer statistics | 4 |
+| Modules that reached 110 records | 4, with 901 records each |
+| Modules judged | 4, from step 109, on 792 records each |
+| Did any fire | No. The largest ratio was 1.44, at step 122 |
+| Today's rule on the same run | Fires at step 114, and reaches 5.28 |
+
+So the rule was tested on this run, and it was quiet where today's rule fires. It is one run of one seed, on a model of the same family as one already on the allowlist.
 
 **What it gives up, stated so it is signed knowingly.**
 
@@ -74,7 +92,8 @@ Cases: `drift_growth_from_scratch_is_not_a_shift`, `drift_a_step_change_is_named
 
 - A router whose first sample is at step 0 and is flagged is in the state it started in.
 - That leading run of flagged samples is not reported while it is shorter than 10 samples.
-- Once it reaches 10 samples it is reported, dated at its first sample, with `since_start: true`.
+- Once it reaches 10 samples it is reported. **When it began and when it became reportable are two facts, and the incident carries both:** `step` is the first flagged sample's step, `reportable_step` is the tenth's, and `since_start` is true. A reader says "collapsed since step 0, reportable at step 9", never that it was found at step 0.
+- Among several routers the incident is the one that could be reported first (`a_start_and_an_earlier_reportable_failure`).
 - Any flagged sample after the leading run has ended is reported as today.
 - A router whose first sample is not at step 0 is judged as today.
 
@@ -86,18 +105,22 @@ Cases: `drift_growth_from_scratch_is_not_a_shift`, `drift_a_step_change_is_named
 
 **What it gives up.** A router collapsed from its first step is reported 10 samples later than today.
 
-Cases: `start_two_samples_then_even`, `start_nine_samples_then_even`, `start_ten_samples_is_reported`, `start_then_a_later_overload`, `start_ends_and_comes_back`, `not_at_step_0_is_not_a_start`, `start_in_a_sparse_capture`, `one_router_starts_another_fails`, `a_healthy_router`, `start_and_the_capture_ends`.
+Cases: `start_two_samples_then_even`, `start_nine_samples_then_even`, `start_ten_samples_is_reported`, `start_then_a_later_overload`, `start_ends_and_comes_back`, `not_at_step_0_is_not_a_start`, `start_in_a_sparse_capture`, `one_router_starts_another_fails`, `a_healthy_router`, `start_and_the_capture_ends`, `a_start_and_an_earlier_reportable_failure`.
 
 ## 4. The learning rate on `update_spike`
 
-The incident gains `lr`, the record's `lr` list at the flagged step, and `lr_before`, the same at the step it was compared with. Each is present only when that record carries `lr`. Nothing about when the kind fires changes. The engine lanes hold both engines to the same two keys on the existing `update-size-a-jump` record set.
+The incident gains `lr`, the record's `lr` list at the flagged step, and `lr_before`, the same at the step it was compared with. Each is present only when that record carries `lr`. Nothing about when the kind fires changes: the rule does not read `lr`, which the generator checks.
+
+Cases: `update_spike_carries_the_learning_rate`, `update_spike_without_a_learning_rate`.
 
 ## 5. `parameters_not_judged`
 
 Today the Python detectors name the parameters whose gradient was not read on the `stalled_weights` entry of `kind_checks`, and the server writes no such key.
 
 - Both engines write `parameters_not_judged`, a sorted list of names, on the `stalled_weights` entry of one rank's `kind_checks`, when a `gradients` entry of `not_checked` lists them and the kind is not itself `unavailable`.
-- The all-ranks view's `stalled_weights` entry carries the sorted union under the same key, and `parameters_not_judged_by_rank` (rank to list) when the ranks' lists differ.
+- The all-ranks view's `stalled_weights` entry carries the sorted union under the same key, and `parameters_not_judged_by_rank` (rank to list) when the ranks' lists differ. "The run-level check" of the bug list is the run-level part of the all-ranks view (`combine_rank_evidence`).
+
+Cases: `stalled_weights_names_what_it_did_not_judge`, `the_all_ranks_view_names_them_by_rank_when_ranks_differ`.
 
 ## 6. Four measurements, with no incident and no threshold
 
@@ -112,6 +135,8 @@ The first two are the robust local trend of the sibling repository LLM-Training-
 | `update_trends` | Q2 | Each parameter's `update_rms` against the median of its own 50 records before, from 10 earlier values on | `parameters`, `judged`, and `lowest`: the ten parameters whose update fell furthest, each with `ratio`, `step`, `baseline`, `update_rms` |
 | `weight_jumps` | Q3 | Each tensor's norm at two consecutive weight checks | `checks`, `parameters`, and `largest`: the ten largest changes, each with `ratio`, `step`, `previous_step`, `before`, `after` |
 
+**What these measurements do not do, in the author's words of Nov 21, 2026:** B4's re-created fault is still missed, and Q1 has only synthetic coverage. Neither gap is closed by this wave.
+
 What the development captures say of the trend, so that it is not over-read:
 
 - It shows a sustained rise where there is one (5.2 times over B1's buggy long run).
@@ -125,48 +150,62 @@ Cases: `gradient_trend_a_steady_rise`, `gradient_trend_a_plateau`, `gradient_tre
 
 None changes the Arrow schema or the protocol number: the two record keys travel in `extra_json`, as `moe_refused` and `grads_not_read` do.
 
-- **`layers_not_read`** on a record, said once on the first record written after the capture knows: a map from module name to why it could not be read. In evidence it is a `not_checked` entry with `check: "layers"`, `modules`, `reason` and `step`. No kind becomes `unavailable` for it: the activation kinds stay `checked` for the modules read and name the others under `modules_not_judged`, as `stalled_weights` does for parameters.
-- **`moe_source`** on a record, said once: a map from router name to `"scores"` (TensorQuill took the top-k of the hooked module's output), `"indices"` (the model gave the chosen experts) or `"map"` (a routing map). In evidence it is copied as recorded under `moe_source`, and a MoE incident on a `"scores"` router says the counts are what the router asked for, which a capacity limit, a bias or noise after the hooked module can change.
-- **The step capture stopped at**, on the heartbeat. A beat that carries `capture_stopped` also carries `capture_stopped_step`, the last step the session committed before it stopped, or null when it committed none. The server's status shows it as `step` inside the rank's `capture_stopped`, beside `reason`.
+- **`layers_not_read`** on a record, said once on the first record written after the capture knows: a map from module name to why it could not be read. In evidence it is a `not_checked` entry with `check: "layers"`, `modules`, `reason`, `step` and `coverage`. The two coverages are different things and read differently:
+  - `"partial"`: some modules were read. No kind becomes `unavailable`: the activation kinds stay `checked` for the modules read and name the others under `modules_not_judged`, as `stalled_weights` does for parameters.
+  - `"none"`: no module was readable. The activation kinds are `unavailable` and the entry lists them under `kinds`. Nothing was looked at, so nothing reads as clean.
+- **`moe_source`** on a record, said once: for each router, `form` and `point`.
+  - `form` is how the routing reached the capture: `"scores"` (TensorQuill took the top-k of the hooked module's output), `"indices"` (the model gave the chosen experts) or `"map"` (a routing map). It describes the representation and nothing else.
+  - `point` is where in the model it was taken: `"requested"` (before any capacity limit, bias or noise that follows), `"dispatched"` (after the model has finished assigning), or `"unknown"`.
+  - Indices and maps can be produced before or after capacity handling, so the form never tells a reader which. **A reader says "dispatched assignments" only when `point` is `"dispatched"`**, which the capture writes only where the capture point establishes it. Scores are always `"requested"`. With `"unknown"` a reader says the assignments are as the model gave them and that it is not known whether a capacity limit came first.
+- **The step capture stopped at**, on the heartbeat. A beat that carries `capture_stopped` also carries `capture_stopped_step`: the last step the session committed before it stopped, or null when it committed none. Step 0 and null are different and stay different all the way to a reader. The server's status shows it as `step` inside the rank's `capture_stopped`, beside `reason`; a beat from a sender older than the key gives no `step` key.
+
+Cases, each from what is written on the wire to what a reader holds: `layers_not_read_some_modules`, `layers_not_read_no_module`, `moe_source_scores_are_what_the_router_asked_for`, `moe_source_indices_at_an_unknown_point`, `moe_source_a_map_after_dispatch`, `moe_source_absent`, `capture_stopped_at_step_0`, `capture_stopped_before_any_step`, `capture_stopped_from_an_older_sender`.
 
 ## 8. RS10: what a refused batch does to its stream
 
-The acceptance run is `sdk/tests/test_rs10_acceptance.py`, written against the real server before this part is signed. One rank sends a batch the server can store (A, 3 rows, ending at byte 300), a batch whose `step` column is of another type (B, 2 rows, to 500), and another it can store (C, 3 rows, to 800), then disconnects and returns.
+**Approved in intent by the author. The transport is not signed.** The intent: a batch refused for good is counted once, is not sent again, and never costs rows the server could have stored. How the server tells the sender is still open, and is settled by the tests below.
+
+One rank sends a batch the server can store (A, 3 rows, ending at byte 300), a batch whose `step` column is of another type (B, 2 rows, to 500), and another it can store (C, 3 rows, to 800), then disconnects and returns.
 
 Two facts the run established, which shape the choice:
 
-- **A `DoPut` stream has one schema.** A batch refused for a key column is followed, in its stream, only by batches that would be refused the same way. So "keep the stream open" cannot make a later batch of that stream storable, and B travels in a stream of its own.
+- **A `DoPut` stream has one schema.** A batch refused for a key column is followed, in its stream, only by batches that would be refused the same way. So keeping the stream open cannot make a later batch of it storable, and B travels in a stream of its own.
 - **A new stream's first answer names no offset.** The sender restarts from the offset it saved itself. So what happens after a refusal is decided by what the sender saved.
 
-| | Today (`eb5a71b`, pinned by the test) | Proposed |
+**The sender's rule.** Its saved offset moves for two reasons only: the server confirmed it stored the bytes, or the server confirmed, naming exactly the byte range the sender sent, that it refused them for good. A refusal that is lost, or that names another range, moves nothing.
+
+| | Today (`eb5a71b`, pinned) | Intended |
 |---|---|---|
+| Batches the client sends | A, then B | A, B once, then C directly |
 | Acknowledged after A | 300 | 300 |
-| What the server says of B | Ends the stream with `INVALID_ARGUMENT` naming `step`. No answer first | First an answer on the acknowledgement channel: `{"end_byte_offset": 300, "refused": {"end_byte_offset": 500, "column": "step"}}`. Then the same status ends the stream |
-| The sender's restart byte before C | 300: it sends B again, and again | 500: it counts B as refused for good and saves 500 |
-| Acknowledged after C | Nothing: C waits behind B for as long as B is refused | 800 |
-| Rows stored | A's three | A's and C's six |
-| `refused_batches` | 1, though B was sent twice | 1 |
-| The sender's restart byte after the run | 300 | 800 |
+| What the server says of B | The status names `step` and no byte range | A confirmation that names bytes 300 to 500 and the column, then the same status |
+| Where the sender restarts | 300: B again | 500 |
+| Rows stored | A's three | A's and C's six, and only those |
+| `refused_batches` | 1 | 1 |
 
-- **Why the stream still ends:** by the first fact, nothing later in it could be stored.
-- **Why the sender goes on:** the author's decision of Nov 20, 2026 is that such a batch "is refused and counted". Today it is counted and then sent again without end, and every valid batch behind it waits.
-- **What is lost:** B's rows, which no reader could have read. Both sides count them: the server in `refused_batches`, the sender in a count of its own that `close()` and its last error report.
-- **What must not happen:** a refusal skips rows the server could have stored. The sender moves its offset only to the end the server named, and only on an answer that carries `refused`.
-- **Left as it is:** when every batch of a sender is refused (a sender newer than its server), each batch costs one stream and one backoff. This wave sets no rule to stop sending after several refusals in a row.
+The tests, and what each one shows today:
 
-**What the acceptance run does not cover.**
+| Test | What it exercises | Today |
+|---|---|---|
+| `test_rs10_acceptance.py::test_the_run_as_the_server_answers_today` | The real server; every batch the client sent is recorded | Passes: pins the left column |
+| `...::test_the_run_as_the_contract_states_it` | The real server: after a confirmed refusal of B at 300 to 500, restart at 500, C sent directly, only A and C stored | A strict expected failure until the server confirms the range |
+| `...::test_the_same_refused_bytes_sent_again_are_counted_once` | The original byte range replayed three times, apart from the run | Passes |
+| `test_rs10_sender.py::test_a_confirmed_refusal_moves_the_offset_to_the_end_of_the_refused_bytes` | The production `FlightSender` against a stand-in that injects the refusal | A strict expected failure until the sender reads the confirmation |
+| `test_rs10_sender.py::test_a_refusal_that_is_lost_or_names_another_range_keeps_the_last_confirmed_offset` | The production sender, with no answer, and with an answer for another range | Passes, and must go on passing |
 
-- **It does not use the real sender.** TensorQuill's sender builds every batch from one schema, so it cannot send a batch the server refuses for a key column. The run's client is a raw Flight client that follows the sender's rules as this part states them. The real sender's handling of the answer is lane AD4's, tested against the fake server in `sdk/tests/flight_fake_server.py`.
-- **"An answer, then the status" is not yet shown to arrive.** Whether a Flight client reads a last message on the acknowledgement channel before the error status ends the call was not tried. Lanes AD2 and AD4 show it first. If it does not arrive, the status text carries the same two values (the refused end offset and the column) and the sender reads them from there; the numbers in the table stay as they are.
+**Still open before the transport is signed.**
 
-The alternative, if the author prefers it: change nothing on the wire, and have the sender keep its offset and retry only at its backoff ceiling. Then C never arrives while B is refused, and nothing valid is ever skipped.
+- Whether a Flight client reads a last message on the acknowledgement channel before the error status ends the call, **with the real server**. With pyarrow's own server, which the stand-in is, a client read the confirmation before the status in 20 of 20 tries (Nov 21, 2026). The real server is another implementation, and that is not shown for it.
+- If it cannot be relied on with the real server, the same three values (start, end, column) travel in the status text, and the sender applies the same rule to them.
+- The real sender cannot be made to send a batch the real server refuses, since it builds every batch from one schema. So the two halves are joined by the shared values in the two test files, not by one process pair.
 
-## What has cases and what does not
+**Left as it is:** when every batch of a sender is refused (a sender newer than its server), each batch costs one stream and one backoff. No rule stops the sender after several refusals in a row.
 
-- **With shared cases (36):** the score's arithmetic (7), `activation_drift` (9), `moe_imbalance` (10), the four measurements (10).
-- **With an acceptance test:** RS10.
-- **Prose only, so far:** the learning rate on `update_spike` (part 4), `parameters_not_judged` (part 5, where "the run-level check" is the run-level part of the all-ranks view, `combine_rank_evidence`), and the three wire keys (part 7).
-- **Still to add before the engine lanes start:** a records-level case of the score for `grad_spike`, whose two parameter paths take different baselines, and for `activation_spike`. Without them the two engines would first meet on the score's windows at the merge.
+## What has cases, and what is still owed
+
+- **55 shared cases:** the score's arithmetic (8) and over records (4), `activation_drift` (9), `moe_imbalance` (11), the four measurements (10), the learning rate and `parameters_not_judged` (4), the wire keys (9).
+- **Five RS10 tests** in two files.
+- **On the wave's checklist, not done:** the spike, diversity, starvation and stall thresholds are still to be read on the development runs, as measurement only.
 
 ## 9. Held out of this page
 

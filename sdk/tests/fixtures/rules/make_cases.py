@@ -39,7 +39,7 @@ TODAY = {
     "start_two_samples_then_even": 0, "start_nine_samples_then_even": 0, "start_ten_samples_is_reported": 0,
     "start_then_a_later_overload": 0, "start_ends_and_comes_back": 0, "not_at_step_0_is_not_a_start": 5,
     "start_in_a_sparse_capture": 0, "one_router_starts_another_fails": 0, "a_healthy_router": None,
-    "start_and_the_capture_ends": 0,
+    "start_and_the_capture_ends": 0, "a_start_and_an_earlier_reportable_failure": 0,
 }
 
 
@@ -63,6 +63,15 @@ def score(value, window):
     if spread == 0:
         return {"score": None, "score_note": "no_dispersion"}
     return {"score": (value - centre) / (SCORE_SCALE * spread)}
+
+
+DISPLAY = {"short_history": f"no score: fewer than {SCORE_MIN} earlier values",
+           "no_dispersion": "no score: the earlier values had zero median absolute deviation"}
+
+
+def display(scored):
+    """What a reader shows for a score: the number to one decimal place, or why there is none."""
+    return f"score {scored['score']:.1f}" if scored["score"] is not None else DISPLAY[scored["score_note"]]
 
 
 # -- part 2: activation_drift ------------------------------------------------------------------
@@ -171,17 +180,19 @@ def imbalance(records):
             while leading < len(flags) and flags[leading]:
                 leading += 1
         if leading >= START_GRACE:
-            found.append((seq[0], True))
+            found.append((seq[0], seq[START_GRACE - 1]["step"]))
             continue
         later = next((s for s, f in list(zip(seq, flags))[leading:] if f), None)
         if later is not None:
-            found.append((later, False))
+            found.append((later, None))
     if not found:
         return None
-    hit, since_start = min(found, key=lambda pair: (pair[0]["step"], pair[0]["layer"]))
+    # The incident is the one that could be reported first. `step` is when it began; for a router
+    # collapsed since its start that is its first sample, and `reportable_step` is its tenth.
+    hit, reportable = min(found, key=lambda pair: (pair[1] if pair[1] is not None else pair[0]["step"], pair[0]["layer"]))
     return {"kind": "moe_imbalance", "step": hit["step"], "layer": hit["layer"], "router": hit["router"],
             "diversity": hit["diversity"], "overloaded": hit["overloaded"], "dead": hit["dead"],
-            **({"since_start": True} if since_start else {})}
+            **({"since_start": True, "reportable_step": reportable} if reportable is not None else {})}
 
 
 def starting(records):
@@ -221,6 +232,9 @@ def imbalance_cases():
         "one_router_starts_another_fails": ("router `a` overloaded at steps 0 and 1; router `b` even until step 3",
                                             moe_records({"a": "xx" + "." * 10, "b": "..." + "x" * 9}, routers=("a", "b"))),
         "a_healthy_router": ("even throughout", moe_records({"r": "." * 30})),
+        "a_start_and_an_earlier_reportable_failure": (
+            "router `a` overloaded from step 0 for good, reportable at its tenth sample (step 9); router `b` even until step 4: `b` is reported, since it could be reported first",
+            moe_records({"a": "x" * 14, "b": "...." + "x" * 10}, routers=("a", "b"))),
         "start_and_the_capture_ends": ("overloaded on all five samples of a five-step capture: nothing is reported, and the check names the router as still in its starting state",
                                        moe_records({"r": "x" * 5})),
     }
@@ -356,9 +370,173 @@ def score_cases():
                                                          [*base[:9], "nan", None], 25.0),
         "score_no_dispersion": ("more than half the earlier values equal: no score, and no division", [10.0] * 30 + base[:20], 25.0),
         "score_all_equal": ("every earlier value equal", [10.0] * 50, 25.0),
+        "score_six_alike_and_four_different": (
+            "six equal values and four that differ: the MAD is zero though the values vary, so the words must not say they did not",
+            [10.0] * 6 + [11.0, 12.0, 13.0, 14.0], 25.0),
     }
-    return {name: {"part": "score", "says": says, "window": window, "value": value, "expected": score(value, window)}
+    return {name: {"part": "score", "says": says, "window": window, "value": value,
+                   "expected": {**score(value, window), "display": display(score(value, window))}}
             for name, (says, window, value) in sets.items()}
+
+
+# -- part 1 over records: the window each ratio is taken against ---------------------------------
+
+def same(a, b):
+    return abs(a - b) <= 1e-12 * max(1.0, abs(a), abs(b))
+
+
+def grad_records(n, total, norms):
+    return [{"step": i, "grad_norm": total(i), "grad_norms": {name: fn(i) for name, fn in norms.items()}} for i in range(n)]
+
+
+def grad_spike_scored(records):
+    """Today's `grad_spike` incident with the score each ratio gains. The windows are stated on the
+    page; each is checked here against the baseline today's rule reports for it."""
+    incident = ev.detect_grad_spikes(records)
+    assert incident is not None
+    rows = sorted(records, key=lambda r: r["step"])
+    at = next(i for i, r in enumerate(rows) if r["step"] == incident["step"])
+    totals = [finite(r["grad_norm"]) for r in rows[:at] if not r.get("step_skipped")][-WINDOW:]
+    assert incident["baseline"] is None or same(median(totals), incident["baseline"])
+    out = {**incident, **(score(incident["grad_norm"], totals) if incident.get("ratio") is not None else {})}
+    out["parameters"] = []
+    for parameter in incident["parameters"]:
+        earlier = [finite(r["grad_norms"][parameter["name"]]) for r in rows if r["step"] < parameter["rising_since"]
+                   or (incident.get("trigger") != "parameter" and r["step"] < incident["step"])]
+        if incident.get("trigger") != "parameter":
+            earlier = [finite(r["grad_norms"][parameter["name"]]) for r in rows[:at]]
+        window = earlier[-WINDOW:]
+        assert same(median(window), parameter["baseline"]), (parameter, median(window))
+        out["parameters"].append({**parameter, **score(parameter["grad_norm"], window)})
+    return out
+
+
+def activation_spike_scored(records):
+    incident = next(i for i in ev.detect_activation_anomalies(records) if i["kind"] == "activation_spike")
+    rows = sorted(records, key=lambda r: r["step"])
+    modules = []
+    for hit in incident["modules"]:
+        window = [finite(r["layers"][hit["module"]][hit["stat"]]) for r in rows if r["step"] < incident["step"]][-WINDOW:]
+        assert same(median(window), hit["baseline"]), hit
+        modules.append({**hit, **score(hit["value"], window)})
+    return {**incident, "modules": modules}
+
+
+def score_record_cases():
+    total_spike = grad_records(80, lambda i: (10.0 if i == 60 else 1.0) * wobble(i),
+                               {"w": lambda i: (14.0 if i == 60 else 0.9) * wobble(i + 1), "v": lambda i: 0.4 * wobble(i + 2)})
+    one_parameter = grad_records(80, lambda i: 1.0 * wobble(i),
+                                 {"w": lambda i: 0.99 * wobble(i), "tiny": lambda i: (0.08 if i >= 60 else 0.01) * wobble(i + 3)})
+    early = grad_records(30, lambda i: (10.0 if i == 12 else 1.0) * wobble(i), {"w": lambda i: (10.0 if i == 12 else 1.0) * wobble(i)})
+    spike = layers_series([(1.0) * wobble(i) for i in range(100)],
+                          amax=[(40.0 if i == 80 else 4.0) * wobble(i + 2) for i in range(100)])
+    return {
+        "score_on_grad_spike_by_the_total": {
+            "part": "score_records", "says": "the total gradient norm at ten times its level on one step; the incident and each parameter gain a score against the 50 records before",
+            "records": total_spike, "expected": {"incident": grad_spike_scored(total_spike)}},
+        "score_on_grad_spike_by_one_parameter": {
+            "part": "score_records", "says": "the total steady, one small parameter at eight times its own level and staying there: the other parameter path, whose baseline is that parameter's own earlier norms",
+            "records": one_parameter, "expected": {"incident": grad_spike_scored(one_parameter)}},
+        "score_on_grad_spike_with_twelve_earlier_records": {
+            "part": "score_records", "says": "a spike on the thirteenth record: twelve earlier totals, so a score; a ratio and its score always come from the same values",
+            "records": early, "expected": {"incident": grad_spike_scored(early)}},
+        "score_on_activation_spike": {
+            "part": "score_records", "says": "one module's `abs_max` at ten times its level on one record",
+            "records": spike, "expected": {"incident": activation_spike_scored(spike)}},
+    }
+
+
+# -- parts 4 and 5 -----------------------------------------------------------------------------
+
+def evidence_cases():
+    import sys
+    sys.path.insert(0, str(HERE.parents[1]))
+    try:
+        import test_update_size
+    finally:
+        sys.path.remove(str(HERE.parents[1]))
+    name = next(n for n in test_update_size.UPDATE_CASES if "jump" in n)
+    plain = [dict(r) for r in test_update_size.UPDATE_CASES[name]]
+    today = ev.detect_update_spikes(plain)
+    assert today is not None, name
+    rows = sorted(plain, key=lambda r: r["step"])
+    at = next(i for i, r in enumerate(rows) if r["step"] == today["step"])
+    with_lr = [{**r, "lr": [3e-3, 3e-4] if r["step"] >= today["step"] else [1e-3, 1e-4]} for r in rows]
+    without = [{k: v for k, v in r.items() if k != "lr"} for r in rows]
+    assert rows[at - 1]["step"] == today["step"] - 1  # the record it was compared with is the one before
+    assert ev.detect_update_spikes(with_lr) == today == ev.detect_update_spikes(without)  # the rule does not read `lr`
+    unread = [{"step": i, "grad_norm": 1.0, "grad_norms": {"a": 1.0}, "weight_norms": {"a": 2.0 + 0.01 * i},
+               **({"grads_not_read": {"c": "a nested tensor", "b": "on the meta device"}} if i == 0 else {})} for i in range(40)]
+    entry = ev.build_evidence(unread, detectors="python")["kind_checks"]["stalled_weights"]
+    assert entry.get("parameters_not_judged") == ["b", "c"], entry  # the Python detectors do this today
+    other = [{**r, "rank": 1, **({"grads_not_read": {"c": "a nested tensor"}} if r["step"] == 0 else {})}
+             for r in ({k: v for k, v in r.items() if k != "grads_not_read"} for r in unread)]
+    return {
+        "update_spike_carries_the_learning_rate": {
+            "part": "evidence", "says": f"the parity suite's `{name}` records with a learning rate on every record, which changes at the flagged step: the incident carries the rate there and at the record it was compared with",
+            "records": with_lr, "expected": {"incident": {**today, "lr": [3e-3, 3e-4], "lr_before": [1e-3, 1e-4]}}},
+        "update_spike_without_a_learning_rate": {
+            "part": "evidence", "says": "the same records with no `lr`: neither key is there, and the incident is as today",
+            "records": without, "expected": {"incident": today}},
+        "stalled_weights_names_what_it_did_not_judge": {
+            "part": "evidence", "says": "two parameters whose gradient the capture could not read: the `stalled_weights` entry of `kind_checks` names them, sorted, in both engines",
+            "records": unread, "expected": {"kind_checks": {"stalled_weights": {"value": entry["value"], "parameters_not_judged": ["b", "c"]}}}},
+        "the_all_ranks_view_names_them_by_rank_when_ranks_differ": {
+            "part": "evidence", "says": "rank 0 could not read `b` and `c`, rank 1 only `c`: the run-level entry carries the union, and each rank's list",
+            "records_by_rank": {"0": unread, "1": other},
+            "expected": {"kind_checks": {"stalled_weights": {"parameters_not_judged": ["b", "c"],
+                                                             "parameters_not_judged_by_rank": {"0": ["b", "c"], "1": ["c"]}}}}},
+    }
+
+
+# -- part 7: from the wire to a reader -----------------------------------------------------------
+
+def wire_cases():
+    layers = {"blk0": {"std": 1.0, "abs_max": 4.0, "zero_frac": 0.0}}
+    partial = [{"step": i, "layers": layers, **({"layers_not_read": {"blk1": "its output is not a tensor"}} if i == 0 else {})} for i in range(20)]
+    none = [{"step": i, **({"layers_not_read": {"blk0": "its output is not a tensor", "blk1": "its output is not a tensor"}} if i == 0 else {})} for i in range(20)]
+    kinds = ["activation_spike", "activation_drift", "dead_activations"]
+    moe = lambda source: [{"step": i, "moe": {"r": [32] * 8}, "moe_top_k": {"r": 1}, **({"moe_source": {"r": source}} if i == 0 else {})} for i in range(3)]
+    beat = lambda **more: {"run_id": "run", "rank": 0, "attempt": 1, "phase": "train", "capture_stopped": "sink_error", **more}
+    return {
+        "layers_not_read_some_modules": {
+            "part": "wire", "says": "one module of two could not be read: coverage is partial, the activation kinds stay checked for what was read and name the module",
+            "records": partial,
+            "expected": {"not_checked": [{"check": "layers", "coverage": "partial", "modules": ["blk1"], "step": 0,
+                                          "reason": "layer not read: blk1: its output is not a tensor"}],
+                         "kind_checks": {kind: {"value": "checked", "modules_not_judged": ["blk1"]} for kind in kinds}}},
+        "layers_not_read_no_module": {
+            "part": "wire", "says": "no module could be read on any record: coverage is none, and the activation kinds are unavailable, not clean",
+            "records": none,
+            "expected": {"not_checked": [{"check": "layers", "coverage": "none", "modules": ["blk0", "blk1"], "step": 0, "kinds": kinds,
+                                          "reason": "layer not read: blk0: its output is not a tensor; blk1: its output is not a tensor"}],
+                         "kind_checks": {kind: {"value": "unavailable"} for kind in kinds}}},
+        "moe_source_scores_are_what_the_router_asked_for": {
+            "part": "wire", "says": "counts taken as the top-k of the hooked scores: the router's requests, whatever is applied after",
+            "records": moe({"form": "scores", "point": "requested"}),
+            "expected": {"moe_source": {"r": {"form": "scores", "point": "requested"}}, "words": {"r": "the assignments the router asked for"}}},
+        "moe_source_indices_at_an_unknown_point": {
+            "part": "wire", "says": "the model gave indices, and the capture cannot tell whether a capacity limit was applied before that point: a reader does not call them dispatched",
+            "records": moe({"form": "indices", "point": "unknown"}),
+            "expected": {"moe_source": {"r": {"form": "indices", "point": "unknown"}},
+                         "words": {"r": "the assignments the model gave; whether a capacity limit was applied before this point is not known"}}},
+        "moe_source_a_map_after_dispatch": {
+            "part": "wire", "says": "a routing map taken where the capture point establishes that dispatch is done: only then does a reader say dispatched",
+            "records": moe({"form": "map", "point": "dispatched"}),
+            "expected": {"moe_source": {"r": {"form": "map", "point": "dispatched"}}, "words": {"r": "the dispatched assignments"}}},
+        "moe_source_absent": {
+            "part": "wire", "says": "a capture from before the key: no `moe_source`, and a reader makes no claim",
+            "records": moe(None)[1:], "expected": {"moe_source": None, "words": {}}},
+        "capture_stopped_at_step_0": {
+            "part": "wire", "says": "a beat that says capture stopped after committing step 0: the status carries step 0, which is not the same as none",
+            "heartbeat": beat(capture_stopped_step=0), "expected": {"status": {"capture_stopped": {"reason": "sink_error", "step": 0}}}},
+        "capture_stopped_before_any_step": {
+            "part": "wire", "says": "capture stopped before any step was committed: the step is null",
+            "heartbeat": beat(capture_stopped_step=None), "expected": {"status": {"capture_stopped": {"reason": "sink_error", "step": None}}}},
+        "capture_stopped_from_an_older_sender": {
+            "part": "wire", "says": "a sender from before the key: the status has the reason and no `step` key at all",
+            "heartbeat": beat(), "expected": {"status": {"capture_stopped": {"reason": "sink_error"}}}},
+    }
 
 
 def jsonable(value):
@@ -373,7 +551,8 @@ def jsonable(value):
 
 
 def build():
-    cases = {**score_cases(), **drift_cases(), **imbalance_cases(), **measurement_cases()}
+    cases = {**score_cases(), **score_record_cases(), **drift_cases(), **imbalance_cases(), **measurement_cases(),
+             **evidence_cases(), **wire_cases()}
     return {
         "contract": "DETECTOR_RULES_CONTRACT.md",
         "constants": {"score_min": SCORE_MIN, "score_scale": SCORE_SCALE, "drift_factor": DRIFT_FACTOR,
