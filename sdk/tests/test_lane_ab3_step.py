@@ -26,6 +26,7 @@ TABLE = (
     "an_update_due_and_applied",
     "an_update_due_and_skipped",
     "a_skip_only_the_caller_reported",
+    "a_skip_the_caller_reported_with_no_scaler_outcome",
     "a_skip_only_the_scaler_reported",
     "a_skip_both_reported",
     "nothing_said_with_a_scaler",
@@ -34,7 +35,13 @@ TABLE = (
 )
 
 # The fixture's words for the scaler given to `init`, as what the step does to it.
-SCALERS = {None: None, "a GradScaler that applied this step": "applied", "a GradScaler that skipped this step": "skipped"}
+SCALERS = {
+    None: (False, None),
+    "a GradScaler that applied this step": (True, "applied"),
+    "a GradScaler that skipped this step": (True, "skipped"),
+    # Given to `init`, but this update went to the optimizer directly: no `scaler.step`, no verdict.
+    "a GradScaler whose `step` was not called for this update": (True, None),
+}
 LEFT_OUT = object()  # `session.step()` with no `skipped`
 
 
@@ -103,9 +110,9 @@ def test_each_row_of_the_table(name):
     assert case["section"] == 1
     given = case["given"]
     assert given["init"]["auto_step"] is False
-    verdict = SCALERS[given["init"].get("scaler")]
+    scaler, verdict = SCALERS[given["init"].get("scaler")]
     backwards, skipped = _calls(given["calls"])
-    records = _manual_run([(verdict, skipped)], scaler=verdict is not None, backwards=backwards)
+    records = _manual_run([(verdict, skipped)], scaler=scaler, backwards=backwards)
     _check(records, case["expected"])
     if name == "an_accumulation_microstep":
         # Four backward passes into one update: one record, step 0, whose gradients are the four's sum.
@@ -122,7 +129,7 @@ def test_an_applied_step_with_a_scaler_and_skipped_false():
     """The first row's other half: a scaler that applied the step and `skipped=False`."""
     records = _manual_run([("applied", False)], scaler=True)
     _check(records, CASES["an_update_due_and_applied"]["expected"])
-    assert records[0]["grad_scale"] == 1024.0
+    assert records[0]["grad_scale"] == 1024.0 and "scaler_applied" not in records[0]
 
 
 def test_nothing_said_with_a_scaler_that_applied_the_step():
@@ -136,7 +143,7 @@ def test_a_caller_skip_with_a_scaler_no_optimizer_went_through():
     records = _manual_run([(None, True), (None, False), (None, LEFT_OUT)], scaler=True)
     assert [r.get("step_skipped", "-") for r in records] == [True, False, "-"]
     assert [r.get("step_skipped_by", "-") for r in records] == ["caller", "-", "-"]
-    assert all("grad_scale" not in r for r in records)
+    assert all("grad_scale" not in r and "scaler_applied" not in r for r in records)
 
 
 def test_skips_land_on_their_own_steps_across_blocks():
@@ -148,11 +155,13 @@ def test_skips_land_on_their_own_steps_across_blocks():
     ]
     want_skipped = [False, True, True, True, False, True, False, True]
     want_by = ["-", "scaler", "caller", "both", "-", "scaler", "-", "both"]
+    want_applied = ["-", "-", True, "-", "-", "-", "-", "-"]  # only on the caller's skip the scaler applied
     for every in (1, 2, 3):
         records = _manual_run(plan, scaler=True, every=every)
         assert [r["step"] for r in records] == list(range(len(plan)))
         assert [r["step_skipped"] for r in records] == want_skipped, every
         assert [r.get("step_skipped_by", "-") for r in records] == want_by, every
+        assert [r.get("scaler_applied", "-") for r in records] == want_applied, every
 
 
 def test_the_argument_under_several_optimizers():
@@ -178,6 +187,8 @@ def test_the_argument_under_several_optimizers():
     records = sink.records
     assert [r["step_skipped"] for r in records] == [True, False, True, True, False, True]
     assert [r.get("step_skipped_by", "-") for r in records] == ["caller", "-", "scaler", "both", "-", "scaler"]
+    # Both optimizers went through the scaler and neither overflowed on step 0: it was seen applied.
+    assert [r.get("scaler_applied", "-") for r in records] == [True, "-", "-", "-", "-", "-"]
 
 
 def test_the_argument_with_lr_and_a_step_number():
@@ -199,6 +210,7 @@ def test_the_argument_with_lr_and_a_step_number():
     assert [r["lr"] for r in records] == [[0.1], [0.5], [pytest.approx(0.3)], [0.5]]
     assert [r.get("step_skipped", "-") for r in records] == [True, False, True, "-"]
     assert [r.get("step_skipped_by", "-") for r in records] == ["caller", "-", "caller", "-"]
+    assert all("scaler_applied" not in r for r in records)  # no scaler: the outcome is unknown
     # The step number given positionally, as before the argument existed, with `skipped` beside it.
     model = _model()
     sink = tensorquill.MemorySink()
@@ -266,7 +278,8 @@ def _scaler_run(auto_step: bool, overflow_at: set[int], steps: int = 6) -> list[
 @pytest.mark.parametrize("auto_step", [True, False])
 def test_todays_scaler_path_gains_only_the_key_on_a_skipped_step(auto_step):
     """A run with a scaler and no argument: the scaler's fields are as before (test_scaler.py),
-    and the only key added to any record is `step_skipped_by`, on the skipped steps alone."""
+    and the only key added to any record is `step_skipped_by`, on the skipped steps alone (never
+    `scaler_applied`, which is for a caller's skip)."""
     records = _scaler_run(auto_step, overflow_at={1, 2})
     assert [r["step_skipped"] for r in records] == [False, True, True, False, False, False]
     assert [r["grad_scale"] for r in records] == [1024.0, 1024.0, 512.0, 256.0, 256.0, 256.0]
@@ -278,21 +291,24 @@ def test_todays_scaler_path_gains_only_the_key_on_a_skipped_step(auto_step):
         assert ("step_skipped_by" in record) == record["step_skipped"]
 
 
-def test_step_skipped_by_travels_in_extra_json(tmp_path, monkeypatch):
-    """Not a column of the Arrow schema: it goes in `extra_json` and comes back unchanged. Read from
-    the JSON Lines file the capture wrote, which is what the sender turns into rows."""
+def test_step_skipped_by_and_scaler_applied_travel_in_extra_json(tmp_path, monkeypatch):
+    """Neither is a column of the Arrow schema: each goes in `extra_json` and comes back unchanged.
+    Read from the JSON Lines file the capture wrote, which is what the sender turns into rows."""
     monkeypatch.chdir(tmp_path)
-    _manual_run([("applied", True), ("skipped", False), ("skipped", True), ("applied", False)], scaler=True, jsonl=True)
+    _manual_run([("applied", True), ("skipped", False), ("skipped", True), ("applied", False), (None, True)],
+                scaler=True, jsonl=True)
     records = tensorquill.load_records(tmp_path / "tensorquill-out" / "ab3.rank0.jsonl")
-    assert [r.get("step_skipped_by", "-") for r in records] == ["caller", "scaler", "both", "-"]
+    assert [r.get("step_skipped_by", "-") for r in records] == ["caller", "scaler", "both", "-", "caller"]
+    assert [r.get("scaler_applied", "-") for r in records] == [True, "-", "-", "-", "-"]
     for record in records:
         row = record_to_row(record)
-        assert "step_skipped_by" not in row
         extra = json.loads(row["extra_json"]) if row["extra_json"] else {}
-        if "step_skipped_by" in record:
-            assert extra["step_skipped_by"] == record["step_skipped_by"]
-        else:
-            assert "step_skipped_by" not in extra
+        for key in ("step_skipped_by", "scaler_applied"):
+            assert key not in row
+            if key in record:
+                assert extra[key] == record[key]
+            else:
+                assert key not in extra
         assert row["step_skipped"] == record["step_skipped"]
         assert row_to_record(row) == record
 
@@ -302,7 +318,8 @@ def test_step_skipped_by_is_not_a_column_of_the_schema():
     from tensorquill.flight import flight_schema
 
     names = flight_schema().names
-    assert "step_skipped" in names and "extra_json" in names and "step_skipped_by" not in names
+    assert "step_skipped" in names and "extra_json" in names
+    assert "step_skipped_by" not in names and "scaler_applied" not in names
 
 
 def _server():
@@ -322,14 +339,39 @@ def test_step_skipped_by_through_a_real_server(tmp_path, monkeypatch):
     server = e2e.Server(store)
     try:
         records = _manual_run(
-            [("applied", True), ("skipped", False), ("skipped", True), ("applied", False), ("skipped", LEFT_OUT)],
+            [("applied", True), ("skipped", False), ("skipped", True), ("applied", False), ("skipped", LEFT_OUT),
+             (None, True)],
             scaler=True, endpoint=server.endpoint,
         )
         written = tensorquill.load_records(tmp_path / "tensorquill-out" / "ab3.rank0.jsonl")
-        assert [r.get("step_skipped_by", "-") for r in written] == ["caller", "scaler", "both", "-", "scaler"]
+        assert [r.get("step_skipped_by", "-") for r in written] == ["caller", "scaler", "both", "-", "scaler", "caller"]
+        assert [r.get("scaler_applied", "-") for r in written] == [True, "-", "-", "-", "-", "-"]
         assert records == []  # written to the file the sender sends from
         stored = e2e.stored_records(store, "ab3")
         assert stored == written
         assert tensorquill.load_records(store / "runs" / "ab3") == written
     finally:
         assert server.terminate() == 0
+
+
+def test_a_caller_skip_before_the_scalers_update_has_no_scaler_outcome():
+    """`scaler.step` ran but `scaler.update()` comes only after `session.step`: the scaler's verdict is
+    read at `update()` (`_record_scaler`), so at the call there is none for this update. The outcome
+    is unknown, and the record does not say the scaler applied it. (That verdict then lands on the
+    next record, as it does today without the argument.)"""
+    model = _model()
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    amp = torch.amp.GradScaler("cpu", init_scale=1024.0)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, capture="full", every=1, auto_step=False, scaler=amp)
+    for i in range(2):
+        opt.zero_grad()
+        amp.scale(model(torch.ones(2, 4)).sum()).backward()
+        amp.step(opt)
+        session.step(skipped=i == 0)
+        amp.update()
+    session.close()
+    first, second = sink.records
+    assert first["step_skipped"] is True and first["step_skipped_by"] == "caller"
+    assert "scaler_applied" not in first and "grad_scale" not in first
+    assert second["step_skipped"] is False and "scaler_applied" not in second

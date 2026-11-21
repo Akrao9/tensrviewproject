@@ -94,7 +94,7 @@ INDEX_CACHE_SIZE = 32
 UPDATES_HOOKS_OFF = "auto_step=False"
 UPDATES_NO_OPTIMIZER = "no optimizer"
 # The key under which `step(skipped=...)` keeps the caller's verdict from `_commit` to `_decode`;
-# never written to a record, which says `step_skipped` and `step_skipped_by` instead.
+# never written to a record, which says `step_skipped`, `step_skipped_by` and `scaler_applied` instead.
 _CALLER_SKIPPED = "caller_skipped"
 # Settings per capture mode. Router load is the always-on signal; layer statistics and
 # gradient and weight norms are a debugging mode, as in Composer's ActivationMonitor,
@@ -2823,7 +2823,10 @@ class Session:
         microstep is not a step. Pass `skipped=True` when the update was due and did not happen
         (Megatron-LM's `skipped=not update_successful`), `skipped=False` when it was applied.
         The record's `step_skipped` is then true when either you or the scaler given to `init`
-        says so, and `step_skipped_by` says who: `"caller"`, `"scaler"` or `"both"`. Left out,
+        says so, and `step_skipped_by` says who: `"caller"`, `"scaler"` or `"both"`. A caller's skip
+        on an update the scaler was seen to apply (an optimizer went through `scaler.step` and
+        `scaler.update()` ran before this call, finding no Inf or NaN) also carries
+        `scaler_applied: true`; with no such verdict for this update there is no key. Left out,
         the record says what the scaler said, as before, and nothing without a scaler. `skipped`
         takes only `True`, `False` or `None`; anything else raises `TypeError` here, before
         anything of the step is recorded.
@@ -3851,6 +3854,11 @@ class Session:
                     record["grad_scale"] = amp["grad_scale"]
                 if by_scaler or by_caller:
                     record["step_skipped_by"] = "both" if by_scaler and by_caller else "scaler" if by_scaler else "caller"
+                if by_caller and not by_scaler and "step_skipped" in amp:
+                    # A caller's skip on an update the scaler was seen to apply: an optimizer went
+                    # through the scaler and `update()` found no Inf or NaN (`_record_scaler`). With no
+                    # verdict of the scaler's for this update its outcome is unknown, and no key is written.
+                    record["scaler_applied"] = True
             if scalars is not None and scalars[i]:
                 record["scalars"] = scalars[i]
             if waits is not None and waits[i] is not None:
@@ -4276,7 +4284,8 @@ def init(
             scale used (`grad_scale`), and with `auto_step` the step ends at
             `scaler.update()`, so skipped steps are counted too. A skipped step's record
             also says who reported it (`step_skipped_by`): `"scaler"`, or `"caller"` or
-            `"both"` when `session.step(skipped=True)` said so.
+            `"both"` when `session.step(skipped=True)` said so, and a caller's skip that the
+            scaler was seen to apply says `scaler_applied: true`.
         replica_params: which parameters the cross-GPU drift check compares across
             `replica_group`: every trainable parameter by default, as under data
             parallelism. Under tensor parallelism only some weights, such as LayerNorm, are
