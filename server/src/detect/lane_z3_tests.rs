@@ -34,8 +34,36 @@ fn cases() -> Vec<(String, String, Vec<Value>, Value, f64)> {
     out
 }
 
+/// What section 4a's `earlier_cases` says attribution adds to an earlier case: an empty list for
+/// a case it does not name (an absent key and an empty list are the same there).
+fn earlier_attribution(name: &str) -> Value {
+    let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk/tests/fixtures/replica");
+    let text = std::fs::read_to_string(folder.join("attribution_cases.json")).expect("section 4a's cases");
+    let document: Value = serde_json::from_str(&text).unwrap();
+    document["earlier_cases"]
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| json!([]))
+}
+
+/// A result compared as section 4a says ("For the engines that build this"): everything but
+/// `attribution` with the earlier file, and `attribution` with `earlier_cases`.
+pub(super) fn split_attribution(mut result: Value) -> (Value, Value) {
+    let attribution = result
+        .as_object_mut()
+        .and_then(|result| result.remove("attribution"))
+        .unwrap_or_else(|| json!([]));
+    (result, attribution)
+}
+
+/// Whether a result is the earlier file's, with section 4a's attribution beside it.
+fn matches(got: Value, name: &str, expected: &Value) -> bool {
+    let (rest, attribution) = split_attribution(got);
+    &rest == expected && attribution == earlier_attribution(name)
+}
+
 /// An attempt's place in its rank's order: where it first appears in the case (contract 1's order).
-fn first_seen(records: &[Value]) -> HashMap<(i64, i64), usize> {
+pub(super) fn first_seen(records: &[Value]) -> HashMap<(i64, i64), usize> {
     let mut places = HashMap::new();
     let mut next: HashMap<i64, usize> = HashMap::new();
     for record in records {
@@ -56,8 +84,11 @@ fn every_case_of_the_contract_gives_its_expected_result() {
     let mut wrong = Vec::new();
     for (file, name, records, expected, tolerance) in &all {
         let got = compare(records, *tolerance);
-        if &got != expected {
-            wrong.push(format!("{file}:{name}\n  got      {got}\n  expected {expected}"));
+        if !matches(got.clone(), name, expected) {
+            let attribution = earlier_attribution(name);
+            wrong.push(format!(
+                "{file}:{name}\n  got      {got}\n  expected {expected}\n  with attribution {attribution}"
+            ));
         }
     }
     assert!(
@@ -87,14 +118,18 @@ fn every_case_gives_its_result_in_any_order_of_arrival() {
             for at in &order {
                 comparison.insert(record_from_json(&records[*at], tolerance).unwrap(), &place);
             }
-            assert_eq!(comparison.result(), expected, "{file}:{name} in the order {order:?}");
+            assert!(
+                matches(comparison.result(), &name, &expected),
+                "{file}:{name} in the order {order:?}: {}",
+                comparison.result()
+            );
         }
     }
 }
 
 /// One rank's records as a batch in the shape the server stores (`flight.py`'s `record_to_row`):
 /// `replica_spread` in its map column, `replica` and `replica_spread_scope` in `extra_json`.
-fn batch(records: &[&Value]) -> RecordBatch {
+pub(super) fn batch(records: &[&Value]) -> RecordBatch {
     let steps = Int64Array::from(records.iter().map(|r| r["step"].as_i64()).collect::<Vec<_>>());
     let attempts = Int64Array::from(records.iter().map(|r| r["attempt"].as_i64()).collect::<Vec<_>>());
     let mut spreads = MapBuilder::new(None, StringBuilder::new(), ListBuilder::new(Float64Builder::new()));
@@ -151,7 +186,11 @@ fn every_case_gives_its_result_from_stored_batches() {
                 comparison.insert(record, &place);
             }
         }
-        assert_eq!(comparison.result(), expected, "{file}:{name}");
+        assert!(
+            matches(comparison.result(), &name, &expected),
+            "{file}:{name}: {}",
+            comparison.result()
+        );
     }
 }
 
@@ -260,6 +299,12 @@ fn steps_past_the_listing_bound_are_counted_and_their_incidents_kept() {
 #[test]
 fn a_restart_keeps_every_verdict_written_before_it() {
     for (file, name, records, expected, tolerance) in cases() {
+        // What the server writes: the earlier file's result with section 4a's attribution beside it.
+        let mut expected = expected;
+        let attribution = earlier_attribution(&name);
+        if !attribution.as_array().unwrap().is_empty() {
+            expected["attribution"] = attribution;
+        }
         let mut written = json!({"v": 1, "tolerance": tolerance});
         written
             .as_object_mut()

@@ -3,7 +3,8 @@
 //! `sdk/tests/fixtures/replica/` (lane Z3 of the SDK-22 wave, Nov 20, 2026).
 //!
 //! One type, [`Comparison`], holds what the rules need for one run and gives the result the
-//! fixtures spell (`steps`, `replica_drift`, `legacy`). [`compare`] feeds it a finished list of
+//! fixtures spell (`steps`, `replica_drift`, `legacy`, and `attribution`, section 4a's D1, when it
+//! has an entry). [`compare`] feeds it a finished list of
 //! records, as a reader of files would; the server feeds it each part's rows as they are stored
 //! (`Ingest::flush`) and writes the result into the run's `watchdog.json` under `replica`. Both
 //! paths judge through the same code, so they cannot read the rules differently.
@@ -345,10 +346,97 @@ fn python_sum(values: impl IntoIterator<Item = f64>) -> f64 {
     total
 }
 
+/// The median of section 4a: the middle value, or with an even number the mean of the two middle ones.
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let half = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[half]
+    } else {
+        (values[half - 1] + values[half]) / 2.0
+    }
+}
+
+/// Section 4a by fingerprints, for one parameter that drifted: `rows` are the compared ranks'
+/// fingerprints, each cut to the columns the drift was decided on, sorted by rank.
+fn by_fingerprints(rows: &[(i64, &[f64])], tolerance: f64) -> Value {
+    if rows.len() == 2 {
+        return json!({"verdict": "inconclusive", "why": "two_ranks"});
+    }
+    let finite: Vec<&(i64, &[f64])> = rows
+        .iter()
+        .filter(|(_, row)| row.iter().all(|value| value.is_finite()))
+        .collect();
+    let mut apart: BTreeSet<i64> = rows
+        .iter()
+        .filter(|(_, row)| !row.iter().all(|value| value.is_finite()))
+        .map(|(rank, _)| *rank)
+        .collect();
+    if !finite.is_empty() {
+        // Measured as section 4 measures a spread: by the mean of the finite ranks' norms.
+        let scale = (python_sum(finite.iter().map(|(_, row)| row[0])) / finite.len() as f64).max(1e-12);
+        let width = finite.iter().map(|(_, row)| row.len()).min().unwrap_or(0);
+        for at in 0..width {
+            let middle = median(&mut finite.iter().map(|(_, row)| row[at]).collect::<Vec<f64>>());
+            apart.extend(
+                finite
+                    .iter()
+                    .filter(|(_, row)| (row[at] - middle).abs() / scale > tolerance)
+                    .map(|(rank, _)| *rank),
+            );
+        }
+    }
+    if apart.is_empty() {
+        return json!({"verdict": "inconclusive", "why": "no_outlier"});
+    }
+    if 2 * (rows.len() - apart.len()) <= rows.len() {
+        return json!({"verdict": "inconclusive", "why": "no_majority"});
+    }
+    json!({"verdict": "attributed", "outliers": apart})
+}
+
+/// Section 4a by signatures, for one parameter whose signatures differ: one signature held by a
+/// strict majority names the other ranks. `rows` are sorted by rank.
+fn by_signatures(rows: &[(i64, &Value)]) -> Value {
+    if rows.len() == 2 {
+        return json!({"verdict": "inconclusive", "why": "two_ranks"});
+    }
+    let held = rows
+        .iter()
+        .map(|(_, sig)| *sig)
+        .find(|sig| 2 * rows.iter().filter(|(_, other)| other == sig).count() > rows.len());
+    match held {
+        Some(sig) => {
+            let outliers: Vec<i64> = rows
+                .iter()
+                .filter(|(_, other)| *other != sig)
+                .map(|(rank, _)| *rank)
+                .collect();
+            json!({"verdict": "attributed", "outliers": outliers})
+        }
+        None => json!({"verdict": "inconclusive", "why": "no_majority"}),
+    }
+}
+
+/// An attribution entry's place in the list (section 4a): by step, launch, group, parameter, then `by`.
+fn attribution_order(entry: &Value) -> (i64, String, Vec<i64>, String, String) {
+    (
+        entry["step"].as_i64().unwrap_or(i64::MIN),
+        entry["launch"].as_str().unwrap_or_default().to_string(),
+        ranks(&entry["group"]).unwrap_or_default(),
+        entry["parameter"].as_str().unwrap_or_default().to_string(),
+        entry["by"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
 /// Sections 3 and 4 for one launch, group and step with complete coverage: `_compare` in
-/// `test_replica_contract.py`. `members` are sorted by rank.
-fn compare_cell(members: &[(i64, &Observation)], tolerance: f64) -> Map<String, Value> {
+/// `test_replica_contract.py`. `members` are sorted by rank. Also gives section 4a's attribution
+/// of each parameter that drifted or whose signatures differ, read from the same rows (`parameter`,
+/// `by`, `verdict`, and `outliers` or `why`; the caller adds where): it is read here, while the
+/// observations are held, and kept with the verdict.
+fn compare_cell(members: &[(i64, &Observation)], tolerance: f64) -> (Map<String, Value>, Vec<Value>) {
     let mut out = Map::new();
+    let mut attribution: Vec<Value> = Vec::new();
     let first = members[0].1;
     let same_device = members.iter().all(|(_, o)| o.device == first.device);
     let projection = !first.projection.is_null() && members.iter().all(|(_, o)| o.projection == first.projection);
@@ -387,6 +475,17 @@ fn compare_cell(members: &[(i64, &Observation)], tolerance: f64) -> Map<String, 
             signatures_compared += 1;
             if rows.iter().any(|row| row.sig != rows[0].sig) {
                 differ.push(name.clone());
+                let held: Vec<(i64, &Value)> = members
+                    .iter()
+                    .zip(&rows)
+                    .map(|((rank, _), row)| (*rank, &row.sig))
+                    .collect();
+                let mut entry = json!({"parameter": name, "by": "signatures"});
+                entry
+                    .as_object_mut()
+                    .expect("an object")
+                    .extend(by_signatures(&held).as_object().cloned().unwrap_or_default());
+                attribution.push(entry);
             }
         }
         if !same_device {
@@ -395,13 +494,30 @@ fn compare_cell(members: &[(i64, &Observation)], tolerance: f64) -> Map<String, 
         prints_compared += 1;
         let columns = if projection { 3 } else { 2 };
         let values: Vec<&[f64]> = rows.iter().map(|row| &row.fp[..row.fp.len().min(columns)]).collect();
+        let width = values.iter().map(|row| row.len()).min().unwrap_or(0);
+        // Attribution reads the columns the drift is decided on.
+        let attribute = |attribution: &mut Vec<Value>| {
+            let held: Vec<(i64, &[f64])> = members
+                .iter()
+                .zip(&values)
+                .map(|((rank, _), row)| (*rank, &row[..width]))
+                .collect();
+            let mut entry = json!({"parameter": name, "by": "fingerprints"});
+            entry.as_object_mut().expect("an object").extend(
+                by_fingerprints(&held, tolerance)
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            attribution.push(entry);
+        };
         if values.iter().any(|row| row.iter().any(|value| !value.is_finite())) {
             drift.push(name.clone());
+            attribute(&mut attribution);
             continue;
         }
         // `spread_from_fingerprints`: the mean of the ranks' norms, never below 1e-12.
         let scale = (python_sum(values.iter().map(|row| row[0])) / values.len() as f64).max(1e-12);
-        let width = values.iter().map(|row| row.len()).min().unwrap_or(0);
         let spread_over = (0..width).any(|at| {
             let (low, high) = values
                 .iter()
@@ -413,6 +529,7 @@ fn compare_cell(members: &[(i64, &Observation)], tolerance: f64) -> Map<String, 
         });
         if spread_over {
             drift.push(name.clone());
+            attribute(&mut attribution);
         }
     }
     if !not_compared.is_empty() {
@@ -457,7 +574,7 @@ fn compare_cell(members: &[(i64, &Observation)], tolerance: f64) -> Map<String, 
         };
         out.insert("signatures_why".into(), json!(why));
     }
-    out
+    (out, attribution)
 }
 
 // --- one run --------------------------------------------------------------------------------
@@ -487,6 +604,9 @@ struct SpreadRow {
 struct Cell {
     members: Vec<(i64, i64)>,
     verdict: Map<String, Value>,
+    /// Section 4a's entries for the cell, read when it was compared: kept with the verdict, since
+    /// the observations may be let go before the cell is judged again.
+    attribution: Vec<Value>,
 }
 
 /// A launch at a step whose entries no longer change.
@@ -494,6 +614,7 @@ struct Cell {
 struct Frozen {
     entries: Vec<Value>,
     incidents: Vec<Value>,
+    attribution: Vec<Value>,
     why: &'static str,
     rows_not_compared: u64,
 }
@@ -503,6 +624,8 @@ struct Output {
     entries: Vec<Value>,
     incidents: Vec<Value>,
     legacy: Vec<Value>,
+    /// Section 4a's entries of the step: listed with the step's entries and dropped with them.
+    attribution: Vec<Value>,
 }
 
 type Scope = Option<(String, Vec<i64>)>;
@@ -725,7 +848,7 @@ impl Comparison {
         loop {
             match self.judge_once(number, &mut step) {
                 Ok(output) => {
-                    step.size = [&output.entries, &output.incidents, &output.legacy]
+                    step.size = [&output.entries, &output.incidents, &output.legacy, &output.attribution]
                         .iter()
                         .flat_map(|list| list.iter())
                         .map(|item| item.to_string().len() + 1)
@@ -757,6 +880,7 @@ impl Comparison {
         for frozen in step.frozen.values() {
             out.entries.extend(frozen.entries.iter().cloned());
             out.incidents.extend(frozen.incidents.iter().cloned());
+            out.attribution.extend(frozen.attribution.iter().cloned());
         }
         // The gathered spreads, each under what it says it covers (contract 5).
         let mut gathered: BTreeMap<Scope, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
@@ -839,8 +963,8 @@ impl Comparison {
                 }
                 let membership: Vec<(i64, i64)> = present.iter().map(|(rank, attempt, _)| (*rank, *attempt)).collect();
                 let key = (launch.clone(), group.clone());
-                let verdict = match step.cells.get(&key) {
-                    Some(cell) if cell.members == membership => cell.verdict.clone(),
+                let (verdict, attribution) = match step.cells.get(&key) {
+                    Some(cell) if cell.members == membership => (cell.verdict.clone(), cell.attribution.clone()),
                     _ => {
                         let observations: Option<Vec<(i64, &Observation)>> = present
                             .iter()
@@ -849,14 +973,28 @@ impl Comparison {
                         let Some(observations) = observations else {
                             return Err(launch.clone());
                         };
-                        compare_cell(&observations, tolerance)
+                        let (verdict, read) = compare_cell(&observations, tolerance);
+                        let attribution = read
+                            .into_iter()
+                            .map(|said| {
+                                let mut entry = json!({"step": number, "launch": launch, "group": group});
+                                entry
+                                    .as_object_mut()
+                                    .expect("an object")
+                                    .extend(said.as_object().cloned().unwrap_or_default());
+                                entry
+                            })
+                            .collect();
+                        (verdict, attribution)
                     }
                 };
+                out.attribution.extend(attribution.iter().cloned());
                 cells.insert(
                     key,
                     Cell {
                         members: membership.clone(),
                         verdict: verdict.clone(),
+                        attribution,
                     },
                 );
                 judged.extend(
@@ -920,6 +1058,7 @@ impl Comparison {
         }
         out.entries.sort_by_key(entry_order);
         out.incidents.sort_by_key(incident_order);
+        out.attribution.sort_by_key(attribution_order);
         // Only an unfinished cell's rows and a complete cell's members keep their observations.
         for (key, row) in step.rows.iter_mut() {
             row.judged = judged.contains(key);
@@ -954,11 +1093,13 @@ impl Comparison {
                 .filter(named)
                 .cloned()
                 .collect();
+            let attribution: Vec<Value> = step.output.attribution.iter().filter(named).cloned().collect();
             step.rows.retain(|_, row| row.launch != launch);
             step.cells.retain(|(cell, _), _| Some(cell) != launch.as_ref());
             step.frozen.entry(launch).or_insert(Frozen {
                 entries,
                 incidents,
+                attribution,
                 why,
                 rows_not_compared: 0,
             });
@@ -1071,6 +1212,7 @@ impl Comparison {
                     Frozen {
                         entries,
                         incidents: Vec::new(),
+                        attribution: Vec::new(),
                         why: "restart",
                         rows_not_compared: 0,
                     },
@@ -1109,6 +1251,17 @@ impl Comparison {
                 _ => self.kept.push(incident.clone()),
             }
         }
+        // Section 4a's entries go with their launch and step; one whose step entry is not listed
+        // has nothing to stand beside and is dropped with it, as the listing bound drops it.
+        for said in written["attribution"].as_array().into_iter().flatten() {
+            let frozen = said["step"]
+                .as_i64()
+                .and_then(|number| self.steps.get_mut(&number))
+                .and_then(|step| step.frozen.get_mut(&said["launch"].as_str().map(str::to_string)));
+            if let Some(frozen) = frozen {
+                frozen.attribution.push(said.clone());
+            }
+        }
         let omitted = &written["omitted"];
         self.steps_forgotten += omitted["steps"].as_u64().unwrap_or(0);
         self.incidents_dropped += omitted["replica_drift"].as_u64().unwrap_or(0);
@@ -1132,16 +1285,19 @@ impl Comparison {
     }
 
     /// The result: `steps` and `replica_drift` in the contract's order and words, `legacy` when
-    /// there is one, and `omitted` when a bound dropped something.
+    /// there is one, `attribution` when it has an entry (section 4a), and `omitted` when a bound
+    /// dropped something.
     pub fn result(&self) -> Value {
         let mut steps = Vec::new();
         let mut incidents = self.kept.clone();
         let mut legacy = Vec::new();
+        let mut attribution = Vec::new();
         let mut frozen = Vec::new();
         for (number, step) in &self.steps {
             steps.extend(step.output.entries.iter().cloned());
             incidents.extend(step.output.incidents.iter().cloned());
             legacy.extend(step.output.legacy.iter().cloned());
+            attribution.extend(step.output.attribution.iter().cloned());
             for (launch, held) in &step.frozen {
                 if held.why != "restart" || held.rows_not_compared > 0 {
                     frozen.push(json!({"launch": launch, "step": number, "why": held.why,
@@ -1153,6 +1309,9 @@ impl Comparison {
         let mut out = json!({"steps": steps, "replica_drift": incidents});
         if !legacy.is_empty() {
             out["legacy"] = json!(legacy);
+        }
+        if !attribution.is_empty() {
+            out["attribution"] = json!(attribution);
         }
         let mut omitted = Map::new();
         if self.steps_forgotten > 0 {

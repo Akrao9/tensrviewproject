@@ -72,6 +72,8 @@ use data::{DataProgress, DataRow, ResumeFound, ResumePass, ResumeRow};
 mod system;
 use system::{System, SystemColumns};
 #[cfg(test)]
+mod lane_ab2_tests;
+#[cfg(test)]
 mod lane_v7_tests;
 #[cfg(test)]
 mod lane_w3_tests;
