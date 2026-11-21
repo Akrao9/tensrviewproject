@@ -11,6 +11,9 @@ parameter drift.
 from __future__ import annotations
 
 import argparse
+import bisect
+import contextvars
+import copy
 import json
 import math
 import os
@@ -187,17 +190,28 @@ def _dead_experts_significant(
 
 def _mark_starved(samples: list[dict[str, Any]], window: int, ratio: float) -> None:
     """Set `sample["starved"]` from each router's trailing window of `window` samples."""
-    by_layer: dict[int, list[dict[str, Any]]] = {}
-    for sample in samples:
-        sample["starved"] = []
-        by_layer.setdefault(sample["layer"], []).append(sample)
-    for seq in by_layer.values():
-        recent: list[dict[str, Any]] = []
-        sums: list[int] = []
-        tokens = 0
-        for sample in seq:  # in step order
+    _StarvedMarks(window, ratio).feed(samples)
+
+
+class _StarvedMarks:
+    """`_mark_starved`'s state: each router's trailing window, so that the samples of later records
+    can be marked as they come (`feed`, in step order), as `_GradSpikes` is fed (lane AD11). A sample
+    is marked when it is fed and never again: the window ends at it."""
+
+    __slots__ = ("window", "ratio", "layers")
+
+    def __init__(self, window: int, ratio: float) -> None:
+        self.window, self.ratio = window, ratio
+        # Each router's samples in the window, the sums of their counts, and their tokens.
+        self.layers: dict[Any, tuple[list[dict[str, Any]], list[int], int]] = {}
+
+    def feed(self, samples: Iterable[dict[str, Any]]) -> None:
+        window, ratio, layers = self.window, self.ratio, self.layers
+        for sample in samples:  # in step order
+            sample["starved"] = []
             if sample.get("missing") or sample["routed_tokens"] <= 0:
                 continue
+            recent, sums, tokens = layers.get(sample["layer"], ([], [], 0))
             counts = sample["counts"]
             if len(sums) != len(counts):
                 recent, sums, tokens = [], [0] * len(counts), 0
@@ -208,6 +222,7 @@ def _mark_starved(samples: list[dict[str, Any]], window: int, ratio: float) -> N
                 old = recent.pop(0)
                 sums = [a - b for a, b in zip(sums, old["counts"])]
                 tokens -= old["routed_tokens"]
+            layers[sample["layer"]] = (recent, sums, tokens)
             even = 1.0 / len(counts)
             if len(recent) < window or tokens * even < STARVE_MIN_EXPECTED:
                 continue
@@ -224,22 +239,39 @@ def _mark_starved(samples: list[dict[str, Any]], window: int, ratio: float) -> N
 
 def detect_starved_experts(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Return every starved expert with the first step it was flagged, or None."""
-    first: dict[tuple[int, int], dict[str, Any]] = {}
-    for sample in samples:
-        for expert in sample.get("starved", ()):
-            key = (sample["layer"], expert)
-            if key not in first:
-                first[key] = {
-                    "layer": sample["layer"],
-                    "router": sample.get("router"),
-                    "expert": expert,
-                    "step": sample["step"],
-                    "window_share": sample["starved_shares"][str(expert)],
-                }
-    if not first:
-        return None
-    experts = sorted(first.values(), key=lambda e: (e["window_share"], e["layer"], e["expert"]))
-    return {"kind": "starved_experts", "step": min(e["step"] for e in experts), "experts": experts}
+    state = _StarvedFirsts()
+    state.feed(samples)
+    return state.result()
+
+
+class _StarvedFirsts:
+    """`detect_starved_experts`'s state: the first step each expert was flagged, fed samples in
+    step order (lane AD11)."""
+
+    __slots__ = ("first",)
+
+    def __init__(self) -> None:
+        self.first: dict[tuple[int, int], dict[str, Any]] = {}
+
+    def feed(self, samples: Iterable[Mapping[str, Any]]) -> None:
+        first = self.first
+        for sample in samples:
+            for expert in sample.get("starved", ()):
+                key = (sample["layer"], expert)
+                if key not in first:
+                    first[key] = {
+                        "layer": sample["layer"],
+                        "router": sample.get("router"),
+                        "expert": expert,
+                        "step": sample["step"],
+                        "window_share": sample["starved_shares"][str(expert)],
+                    }
+
+    def result(self) -> dict[str, Any] | None:
+        if not self.first:
+            return None
+        experts = sorted(copy.deepcopy(list(self.first.values())), key=lambda e: (e["window_share"], e["layer"], e["expert"]))
+        return {"kind": "starved_experts", "step": min(e["step"] for e in experts), "experts": experts}
 
 
 def _router_top_k(
@@ -429,84 +461,127 @@ def detect_grad_spikes(
     total is judged. The total is the pre-clipping `clip_grad_norm` whenever the run clips,
     since per-parameter norms are read after clipping, and `grad_norm` otherwise.
     """
-    totals: list[float] = []
-    per_param: dict[str, list[tuple[int, float]]] = {}
-    baselines: dict[str, _Baseline] = {}
-    first: dict[str, Any] | None = None
-    spikes: list[int] = []
     # One series for the whole run. When the run clips, the pre-clipping norm is used:
     # the per-parameter norms are read after clipping, so a clipped spike stays flat there.
     key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
-    for record in sorted(records, key=lambda r: r["step"]):
-        if record.get("step_skipped"):
-            continue  # a loss-scaler overflow step: its gradients are Inf or NaN by design
-        total = _finite(record.get(key))
-        if total is None:
-            continue
-        step = int(record["step"])
-        baseline = _median(totals[-window:]) if len(totals) >= min_history else None
-        if baseline is not None and baseline > 0 and total >= factor * baseline:
-            spikes.append(step)
-            if first is None:
-                first = {
-                    "step": step,
-                    "grad_norm": total,
-                    "baseline": baseline,
-                    "ratio": total / baseline,
-                    # Against the same earlier totals as `baseline` (part 1 of the rules contract).
-                    **robust_score(total, totals[-window:]),
-                    "parameters": _spiking_parameters(record, per_param, factor, window),
-                }
-        totals.append(total)
-        lasted: list[dict[str, Any]] = []
-        for name, value in record.get("grad_norms", {}).items():
-            norm = _finite(value)
-            if norm is None:
+    state = _GradSpikes(key, factor=factor, window=window, min_history=min_history, sustain=sustain)
+    state.feed(records)
+    return state.result()
+
+
+def _window_store(window: int) -> Any:
+    """Where a rule keeps the values it reads `[-window:]` of: the last `window` of them (lane AD11:
+    the whole run was kept). A `window` below 1 reads a slice that is not a trailing window
+    (`values[-0:]` is all of them), so then everything is kept, as before."""
+    return deque(maxlen=window) if window > 0 else []
+
+
+class _GradSpikes:
+    """`detect_grad_spikes`'s state, fed records in step order (`feed`, any number of times, each
+    batch at or after the steps fed before) and read by `result`. The function feeds every record
+    at once; the `--watch` path (`_Incremental`) feeds each look's new records to the state it kept.
+
+    Only what the rules read is kept (lane AD11): the last `window + 1` totals (`baseline` and the
+    score read `[-window:]`, and the parameter path's `total_window` the `window` before the
+    newest), each parameter's last `window` norms (`_spiking_parameters`), its `_Baseline`, the
+    count of totals for `min_history`, and the first 20 spike steps with their count."""
+
+    def __init__(self, key: str, *, factor: float = SPIKE_FACTOR, window: int = SPIKE_WINDOW,
+                 min_history: int = SPIKE_MIN_HISTORY, sustain: int = SPIKE_SUSTAIN) -> None:
+        self.key, self.factor, self.window, self.min_history, self.sustain = key, factor, window, min_history, sustain
+        self.totals: Any = deque(maxlen=window + 1) if window > 0 else []
+        self.total_count = 0  # every total kept, for `min_history`
+        self.per_param: dict[str, Any] = {}
+        self.baselines: dict[str, _Baseline] = {}
+        self.first: dict[str, Any] | None = None
+        self.spike_count = 0
+        self.spike_steps: list[int] = []  # the first 20
+
+    def feed(self, records: Iterable[Mapping[str, Any]]) -> None:
+        key, factor, window, min_history, sustain = self.key, self.factor, self.window, self.min_history, self.sustain
+        per_param, baselines = self.per_param, self.baselines
+        for record in sorted(records, key=lambda r: r["step"]):
+            if record.get("step_skipped"):
+                continue  # a loss-scaler overflow step: its gradients are Inf or NaN by design
+            total = _finite(record.get(key))
+            if total is None:
                 continue
-            per_param.setdefault(name, []).append((step, norm))
-            own = baselines.get(name)
-            if own is None:
-                own = baselines[name] = _Baseline()
-            if len(own.values) >= min_history and norm >= factor * own.low:
-                usual = _median(list(own.values))
-                if usual > 0 and norm >= factor * usual:
-                    if own.count == 0:
-                        own.start = {
-                            "step": step, "total": total, "total_baseline": baseline,
-                            # The totals `baseline` was taken over: those before this one.
-                            "total_window": totals[-(window + 1):-1],
-                            # Scored against the parameter's own window, which its `baseline` is.
-                            "parameter": {"name": name, "grad_norm": norm, "baseline": usual,
-                                          "ratio": norm / usual, **robust_score(norm, own.values),
-                                          "rising_since": step},
-                        }
-                    own.count += 1
-                    if own.count == sustain and own.start is not None:
-                        lasted.append(own.start)
+            step = int(record["step"])
+            totals = list(self.totals)
+            baseline = _median(totals[-window:]) if self.total_count >= min_history else None
+            if baseline is not None and baseline > 0 and total >= factor * baseline:
+                self.spike_count += 1
+                if len(self.spike_steps) < 20:
+                    self.spike_steps.append(step)
+                if self.first is None:
+                    self.first = {
+                        "step": step,
+                        "grad_norm": total,
+                        "baseline": baseline,
+                        "ratio": total / baseline,
+                        # Against the same earlier totals as `baseline` (part 1 of the rules contract).
+                        **robust_score(total, totals[-window:]),
+                        "parameters": _spiking_parameters(record, per_param, factor, window),
+                    }
+            self.totals.append(total)
+            self.total_count += 1
+            totals.append(total)
+            lasted: list[dict[str, Any]] = []
+            for name, value in record.get("grad_norms", {}).items():
+                norm = _finite(value)
+                if norm is None:
                     continue
-            own.count = 0
-            own.keep(norm, window)
-        if lasted and first is None:
-            # Usually every excursion that lasts to this record began on the same step; if
-            # not, the incident is the earliest, with the parameters that began there.
-            began = min(start["step"] for start in lasted)
-            starts = [start for start in lasted if start["step"] == began]
-            parameters = sorted((start["parameter"] for start in starts), key=lambda p: (-p["ratio"], p["name"]))
-            usual = starts[0]["total_baseline"]
-            first = {
-                "step": began,
-                "grad_norm": starts[0]["total"],
-                "baseline": usual,
-                "ratio": starts[0]["total"] / usual if usual else None,
-                # A score only beside a ratio, and over the totals that ratio's baseline was taken over.
-                **(robust_score(starts[0]["total"], starts[0]["total_window"]) if usual else {}),
-                "parameters": parameters[:10],
-                "trigger": "parameter",
-                "sustained": sustain,
-            }
-    if first is None:
-        return None
-    return {"kind": "grad_spike", **first, "spike_count": len(spikes), "spike_steps": spikes[:20]}
+                past = per_param.get(name)
+                if past is None:
+                    past = per_param[name] = _window_store(window)
+                past.append((step, norm))
+                own = baselines.get(name)
+                if own is None:
+                    own = baselines[name] = _Baseline()
+                if len(own.values) >= min_history and norm >= factor * own.low:
+                    usual = _median(list(own.values))
+                    if usual > 0 and norm >= factor * usual:
+                        if own.count == 0:
+                            own.start = {
+                                "step": step, "total": total, "total_baseline": baseline,
+                                # The totals `baseline` was taken over: those before this one.
+                                "total_window": totals[-(window + 1):-1],
+                                # Scored against the parameter's own window, which its `baseline` is.
+                                "parameter": {"name": name, "grad_norm": norm, "baseline": usual,
+                                              "ratio": norm / usual, **robust_score(norm, own.values),
+                                              "rising_since": step},
+                            }
+                        own.count += 1
+                        if own.count == sustain and own.start is not None:
+                            lasted.append(own.start)
+                        continue
+                own.count = 0
+                own.keep(norm, window)
+            if lasted and self.first is None:
+                # Usually every excursion that lasts to this record began on the same step; if
+                # not, the incident is the earliest, with the parameters that began there.
+                began = min(start["step"] for start in lasted)
+                starts = [start for start in lasted if start["step"] == began]
+                parameters = sorted((start["parameter"] for start in starts), key=lambda p: (-p["ratio"], p["name"]))
+                usual = starts[0]["total_baseline"]
+                self.first = {
+                    "step": began,
+                    "grad_norm": starts[0]["total"],
+                    "baseline": usual,
+                    "ratio": starts[0]["total"] / usual if usual else None,
+                    # A score only beside a ratio, and over the totals that ratio's baseline was taken over.
+                    **(robust_score(starts[0]["total"], starts[0]["total_window"]) if usual else {}),
+                    "parameters": parameters[:10],
+                    "trigger": "parameter",
+                    "sustained": sustain,
+                }
+
+    def result(self) -> dict[str, Any] | None:
+        """The incident `detect_grad_spikes` returns for the records fed so far, a new copy each time."""
+        if self.first is None:
+            return None
+        return copy.deepcopy({"kind": "grad_spike", **self.first, "spike_count": self.spike_count,
+                              "spike_steps": list(self.spike_steps)})
 
 
 def detect_update_spikes(
@@ -545,7 +620,7 @@ def detect_update_spikes(
     before: tuple[Any, float, dict[str, float], Mapping[str, Any] | None, list[float] | None] | None = None
     recent: deque[float] = deque(maxlen=window)  # the last `window` changes that were not flagged
     first: dict[str, Any] | None = None
-    spikes: list[int] = []
+    spike_count, spikes = 0, []  # every flagged record counted; the first 20 kept (lane AD11)
     for record in sorted(records, key=lambda r: r["step"]):
         if record.get("step_skipped"):
             continue
@@ -577,7 +652,9 @@ def detect_update_spikes(
                     recent.append(change)
                 else:
                     step = int(record["step"])
-                    spikes.append(step)
+                    spike_count += 1
+                    if len(spikes) < 20:
+                        spikes.append(step)
                     if first is None:
                         moved = sorted(
                             ({"name": name, "update_rms": own[name], "previous": before[2][name],
@@ -599,7 +676,7 @@ def detect_update_spikes(
         before = (attempt, total, own, grads, _lr_list(record))
     if first is None:
         return None
-    return {"kind": "update_spike", **first, "spike_count": len(spikes), "spike_steps": spikes[:20]}
+    return {"kind": "update_spike", **first, "spike_count": spike_count, "spike_steps": spikes}
 
 
 def _lr_list(record: Mapping[str, Any]) -> list[float] | None:
@@ -806,14 +883,14 @@ def moe_source_words(evidence: Mapping[str, Any]) -> dict[str, str]:
 
 def _spiking_parameters(
     record: dict[str, Any],
-    per_param: dict[str, list[tuple[int, float]]],
+    per_param: Mapping[str, Iterable[tuple[int, float]]],
     factor: float,
     window: int,
 ) -> list[dict[str, Any]]:
     found = []
     for name, value in record.get("grad_norms", {}).items():
         norm = _finite(value)
-        past = per_param.get(name, [])[-window:]
+        past = list(per_param.get(name, ()))[-window:]
         if norm is None or len(past) < 2:
             continue
         baseline = _median([v for _, v in past])
@@ -951,7 +1028,9 @@ def update_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     values on. `parameters` with an update size, `judged`, and `lowest`: the MEASUREMENTS_LISTED
     whose update fell furthest, each with `name`, `ratio`, `step`, `baseline` and `update_rms`.
     None when no record carries `update_rms`."""
-    past: dict[str, list[float]] = {}
+    # Each parameter's last ACT_WINDOW values, which is all the rule reads (lane AD11: the whole run
+    # was kept), and never fewer than SCORE_MIN_HISTORY, so that its length still counts them.
+    past: dict[str, deque[float]] = {}
     lowest: dict[str, dict[str, Any]] = {}
     for record in sorted(records, key=lambda r: r["step"]):
         sizes = record.get("update_rms")
@@ -962,9 +1041,11 @@ def update_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
             if now is None:
                 continue
             name = str(name)
-            earlier = past.setdefault(name, [])
+            earlier = past.get(name)
+            if earlier is None:
+                earlier = past[name] = deque(maxlen=max(ACT_WINDOW, SCORE_MIN_HISTORY))
             if len(earlier) >= SCORE_MIN_HISTORY:
-                base = _median(earlier[-ACT_WINDOW:])
+                base = _median(list(earlier)[-ACT_WINDOW:])
                 if base > 0 and (name not in lowest or now / base < lowest[name]["ratio"]):
                     lowest[name] = {"name": name, "ratio": now / base, "step": int(record["step"]),
                                     "baseline": base, "update_rms": now}
@@ -1622,70 +1703,95 @@ def detect_activation_anomalies(records: list[dict[str, Any]]) -> list[dict[str,
     Returns at most one incident per kind: the first step it happened, the modules
     affected at that step, and how many steps were affected in all.
     """
-    history: dict[str, list[tuple[float, float, float]]] = {}
-    # Each module's baseline for dead outputs, from its first ACT_WINDOW records. A module's
-    # history only grows, so those records never change once the check starts; they are
-    # summarized once, not again for every later record.
-    baselines: dict[str, float] = {}
-    found: dict[str, dict[str, Any]] = {}
-    counts: dict[str, int] = {}
-    outlier = lambda rows: _median([a / s for s, a, _ in rows if s > 0] or [0.0])
+    state = _ActivationAnomalies()
+    state.feed(records)
+    return state.result()
 
-    def report(kind: str, step: int, hits: list[dict[str, Any]]) -> None:
+
+class _ActivationAnomalies:
+    """`detect_activation_anomalies`'s state, fed records in step order (`feed`, any number of times,
+    each batch at or after the steps fed before) and read by `result`, as `_GradSpikes` is.
+
+    Only what the rules read is kept (lane AD11: every module's whole history was): each module's
+    last ACT_WINDOW + ACT_RECENT rows (the spike reads the last ACT_WINDOW, the drift the last
+    ACT_RECENT and the ACT_WINDOW before them), how many rows it has had, and its dead-output
+    baseline, the median `zero_frac` of its first ACT_WINDOW rows, taken when it has
+    ACT_WINDOW + ACT_RECENT rows, when those are all still kept."""
+
+    def __init__(self) -> None:
+        self.history: dict[str, deque[tuple[float, float, float]]] = {}
+        self.rows: dict[str, int] = {}  # rows each module has had
+        # Each module's baseline for dead outputs, from its first ACT_WINDOW records. A module's
+        # history only grows, so those records never change once the check starts; they are
+        # summarized once, not again for every later record.
+        self.baselines: dict[str, float] = {}
+        self.found: dict[str, dict[str, Any]] = {}
+        self.counts: dict[str, int] = {}
+
+    def _report(self, kind: str, step: int, hits: list[dict[str, Any]]) -> None:
         if not hits:
             return
-        counts[kind] = counts.get(kind, 0) + 1
-        if kind not in found:
-            found[kind] = {"kind": kind, "step": step, "modules": hits[:20], "affected": len(hits)}
+        self.counts[kind] = self.counts.get(kind, 0) + 1
+        if kind not in self.found:
+            self.found[kind] = {"kind": kind, "step": step, "modules": hits[:20], "affected": len(hits)}
 
-    for record in sorted(records, key=lambda r: r["step"]):
-        step = int(record["step"])
-        spikes, drifts, dead = [], [], []
-        for name, stats in record.get("layers", {}).items():
-            std, amax, zfrac = (_finite(stats.get(k)) for k in ("std", "abs_max", "zero_frac"))
-            if std is None or amax is None or zfrac is None:
-                continue
-            past = history.setdefault(name, [])
-            if len(past) >= ACT_MIN_HISTORY:
-                recent = past[-ACT_WINDOW:]
-                for key, value, earlier in (
-                    ("abs_max", amax, [p[1] for p in recent]),
-                    ("std", std, [p[0] for p in recent]),
-                ):
-                    base = _median(earlier)
-                    if base > 0 and value >= ACT_SPIKE_FACTOR * base:
-                        spikes.append({"module": name, "stat": key, "value": value,
-                                       "baseline": base, "ratio": value / base, **robust_score(value, earlier)})
-                        break
-            past.append((std, amax, zfrac))
-            if len(past) >= ACT_DRIFT_NEEDS:
-                # The trailing baseline (rules contract, part 2): the last ACT_RECENT records against
-                # the ACT_WINDOW before them, from the record whose baseline holds none of the first
-                # ACT_WINDOW. The score is over the same ACT_WINDOW values as the baseline.
-                last, trail = past[-ACT_RECENT:], past[-(ACT_WINDOW + ACT_RECENT):-ACT_RECENT]
-                for key, base, now, earlier in (
-                    ("std", _median([p[0] for p in trail]), _median([p[0] for p in last]), [p[0] for p in trail]),
-                    ("abs_max/std", outlier(trail), outlier(last), [a / s for s, a, _ in trail if s > 0]),
-                ):
-                    if base > 0 and now > 0 and max(now / base, base / now) >= ACT_DRIFT_FACTOR:
-                        drifts.append({"module": name, "stat": key, "baseline": base,
-                                       "recent": now, "ratio": now / base, **robust_score(now, earlier)})
-                        break
-            if len(past) >= ACT_WINDOW + ACT_RECENT:
-                # `dead_activations` keeps the module's first ACT_WINDOW records as its baseline.
-                last = past[-ACT_RECENT:]
-                if name not in baselines:
-                    baselines[name] = _median([p[2] for p in past[:ACT_WINDOW]])
-                base_zero = baselines[name]
-                now_zero = _median([p[2] for p in last])
-                if now_zero - base_zero >= ACT_DEAD_RISE:
-                    dead.append({"module": name, "baseline": base_zero, "recent": now_zero})
-        report("activation_spike", step, _first_in_forward_pass_leads(spikes))
-        report("activation_drift", step, drifts)
-        report("dead_activations", step, dead)
-    for kind, incident in found.items():
-        incident["affected_steps"] = counts[kind]
-    return list(found.values())
+    def feed(self, records: Iterable[Mapping[str, Any]]) -> None:
+        history, rows, baselines = self.history, self.rows, self.baselines
+        outlier = lambda kept: _median([a / s for s, a, _ in kept if s > 0] or [0.0])
+        for record in sorted(records, key=lambda r: r["step"]):
+            step = int(record["step"])
+            spikes, drifts, dead = [], [], []
+            for name, stats in record.get("layers", {}).items():
+                std, amax, zfrac = (_finite(stats.get(k)) for k in ("std", "abs_max", "zero_frac"))
+                if std is None or amax is None or zfrac is None:
+                    continue
+                kept = history.get(name)
+                if kept is None:
+                    kept = history[name] = deque(maxlen=ACT_WINDOW + ACT_RECENT)
+                if rows.get(name, 0) >= ACT_MIN_HISTORY:
+                    recent = list(kept)[-ACT_WINDOW:]
+                    for key, value, earlier in (
+                        ("abs_max", amax, [p[1] for p in recent]),
+                        ("std", std, [p[0] for p in recent]),
+                    ):
+                        base = _median(earlier)
+                        if base > 0 and value >= ACT_SPIKE_FACTOR * base:
+                            spikes.append({"module": name, "stat": key, "value": value,
+                                           "baseline": base, "ratio": value / base, **robust_score(value, earlier)})
+                            break
+                kept.append((std, amax, zfrac))
+                count = rows[name] = rows.get(name, 0) + 1
+                past = list(kept) if count >= ACT_WINDOW + ACT_RECENT or count >= ACT_DRIFT_NEEDS else None
+                if count >= ACT_DRIFT_NEEDS:
+                    # The trailing baseline (rules contract, part 2): the last ACT_RECENT records against
+                    # the ACT_WINDOW before them, from the record whose baseline holds none of the first
+                    # ACT_WINDOW. The score is over the same ACT_WINDOW values as the baseline.
+                    last, trail = past[-ACT_RECENT:], past[-(ACT_WINDOW + ACT_RECENT):-ACT_RECENT]
+                    for key, base, now, earlier in (
+                        ("std", _median([p[0] for p in trail]), _median([p[0] for p in last]), [p[0] for p in trail]),
+                        ("abs_max/std", outlier(trail), outlier(last), [a / s for s, a, _ in trail if s > 0]),
+                    ):
+                        if base > 0 and now > 0 and max(now / base, base / now) >= ACT_DRIFT_FACTOR:
+                            drifts.append({"module": name, "stat": key, "baseline": base,
+                                           "recent": now, "ratio": now / base, **robust_score(now, earlier)})
+                            break
+                if count >= ACT_WINDOW + ACT_RECENT:
+                    # `dead_activations` keeps the module's first ACT_WINDOW records as its baseline,
+                    # taken at its ACT_WINDOW + ACT_RECENT-th row, while all of them are still kept.
+                    last = past[-ACT_RECENT:]
+                    if name not in baselines:
+                        baselines[name] = _median([p[2] for p in past[:ACT_WINDOW]])
+                    base_zero = baselines[name]
+                    now_zero = _median([p[2] for p in last])
+                    if now_zero - base_zero >= ACT_DEAD_RISE:
+                        dead.append({"module": name, "baseline": base_zero, "recent": now_zero})
+            self._report("activation_spike", step, _first_in_forward_pass_leads(spikes))
+            self._report("activation_drift", step, drifts)
+            self._report("dead_activations", step, dead)
+
+    def result(self) -> list[dict[str, Any]]:
+        """The incidents `detect_activation_anomalies` returns for the records fed so far, new copies."""
+        return [{**copy.deepcopy(incident), "affected_steps": self.counts[kind]} for kind, incident in self.found.items()]
 
 
 def _attention_values(stats: Any) -> tuple[float | None, float | None, int]:
@@ -2489,26 +2595,72 @@ def replace_atomically(path: Path, text: str) -> None:
         raise
 
 
+def _json_text(value: Any) -> str:
+    """`json.dumps(json_safe(value), separators=(",", ":"), allow_nan=False)`. A value that is plain
+    JSON already (dicts, lists and tuples of finite numbers, strings, bools and None) is dumped as it
+    is, which gives the same text, without the walk `json_safe` makes over every value (lane AD11:
+    4.5 s of a 10,000-step watcher's update); anything else, a NaN among it, goes through `json_safe`."""
+    try:
+        return json.dumps(value, separators=(",", ":"), allow_nan=False)
+    except (ValueError, TypeError):
+        return json.dumps(json_safe(value), separators=(",", ":"), allow_nan=False)
+
+
+# Stands for the samples in the text of the rest of an evidence file (`_evidence_text`).
+_SAMPLES_HERE = f"\x00tensorquill samples {secrets.token_hex(16)}\x00"
+
+
+def _evidence_text(evidence: Mapping[str, Any], samples_text: str | None = None) -> str:
+    """The text `write_evidence` writes. With `samples_text`, the text of `evidence["samples"]`
+    made beforehand (`_Incremental.samples_text`), which is put in the place the samples have in the
+    rest of the text, as `json.dumps` puts a list: "[" + its items joined by "," + "]"."""
+    if samples_text is not None and "samples" in evidence:
+        rest = _json_text({key: (_SAMPLES_HERE if key == "samples" else value) for key, value in evidence.items()})
+        here = json.dumps(_SAMPLES_HERE)
+        if rest.count(here) == 1:
+            return rest.replace(here, samples_text) + "\n"
+    return _json_text(evidence) + "\n"
+
+
 def write_evidence(evidence: Mapping[str, Any], path: str | Path) -> Path:
     """Write `evidence` as strict JSON (`json_safe`) through a temporary file and a rename, so
     a reader polling the file never sees half of it."""
+    return _write_evidence_text(_evidence_text(evidence), path)
+
+
+def _write_evidence_text(text: str, path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    replace_atomically(path, json.dumps(json_safe(evidence), separators=(",", ":"), allow_nan=False) + "\n")
+    replace_atomically(path, text)
     return path
 
 
-def _write_output(evidence: Mapping[str, Any], path: Path, named: bool, compact_window: int | None) -> Path:
-    """`write_evidence`, or with `compact_window` set the compact file instead (`compact.write_compact`)."""
+def _write_output(evidence: Mapping[str, Any], path: Path, named: bool, compact_window: int | None,
+                  samples_text: str | None = None) -> Path:
+    """`write_evidence`, or with `compact_window` set the compact file instead (`compact.write_compact`).
+    `samples_text` is the text of the samples made beforehand (`_Incremental.samples_text`)."""
     if compact_window is None:
-        return write_evidence(evidence, path)
+        return _write_evidence_text(_evidence_text(evidence, samples_text), path)
     from .compact import write_compact
 
     return write_compact(evidence, path, window=compact_window, named=named)
 
 
 class _Tail:
-    """Reads what is new in a `.jsonl` file or a directory of Parquet parts."""
+    """Reads what is new in a `.jsonl` file or a directory of Parquet parts.
+
+    A file cut short, replaced or rewritten is read again from the start (lane AD11): a `.jsonl`
+    file that is shorter than what was read, that is another file at the path (another device or
+    inode), or whose first CHECKED_BYTES or last CHECKED_BYTES read have changed; and a part that was
+    read and has changed (its size, time or file) or is gone. Before, such a file was read on from
+    where it was, or not at all, and the evidence went on showing rows the source no longer holds.
+
+    The limit: a rewrite in place that keeps the same file, at least the same length, and the same
+    first and last CHECKED_BYTES (4 KiB) of what was read is not detected, and the watcher goes on
+    reading from its offset. A file cut to empty is read again but holds no record, so the watcher
+    still writes nothing for it and the last evidence file stays as it was."""
+
+    CHECKED_BYTES = 4096  # at the start of a `.jsonl` file, and before the end of what was read
 
     def __init__(self, source: Path, rank: int | None) -> None:
         self.source = source
@@ -2516,20 +2668,75 @@ class _Tail:
         self.records: list[dict[str, Any]] = []
         self._offset = 0
         self._seen: set[Path] = set()
+        self._stats: dict[Path, tuple[int, int, int]] = {}  # each part read: its size, time and file
+        self._file: tuple[int, int] | None = None  # the `.jsonl` file read: its device and file
+        self._head = b""  # the first bytes read, and the last ones
+        self._last = b""
         self.left_out = 0  # whole lines that were not a JSON object (lane U7, Nov 19, 2026)
+        self.restarts = 0  # how often what was read was read again from the start
+
+    def _restart(self) -> None:
+        self.records = []
+        self._offset = 0
+        self._seen = set()
+        self._stats = {}
+        self._file = None
+        self._head = self._last = b""
+        self.left_out = 0
+        self.restarts += 1
+
+    @staticmethod
+    def _stat(path: Path) -> tuple[int, int, int] | None:
+        try:
+            found = path.stat()
+        except OSError:
+            return None
+        return found.st_size, found.st_mtime_ns, found.st_ino
+
+    def _jsonl_changed(self) -> bool:
+        """Whether the `.jsonl` file no longer holds what was read from it."""
+        if not self._offset:
+            return False
+        try:
+            found = self.source.stat()
+            if (found.st_dev, found.st_ino) != self._file or found.st_size < self._offset:
+                return True
+            with self.source.open("rb") as file:
+                head = file.read(len(self._head))
+                file.seek(self._offset - len(self._last))
+                last = file.read(len(self._last))
+        except OSError:
+            return True
+        return head != self._head or last != self._last
 
     def poll(self) -> bool:
-        """Add newly written records; return whether there were any."""
+        """Add newly written records; return whether there were any, or whether what was read was
+        read again from the start."""
         new: list[dict[str, Any]] = []
+        restarted = False
         if self.source.is_dir():
-            for part in _parquet_parts(self.source, self.rank):
+            parts = _parquet_parts(self.source, self.rank)
+            if self._seen:
+                listed = set(parts)
+                # A part read without its stat kept (one a caller marked as read) is checked for being there only.
+                if any(part not in listed or (part in self._stats and self._stat(part) != self._stats[part])
+                       for part in self._seen):
+                    self._restart()
+                    restarted = True
+            for part in parts:
                 if part not in self._seen:  # a part is written once and never changed
+                    stat = self._stat(part)
                     new.extend(_read_part(part))
                     self._seen.add(part)
+                    self._stats[part] = stat if stat is not None else (-1, -1, -1)
         elif self.source.exists():
+            if self._jsonl_changed():
+                self._restart()
+                restarted = True
             with self.source.open("rb") as file:
                 file.seek(self._offset)
                 data = file.read()
+                found = os.fstat(file.fileno())
             end = data.rfind(b"\n") + 1  # a last line with no newline is still being written
             for line in data[:end].splitlines():
                 if line.strip():
@@ -2541,11 +2748,16 @@ class _Tail:
                         new.append(record)
                     else:
                         self.left_out += 1  # a line torn by a killed process: counted, and said
-            self._offset += end
+            if end:
+                if not self._offset:
+                    self._file = (found.st_dev, found.st_ino)
+                    self._head = data[:min(end, self.CHECKED_BYTES)]
+                self._offset += end
+                self._last = (self._last + data[max(0, end - self.CHECKED_BYTES):end])[-self.CHECKED_BYTES:]
         if self.rank is not None:
             new = [r for r in new if r.get("rank", 0) == self.rank]
         self.records.extend(new)
-        return bool(new)
+        return bool(new) or restarted
 
 
 # The kinds `tensorquill-server` works out itself and writes to a rank's `incidents.json`.
@@ -4056,6 +4268,11 @@ def _report_freshness(look: Mapping[str, Any], judged: bool) -> dict[str, Any] |
     return freshness_block(report.get("last_step"), stored[1], "records_newer")
 
 
+# `watch` keeps the costly detectors' states between looks (`_Incremental`, lane AD11). False judges
+# every record again at every look, as before; the tests compare the two.
+_INCREMENTAL_WATCH = True
+
+
 def watch(
     source: str | Path,
     output: str | Path | None = None,
@@ -4087,8 +4304,8 @@ def watch(
     as `read_server_report` calls that report current. The evidence then has no per-step
     `samples`. When the report is missing or unusable, or has not caught up with the stored
     parts `report_grace` seconds after it was last current, the parts are read and the
-    detectors run here, as they do for a `.jsonl` file; that is repeated over the whole run
-    at every change. While waiting for a report inside `report_grace`, status updates and
+    detectors run here, as they do for a `.jsonl` file, at every change (only the new records
+    for the costliest detectors, as said below). While waiting for a report inside `report_grace`, status updates and
     external sources (`flight_recorder`, `traincheck`) still trigger fresh writes from the
     last current report. `default_rank`, when set alongside `rank=None`, locks onto that
     rank if a watched run directory ends up holding more than one `rank=*` folder.
@@ -4102,6 +4319,19 @@ def watch(
     (`thresholds_changed`): that result is not carried over, and the parts are judged here.
     When the report covers the newest stored step there is no `freshness` key.
 
+    When the detectors run here, the costly ones (the MoE samples and their rules, `grad_spike`, the
+    activation kinds, `non_finite`) keep their state between looks and are fed only the records that
+    are new, as long as every record judged before is still judged, in its place, with the same
+    options; otherwise they judge every record again (`_Incremental`, lane AD11). The evidence is the
+    same either way. The `samples` handed to `on_update` are the ones kept for the next look: read
+    them, do not change them in place.
+
+    A `.jsonl` file cut short, replaced or rewritten under the watcher is read again from the start,
+    and so is a store whose parts read have changed or are gone (`_Tail`). The limit: a rewrite in
+    place that keeps the same file, at least the same length, and the same first and last 4 KiB of
+    what was read is not detected, and the watcher goes on from its offset. A file cut to empty still
+    writes nothing: the last evidence file is left as it was until the file holds a record again.
+
     The five thresholds (`overload_threshold`, `drift_tolerance`, `starve_window`,
     `starve_ratio`, `top_k`) are the caller's only when given. For a server's store, one left
     out is the server's: its report is taken with what it applied, and when the detectors have
@@ -4113,7 +4343,7 @@ def watch(
     `detectors="rust"` (with `server_binary`, as in `build_evidence`) judges through
     `tensorquill-server detect` whenever the detectors run here: on every rebuild for a
     `.jsonl` file, and for a server's store when its report cannot be used. Each rebuild sends
-    every record read so far, as the Python detectors read them all again. A missing binary or
+    every record read so far. A missing binary or
     `pyarrow` raises `RuntimeError` before the first look, not at the first rebuild.
     `detectors="auto"` is decided once, before the first look, as `build_evidence` decides it.
     The default here is "python"; the command line's `--watch` asks for "rust" (`main`).
@@ -4146,6 +4376,8 @@ def watch(
         rust_ready(build_options.get("server_binary"))
     picked_rank = rank
     tail = _Tail(source, picked_rank)
+    # The costly detectors' states, kept between looks and fed only the new records (lane AD11).
+    memo = _Incremental() if _INCREMENTAL_WATCH else None
     written: Path | None = None
     done = 0
     status_file = build_options.pop("watchdog", None)
@@ -4195,6 +4427,7 @@ def watch(
                         emitted = None
                         emitted_grace = None
                         tail = _Tail(source, picked_rank)
+                        memo = _Incremental() if _INCREMENTAL_WATCH else None
                     else:
                         tail.rank = picked_rank
                     dirs = None
@@ -4264,6 +4497,7 @@ def watch(
                         picked_rank = default_rank
                         others_seen |= ranks_seen
                         tail = _Tail(source, picked_rank)
+                        memo = _Incremental() if _INCREMENTAL_WATCH else None
                         grown = tail.poll()
                         folder = _rank_folder(source, picked_rank) if server_reports else None
                         emitted = None
@@ -4290,9 +4524,9 @@ def watch(
                 if not grown and seen == emitted:
                     continue
                 here = {**adopted, **thresholds}
-                evidence = build_evidence(
-                    tail.records, **{"run_manifest": source, "records_file": source, **build_options, **here,
-                                     **({"watchdog": status_file} if status_file else {})}
+                evidence = _build_evidence(
+                    tail.records, memo, **{"run_manifest": source, "records_file": source, **build_options, **here,
+                                           **({"watchdog": status_file} if status_file else {})}
                 )
                 if look is not None:
                     evidence["detection"] = {**_detection(look, "python", picked_rank),
@@ -4311,7 +4545,9 @@ def watch(
                                                         report_awaited=in_grace)
             emitted = seen
             emitted_grace = grace_key
-            written = _write_output(evidence, path, output is not None, compact_window)
+            written = _write_output(evidence, path, output is not None, compact_window,
+                                    memo.samples_text(evidence)
+                                    if memo is not None and report_look is None and compact_window is None else None)
             if on_update is not None:
                 on_update(evidence, written)
             if trigger is not None:
@@ -5734,21 +5970,41 @@ def detect_non_finite(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     reported is kept in the evidence's `skipped_updates` instead (STEP_AND_EVIDENCE_CONTRACT.md,
     section 1); the scaler's skips are counted in `detect_loss_scale_trouble`.
     """
-    for record in records:
-        bad_layers = [
-            name
-            for name, stats in record.get("layers", {}).items()
-            if any(_is_non_finite(v) for v in stats.values())
-        ]
-        bad_grads = [] if record.get("step_skipped") else _non_finite_gradients(record)
-        if bad_layers or bad_grads:
-            return {
-                "kind": "non_finite",
-                "step": record["step"],
-                "layers": bad_layers,
-                "gradients": bad_grads,
-            }
-    return None
+    state = _NonFinite()
+    state.feed(records)
+    return state.found
+
+
+class _NonFinite:
+    """`detect_non_finite`'s state: the first record found, fed records in their order (lane AD11).
+    Once one is found the records after it are not read."""
+
+    __slots__ = ("found",)
+
+    def __init__(self) -> None:
+        self.found: dict[str, Any] | None = None
+
+    def feed(self, records: Iterable[Mapping[str, Any]]) -> None:
+        if self.found is not None:
+            return
+        for record in records:
+            bad_layers = [
+                name
+                for name, stats in record.get("layers", {}).items()
+                if any(_is_non_finite(v) for v in stats.values())
+            ]
+            bad_grads = [] if record.get("step_skipped") else _non_finite_gradients(record)
+            if bad_layers or bad_grads:
+                self.found = {
+                    "kind": "non_finite",
+                    "step": record["step"],
+                    "layers": bad_layers,
+                    "gradients": bad_grads,
+                }
+                return
+
+    def result(self) -> dict[str, Any] | None:
+        return copy.deepcopy(self.found)
 
 
 def detect_replica_drift(
@@ -6425,91 +6681,218 @@ def _moe_samples(
     """The per-step MoE samples as the Python rules judge them: one for every record and
     router, with the experts found overloaded or dead there. `_mark_starved` adds the starved
     ones. The Rust detectors make the same list (`tensorquill-server detect --samples`)."""
-    routers = list(router_sizes)
-    history: dict[str, list[tuple[list[int], int, float]]] = {name: [] for name in routers}
-    samples: list[dict[str, Any]] = []
-    for record in sorted(records, key=lambda r: r["step"]):
-        step = int(record["step"])
-        moe = record.get("moe", {})
-        moe_stats = record.get("moe_stats", {})
-        for layer_idx, router_name in enumerate(routers, 1):
-            expected_experts = router_sizes[router_name]
-            if router_name not in moe:
-                counts = [0] * expected_experts
-                missing = True
-            else:
-                counts = [int(c) for c in moe[router_name]]
-                missing = sum(counts) == 0
-            n_experts = len(counts)
-            tokens = sum(counts)
-            if missing or tokens <= 0:
-                diversity: float | None = None
-                overloaded: list[int] = []
-                dead: list[int] = []
-            else:
-                shares = [c / tokens for c in counts]
-                diversity = (
-                    float(moe_stats[router_name]["diversity"])
-                    if router_name in moe_stats and "diversity" in moe_stats[router_name]
-                    else _diversity_from_counts(counts, n_experts)
-                )
-                k = router_top_k.get(router_name, 1)
-                window = history[router_name]
-                if k >= 3:
-                    overloaded = _jump_overloaded(counts, k, diversity, window)
-                    rule: dict[str, Any] = {
-                        "rule": "diversity_drop", "drop": DIVERSITY_DROP, "jump": OVERLOAD_JUMP
-                    }
+    return _MoeSamples(router_sizes, router_top_k, overload_threshold).feed(records)
+
+
+class _MoeSamples:
+    """`_moe_samples`'s state: each router's history and the samples made so far, fed records in step
+    order (`feed`, any number of times), as `_GradSpikes` is (lane AD11). The router sizes, their
+    top-k and the threshold are the run's and fixed for the state: a record that changes any of them
+    changes every sample, so a state is not fed past such a change (`_Incremental`)."""
+
+    def __init__(self, router_sizes: Mapping[str, int], router_top_k: Mapping[str, int], overload_threshold: float) -> None:
+        self.router_sizes, self.router_top_k, self.overload_threshold = router_sizes, router_top_k, overload_threshold
+        self.history: dict[str, list[tuple[list[int], int, float]]] = {name: [] for name in router_sizes}
+        self.samples: list[dict[str, Any]] = []
+
+    def feed(self, records: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Make the samples of `records`, keep them, and return them."""
+        router_sizes, router_top_k, overload_threshold = self.router_sizes, self.router_top_k, self.overload_threshold
+        routers = list(router_sizes)
+        history = self.history
+        new: list[dict[str, Any]] = []
+        for record in sorted(records, key=lambda r: r["step"]):
+            step = int(record["step"])
+            moe = record.get("moe", {})
+            moe_stats = record.get("moe_stats", {})
+            for layer_idx, router_name in enumerate(routers, 1):
+                expected_experts = router_sizes[router_name]
+                if router_name not in moe:
+                    counts = [0] * expected_experts
+                    missing = True
                 else:
-                    threshold = effective_overload_threshold(n_experts, tokens, overload_threshold)
-                    overloaded = [i for i, share in enumerate(shares, 1) if share > threshold]
-                    rule = {"rule": "share", "threshold": threshold}
-                zero_experts = [i for i, c in enumerate(counts, 1) if c == 0]
-                dead = (
-                    zero_experts
-                    if _dead_experts_significant(
-                        n_experts, tokens, overloaded, len(zero_experts), diversity
+                    counts = [int(c) for c in moe[router_name]]
+                    missing = sum(counts) == 0
+                n_experts = len(counts)
+                tokens = sum(counts)
+                if missing or tokens <= 0:
+                    diversity: float | None = None
+                    overloaded: list[int] = []
+                    dead: list[int] = []
+                else:
+                    shares = [c / tokens for c in counts]
+                    diversity = (
+                        float(moe_stats[router_name]["diversity"])
+                        if router_name in moe_stats and "diversity" in moe_stats[router_name]
+                        else _diversity_from_counts(counts, n_experts)
                     )
-                    else []
-                )
-                # During top-k warm-up we can attribute an independently detected dead-expert
-                # collapse using share. With a baseline, only a change from that router's
-                # own past can mark an expert overloaded.
-                if k >= 3 and len(window) < OVERLOAD_MIN_HISTORY and dead:
-                    mean_share = 1.0 / n_experts
-                    se_share = math.sqrt(mean_share * (1.0 - mean_share) / tokens)
-                    collapse_threshold = max(2.0 * mean_share, mean_share + 3.0 * se_share)
-                    if collapse_threshold >= 1.0 / k:
-                        # A top-k expert's share cannot pass 1/k (each token picks it once at
-                        # most), so with n_experts <= 2k that bound names nothing (DET-11): use
-                        # the midpoint between an even share and the largest one there is.
-                        collapse_threshold = (mean_share + 1.0 / k) / 2.0
-                    overloaded = [
-                        i for i, share in enumerate(shares, 1) if share > collapse_threshold
-                    ]
-                    rule = {"rule": "collapse", "threshold": collapse_threshold}
-                if k >= 3 and not (overloaded or dead):
-                    # Once a collapse is flagged, compare subsequent samples to the same
-                    # pre-collapse baseline. A recovered sample starts updating it again.
-                    window.append((counts, tokens, diversity))
-                    if len(window) > OVERLOAD_WINDOW:
-                        window.pop(0)
-            sample: dict[str, Any] = {
-                "step": step,
-                "layer": layer_idx,
-                "router": router_name,
-                "routed_tokens": tokens,
-                "counts": counts,
-                "diversity": diversity,
-                "overloaded": overloaded,
-                "dead": dead,
-            }
-            if missing:
-                sample["missing"] = True
-            else:
-                sample["overload_rule"] = rule
-            samples.append(sample)
-    return samples
+                    k = router_top_k.get(router_name, 1)
+                    window = history[router_name]
+                    if k >= 3:
+                        overloaded = _jump_overloaded(counts, k, diversity, window)
+                        rule: dict[str, Any] = {
+                            "rule": "diversity_drop", "drop": DIVERSITY_DROP, "jump": OVERLOAD_JUMP
+                        }
+                    else:
+                        threshold = effective_overload_threshold(n_experts, tokens, overload_threshold)
+                        overloaded = [i for i, share in enumerate(shares, 1) if share > threshold]
+                        rule = {"rule": "share", "threshold": threshold}
+                    zero_experts = [i for i, c in enumerate(counts, 1) if c == 0]
+                    dead = (
+                        zero_experts
+                        if _dead_experts_significant(
+                            n_experts, tokens, overloaded, len(zero_experts), diversity
+                        )
+                        else []
+                    )
+                    # During top-k warm-up we can attribute an independently detected dead-expert
+                    # collapse using share. With a baseline, only a change from that router's
+                    # own past can mark an expert overloaded.
+                    if k >= 3 and len(window) < OVERLOAD_MIN_HISTORY and dead:
+                        mean_share = 1.0 / n_experts
+                        se_share = math.sqrt(mean_share * (1.0 - mean_share) / tokens)
+                        collapse_threshold = max(2.0 * mean_share, mean_share + 3.0 * se_share)
+                        if collapse_threshold >= 1.0 / k:
+                            # A top-k expert's share cannot pass 1/k (each token picks it once at
+                            # most), so with n_experts <= 2k that bound names nothing (DET-11): use
+                            # the midpoint between an even share and the largest one there is.
+                            collapse_threshold = (mean_share + 1.0 / k) / 2.0
+                        overloaded = [
+                            i for i, share in enumerate(shares, 1) if share > collapse_threshold
+                        ]
+                        rule = {"rule": "collapse", "threshold": collapse_threshold}
+                    if k >= 3 and not (overloaded or dead):
+                        # Once a collapse is flagged, compare subsequent samples to the same
+                        # pre-collapse baseline. A recovered sample starts updating it again.
+                        window.append((counts, tokens, diversity))
+                        if len(window) > OVERLOAD_WINDOW:
+                            window.pop(0)
+                sample: dict[str, Any] = {
+                    "step": step,
+                    "layer": layer_idx,
+                    "router": router_name,
+                    "routed_tokens": tokens,
+                    "counts": counts,
+                    "diversity": diversity,
+                    "overloaded": overloaded,
+                    "dead": dead,
+                }
+                if missing:
+                    sample["missing"] = True
+                else:
+                    sample["overload_rule"] = rule
+                new.append(sample)
+        self.samples.extend(new)
+        return new
+
+
+def _same_record(kept: Mapping[str, Any], given: Mapping[str, Any]) -> bool:
+    """Whether `given` is the record `kept` was: the same keys in the same order, each value the same
+    object. `build_evidence` copies each record it is handed (`load_records`), so the copies of one
+    record of a watcher's `_Tail` share every value; a record read again from a file shares none."""
+    return kept is given or (list(kept) == list(given) and all(kept[key] is given[key] for key in kept))
+
+
+class _Incremental:
+    """The detectors that read every record, kept between a watcher's looks (lane AD11, OPEN_BUGS
+    section 9: `--watch` judged the whole run again at every look, 8.1 s at 10,000 steps).
+
+    `judge` is handed a look's records as `build_evidence` judges them (resolved, in step order) and
+    gives the MoE samples, the `moe_imbalance` sample and the starting state (`_RouterStarts`), and
+    the `starved_experts`, `grad_spike`, activation and `non_finite` incidents. When the records
+    judged at the last look are the first records of this one, each the same record, and nothing
+    the states were made with has changed, only the records after them are fed to the states: this
+    look's evidence is what a full judgment would give, since each state is what feeding it every
+    record in step order would leave. Otherwise every state starts again from the first record
+    (`path` says which, and why):
+
+    - the first look;
+    - another option (the six thresholds) or whole-run fact the states read: the routers and their
+      sizes, their top-k, and whether the run clips (`clip_grad_norm`), which picks the gradient
+      series of every step;
+    - a record judged before that is not the same or not in its place: rows that came late and sort
+      before the newest step, an attempt that replaced steps already judged, a file that was cut
+      short, replaced or rewritten and read again from the start (`_Tail` says which rewrite it does
+      not detect);
+    - a step that is not a whole number, which the states' own step order might not keep.
+
+    Everything else in the evidence is made again at every look from every record, as before: those
+    passes are cheap and some read the arrival order or files outside the records. Each look's
+    `samples` is a new list of the samples kept here, which readers must not change in place.
+    """
+
+    def __init__(self) -> None:
+        self.key: Any = None
+        self.records: list[Mapping[str, Any]] = []
+        self.path: tuple[str, Any] = ("full", "first look")
+        self.texts: list[str] = []  # each sample's JSON text, for the watcher's writer (`samples_text`)
+        self.handed: list[dict[str, Any]] | None = None  # the last `samples` list given out
+
+    def _start(self, key: Any, router_sizes: Mapping[str, int], router_top_k: Mapping[str, int],
+               overload_threshold: float, starve_window: int, starve_ratio: float, grad_key: str) -> None:
+        self.key = key
+        self.records = []
+        self.texts = []
+        self.moe = _MoeSamples(dict(router_sizes), dict(router_top_k), overload_threshold)
+        self.starved = _StarvedMarks(starve_window, starve_ratio)
+        self.starved_firsts = _StarvedFirsts()
+        self.starts = _RouterStarts()
+        self.grad = _GradSpikes(grad_key)
+        self.activation = _ActivationAnomalies()
+        self.non_finite = _NonFinite()
+
+    def judge(self, records: list[dict[str, Any]], *, router_sizes: Mapping[str, int],
+              router_top_k: Mapping[str, int], overload_threshold: float, starve_window: int,
+              starve_ratio: float, options: tuple[Any, ...]) -> dict[str, Any]:
+        grad_key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
+        key = repr((overload_threshold, starve_window, starve_ratio, options, list(router_sizes.items()),
+                    list(router_top_k.items()), grad_key))
+        kept = self.records
+        why = None
+        if self.key is None:
+            why = "first look"
+        elif key != self.key:
+            why = "thresholds or a whole-run fact changed"
+        elif len(records) < len(kept) or not all(map(_same_record, kept, records)):
+            why = "records judged before changed"
+        elif not all(type(r["step"]) is int for r in records):
+            why = "a step that is not a whole number"
+        if why is None:
+            new = records[len(kept):]
+            self.path = ("incremental", len(new))
+        else:
+            self._start(key, router_sizes, router_top_k, overload_threshold, starve_window, starve_ratio, grad_key)
+            new = records
+            self.path = ("full", why)
+        self.records = list(records)
+        made = self.moe.feed(new)
+        self.starved.feed(made)
+        self.starved_firsts.feed(made)
+        self.starts.feed(made)
+        self.grad.feed(new)
+        self.activation.feed(new)
+        self.non_finite.feed(new)
+        self.handed = list(self.moe.samples)
+        return {
+            "samples": self.handed,
+            "moe_hit": self.starts.first(),
+            "starting": self.starts.starting(),
+            "starved_hit": self.starved_firsts.result(),
+            "grad_hit": self.grad.result(),
+            "activation": self.activation.result(),
+            "non_finite_hit": self.non_finite.result(),
+        }
+
+    def samples_text(self, evidence: Mapping[str, Any]) -> str | None:
+        """The JSON text of `evidence["samples"]` as `write_evidence` writes it, when that is the list
+        the last `judge` gave and none of it was replaced; each sample's text is made once. None
+        otherwise, and the writer makes it all."""
+        samples = evidence.get("samples")
+        if samples is None or samples is not self.handed or len(self.texts) > len(samples):
+            return None
+        for sample in samples[len(self.texts):]:
+            self.texts.append(_json_text(sample))
+        return "[" + ",".join(self.texts) + "]"
 
 
 def build_evidence(
@@ -6596,6 +6979,38 @@ def build_evidence(
     (the name a server's report gives them), and `thresholds_line` names those that differ. At
     the defaults there is no such key, so that evidence is what it was before the key.
     """
+    return _build_evidence(
+        source, None, rank=rank, overload_threshold=overload_threshold, drift_tolerance=drift_tolerance,
+        starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k, watchdog=watchdog,
+        flight_recorder=flight_recorder, flight_recorder_prefix=flight_recorder_prefix, traincheck=traincheck,
+        detectors=detectors, server_binary=server_binary, run_manifest=run_manifest, update_window=update_window,
+        records_file=records_file, attempt_order=attempt_order,
+    )
+
+
+def _build_evidence(
+    source: str | Path | Iterable[Mapping[str, Any]],
+    memo: "_Incremental | None",
+    *,
+    rank: int | None = None,
+    overload_threshold: float = OVERLOAD_THRESHOLD,
+    drift_tolerance: float = DRIFT_TOLERANCE,
+    starve_window: int = STARVE_WINDOW,
+    starve_ratio: float = STARVE_RATIO,
+    top_k: int | Mapping[str, int] | None = None,
+    watchdog: str | Path | Mapping[str, Any] | None = None,
+    flight_recorder: str | Path | None = None,
+    flight_recorder_prefix: str | None = None,
+    traincheck: str | Path | None = None,
+    detectors: str = "python",
+    server_binary: str | os.PathLike[str] | None = None,
+    run_manifest: str | Path | Mapping[str, Any] | None = None,
+    update_window: int = UPDATE_WINDOW,
+    records_file: str | Path | None = None,
+    attempt_order: Mapping[tuple[str, Any], list[Any]] | None = None,
+) -> dict[str, Any]:
+    """`build_evidence`, with the states of the detectors that read every record kept in `memo` when
+    one is given (`watch`), and else in a state made for this read (lane AD11)."""
     detectors = _detectors_option(detectors, server_binary)  # "auto" becomes one of the two here
     # Both detectors judge by one contract, the Rust one's: refused here before anything is read.
     check_thresholds(overload_threshold=overload_threshold, drift_tolerance=drift_tolerance,
@@ -6694,10 +7109,15 @@ def build_evidence(
                 rank_checks[kind] = _unavailable(grads_unread, **{key: held[key] for key in (
                     "records", "records_needed", "enough_history", "needs") if key in held})
     else:
-        samples = _moe_samples(records, router_sizes, router_top_k, overload_threshold)
-        _mark_starved(samples, starve_window, starve_ratio)
+        # The detectors that read every record are kept in states (`_Incremental`): `watch` keeps one
+        # between looks and feeds it each look's new records; a single read starts one here.
+        judged = (memo if memo is not None else _Incremental()).judge(
+            records, router_sizes=router_sizes, router_top_k=router_top_k, overload_threshold=overload_threshold,
+            starve_window=starve_window, starve_ratio=starve_ratio,
+            options=(drift_tolerance, _top_k_option(top_k), update_window))
+        samples = judged["samples"]
         incidents = []
-        moe_hit = first_incident({"samples": samples})
+        moe_hit = judged["moe_hit"]
         if moe_hit is not None:
             incidents.append(
                 {
@@ -6713,12 +7133,12 @@ def build_evidence(
                     **{key: moe_hit[key] for key in ("since_start", "reportable_step") if key in moe_hit},
                 }
             )
-        starved_hit = detect_starved_experts(samples)
+        starved_hit = judged["starved_hit"]
         if starved_hit is not None:
             incidents.append(starved_hit)
         for detector in (
-            detect_grad_spikes, lambda found: detect_update_spikes(found, window=update_window), detect_stalled_weights,
-            detect_repeated_steps, detect_loss_scale_trouble,
+            lambda found: judged["grad_hit"], lambda found: detect_update_spikes(found, window=update_window),
+            detect_stalled_weights, detect_repeated_steps, detect_loss_scale_trouble,
         ):
             # Only this detector looks at what a later attempt replaced.
             detector_records = every_attempt if detector is detect_repeated_steps else records
@@ -6735,9 +7155,9 @@ def build_evidence(
             data_hit = data_detector(records)
             if data_hit is not None:
                 incidents.append(data_hit)
-        incidents.extend(detect_activation_anomalies(records))
+        incidents.extend(judged["activation"])
         incidents.extend(detect_attention_anomalies(records, not_checked=not_checked))
-        non_finite_hit = detect_non_finite(records)
+        non_finite_hit = judged["non_finite_hit"]
         if non_finite_hit is not None:
             incidents.append(non_finite_hit)
         incidents.extend(detect_system_incidents(records, not_checked))
@@ -6755,7 +7175,7 @@ def build_evidence(
             not_checked.append(layers_unread)
         rank_checks = kind_checks(
             input_counts(records), not_checked, starve_window=starve_window, update_window=update_window)
-        name_starting_state(rank_checks, samples)
+        _name_starting_state(rank_checks, judged["starting"])
     name_gradients_not_judged(rank_checks, not_checked)
     name_modules_not_judged(rank_checks, not_checked)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
@@ -6973,8 +7393,12 @@ def name_starting_state(checks: dict[str, dict[str, Any]], samples: Iterable[Map
     short capture of a router flagged since step 0 reads as checked without enough history, not
     as checked and clean (rules contract, part 3). Not on an entry that is `unavailable`, as
     `parameters_not_judged` is not."""
+    _name_starting_state(checks, moe_starting_state(samples))
+
+
+def _name_starting_state(checks: dict[str, dict[str, Any]], starting: list[dict[str, Any]]) -> None:
+    """`name_starting_state` with the routers still in their starting state already found."""
     check = checks.get("moe_imbalance")
-    starting = moe_starting_state(samples)
     if starting and isinstance(check, dict) and check.get("value") != "unavailable":
         check["starting_state"] = starting
         check["enough_history"] = False
@@ -6988,6 +7412,59 @@ def moe_starting_state(samples: Iterable[Mapping[str, Any]]) -> list[dict[str, A
     return [{"router": seq[0].get("router", f"layer-{seq[0]['layer']:02}"), "samples": len(seq)}
             for seq in _routed_by_router(samples)
             if _leading_start(seq) == len(seq) < MOE_START_GRACE]
+
+
+class _RouterStarts:
+    """`first_incident` and `moe_starting_state` of a run's samples, fed in step order (lane AD11): for
+    each router, its first routed sample, how many it has had, the leading run of flagged samples
+    while its first is at step 0 (`_leading_start`), the MOE_START_GRACE-th of them, and the first
+    flagged sample after that run. `first` and `starting` give what the two functions give on every
+    sample fed so far; `build_evidence` reads them here, and the two functions stay for any evidence."""
+
+    def __init__(self) -> None:
+        # layer -> [first sample, routed samples, leading run, still leading, grace sample, later flagged]
+        self.routers: dict[Any, list[Any]] = {}
+
+    def feed(self, samples: Iterable[Mapping[str, Any]]) -> None:
+        routers = self.routers
+        for sample in samples:
+            if not (isinstance(sample, Mapping) and not sample.get("missing") and sample.get("routed_tokens", 0) > 0):
+                continue
+            state = routers.get(sample.get("layer"))
+            if state is None:
+                state = routers[sample.get("layer")] = [sample, 0, 0, sample["step"] == 0, None, None]
+            state[1] += 1
+            flagged = _flagged_sample(sample)
+            if state[3]:
+                if flagged:
+                    state[2] += 1
+                    if state[2] == MOE_START_GRACE:
+                        state[4] = sample
+                    continue
+                state[3] = False
+            if flagged and state[5] is None:
+                state[5] = sample
+
+    def _in_order(self) -> list[list[Any]]:
+        """The routers in their layer's order, as `_routed_by_router` gives them."""
+        return [state for _, state in sorted(
+            self.routers.items(), key=lambda item: (0, item[0], "") if isinstance(item[0], int) else (1, 0, repr(item[0])))]
+
+    def first(self) -> dict[str, Any] | None:
+        found: list[tuple[int, Any, dict[str, Any]]] = []
+        for first, _, leading, _, grace, later in self._in_order():
+            if leading >= MOE_START_GRACE:
+                reportable = int(grace["step"])
+                found.append((reportable, first["layer"], {**first, "since_start": True, "reportable_step": reportable}))
+            elif later is not None:
+                found.append((int(later["step"]), later["layer"], dict(later)))
+        if not found:
+            return None
+        return copy.deepcopy(min(found, key=lambda item: (item[0], item[1]))[2])
+
+    def starting(self) -> list[dict[str, Any]]:
+        return [{"router": first.get("router", f"layer-{first['layer']:02}"), "samples": count}
+                for first, count, leading, _, _, _ in self._in_order() if leading == count < MOE_START_GRACE]
 
 
 def _missing_sample(step: int, layer: int, expert_count: int) -> dict[str, Any]:
@@ -7016,22 +7493,57 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
     from .compact import require_table
 
     compared_here = require_table(evidence, step, layer)
+    lookup = _TABLE_LOOKUP.get()
+    if lookup is None or lookup.evidence is not evidence:
+        lookup = _SampleLookup(evidence)  # for this table alone
+    return _expert_load_text(evidence, lookup.samples, step, layer, lookup.previous(step, layer), compared_here)
+
+
+class _SampleLookup:
+    """The samples of one evidence by `(step, layer)` (the last of a key wins), and each layer's steps
+    in order, all of them and those on which the router routed tokens: what `expert_load_table`
+    reads. `export_rerun` makes one for the whole recording and puts it in `_TABLE_LOOKUP` while it
+    tables every step (lane AD11: each table made it again, so the export was quadratic in the steps)."""
+
+    def __init__(self, evidence: Mapping[str, Any]) -> None:
+        self.evidence = evidence
+        self.samples = {(int(s["step"]), int(s["layer"])): s for s in evidence.get("samples", ())}
+        steps: dict[Any, list[int]] = {}
+        for step, layer in self.samples:
+            steps.setdefault(layer, []).append(step)
+        self.steps = {layer: sorted(found) for layer, found in steps.items()}
+        self.routed = {
+            layer: [s for s in found if not self.samples[s, layer].get("missing")
+                    and self.samples[s, layer].get("routed_tokens", 0) > 0]
+            for layer, found in self.steps.items()
+        }
+
+    def previous(self, step: int, layer: int) -> int | None:
+        """The step `step` is compared with: the last earlier one of the layer on which the router routed
+        tokens, else the last earlier one, else None (the layer's first step: nothing to compare it with)."""
+        for found in (self.routed.get(layer, ()), self.steps.get(layer, ())):
+            index = bisect.bisect_left(found, step)
+            if index:
+                return found[index - 1]
+        return None
+
+
+# The lookup `export_rerun` made for the evidence it is recording, while it tables its steps.
+_TABLE_LOOKUP: contextvars.ContextVar[_SampleLookup | None] = contextvars.ContextVar("tensorquill_table_lookup", default=None)
+
+
+def _expert_load_text(
+    evidence: Mapping[str, Any],
+    samples: Mapping[tuple[int, int], Mapping[str, Any]],
+    step: int,
+    layer: int,
+    previous: int | None,
+    compared_here: bool,
+) -> str:
+    """`expert_load_table`'s text, from the samples by `(step, layer)` and the step it is compared
+    with (`previous`, None at the layer's first step), as `_SampleLookup` finds them."""
     expert_count = int(evidence.get("expert_count", 0))
-    samples = {(int(s["step"]), int(s["layer"])): s for s in evidence.get("samples", ())}
     sample = samples.get((step, layer)) or _missing_sample(step, layer, expert_count)
-    prior_steps = [s for s, l in samples if l == layer and s < step]
-    active_priors = [
-        s
-        for s in prior_steps
-        if not samples[s, layer].get("missing") and samples[s, layer].get("routed_tokens", 0) > 0
-    ]
-    previous: int | None
-    if active_priors:
-        previous = max(active_priors)
-    elif prior_steps:
-        previous = max(prior_steps)
-    else:
-        previous = None  # the layer's first step: nothing earlier to compare it with
     if not compared_here:
         previous = None  # left out of a compact file: never an earlier window's step instead
     baseline = samples.get((previous, layer)) if previous is not None else None
@@ -7947,15 +8459,20 @@ def export_rerun(
                 )
             )
             # Every step, the first among them: a one-step recording has its table too (DET-14).
-            for step in steps:
-                rr.set_time("training_step", sequence=step)
-                rr.log(
-                    "/incident/expert_load",
-                    rr.TextDocument(
-                        expert_load_table(evidence, step, incident_layer),
-                        media_type=rr.MediaType.MARKDOWN,
-                    ),
-                )
+            # The tables read one lookup of the samples, made here (lane AD11).
+            looked_up = _TABLE_LOOKUP.set(_SampleLookup(evidence))
+            try:
+                for step in steps:
+                    rr.set_time("training_step", sequence=step)
+                    rr.log(
+                        "/incident/expert_load",
+                        rr.TextDocument(
+                            expert_load_table(evidence, step, incident_layer),
+                            media_type=rr.MediaType.MARKDOWN,
+                        ),
+                    )
+            finally:
+                _TABLE_LOOKUP.reset(looked_up)
             for layer in range(1, layer_count + 1):
                 rr.log(
                     f"/routing/layers/layer-{layer:02}",
