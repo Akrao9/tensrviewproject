@@ -353,3 +353,194 @@ def test_sink_the_next_write_after_one_that_failed_partway_is_read(tmp_path, pad
     expected = [0, 1, 2, 3, 4] if pad < 8192 else [0, 1, 3, 4]  # only the failed write's step can be lost
     assert found["read"] == expected and found["sent"] == expected
     assert found["left_out"] == found["skipped"] == (0 if pad < 8192 else 1)
+
+
+# --- Items 4 and 5: an in-process stand-in for the server, whose ending a test chooses -------
+
+def _flight():
+    return pytest.importorskip("pyarrow.flight")
+
+
+def _record(step, **more):
+    return {"schema_version": 1, "run_id": "run-a", "rank": 0, "attempt": 1, "step": step, "ts": 1.0 + step,
+            "grad_norm": 0.5, "lr": [0.01], **more}
+
+
+def _append(path: Path, records) -> None:
+    import json
+
+    with path.open("a", encoding="utf-8") as file:
+        for item in records:
+            file.write(json.dumps(item, separators=(",", ":")) + "\n")
+
+
+def _wait(condition, timeout: float = 15.0) -> None:
+    import time
+
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out waiting")
+        time.sleep(0.02)
+
+
+@pytest.fixture
+def stand_in():
+    import json
+
+    flight = _flight()
+    pa = pytest.importorskip("pyarrow")
+
+    class StandIn(flight.FlightServerBase):
+        """Keeps every row and acks every batch, unless `ending` says how to end a stream after its
+        first batch: "unavailable" raises UNAVAILABLE, "return" ends it with OK."""
+
+        def __init__(self) -> None:
+            super().__init__("grpc://127.0.0.1:0")
+            self.rows: list[dict] = []
+            self.ending: str | None = None
+            self.headers: list = []
+
+        def do_put(self, context, descriptor, reader, writer):
+            batches = 0
+            while True:
+                try:
+                    chunk = reader.read_chunk()
+                except StopIteration:
+                    return
+                metadata = json.loads(chunk.app_metadata.to_pybytes())
+                if chunk.data is not None and chunk.data.num_rows:
+                    batches += 1
+                    if batches >= 2 and self.ending == "unavailable":
+                        raise flight.FlightUnavailableError("going away")
+                    if batches >= 2 and self.ending == "return":
+                        return
+                    self.rows.extend(chunk.data.to_pylist())
+                writer.write(pa.py_buffer(json.dumps({"end_byte_offset": metadata["end_byte_offset"]}).encode()))
+
+    server = StandIn()
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    server.endpoint = f"grpc://127.0.0.1:{server.port}"
+    yield server
+    server.shutdown()
+
+
+def _sender(path, endpoint, **options):
+    from tensorquill.flight import FlightSender
+
+    options = {"batch_seconds": 0.02, "poll_seconds": 0.02, "backoff_base": 0.02, "backoff_cap": 0.1, **options}
+    return FlightSender(path, endpoint, "run-a", 0, **options)
+
+
+# --- Item 4: a field the typed Arrow schema cannot encode ------------------------------------
+
+_UNENCODABLE = {
+    "an integer too large for a float": {"grad_norm": 10**400},
+    "a logged scalar too large for a float": {"scalars": {"loss": 10**400, "acc": 0.5}},
+    "a top-k past int32": {"moe_top_k": {"router": 2**40}},
+    "an expert count past int64": {"moe": {"router": [1, 2**70]}},
+    "a parameter name with a lone surrogate": {"grad_norms": {"w\ud800": 1.0, "b": 2.0}},
+    "a frozen name with a lone surrogate": {"weights_unchanged": ["w\ud800"]},
+    "a data wait too large for a float": {"data_wait": 10**400},
+}
+
+
+@pytest.mark.parametrize("fields", list(_UNENCODABLE.values()), ids=list(_UNENCODABLE))
+def test_unencodable_field_the_step_is_sent_with_that_field_in_extra_json(fields):
+    """Before, `rows_to_send` left the whole step out (counted as skipped) for each of these; the
+    stream went on. Now the rest of the row is sent, the value travels in `extra_json`, and reads
+    back as written."""
+    pytest.importorskip("pyarrow")
+    from tensorquill.flight import flight_schema, row_to_record, rows_to_send
+
+    bad, good = _record(5, **fields), _record(6)
+    moved: list = []
+    batch, steps, skipped = rows_to_send([bad, good], flight_schema(), moved)
+    assert steps == [5, 6] and skipped == 0
+    assert moved == [(5, key) for key in fields]
+    back = {row["step"]: row_to_record(row) for row in batch.to_pylist()}
+    for key, value in fields.items():
+        assert back[5][key] == value
+    assert back[5]["ts"] == 6.0 and back[5]["lr"] == [0.01] and back[6] == row_to_record(
+        rows_to_send([good], flight_schema())[0].to_pylist()[0])
+
+
+def test_unencodable_key_column_still_skips_the_line():
+    """A key column cannot travel in `extra_json`: such a line is skipped and counted, as before."""
+    pytest.importorskip("pyarrow")
+    from tensorquill.flight import flight_schema, rows_to_send
+
+    moved: list = []
+    batch, steps, skipped = rows_to_send([_record(5, rank=2**40), _record(6), _record(7, grad_norm=10**400)],
+                                         flight_schema(), moved)
+    assert steps == [6, 7] and skipped == 1 and moved == [(7, "grad_norm")]
+
+
+def test_unencodable_field_through_the_sender_every_step_reaches_the_server_and_it_is_said_once(
+        tmp_path, stand_in, capsys):
+    path = tmp_path / "run-a.rank0.jsonl"
+    _append(path, [_record(0), _record(1, grad_norm=10**400), _record(2, moe_top_k={"r": 2**40}), _record(3)])
+    sender = _sender(path, stand_in.endpoint)
+    assert sender.close(timeout=20) is True
+    assert sorted(row["step"] for row in stand_in.rows) == [0, 1, 2, 3]  # before: 0 and 3
+    assert sender.moved_fields == 2 and sender.skipped_lines == 0
+    said = [line for line in capsys.readouterr().err.splitlines() if "extra_json" in line]
+    assert len(said) == 1 and "step 1's 'grad_norm'" in said[0]
+
+
+# --- Item 5: what the sender keeps when a stream ends without it having closed it ------------
+
+def test_stream_end_a_server_that_ends_the_stream_with_unavailable_is_explained(tmp_path, stand_in):
+    import json
+
+    stand_in.ending = "unavailable"
+    path = tmp_path / "run-a.rank0.jsonl"
+    _append(path, [_record(0)])
+    sender = _sender(path, stand_in.endpoint, token="SECRET-TOKEN-123", batch_steps=1)
+    try:
+        _wait(lambda: sender.acked_offset > 0)
+        first_ack = sender.acked_offset
+        _append(path, [_record(1), _record(2)])
+        _wait(lambda: sender.last_stream_end is not None)
+        end = dict(sender.last_stream_end)
+        assert end["grpc_status"] == "UNAVAILABLE" and end["grpc_code"] == 14
+        assert "going away" in end["details"] and end["error"] == "FlightUnavailableError"
+        assert end["stream_opened"] and end["seconds_open"] >= 0
+        assert end["batches_sent"] >= 1 and end["bytes_sent"] >= first_ack and end["arrow_bytes_sent"] > 0
+        assert end["acks"] >= 1 and end["last_acked_offset"] == first_ack and end["start_offset"] == 0
+        assert end["sender_closing"] is False
+        assert "SECRET" not in json.dumps(end) and "authorization" not in json.dumps(end).lower()
+        # The server takes the rest again: progress clears `last_error`, and the explanation stays.
+        stand_in.ending = None
+        _wait(lambda: sender.acked_offset == path.stat().st_size)
+        _wait(lambda: sender.last_error is None)
+        assert sender.last_stream_end["grpc_status"] == "UNAVAILABLE"
+    finally:
+        stand_in.ending = None
+        assert sender.close(timeout=20) is True
+
+
+def test_stream_end_a_server_that_ends_the_stream_with_ok_is_kept_too(tmp_path, stand_in):
+    stand_in.ending = "return"
+    path = tmp_path / "run-a.rank0.jsonl"
+    _append(path, [_record(0)])
+    sender = _sender(path, stand_in.endpoint, batch_steps=1)
+    try:
+        _wait(lambda: sender.acked_offset > 0)
+        _append(path, [_record(1)])
+        _wait(lambda: sender.last_stream_end is not None)
+        end = sender.last_stream_end
+        assert end["grpc_status"] is None and end["grpc_code"] is None and end["error"] == "ConnectionError"
+        assert "ended the stream" in end["details"] and end["batches_sent"] >= 2
+    finally:
+        stand_in.ending = None
+        assert sender.close(timeout=20) is True
+
+
+def test_stream_end_a_stream_the_sender_closed_keeps_nothing(tmp_path, stand_in):
+    path = tmp_path / "run-a.rank0.jsonl"
+    _append(path, [_record(step) for step in range(5)])
+    sender = _sender(path, stand_in.endpoint)
+    assert sender.close(timeout=20) is True
+    assert sender.last_stream_end is None and sender.last_error is None

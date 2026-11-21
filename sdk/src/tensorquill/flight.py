@@ -197,8 +197,16 @@ def flight_schema() -> Any:
     )
 
 
-def record_to_row(record: Mapping[str, Any]) -> dict[str, Any]:
-    """One JSONL step record as a row of `flight_schema()`."""
+def record_to_row(
+    record: Mapping[str, Any], schema: Any = None, moved: list[str] | None = None,
+) -> dict[str, Any]:
+    """One JSONL step record as a row of `flight_schema()`.
+
+    A value that does not fit its column's type travels in `extra_json`, as always. So does one the
+    column's converter or Arrow cannot hold (lane AD4): an integer too large for a float
+    (`float(10**400)` raises `OverflowError`), past int32 or int64, or a string with a lone
+    surrogate; Arrow's check runs only when `schema` is given, which `rows_to_send` does for a row
+    Arrow refused. Before, any of these cost the whole step. Each such key is added to `moved`."""
     row: dict[str, Any] = dict.fromkeys(_COLUMNS)
     extra: dict[str, Any] = {}
     for key, value in record.items():
@@ -213,9 +221,21 @@ def record_to_row(record: Mapping[str, Any]) -> dict[str, Any]:
             # out of the row, and the rest of the map stays in its column for the Rust detectors.
             value = {k: v for k, v in value.items() if not isinstance(v, bool)}
         try:
-            row[spec[0]] = spec[1](value)
+            converted = spec[1](value)
         except (TypeError, ValueError):
             extra[key] = value
+            continue
+        except Exception:  # noqa: BLE001  OverflowError and the like: the value's, not the step's
+            extra[key] = value
+            if moved is not None:
+                moved.append(key)
+            continue
+        if schema is not None and not _fits(converted, schema.field(spec[0]).type):
+            extra[key] = value
+            if moved is not None:
+                moved.append(key)
+            continue
+        row[spec[0]] = converted
     row["schema_version"] = _int(record.get("schema_version", 0))
     row["run_id"] = _str(record["run_id"])
     row["rank"] = _int(record.get("rank", 0))
@@ -224,6 +244,17 @@ def record_to_row(record: Mapping[str, Any]) -> dict[str, Any]:
     if extra:
         row["extra_json"] = _json(extra)
     return row
+
+
+def _fits(value: Any, arrow_type: Any) -> bool:
+    """Whether Arrow can hold `value` in a column of `arrow_type`."""
+    import pyarrow as pa
+
+    try:
+        pa.array([value], type=arrow_type)
+    except Exception:  # noqa: BLE001  out of range, a lone surrogate, any refusal
+        return False
+    return True
 
 
 def records_to_batch(records: Iterable[Mapping[str, Any]]) -> Any:
@@ -435,34 +466,63 @@ def parse_lines(lines: Iterable[bytes], run_id: str) -> tuple[list[dict[str, Any
     return records, skipped
 
 
-def rows_to_send(records: Iterable[Mapping[str, Any]], schema: Any) -> tuple[Any, list[int], int]:
+def rows_to_send(
+    records: Iterable[Mapping[str, Any]], schema: Any, moved: list[tuple[int, str]] | None = None,
+) -> tuple[Any, list[int], int]:
     """`records` as one record batch of `schema`, the steps it holds, and how many records were
-    left out because a value cannot be stored: a null or a string where a key column needs an
-    integer (`"attempt": null`), an integer too large for its column. Such a line is skipped and
-    counted like a line that is not JSON; were it kept, every retry would start again at it and
-    the sender would never get past it. (A NaN inside a nested object is sent as "nan", L20.)"""
+    left out because a key column's value cannot be stored: a null or a string where a key column
+    needs an integer (`"attempt": null`), an integer too large for its column. Such a line is
+    skipped and counted like a line that is not JSON; were it kept, every retry would start again
+    at it and the sender would never get past it. (A NaN inside a nested object is sent as "nan",
+    L20.)
+
+    Any other field whose value cannot be stored in its column goes in `extra_json` with the rest
+    of the row sent (lane AD4; before, the whole step was left out), and `(step, key)` is added to
+    `moved`: the server reads such a value as absent from its column, and the sender says so."""
     import pyarrow as pa
 
-    rows: list[dict[str, Any]] = []
+    def strict(record: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]] | None:
+        """The row with every field Arrow refuses moved to `extra_json`, and those fields' keys;
+        None if a key column is refused."""
+        keys: list[str] = []
+        try:
+            row = record_to_row(record, schema, keys)
+            pa.RecordBatch.from_pylist([row], schema=schema)
+        except Exception:  # noqa: BLE001  a key column the schema cannot hold: the line is skipped
+            return None
+        return row, keys
+
+    kept: list[tuple[Mapping[str, Any], dict[str, Any], list[str]]] = []
     skipped = 0
     for record in records:
+        keys: list[str] = []
         try:
-            rows.append(record_to_row(record))
+            kept.append((record, record_to_row(record, None, keys), keys))
         except Exception:  # noqa: BLE001  any value that cannot be converted is the line's, not the stream's
-            skipped += 1
+            found = strict(record)
+            if found is None:
+                skipped += 1
+            else:
+                kept.append((record, *found))
     try:
-        batch = pa.RecordBatch.from_pylist(rows, schema=schema)
+        batch = pa.RecordBatch.from_pylist([row for _, row, _ in kept], schema=schema)
     except Exception:  # noqa: BLE001  find the rows Arrow refuses, one at a time
-        kept = []
-        for row in rows:
+        alone = []
+        for record, row, keys in kept:
             try:
                 pa.RecordBatch.from_pylist([row], schema=schema)
             except Exception:  # noqa: BLE001
-                skipped += 1
-                continue
-            kept.append(row)
-        rows = kept
-        batch = pa.RecordBatch.from_pylist(rows, schema=schema)
+                found = strict(record)
+                if found is None:
+                    skipped += 1
+                    continue
+                row, keys = found
+            alone.append((record, row, keys))
+        kept = alone
+        batch = pa.RecordBatch.from_pylist([row for _, row, _ in kept], schema=schema)
+    rows = [row for _, row, _ in kept]
+    if moved is not None:
+        moved.extend((row["step"], key) for _, row, keys in kept for key in keys)
     return batch, [row["step"] for row in rows], skipped
 
 
@@ -542,6 +602,16 @@ class FlightSender:
             _say(f"tensorquill: {left_out}. The local file has all of it; the run streams as usual.", stacklevel=4)
         self.last_error: BaseException | None = None
         self.skipped_lines = 0
+        # Fields sent in `extra_json` because their column cannot hold the value (`rows_to_send`):
+        # the step is sent and the server reads that value as absent. Said once per sender.
+        self.moved_fields = 0
+        self._said_moved = False
+        # What explains the last stream that ended without this sender having closed it (lane AD4;
+        # the plan's unexplained endings, "h2 protocol error", 3 of 22 synthetic runs): set beside
+        # `last_error` when a stream fails before `done_writing`, and kept after later progress,
+        # which clears `last_error`. See `_note_stream_end`. Holds no token and no header.
+        self.last_stream_end: dict[str, Any] | None = None
+        self._life: dict[str, Any] | None = None  # the stream now open: when, and what it carried
         self._location = _location(endpoint)
         self._token = token if token is not None else os.environ.get(TOKEN_ENV)
         self._tls_root_certs = (
@@ -664,6 +734,7 @@ class FlightSender:
                 return
             except BaseException as error:  # noqa: BLE001  the stream must never raise into training
                 self.last_error = _without_traceback(error)
+                self._note_stream_end(error)
             if self._progress:
                 self._progress = False
                 ceiling = self._backoff_base
@@ -773,6 +844,74 @@ class FlightSender:
                 file=sys.stderr,
             )
 
+    def _note_stream_end(self, error: BaseException) -> None:
+        """Keep what would explain a stream that ended before this sender said it was done writing,
+        as `last_stream_end`: the error and the gRPC status it names (code and name, from the text
+        pyarrow gives, "gRPC client debug context: UNAVAILABLE:..."), its details, what the ack
+        reader and `writer.close()` raised (one can hide the other), how long the stream had been
+        open, the file bytes, batches and Arrow bytes it sent, the acks it got and the last offset
+        acknowledged. Not for a file that cannot be read (that is not the stream's ending) or a
+        stream the sender closed. The token is cut out of every text kept; no header is kept.
+        Never raises, and changes nothing the sender does."""
+        try:
+            life = self._life
+            self._life = None
+            if isinstance(error, LocalFileUnreadable) or (life is not None and life.get("done_writing")):
+                return
+            text = self._scrub(f"{error}")
+            name = _grpc_status_name(text, error)
+            opened = life.get("opened") if life else None
+            self.last_stream_end = {
+                "at": time.time(),
+                "error": type(error).__name__,
+                "grpc_code": _GRPC_CODES.get(name) if name else None,
+                "grpc_status": name,
+                "details": text[:500],
+                "ack_reader_error": self._brief(life.get("ack_error")) if life else None,
+                "writer_close_error": self._brief(life.get("close_error")) if life else None,
+                "stream_opened": opened is not None,
+                "seconds_open": round(time.monotonic() - opened, 3) if opened is not None else None,
+                "start_offset": life.get("start", 0) if life else 0,
+                "bytes_sent": (life.get("sent", 0) - life.get("start", 0)) if life else 0,
+                "batches_sent": life.get("batches", 0) if life else 0,
+                "arrow_bytes_sent": life.get("arrow_bytes", 0) if life else 0,
+                "acks": life.get("acks", 0) if life else 0,
+                "last_acked_offset": self._acked,
+                "sender_closing": self._closing.is_set(),
+            }
+        except Exception:  # noqa: BLE001  explaining a failure must never be one
+            pass
+
+    def _scrub(self, text: str) -> str:
+        """`text` with the token cut out, should a server or library ever echo it."""
+        if self._token:
+            text = text.replace(self._token, "<token>")
+        return text
+
+    def _brief(self, error: BaseException | None) -> str | None:
+        if error is None:
+            return None
+        return self._scrub(f"{type(error).__name__}: {error}")[:300]
+
+    def _say_moved(self, moved: list[tuple[int, str]]) -> None:
+        """Count fields sent in `extra_json` because their column cannot hold the value, and say the
+        first once per sender. Never raises."""
+        self.moved_fields += len(moved)
+        if self._said_moved:
+            return
+        self._said_moved = True
+        step, key = moved[0]
+        try:
+            print(
+                f"tensorquill: step {step}'s {key!r} cannot be held by its column in the stream to {self.endpoint} "
+                f"(a number out of range, or text Arrow cannot encode), so it is sent in extra_json with the rest of "
+                f"the step, and the server reads it as absent. {self.path} has it as written. Said once; "
+                "sender.moved_fields counts them.",
+                file=sys.stderr,
+            )
+        except Exception:  # noqa: BLE001  a closed stderr is not the stream's failure
+            pass
+
     def _sent(self, data: bytes, end: int) -> None:
         """Move the identity windows past `data`, the bytes just sent, which end at `end`."""
         if len(self._head) < HEAD_BYTES:
@@ -818,6 +957,8 @@ class FlightSender:
         import pyarrow as pa
         import pyarrow.flight as flight
 
+        life: dict[str, Any] = {"opened": None, "start": 0, "sent": 0, "batches": 0, "arrow_bytes": 0, "acks": 0}
+        self._life = life  # read by `_note_stream_end` if this stream fails
         saved = self._resume()  # 0 when the file is not the one the offset was saved for
         # A saved offset is used once the server has named its store, in answer to an empty first
         # batch (L3): until then nothing past byte 0 is sent and nothing is counted as confirmed.
@@ -836,6 +977,7 @@ class FlightSender:
         try:
             descriptor = flight.FlightDescriptor.for_path("runs", self.run_id, f"rank={self.rank}")
             writer, reader = client.do_put(descriptor, schema, flight.FlightCallOptions(headers=headers))
+            life["opened"] = time.monotonic()
             failure: list[BaseException] = []
             ended = threading.Event()
             answered = threading.Event()  # the first ack has come: it names the store, or none
@@ -849,6 +991,7 @@ class FlightSender:
                         buffer = reader.read()
                         if buffer is None:
                             return
+                        life["acks"] += 1
                         document = json.loads(buffer.to_pybytes())
                         offset, store_id = int(document["end_byte_offset"]), _store_of(document)
                         if probing and not answered.is_set():
@@ -860,6 +1003,7 @@ class FlightSender:
                         self._ack(offset, store_id)
                 except BaseException as error:  # noqa: BLE001
                     failure.append(error)
+                    life["ack_error"] = error
                 finally:
                     ended.set()
 
@@ -908,6 +1052,7 @@ class FlightSender:
                         reason = self._bound(named[0])
                         if reason is None:
                             self._acked = sent = saved
+                            life["start"] = life["sent"] = saved
                         else:
                             self._replay(reason)
                         chose.append(True)
@@ -924,33 +1069,76 @@ class FlightSender:
                     full = len(lines) >= self._batch_steps or end - sent >= self._batch_bytes
                     if lines and (full or closing or now - waiting_since >= self._batch_seconds):
                         records, skipped = parse_lines(lines, self.run_id)
-                        batch, steps, unstorable = rows_to_send(records, schema)
+                        moved: list[tuple[int, str]] = []
+                        batch, steps, unstorable = rows_to_send(records, schema, moved)
                         self.skipped_lines += skipped + unstorable
+                        if moved:
+                            self._say_moved(moved)
                         metadata = metadata_for(end, steps)
                         self._sent(b"".join(line + b"\n" for line in lines), end)
                         writer.write_with_metadata(batch, pa.py_buffer(metadata))
-                        sent = end
+                        sent = life["sent"] = end
+                        life["batches"] += 1
+                        life["arrow_bytes"] += batch.nbytes
                         waiting_since = None
                         continue
                     if closing and not lines:
                         break
                     ended.wait(self._poll_seconds) if closing else self._closing.wait(self._poll_seconds)
                 if not ended.is_set():
+                    life["done_writing"] = True  # from here an ending is the sender's own close
                     writer.done_writing()  # the server stores what it holds and sends the last ack
                     ended.wait(max(0.0, self._deadline - time.monotonic()))
             except BaseException:
                 try:
                     writer.close()
-                except BaseException:  # noqa: BLE001  the first failure is the one to report
-                    pass
+                except BaseException as error:  # noqa: BLE001  the first failure is the one to report
+                    life["close_error"] = error
                 raise
-            writer.close()
+            try:
+                writer.close()
+            except BaseException as error:
+                life["close_error"] = error
+                raise
             if failure:
                 raise failure[0]
             if self._acked < sent or not self._closing.is_set():
                 raise ConnectionError("the server ended the stream before confirming every batch")
         finally:
             client.close()
+
+
+# gRPC's status codes by name (`grpc/status.h`), for the name pyarrow puts in an error's text.
+_GRPC_CODES = {
+    "OK": 0, "CANCELLED": 1, "UNKNOWN": 2, "INVALID_ARGUMENT": 3, "DEADLINE_EXCEEDED": 4, "NOT_FOUND": 5,
+    "ALREADY_EXISTS": 6, "PERMISSION_DENIED": 7, "RESOURCE_EXHAUSTED": 8, "FAILED_PRECONDITION": 9, "ABORTED": 10,
+    "OUT_OF_RANGE": 11, "UNIMPLEMENTED": 12, "INTERNAL": 13, "UNAVAILABLE": 14, "DATA_LOSS": 15, "UNAUTHENTICATED": 16,
+}
+# pyarrow's Flight errors by the status they stand for, when the text names none.
+_FLIGHT_ERRORS = {
+    "FlightUnavailableError": "UNAVAILABLE", "FlightInternalError": "INTERNAL", "FlightTimedOutError": "DEADLINE_EXCEEDED",
+    "FlightCancelledError": "CANCELLED", "FlightUnauthenticatedError": "UNAUTHENTICATED",
+    "FlightUnauthorizedError": "PERMISSION_DENIED",
+}
+
+
+def _grpc_status_name(text: str, error: BaseException) -> str | None:
+    """The gRPC status an error from pyarrow's Flight client names: from its text ("gRPC client debug
+    context: UNAVAILABLE:..." or "grpc_status:14"), else from its class; None for an error that is not
+    gRPC's (a server that ended the stream with OK, a local error)."""
+    marker = "gRPC client debug context: "
+    at = text.find(marker)
+    if at >= 0:
+        name = text[at + len(marker):].split(":", 1)[0].strip()
+        if name in _GRPC_CODES:
+            return name
+    at = text.find("grpc_status:")
+    if at >= 0:
+        digits = "".join(c for c in text[at + len("grpc_status:"):at + len("grpc_status:") + 3] if c.isdigit())
+        for name, code in _GRPC_CODES.items():
+            if digits and code == int(digits):
+                return name
+    return _FLIGHT_ERRORS.get(type(error).__name__)
 
 
 def _without_traceback(error: BaseException) -> BaseException:
