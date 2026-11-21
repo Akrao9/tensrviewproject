@@ -24,6 +24,30 @@ pub const DUPLICATE_WINDOW: usize = 4096;
 pub const SCHEDULER_SLACK: i64 = 1;
 const CHANGES_LISTED: usize = 5;
 
+/// The keys of a load's `tensors` (`CHECKPOINT_TENSOR_CONTRACT.md`, section 3) that the rank's
+/// `checkpoint_tensors` carries as the record has them, and its five lists, each carried as its
+/// `count` and `names` (section 4). `tied`, `prefix`, `shapes`, `closest` and `candidates` stay
+/// in the record.
+const TENSOR_KEYS: [&str; 8] = [
+    "state",
+    "why",
+    "entry",
+    "by",
+    "model",
+    "trainable",
+    "checkpoint",
+    "matched",
+];
+const TENSOR_LISTS: [&str; 5] = [
+    "missing",
+    "missing_frozen",
+    "missing_buffers",
+    "unexpected",
+    "shape_differs",
+];
+/// The lists that raise, and the finding each gives at a resume (section 4).
+const TENSOR_FINDINGS: [(&str, &str); 2] = [("missing", "missing_tensors"), ("shape_differs", "shape_differs")];
+
 /// Python's `_int`: a JSON integer, and nothing for any other value (a boolean included).
 fn int(value: &Value) -> Option<i64> {
     match value {
@@ -536,11 +560,40 @@ pub(super) fn checkpoint(columns: &Columns, row: usize) -> Option<Value> {
         .filter(Value::is_object)
 }
 
+/// The `tensors` of a resume's load manifest when it is an object: what the SDK recorded of the
+/// checkpoint's tensors against the model's (`CHECKPOINT_TENSOR_CONTRACT.md`, section 3). A
+/// resume judged from a save reads none, even if the save carries one (section 4).
+fn load_tensors(first: &ResumeRow) -> Option<&Map<String, Value>> {
+    first
+        .checkpoint
+        .as_ref()?
+        .get("load")?
+        .as_object()?
+        .get("tensors")?
+        .as_object()
+}
+
+/// One of the lists of `tensors`, read only when its `count` is a positive whole number (as
+/// `_int` reads it): the count, unchanged, and the strings of `names`, anything else dropped.
+fn tensor_list(tensors: &Map<String, Value>, name: &str) -> Option<(i64, Vec<Value>)> {
+    let list = tensors.get(name)?.as_object()?;
+    let count = list.get("count").and_then(int).filter(|count| *count > 0)?;
+    let names = list
+        .get("names")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter(|name| name.is_string()).cloned().collect())
+        .unwrap_or_default();
+    Some((count, names))
+}
+
 /// What the resume checks found: kept with the rank, like `Attempts`.
 #[derive(Default)]
 pub(super) struct ResumeFound {
     data_changes: Vec<(i64, Value)>,
     state_changes: Vec<(i64, Value)>,
+    /// (step, entry) of each judged resume whose load recorded `tensors` with `state`
+    /// `compared` or `unavailable`: the rank's `checkpoint_tensors`.
+    tensors: Vec<(i64, Value)>,
     pub data_context: Wanted,
     pub state_context: Wanted,
     data_not_checked: Vec<Value>,
@@ -589,6 +642,47 @@ impl ResumeFound {
 
     pub(super) fn not_checked(&self) -> impl Iterator<Item = &Value> {
         self.data_not_checked.iter().chain(&self.state_not_checked)
+    }
+
+    /// The rank's `checkpoint_tensors` (`CHECKPOINT_TENSOR_CONTRACT.md`, section 4), present only
+    /// when a judged resume's load recorded `tensors` with `state` `compared` or `unavailable`:
+    /// how many, and the first five by step, as `resume_incomplete` lists its changes.
+    pub(super) fn checkpoint_tensors(&self) -> Option<Value> {
+        if self.tensors.is_empty() {
+            return None;
+        }
+        Some(json!({
+            "resumes": self.tensors.len(),
+            "entries": self.tensors.iter().take(CHANGES_LISTED).map(|(_, entry)| entry).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// A judged resume's entry in `checkpoint_tensors`: its step, rank and attempt, then the keys
+    /// the record has of [`TENSOR_KEYS`], and each list of [`TENSOR_LISTS`] that is read. It
+    /// changes no finding and no kind's value.
+    fn add_tensors(&mut self, step: i64, rank: i32, attempt: i64, tensors: &Map<String, Value>) {
+        if !matches!(
+            tensors.get("state").and_then(Value::as_str),
+            Some("compared" | "unavailable")
+        ) {
+            return;
+        }
+        let mut entry = Map::new();
+        entry.insert("step".into(), json!(step));
+        entry.insert("rank".into(), json!(rank));
+        entry.insert("attempt".into(), json!(attempt));
+        for key in TENSOR_KEYS {
+            if let Some(value) = tensors.get(key) {
+                entry.insert(key.into(), value.clone());
+            }
+        }
+        for name in TENSOR_LISTS {
+            if let Some((count, names)) = tensor_list(tensors, name) {
+                entry.insert(name.into(), json!({"count": count, "names": names}));
+            }
+        }
+        self.tensors.push((step, Value::Object(entry)));
+        self.tensors.sort_by_key(|(step, _)| *step); // stable, as Python's sort
     }
 }
 
@@ -658,6 +752,11 @@ impl ResumePass {
             }
         }
         let (findings, source, saved, checked) = self.state_findings(first, step, run_start);
+        if source == Some("load") {
+            if let Some(tensors) = load_tensors(first) {
+                found.add_tensors(step, rank, attempt, tensors);
+            }
+        }
         if !findings.is_empty() {
             let mut change = json!({
                 "step": step,
@@ -775,9 +874,11 @@ impl ResumePass {
                 if !has(name) {
                     // Which entry is the model's state is found by a rule over names and keys,
                     // which can fail to find one that is there: for the model alone that is
-                    // `not_identified` ("model state could not be identified"). `missing` is kept
-                    // for a comparison that knows what the checkpoint should hold (B14, not built),
-                    // and for the other components (`STEP_AND_EVIDENCE_CONTRACT.md`, section 4).
+                    // `not_identified` ("model state could not be identified"), and `missing` for
+                    // the other components (`STEP_AND_EVIDENCE_CONTRACT.md`, section 4). What the
+                    // checkpoint should hold of the model is B14, built from the load's `tensors`
+                    // below (`CHECKPOINT_TENSOR_CONTRACT.md`, section 4): `not_identified` still
+                    // comes from `components` alone.
                     let finding = if name == "model" { "not_identified" } else { "missing" };
                     findings.push(json!({"component": name, "finding": finding}));
                 }
@@ -818,6 +919,20 @@ impl ResumePass {
                     "scale": scale,
                     "expected_scale": previous,
                 }));
+            }
+        }
+        // B14 (`CHECKPOINT_TENSOR_CONTRACT.md`, section 4): the tensors the SDK compared at the
+        // load, after today's findings. A save's `tensors` is not read, and `why` is not acted on.
+        if source == Some("load") {
+            let compared =
+                load_tensors(first).filter(|tensors| tensors.get("state").and_then(Value::as_str) == Some("compared"));
+            if let Some(tensors) = compared {
+                for (list, finding) in TENSOR_FINDINGS {
+                    if let Some((count, names)) = tensor_list(tensors, list) {
+                        findings
+                            .push(json!({"component": "model", "finding": finding, "count": count, "tensors": names}));
+                    }
+                }
             }
         }
         (findings, source, saved.map(|(after, _)| *after), checked)
