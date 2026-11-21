@@ -165,3 +165,5 @@ So the score is worth recording beside the ratio, and these captures give no lin
 With four experts at top-1 an even share is 25%. One expert takes most of every router's tokens for most of the run, though nanoMoE's balance loss was on at its own weight of 0.01. Today's rule reports step 0 on `h.2`. The proposed rule reports step 5 on `h.3`, the first incident that can be reported; `h.2`, collapsed since step 0, becomes reportable at its tenth sample. Both are right to report. What the run cannot say is whether the rule stays quiet on a healthy router of another shape: for that it would need a run whose routing did not collapse.
 
 **The trend.** The gradient norm's growth is 1.14 over the run.
+
+The spike, diversity, starvation and stall thresholds were read on these inputs in wave AE: [THRESHOLDS.md](THRESHOLDS.md).
