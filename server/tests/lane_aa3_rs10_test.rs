@@ -116,6 +116,12 @@ async fn a_batch_with_a_missing_or_mistyped_key_column_is_refused_and_counted_na
     for _ in 0..2 {
         let mut put = open(&server.address, RUN, 0, no_step.clone()).await;
         put.send(batch.clone(), 200).await;
+        // RS10's transport (DETECTOR_RULES_CONTRACT.md part 8): the refused bytes are named first.
+        let refusal = put.reply().await.expect("the refusal before the status");
+        assert_eq!(
+            refusal["refused"],
+            serde_json::json!({"start_byte_offset": 100, "end_byte_offset": 200, "column": "step"})
+        );
         let refused = put.reply().await.expect_err("refused");
         assert_eq!(refused.code(), Code::InvalidArgument);
         assert!(refused.message().contains("`step`"), "{}", refused.message());
@@ -144,6 +150,11 @@ async fn a_batch_with_a_missing_or_mistyped_key_column_is_refused_and_counted_na
     .unwrap();
     let mut put = open(&server.address, RUN, 0, text_attempt).await;
     put.send(batch, 300).await;
+    let refusal = put.reply().await.expect("the refusal before the status");
+    assert_eq!(
+        refusal["refused"],
+        serde_json::json!({"start_byte_offset": 100, "end_byte_offset": 300, "column": "attempt"})
+    );
     let refused = put.reply().await.expect_err("refused");
     assert_eq!(refused.code(), Code::InvalidArgument);
     assert!(refused.message().contains("`attempt`"), "{}", refused.message());
@@ -188,6 +199,11 @@ async fn the_refusal_count_survives_a_restart() {
         .unwrap();
         let mut put = open(&server.address, RUN, 0, no_rank).await;
         put.send(batch, 200).await;
+        let refusal = put.reply().await.expect("the refusal before the status");
+        assert_eq!(
+            refusal["refused"],
+            serde_json::json!({"start_byte_offset": 100, "end_byte_offset": 200, "column": "rank"})
+        );
         assert_eq!(put.reply().await.expect_err("refused").code(), Code::InvalidArgument);
         server.ingest.write_watchdog().await;
     }
