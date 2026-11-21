@@ -146,12 +146,12 @@ def _resolved(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     without the keyword gets them as they are, and raw rows whose first attempt sits wholly
     above a later one look exactly like those rows, so they are still read unresolved here.
     """
-    from .evidence import _run_of, resolve_attempts
+    from .evidence import resolve_attempts, run_of
 
     ranges: dict[str, dict[Any, list[int]]] = {}
     for row in rows:
         step = int(row["step"])
-        span = ranges.setdefault(_run_of(row), {}).setdefault(row.get("attempt", 0), [step, step])
+        span = ranges.setdefault(run_of(row), {}).setdefault(row.get("attempt", 0), [step, step])
         span[0], span[1] = min(span[0], step), max(span[1], step)
 
     def overlap(spans: Iterable[list[int]]) -> bool:
@@ -161,8 +161,8 @@ def _resolved(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     runs = {run for run, attempts in ranges.items() if overlap(attempts.values())}
     if not runs:
         return rows
-    kept = {id(row) for row in resolve_attempts([row for row in rows if _run_of(row) in runs])}  # type: ignore[arg-type]
-    return [row for row in rows if _run_of(row) not in runs or id(row) in kept]
+    kept = {id(row) for row in resolve_attempts([row for row in rows if run_of(row) in runs])}  # type: ignore[arg-type]
+    return [row for row in rows if run_of(row) not in runs or id(row) in kept]
 
 
 class _Run:

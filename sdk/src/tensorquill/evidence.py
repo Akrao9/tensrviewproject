@@ -3776,6 +3776,9 @@ def _report_evidence(
         # The server's `checkpoint_tensors` block (CHECKPOINT_TENSOR_CONTRACT.md, section 4), unchanged.
         **({"checkpoint_tensors": dict(served)} if isinstance(served := report.get("checkpoint_tensors"), Mapping) else {}),
         **({"head_trends": dict(heads)} if isinstance(heads := report.get("head_trends"), Mapping) and heads else {}),
+        # `moe_source` as the server carried it from the records (rules contract, part 7; wave AD's seam):
+        # without it a reader of a server's report could not say whose assignments the counts are.
+        **({"moe_source": dict(source)} if isinstance(source := report.get("moe_source"), Mapping) and source else {}),
         # The four measurements (rules contract, part 6) where the server's report has them, unchanged.
         **{name: dict(block) for name in MEASUREMENT_BLOCKS if isinstance(block := report.get(name), Mapping) and block},
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),

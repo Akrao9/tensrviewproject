@@ -1051,11 +1051,23 @@ def _judged_to_step(evidence: Mapping[str, Any] | None) -> int | None:
     say. Only a watcher's evidence taken from a server's report says so today: its `detection`
     (`source` "server") names the report's `report_last_step`. A file the command line writes
     names no step, so its judgment is dated by the file's time alone (`_read_evidence_file`)."""
+    whole = lambda step: step if isinstance(step, int) and not isinstance(step, bool) else None
+    # A watcher's own `freshness` block, written exactly when its judgment is not current, names
+    # the step (it may be null: nothing judged). Wave AD's seam with the watchers in `evidence.py`.
+    fresh = (evidence or {}).get("freshness")
+    if isinstance(fresh, Mapping) and "judged_to_step" in fresh:
+        return whole(fresh["judged_to_step"])
     detection = (evidence or {}).get("detection")
-    if not isinstance(detection, Mapping) or detection.get("source") != "server" or detection.get("state") != "current":
+    if not isinstance(detection, Mapping):
         return None
-    step = detection.get("report_last_step")
-    return step if isinstance(step, int) and not isinstance(step, bool) else None
+    if detection.get("source") == "server":
+        # Built from the report the watcher judged from: a current one, or inside its wait the
+        # last current one. Either way it is the step judged.
+        return whole(detection.get("report_last_step"))
+    if detection.get("source") == "python":
+        # The watcher's fallback judged every record it read from the store at that look.
+        return whole(detection.get("stored_last_step"))
+    return None
 
 
 def _judged_nothing(evidence: Mapping[str, Any] | None) -> bool:

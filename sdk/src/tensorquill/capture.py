@@ -3643,7 +3643,10 @@ class Session:
         beat = getattr(self._sink, "heartbeat", None)
         if beat is not None:
             try:
-                beat.stop_capture(reason or ("sink_error" if cause is self._error else "stopped"))
+                # The step it stopped at (detector rules contract, part 7): the last step committed,
+                # or None when none was. Step 0 is a step.
+                beat.stop_capture(reason or ("sink_error" if cause is self._error else "stopped"),
+                                  step=self._next_step - 1 if self._steps_committed else None)
             except Exception:  # noqa: BLE001  a beat that cannot be told is the server's limit, not training's
                 pass
         self._clear_ring_lists()
