@@ -22,3 +22,9 @@ tensorlens-out/
 # Captures and evidence copied in from runs
 /*.jsonl
 /*.evidence.json
+
+# Working documents kept beside the repository, not in it: the task list and code reviews
+/PENDING_CODING_TASKS.md
+/CODEBASE_AUDIT.md
+/CORRECTNESS_AUDIT.md
+/codebase_review_findings.md
