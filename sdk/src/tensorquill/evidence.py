@@ -1116,13 +1116,17 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
 
 def _capture_stopped_keys(ranks: list[dict[str, Any]]) -> dict[str, Any]:
     """A silence incident's link to a rank whose capture had stopped while training went on
-    (STEP_AND_EVIDENCE_CONTRACT.md, section 3): each such rank's entry gains `capture_last_step`,
-    the last step its current attempt stored, or null when that attempt stored none (a rank the
-    status marks `attempt_without_steps`: a step an earlier attempt stored is not this one's);
-    and the incident gains `capture_stopped` (the status entry's value, unchanged) and
+    (STEP_AND_EVIDENCE_CONTRACT.md, section 3). Such a rank is one that stopped (its state is
+    `silent`, `lost` or `unresponsive`) and whose status entry has a `capture_stopped` object, as
+    the server reads it (`progress_incidents` in watchdog.rs): a rank whose capture stopped and that
+    still reads another state in a stalled job gives neither key. Each such rank's entry gains
+    `capture_last_step`, the last step its current attempt stored, or null when that attempt stored
+    none (a rank the status marks `attempt_without_steps`: a step an earlier attempt stored is not
+    this one's); and the incident gains `capture_stopped` (the status entry's value, unchanged) and
     `capture_last_step` of the first such rank, by rank. Nothing for a rank whose capture never
     stopped."""
-    stopped = sorted((r for r in ranks if r.get("capture_stopped") is not None), key=lambda r: r.get("rank", 0))
+    stopped = sorted((r for r in ranks if r.get("state") in ("silent", "lost", "unresponsive")
+                      and isinstance(r.get("capture_stopped"), Mapping)), key=lambda r: r.get("rank", 0))
     for entry in stopped:
         entry["capture_last_step"] = None if entry.get("attempt_without_steps") else entry.get("last_step")
     if not stopped:
@@ -1134,7 +1138,9 @@ def _capture_stopped_text(incident: Mapping[str, Any]) -> str:
     """The sentence for a silence incident whose rank's capture had stopped (`_capture_stopped_keys`)."""
     if incident.get("capture_stopped") is None:
         return ""
-    named = next((r for r in incident.get("ranks") or () if isinstance(r, Mapping) and r.get("capture_stopped") is not None), {})
+    # The rank the keys came from: one that stopped after its capture had (`capture_last_step` on its entry).
+    named = next((r for r in sorted((r for r in incident.get("ranks") or () if isinstance(r, Mapping)),
+                                    key=lambda r: r.get("rank", 0)) if "capture_last_step" in r), {})
     said = incident["capture_stopped"]
     reason = said.get("reason") if isinstance(said, Mapping) else said
     ago = _finite(said.get("seconds")) if isinstance(said, Mapping) else None

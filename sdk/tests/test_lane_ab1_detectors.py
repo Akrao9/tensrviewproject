@@ -442,6 +442,29 @@ def test_a_job_stalled_with_capture_stopped_carries_the_keys_too():
     assert found["kind"] == "job_stalled" and found["capture_last_step"] == 120
 
 
+def test_in_a_stalled_job_only_a_stopped_rank_gives_the_capture_keys():
+    """As the server reads it: in `job_stalled`, a rank whose capture stopped and that is still
+    beating (state `capture_stopped`) gives neither key, at the top level or on its own entry; the
+    rank that went silent after its capture stopped gives both. Rank 0 is the beating one, so a
+    reader that took the first unfinished rank by number would show its keys."""
+    status = {"schema_version": 1, "run_id": "r1", "summary": "stalled", "world_size": 2, "missing_ranks": [],
+              "ranks": [{"rank": 0, "attempt": 1, "last_step": 300, "state": "capture_stopped", "phase": "train",
+                         "heartbeat_age_seconds": 2.0, "capture_stopped": {"reason": "sink_error", "seconds": 600.0}},
+                        {"rank": 1, "attempt": 1, "last_step": 120, "state": "silent", "phase": "train",
+                         "seconds_since_progress": 900.0, "capture_stopped": {"reason": "sink_error", "seconds": 398.0}}]}
+    [found] = ev.detect_watchdog_incidents(status)
+    assert found["kind"] == "job_stalled"
+    assert (found["capture_stopped"], found["capture_last_step"]) == ({"reason": "sink_error", "seconds": 398.0}, 120)
+    beating, silent = sorted(found["ranks"], key=lambda r: r["rank"])
+    assert "capture_last_step" not in beating and silent["capture_last_step"] == 120
+    assert "Rank 1's capture had stopped after step 120" in ev._describe(found)
+    # With no rank stopped after its capture stopped, neither key.
+    status["ranks"][1].pop("capture_stopped")
+    [found] = ev.detect_watchdog_incidents(status)
+    assert "capture_stopped" not in found and "capture_last_step" not in found
+    assert all("capture_last_step" not in r for r in found["ranks"])
+
+
 def test_silent_with_capture_running_has_neither_key():
     body = BEHAVIOUR["silent_with_capture_running"]
     [found] = ev.detect_watchdog_incidents(_silent_status(body["given"]["status_entry"]))
