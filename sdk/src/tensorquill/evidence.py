@@ -5116,6 +5116,67 @@ def _compare_one_group(seen: Mapping[int, Mapping[str, Any]], tolerance: float) 
     return facts, drifted
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    half = len(ordered) // 2
+    return ordered[half] if len(ordered) % 2 else (ordered[half - 1] + ordered[half]) / 2
+
+
+def _attributed_by_fingerprints(rows: Mapping[int, Mapping[str, Any]], width: int, tolerance: float) -> dict[str, Any]:
+    """D1 by fingerprints for one parameter that drifted (contract 4a): `rows` are each compared
+    rank's entry in `params`, `width` the compared columns (2 without the projection)."""
+    ranks = sorted(rows)
+    if len(ranks) == 2:
+        return {"verdict": "inconclusive", "why": "two_ranks"}
+    values = {rank: [_fingerprint(v) for v in list(rows[rank].get("fp") or ())[:width]] for rank in ranks}
+    columns = min(len(v) for v in values.values())
+    finite = [rank for rank in ranks if all(math.isfinite(v) for v in values[rank][:columns])]
+    apart = {rank for rank in ranks if rank not in finite}  # a fingerprint that is not finite stands apart
+    if finite and columns:
+        scale = max(math.fsum(values[rank][0] for rank in finite) / len(finite), 1e-12)
+        for column in range(columns):
+            middle = _median([values[rank][column] for rank in finite])
+            apart |= {rank for rank in finite if abs(values[rank][column] - middle) / scale > tolerance}
+    if not apart:
+        return {"verdict": "inconclusive", "why": "no_outlier"}
+    if 2 * (len(ranks) - len(apart)) <= len(ranks):
+        return {"verdict": "inconclusive", "why": "no_majority"}
+    return {"verdict": "attributed", "outliers": sorted(apart)}
+
+
+def _attributed_by_signatures(rows: Mapping[int, Mapping[str, Any]]) -> dict[str, Any]:
+    """D1 by signatures for one parameter whose signatures differ: one signature held by a strict
+    majority names the other ranks (SCOUT's exact classifier)."""
+    ranks = sorted(rows)
+    if len(ranks) == 2:
+        return {"verdict": "inconclusive", "why": "two_ranks"}
+    held: dict[str, list[int]] = {}
+    for rank in ranks:
+        held.setdefault(str(rows[rank].get("sig")), []).append(rank)
+    most = max(held.values(), key=len)
+    if 2 * len(most) <= len(ranks):
+        return {"verdict": "inconclusive", "why": "no_majority"}
+    return {"verdict": "attributed", "outliers": [rank for rank in ranks if rank not in most]}
+
+
+def _attribution(members: Mapping[int, Mapping[str, Any]], facts: Mapping[str, Any], where: Mapping[str, Any],
+                 tolerance: float) -> list[dict[str, Any]]:
+    """The attribution entries of one complete step entry (contract 4a), from the rows compared:
+    one for each parameter that drifted, by fingerprints, and one for each whose signatures
+    differ, by signatures. Each parameter is read on its own."""
+    rows_of = {rank: (o.get("params") if isinstance(o.get("params"), Mapping) else {}) for rank, o in members.items()}
+    projections = {o.get("projection") for o in members.values()}
+    width = 3 if len(projections) == 1 and None not in projections else 2  # the columns `_compare_one_group` compared
+    out = []
+    for name in facts.get("drift_parameters") or ():
+        rows = {rank: params[name] for rank, params in rows_of.items()}
+        out.append({**where, "parameter": name, "by": "fingerprints", **_attributed_by_fingerprints(rows, width, tolerance)})
+    for name in facts.get("signature_parameters") or ():
+        rows = {rank: params[name] for rank, params in rows_of.items()}
+        out.append({**where, "parameter": name, "by": "signatures", **_attributed_by_signatures(rows)})
+    return out
+
+
 def _replica_place(entry: Mapping[str, Any]) -> tuple[Any, ...]:
     """Contract 4's order of step entries: by step, then the rows that name no launch, then by
     launch, then by group (a group that could not be named first), a step's own entry before
@@ -5165,6 +5226,7 @@ def _replica_judged(
         cells.setdefault((launch, step), {})[rank] = observation
     steps: list[dict[str, Any]] = []
     raised: list[dict[str, Any]] = []
+    attribution: list[dict[str, Any]] = []
     details: dict[tuple[Any, ...], dict[str, Any]] = {}
     for (launch, step), seen in cells.items():
         named = {tuple(o.get("group") or ()) for o in seen.values()}
@@ -5188,6 +5250,7 @@ def _replica_judged(
             facts, drifted = _compare_one_group(members, tolerance)
             decided = covers.get(((launch, group), step), {}).get("covered", set())
             steps.append({**entry, "coverage": "complete", **({"gathered": sorted(decided)} if decided else {}), **facts})
+            attribution.extend(_attribution(members, facts, {"step": step, "launch": launch, "group": list(group)}, tolerance))
             mine = [name for name in facts.get("drift_parameters", ()) if name not in decided]
             if mine:  # a gathered spread of this launch, group and step decides the parameters it holds
                 raised.append({"step": step, "parameters": mine, "source": "replica", "launch": launch, "group": list(group)})
@@ -5201,7 +5264,9 @@ def _replica_judged(
                            **({"launch": scope[0], "group": list(scope[1])} if scope else {})})
     steps.sort(key=_replica_place)
     raised.sort(key=lambda i: (i["step"], i["source"], i.get("launch") or "", list(i.get("group") or ())))
-    return {"steps": steps, "replica_drift": raised, **({"legacy": legacy} if legacy else {})}, details
+    attribution.sort(key=lambda e: (e["step"], e["launch"], e["group"], e["parameter"], e["by"]))
+    return {"steps": steps, "replica_drift": raised, **({"legacy": legacy} if legacy else {}),
+            **({"attribution": attribution} if attribution else {})}, details
 
 
 def compare_replicas(
@@ -5229,7 +5294,13 @@ def compare_replicas(
     A gathered spread (`replica_spread`) is judged on its own record by today's rule
     (`detect_replica_drift`) wherever it is. It decides a step's comparison only for the
     parameters it holds and only when its `replica_spread_scope` names that step's launch and
-    group. Nothing here names which rank drifted (D1 is held)."""
+    group.
+
+    `attribution` (contract 4a, D1), a list present only when it has an entry, says for each
+    complete step where the ranks differ on a parameter which ranks stand apart from a strict
+    majority, by fingerprints for each parameter that drifted and by signatures for each whose
+    signatures differ, or why none can be named (`two_ranks`, `no_majority`, `no_outlier`). It
+    describes a difference and raises nothing: `replica_drift` is the same with or without it."""
     return _replica_judged(records, tolerance, attempt_order)[0]
 
 
@@ -5399,10 +5470,18 @@ def _replica_incident(
     spreads = (details or {}).get((first.get("step"), first.get("launch"), tuple(group))) or {}
     also = [{key: i[key] for key in ("source", "parameters", "launch", "group") if key in i}
             for i in raised if i is not first and i.get("step") == first.get("step")]
+    # The ranks named, by the fingerprints' reading only (contract 4a): they raised it. The
+    # signatures' reading stays in the result's `attribution`, as evidence.
+    names = [str(name) for name in first.get("parameters") or ()]
+    attributed = [dict(e) for e in replica.get("attribution") or ()
+                  if isinstance(e, Mapping) and e.get("by") == "fingerprints" and e.get("step") == first.get("step")
+                  and e.get("launch") == first.get("launch") and list(e.get("group") or ()) == group
+                  and str(e.get("parameter")) in names]
     return {
         "kind": "replica_drift", "step": first.get("step"), "tolerance": replica.get("tolerance"),
-        "parameters": {str(name): dict(spreads.get(name) or {}) for name in first.get("parameters") or ()},
+        "parameters": {name: dict(spreads.get(name) or {}) for name in names},
         "source": "replica", "launch": first.get("launch"), "group": group,
+        **({"attribution": attributed} if attributed else {}),
         **({"also": also} if also else {}),
     }
 
@@ -6521,10 +6600,34 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             group = incident.get("group") or ()
             text += (f", from the observations of ranks {_rank_ranges(group, 8)} in launch"
                      f" {str(incident.get('launch'))[:8]}")
+            text += _attribution_words(incident.get("attribution") or ())
             for other in incident.get("also") or ():
                 text += f"; a gathered spread ({other.get('source')}) shows drift on that step too"
         return text
     return describe_system(incident)
+
+
+_NO_RANK_NAMED = {
+    "two_ranks": "two ranks that differ cannot say which is wrong",
+    "no_majority": "no strict majority",
+    "no_outlier": "no rank is further than the tolerance from the median",
+}
+
+
+def _attribution_words(attributed: Iterable[Mapping[str, Any]]) -> str:
+    """What the incident's `attribution` says, by fingerprints: for each parameter the ranks that
+    stand apart from a strict majority, or why none can be named. A named rank stands apart; it is
+    not thereby the one at fault (contract 4a)."""
+    parts = []
+    for entry in attributed:
+        if entry.get("verdict") == "attributed":
+            ranks = list(entry.get("outliers") or ())
+            parts.append(f"{entry.get('parameter')}: rank{'s' if len(ranks) != 1 else ''} {_rank_ranges(ranks, 8)}"
+                         " apart from the majority")
+        else:
+            parts.append(f"{entry.get('parameter')}: no rank named ("
+                         f"{_NO_RANK_NAMED.get(str(entry.get('why')), entry.get('why'))})")
+    return f"; by fingerprints, {'; '.join(parts[:5])}" if parts else ""
 
 
 def incident_summary(evidence: Mapping[str, Any]) -> str:
