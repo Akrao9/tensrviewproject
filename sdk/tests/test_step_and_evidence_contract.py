@@ -34,7 +34,7 @@ def _numbers(value):
 
 def test_the_file_holds_the_cases_the_page_names():
     page = (ROOT / "STEP_AND_EVIDENCE_CONTRACT.md").read_text()
-    assert len(CASES) == 20 and len(PINS) == 6
+    assert len(CASES) == 41 and len(PINS) == 12
     for name, body in CASES.items():
         assert f"`{name}`" in page, f"{name} is not named on the page"
         assert body["section"] in (1, 2, 3, 4) and body["says"] and body["expected"]
@@ -62,13 +62,13 @@ def test_the_skip_changes_the_verdict_and_nothing_else_does():
 
 @pytest.mark.parametrize("name,body", NEW, ids=[n for n, _ in NEW])
 def test_a_new_case_states_a_target_in_the_pages_words(name, body):
-    assert set(body) == {"section", "status", "says", "given", "expected"}
-    allowed = {"incident_kinds_present", "incident_kinds_absent", "kind_values", "not_checked", "run_state", "status",
-               "words", "words_absent", "incident_carries", "incident_lacks", "findings",
-               "records_carry", "records_lack", "records"}
+    assert set(body) - {"today"} == {"section", "status", "says", "given", "expected"}
+    allowed = {"incident_kinds_present", "incident_kinds_absent", "incident_kind_one_of", "kind_values", "not_checked",
+               "run_state", "status", "words", "words_absent", "incident_carries", "incident_lacks", "findings",
+               "records_carry", "records_lack", "records", "evidence_carries", "evidence_lacks"}
     assert set(body["expected"]) <= allowed, set(body["expected"]) - allowed
     for kind in (*body["expected"].get("incident_kinds_present", ()), *body["expected"].get("incident_kinds_absent", ()),
-                 *body["expected"].get("kind_values", {})):
+                 *body["expected"].get("incident_kind_one_of", ()), *body["expected"].get("kind_values", {})):
         assert kind in KNOWN_KINDS, f"{kind} is not a kind the evidence knows"
     for value in body["expected"].get("kind_values", {}).values():
         assert value in ("checked", "not_configured", "unavailable")
@@ -80,3 +80,42 @@ def test_the_one_new_detector_rule_of_section_1_is_not_built_yet():
     import inspect
 
     assert "step_skipped" not in inspect.getsource(ev.detect_stalled_weights)
+
+
+NOT_BUILT = [(name, body) for name, body in NEW if "today" in body]
+
+
+@pytest.mark.parametrize("name,body", NOT_BUILT, ids=[n for n, _ in NOT_BUILT])
+def test_a_new_case_over_records_is_not_what_the_python_detectors_do_today(name, body):
+    """`today` is what today's detector answers on the case's records, and it is not the target. So
+    the case states something to build. The lane that builds the rule removes `today` from the case
+    and makes it a pin."""
+    today, expected = dict(body["today"]), body["expected"]
+    found = getattr(ev, today.pop("detector"))(_numbers(body["given"]["records"]))
+    assert (found is not None) == today.pop("fires")
+    assert {key: found.get(key) for key in today} == today
+    if found["kind"] in expected.get("incident_kinds_absent", ()):
+        return  # raised today, and the target is that it is not
+    carried = expected["incident_carries"]
+    assert any(found.get(key) != value for key, value in carried.items()), "today's answer is already the target"
+
+
+def test_who_reported_a_skip_is_read_by_no_detector_yet():
+    """No Python detector reads `step_skipped_by` today: a capture with the key is judged as one
+    without it. When one does, this test is the one to remove."""
+    import inspect
+
+    assert "step_skipped_by" not in inspect.getsource(ev)
+
+
+def test_the_three_provenances_are_the_same_records_but_for_who_reported():
+    """Each family of cases by who reported the skip differs in `step_skipped_by` alone."""
+    def bare(name):
+        body = CASES[name]
+        records = body["records"] if body["status"] == "pin" else body["given"]["records"]
+        return [{k: v for k, v in r.items() if k != "step_skipped_by"} for r in records]
+
+    for family in ("weights_unchanged_across_skips_{}_reported", "an_activation_not_finite_on_a_skip_{}_reported",
+                   "a_gradient_not_finite_on_a_skip_{}_reported"):
+        assert bare(family.format("the_caller")) == bare(family.format("the_scaler")) == bare(family.format("both"))
+    assert bare("ten_skips_only_the_caller_reported") == bare("ten_skips_the_scaler_reported") == bare("ten_skips_both_reported")

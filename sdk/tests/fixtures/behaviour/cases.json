@@ -636,7 +636,7 @@
   "ten_skips_in_a_row_with_no_loss_scale": {
    "section": 1,
    "status": "pin",
-   "says": "A caller reports ten skipped updates in a row and records no loss scale. The streak is raised.",
+   "says": "A capture written before `step_skipped_by`: ten skipped updates in a row, no loss scale, and nothing that says who reported them. They are read as a scaler's, and the streak is raised as before.",
    "detector": "detect_loss_scale_trouble",
    "records": [
     {
@@ -725,13 +725,16 @@
      {
       "step_skipped": false
      }
+    ],
+    "records_lack": [
+     "step_skipped_by"
     ]
    }
   },
   "an_update_due_and_skipped": {
    "section": 1,
    "status": "new",
-   "says": "The caller says an update was due and was skipped.",
+   "says": "The caller says an update was due and was skipped, and there is no scaler.",
    "given": {
     "init": {
      "auto_step": false
@@ -743,7 +746,74 @@
    "expected": {
     "records_carry": [
      {
-      "step_skipped": true
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     }
+    ]
+   }
+  },
+  "a_skip_only_the_caller_reported": {
+   "section": 1,
+   "status": "new",
+   "says": "The caller says the update was skipped; the scaler given to `init` applied the step.",
+   "given": {
+    "init": {
+     "auto_step": false,
+     "scaler": "a GradScaler that applied this step"
+    },
+    "calls": [
+     "session.step(skipped=True)"
+    ]
+   },
+   "expected": {
+    "records_carry": [
+     {
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     }
+    ]
+   }
+  },
+  "a_skip_only_the_scaler_reported": {
+   "section": 1,
+   "status": "new",
+   "says": "The caller says the update was applied; the scaler skipped it. Either one saying so makes it skipped.",
+   "given": {
+    "init": {
+     "auto_step": false,
+     "scaler": "a GradScaler that skipped this step"
+    },
+    "calls": [
+     "session.step(skipped=False)"
+    ]
+   },
+   "expected": {
+    "records_carry": [
+     {
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     }
+    ]
+   }
+  },
+  "a_skip_both_reported": {
+   "section": 1,
+   "status": "new",
+   "says": "The caller and the scaler both say the same update was skipped.",
+   "given": {
+    "init": {
+     "auto_step": false,
+     "scaler": "a GradScaler that skipped this step"
+    },
+    "calls": [
+     "session.step(skipped=True)"
+    ]
+   },
+   "expected": {
+    "records_carry": [
+     {
+      "step_skipped": true,
+      "step_skipped_by": "both"
      }
     ]
    }
@@ -776,7 +846,7 @@
   "nothing_said_with_a_scaler": {
    "section": 1,
    "status": "new",
-   "says": "The argument is left out and `init` was given a loss scaler. The record carries the scaler's verdict, as today.",
+   "says": "The argument is left out and `init` was given a loss scaler. The record carries the scaler's verdict, as today, and says it is the scaler's.",
    "given": {
     "init": {
      "auto_step": false,
@@ -789,7 +859,8 @@
    "expected": {
     "records_carry": [
      {
-      "step_skipped": true
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
      }
     ]
    }
@@ -853,6 +924,887 @@
    "expected": {
     "incident_kinds_absent": [
      "stalled_weights"
+    ]
+   },
+   "today": {
+    "detector": "detect_stalled_weights",
+    "fires": true,
+    "kind": "stalled_weights",
+    "step": 2
+   }
+  },
+  "weights_unchanged_across_skips_the_caller_reported": {
+   "section": 1,
+   "status": "new",
+   "says": "The same three steps, skipped updates that only the caller reported. Not a stall, whoever reported them.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "caller",
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "caller",
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "caller",
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_absent": [
+     "stalled_weights"
+    ]
+   },
+   "today": {
+    "detector": "detect_stalled_weights",
+    "fires": true,
+    "kind": "stalled_weights",
+    "step": 2
+   }
+  },
+  "weights_unchanged_across_skips_the_scaler_reported": {
+   "section": 1,
+   "status": "new",
+   "says": "The same three steps, skipped updates that only the scaler reported. Not a stall, whoever reported them.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "scaler",
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "scaler",
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler",
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_absent": [
+     "stalled_weights"
+    ]
+   },
+   "today": {
+    "detector": "detect_stalled_weights",
+    "fires": true,
+    "kind": "stalled_weights",
+    "step": 2
+   }
+  },
+  "weights_unchanged_across_skips_both_reported": {
+   "section": 1,
+   "status": "new",
+   "says": "The same three steps, skipped updates that the caller and the scaler both reported. Not a stall, whoever reported them.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "both",
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "both",
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "both",
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_absent": [
+     "stalled_weights"
+    ]
+   },
+   "today": {
+    "detector": "detect_stalled_weights",
+    "fires": true,
+    "kind": "stalled_weights",
+    "step": 2
+   }
+  },
+  "a_stall_across_a_skipped_step": {
+   "section": 1,
+   "status": "new",
+   "says": "Awaiting the author. A parameter is unchanged at two applied steps, at a skipped one, and at one more applied step. The skipped step adds nothing to the streak and does not end it, so the stall is raised at the last step.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": false,
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "step_skipped": false,
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "caller",
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "step_skipped": false,
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_present": [
+     "stalled_weights"
+    ],
+    "incident_carries": {
+     "step": 3
+    }
+   },
+   "today": {
+    "detector": "detect_stalled_weights",
+    "fires": true,
+    "kind": "stalled_weights",
+    "step": 2
+   }
+  },
+  "ten_skips_only_the_caller_reported": {
+   "section": 1,
+   "status": "new",
+   "says": "Ten skipped updates in a row that only the caller reported. They are not the loss scale's trouble, and nothing is raised.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": false
+     },
+     {
+      "step": 1,
+      "step_skipped": false
+     },
+     {
+      "step": 2,
+      "step_skipped": false
+     },
+     {
+      "step": 3,
+      "step_skipped": false
+     },
+     {
+      "step": 4,
+      "step_skipped": false
+     },
+     {
+      "step": 5,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 6,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 7,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 8,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 9,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 10,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 11,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 12,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 13,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 14,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_absent": [
+     "loss_scale_trouble"
+    ]
+   },
+   "today": {
+    "detector": "detect_loss_scale_trouble",
+    "fires": true,
+    "kind": "loss_scale_trouble",
+    "step": 14
+   }
+  },
+  "ten_skips_the_scaler_reported": {
+   "section": 1,
+   "status": "pin",
+   "says": "Ten skipped updates in a row that the scaler reported, on a capture that says so. Raised.",
+   "detector": "detect_loss_scale_trouble",
+   "records": [
+    {
+     "step": 0,
+     "step_skipped": false
+    },
+    {
+     "step": 1,
+     "step_skipped": false
+    },
+    {
+     "step": 2,
+     "step_skipped": false
+    },
+    {
+     "step": 3,
+     "step_skipped": false
+    },
+    {
+     "step": 4,
+     "step_skipped": false
+    },
+    {
+     "step": 5,
+     "step_skipped": true,
+     "step_skipped_by": "scaler"
+    },
+    {
+     "step": 6,
+     "step_skipped": true,
+     "step_skipped_by": "scaler"
+    },
+    {
+     "step": 7,
+     "step_skipped": true,
+     "step_skipped_by": "scaler"
+    },
+    {
+     "step": 8,
+     "step_skipped": true,
+     "step_skipped_by": "scaler"
+    },
+    {
+     "step": 9,
+     "step_skipped": true,
+     "step_skipped_by": "scaler"
+    },
+    {
+     "step": 10,
+     "step_skipped": true,
+     "step_skipped_by": "scaler"
+    },
+    {
+     "step": 11,
+     "step_skipped": true,
+     "step_skipped_by": "scaler"
+    },
+    {
+     "step": 12,
+     "step_skipped": true,
+     "step_skipped_by": "scaler"
+    },
+    {
+     "step": 13,
+     "step_skipped": true,
+     "step_skipped_by": "scaler"
+    },
+    {
+     "step": 14,
+     "step_skipped": true,
+     "step_skipped_by": "scaler"
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "kind": "loss_scale_trouble",
+    "step": 14,
+    "reason": "skips",
+    "consecutive_skips": 10
+   }
+  },
+  "ten_skips_both_reported": {
+   "section": 1,
+   "status": "pin",
+   "says": "Ten skipped updates in a row that the caller and the scaler both reported. The scaler confirmed each, so the streak is raised.",
+   "detector": "detect_loss_scale_trouble",
+   "records": [
+    {
+     "step": 0,
+     "step_skipped": false
+    },
+    {
+     "step": 1,
+     "step_skipped": false
+    },
+    {
+     "step": 2,
+     "step_skipped": false
+    },
+    {
+     "step": 3,
+     "step_skipped": false
+    },
+    {
+     "step": 4,
+     "step_skipped": false
+    },
+    {
+     "step": 5,
+     "step_skipped": true,
+     "step_skipped_by": "both"
+    },
+    {
+     "step": 6,
+     "step_skipped": true,
+     "step_skipped_by": "both"
+    },
+    {
+     "step": 7,
+     "step_skipped": true,
+     "step_skipped_by": "both"
+    },
+    {
+     "step": 8,
+     "step_skipped": true,
+     "step_skipped_by": "both"
+    },
+    {
+     "step": 9,
+     "step_skipped": true,
+     "step_skipped_by": "both"
+    },
+    {
+     "step": 10,
+     "step_skipped": true,
+     "step_skipped_by": "both"
+    },
+    {
+     "step": 11,
+     "step_skipped": true,
+     "step_skipped_by": "both"
+    },
+    {
+     "step": 12,
+     "step_skipped": true,
+     "step_skipped_by": "both"
+    },
+    {
+     "step": 13,
+     "step_skipped": true,
+     "step_skipped_by": "both"
+    },
+    {
+     "step": 14,
+     "step_skipped": true,
+     "step_skipped_by": "both"
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "kind": "loss_scale_trouble",
+    "step": 14,
+    "reason": "skips",
+    "consecutive_skips": 10
+   }
+  },
+  "caller_skips_inside_a_run_of_scaler_skips": {
+   "section": 1,
+   "status": "new",
+   "says": "Awaiting the author. Two applied steps, five skips the scaler reported, three only the caller reported, five more the scaler reported. The caller's are passed over: they neither add to the streak nor end it, and are in neither count. Ten in a row are reached at the last step.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": false
+     },
+     {
+      "step": 1,
+      "step_skipped": false
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 3,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 4,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 5,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 6,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 7,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 8,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 9,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 10,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 11,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 12,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 13,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 14,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_present": [
+     "loss_scale_trouble"
+    ],
+    "incident_carries": {
+     "step": 14,
+     "reason": "skips",
+     "consecutive_skips": 10,
+     "skipped_steps": 10,
+     "recorded_steps": 12
+    }
+   },
+   "today": {
+    "detector": "detect_loss_scale_trouble",
+    "fires": true,
+    "kind": "loss_scale_trouble",
+    "step": 11,
+    "skipped_steps": 13,
+    "recorded_steps": 15
+   }
+  },
+  "a_low_loss_scale_on_a_skip_only_the_caller_reported": {
+   "section": 1,
+   "status": "pin",
+   "says": "Awaiting the author. A loss scale below the floor is recorded on a step whose skip only the caller reported. The scale is still read: it is the scale's own reading, not the skip's.",
+   "detector": "detect_loss_scale_trouble",
+   "records": [
+    {
+     "step": 3,
+     "step_skipped": true,
+     "step_skipped_by": "caller",
+     "grad_scale": 0.5
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "kind": "loss_scale_trouble",
+    "step": 3,
+    "reason": "scale"
+   }
+  },
+  "an_activation_not_finite_on_a_skip_the_caller_reported": {
+   "section": 1,
+   "status": "pin",
+   "says": "A layer statistic is not finite on a skip that only the caller reported. Raised for the layer, with no gradient named.",
+   "detector": "detect_non_finite",
+   "records": [
+    {
+     "step": 3,
+     "grad_norm": "nan",
+     "step_skipped": true,
+     "step_skipped_by": "caller",
+     "layers": {
+      "blk": {
+       "mean": "nan",
+       "std": 1.0,
+       "abs_max": 1.0
+      }
+     }
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "kind": "non_finite",
+    "step": 3,
+    "layers": [
+     "blk"
+    ],
+    "gradients": []
+   }
+  },
+  "an_activation_not_finite_on_a_skip_the_scaler_reported": {
+   "section": 1,
+   "status": "pin",
+   "says": "A layer statistic is not finite on a skip that only the scaler reported. Raised for the layer, with no gradient named.",
+   "detector": "detect_non_finite",
+   "records": [
+    {
+     "step": 3,
+     "grad_norm": "nan",
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "layers": {
+      "blk": {
+       "mean": "nan",
+       "std": 1.0,
+       "abs_max": 1.0
+      }
+     }
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "kind": "non_finite",
+    "step": 3,
+    "layers": [
+     "blk"
+    ],
+    "gradients": []
+   }
+  },
+  "an_activation_not_finite_on_a_skip_both_reported": {
+   "section": 1,
+   "status": "pin",
+   "says": "A layer statistic is not finite on a skip that the caller and the scaler both reported. Raised for the layer, with no gradient named.",
+   "detector": "detect_non_finite",
+   "records": [
+    {
+     "step": 3,
+     "grad_norm": "nan",
+     "step_skipped": true,
+     "step_skipped_by": "both",
+     "layers": {
+      "blk": {
+       "mean": "nan",
+       "std": 1.0,
+       "abs_max": 1.0
+      }
+     }
+    }
+   ],
+   "expected": {
+    "fires": true,
+    "kind": "non_finite",
+    "step": 3,
+    "layers": [
+     "blk"
+    ],
+    "gradients": []
+   }
+  },
+  "a_gradient_not_finite_on_a_skip_the_caller_reported": {
+   "section": 1,
+   "status": "new",
+   "says": "A parameter's gradient norm is not finite on a skip only the caller reported. No incident is raised from the gradient alone, and the evidence keeps it.",
+   "given": {
+    "records": [
+     {
+      "step": 3,
+      "grad_norm": "nan",
+      "grad_norms": {
+       "blk.weight": "nan"
+      },
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_absent": [
+     "non_finite"
+    ],
+    "kind_values": {
+     "non_finite": "checked"
+    },
+    "evidence_carries": {
+     "skipped_updates": {
+      "caller": 1,
+      "scaler": 0,
+      "both": 0,
+      "non_finite_gradients": {
+       "steps": 1,
+       "first_step": 3,
+       "gradients": [
+        "blk.weight"
+       ]
+      }
+     }
+    }
+   }
+  },
+  "a_gradient_not_finite_on_a_skip_the_scaler_reported": {
+   "section": 1,
+   "status": "new",
+   "says": "The same gradient on a skip only the scaler reported is what the scaler skipped for. No incident, and nothing kept but the count.",
+   "given": {
+    "records": [
+     {
+      "step": 3,
+      "grad_norm": "nan",
+      "grad_norms": {
+       "blk.weight": "nan"
+      },
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_absent": [
+     "non_finite"
+    ],
+    "evidence_carries": {
+     "skipped_updates": {
+      "caller": 0,
+      "scaler": 1,
+      "both": 0
+     }
+    }
+   }
+  },
+  "a_gradient_not_finite_on_a_skip_both_reported": {
+   "section": 1,
+   "status": "new",
+   "says": "The same gradient on a skip both reported. No incident, and the evidence keeps it, since the caller reported the skip.",
+   "given": {
+    "records": [
+     {
+      "step": 3,
+      "grad_norm": "nan",
+      "grad_norms": {
+       "blk.weight": "nan"
+      },
+      "step_skipped": true,
+      "step_skipped_by": "both"
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_absent": [
+     "non_finite"
+    ],
+    "evidence_carries": {
+     "skipped_updates": {
+      "caller": 0,
+      "scaler": 0,
+      "both": 1,
+      "non_finite_gradients": {
+       "steps": 1,
+       "first_step": 3,
+       "gradients": [
+        "blk.weight"
+       ]
+      }
+     }
+    }
+   }
+  },
+  "an_activation_and_a_gradient_not_finite_on_a_skip_the_caller_reported": {
+   "section": 1,
+   "status": "new",
+   "says": "A layer statistic and a gradient norm are both not finite on a skip only the caller reported. The incident is raised for the layer and names no gradient; the gradient is kept in the evidence.",
+   "given": {
+    "records": [
+     {
+      "step": 3,
+      "grad_norm": "nan",
+      "grad_norms": {
+       "blk.weight": "nan"
+      },
+      "step_skipped": true,
+      "step_skipped_by": "caller",
+      "layers": {
+       "blk": {
+        "mean": "nan",
+        "std": 1.0,
+        "abs_max": 1.0
+       }
+      }
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_present": [
+     "non_finite"
+    ],
+    "incident_carries": {
+     "step": 3,
+     "layers": [
+      "blk"
+     ],
+     "gradients": []
+    },
+    "evidence_carries": {
+     "skipped_updates": {
+      "caller": 1,
+      "scaler": 0,
+      "both": 0,
+      "non_finite_gradients": {
+       "steps": 1,
+       "first_step": 3,
+       "gradients": [
+        "blk.weight"
+       ]
+      }
+     }
+    }
+   }
+  },
+  "a_capture_written_before_the_key": {
+   "section": 1,
+   "status": "new",
+   "says": "A skipped step with nothing that says who reported it, as every capture had before. The evidence has no `skipped_updates`, and is what it was.",
+   "given": {
+    "records": [
+     {
+      "step": 3,
+      "grad_norm": "nan",
+      "step_skipped": true
+     }
+    ]
+   },
+   "expected": {
+    "incident_kinds_absent": [
+     "non_finite"
+    ],
+    "evidence_lacks": [
+     "skipped_updates"
     ]
    }
   },
@@ -1244,6 +2196,43 @@
      "capture_stopped",
      "capture_last_step"
     ]
+   }
+  },
+  "silent_after_a_restart_that_stored_nothing": {
+   "section": 3,
+   "status": "new",
+   "says": "Rank 1's earlier attempt reached step 100. The job was started again, the new attempt's capture stopped with a writer error before its first record, and later its heartbeats ceased. The incident gives the reason and a null last step: step 100 is not this attempt's.",
+   "given": {
+    "earlier_attempt": {
+     "attempt": 0,
+     "last_step": 100
+    },
+    "status_entry": {
+     "rank": 1,
+     "attempt": 1,
+     "last_step": null,
+     "attempt_without_steps": true,
+     "capture_stopped": {
+      "reason": "sink_error",
+      "seconds": 42.0
+     }
+    },
+    "then": "heartbeats cease"
+   },
+   "expected": {
+    "incident_kind_one_of": [
+     "rank_silent",
+     "job_stalled"
+    ],
+    "incident_carries": {
+     "capture_stopped": {
+      "reason": "sink_error",
+      "seconds": 42.0
+     },
+     "capture_last_step": null
+    },
+    "words": "before this attempt stored a step",
+    "words_absent": "100"
    }
   },
   "a_checkpoint_with_no_identified_model_state": {
