@@ -81,11 +81,11 @@ export TENSORQUILL_SERVER_BIN=$PWD/server/target/release/tensorquill-server PYTH
 .venv/bin/python experiments/nanomoe/drift_measure.py balance-on=<capture> balance-off=<capture>
 ```
 
-`fresh_compare.py` builds each capture's evidence with `build_evidence(..., detectors="python")` and `detectors="rust"`, compares the two key by key, and sets the fresh records against the first run's, step by step.
+`run.sh` runs `$ROOT/.venv/bin/python`, and a worktree has no `.venv`, so a symlink to the main checkout's was made at the worktree's root for the run and removed after it. The work copy is the main checkout's `work/` without its outputs. `fresh_compare.py` builds each capture's evidence with `build_evidence(..., detectors="python")` and `detectors="rust"`, compares the two key by key, and sets the fresh records against the first run's, step by step.
 
 **Training is the same.** nanoMoE's own log gives the same loss at every logged step in both arms: step 2,000 train / validation 1.3353 / 1.5994 with the balance loss and 1.2832 / 1.5498 without it. Only the timings differ. Every one of the 2,001 records of each arm equals the first run's on every key the two share, exactly, apart from the run ID, the attempt and the timestamp.
 
-**The two engines agree.** On both fresh captures, and on both first-run captures, the Python and Rust evidence are equal on `incidents`, `not_checked`, `kind_checks`, `run_state`, `moe_source` and the four measurement blocks, and on every other key but `detectors`. No difference was found.
+**The two engines agree.** On both fresh captures, and on both first-run captures, the Python and Rust evidence are equal on `incidents`, `not_checked`, `kind_checks`, `run_state`, `moe_source` and the four measurement blocks, and on every other key but `detectors`. No difference was found. Under `detectors="rust"`, `build_evidence` takes the incidents, the samples, `kind_checks` for the server's kinds and `not_checked` from the Rust report. It makes `moe_source` and the four blocks in Python from the records under either setting, so their equality there holds by construction. Those keys were therefore also read from the Rust detector's own report (`server_detect.server_report` on each fresh capture). In both arms its `moe_source`, `gradient_trend` and `weight_jumps` equal the Python evidence exactly. It has no `attention_trends` or `update_trends`, as the Python evidence has none, and its `head_trends` and `memory` are empty.
 
 **What the detectors give**, the same on the fresh captures as recomputed from the first run's at the merge:
 
@@ -116,7 +116,7 @@ With the balance loss, the evidence of the fresh capture differs from the first 
 - **Incidents:** none in both runs. Two are in balance-off only, `moe_imbalance` from step 7 and `starved_experts` from step 130, on router `h.2`, and for each the arm with the balance loss checked the kind and found none.
 - **Where the runs part:** no answer, as before. The two do not agree in their first 30 common steps (on 66 series the typical early difference is 0.23 times a series' own step-to-step movement, and 27 of them agree).
 
-Against the first run's `compare.json`, the two incidents that sat in both arms (`moe_imbalance` at step 0 and `activation_drift` at 79 and 81) are gone. What separates the arms is now the whole of what either one reports.
+The first run's `compare.json` (read again for this) has the same setup and checked lines and the same "where the runs part" figures. It lists two incidents in both arms, `moe_imbalance` at step 0 on router `h.4` and `activation_drift` at 79 and 81 on `transformer.h.5`, and `starved_experts` in balance-off only. Under the rules of wave AD the two shared incidents are gone, and `moe_imbalance` moves to step 7 on router `h.2`, in balance-off only. What separates the arms is now the whole of what either one reports.
 
 `drift_measure.py` still runs on this SDK. Its "detector today" line calls the current rule and reports nothing on either arm. Its factor table encodes the rule before wave AD (a baseline of a module's first 50 records), and gives the same numbers as the table above, since the records are the same.
 
