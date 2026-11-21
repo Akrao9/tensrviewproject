@@ -94,12 +94,14 @@
       "update_spike"
      ],
      "comparisons": 1,
+     "compared": 4,
      "step": 5
     }
    },
    "today": {
     "update_spike_step": 5,
-    "clip_groups_entry": null
+    "clip_groups_entry": null,
+    "update_spike_check": "checked"
    }
   },
   "a_split_pair_whose_earlier_record_had_two_clip_calls": {
@@ -194,12 +196,14 @@
       "update_spike"
      ],
      "comparisons": 1,
+     "compared": 4,
      "step": 5
     }
    },
    "today": {
     "update_spike_step": 5,
-    "clip_groups_entry": null
+    "clip_groups_entry": null,
+    "update_spike_check": "checked"
    }
   },
   "after_a_pair_that_is_not_compared_the_next_is": {
@@ -308,12 +312,15 @@
       "update_spike"
      ],
      "comparisons": 1,
+     "compared": 5,
      "step": 5
-    }
+    },
+    "update_spike_check": "checked"
    },
    "today": {
     "update_spike_step": 5,
-    "clip_groups_entry": null
+    "clip_groups_entry": null,
+    "update_spike_check": "checked"
    }
   },
   "two_pairs_that_are_not_compared": {
@@ -421,12 +428,126 @@
       "update_spike"
      ],
      "comparisons": 2,
+     "compared": 4,
      "step": 5
     }
    },
    "today": {
     "update_spike_step": 5,
-    "clip_groups_entry": null
+    "clip_groups_entry": null,
+    "update_spike_check": "checked"
+   }
+  },
+  "every_pair_needs_a_split_and_none_is_compared": {
+   "section": 1,
+   "status": "new",
+   "says": "Every step was clipped by two calls and names one parameter more or fewer than the step before, so every pair needs a split and none is compared. The entry says zero were compared, and `update_spike` reads `unavailable`: nothing was judged, so nothing reads as clean.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "clip_calls": 2,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.0,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "clip_calls": 2,
+      "clip_grad_norm": 2.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8,
+       "c": 1.0
+      },
+      "update_rms": {
+       "a": 2.0,
+       "b": 0.5,
+       "c": 0.1
+      }
+     },
+     {
+      "step": 2,
+      "clip_calls": 2,
+      "clip_grad_norm": 3.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 3.0,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "clip_calls": 2,
+      "clip_grad_norm": 4.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8,
+       "c": 1.0
+      },
+      "update_rms": {
+       "a": 4.0,
+       "b": 0.5,
+       "c": 0.1
+      }
+     },
+     {
+      "step": 4,
+      "clip_calls": 2,
+      "clip_grad_norm": 5.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 5.0,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 5,
+      "clip_calls": 2,
+      "clip_grad_norm": 6.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8,
+       "c": 1.0
+      },
+      "update_rms": {
+       "a": 6.0,
+       "b": 0.5,
+       "c": 0.1
+      }
+     }
+    ],
+    "window": 3
+   },
+   "expected": {
+    "update_spike_step": null,
+    "clip_groups_entry": {
+     "check": "clip_groups",
+     "kinds": [
+      "update_spike"
+     ],
+     "comparisons": 5,
+     "compared": 0,
+     "step": 1
+    },
+    "update_spike_check": "unavailable"
+   },
+   "today": {
+    "update_spike_step": null,
+    "clip_groups_entry": null,
+    "update_spike_check": "checked"
    }
   },
   "a_pair_that_cannot_be_split_is_compared_whatever_the_clip_calls": {

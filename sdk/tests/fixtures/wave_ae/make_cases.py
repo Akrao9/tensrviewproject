@@ -45,7 +45,9 @@ def update_spike(given: dict) -> dict:
     found = ev.detect_update_spikes(given["records"], window=given.get("window", ev.UPDATE_WINDOW))
     entries = [e for e in ev.build_evidence(given["records"], update_window=given.get("window", ev.UPDATE_WINDOW))
                .get("not_checked", []) if e.get("check") == "clip_groups"]
-    return {"update_spike_step": None if found is None else found["step"], "clip_groups_entry": entries[0] if entries else None}
+    built = ev.build_evidence(given["records"], update_window=given.get("window", ev.UPDATE_WINDOW))
+    return {"update_spike_step": None if found is None else found["step"], "clip_groups_entry": entries[0] if entries else None,
+            "update_spike_check": built["kind_checks"]["update_spike"]["value"]}
 
 
 def stalled(given: dict) -> dict:
@@ -105,7 +107,7 @@ def clip_rows(calls_at: dict[int, Any] | None = None, *, split: bool = True, lat
     return rows
 
 
-ENTRY = {"check": "clip_groups", "kinds": ["update_spike"], "comparisons": 1, "step": 5}
+ENTRY = {"check": "clip_groups", "kinds": ["update_spike"], "comparisons": 1, "compared": 4, "step": 5}
 
 given = {"records": clip_rows({5: 2}), "window": 3}
 case("a_split_pair_with_two_clip_calls_is_not_compared", 1, "new",
@@ -124,13 +126,24 @@ case("after_a_pair_that_is_not_compared_the_next_is", 1, "new",
      "The pair of steps 4 and 5 is not compared, and its change joins no baseline. Step 5 is still the record step 6 "
      "is compared with: they name the same parameters, so their totals are used as recorded, and step 6's jump is "
      "flagged. Today the incident is at step 5.",
-     given, {"update_spike_step": 6, "clip_groups_entry": ENTRY}, update_spike(given))
+     given, {"update_spike_step": 6, "clip_groups_entry": {**ENTRY, "compared": 5}, "update_spike_check": "checked"}, update_spike(given))
 
 given = {"records": clip_rows({5: 2, 6: 2}, back=True), "window": 3}
 case("two_pairs_that_are_not_compared", 1, "new",
      "Step 5 names a parameter more than step 4, and step 6 names one fewer than step 5; both were clipped by two "
      "calls. Neither pair is compared. There is one entry, counting both and dated at the first.",
      given, {"update_spike_step": None, "clip_groups_entry": {**ENTRY, "comparisons": 2}}, update_spike(given))
+
+rows = [{"step": step, "clip_calls": 2, "clip_grad_norm": 1.0 + step,
+         "grad_norms": {"a": 0.6, "b": 0.8, **({"c": 1.0} if step % 2 else {})},
+         "update_rms": {"a": 1.0 + step, "b": 0.5, **({"c": 0.1} if step % 2 else {})}} for step in range(6)]
+given = {"records": rows, "window": 3}
+case("every_pair_needs_a_split_and_none_is_compared", 1, "new",
+     "Every step was clipped by two calls and names one parameter more or fewer than the step before, so every pair "
+     "needs a split and none is compared. The entry says zero were compared, and `update_spike` reads `unavailable`: "
+     "nothing was judged, so nothing reads as clean.",
+     given, {"update_spike_step": None, "clip_groups_entry": {**ENTRY, "comparisons": 5, "compared": 0, "step": 1},
+             "update_spike_check": "unavailable"}, update_spike(given))
 
 given = {"records": clip_rows({5: 2}, no_norms_at_5=True), "window": 3}
 case("a_pair_that_cannot_be_split_is_compared_whatever_the_clip_calls", 1, "pin",

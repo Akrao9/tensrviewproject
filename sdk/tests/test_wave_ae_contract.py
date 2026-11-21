@@ -41,8 +41,10 @@ def answer(body: dict) -> dict:
         found = ev.detect_update_spikes(records, window=window)
         entries = [e for e in ev.build_evidence(records, update_window=window).get("not_checked", [])
                    if e.get("check") == "clip_groups"]
+        built = ev.build_evidence(records, update_window=window)
         return {"update_spike_step": None if found is None else found["step"],
-                "clip_groups_entry": entries[0] if entries else None}
+                "clip_groups_entry": entries[0] if entries else None,
+                "update_spike_check": built["kind_checks"]["update_spike"]["value"]}
     found, counters = ev._loss_scale_judged(records)
     out = {"loss_scale_trouble_step": None if found is None else found["step"],
            "reason": None if found is None else found["reason"],
@@ -68,7 +70,7 @@ def matches(found: dict, expected: dict) -> bool:
 
 def test_the_file_holds_the_cases_the_page_names():
     page = (ROOT / "WAVE_AE_CONTRACT.md").read_text()
-    assert len(CASES) == 34 and len(PINS) == 21 and len(NEW) == 13
+    assert len(CASES) == 35 and len(PINS) == 21 and len(NEW) == 14
     assert DOCUMENT["base"] == "265311c"
     for name, body in CASES.items():
         assert f"`{name}`" in page, f"{name} is not named on the page"
