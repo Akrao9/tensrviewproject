@@ -31,6 +31,8 @@ CASES = {name: body for name, body in DOCUMENT["cases"].items() if body["section
 NAMES = list(CASES)
 REASON = ("clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter,"
           " so {n} comparison(s) of update_spike were not made")
+NONE_REASON = ("clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter,"
+               " so none of the {n} comparison(s) of update_spike was made, and no pair was judged")
 
 
 def _records(name: str) -> list[dict]:
@@ -53,8 +55,8 @@ def _incident(evidence: dict, kind: str) -> dict | None:
 
 
 def test_the_cases_of_the_three_sections_are_all_here():
-    assert len(CASES) == 29
-    assert sum(body["status"] == "new" for body in CASES.values()) == 10
+    assert len(CASES) == 30
+    assert sum(body["status"] == "new" for body in CASES.values()) == 11
 
 
 # --- every case, through the detector and through `build_evidence` ---------------------------
@@ -79,9 +81,13 @@ def test_each_case_gives_its_expected_answer_through_build_evidence(name):
         if want is None:
             assert entries == []
         else:
-            assert entries == [{**want, "reason": REASON.format(n=want["comparisons"])}]
-            assert list(entries[0]) == ["check", "kinds", "comparisons", "step", "reason"]
-            assert evidence["kind_checks"]["update_spike"]["value"] == "checked"
+            words = (REASON if want["compared"] else NONE_REASON).format(n=want["comparisons"])
+            assert entries == [{**want, "reason": words}]
+            assert list(entries[0]) == ["check", "kinds", "comparisons", "compared", "step", "reason"]
+            check = evidence["kind_checks"]["update_spike"]
+            assert check["value"] == expected.get("update_spike_check", "checked")
+            if check["value"] == "unavailable":
+                assert (check["check"], check["reason"]) == ("clip_groups", words)
             assert {"state": "degraded", "code": "not_checked", "checks": ["clip_groups"],
                     "detail": "not checked: clip_groups"} in evidence["run_state"]["reasons"]
     if "stalled_weights_step" in expected:
@@ -157,7 +163,7 @@ def test_a_pair_not_compared_inside_the_first_window_is_counted():
     records[2] = {**records[2], "grad_norms": {"a": 0.6, "b": 0.8, "c": 1.0},
                   "update_rms": {**records[2]["update_rms"], "c": 0.1}, "clip_calls": 2}
     found, not_compared = ev._update_spikes_judged(records, window=3)
-    assert found is None and not_compared == {"comparisons": 1, "step": 2}
+    assert found is None and not_compared == {"comparisons": 1, "step": 2, "compared": 1}
 
 
 def test_a_split_whose_factor_is_1_is_still_a_split():
@@ -166,13 +172,34 @@ def test_a_split_whose_factor_is_1_is_still_a_split():
     records = _records("a_split_pair_with_two_clip_calls_is_not_compared")
     records[5]["grad_norms"] = {"a": 0.6, "b": 0.8, "c": 0.0}
     found, not_compared = ev._update_spikes_judged(records, window=3)
-    assert found is None and not_compared == {"comparisons": 1, "step": 5}
+    assert found is None and not_compared == {"comparisons": 1, "step": 5, "compared": 4}
 
 
 def test_detect_update_spikes_keeps_its_return():
     records = _records("a_split_pair_with_one_clip_call_is_compared")
     assert ev.detect_update_spikes(records, window=3) == ev._update_spikes_judged(records, window=3)[0]
     assert ev._update_spikes_judged(records, window=3)[1] is None
+
+
+def test_with_no_pair_compared_update_spike_is_unavailable_and_the_words_say_none_was_made():
+    evidence = _evidence("every_pair_needs_a_split_and_none_is_compared")
+    (entry,) = [e for e in evidence["not_checked"] if e["check"] == "clip_groups"]
+    assert entry["compared"] == 0 and entry["reason"] == (
+        "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter,"
+        " so none of the 5 comparison(s) of update_spike was made, and no pair was judged")
+    assert evidence["kind_checks"]["update_spike"]["value"] == "unavailable"
+    assert evidence["kind_checks"]["update_spike"]["reason"] == entry["reason"]
+    combined = ev.combine_rank_evidence({0: evidence})
+    assert combined["kind_checks"]["update_spike"]["value"] == "unavailable"
+
+
+def test_a_clip_groups_entry_without_compared_leaves_the_kind_checked():
+    """An entry written before `compared` (a server report of the first word) reads as it did."""
+    entry = {"check": "clip_groups", "kinds": ["update_spike"], "comparisons": 1, "step": 5, "reason": "r"}
+    checks = ev.kind_checks({"update": 6}, [entry])
+    assert checks["update_spike"]["value"] == "checked"
+    assert ev.kind_checks({"update": 6}, [{**entry, "compared": 0}])["update_spike"]["value"] == "unavailable"
+    assert ev.kind_checks({"update": 6}, [{**entry, "compared": 3}])["update_spike"]["value"] == "checked"
 
 
 def test_the_entry_leaves_update_spike_checked_in_the_all_ranks_view():
@@ -325,6 +352,7 @@ def _looks(records: list[dict], ends: list[int], **options) -> tuple[list[tuple[
     ("a_partial_step_then_ten_full_skips", [1, 2, 10, 11], "loss_scale_trouble", 10),
     ("after_a_pair_that_is_not_compared_the_next_is", [5, 6, 7], "update_spike", 6),  # a pair not compared
     ("two_pairs_that_are_not_compared", [5, 6, 7], "update_spike", None),
+    ("every_pair_needs_a_split_and_none_is_compared", [1, 2, 3, 6], "update_spike", None),
 ])
 def test_each_look_of_the_watcher_is_a_fresh_judgment(name, ends, kind, step):
     window = CASES[name]["given"].get("window", ev.UPDATE_WINDOW)
@@ -334,5 +362,75 @@ def test_each_look_of_the_watcher_is_a_fresh_judgment(name, ends, kind, step):
     hit = _incident(last, kind)
     assert (None if hit is None else hit["step"]) == step
     if kind == "update_spike":
-        assert [e["comparisons"] for e in last["not_checked"] if e["check"] == "clip_groups"] == [
-            CASES[name]["expected"]["clip_groups_entry"]["comparisons"]]
+        want = CASES[name]["expected"]
+        assert [{k: e[k] for k in want["clip_groups_entry"]} for e in last["not_checked"]
+                if e["check"] == "clip_groups"] == [want["clip_groups_entry"]]
+        assert last["kind_checks"]["update_spike"]["value"] == want.get("update_spike_check", "checked")
+
+
+# --- section 6: rows not stored because their step was not newer (L30) -------------------------
+
+
+def _status(ranks: list[dict]) -> dict:
+    """A `watchdog.json` written by hand in the shape section 6 gives: the two keys on a rank's
+    entry, each only when above zero."""
+    return {"schema_version": 1, "run_id": "r1", "summary": "active", "server_running": True, "refresh_seconds": 30.0,
+            "written_at_ms": 1, "world_size": len(ranks), "missing_ranks": [], "incidents": [],
+            "ranks": [{"attempt": 1, "last_step": 59, "state": "active", **r} for r in ranks],
+            "pauses": {}, "recommended_silent_seconds": None}
+
+
+SENTENCE = ("The server received 12 row(s) whose step was not above a step it had already kept for their attempt,"
+            " and did not store them. A row sent again is counted again, so 12 is not a number of steps lost."
+            " 12 distinct step(s) among them are confirmed to have arrived out of order inside one stored part, and"
+            " are not stored. 12 is a lower bound: a late step that crosses a part boundary is not in it, so the same"
+            " rows can give another 12 when the parts are cut elsewhere. The other rows are not told apart from rows"
+            " sent again.")
+ZERO = ("The server received 3 row(s) whose step was not above a step it had already kept for their attempt, and"
+        " did not store them. A row sent again is counted again, so 3 is not a number of steps lost. None is"
+        " confirmed as a step that arrived out of order. The other rows are not told apart from rows sent again.")
+
+
+def test_the_note_is_the_page_s_sentence_and_its_form_when_m_is_zero():
+    assert ev.rows_not_newer_note(12, 12) == SENTENCE
+    assert ev.rows_not_newer_note(3, 0) == ZERO
+
+
+def test_the_all_ranks_view_carries_both_counts_as_written():
+    status = _status([{"rank": 0, "rows_not_newer": 12, "late_steps_confirmed": 12}, {"rank": 1, "rows_not_newer": 3},
+                      {"rank": 2}])
+    said = ev._dropped_rows_said(status)
+    assert said == {"rows_not_newer": {"rows": 15, "late_steps_confirmed": 12, "rank_ranges": "0-1",
+                                       "includes_replays": True, "note": ev.rows_not_newer_note(15, 12)}}
+    combined = ev.combine_rank_evidence({0: {"rank": 0, "incidents": [], "last_step": 59}}, status=status)
+    assert combined["watchdog"]["rows_not_newer"] == said["rows_not_newer"]
+    assert "dropped_rows" not in combined["watchdog"]  # never added to the rows dropped
+
+
+def test_with_no_confirmed_late_step_the_block_has_no_such_key_and_says_none():
+    said = ev._dropped_rows_said(_status([{"rank": 0, "rows_not_newer": 3}]))["rows_not_newer"]
+    assert "late_steps_confirmed" not in said and said["note"] == ZERO
+
+
+def test_one_rank_s_evidence_carries_its_own_counts(tmp_path):
+    from test_lane_ab1_detectors import _store
+
+    run = _store(tmp_path, {"rows_not_newer": 12, "late_steps_confirmed": 12})
+    status = json.loads((run / "watchdog.json").read_text())
+    status["ranks"][1]["rows_not_newer"] = 40  # rank 1's, not this rank's
+    evidence = ev._report_evidence(run / "rank=0", ev.read_server_report(run / "rank=0"), status)
+    assert evidence["watchdog"]["rows_not_newer"] == {"rows": 12, "late_steps_confirmed": 12, "includes_replays": True,
+                                                      "note": SENTENCE}
+    assert ev._rank_dropped_rows_said(status, 1)["rows_not_newer"]["note"] == ev.rows_not_newer_note(40, 0)
+
+
+@pytest.mark.parametrize("entry", [{}, {"rows_not_newer": 0}, {"rows_not_newer": True}, {"rows_not_newer": "3"},
+                                   {"late_steps_confirmed": 4}, {"rows_not_newer": 2.0}])
+def test_a_status_without_a_count_above_zero_says_what_it_said(entry):
+    """Without the key (or with a value that is not a count above zero) the blocks are as on the
+    base: `dropped_rows` and `refused_batches` alone, or nothing."""
+    status = _status([{"rank": 0, "dropped_rows": 2, **entry}])
+    plain = _status([{"rank": 0, "dropped_rows": 2}])
+    assert ev._dropped_rows_said(status) == ev._dropped_rows_said(plain) and "rows_not_newer" not in ev._dropped_rows_said(status)
+    assert ev._rank_dropped_rows_said(status, 0) == ev._rank_dropped_rows_said(plain, 0)
+    assert ev._dropped_rows_said(_status([{"rank": 0, **entry}])) == {}

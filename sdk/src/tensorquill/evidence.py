@@ -658,32 +658,43 @@ CLIP_GROUPS_REASON = (
     "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter,"
     " so {n} comparison(s) of update_spike were not made"
 )
+# With no pair compared (WAVE_AE_CONTRACT.md, section 1, the author's second word): "the reader must
+# make clear that zero were judged".
+CLIP_GROUPS_NONE_REASON = (
+    "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter,"
+    " so none of the {n} comparison(s) of update_spike was made, and no pair was judged"
+)
 
 
 def update_spike_not_checked(not_compared: Mapping[str, int] | None) -> dict[str, Any] | None:
     """The `clip_groups` entry of `not_checked` (WAVE_AE_CONTRACT.md, section 1), from what
     `_update_spikes_judged` gives as its second value: `comparisons` the pairs of `update_spike`
     that were not made because either record was clipped by more than one call and the pair
-    needed a per-parameter split, and `step` the later record of the first such pair. None when
-    every pair was made. `update_spike` stays `checked` (`_PARTIAL_CHECKS`): every other pair was
-    judged."""
+    needed a per-parameter split, `compared` the pairs that were made (those in the first
+    `window`, which are not judged, among them), and `step` the later record of the first pair
+    not made. None when every pair was made. While `compared` is above zero `update_spike` stays
+    `checked` (`_PARTIAL_CHECKS`); at zero it reads `unavailable` with this entry's reason, which
+    then says that none was made."""
     if not not_compared:
         return None
-    count = int(not_compared["comparisons"])
-    return {"check": "clip_groups", "kinds": ["update_spike"], "comparisons": count,
-            "step": int(not_compared["step"]), "reason": CLIP_GROUPS_REASON.format(n=count)}
+    count, compared = int(not_compared["comparisons"]), int(not_compared["compared"])
+    reason = (CLIP_GROUPS_REASON if compared else CLIP_GROUPS_NONE_REASON).format(n=count)
+    return {"check": "clip_groups", "kinds": ["update_spike"], "comparisons": count, "compared": compared,
+            "step": int(not_compared["step"]), "reason": reason}
 
 
 def _update_spikes_judged(
     records: list[dict[str, Any]], *, window: int = UPDATE_WINDOW, alpha: float = UPDATE_ALPHA
 ) -> tuple[dict[str, Any] | None, dict[str, int] | None]:
     """`detect_update_spikes`'s incident, and the pairs it did not compare because a split total
-    met more than one clip call: `{"comparisons", "step"}`, or None when there was none."""
+    met more than one clip call: `{"comparisons", "step", "compared"}`, with `compared` the pairs
+    it did compare, or None when every pair was compared."""
     key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
     # attempt, total, each parameter's update size, each parameter's gradient norm (or None), the
     # learning rates the record carries (or None), its clip calls above 1 (or None)
     before: tuple[Any, float, dict[str, float], Mapping[str, Any] | None, list[float] | None, int | None] | None = None
     not_compared: dict[str, int] | None = None
+    compared = 0  # the pairs compared, judged or among the first `window`
     recent: deque[float] = deque(maxlen=window)  # the last `window` changes that were not flagged
     first: dict[str, Any] | None = None
     spike_count, spikes = 0, []  # every flagged record counted; the first 20 kept (lane AD11)
@@ -714,6 +725,7 @@ def _update_spikes_judged(
                 not_compared = {"comparisons": 0, "step": int(record["step"])}
             not_compared["comparisons"] += 1
         elif shared:
+            compared += 1
             largest, was = max(own[name] for name in shared), max(before[2][name] for name in shared)
             now, then = split if split is not None else (total, before[1])
             change, rise = abs(largest - was), max(0.0, now - then)
@@ -748,6 +760,8 @@ def _update_spikes_judged(
                             **({"lr_before": lr_before} if lr_before is not None else {}),
                         }
         before = (attempt, total, own, grads, _lr_list(record), calls)
+    if not_compared is not None:
+        not_compared["compared"] = compared
     if first is None:
         return None, not_compared
     return {"kind": "update_spike", **first, "spike_count": spike_count, "spike_steps": spikes}, not_compared
@@ -3100,6 +3114,17 @@ _CHECK_KINDS: dict[str, tuple[str, ...]] = {
 # were not made and every other was. `clip_groups` (WAVE_AE_CONTRACT.md, section 1) names
 # `update_spike`, whose pairs that needed no split were judged.
 _PARTIAL_CHECKS = frozenset({"clip_groups"})
+
+
+def _partial_check(item: Mapping[str, Any]) -> bool:
+    """Whether a `not_checked` entry leaves the kinds it names `checked` (`_PARTIAL_CHECKS`): some
+    of their judgments were made. A `clip_groups` entry whose `compared` is 0 says none was, and
+    makes `update_spike` `unavailable` (WAVE_AE_CONTRACT.md, section 1, the author's second word);
+    one without the key, written before it, reads as before it."""
+    if item.get("check") not in _PARTIAL_CHECKS:
+        return False
+    compared = item.get("compared")
+    return not (type(compared) is int and compared == 0)
 _STATUS_NEEDS = "the server's progress status (watchdog.json)"
 _NO_STATUS = "no progress status (the server's watchdog.json): whether the job is still making progress is not checked"
 
@@ -3160,7 +3185,7 @@ def _kinds_not_checked(not_checked: Iterable[Mapping[str, Any]]) -> dict[str, Ma
     """Each kind a `not_checked` entry names, with the first entry that names it."""
     named: dict[str, Mapping[str, Any]] = {}
     for item in not_checked:
-        if not isinstance(item, Mapping) or item.get("check") in _PARTIAL_CHECKS:
+        if not isinstance(item, Mapping) or _partial_check(item):
             continue
         kinds = item.get("kinds")
         if not isinstance(kinds, (list, tuple)):
@@ -5618,6 +5643,55 @@ def _all_ranks_evidence(
     return evidence
 
 
+def rows_not_newer_note(rows: int, late: int) -> str:
+    """The reader's words for the rows the server did not store because their step was not above
+    one it had kept for their attempt (WAVE_AE_CONTRACT.md, section 6), with `rows` the server's
+    `rows_not_newer` and `late` its `late_steps_confirmed` (0 when the status has none)."""
+    head = (f"The server received {rows} row(s) whose step was not above a step it had already kept for their"
+            f" attempt, and did not store them. A row sent again is counted again, so {rows} is not a number of"
+            " steps lost.")
+    if late:
+        middle = (f" {late} distinct step(s) among them are confirmed to have arrived out of order inside one stored"
+                  f" part, and are not stored. {late} is a lower bound: a late step that crosses a part boundary is"
+                  f" not in it, so the same rows can give another {late} when the parts are cut elsewhere.")
+    else:
+        middle = " None is confirmed as a step that arrived out of order."
+    return head + middle + " The other rows are not told apart from rows sent again."
+
+
+def _rows_not_newer(entries: Iterable[Any]) -> dict[str, Any] | None:
+    """`{"rows", "late_steps_confirmed"?, "ranks"}` over the rank entries of a status: each rank's
+    `rows_not_newer` and `late_steps_confirmed` as written, where each is a count above zero, and
+    the ranks with `rows_not_newer`. None when no rank has `rows_not_newer`: a status without the
+    key reads as before. A `late_steps_confirmed` without `rows_not_newer` on its rank is not
+    read, since every confirmed late step is among those rows."""
+    rows = late = 0
+    ranks: list[int] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        rank, count = entry.get("rank"), entry.get("rows_not_newer")
+        if not (type(rank) is int and rank >= 0) or not _count(count):
+            continue
+        ranks.append(rank)
+        rows += count
+        confirmed = entry.get("late_steps_confirmed")
+        late += confirmed if _count(confirmed) else 0
+    if not ranks:
+        return None
+    return {"rows": rows, **({"late_steps_confirmed": late} if late else {}), "ranks": sorted(ranks)}
+
+
+def _rows_not_newer_said(found: Mapping[str, Any], *, ranges: bool) -> dict[str, Any]:
+    """The `rows_not_newer` block of a `watchdog` block (WAVE_AE_CONTRACT.md, section 6): the
+    counts as the status wrote them, the ranks as ranges in the all-ranks view, and the note."""
+    return {"rows": found["rows"],
+            **({"late_steps_confirmed": found["late_steps_confirmed"]} if "late_steps_confirmed" in found else {}),
+            **({"rank_ranges": _rank_ranges(found["ranks"], 8)} if ranges else {}),
+            "includes_replays": True,
+            "note": rows_not_newer_note(found["rows"], found.get("late_steps_confirmed", 0))}
+
+
 def _dropped_rows_said(status: Mapping[str, Any] | None) -> dict[str, Any]:
     """`{"dropped_rows": ...}` for the all-ranks view's `watchdog` block, or nothing when no rank
     dropped a row, so such a run's block is as before (L22). The rows the server dropped because
@@ -5630,7 +5704,13 @@ def _dropped_rows_said(status: Mapping[str, Any] | None) -> dict[str, Any]:
     And `{"refused_batches": ...}` beside it, or nothing when no rank had a batch refused: the
     batches the server refused whole for a key column that was missing or of another type
     (`runs.refused_batches`, lane AB5), with the same ranges. Its own key, never added to the
-    rows, and not an upper bound: the server counts a batch sent again once (wave AB's seam)."""
+    rows, and not an upper bound: the server counts a batch sent again once (wave AB's seam).
+
+    And `{"rows_not_newer": ...}` beside them, or nothing when no rank has the key (L30,
+    WAVE_AE_CONTRACT.md, section 6): the rows the server did not store because their step was not
+    above one it had kept for their attempt, with `late_steps_confirmed` where the status has it,
+    the ranks as ranges, and the page's sentence (`rows_not_newer_note`). Never added to the rows
+    dropped."""
     from .runs import dropped_rows, refused_batches
 
     said: dict[str, Any] = {}
@@ -5644,6 +5724,10 @@ def _dropped_rows_said(status: Mapping[str, Any] | None) -> dict[str, Any]:
         said["refused_batches"] = {"batches": refused["batches"], **({"by_key": refused["by_key"]} if refused.get("by_key") else {}),
                                    "rank_ranges": _rank_ranges((item["rank"] for item in refused["ranks"]), 8),
                                    "note": refused["note"]}
+    entries = status.get("ranks") if isinstance(status, Mapping) else None
+    not_newer = _rows_not_newer(entries) if isinstance(entries, list) else None
+    if not_newer is not None:
+        said["rows_not_newer"] = _rows_not_newer_said(not_newer, ranges=True)
     return said
 
 
@@ -5652,7 +5736,9 @@ def _rank_dropped_rows_said(status: Mapping[str, Any] | None, rank: Any) -> dict
     server dropped from this rank for a null key, from its entry in the status (`runs.dropped_rows`
     over that entry alone), or nothing when it dropped none, so the block is as before. An upper
     bound, as in the all-ranks view (`_dropped_rows_said`). And `{"refused_batches": ...}` beside
-    it for the batches the server refused whole from this rank, on the same terms as there."""
+    it for the batches the server refused whole from this rank, on the same terms as there, and
+    `{"rows_not_newer": ...}` for this rank's rows not stored because their step was not newer
+    (WAVE_AE_CONTRACT.md, section 6), without ranges."""
     from .runs import dropped_rows, refused_batches
 
     entries = status.get("ranks") if isinstance(status, Mapping) else None
@@ -5668,6 +5754,9 @@ def _rank_dropped_rows_said(status: Mapping[str, Any] | None, rank: Any) -> dict
     if refused is not None:
         said["refused_batches"] = {"batches": refused["batches"], **({"by_key": refused["by_key"]} if refused.get("by_key") else {}),
                                    "note": refused["note"]}
+    not_newer = _rows_not_newer(own["ranks"])
+    if not_newer is not None:
+        said["rows_not_newer"] = _rows_not_newer_said(not_newer, ranges=False)
     return said
 
 
