@@ -25,11 +25,11 @@ Only the rows marked *Run on main* were run again when this file was written. Ro
 | Area | P1 | P2 or Medium | P3 or Low | Total |
 |---|---:|---:|---:|---:|
 | Can raise into training, or stop it | 1 | 0 | 0 | 1 |
-| Training SDK | 1 | 7 | 0 | 8 |
+| Training SDK | 1 | 6 | 0 | 7 |
 | Evidence readers, detectors, command line, MCP | 0 | 0 | 0 | 0 |
 | Rust server | 0 | 1 | 1 | 2 |
-| Experiments, examples, CI, docs | 0 | 2 | 0 | 2 |
-| **All** | **2** | **10** | **1** | **13** |
+| Experiments, examples, CI, docs | 0 | 0 | 0 | 0 |
+| **All** | **2** | **7** | **1** | **10** |
 
 There were 72 when this file was written. Waves V and W closed 51 of them in four merge groups, and CI on Nov 19, 2026 closed X11; wave X closed four more (DET-14, DET-17, CLI-13, CLI-14); wave Y closed three more (C06, SDK-23, DET-13); wave AA closed one more (C12); wave AB closed two more (X02, X09); 10 remain, 8 of which are fixed in part and say what is still open (X09 was one of the nine). A recount by script on Nov 19, 2026 found 15 rows marked as fixed in part among the 21, not the 16 this file gave before. Two P1 rows remain, each fixed in part: SDK-22 (a process group that fails after `init`; built in wave Z on Nov 20, 2026, and not yet run on NCCL or a GPU) and C03 (every stop notice lost, accepted for v1). C06 (the length check) was the third until wave Y closed it. Section 6 holds what is left of the closed findings and the two reviews' disagreements, section 7 the items the lanes raised, section 8 the audit's notes on cost and narrow cases, and section 9 the wrong behaviour the plan records from measurement. None of those is counted here.
 
@@ -73,8 +73,7 @@ RUST-17 (Low) was shown by lane V6 and fixed: rebuilds from the stream path had 
 
 ## 5. Experiments, examples, CI and docs
 
-| ID | Also known as | Priority | Issue | Checked |
-|---|---|---|---|---|
+None open after wave AB: X02 and X09 are closed (lanes AB6 and AB3), and the rest were closed in waves V and W. The table above was recounted from the rows on Nov 20, 2026: before this it gave the training SDK one P2 row more than it listed.
 
 ## 6. Parts of closed findings, and where the two reviews disagree
 
