@@ -121,6 +121,12 @@
 //! in every state, survive a restart, and go only when a newer attempt owns the rank. A run whose
 //! ranks are all stopped or finished reads `capture_stopped`; with another rank active, `degraded`.
 //!
+//! The beat also says the last step the session committed before it stopped
+//! (`capture_stopped_step`, `DETECTOR_RULES_CONTRACT.md` part 7): the entry's `capture_stopped`
+//! holds it as `step`, beside `reason`, kept with the reason and over a restart. Step 0 and null
+//! (none committed) are different values, and a beat from a sender older than the key gives no
+//! `step` key at all.
+//!
 //! # Dropped rows
 //!
 //! Rows the ingest drops because a key of theirs is null (RS10) are counted per rank in the rank's
@@ -341,10 +347,16 @@ pub struct Progress {
     dropped_rows: BTreeMap<String, u64>,
     /// Batches refused because a key column was missing or of another type (RS10), by the column.
     refused_batches: BTreeMap<String, u64>,
-    /// The owner attempt's capture stopped (contract 3), its reason and since when the server saw
-    /// it. Kept whatever state the rank reads, until a newer attempt owns the rank.
-    capture_stopped: Option<(String, Instant)>,
+    /// The owner attempt's capture stopped (contract 3), its reason, since when the server saw
+    /// it, and the last step committed before it stopped as the beat said it ([`StoppedAt`]).
+    /// Kept whatever state the rank reads, until a newer attempt owns the rank.
+    capture_stopped: Option<(String, Instant, StoppedAt)>,
 }
+
+/// The last step a session committed before its capture stopped, as its heartbeat said it
+/// (`capture_stopped_step`, part 7): None from a sender older than the key, which says nothing,
+/// `Some(None)` when it committed none, `Some(Some(step))` otherwise. Step 0 is a step.
+pub type StoppedAt = Option<Option<i64>>;
 
 impl Progress {
     fn new(now: Instant) -> Self {
@@ -781,7 +793,9 @@ impl Progress {
                     .take(CAPTURE_REASON_CHARS)
                     .collect();
                 let since = stopped.get("seconds").and_then(seconds).unwrap_or(0.0);
-                (reason, ago(now, since))
+                // The three states of the step as the status held them: no key, null, a step.
+                let step = stopped.get("step").map(Value::as_i64);
+                (reason, ago(now, since), step)
             }),
         })
         .map(|mut progress| {
@@ -1112,9 +1126,16 @@ impl Watchdog {
     /// capture. The stack it kept is dropped: once capture stops, a work counter that stands still
     /// says nothing of where training is.
     pub fn capture_stopped(&self, key: &Key, reason: &str, now: Instant) {
+        self.capture_stopped_at(key, reason, None, now);
+    }
+
+    /// [`capture_stopped`](Self::capture_stopped) with the step the beat said capture stopped at
+    /// ([`StoppedAt`]), kept with the first reason: the step a session committed last does not
+    /// change once it has stopped.
+    pub fn capture_stopped_at(&self, key: &Key, reason: &str, step: StoppedAt, now: Instant) {
         self.with(key, now, |p| {
             if p.capture_stopped.is_none() {
-                p.capture_stopped = Some((reason.chars().take(CAPTURE_REASON_CHARS).collect(), now));
+                p.capture_stopped = Some((reason.chars().take(CAPTURE_REASON_CHARS).collect(), now, step));
             }
             p.stack = None;
         });
@@ -1413,11 +1434,14 @@ pub fn run_status(
                     json!(p.refused_batches.values().fold(0u64, |sum, batches| sum.saturating_add(*batches)));
                 entry["refused_batch_keys"] = json!(p.refused_batches);
             }
-            if let Some((reason, since)) = &p.capture_stopped {
+            if let Some((reason, since, step)) = &p.capture_stopped {
                 entry["capture_stopped"] = json!({
                     "reason": reason,
                     "seconds": (now.saturating_duration_since(*since).as_secs_f64() * 10.0).round() / 10.0,
                 });
+                if let Some(step) = step {
+                    entry["capture_stopped"]["step"] = json!(step);
+                }
             }
             if let Some(stack) = &p.stack {
                 entry["stack"] = stack.clone();
@@ -1870,6 +1894,8 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
 
 #[cfg(test)]
 mod lane_ad2_tests;
+#[cfg(test)]
+mod lane_ad8_tests;
 
 #[cfg(test)]
 mod tests {

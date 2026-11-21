@@ -32,7 +32,10 @@
 //!   known only once it has lasted `SPIKE_SUSTAIN` recorded steps and is dated at the
 //!   first of them. Python then looks back for what was logged on that step; here it is
 //!   read when the excursion begins and kept with it. An incident, once made, is never
-//!   replaced or dated again, so a prefix and the whole run agree on it.
+//!   replaced or dated again, so a prefix and the whole run agree on it. A router flagged
+//!   since its first sample at step 0 is the same: its `moe_imbalance` is made on its tenth
+//!   flagged sample and dated at the first (`DETECTOR_RULES_CONTRACT.md` part 3), with what
+//!   was logged there, kept from that row.
 //!
 //! - *The per-step MoE samples.* Python lists a sample for every record and every router the
 //!   run ever recorded, sized by the most experts that router ever had. A stream learns both
@@ -76,6 +79,10 @@ mod lane_ab2_tests;
 #[cfg(test)]
 mod lane_ac2_tests;
 #[cfg(test)]
+mod lane_ad8_score_tests;
+#[cfg(test)]
+mod lane_ad8_tests;
+#[cfg(test)]
 mod lane_v7_tests;
 #[cfg(test)]
 mod lane_w3_tests;
@@ -96,6 +103,9 @@ pub const DIVERSITY_DROP: f64 = 0.6;
 pub const OVERLOAD_JUMP: f64 = 0.25;
 pub const OVERLOAD_MIN_HISTORY: usize = 10;
 pub const OVERLOAD_WINDOW: usize = 50;
+/// Samples a router may stay flagged in the state it started in before it is reported
+/// (`DETECTOR_RULES_CONTRACT.md`, part 3).
+pub const START_GRACE: u32 = 10;
 pub const SPIKE_FACTOR: f64 = 5.0;
 pub const SPIKE_WINDOW: usize = 50;
 pub const SPIKE_MIN_HISTORY: usize = 10;
@@ -112,6 +122,10 @@ pub const ACT_WINDOW: usize = 50;
 pub const ACT_MIN_HISTORY: usize = 10;
 pub const ACT_DRIFT_FACTOR: f64 = 3.0;
 pub const ACT_RECENT: usize = 10;
+/// The records a module needs before `activation_drift` judges it (`DETECTOR_RULES_CONTRACT.md`,
+/// part 2): its last `ACT_RECENT` against the `ACT_WINDOW` before those, which then hold none of
+/// its first `ACT_WINDOW` records.
+pub const ACT_DRIFT_NEEDS: usize = 2 * ACT_WINDOW + ACT_RECENT;
 pub const ACT_DEAD_RISE: f64 = 0.25;
 pub const STALL_STEPS: u32 = 3;
 /// Onsets listed in one `stalled_weights` incident; `onsets_omitted` counts the rest.
@@ -300,7 +314,8 @@ pub const RECORDS_NEEDED: [(&str, u64); 26] = [
     // A pass of two different batches, and the next pass matching both.
     ("epoch_order_repeated", 4),
     ("activation_spike", ACT_MIN_HISTORY as u64 + 1),
-    ("activation_drift", (ACT_WINDOW + ACT_RECENT) as u64),
+    // A module's 110th record: the trailing baseline then holds none of its first 50.
+    ("activation_drift", ACT_DRIFT_NEEDS as u64),
     ("dead_activations", (ACT_WINDOW + ACT_RECENT) as u64),
     ("attention_collapse", (ATTN_MIN_HISTORY + ATTN_SUSTAIN) as u64),
     ("attention_uniform", (ATTN_MIN_HISTORY + ATTN_SUSTAIN) as u64),
@@ -508,6 +523,60 @@ fn median(values: &mut [f64]) -> f64 {
             .max_by(f64::total_cmp)
             .expect("an even length is at least two");
         (low + *middle) / 2.0
+    }
+}
+
+/// Earlier finite values a score needs (`DETECTOR_RULES_CONTRACT.md`, part 1).
+pub const SCORE_MIN: usize = 10;
+/// The MAD times this is the spread a score is in units of: a standard deviation, for normal data.
+pub const SCORE_SCALE: f64 = 1.4826;
+
+/// The score beside a ratio (part 1): how far `value` is from the median of the earlier values,
+/// in units of `SCORE_SCALE` times their median absolute deviation. The earlier values are the
+/// ones the ratio's baseline was taken over; one that is not finite does not count.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Score {
+    Number(f64),
+    /// Fewer than `SCORE_MIN` finite earlier values.
+    ShortHistory,
+    /// More than half the earlier values are one value: the MAD is 0, and nothing is divided by it.
+    NoDispersion,
+}
+
+impl Score {
+    /// The score of `value` against `earlier`, with the arithmetic in the reference's order: the
+    /// median as `_median` takes it, the MAD as the median of the absolute distances from it.
+    pub(crate) fn of(value: f64, earlier: impl IntoIterator<Item = f64>, scratch: &mut Vec<f64>) -> Self {
+        scratch.clear();
+        scratch.extend(earlier.into_iter().filter(|value| value.is_finite()));
+        if scratch.len() < SCORE_MIN {
+            return Self::ShortHistory;
+        }
+        let centre = median(scratch);
+        for value in scratch.iter_mut() {
+            *value = (*value - centre).abs();
+        }
+        let spread = median(scratch);
+        if spread == 0.0 {
+            return Self::NoDispersion;
+        }
+        Self::Number((value - centre) / (SCORE_SCALE * spread))
+    }
+
+    /// Puts `score` on `hit`, and `score_note` when there is no number: a null score is never 0
+    /// and never left out.
+    pub(crate) fn put(self, hit: &mut Value) {
+        match self {
+            Self::Number(score) => hit["score"] = json!(score),
+            Self::ShortHistory | Self::NoDispersion => {
+                hit["score"] = Value::Null;
+                hit["score_note"] = json!(if self == Self::ShortHistory {
+                    "short_history"
+                } else {
+                    "no_dispersion"
+                });
+            }
+        }
     }
 }
 
@@ -1061,6 +1130,29 @@ struct Router {
     /// The most experts any of its recorded counts had: the size of the sample it is given
     /// on a step that recorded nothing for it (Python's `_router_sizes`).
     largest: usize,
+    /// Where it stands against the starting-state rule (part 3).
+    leading: Leading,
+}
+
+/// A router against the starting-state rule (part 3). Only its judged samples (counts that sum
+/// to more than 0) count.
+#[derive(Default)]
+enum Leading {
+    /// No judged sample yet.
+    #[default]
+    Unknown,
+    /// Its first judged sample was at step 0 and every one since was flagged: it is in the state
+    /// it started in, `samples` of them so far, fewer than `START_GRACE`. `first` is the first
+    /// sample as an incident names it, and `scalars` what was logged on that step: an incident
+    /// made later is dated there.
+    Started {
+        samples: u32,
+        first: Value,
+        scalars: Option<Value>,
+    },
+    /// Judged as before the rule: its first sample was not at step 0, or the leading run ended,
+    /// or it reached `START_GRACE`.
+    Judged,
 }
 
 impl Router {
@@ -1230,7 +1322,7 @@ struct Moe {
 }
 
 impl Moe {
-    fn row(&mut self, step: i64, columns: &Columns, row: usize, options: &Thresholds) {
+    fn row(&mut self, step: i64, columns: &Columns, row: usize, options: &Thresholds, scalars: &mut Scalars) {
         if let Some(kept) = &mut self.kept {
             kept.rows.push((step, kept.samples.len()));
         }
@@ -1397,8 +1489,8 @@ impl Moe {
                 self.flagged_samples += 1;
                 self.last_flagged_step = Some(step);
             }
-            if flagged && self.first.is_none() {
-                self.first = Some(json!({
+            let sample = || {
+                json!({
                     "kind": "moe_imbalance",
                     "step": step,
                     "layer": index + 1,
@@ -1406,7 +1498,52 @@ impl Moe {
                     "diversity": diversity,
                     "overloaded": overloaded,
                     "dead": dead,
-                }));
+                })
+            };
+            // The starting-state rule (part 3): a router flagged from its first sample at step 0
+            // is reported once that leading run reaches `START_GRACE` samples, dated at its first
+            // sample; a flagged sample after the run has ended is reported as before. Routers are
+            // read in layer order, so of two that become reportable on one row the lower layer is
+            // the incident, and the first row with any is the one that could be reported first.
+            let reportable = match &mut router.leading {
+                Leading::Unknown if flagged && step == 0 => {
+                    router.leading = Leading::Started {
+                        samples: 1,
+                        first: sample(),
+                        scalars: if self.first.is_none() {
+                            scalars.context(columns, row)
+                        } else {
+                            None
+                        },
+                    };
+                    None
+                }
+                Leading::Started { samples, .. } if flagged => {
+                    *samples += 1;
+                    if *samples < START_GRACE {
+                        None
+                    } else {
+                        let Leading::Started { first, scalars, .. } = std::mem::take(&mut router.leading) else {
+                            unreachable!("the router is in its starting state")
+                        };
+                        router.leading = Leading::Judged;
+                        let mut first = first;
+                        first["since_start"] = json!(true);
+                        first["reportable_step"] = json!(step);
+                        if let Some(scalars) = scalars {
+                            first["scalars"] = scalars;
+                        }
+                        Some(first)
+                    }
+                }
+                Leading::Unknown | Leading::Started { .. } => {
+                    router.leading = Leading::Judged;
+                    flagged.then(sample)
+                }
+                Leading::Judged => flagged.then(sample),
+            };
+            if self.first.is_none() {
+                self.first = reportable;
             }
             let starved = router.starved(&shared, tokens, &dead, options.starve_window, options.starve_ratio);
             for (expert, window_share) in starved.iter().flatten() {
@@ -1450,6 +1587,19 @@ impl Moe {
             "reason": reason.join("; "),
             "step": step,
         }))
+    }
+
+    /// The routers still in the state they started in when the rows end (part 3): flagged on
+    /// every judged sample since step 0, and fewer than `START_GRACE` of them. Nothing is reported
+    /// for them, and the kind is not checked with enough history.
+    fn starting_state(&self) -> Vec<Value> {
+        self.routers
+            .iter()
+            .filter_map(|router| match &router.leading {
+                Leading::Started { samples, .. } => Some(json!({"router": router.name, "samples": samples})),
+                _ => None,
+            })
+            .collect()
     }
 
     fn incidents(&self, out: &mut Vec<Value>) {
@@ -1588,17 +1738,25 @@ struct Start {
     /// What was logged on that step. The incident is dated here and made later, when the
     /// window the medians come from has moved on, so it is read when the excursion begins.
     scalars: Option<Value>,
+    /// The scores beside the parameter's ratio and the total's (part 1), taken then for the same
+    /// reason, over the windows the two medians came from. None when no incident can follow.
+    score: Option<Score>,
+    total_score: Option<Score>,
 }
 
 impl Start {
     fn parameter(&self) -> Value {
-        json!({
+        let mut parameter = json!({
             "name": self.name,
             "grad_norm": self.norm,
             "baseline": self.usual,
             "ratio": self.norm / self.usual,
             "rising_since": self.step,
-        })
+        });
+        if let Some(score) = self.score {
+            score.put(&mut parameter);
+        }
+        parameter
     }
 }
 
@@ -1695,29 +1853,49 @@ impl Gradients {
                     self.spike_steps.push(step);
                 }
                 if self.first.is_none() {
-                    self.first = Some(json!({
+                    let mut first = json!({
                         "kind": "grad_spike",
                         "step": step,
                         "grad_norm": total,
                         "baseline": baseline,
                         "ratio": total / baseline,
                         "parameters": self.spiking_parameters(step, columns, row),
-                    }));
+                    });
+                    Score::of(total, self.totals.iter().copied(), &mut self.scratch).put(&mut first);
+                    self.first = Some(first);
                 }
             }
         }
+        // The total joins the window after this row's parameters are read: an excursion that
+        // begins here takes its score over the totals the baseline was taken over.
+        self.parameters_row(step, total, total_baseline, columns, row, scalars);
         self.seen += 1;
         self.totals.push_back(total);
         if self.totals.len() > SPIKE_WINDOW {
             self.totals.pop_front();
         }
+    }
+
+    /// One parameter on its own (Python's `_Baseline` path): the rest of [`row`](Self::row),
+    /// before the row's total joins the window.
+    fn parameters_row(
+        &mut self,
+        step: i64,
+        total: f64,
+        total_baseline: Option<f64>,
+        columns: &Columns,
+        row: usize,
+        scalars: &mut Scalars,
+    ) {
         let Some(norms) = &columns.grad_norms else { return };
         let entries = norms.row(row);
         let first_entry = entries.start;
         // The parameters whose own norm has now stayed high for `SPIKE_SUSTAIN` recorded steps.
         let mut lasted: Vec<Start> = Vec::new();
-        // This row's logged values, read once if an excursion begins here and no incident exists.
+        // This row's logged values, read once if an excursion begins here and no incident exists,
+        // and the total's score, worked out once for the same.
         let mut logged: Option<Option<Value>> = None;
+        let mut total_score: Option<Score> = None;
         for entry in entries {
             if norms.values.is_null(entry) || !norms.values.value(entry).is_finite() {
                 continue;
@@ -1736,11 +1914,18 @@ impl Gradients {
                 let usual = median(&mut self.scratch);
                 if usual > 0.0 && norm >= SPIKE_FACTOR * usual {
                     if parameter.run == 0 {
-                        let scalars = if self.first.is_some() {
-                            None // the incident is made already: no later excursion is reported
-                        } else {
+                        // The incident is made already: no later excursion is reported.
+                        let open = self.first.is_none();
+                        let scalars = if open {
                             logged.get_or_insert_with(|| scalars.context(columns, row)).clone()
+                        } else {
+                            None
                         };
+                        let score = open.then(|| Score::of(norm, parameter.usual.iter().copied(), &mut self.scratch));
+                        let total_score = open.then(|| {
+                            *total_score
+                                .get_or_insert_with(|| Score::of(total, self.totals.iter().copied(), &mut self.scratch))
+                        });
                         parameter.start = Some(Start {
                             step,
                             total,
@@ -1749,6 +1934,8 @@ impl Gradients {
                             norm,
                             usual,
                             scalars,
+                            score,
+                            total_score: total_score.filter(|_| total_baseline.is_some()),
                         });
                     }
                     parameter.run += 1;
@@ -1788,6 +1975,10 @@ impl Gradients {
             "trigger": "parameter",
             "sustained": SPIKE_SUSTAIN,
         });
+        // The score is beside the ratio: there is none without one.
+        if let Some(score) = start.total_score.filter(|_| ratio.is_some()) {
+            score.put(&mut first);
+        }
         if let Some(scalars) = &start.scalars {
             first["scalars"] = scalars.clone();
         }
@@ -1834,11 +2025,10 @@ impl Gradients {
                 }
             }
             let ratio = norm / baseline;
-            found.push((
-                rising,
-                ratio,
-                json!({"name": name, "grad_norm": norm, "baseline": baseline, "ratio": ratio, "rising_since": rising}),
-            ));
+            let mut parameter =
+                json!({"name": name, "grad_norm": norm, "baseline": baseline, "ratio": ratio, "rising_since": rising});
+            Score::of(norm, past.iter().map(|(_, norm)| *norm), &mut self.scratch).put(&mut parameter);
+            found.push((rising, ratio, parameter));
         }
         found.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1))); // stable, as Python's sort
         found.into_iter().take(10).map(|(_, _, parameter)| parameter).collect()
@@ -1863,6 +2053,8 @@ struct UpdateRow {
     own: Vec<(String, f64)>,
     /// Each parameter's gradient norm (`grad_norms`; a null one as NaN), or None with none.
     grads: Option<Vec<(String, f64)>>,
+    /// The row's learning rates, as `_lr_values` reads them: an incident's `lr_before` (part 4).
+    lr: Option<Vec<f64>>,
 }
 
 /// Python's `detect_update_spikes` and `update_not_read_not_checked`.
@@ -1995,7 +2187,7 @@ impl Updates {
                                 json!({"name": name, "update_rms": size, "previous": was, "change": change})
                             })
                             .collect();
-                        self.first = Some(json!({
+                        let mut first = json!({
                             "kind": "update_spike",
                             "step": step,
                             "update_rms": largest,
@@ -2007,7 +2199,16 @@ impl Updates {
                             "grad_norm_before": then,
                             "grad_rise": rise,
                             "parameters": parameters,
-                        }));
+                        });
+                        // The learning rate at the flagged step and at the step it was compared
+                        // with, each only when that record carries one (part 4). No rule reads it.
+                        if let Some(lr) = columns.lr(row) {
+                            first["lr"] = json!(lr);
+                        }
+                        if let Some(lr) = &before.lr {
+                            first["lr_before"] = json!(lr);
+                        }
+                        self.first = Some(first);
                     }
                 } else {
                     // Every change that is not flagged joins the baseline, whether or not the
@@ -2023,6 +2224,7 @@ impl Updates {
             total,
             own,
             grads,
+            lr: columns.lr(row),
         });
     }
 
@@ -2296,10 +2498,19 @@ fn python_str(value: &Value) -> String {
 #[derive(Default)]
 struct Module {
     seen: usize,
-    /// The last `ACT_WINDOW` records, as (std, abs_max, zero_frac).
+    /// The last `ACT_WINDOW + ACT_RECENT` records, as (std, abs_max, zero_frac): the trailing
+    /// baseline of `activation_drift` and the last `ACT_RECENT`. `activation_spike` reads the
+    /// last `ACT_WINDOW` of them.
     recent: VecDeque<(f64, f64, f64)>,
-    /// The medians of the first `ACT_WINDOW` records: std, abs_max / std, zero_frac.
-    baseline: Option<(f64, f64, f64)>,
+    /// The median zero fraction of the first `ACT_WINDOW` records: `dead_activations`' baseline.
+    baseline_zero: Option<f64>,
+}
+
+impl Module {
+    /// The `ACT_WINDOW` records before this one, of the module: `activation_spike`'s window.
+    fn spike_window(&self) -> impl Iterator<Item = &(f64, f64, f64)> {
+        self.recent.iter().skip(self.recent.len().saturating_sub(ACT_WINDOW))
+    }
 }
 
 /// Python's `outlier`: the median of abs_max / std over the rows whose std is positive.
@@ -2313,6 +2524,56 @@ fn outlier<'a>(rows: impl Iterator<Item = &'a (f64, f64, f64)>, scratch: &mut Ve
         return 0.0;
     }
     median(scratch)
+}
+
+/// `activation_drift` on one module from its `ACT_DRIFT_NEEDS`th record (part 2): the median of
+/// its last `ACT_RECENT` records against the median of the `ACT_WINDOW` before those, for `std`
+/// and then for `abs_max / std`, at `ACT_DRIFT_FACTOR` times up or down. `recent` holds exactly
+/// those `ACT_WINDOW + ACT_RECENT` records, the newest last.
+fn drift(name: &str, recent: &VecDeque<(f64, f64, f64)>, scratch: &mut Vec<f64>) -> Option<Value> {
+    let trail = || recent.iter().take(ACT_WINDOW);
+    let last = || recent.iter().skip(ACT_WINDOW);
+    let ratio = |past: &(f64, f64, f64)| (past.0 > 0.0).then(|| past.1 / past.0);
+    for stat in ["std", "abs_max/std"] {
+        let ((low_base, high_base), (low_now, high_now)) = if stat == "std" {
+            (bounds(trail().map(|past| past.0)), bounds(last().map(|past| past.0)))
+        } else {
+            (bounds(trail().filter_map(ratio)), bounds(last().filter_map(ratio)))
+        };
+        // A median lies between the lowest and highest of its values. When no recent value is
+        // ACT_DRIFT_FACTOR from any baseline value the medians are not either, and are not worked
+        // out. With no ratio on either side (no positive `std`) a median is 0 and nothing is judged.
+        if low_base == f64::INFINITY || low_now == f64::INFINITY {
+            continue;
+        }
+        if low_base > 0.0
+            && low_now > 0.0
+            && high_now / low_base < ACT_DRIFT_FACTOR
+            && high_base / low_now < ACT_DRIFT_FACTOR
+        {
+            continue;
+        }
+        let (base, now) = if stat == "std" {
+            scratch.clear();
+            scratch.extend(trail().map(|past| past.0));
+            let base = median(scratch);
+            scratch.clear();
+            scratch.extend(last().map(|past| past.0));
+            (base, median(scratch))
+        } else {
+            (outlier(trail(), scratch), outlier(last(), scratch))
+        };
+        if base > 0.0 && now > 0.0 && (now / base).max(base / now) >= ACT_DRIFT_FACTOR {
+            let mut hit = json!({"module": name, "stat": stat, "baseline": base, "recent": now, "ratio": now / base});
+            if stat == "std" {
+                Score::of(now, trail().map(|past| past.0), scratch).put(&mut hit);
+            } else {
+                Score::of(now, trail().filter_map(ratio), scratch).put(&mut hit);
+            }
+            return Some(hit);
+        }
+    }
+    None
 }
 
 #[derive(Default)]
@@ -2335,77 +2596,49 @@ impl Activations {
             let module = self.modules.slot(position, name);
             if module.seen >= ACT_MIN_HISTORY {
                 for (stat, now, pick) in [("abs_max", abs_max, 1), ("std", std, 0)] {
+                    let of = |past: &(f64, f64, f64)| if pick == 1 { past.1 } else { past.0 };
                     // The median is at least the lowest value: below the factor times
                     // that, nothing can be a spike and the median is not needed.
-                    let (lowest, _) = bounds(module.recent.iter().map(|past| if pick == 1 { past.1 } else { past.0 }));
+                    let (lowest, _) = bounds(module.spike_window().map(of));
                     if now < ACT_SPIKE_FACTOR * lowest {
                         continue;
                     }
                     scratch.clear();
-                    scratch.extend(module.recent.iter().map(|past| if pick == 1 { past.1 } else { past.0 }));
+                    scratch.extend(module.spike_window().map(of));
                     let base = median(scratch);
                     if base > 0.0 && now >= ACT_SPIKE_FACTOR * base {
                         let ratio = now / base;
-                        spikes.push((
-                            ratio,
-                            json!({"module": name, "stat": stat, "value": now, "baseline": base, "ratio": ratio}),
-                        ));
+                        let mut hit =
+                            json!({"module": name, "stat": stat, "value": now, "baseline": base, "ratio": ratio});
+                        Score::of(now, module.spike_window().map(of), scratch).put(&mut hit);
+                        spikes.push((ratio, hit));
                         break;
                     }
                 }
             }
             module.seen += 1;
             module.recent.push_back((std, abs_max, zero_frac));
-            if module.recent.len() > ACT_WINDOW {
+            if module.recent.len() > ACT_WINDOW + ACT_RECENT {
                 module.recent.pop_front();
             }
             if module.seen == ACT_WINDOW {
                 // The first ACT_WINDOW records never change again: summarize them once.
-                let column = |pick: fn(&(f64, f64, f64)) -> f64, scratch: &mut Vec<f64>| {
-                    scratch.clear();
-                    scratch.extend(module.recent.iter().map(pick));
-                    median(scratch)
-                };
-                let base_std = column(|past| past.0, scratch);
-                let base_zero = column(|past| past.2, scratch);
-                module.baseline = Some((base_std, outlier(module.recent.iter(), scratch), base_zero));
+                scratch.clear();
+                scratch.extend(module.recent.iter().map(|past| past.2));
+                module.baseline_zero = Some(median(scratch));
+            }
+            if module.seen >= ACT_DRIFT_NEEDS {
+                if let Some(hit) = drift(name, &module.recent, scratch) {
+                    drifts.push(hit);
+                }
             }
             if module.seen < ACT_WINDOW + ACT_RECENT {
                 continue;
             }
-            let Some((base_std, base_outlier, base_zero)) = module.baseline else {
+            let Some(base_zero) = module.baseline_zero else {
                 continue;
             };
             let last = || module.recent.iter().skip(module.recent.len() - ACT_RECENT);
-            // A recent median lies between the lowest and highest recent values. When
-            // neither is ACT_DRIFT_FACTOR away from the baseline the median is not either,
-            // and it is not worked out.
-            for stat in ["std", "abs_max/std"] {
-                let ratios = || last().filter(|past| past.0 > 0.0).map(|past| past.1 / past.0);
-                let (base, (lowest, highest)) = if stat == "std" {
-                    (base_std, bounds(last().map(|past| past.0)))
-                } else {
-                    (base_outlier, bounds(ratios()))
-                };
-                if base <= 0.0
-                    || (lowest > 0.0 && highest / base < ACT_DRIFT_FACTOR && base / lowest < ACT_DRIFT_FACTOR)
-                {
-                    continue;
-                }
-                let now = if stat == "std" {
-                    scratch.clear();
-                    scratch.extend(last().map(|past| past.0));
-                    median(scratch)
-                } else {
-                    outlier(last(), scratch)
-                };
-                if now > 0.0 && (now / base).max(base / now) >= ACT_DRIFT_FACTOR {
-                    drifts.push(
-                        json!({"module": name, "stat": stat, "baseline": base, "recent": now, "ratio": now / base}),
-                    );
-                    break;
-                }
-            }
             let (_, highest_zero) = bounds(last().map(|past| past.2));
             if highest_zero - base_zero >= ACT_DEAD_RISE {
                 scratch.clear();
@@ -2617,6 +2850,9 @@ struct Onset {
     baseline_probes: usize,
     heads: usize,
     scalars: Option<Value>,
+    /// The score beside the ratio (part 1), over the probes of the baseline. They are at most
+    /// `ATTN_WINDOW`, fewer than `SCORE_MIN`, so it is always `short_history`.
+    score: Score,
 }
 
 /// Python's `_AttentionSeries`: a module's share or logit, its baseline of probes that met no
@@ -2727,6 +2963,7 @@ impl Attention {
                                 baseline_probes: series.baseline.len(),
                                 heads: stats.heads,
                                 scalars: None,
+                                score: Score::of(value, series.baseline.iter().copied(), &mut self.scratch),
                             },
                         ),
                     };
@@ -2749,6 +2986,7 @@ impl Attention {
                             hit["rise"] = json!(onset.value - onset.baseline);
                         } else {
                             hit["ratio"] = json!(onset.value / onset.baseline);
+                            onset.score.put(&mut hit);
                         }
                         hit["baseline_probes"] = json!(onset.baseline_probes);
                         hit["heads"] = json!(onset.heads);
@@ -3158,6 +3396,9 @@ impl SkippedUpdates {
 /// section 2): those judged from the total gradient norm, which leaves the unread parameter out.
 /// `non_finite` and `stalled_weights` are judged from what was read and stay `checked`.
 pub const GRADS_NOT_READ_KINDS: [&str; 1] = ["grad_spike"];
+/// The kind that stays `checked` for the parameters read and names the others under
+/// `parameters_not_judged` (`DETECTOR_RULES_CONTRACT.md`, part 5).
+pub const GRADS_NOT_READ_NAMED: &str = "stalled_weights";
 
 /// Parameters whose gradient the capture could not read (`grads_not_read`, said once on a record
 /// with why): Python's `grads_not_read_not_checked`.
@@ -3199,6 +3440,73 @@ impl GradsNotRead {
             "reason": format!("gradient not read for {}", reason.join("; ")),
             "step": step,
         }))
+    }
+}
+
+// --- unread layers and the routing's source (part 7) ---------------------------------------
+
+/// The kinds judged from layer statistics: what a capture that read no module leaves
+/// `unavailable`, and what names the modules it did not judge when some were read.
+pub const LAYER_KINDS: [&str; 3] = ["activation_spike", "activation_drift", "dead_activations"];
+
+/// Two notes a capture says once on a record, in `extra_json` (`DETECTOR_RULES_CONTRACT.md`,
+/// part 7): `layers_not_read`, the modules it cannot read at all with why, and `moe_source`, for
+/// each router how the routing reached it and where it was taken.
+#[derive(Default)]
+struct CaptureNotes {
+    /// Module -> (the step that first named it, why).
+    layers_not_read: BTreeMap<String, (i64, String)>,
+    /// Router -> its `moe_source` entry as first recorded.
+    moe_source: BTreeMap<String, Value>,
+}
+
+impl CaptureNotes {
+    fn row(&mut self, step: i64, columns: &Columns, row: usize) {
+        // Both travel in `extra_json`, which is parsed only on a row that names one.
+        let Some(extra) = text(columns.extra, row)
+            .filter(|extra| extra.contains("\"layers_not_read\"") || extra.contains("\"moe_source\""))
+        else {
+            return;
+        };
+        let Ok(Value::Object(extra)) = serde_json::from_str::<Value>(extra) else {
+            return;
+        };
+        for (name, why) in extra
+            .get("layers_not_read")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            let why = why.as_str().map_or_else(|| why.to_string(), str::to_owned);
+            self.layers_not_read.entry(name.clone()).or_insert((step, why));
+        }
+        for (router, source) in extra.get("moe_source").and_then(Value::as_object).into_iter().flatten() {
+            self.moe_source.entry(router.clone()).or_insert_with(|| source.clone());
+        }
+    }
+
+    /// The `layers` entry of `not_checked`. `coverage` is `partial` when some module was read on
+    /// some record (`read`): the activation kinds stay checked for what was read, and name the
+    /// others. It is `none` when no module was read on any record: the entry lists those kinds,
+    /// which are then `unavailable`, since nothing was looked at.
+    fn layers_not_checked(&self, read: bool) -> Option<Value> {
+        let step = self.layers_not_read.values().map(|(step, _)| *step).min()?;
+        let reason: Vec<String> = self
+            .layers_not_read
+            .iter()
+            .map(|(name, (_, why))| format!("{name}: {why}"))
+            .collect();
+        let mut entry = json!({
+            "check": "layers",
+            "coverage": if read { "partial" } else { "none" },
+            "modules": self.layers_not_read.keys().collect::<Vec<_>>(),
+            "reason": format!("layer not read: {}", reason.join("; ")),
+            "step": step,
+        });
+        if !read {
+            entry["kinds"] = json!(LAYER_KINDS);
+        }
+        Some(entry)
     }
 }
 
@@ -3713,6 +4021,7 @@ pub struct RankDetectors {
     non_finite: NonFinite,
     skipped_updates: SkippedUpdates,
     grads_not_read: GradsNotRead,
+    notes: CaptureNotes,
     replica_drift: ReplicaDrift,
     system: System,
     attempts: Attempts,
@@ -3787,7 +4096,7 @@ impl RankDetectors {
                 text(columns.layers, row).and_then(|layers| serde_json::from_str(layers).ok());
             let layers = layers.as_ref().map_or(&[][..], |layers| &layers.0);
             self.inputs.row(&columns, row, !layers.is_empty(), data.is_some());
-            self.moe.row(step, &columns, row, &self.thresholds);
+            self.moe.row(step, &columns, row, &self.thresholds, &mut self.scalars);
             self.gradients.row(step, &columns, row, &mut self.scalars);
             self.updates
                 .row(self.attempt, step, &columns, row, self.thresholds.update_window);
@@ -3796,6 +4105,7 @@ impl RankDetectors {
             self.loss_scale.row(step, &columns, row, skipped_by);
             self.skipped_updates.row(step, &columns, row, skipped_by, carried);
             self.grads_not_read.row(step, &columns, row);
+            self.notes.row(step, &columns, row);
             self.activations.row(step, layers);
             self.attention.row(step, &columns, row, &mut self.scalars);
             self.head.row(step, &columns, row);
@@ -3835,9 +4145,10 @@ impl RankDetectors {
                     ];
                     for (first, was) in firsts.into_iter().zip(before.0) {
                         if let (Some(first), false) = (first, was) {
-                            // One parameter's spike is dated at an earlier step and carries
-                            // what was logged there, not what is logged on this row.
-                            if first.get("trigger").is_none() {
+                            // One parameter's spike, and a router collapsed since its start, is
+                            // dated at an earlier step and carries what was logged there, not
+                            // what is logged on this row.
+                            if first.get("trigger").is_none() && first.get("since_start").is_none() {
                                 first["scalars"] = context.clone();
                             }
                         }
@@ -3964,6 +4275,12 @@ impl RankDetectors {
         self.skipped_updates.report()
     }
 
+    /// The capture's `moe_source` as recorded (part 7), each router's first, or None when no
+    /// record said one: written in the report after `head_trends`.
+    pub fn moe_source(&self) -> Option<Value> {
+        (!self.notes.moe_source.is_empty()).then(|| json!(self.notes.moe_source))
+    }
+
     /// The rank's `checkpoint_tensors` (`CHECKPOINT_TENSOR_CONTRACT.md`, section 4), present only
     /// when a judged resume's load recorded `tensors` that was compared or unavailable: written in
     /// the report after `skipped_updates`.
@@ -3994,6 +4311,7 @@ impl RankDetectors {
         out.extend(self.moe.refused_not_checked());
         out.extend(self.updates.not_read_not_checked());
         out.extend(self.grads_not_read.not_checked());
+        out.extend(self.notes.layers_not_checked(self.inputs.layers > 0));
         out
     }
 
@@ -4068,6 +4386,26 @@ impl RankDetectors {
                 .find(|(noted, _)| *noted == kind && entry["value"] == "checked")
             {
                 entry["note"] = json!(note);
+            }
+            let judged = entry["value"] != "unavailable";
+            if kind == "moe_imbalance" {
+                // A router still in the state it started in: nothing is reported for it, and a
+                // short capture must not read as checked with enough history (part 3).
+                let starting = self.moe.starting_state();
+                if !starting.is_empty() {
+                    entry["starting_state"] = json!(starting);
+                    entry["enough_history"] = json!(false);
+                }
+            }
+            if kind == GRADS_NOT_READ_NAMED && judged && !self.grads_not_read.first.is_empty() {
+                // Each parameter on its own history: checked for those read, naming the others
+                // (part 5, `STEP_AND_EVIDENCE_CONTRACT.md` section 2).
+                entry["parameters_not_judged"] = json!(self.grads_not_read.first.keys().collect::<Vec<_>>());
+            }
+            if LAYER_KINDS.contains(&kind) && judged && self.inputs.layers > 0 && !self.notes.layers_not_read.is_empty()
+            {
+                // Some modules read: checked for those, naming the others (part 7).
+                entry["modules_not_judged"] = json!(self.notes.layers_not_read.keys().collect::<Vec<_>>());
             }
             checks.insert(kind.to_string(), entry);
         }
@@ -4280,6 +4618,9 @@ pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64)
         "head_trends": detectors.head_trends(),
         "incidents": detectors.incidents(),
     });
+    if let Some(source) = detectors.moe_source() {
+        report["moe_source"] = source;
+    }
     if let Some(skipped) = detectors.skipped_updates() {
         report["skipped_updates"] = skipped;
     }
@@ -5028,8 +5369,9 @@ mod tests {
         let kinds: Vec<&str> = RECORDS_NEEDED.iter().map(|(kind, _)| *kind).collect();
         assert_eq!(kinds, PORTED);
         // By hand from the rules, not from the constants: evidence.py lists each kind's rules.
+        // `activation_drift` needs 110 (`DETECTOR_RULES_CONTRACT.md` part 2; it needed 60).
         let by_hand: [u64; 26] = [
-            11, 50, 13, 102, 3, 1, 10, 1, 1, 1, 4, 4, 11, 60, 60, 4, 4, 4, 1, 1, 6, 1, 1, 2, 1, 21,
+            11, 50, 13, 102, 3, 1, 10, 1, 1, 1, 4, 4, 11, 110, 60, 4, 4, 4, 1, 1, 6, 1, 1, 2, 1, 21,
         ];
         for ((kind, needed), expected) in RECORDS_NEEDED.iter().zip(by_hand) {
             assert_eq!(*needed, expected, "{kind}");
