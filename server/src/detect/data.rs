@@ -301,20 +301,18 @@ impl DataProgress {
 /// --run` list them as `ranks_compared` whether or not a duplicate is found, so "compared, none
 /// found" can be told from "not compared".
 ///
-/// - One rank with hashed batches: that rank, as always (whether a lone rank should read as
-///   compared is a question left to the author, not changed here).
-/// - Two or more: a rank is listed only when another rank's window holds a hash of a kind
-///   ([`hash_kind`]) its own holds (C16, lane V7, Nov 19, 2026). Until then any rank with a
-///   hashed batch was listed, which claimed a comparison across hash kinds that never happened.
+/// A rank is listed only when it was compared with at least one other: when another rank's window
+/// holds a hash of a kind ([`hash_kind`]) its own holds (C16, lane V7, Nov 19, 2026). Until then any
+/// rank with a hashed batch was listed, which claimed a comparison across hash kinds that never
+/// happened. One rank with hashed batches has no rank to be compared with, so it is not listed and
+/// the list is empty: one rank observed, zero peers compared (`STEP_AND_EVIDENCE_CONTRACT.md`,
+/// section 2; lane AB2, Nov 20, 2026). Until then a lone rank was listed.
 pub fn ranks_compared(ranks: &BTreeMap<i32, BTreeMap<i64, (Option<i64>, String)>>) -> Vec<i32> {
     let kinds: Vec<(i32, BTreeSet<&str>)> = ranks
         .iter()
         .filter(|(_, window)| !window.is_empty())
         .map(|(rank, window)| (*rank, window.values().map(|(_, hash)| hash_kind(hash)).collect()))
         .collect();
-    if kinds.len() < 2 {
-        return kinds.into_iter().map(|(rank, _)| rank).collect();
-    }
     kinds
         .iter()
         .filter(|(rank, own)| {
@@ -775,7 +773,13 @@ impl ResumePass {
             expected.extend(["rng", "data"]);
             for name in expected {
                 if !has(name) {
-                    findings.push(json!({"component": name, "finding": "missing"}));
+                    // Which entry is the model's state is found by a rule over names and keys,
+                    // which can fail to find one that is there: for the model alone that is
+                    // `not_identified` ("model state could not be identified"). `missing` is kept
+                    // for a comparison that knows what the checkpoint should hold (B14, not built),
+                    // and for the other components (`STEP_AND_EVIDENCE_CONTRACT.md`, section 4).
+                    let finding = if name == "model" { "not_identified" } else { "missing" };
+                    findings.push(json!({"component": name, "finding": finding}));
                 }
             }
             let component = |name: &str| {
@@ -968,11 +972,12 @@ mod tests {
             (&document["incidents"], &document["ranks_compared"]),
             (&json!([]), &json!([0, 1]))
         );
-        // One rank, and a rank that hashed nothing: no finding, and not "compared and clean".
+        // One rank, and a rank that hashed nothing: no finding, and not "compared and clean". A
+        // lone hashed rank was compared with no other, so it is not listed (contract section 2).
         let alone = detect_run(&[rows("run", &rank(0, 0..5, 0..0))], &usual()).unwrap();
         assert_eq!(
             (&alone["duplicate_batches"], &alone["ranks_compared"]),
-            (&Value::Null, &json!([0]))
+            (&Value::Null, &json!([]))
         );
         let unhashed: Vec<_> = (0..5)
             .map(|step| (1, 1, step, Some(json!({"batches": 1}).to_string())))
@@ -980,7 +985,7 @@ mod tests {
         let document = detect_run(&[rows("run", &rank(0, 0..5, 0..0)), rows("run", &unhashed)], &usual()).unwrap();
         assert_eq!(
             (&document["ranks"], &document["ranks_compared"]),
-            (&json!([0, 1]), &json!([0]))
+            (&json!([0, 1]), &json!([]))
         );
         assert_eq!(document["duplicate_batches"], Value::Null);
     }

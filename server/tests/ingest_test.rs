@@ -1916,10 +1916,15 @@ async fn the_status_names_the_ranks_whose_batches_were_compared_found_or_not() {
     assert_eq!(compared(&old), serde_json::json!([]));
     rank0.send(data_batch(0, 10..20, own(0)), 2).await;
     assert_eq!(rank0.ack().await, Ok(2));
-    until_within("rank 0 compared", SLOW_BOUND, || {
-        compared(&old) == serde_json::json!([0])
+    // A lone rank with hashes was compared with no other: one rank observed, zero peers compared
+    // (`STEP_AND_EVIDENCE_CONTRACT.md`, section 2; lane AB2). Until then it was listed alone.
+    until_within("rank 0's hashes taken", SLOW_BOUND, || {
+        old.ingest.watchdog_statuses()[RUN]["ranks"]
+            .as_array()
+            .is_some_and(|ranks| ranks.iter().any(|r| r["rank"] == 0 && r["last_step"] == 19))
     })
     .await;
+    assert_eq!(compared(&old), serde_json::json!([]));
     rank1.send(data_batch(1, 0..10, own(1)), 1).await;
     assert_eq!(rank1.ack().await, Ok(1));
     until_within("both ranks compared", SLOW_BOUND, || {
@@ -1948,10 +1953,13 @@ async fn the_status_names_the_ranks_whose_batches_were_compared_found_or_not() {
     let mut rank1 = open_with(&new.address, RUN, 1, None, data_schema()).await;
     rank1.send(data_batch(1, 10..20, own(1)), 2).await;
     assert_eq!(rank1.ack().await, Ok(2));
-    until_within("rank 1 compared", SLOW_BOUND, || {
-        compared(&new) == serde_json::json!([1])
+    until_within("rank 1's hashes taken", SLOW_BOUND, || {
+        new.ingest.watchdog_statuses()[RUN]["ranks"]
+            .as_array()
+            .is_some_and(|ranks| ranks.iter().any(|r| r["rank"] == 1 && r["last_step"] == 19))
     })
     .await;
+    assert_eq!(compared(&new), serde_json::json!([]), "rank 1 alone has no peer");
     // Rank 0 draws rank 1's batches on 20..25: a duplicate, named with the same ranks compared.
     let mut rank0 = open_with(&new.address, RUN, 0, None, data_schema()).await;
     rank1.send(data_batch(1, 20..30, own(1)), 3).await;
@@ -2540,8 +2548,14 @@ async fn a_failed_rebuild_drops_the_ranks_batch_hashes_from_the_comparison() {
     let mut put = open_with(&server.address, RUN, 0, None, data_attempt_schema()).await;
     put.send(data_attempt_batch(1, 0..10), 1).await;
     assert_eq!(put.ack().await, Ok(1));
+    // A lone rank is compared with none (contract section 2, lane AB2): rank 1 hashes too, so rank
+    // 0 is listed while its hashes are held.
+    let mut peer = open_with(&server.address, RUN, 1, None, data_schema()).await;
+    peer.send(data_batch(1, 0..10, |step| Some(format!("b-{step}"))), 1)
+        .await;
+    assert_eq!(peer.ack().await, Ok(1));
     until_within("rank 0 compared", SLOW_BOUND, || {
-        compared(&server) == serde_json::json!([0])
+        compared(&server) == serde_json::json!([0, 1])
     })
     .await;
     status_until(&server, &store, "rank 0 judged", judged).await;
@@ -2559,6 +2573,7 @@ async fn a_failed_rebuild_drops_the_ranks_batch_hashes_from_the_comparison() {
     assert!(!judged(&status), "{}", status["run_state"]);
     store.knobs.fail_gets.store(false, Ordering::SeqCst);
     put.finish().await;
+    peer.finish().await;
 }
 
 // --- Lane V6 (Nov 19, 2026): the server's watchdog and ingest ----------------------------------

@@ -313,3 +313,591 @@ fn the_listed_bytes_count_the_attribution() {
     }
     assert_eq!(bounded.result()["omitted"]["steps"], 1, "{}", bounded.result());
 }
+
+// --- STEP_AND_EVIDENCE_CONTRACT.md ------------------------------------------------------------
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Float64Builder, Int32Array, Int64Array, ListBuilder, MapBuilder, StringArray,
+    StringBuilder,
+};
+use arrow::datatypes::{Field, Schema};
+use arrow::record_batch::RecordBatch;
+
+use super::{judge, report, Thresholds};
+
+fn behaviour() -> serde_json::Map<String, Value> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk/tests/fixtures/behaviour/cases.json");
+    let document: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("the page's cases")).unwrap();
+    document["cases"].as_object().unwrap().clone()
+}
+
+/// A number as the page's records write it: `"nan"`, `"inf"` and `"-inf"` as strings.
+fn number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+/// One rank's records stored as the server stores them (`flight.py`'s `record_to_row`): the keys
+/// with columns of their own in their columns, `layers` and `checkpoint` as JSON text, and every
+/// other key (`step_skipped_by`, `grads_not_read`) in `extra_json`.
+fn stored(records: &[Value], attempt: i64) -> RecordBatch {
+    let n = records.len();
+    let float = |key: &str| -> ArrayRef {
+        Arc::new(Float64Array::from(
+            records.iter().map(|r| r.get(key).and_then(number)).collect::<Vec<_>>(),
+        ))
+    };
+    let mut norms = MapBuilder::new(None, StringBuilder::new(), Float64Builder::new());
+    let mut unchanged = ListBuilder::new(StringBuilder::new());
+    let mut extra = Vec::new();
+    let own = [
+        "step",
+        "grad_norm",
+        "clip_grad_norm",
+        "grad_scale",
+        "step_skipped",
+        "grad_norms",
+        "weights_unchanged",
+        "layers",
+        "checkpoint",
+    ];
+    for record in records {
+        match record.get("grad_norms").and_then(Value::as_object) {
+            Some(table) => {
+                for (name, value) in table {
+                    norms.keys().append_value(name);
+                    norms.values().append_option(number(value));
+                }
+                norms.append(true).unwrap();
+            }
+            None => norms.append(false).unwrap(),
+        }
+        match record.get("weights_unchanged").and_then(Value::as_array) {
+            Some(names) => {
+                for name in names {
+                    unchanged.values().append_value(name.as_str().unwrap());
+                }
+                unchanged.append(true);
+            }
+            None => unchanged.append(false),
+        }
+        let rest: serde_json::Map<String, Value> = record
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| !own.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        extra.push((!rest.is_empty()).then(|| Value::Object(rest).to_string()));
+    }
+    let text = |key: &str| -> ArrayRef {
+        Arc::new(StringArray::from(
+            records
+                .iter()
+                .map(|r| r.get(key).map(Value::to_string))
+                .collect::<Vec<_>>(),
+        ))
+    };
+    let columns: Vec<(&str, ArrayRef)> = vec![
+        ("run_id", Arc::new(StringArray::from(vec!["ab2"; n]))),
+        ("rank", Arc::new(Int32Array::from(vec![0; n]))),
+        ("attempt", Arc::new(Int64Array::from(vec![attempt; n]))),
+        (
+            "step",
+            Arc::new(Int64Array::from_iter_values(
+                records.iter().map(|r| r["step"].as_i64().unwrap()),
+            )),
+        ),
+        ("grad_norm", float("grad_norm")),
+        ("clip_grad_norm", float("clip_grad_norm")),
+        ("grad_scale", float("grad_scale")),
+        (
+            "step_skipped",
+            Arc::new(BooleanArray::from(
+                records
+                    .iter()
+                    .map(|r| r.get("step_skipped").and_then(Value::as_bool))
+                    .collect::<Vec<_>>(),
+            )),
+        ),
+        ("grad_norms", Arc::new(norms.finish())),
+        ("weights_unchanged", Arc::new(unchanged.finish())),
+        ("layers_json", text("layers")),
+        ("checkpoint_json", text("checkpoint")),
+        ("extra_json", Arc::new(StringArray::from(extra))),
+    ];
+    let fields: Vec<Field> = columns
+        .iter()
+        .map(|(name, array)| Field::new(*name, array.data_type().clone(), true))
+        .collect();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns.into_iter().map(|(_, array)| array).collect(),
+    )
+    .unwrap()
+}
+
+/// The rank's report on a case's records, as the server writes it.
+fn judged(records: &[Value]) -> Value {
+    let detectors = judge(0, &[stored(records, 1)], &Arc::new(Thresholds::default())).unwrap();
+    report("ab2", 0, &detectors, 0)
+}
+
+fn incident<'a>(report: &'a Value, kind: &str) -> Option<&'a Value> {
+    report["incidents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["kind"] == kind)
+}
+
+/// Each case of the page that holds records, judged by the server: a pin's detector and what it
+/// gives, or a new case's target (the incidents present and absent, what an incident carries, the
+/// kinds' values, the `not_checked` entries and the evidence's `skipped_updates`). None when it holds.
+fn case_differs(name: &str, body: &Value) -> Option<String> {
+    let records = body.get("records").or(body["given"].get("records"))?.as_array()?;
+    let report = judged(records);
+    let expected = &body["expected"];
+    let mut wrong = Vec::new();
+    if let Some(detector) = body["detector"].as_str() {
+        let kind = match detector {
+            "detect_grad_spikes" => "grad_spike",
+            "detect_non_finite" => "non_finite",
+            "detect_loss_scale_trouble" => "loss_scale_trouble",
+            "detect_stalled_weights" => "stalled_weights",
+            other => panic!("{name}: a detector this test does not know: {other}"),
+        };
+        let found = incident(&report, kind);
+        if expected["fires"] == true {
+            match found {
+                None => wrong.push(format!("no {kind}")),
+                Some(found) => {
+                    for (key, value) in expected.as_object().unwrap().iter().filter(|(key, _)| *key != "fires") {
+                        if &found[key] != value {
+                            wrong.push(format!("{key}: {} expected {value}", found[key]));
+                        }
+                    }
+                }
+            }
+        } else if let Some(found) = found {
+            wrong.push(format!("{kind} raised: {found}"));
+        }
+    }
+    for kind in expected["incident_kinds_present"].as_array().into_iter().flatten() {
+        let kind = kind.as_str().unwrap();
+        match incident(&report, kind) {
+            None => wrong.push(format!("no {kind}")),
+            Some(found) => {
+                for (key, value) in expected["incident_carries"].as_object().into_iter().flatten() {
+                    if &found[key] != value {
+                        wrong.push(format!("{kind}.{key}: {} expected {value}", found[key]));
+                    }
+                }
+            }
+        }
+    }
+    for kind in expected["incident_kinds_absent"].as_array().into_iter().flatten() {
+        if let Some(found) = incident(&report, kind.as_str().unwrap()) {
+            wrong.push(format!("{kind} raised: {found}"));
+        }
+    }
+    for (kind, value) in expected["kind_values"].as_object().into_iter().flatten() {
+        if &report["kind_checks"][kind]["value"] != value {
+            wrong.push(format!("{kind}: {} expected {value}", report["kind_checks"][kind]));
+        }
+    }
+    for wanted in expected["not_checked"].as_array().into_iter().flatten() {
+        let held = report["not_checked"].as_array().unwrap().iter().any(|entry| {
+            wanted
+                .as_object()
+                .unwrap()
+                .iter()
+                .all(|(key, value)| &entry[key] == value)
+        });
+        if !held {
+            wrong.push(format!("no not_checked entry {wanted}: {}", report["not_checked"]));
+        }
+    }
+    for (key, value) in expected["evidence_carries"].as_object().into_iter().flatten() {
+        if &report[key] != value {
+            wrong.push(format!("{key}: {} expected {value}", report[key]));
+        }
+    }
+    for key in expected["evidence_lacks"].as_array().into_iter().flatten() {
+        if report.get(key.as_str().unwrap()).is_some() {
+            wrong.push(format!("{key} is there: {}", report[key.as_str().unwrap()]));
+        }
+    }
+    if let Some(state) = expected.get("run_state") {
+        // The rank's report as the server holds it beside the status (`Ingest::write_report`).
+        let names = |key: &str, of: &str| -> Vec<String> {
+            report[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item[of].as_str())
+                .filter(|check| !matches!(*check, "flight_recorder" | "traincheck"))
+                .map(str::to_string)
+                .collect()
+        };
+        let held = crate::watchdog::RankReport {
+            kinds: names("incidents", "kind"),
+            not_checked: names("not_checked", "check"),
+            attempt: report["attempt"].as_i64().unwrap(),
+            last_step: report["last_step"].as_i64(),
+            behind: false,
+        };
+        let reports = BTreeMap::from([(0, held)]);
+        let status = json!({"summary": "active", "server_running": true, "incidents": [],
+            "ranks": [{"rank": 0, "state": "active", "last_step": report["last_step"]}]});
+        let got = crate::watchdog::run_state(&status, &reports, true);
+        if &got["state"] != state {
+            wrong.push(format!("run_state {got} expected {state}"));
+        }
+    }
+    (!wrong.is_empty()).then(|| wrong.join("; "))
+}
+
+/// Sections 1 and 2: every case that holds records, the 12 pins and the new cases alike.
+#[test]
+fn every_case_of_sections_1_and_2_that_holds_records_holds_on_the_server() {
+    let cases = behaviour();
+    let mut ran = 0;
+    let mut wrong = Vec::new();
+    for (name, body) in &cases {
+        let holds = body.get("records").or(body["given"].get("records")).is_some();
+        if !holds {
+            continue;
+        }
+        ran += 1;
+        if let Some(why) = case_differs(name, body) {
+            wrong.push(format!("{name}: {why}"));
+        }
+    }
+    assert_eq!(ran, 27, "the page's cases over records");
+    assert!(wrong.is_empty(), "{} cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// The new cases over records also say what today's detector answers; it is not the target, and
+/// the server no longer gives it: each such case cannot pass before its rule is built.
+#[test]
+fn what_today_answers_on_the_new_cases_is_no_longer_what_the_server_says() {
+    for (name, body) in behaviour() {
+        let Some(today) = body.get("today") else { continue };
+        let records = body["given"]["records"].as_array().unwrap();
+        let report = judged(records);
+        let kind = today["kind"].as_str().unwrap();
+        let same = incident(&report, kind).is_some_and(|found| {
+            today
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| !["detector", "fires", "kind"].contains(&key.as_str()))
+                .all(|(key, value)| &found[key] == value)
+        });
+        assert!(
+            !same,
+            "{name}: the server still answers as today: {}",
+            report["incidents"]
+        );
+    }
+}
+
+/// A row with `step_skipped_by` and no skip, a value this version does not know, and a skipped row
+/// without the key beside rows that carry it.
+#[test]
+fn who_reported_a_skip_is_read_from_extra_json() {
+    let records = vec![
+        json!({"step": 0, "step_skipped": true}),
+        json!({"step": 1, "step_skipped": true, "step_skipped_by": "someone"}),
+        json!({"step": 2, "step_skipped": false, "step_skipped_by": "caller"}),
+        json!({"step": 3, "step_skipped": true, "step_skipped_by": "caller", "grad_norm": "inf", "clip_grad_norm": "nan"}),
+        json!({"step": 4, "step_skipped": true, "step_skipped_by": "both", "grad_norm": "nan"}),
+    ];
+    let report = judged(&records);
+    assert_eq!(
+        report["skipped_updates"],
+        json!({"caller": 1, "scaler": 2, "both": 1,
+            "non_finite_gradients": {"steps": 2, "first_step": 3, "gradients": ["<total>", "<total before clipping>"]}})
+    );
+    // The loss scale's input is every row that says whether it skipped, whoever said so.
+    assert_eq!(report["kind_checks"]["loss_scale_trouble"]["records"], 5);
+    assert_eq!(
+        report["kind_checks"]["loss_scale_trouble"]["needs"],
+        "step_skipped (scaler=, or session.step(skipped=))"
+    );
+}
+
+/// The `gradients` entry of `not_checked`, in Python's shape: each parameter once, with the first
+/// step and why; only `grad_spike` is made `unavailable` by it.
+#[test]
+fn an_unread_gradient_is_named_with_why_and_its_first_step() {
+    let records = vec![
+        json!({"step": 4, "grad_norm": 1.0}),
+        json!({"step": 5, "grad_norm": 1.0, "grads_not_read": {"emb.weight": "a sparse gradient"}}),
+        json!({"step": 6, "grad_norm": 1.0, "grads_not_read": {"emb.weight": "on meta", "a.bias": "nested"}}),
+    ];
+    let report = judged(&records);
+    let entry = report["not_checked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["check"] == "gradients")
+        .unwrap();
+    assert_eq!(
+        entry,
+        &json!({"check": "gradients", "kinds": ["grad_spike"], "parameters": ["a.bias", "emb.weight"],
+            "reason": "gradient not read for a.bias: nested; emb.weight: a sparse gradient", "step": 5})
+    );
+    assert_eq!(report["kind_checks"]["grad_spike"]["value"], "unavailable");
+    assert_eq!(report["kind_checks"]["grad_spike"]["check"], "gradients");
+    for kind in ["non_finite", "stalled_weights"] {
+        assert_ne!(report["kind_checks"][kind]["value"], "unavailable", "{kind}");
+    }
+    // None named: no entry.
+    let report = judged(&records[..1]);
+    assert!(report["not_checked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e["check"] != "gradients"));
+}
+
+/// Section 2, `one_rank_with_batch_hashes`: one rank with hashes was compared with none.
+#[test]
+fn one_rank_with_batch_hashes_is_compared_with_none() {
+    let case = &behaviour()["one_rank_with_batch_hashes"];
+    let window = |hashes: &[&str]| -> BTreeMap<i64, (Option<i64>, String)> {
+        hashes
+            .iter()
+            .enumerate()
+            .map(|(step, hash)| (step as i64, (None, hash.to_string())))
+            .collect()
+    };
+    let ranks: BTreeMap<i32, _> = case["given"]["ranks_with_batch_hashes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rank| (rank.as_i64().unwrap() as i32, window(&["5330bfb822ed0aaf"])))
+        .collect();
+    assert_eq!(
+        json!(super::ranks_compared(&ranks)),
+        case["expected"]["status"]["ranks_compared"]
+    );
+    // Beside a rank with no hashes, the same; two ranks with one kind in common are both listed.
+    let mut two = ranks.clone();
+    two.insert(1, window(&[]));
+    assert_eq!(super::ranks_compared(&two), Vec::<i32>::new());
+    two.insert(1, window(&["0123456789abcdef"]));
+    assert_eq!(super::ranks_compared(&two), vec![0, 1]);
+}
+
+// --- section 3 ---------------------------------------------------------------------------------
+
+mod silence {
+    use std::time::{Duration, Instant};
+
+    use serde_json::{json, Value};
+
+    use crate::watchdog::{Watchdog, WatchdogConfig};
+
+    fn key(rank: i32) -> (String, i32) {
+        ("run".to_string(), rank)
+    }
+
+    fn at(base: Instant, seconds: u64) -> Instant {
+        base + Duration::from_secs(seconds)
+    }
+
+    fn dog() -> Watchdog {
+        Watchdog::new(WatchdogConfig {
+            silent_floor: Duration::from_secs(60),
+            silent_factor: 5.0,
+            critical: Duration::from_secs(180),
+            pause_limit: Duration::from_secs(600),
+            start_limit: Duration::from_secs(600),
+            ..WatchdogConfig::default()
+        })
+    }
+
+    fn case(name: &str) -> Value {
+        super::behaviour()[name].clone()
+    }
+
+    fn silence(status: &Value) -> Value {
+        let incidents = status["incidents"].as_array().unwrap();
+        assert_eq!(incidents.len(), 1, "{status}");
+        incidents[0].clone()
+    }
+
+    /// Rank 0 trains on; rank 1 stored steps to `last`, then (when `stopped`) its capture stopped
+    /// with a writer error while it went on beating, and its beats ceased at second 400.
+    fn two_ranks(last: i64, stopped: bool) -> (Watchdog, Instant) {
+        let t0 = Instant::now();
+        let dog = dog();
+        for rank in [0, 1] {
+            dog.stream_opened(&key(rank), t0);
+            assert!(dog.attempt_seen(&key(rank), 1, t0));
+            dog.heartbeat(&key(rank), "train", 5.0, Some(0), None, t0);
+        }
+        dog.batch(&key(1), 1, Some(last), Some(2), at(t0, 1));
+        if stopped {
+            dog.capture_stopped(&key(1), "sink_error", at(t0, 2));
+        }
+        for second in (2..=400).step_by(5) {
+            dog.heartbeat(&key(1), "train", 5.0, Some(10), None, at(t0, second));
+            dog.heartbeat(&key(0), "train", 5.0, Some(second as i64), None, at(t0, second));
+            dog.batch(&key(0), 1, Some(second as i64), Some(2), at(t0, second));
+        }
+        for second in (405..=800).step_by(5) {
+            dog.heartbeat(&key(0), "train", 5.0, Some(second as i64), None, at(t0, second));
+            dog.batch(&key(0), 1, Some(second as i64), Some(2), at(t0, second));
+        }
+        (dog, t0)
+    }
+
+    #[test]
+    fn silent_after_capture_stopped() {
+        let expected = &case("silent_after_capture_stopped")["expected"];
+        let (dog, t0) = two_ranks(120, true);
+        let status = &dog.statuses(at(t0, 800), true)["run"];
+        let incident = silence(status);
+        assert_eq!(json!([incident["kind"]]), expected["incident_kinds_present"]);
+        assert_eq!(incident["capture_stopped"]["reason"], "sink_error");
+        // How long ago, at the status's own time: the entry's value, unchanged.
+        let entry = status["ranks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rank"] == 1)
+            .unwrap();
+        assert_eq!(incident["capture_stopped"], entry["capture_stopped"]);
+        assert_eq!(
+            incident["capture_last_step"],
+            expected["incident_carries"]["capture_last_step"]
+        );
+    }
+
+    #[test]
+    fn silent_with_capture_running() {
+        let expected = &case("silent_with_capture_running")["expected"];
+        let (dog, t0) = two_ranks(120, false);
+        let incident = silence(&dog.statuses(at(t0, 800), true)["run"]);
+        assert_eq!(json!([incident["kind"]]), expected["incident_kinds_present"]);
+        for key in expected["incident_lacks"].as_array().unwrap() {
+            assert!(incident.get(key.as_str().unwrap()).is_none(), "{key}: {incident}");
+        }
+    }
+
+    /// Rank 1's earlier attempt reached step 100; the job was started again, the new attempt's
+    /// capture stopped before its first record, and its beats ceased. Beside rank 0 training on,
+    /// the silence is `rank_silent`; alone, `job_stalled`. Either way the last step is null.
+    #[test]
+    fn silent_after_a_restart_that_stored_nothing() {
+        let body = case("silent_after_a_restart_that_stored_nothing");
+        let expected = &body["expected"];
+        assert_eq!(body["given"]["earlier_attempt"]["last_step"], 100);
+        for beside in [true, false] {
+            let t0 = Instant::now();
+            let dog = dog();
+            let ranks: &[i32] = if beside { &[0, 1] } else { &[1] };
+            for rank in ranks {
+                dog.stream_opened(&key(*rank), t0);
+                assert!(dog.attempt_seen(&key(*rank), 0, t0));
+                dog.heartbeat(&key(*rank), "train", 5.0, Some(0), None, t0);
+                dog.batch(&key(*rank), 0, Some(100), Some(ranks.len() as i32), at(t0, 1));
+            }
+            // Rank 1 is started again: attempt 1, whose capture stops before its first record.
+            assert!(dog.attempt_seen(&key(1), 1, at(t0, 10)));
+            dog.heartbeat(&key(1), "train", 5.0, Some(0), None, at(t0, 10));
+            dog.capture_stopped(&key(1), "sink_error", at(t0, 11));
+            for second in (11..=400).step_by(5) {
+                dog.heartbeat(&key(1), "train", 5.0, Some(0), None, at(t0, second));
+                if beside {
+                    dog.heartbeat(&key(0), "train", 5.0, Some(second as i64), None, at(t0, second));
+                    dog.batch(&key(0), 0, Some(100 + second as i64), Some(2), at(t0, second));
+                }
+            }
+            let before = &dog.statuses(at(t0, 400), true)["run"];
+            let entry = before["ranks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["rank"] == 1)
+                .unwrap();
+            assert_eq!(
+                (&entry["attempt"], &entry["last_step"], &entry["attempt_without_steps"]),
+                (&json!(1), &json!(null), &json!(true)),
+                "{entry}"
+            );
+            for second in (405..=1400).step_by(5) {
+                if beside {
+                    dog.heartbeat(&key(0), "train", 5.0, Some(second as i64), None, at(t0, second));
+                    dog.batch(&key(0), 0, Some(100 + second as i64), Some(2), at(t0, second));
+                }
+            }
+            let status = &dog.statuses(at(t0, 1400), true)["run"];
+            let incident = silence(status);
+            let kind = if beside { "rank_silent" } else { "job_stalled" };
+            assert_eq!(incident["kind"], kind, "{status}");
+            assert!(expected["incident_kind_one_of"]
+                .as_array()
+                .unwrap()
+                .contains(&incident["kind"]));
+            assert_eq!(incident["capture_stopped"]["reason"], "sink_error");
+            assert_eq!(incident["capture_last_step"], Value::Null, "{incident}");
+            assert!(incident.get("capture_last_step").is_some());
+        }
+    }
+}
+
+// --- section 4 ---------------------------------------------------------------------------------
+
+/// A resume from a checkpoint whose manifest holds `components`: attempt 1 to step 5, attempt 2
+/// from step 3, whose first row loaded the checkpoint.
+fn resumed_from(components: Value) -> Value {
+    let earlier: Vec<Value> = (0..6).map(|step| json!({"step": step, "grad_norm": 1.0})).collect();
+    let later = vec![
+        json!({"step": 3, "grad_norm": 1.0, "checkpoint": {"load": {"components": components}}}),
+        json!({"step": 4, "grad_norm": 1.0}),
+    ];
+    let detectors = judge(
+        0,
+        &[stored(&earlier, 1), stored(&later, 2)],
+        &Arc::new(Thresholds::default()),
+    )
+    .unwrap();
+    report("ab2", 0, &detectors, 0)
+}
+
+fn findings(report: &Value) -> Vec<Value> {
+    incident(report, "resume_incomplete").expect("resume_incomplete")["changes"][0]["findings"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn a_checkpoint_with_no_identified_model_state() {
+    let expected = &behaviour()["a_checkpoint_with_no_identified_model_state"]["expected"];
+    let found = findings(&resumed_from(
+        json!({"optimizer": {"entries": 2}, "rng": {}, "data": {}}),
+    ));
+    for wanted in expected["findings"].as_array().unwrap() {
+        assert!(found.contains(wanted), "{found:?}");
+    }
+    assert!(!found.contains(&json!({"component": "model", "finding": "missing"})));
+}
+
+#[test]
+fn a_checkpoint_with_no_optimizer_state() {
+    let expected = &behaviour()["a_checkpoint_with_no_optimizer_state"]["expected"];
+    let found = findings(&resumed_from(json!({"model": {"tensors": 2}, "rng": {}, "data": {}})));
+    assert_eq!(&json!(found), &expected["findings"]);
+}

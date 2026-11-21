@@ -1780,6 +1780,22 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
     if !places.is_empty() {
         incident["stuck_at"] = json!(places);
     }
+    // A stopped rank whose capture had stopped before it went silent (`STEP_AND_EVIDENCE_CONTRACT.md`,
+    // section 3): the incident keeps its kind and carries the status entry's `capture_stopped`
+    // unchanged, with `capture_last_step`, the last step the rank's current attempt stored, or null
+    // when it stored none (the entry's `last_step`, which a new attempt clears: a step an earlier
+    // attempt stored is not this one's). The first such rank by rank, when several are.
+    if let Some(rank) = stopped
+        .iter()
+        .find(|rank| rank.get("capture_stopped").is_some_and(Value::is_object))
+    {
+        incident["capture_stopped"] = rank["capture_stopped"].clone();
+        incident["capture_last_step"] = if rank["attempt_without_steps"] == true {
+            Value::Null
+        } else {
+            rank["last_step"].clone()
+        };
+    }
     if summary == "stalled" {
         incident["kind"] = json!("job_stalled");
         incident["step"] = json!(newest);

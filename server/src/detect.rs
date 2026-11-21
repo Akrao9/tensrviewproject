@@ -228,7 +228,7 @@ pub const INPUT_NEEDS: [(&str, &str); 16] = [
     ("update", "update_rms with grad_norm or clip_grad_norm (updates=True)"),
     ("weight_check", "weights_unchanged with grad_norms (full capture)"),
     ("steps", "step records"),
-    ("loss_scale", "step_skipped (scaler=)"),
+    ("loss_scale", "step_skipped (scaler=, or session.step(skipped=))"),
     ("lr", "lr"),
     ("data", "data (session.watch_loader)"),
     ("checkpoint", "checkpoint, or grad_scale (scaler=)"),
@@ -703,6 +703,58 @@ fn text(column: Option<&StringArray>, row: usize) -> Option<&str> {
     column
         .filter(|column| !column.is_null(row))
         .map(|column| column.value(row))
+}
+
+/// Who reported a skipped update (`STEP_AND_EVIDENCE_CONTRACT.md`, section 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkippedBy {
+    Caller,
+    Scaler,
+    Both,
+}
+
+/// A row's skipped update: None when `step_skipped` is not true, else who reported it, from
+/// `step_skipped_by` in `extra_json`, which is parsed only on a row that names it. A skipped row
+/// without the key was written by a scaler, the only thing that could write it before the key, and
+/// is read as the scaler's; so is a value this version does not know. The second value says
+/// whether the row carries the key at all (the rank's `skipped_updates` is present only then).
+fn skipped_by(columns: &Columns, row: usize) -> (Option<SkippedBy>, bool) {
+    let said: Option<Value> = text(columns.extra, row)
+        .filter(|extra| extra.contains("\"step_skipped_by\""))
+        .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
+        .and_then(|extra| extra.get("step_skipped_by").cloned());
+    let carried = said.is_some();
+    if !flag(columns.step_skipped, row) {
+        return (None, carried);
+    }
+    let by = match said.as_ref().and_then(Value::as_str) {
+        Some("caller") => SkippedBy::Caller,
+        Some("both") => SkippedBy::Both,
+        _ => SkippedBy::Scaler,
+    };
+    (Some(by), carried)
+}
+
+/// The gradients that are not finite on a row, named as a `non_finite` incident names them: each
+/// parameter in `grad_norms`, else `<total>` for the total norm, and `<total before clipping>`.
+fn non_finite_gradients<'a>(columns: &'a Columns, row: usize) -> Vec<&'a str> {
+    let mut bad: Vec<&str> = Vec::new();
+    if let Some(norms) = &columns.grad_norms {
+        bad.extend(
+            norms
+                .row(row)
+                .filter(|entry| !norms.values.is_null(*entry) && !norms.values.value(*entry).is_finite())
+                .map(|entry| norms.keys.value(entry)),
+        );
+    }
+    let not_finite = |column| value(column, row).is_some_and(|norm| !norm.is_finite());
+    if not_finite(columns.grad_norm) && bad.is_empty() {
+        bad.push("<total>");
+    }
+    if not_finite(columns.clip_grad_norm) {
+        bad.push("<total before clipping>");
+    }
+    bad
 }
 
 /// The columns the detectors read. A column that is missing or of another type reads as
@@ -2805,7 +2857,8 @@ struct Stalled {
 }
 
 impl Stalled {
-    fn row(&mut self, step: i64, columns: &Columns, row: usize) {
+    /// `skipped` says the row's update was skipped, whoever reported it.
+    fn row(&mut self, step: i64, columns: &Columns, row: usize, skipped: bool) {
         // No list: no weight check on this step, and every streak holds. An empty list is a
         // check that showed no parameter unchanged (contract 2).
         let Some(unchanged) = &columns.weights_unchanged else {
@@ -2813,8 +2866,10 @@ impl Stalled {
         };
         let Some(listed) = unchanged.row(row) else { return };
         // A loss scaler skips the optimizer step on purpose when a gradient is not finite: such
-        // a row adds nothing to a streak, but what it shows changing still breaks one.
-        let evidence = !value(columns.grad_norm, row).is_some_and(|norm| !norm.is_finite());
+        // a row adds nothing to a streak, but what it shows changing still breaks one. A skipped
+        // update, whoever reported it, is read the same way: the weights were not meant to move
+        // (contract section 1, the first rule awaiting the author).
+        let evidence = !skipped && !value(columns.grad_norm, row).is_some_and(|norm| !norm.is_finite());
         let unchanged: HashSet<&str> = listed
             .filter(|at| !unchanged.values.is_null(*at))
             .map(|at| unchanged.values.value(at))
@@ -2943,18 +2998,29 @@ struct LossScale {
     streak: u64,
     skipped: u64,
     recorded: u64,
+    /// Rows with `step_skipped`, whoever reported a skip: the kind's input count, as Python's
+    /// `input_counts` counts it.
+    flagged: u64,
     first: Option<Value>,
 }
 
 impl LossScale {
-    fn row(&mut self, step: i64, columns: &Columns, row: usize) {
-        let Some(skips) = columns.step_skipped.filter(|skips| !skips.is_null(row)) else {
+    /// `by` is who reported the row's skipped update, None when it was not skipped.
+    fn row(&mut self, step: i64, columns: &Columns, row: usize, by: Option<SkippedBy>) {
+        if columns.step_skipped.is_none_or(|skips| skips.is_null(row)) {
             return;
-        };
-        let skipped = skips.value(row);
-        self.recorded += 1;
-        self.skipped += u64::from(skipped);
-        self.streak = if skipped { self.streak + 1 } else { 0 };
+        }
+        self.flagged += 1;
+        // Only a skip the scaler confirmed counts. One only the caller reported is passed over: it
+        // neither adds to the streak nor ends it, and is in neither count (contract section 1, the
+        // second rule awaiting the author). Its loss scale is still read against the floor (the
+        // third): it is the scale's own reading.
+        if by != Some(SkippedBy::Caller) {
+            let skipped = by.is_some();
+            self.recorded += 1;
+            self.skipped += u64::from(skipped);
+            self.streak = if skipped { self.streak + 1 } else { 0 };
+        }
         let scale = value(columns.grad_scale, row).filter(|scale| scale.is_finite());
         if self.first.is_none() && (self.streak >= SCALE_SKIP_RUN || scale.is_some_and(|scale| scale < SCALE_FLOOR)) {
             self.first = Some(json!({
@@ -2993,25 +3059,14 @@ impl NonFinite {
             .filter(|(_, stats)| stats.non_finite)
             .map(|(name, _)| name.as_ref())
             .collect();
-        let mut bad_gradients: Vec<&str> = Vec::new();
-        // On a step the loss scaler skipped, Inf and NaN gradients are what it expects.
-        if !flag(columns.step_skipped, row) {
-            if let Some(norms) = &columns.grad_norms {
-                bad_gradients.extend(
-                    norms
-                        .row(row)
-                        .filter(|entry| !norms.values.is_null(*entry) && !norms.values.value(*entry).is_finite())
-                        .map(|entry| norms.keys.value(entry)),
-                );
-            }
-            let bad = |column| value(column, row).is_some_and(|norm| !norm.is_finite());
-            if bad(columns.grad_norm) && bad_gradients.is_empty() {
-                bad_gradients.push("<total>");
-            }
-            if bad(columns.clip_grad_norm) {
-                bad_gradients.push("<total before clipping>");
-            }
-        }
+        // On a skipped update, whoever reported it, a gradient that is not finite raises nothing
+        // by itself: a scaler expects Inf and NaN there, and one the caller reported is kept in
+        // the rank's `skipped_updates` instead (contract section 1). A layer statistic still raises.
+        let bad_gradients: Vec<&str> = if flag(columns.step_skipped, row) {
+            Vec::new()
+        } else {
+            non_finite_gradients(columns, row)
+        };
         if !(bad_layers.is_empty() && bad_gradients.is_empty()) {
             self.first = Some(json!({
                 "kind": "non_finite",
@@ -3020,6 +3075,108 @@ impl NonFinite {
                 "gradients": bad_gradients,
             }));
         }
+    }
+}
+
+// --- skipped updates -----------------------------------------------------------------------
+
+/// The rank's `skipped_updates` (contract section 1): the skipped steps by who reported them, and
+/// the skips the caller reported (alone or with the scaler) whose gradients were not finite. It
+/// raises nothing and changes no kind's value.
+#[derive(Default)]
+struct SkippedUpdates {
+    /// A row of the run carries `step_skipped_by`: only then is the object reported.
+    carried: bool,
+    caller: u64,
+    scaler: u64,
+    both: u64,
+    non_finite_steps: u64,
+    /// The first such step, and what was not finite there.
+    first: Option<(i64, Vec<String>)>,
+}
+
+impl SkippedUpdates {
+    fn row(&mut self, step: i64, columns: &Columns, row: usize, by: Option<SkippedBy>, carried: bool) {
+        self.carried |= carried;
+        let Some(by) = by else { return };
+        match by {
+            SkippedBy::Caller => self.caller += 1,
+            SkippedBy::Scaler => self.scaler += 1,
+            SkippedBy::Both => self.both += 1,
+        }
+        if by == SkippedBy::Scaler {
+            return; // as today: what a scaler skipped for is nothing to keep
+        }
+        let bad = non_finite_gradients(columns, row);
+        if bad.is_empty() {
+            return;
+        }
+        self.non_finite_steps += 1;
+        if self.first.is_none() {
+            self.first = Some((step, bad.into_iter().map(str::to_string).collect()));
+        }
+    }
+
+    fn report(&self) -> Option<Value> {
+        if !self.carried {
+            return None;
+        }
+        let mut out = json!({"caller": self.caller, "scaler": self.scaler, "both": self.both});
+        if let Some((step, gradients)) = &self.first {
+            out["non_finite_gradients"] =
+                json!({"steps": self.non_finite_steps, "first_step": step, "gradients": gradients});
+        }
+        Some(out)
+    }
+}
+
+// --- unread gradients ----------------------------------------------------------------------
+
+/// The kinds a gradient that could not be read leaves `unavailable` (`STEP_AND_EVIDENCE_CONTRACT.md`,
+/// section 2): those judged from the total gradient norm, which leaves the unread parameter out.
+/// `non_finite` and `stalled_weights` are judged from what was read and stay `checked`.
+pub const GRADS_NOT_READ_KINDS: [&str; 1] = ["grad_spike"];
+
+/// Parameters whose gradient the capture could not read (`grads_not_read`, said once on a record
+/// with why): Python's `grads_not_read_not_checked`.
+#[derive(Default)]
+struct GradsNotRead {
+    /// Parameter -> (the step that first named it, why).
+    first: BTreeMap<String, (i64, String)>,
+}
+
+impl GradsNotRead {
+    fn row(&mut self, step: i64, columns: &Columns, row: usize) {
+        // `grads_not_read` travels in `extra_json`, which is parsed only on a row that names it.
+        let Some(extra) = text(columns.extra, row).filter(|extra| extra.contains("\"grads_not_read\"")) else {
+            return;
+        };
+        let extra: Option<Value> = serde_json::from_str(extra).ok();
+        let said = extra
+            .as_ref()
+            .and_then(|extra| extra.get("grads_not_read"))
+            .and_then(Value::as_object);
+        for (name, why) in said.into_iter().flatten() {
+            let why = why.as_str().map_or_else(|| why.to_string(), str::to_owned);
+            self.first.entry(name.clone()).or_insert((step, why));
+        }
+    }
+
+    /// The `gradients` entry of `not_checked`: each parameter, with why and the first step.
+    fn not_checked(&self) -> Option<Value> {
+        let step = self.first.values().map(|(step, _)| *step).min()?;
+        let reason: Vec<String> = self
+            .first
+            .iter()
+            .map(|(name, (_, why))| format!("{name}: {why}"))
+            .collect();
+        Some(json!({
+            "check": "gradients",
+            "kinds": GRADS_NOT_READ_KINDS,
+            "parameters": self.first.keys().collect::<Vec<_>>(),
+            "reason": format!("gradient not read for {}", reason.join("; ")),
+            "step": step,
+        }))
     }
 }
 
@@ -3532,6 +3689,8 @@ pub struct RankDetectors {
     attention: Attention,
     head: HeadTrends,
     non_finite: NonFinite,
+    skipped_updates: SkippedUpdates,
+    grads_not_read: GradsNotRead,
     replica_drift: ReplicaDrift,
     system: System,
     attempts: Attempts,
@@ -3610,8 +3769,11 @@ impl RankDetectors {
             self.gradients.row(step, &columns, row, &mut self.scalars);
             self.updates
                 .row(self.attempt, step, &columns, row, self.thresholds.update_window);
-            self.stalled.row(step, &columns, row);
-            self.loss_scale.row(step, &columns, row);
+            let (skipped_by, carried) = skipped_by(&columns, row);
+            self.stalled.row(step, &columns, row, skipped_by.is_some());
+            self.loss_scale.row(step, &columns, row, skipped_by);
+            self.skipped_updates.row(step, &columns, row, skipped_by, carried);
+            self.grads_not_read.row(step, &columns, row);
             self.activations.row(step, layers);
             self.attention.row(step, &columns, row, &mut self.scalars);
             self.head.row(step, &columns, row);
@@ -3774,6 +3936,12 @@ impl RankDetectors {
         self.head.value()
     }
 
+    /// The rank's `skipped_updates` (contract section 1), present only when a row carried
+    /// `step_skipped_by`: written in the report beside `not_checked`.
+    pub fn skipped_updates(&self) -> Option<Value> {
+        self.skipped_updates.report()
+    }
+
     /// What was not checked, in the shape of the `not_checked` list in Python's evidence:
     /// the kinds whose sources the server does not have, and the resumes whose learning
     /// rate could not be compared.
@@ -3796,6 +3964,7 @@ impl RankDetectors {
         self.system.not_checked(&mut out);
         out.extend(self.moe.refused_not_checked());
         out.extend(self.updates.not_read_not_checked());
+        out.extend(self.grads_not_read.not_checked());
         out
     }
 
@@ -3809,7 +3978,7 @@ impl RankDetectors {
             self.updates.carried,
             self.inputs.weight_check,
             self.rows,
-            self.loss_scale.recorded,
+            self.loss_scale.flagged,
             self.inputs.lr,
             self.inputs.data,
             self.inputs.checkpoint,
@@ -4064,7 +4233,7 @@ fn judge_with(mut detectors: RankDetectors, rank: i32, batches: &[RecordBatch]) 
 /// `tensorquill-server detect` prints. `rebuilds` is how often the server rebuilt the rank's
 /// detectors from its store, and 0 for a report made outside a server.
 pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64) -> Value {
-    json!({
+    let mut report = json!({
         "schema_version": 1,
         "source": "tensorquill-server",
         "run_id": run_id,
@@ -4081,7 +4250,11 @@ pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64)
         "memory": detectors.memory(),
         "head_trends": detectors.head_trends(),
         "incidents": detectors.incidents(),
-    })
+    });
+    if let Some(skipped) = detectors.skipped_updates() {
+        report["skipped_updates"] = skipped;
+    }
+    report
 }
 
 /// `tensorquill-server detect`: one rank's rows in, as an Arrow IPC stream in the schema the
