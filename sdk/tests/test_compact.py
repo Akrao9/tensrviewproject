@@ -93,7 +93,7 @@ def test_a_10000_step_moe_run_gives_a_compact_file_under_1_mb(granite_run, tmp_p
         {**s, "overloaded": [], "dead": []} for s in seeded["samples"]
     ]})
     assert nothing["samples"] == [] and nothing["compact"]["samples"]["omitted"] == 240_000
-    assert _size(nothing) < 10_000
+    assert _size(nothing) < 12_000  # 10,178 bytes with the two measurement blocks of the rules contract, part 6 (8,221 before)
 
 
 # --- Small runs: the window's edges, and what each reader of samples says ---------------------

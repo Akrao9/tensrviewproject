@@ -43,7 +43,7 @@ BY_HAND = {
     "moe_imbalance": 11, "starved_experts": 50, "grad_spike": 13, "update_spike": 102, "stalled_weights": 3,
     "repeated_steps": 1,
     "loss_scale_trouble": 10, "resume_lr_change": 1, "resume_data_mismatch": 1, "resume_incomplete": 1,
-    "data_stalled": 4, "epoch_order_repeated": 4, "activation_spike": 11, "activation_drift": 60,
+    "data_stalled": 4, "epoch_order_repeated": 4, "activation_spike": 11, "activation_drift": 110,
     "dead_activations": 60, "attention_collapse": 4, "attention_uniform": 4, "attention_logit_growth": 4,
     "non_finite": 1, "replica_drift": 1, "memory_growth": 6, "memory_pressure": 1, "allocator_retries": 1,
     "hardware_errors": 2, "gpu_throttled": 1, "input_starvation": 21,
@@ -569,8 +569,10 @@ def boundary() -> dict[str, tuple[str, list[dict], dict]]:
             "epoch_order_repeated", _each([_batch("a"), _batch("b"), _batch("a", 1), _batch("b", 1)]), {"batches_compared": 2},
         ),
         "activation_spike": ("activation_spike", _each([_layer()] * 10 + [_layer(abs_max=20.0)]), {}),
-        # 3.5 times the baseline: under the spike rule's 5, over the drift rule's 3.
-        "activation_drift": ("activation_drift", _each([_layer()] * 50 + [_layer(std=3.5, abs_max=7.0)] * 10), {}),
+        # 3.5 times the baseline: under the spike rule's 5, over the drift rule's 3. The trailing
+        # baseline (DETECTOR_RULES_CONTRACT.md, part 2) is the 50 records before the last 10, judged
+        # from the 110th record, so that it holds none of the module's first 50.
+        "activation_drift": ("activation_drift", _each([_layer()] * 100 + [_layer(std=3.5, abs_max=7.0)] * 10), {}),
         "dead_activations": ("dead_activations", _each([_layer()] * 50 + [_layer(zero_frac=0.5)] * 10), {}),
         "attention_collapse": ("attention_collapse", _each([_probe()] * 2 + [_probe(share=0.2)] * 2), {}),
         "attention_uniform": ("attention_uniform", _each([_probe()] * 2 + [_probe(share=0.99)] * 2), {}),
