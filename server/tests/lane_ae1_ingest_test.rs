@@ -268,3 +268,170 @@ async fn after_the_binary_is_killed_a_refusal_names_the_start_the_batch_claimed(
     second.stop();
     assert_eq!(stored_steps(dir.path(), RUN, 0), vec![0, 1, 2]);
 }
+
+// --- L30 (contract section 6): rows not stored because their step was not newer -----------------
+
+/// A server in this process over `root`, its status read back from the store first (as a
+/// restarted binary does), storing a part every `flush_steps` rows and never on the timer.
+async fn start_with(
+    root: &std::path::Path,
+    flush_steps: usize,
+) -> (
+    String,
+    Arc<tensorquill_server::ingest::Ingest>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    use object_store::local::LocalFileSystem;
+    use tensorquill_server::ingest::{Ingest, IngestConfig};
+    use tensorquill_server::storage::Storage;
+    let config = IngestConfig {
+        flush_steps,
+        flush_interval: Duration::from_secs(3600),
+        ..IngestConfig::default()
+    };
+    let store = LocalFileSystem::new_with_prefix(root).unwrap();
+    let ingest = Ingest::new(Storage::new(Arc::new(store), "".into()), config);
+    ingest.restore_watchdog().await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let served = ingest.clone();
+    tokio::spawn(async move {
+        tensorquill_server::server::serve(listener, served, None, None, async {
+            let _ = stopped.await;
+        })
+        .await
+        .unwrap();
+    });
+    (address, ingest, stop)
+}
+
+/// Rank 0's entry in the run's status, and the rank's `restart` carry, as `watchdog.json` holds them.
+fn entry_and_carry(ingest: &tensorquill_server::ingest::Ingest) -> (serde_json::Value, serde_json::Value) {
+    let status = ingest.watchdog_statuses()[RUN].clone();
+    (status["ranks"][0].clone(), status["restart"][0].clone())
+}
+
+/// The two counts on the entry, `None` for a key that is not there.
+fn counts(entry: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+    (
+        entry.get("rows_not_newer").map(|v| v.as_u64().unwrap()),
+        entry.get("late_steps_confirmed").map(|v| v.as_u64().unwrap()),
+    )
+}
+
+/// The seam's part: 60 distinct steps, every fifth (step % 5 == 2) sent three places after its
+/// successor, as `sdk/tests/test_wave_ad_seams.py::_out_of_order` builds it.
+fn out_of_order() -> Vec<i64> {
+    let late: Vec<i64> = (0..60).filter(|step| step % 5 == 2).collect();
+    let mut order: Vec<i64> = (0..60).filter(|step| !late.contains(step)).collect();
+    for step in &late {
+        let at = order
+            .iter()
+            .position(|s| *s == step + 1)
+            .map_or(order.len(), |at| at + 3);
+        order.insert(at.min(order.len()), *step);
+    }
+    order
+}
+
+/// The author's first two tests, in process: the 60-row part gives 12 rows not stored and 12
+/// distinct steps confirmed late; the same part sent again after it was stored adds its 60 rows to
+/// `rows_not_newer` and nothing to `late_steps_confirmed`. The status file written at the stop
+/// carries both, in `restart` too (taken up again by a restart: the watchdog's own test). Fails before lane AE1: neither key existed.
+#[tokio::test]
+async fn the_seams_part_gives_12_and_12_and_the_stored_part_sent_again_confirms_nothing_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let (address, ingest, stop) = start_with(dir.path(), 1).await;
+    let sent = out_of_order();
+    let mut put = open(&address, schema(DataType::Int64)).await;
+    put.send(rows(&sent), 6000, Some(0)).await;
+    assert_eq!(put.finish().await.last(), Some(&6000));
+    let kept: Vec<i64> = (0..60).filter(|step| step % 5 != 2).collect();
+    assert_eq!(stored_steps(dir.path(), RUN, 0), kept);
+    let (entry, carry) = entry_and_carry(&ingest);
+    assert_eq!(counts(&entry), (Some(12), Some(12)), "{entry}");
+    assert_eq!(counts(&carry), (Some(12), Some(12)), "{carry}");
+
+    let mut put = open(&address, schema(DataType::Int64)).await; // the stored part, sent again
+    put.send(rows(&sent), 6000, Some(0)).await;
+    put.finish().await;
+    let (entry, _) = entry_and_carry(&ingest);
+    assert_eq!(counts(&entry), (Some(72), Some(12)), "{entry}");
+    assert_eq!(stored_steps(dir.path(), RUN, 0), kept);
+
+    // The status file the server writes when it stops carries both, on the entry and in `restart`.
+    ingest.stop(std::iter::empty()).await.unwrap();
+    drop(stop);
+    let written = lane_aa3_support::json_file(&dir.path().join("runs").join(RUN).join("watchdog.json"));
+    assert_eq!(counts(&written["ranks"][0]), (Some(72), Some(12)), "{written}");
+    assert_eq!(counts(&written["restart"][0]), (Some(72), Some(12)), "{written}");
+}
+
+/// Inside one open part (stored only at the end of the stream): the same discarded step sent again
+/// adds to `rows_not_newer` and not to `late_steps_confirmed` (the author's third test); a step late
+/// behind a row of an earlier batch of the same part is confirmed; a step twice in one batch, and a
+/// step behind one already stored, are not. Nothing is confirmed before the part is stored.
+#[tokio::test]
+async fn inside_one_part_a_late_step_is_confirmed_once_and_a_step_behind_a_stored_one_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let (address, ingest, _stop) = start_with(dir.path(), 1000).await;
+    let mut put = open(&address, schema(DataType::Int64)).await;
+    put.send(rows(&[0, 1, 2, 5, 3]), 100, Some(0)).await; // 3 is late
+    put.send(rows(&[3]), 110, Some(100)).await; // the same discarded step again
+    put.send(rows(&[4, 6]), 120, Some(110)).await; // 4 is late behind 5, of an earlier batch
+    put.send(rows(&[7, 7]), 130, Some(120)).await; // a step twice in one batch
+                                                   // Each batch is answered only when the part is stored; wait for the four to be taken.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while counts(&entry_and_carry(&ingest).0).0 != Some(4) {
+        assert!(std::time::Instant::now() < deadline, "{}", entry_and_carry(&ingest).0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        counts(&entry_and_carry(&ingest).0),
+        (Some(4), None),
+        "the part is not stored yet"
+    );
+    assert_eq!(put.finish().await.last(), Some(&130));
+    assert_eq!(counts(&entry_and_carry(&ingest).0), (Some(4), Some(2)));
+
+    let mut put = open(&address, schema(DataType::Int64)).await;
+    put.send(rows(&[3, 8]), 140, Some(130)).await; // 3 is behind steps already stored
+    put.finish().await;
+    assert_eq!(counts(&entry_and_carry(&ingest).0), (Some(5), Some(2)));
+    assert_eq!(stored_steps(dir.path(), RUN, 0), vec![0, 1, 2, 5, 6, 7, 8]);
+}
+
+/// A batch sent again while its part is open (its stream broke before the part was stored) adds its
+/// rows to `rows_not_newer` and confirms no step twice.
+#[tokio::test]
+async fn a_batch_sent_again_before_its_part_is_stored_confirms_nothing_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let (address, ingest, _stop) = start_with(dir.path(), 1000).await;
+    let mut put = open(&address, schema(DataType::Int64)).await;
+    put.send(rows(&[0, 1, 4, 2]), 100, Some(0)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while counts(&entry_and_carry(&ingest).0).0 != Some(1) {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(put); // the stream breaks; the rows stay buffered and the offset is not acknowledged
+    let mut put = open(&address, schema(DataType::Int64)).await;
+    put.send(rows(&[0, 1, 4, 2]), 100, Some(0)).await;
+    put.finish().await;
+    assert_eq!(counts(&entry_and_carry(&ingest).0), (Some(5), Some(1)));
+    assert_eq!(stored_steps(dir.path(), RUN, 0), vec![0, 1, 4]);
+}
+
+/// With nothing discarded, neither key is on the entry or in `restart`: such a status is as before.
+#[tokio::test]
+async fn with_no_row_discarded_neither_key_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let (address, ingest, _stop) = start_with(dir.path(), 1).await;
+    let mut put = open(&address, schema(DataType::Int64)).await;
+    put.send(rows(&[0, 1, 2]), 100, Some(0)).await;
+    put.finish().await;
+    let (entry, carry) = entry_and_carry(&ingest);
+    assert_eq!(counts(&entry), (None, None), "{entry}");
+    assert_eq!(counts(&carry), (None, None), "{carry}");
+}

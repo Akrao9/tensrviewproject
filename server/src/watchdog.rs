@@ -140,6 +140,18 @@
 //! no state, severity, incident or run state comes of them. A batch whose acknowledgement was lost
 //! and that is sent again is counted again, so a count is at most the rows dropped (decided
 //! Nov 20, 2026; until then the count reached only stderr).
+//!
+//! # Rows not stored because their step was not newer (L30, wave AE)
+//!
+//! A row whose step is not above the highest step kept for its attempt is not stored (the rule
+//! that drops a replayed row). Two counts say so, each on the rank's entry and in `restart` only
+//! when above zero, so a status that counted none is byte for byte as before (contract section 6):
+//! `rows_not_newer`, every such row, counted on arrival, a row sent again counted again, with no
+//! telling a replay from a step that arrived late; and `late_steps_confirmed`, the distinct steps
+//! among them that the server can prove arrived out of order inside one part: above the highest
+//! step kept when that part began, not kept, and not counted before in the part, each counted
+//! once, when the part is stored. It is a lower bound: a late step that crosses a part's edge is
+//! not in it. The rest of `rows_not_newer` is not classified. No such row is stored.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
@@ -347,6 +359,13 @@ pub struct Progress {
     dropped_rows: BTreeMap<String, u64>,
     /// Batches refused because a key column was missing or of another type (RS10), by the column.
     refused_batches: BTreeMap<String, u64>,
+    /// Rows received with their keys readable and not stored because their step was not above the
+    /// highest step kept for their attempt (L30, wave AE): replays and late steps alike, a row sent
+    /// again counted again.
+    rows_not_newer: u64,
+    /// Distinct steps confirmed to have arrived out of order inside one stored part and not stored
+    /// (L30, wave AE): a lower bound on the late steps, counted when their part is stored.
+    late_steps_confirmed: u64,
     /// The owner attempt's capture stopped (contract 3), its reason, since when the server saw
     /// it, and the last step committed before it stopped as the beat said it ([`StoppedAt`]).
     /// Kept whatever state the rank reads, until a newer attempt owns the rank.
@@ -388,6 +407,8 @@ impl Progress {
             superseded_rows: 0,
             dropped_rows: BTreeMap::new(),
             refused_batches: BTreeMap::new(),
+            rows_not_newer: 0,
+            late_steps_confirmed: 0,
             capture_stopped: None,
         }
     }
@@ -650,7 +671,7 @@ impl Progress {
     /// the module notes). Seconds are before `now`, which is the status's `written_at_ms`.
     fn carry(&self, rank: i32, now: Instant) -> Value {
         let before = |at: Instant| round3(now.saturating_duration_since(at).as_secs_f64());
-        json!({
+        let mut carry = json!({
             "rank": rank,
             "age_seconds": before(self.created),
             "since_change_seconds": before(self.last_change),
@@ -674,7 +695,15 @@ impl Progress {
                 // it took the rank up from.
                 "ended_seconds": stats.ended.map(before),
             }))).collect::<serde_json::Map<String, Value>>(),
-        })
+        });
+        // L30 (wave AE): only when above zero, so a status that counted none is as it was.
+        if self.rows_not_newer > 0 {
+            carry["rows_not_newer"] = json!(self.rows_not_newer);
+        }
+        if self.late_steps_confirmed > 0 {
+            carry["late_steps_confirmed"] = json!(self.late_steps_confirmed);
+        }
+        carry
     }
 
     /// A rank as a restarted server takes it up, from its entry in a status (`entry`) and its
@@ -783,6 +812,9 @@ impl Progress {
             dropped_rows: counts(&carry["dropped_rows"]),
             // Absent from a status written before Nov 20, 2026: none refused.
             refused_batches: counts(&carry["refused_batches"]),
+            // Absent from a status written before wave AE, or that counted none: none.
+            rows_not_newer: carry["rows_not_newer"].as_u64().unwrap_or(0),
+            late_steps_confirmed: carry["late_steps_confirmed"].as_u64().unwrap_or(0),
             // Kept in the entry in every state once seen (contract 3), so a restart keeps it.
             capture_stopped: entry["capture_stopped"].as_object().map(|stopped| {
                 let reason = stopped
@@ -1091,6 +1123,24 @@ impl Watchdog {
                 *held = held.saturating_add(*rows);
             }
         });
+    }
+
+    /// Rows of the rank were not stored because their step was not above the highest step kept for
+    /// their attempt (L30): counted in `rows_not_newer`, whatever they were.
+    pub fn not_newer(&self, key: &Key, rows: u64, now: Instant) {
+        if rows > 0 {
+            self.with(key, now, |p| p.rows_not_newer = p.rows_not_newer.saturating_add(rows));
+        }
+    }
+
+    /// A part of the rank was stored, with `steps` distinct steps confirmed to have arrived out of
+    /// order inside it and not stored (L30): counted in `late_steps_confirmed`.
+    pub fn late_confirmed(&self, key: &Key, steps: u64, now: Instant) {
+        if steps > 0 {
+            self.with(key, now, |p| {
+                p.late_steps_confirmed = p.late_steps_confirmed.saturating_add(steps)
+            });
+        }
     }
 
     /// A batch of the rank none of whose rows could be read was refused (RS10), for its key `column`.
@@ -1433,6 +1483,12 @@ pub fn run_status(
                 entry["refused_batches"] =
                     json!(p.refused_batches.values().fold(0u64, |sum, batches| sum.saturating_add(*batches)));
                 entry["refused_batch_keys"] = json!(p.refused_batches);
+            }
+            if p.rows_not_newer > 0 {
+                entry["rows_not_newer"] = json!(p.rows_not_newer);
+            }
+            if p.late_steps_confirmed > 0 {
+                entry["late_steps_confirmed"] = json!(p.late_steps_confirmed);
             }
             if let Some((reason, since, step)) = &p.capture_stopped {
                 entry["capture_stopped"] = json!({
@@ -4172,6 +4228,45 @@ mod tests {
         assert_eq!(
             (&entry["attempt"], &entry["last_step"], entry["state"].as_str()),
             (&json!(2), &json!(30), Some("active"))
+        );
+    }
+
+    // L30 (wave AE, contract section 6): rows not stored because their step was not newer.
+
+    #[test]
+    fn the_counts_of_rows_not_newer_are_on_the_entry_and_in_restart_only_above_zero_and_survive_a_restart() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(9), Some(1), at(t0, 1));
+        dog.not_newer(&key(0), 0, at(t0, 1));
+        dog.late_confirmed(&key(0), 0, at(t0, 1));
+        let status = dog.statuses(at(t0, 2), true)["run"].clone();
+        for (place, value) in [("entry", &status["ranks"][0]), ("restart", &status["restart"][0])] {
+            assert!(
+                value.get("rows_not_newer").is_none() && value.get("late_steps_confirmed").is_none(),
+                "{place}: {value}"
+            );
+        }
+        dog.not_newer(&key(0), 3, at(t0, 3));
+        dog.not_newer(&key(0), 2, at(t0, 3));
+        dog.late_confirmed(&key(0), 1, at(t0, 3));
+        let status = dog.statuses(at(t0, 4), true)["run"].clone();
+        for value in [&status["ranks"][0], &status["restart"][0]] {
+            assert_eq!(
+                (&value["rows_not_newer"], &value["late_steps_confirmed"]),
+                (&json!(5), &json!(1)),
+                "{value}"
+            );
+        }
+        let now = Instant::now();
+        let again = restarted(&status, 60, now);
+        again.not_newer(&key(0), 1, now);
+        let entry = &again.statuses(now, true)["run"]["ranks"][0];
+        assert_eq!(
+            (&entry["rows_not_newer"], &entry["late_steps_confirmed"]),
+            (&json!(6), &json!(1)),
+            "{entry}"
         );
     }
 }

@@ -208,3 +208,115 @@ def test_a_sender_without_the_claim_across_a_restart_of_the_real_server_holds_an
     assert sorted(int(r["step"]) for r in stored_records(store, "run-a")) == [*A, *B, *C]
     status = json.loads((store / "runs" / "run-a" / "watchdog.json").read_text())
     assert next(r for r in status["ranks"] if r["rank"] == 0).get("refused_batches") == 1
+
+
+# --- Item 2, L30 (WAVE_AE_CONTRACT.md section 6): the server's two counts, against the real server --
+
+
+def _put(endpoint: str, run_id: str, batches: list[list[dict]]) -> None:
+    """One `DoPut` stream holding `batches`, each with the metadata the contract names; ended by the
+    client, so the server stores what it holds before the stream ends."""
+    import pyarrow.flight as pa_flight
+
+    from tensorquill.flight import records_to_batch
+
+    client = pa_flight.FlightClient(endpoint)
+    try:
+        first = records_to_batch(batches[0])
+        writer, reader = client.do_put(pa_flight.FlightDescriptor.for_path("runs", run_id, "rank=0"), first.schema,
+                                       pa_flight.FlightCallOptions(timeout=60.0))
+        end = 0
+        for records in batches:
+            steps = [r["step"] for r in records]
+            start, end = end, end + 100 * len(records)
+            metadata = {"schema_version": 1, "run_id": run_id, "rank": 0, "start_byte_offset": start,
+                        "end_byte_offset": end, "min_step": min(steps), "max_step": max(steps), "sender_attempt": 1}
+            writer.write_with_metadata(records_to_batch(records).cast(first.schema) if records is not batches[0] else first,
+                                       pa.py_buffer(json.dumps(metadata).encode()))
+        writer.done_writing()
+        while reader.read() is not None:
+            pass
+        writer.close()
+    finally:
+        client.close()
+
+
+def _entry(store, run_id: str) -> tuple[dict, dict]:
+    status = json.loads((store / "runs" / run_id / "watchdog.json").read_text())
+    return (next(r for r in status["ranks"] if r["rank"] == 0),
+            next(r for r in status.get("restart") or [] if r["rank"] == 0))
+
+
+def _counts(entry: dict) -> tuple[Any, Any]:
+    return entry.get("rows_not_newer"), entry.get("late_steps_confirmed")
+
+
+@pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
+def test_the_seams_part_gives_12_rows_not_newer_and_12_steps_confirmed_late(tmp_path):
+    """The author's first test. The 60-row part of `test_wave_ad_seams.py`, as that test sends it:
+    48 stored, and 12 rows not stored, all 12 distinct steps confirmed to have arrived out of order
+    inside the part, on the rank's entry and in `restart`. Fails before lane AE1: no key."""
+    from test_wave_ad_seams import LATE, RUN as SEAM_RUN, _out_of_order, _send
+
+    store = tmp_path / "store"
+    server = Server(store)
+    try:
+        _send(server.endpoint, _out_of_order())
+    finally:
+        server.terminate()
+    assert sorted(int(r["step"]) for r in stored_records(store, SEAM_RUN)) == [s for s in range(60) if s not in LATE]
+    entry, carry = _entry(store, SEAM_RUN)
+    assert _counts(entry) == (12, 12) and _counts(carry) == (12, 12), (entry, carry)
+
+
+@pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
+def test_a_stored_part_sent_again_adds_rows_not_newer_and_no_step_confirmed_late(tmp_path):
+    """The author's second test: the same 60-row part sent again on a new stream, after the first was
+    stored, adds its 60 rows to `rows_not_newer` and nothing to `late_steps_confirmed`."""
+    from test_wave_ad_seams import _out_of_order
+
+    store, sent = tmp_path / "store", [dict(r, run_id="ae1-resent") for r in _out_of_order()]
+    server = Server(store)
+    try:
+        _put(server.endpoint, "ae1-resent", [sent])
+        _put(server.endpoint, "ae1-resent", [sent])
+    finally:
+        server.terminate()
+    assert len(stored_records(store, "ae1-resent")) == 48
+    entry, carry = _entry(store, "ae1-resent")
+    assert _counts(entry) == (72, 12) and _counts(carry) == (72, 12), (entry, carry)
+
+
+@pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
+def test_the_same_discarded_step_sent_again_adds_a_row_not_newer_and_no_second_late_step(tmp_path):
+    """The author's third test: step 2, discarded as late in the 60-row part, sent again in the same
+    open part, and again on a new stream after the part was stored: each adds one to
+    `rows_not_newer`, and `late_steps_confirmed` stays at 12."""
+    from test_wave_ad_seams import _out_of_order
+
+    run_id = "ae1-same-step"
+    sent = [dict(r, run_id=run_id) for r in _out_of_order()]
+    again = [r for r in sent if r["step"] == 2]
+    store = tmp_path / "store"
+    server = Server(store)          # parts every 500 steps or 10 s: both batches of the first stream are one part
+    try:
+        _put(server.endpoint, run_id, [sent, again])
+        _put(server.endpoint, run_id, [again])
+    finally:
+        server.terminate()
+    assert 2 not in {int(r["step"]) for r in stored_records(store, run_id)}
+    entry, carry = _entry(store, run_id)
+    assert _counts(entry) == (14, 12) and _counts(carry) == (14, 12), (entry, carry)
+
+
+@pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built")
+def test_a_run_with_nothing_discarded_writes_neither_key(tmp_path):
+    """Both counts zero: neither key on the entry or in `restart`, so the status file is as before."""
+    store = tmp_path / "store"
+    server = Server(store)
+    try:
+        _put(server.endpoint, "ae1-in-order", [[dict(record(s), run_id="ae1-in-order", attempt=1) for s in range(10)]])
+    finally:
+        server.terminate()
+    entry, carry = _entry(store, "ae1-in-order")
+    assert _counts(entry) == (None, None) and _counts(carry) == (None, None), (entry, carry)
