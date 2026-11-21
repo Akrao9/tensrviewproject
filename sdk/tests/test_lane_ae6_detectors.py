@@ -32,7 +32,7 @@ NAMES = list(CASES)
 REASON = ("clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter,"
           " so {n} comparison(s) of update_spike were not made")
 NONE_REASON = ("clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter,"
-               " so none of the {n} comparison(s) of update_spike was made, and no pair was judged")
+               " so {n} comparison(s) of update_spike were not made; none of the comparisons of update_spike was made, so nothing was judged")
 
 
 def _records(name: str) -> list[dict]:
@@ -186,7 +186,7 @@ def test_with_no_pair_compared_update_spike_is_unavailable_and_the_words_say_non
     (entry,) = [e for e in evidence["not_checked"] if e["check"] == "clip_groups"]
     assert entry["compared"] == 0 and entry["reason"] == (
         "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter,"
-        " so none of the 5 comparison(s) of update_spike was made, and no pair was judged")
+        " so 5 comparison(s) of update_spike were not made; none of the comparisons of update_spike was made, so nothing was judged")
     assert evidence["kind_checks"]["update_spike"]["value"] == "unavailable"
     assert evidence["kind_checks"]["update_spike"]["reason"] == entry["reason"]
     combined = ev.combine_rank_evidence({0: evidence})

@@ -662,7 +662,7 @@ CLIP_GROUPS_REASON = (
 # make clear that zero were judged".
 CLIP_GROUPS_NONE_REASON = (
     "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter,"
-    " so none of the {n} comparison(s) of update_spike was made, and no pair was judged"
+    " so {n} comparison(s) of update_spike were not made; none of the comparisons of update_spike was made, so nothing was judged"
 )
 
 
