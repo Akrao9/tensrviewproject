@@ -295,9 +295,8 @@ def _stats_hook(
     `grad_norms` and `weight_norms` already are for FSDP2's parameters. Under Partial each rank
     holds an addend of the output, so no statistic of it would be true, and it is not read.
 
-    Not wired to the records yet: saying `problems` in a record needs a field of its own
-    (`layers_not_read`, as `moe_refused` is for routers), which is a schema change left for a
-    decision."""
+    The session says `problems` under `layers_not_read` (contract, part 7; lane AD3), once, for a
+    block whose output was never read on any step before it (`Session._layers_not_read`)."""
     phase = phase or _Evaluating()
     problems = [] if problems is None else problems
 
@@ -568,8 +567,13 @@ def _count_width(spec: Router) -> int:
     - `[E + 2, 2E + 2)`: true routing-map entries left out because their paired float is exactly 0,
       per expert, so `moe[e] + moe_left_out[e]` is Megatron's own `routing_map.sum(dim=0)`: `moe_left_out`;
     - `2E + 2`: forwards whose expert ids were checked (the integer and `indices=` paths);
-    - `2E + 3`: forwards whose routing map was checked against a paired float."""
-    return 2 * spec.n_experts + 4
+    - `2E + 3`: forwards whose routing map was checked against a paired float;
+    - `2E + 4`: forwards counted from a routing map, paired or not;
+    - `2E + 5`: forwards counted from the top-k of scores (logits).
+
+    The last four tell `moe_source`'s form (`_moe_forms`) from the counts the flush copies anyway, so
+    the hooks keep no Python state of their own, which under `torch.compile` would be guarded on."""
+    return 2 * spec.n_experts + 6
 
 
 def _router_hook(
@@ -587,12 +591,17 @@ def _router_hook(
     out before anything is read, so an evaluation batch is neither counted nor refused."""
     phase = phase or _Evaluating()
     experts = spec.n_experts
-    # Constant tails of the slots `_count_width` lays out, made once on the counts' device.
-    ids_tail = torch.zeros(experts + 2, dtype=counts.dtype, device=counts.device)
-    ids_tail[experts] = 1  # the ids were checked; no routing map
+    # What one forward adds to `counts` before its assignments (`_count_width`), made once on the
+    # counts' device: for expert ids, the slot that says they were checked; for the top-k of
+    # logits, nothing. `expert_ids` is no longer read (lane AD3): the count goes by index.
+    ids_start = torch.zeros(_count_width(spec), dtype=counts.dtype, device=counts.device)
+    ids_start[2 * experts + 2] = 1  # the ids were checked; no routing map
+    scores_start = torch.zeros_like(ids_start)
+    scores_start[2 * experts + 5] = 1  # counted from the top-k of scores
     no_ids = torch.zeros(2, dtype=counts.dtype, device=counts.device)
-    map_checked = torch.tensor([0, 1], dtype=counts.dtype, device=counts.device)
-    unchecked = torch.zeros(experts + 4, dtype=counts.dtype, device=counts.device)
+    map_checked = torch.tensor([0, 1, 1, 0], dtype=counts.dtype, device=counts.device)
+    unchecked_map = torch.zeros(experts + 6, dtype=counts.dtype, device=counts.device)
+    unchecked_map[experts + 4] = 1  # a routing map with no paired float: counted from a map, nothing left out
 
     def refuse(why: Callable[[], str], fix: str | None = None) -> None:
         # Built only the first time: a refused router's hook still runs on every forward, and
@@ -693,11 +702,13 @@ def _router_hook(
                 if paired is None:
                     # No float of the map's shape: every true entry is counted, none can be left out,
                     # so that check did not apply (no `moe_left_out` for this forward).
-                    hits = torch.cat([kept.reshape(-1, experts).sum(0), unchecked])
+                    hits = torch.cat([kept.reshape(-1, experts).sum(0), unchecked_map])
                 else:
-                    zero = paired.detach() == 0
-                    left = (kept & zero).reshape(-1, experts).sum(0)
-                    hits = torch.cat([(kept & ~zero).reshape(-1, experts).sum(0), no_ids, left, map_checked])
+                    # The map is tokens x experts already, so its own size is the floor here; the
+                    # routed count is the map's sum less what is left out, with no second mask.
+                    left = (kept & (paired.detach() == 0)).reshape(-1, experts).sum(0)
+                    routed = kept.reshape(-1, experts).sum(0) - left
+                    hits = torch.cat([routed, no_ids, left, map_checked])
             else:
                 logits = _first_tensor(output, integer=False)
                 if logits is None:
@@ -734,18 +745,26 @@ def _router_hook(
                     if spec.top_k <= 1
                     else logits.topk(spec.top_k, dim=-1).indices
                 )
-        # Fixed output shape: `bincount` would make the shape depend on the data.
+        # Fixed output shape: `bincount` would make the shape depend on the data. Each assignment
+        # adds one at its slot (`index_add_`), so what is made is in proportion to the assignments
+        # and the counts' width: before lane AD3 every id was compared with every expert, a bool
+        # matrix of assignments by experts (16,384 tokens at top-8 over 256 experts: 33.5 million
+        # entries a forward). Integer adds, so the counts are exact in any order, and PyTorch takes
+        # a deterministic path for `index_add_` on CUDA when deterministic algorithms are on.
         # Accumulate across gradient-accumulation microbatches; `_commit` zeroes `counts`.
         if idx is not None:
-            flat = idx.detach().reshape(-1, 1)
-            hits = (flat == expert_ids).sum(0)
+            flat = idx.detach().reshape(-1).to(torch.int64)
             if spec.indices is not None or logits is None:
                 # Ids the router or its `indices=` function gave: those below 0 are no assignment
-                # (counted, not refused), those at or above n_experts refuse the router at the flush
-                # (`_judge_index_ranges`). Device work only; no sync here.
-                hits = torch.cat([hits, (flat < 0).sum().reshape(1), (flat >= experts).sum().reshape(1), ids_tail])
+                # (counted at slot E, not refused), those at or above n_experts at slot E + 1, which
+                # refuses the router at the flush (`_judge_index_ranges`). Every slot is in range, so
+                # no device assert. Device work only; no sync here.
+                slot = torch.where(flat < 0, experts, torch.where(flat >= experts, experts + 1, flat))
+                hits = ids_start.clone()
             else:
-                hits = torch.cat([hits, unchecked])  # top-k of logits: always in range, nothing to check
+                slot = flat  # top-k of logits: always in range, nothing to check
+                hits = scores_start.clone()
+            hits.index_add_(0, slot, torch.ones_like(slot))
         if torch.compiler.is_compiling():
             _add_compiled(counts, hits)
         else:
@@ -1084,6 +1103,13 @@ def _clip_grad_norm_wrapper(parameters: Any, *args: Any, **kwargs: Any) -> Any:
     return total_norm
 
 
+class _ClipCall:
+    """What `record_grad_norm` writes as `Session._clip_calls` under `torch.compile`: a new object at each
+    call, unequal to any count, so a wrapper that compares the count before and after sees the call."""
+
+    __slots__ = ()
+
+
 def _clip_is_l2(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
     """Whether a `clip_grad_norm_(parameters, max_norm, norm_type=2.0, ...)` call computes an
     L2 norm, the only kind recorded. Torch's and Accelerate's both take `norm_type` after
@@ -1373,14 +1399,23 @@ class Session:
         self._router_problems: dict[str, list[tuple[str, str | None]]] = {name: [] for name in self._routers}
         self._router_problems_said: set[str] = set()
         self._router_refusals_written: set[str] = set()
+        # Each router's `moe_source` once it is known and written (`_moe_forms`, contract part 7).
+        self._moe_source_written: set[str] = set()
 
         n_layers, n_params = len(self.layer_names), len(self._params)
+        # What each watched block's hook found it could not read (`_stats_hook`), the blocks read on any
+        # step so far, and those already named under `layers_not_read` (`_layers_not_read`).
+        self._layer_problems: list[list[str]] = [[] for _ in range(n_layers)]
+        self._layers_ever_read: set[int] = set()
+        self._layers_not_read_written: set[str] = set()
         f32 = {"dtype": torch.float32, "device": self.device}
         self._act = torch.zeros(n_layers, _SEEN + 1, **f32)
         self._stat_idx = torch.arange(_SEEN + 1, dtype=torch.int64, device=self.device)
-        # gradient norm, seen, weight norm, weight unchanged since the previous record
-        # (1 = exactly unchanged, 0 = changed, -1 = not known)
-        self._grad = torch.zeros(n_params, 4, **f32)
+        # gradient norm, seen, and with the weight check on, weight norm, weight unchanged since the
+        # previous record (1 = exactly unchanged, 0 = changed, -1 = not known). Only the columns of the
+        # signals that are on (lane AD3): without the weight check its two columns are not made, so
+        # `_decode` reads the width from the block, never from this session.
+        self._grad = torch.zeros(n_params, 4 if weight_every > 0 else 2, **f32)
         # Float64 weight norms of the previous record, to tell exactly whether a step changed
         # each weight. A float32 norm misses the few-element changes typical of bf16 weights
         # under small updates. Apple MPS has no float64, so there only float32 norms are kept.
@@ -1402,7 +1437,12 @@ class Session:
             for name, spec in self._routers.items()
         }
         self._ring_act = torch.zeros(every, n_layers, _SEEN + 1, **f32)
-        self._ring_grad = torch.zeros(every, *self._grad.shape, **f32)
+        # The ring's gradient rows. In the router-only mode, which reads no gradient on its own, none
+        # are made until a step whose gradients were read by hand (`record_grads`) is committed
+        # (`_grad_ring`); before lane AD3 they were `every` rows of four floats a parameter whatever was on.
+        self._ring_grad: torch.Tensor | None = (
+            torch.zeros(every, *self._grad.shape, **f32) if grad_every > 0 or weight_every > 0 else None
+        )
         self._ring_grad_seen: list[bool] = []
         self._ring_weight_seen: list[Any] = []  # False, or the weight check's optimizer ownership and dtypes
         # Squared total gradient norm reported by gradient clipping this step (summed over
@@ -1411,7 +1451,9 @@ class Session:
         self._ring_clip = torch.zeros(every, **f32)
         self._clip_recorded = False
         self._foreign_steps = 0
-        self._clip_calls = 0  # lets an outer wrapper see that an inner one already recorded
+        # Lets an outer wrapper see that an inner one already recorded: a count, or a `_ClipCall` written
+        # under `torch.compile`; compared for equality only.
+        self._clip_calls: int | _ClipCall = 0
         self._ring_clip_seen: list[bool] = []
         # The size of the optimizer's update to each parameter (`updates=True`): its RMS and
         # whether it was read this step, and the ring. Empty when the option is off.
@@ -1622,7 +1664,9 @@ class Session:
         removed, the one effect that is not undone, so it happens only once all else has."""
         undo.append(lambda: [handle.remove() for handle in self._handles])
         self._handles += [
-            module.register_forward_hook(_stats_hook(self._act, self._stat_idx, row, self._evaluating))
+            module.register_forward_hook(
+                _stats_hook(self._act, self._stat_idx, row, self._evaluating, self._layer_problems[row])
+            )
             for row, (_, module) in enumerate(plan.selected)
         ]
         self._handles += [
@@ -1757,11 +1801,25 @@ class Session:
         # The every-th, 2*every-th, ... step, counting from 1 (as Lightning and wandb do).
         return every > 0 and (self._steps_committed + 1) % every == 0
 
-    def _note_foreign_step(self) -> None:
+    def _note_foreign_step(self, optimizer: Any = None) -> None:
         # DeepSpeed's ZeRO optimizers and Megatron's mixed-precision optimizer step copies
         # of the weights, so the optimizer that steps holds none of the model's
         # parameters and no step would ever be counted. Say so instead of writing nothing.
         if self._lead is not None or self._foreign_steps < 0:
+            return
+        if self._foreign_steps == 0 and optimizer is not None and self._replaced_parameters(optimizer):
+            # Lane AD3: a session made before `to_empty` (a model built on meta) holds the meta
+            # parameters, which `to_empty` replaces with new ones; the optimizer, made after, steps the
+            # new ones. Said at the first step, with the cause, instead of after ten with another.
+            self._foreign_steps = -1
+            _warn(
+                "TensorQuill is not counting this optimizer's steps: it holds parameters the model has now "
+                "that replaced the ones it had when tensorquill.init ran (to_empty on a model made on meta, or "
+                "a parameter assigned after init), and the session reads the old ones, so no step is recorded "
+                "until an optimizer of those steps. Call tensorquill.init after to_empty, once the parameters "
+                "are materialised.",
+                stacklevel=3,
+            )
             return
         self._foreign_steps += 1
         if self._foreign_steps == FOREIGN_STEPS_WARNING:
@@ -1773,13 +1831,23 @@ class Session:
                 stacklevel=2,
             )
 
+    def _replaced_parameters(self, optimizer: Any) -> bool:
+        """Whether `optimizer` holds a parameter the model has now that it did not have at `init`: one
+        pass over the model's parameters, on the host, at the first step of an optimizer that holds
+        none of the session's, once a session. Never raises."""
+        try:
+            now = {id(p) for p in self._model.parameters()} - self._model_param_ids
+            return bool(now) and any(id(p) in now for group in optimizer.param_groups for p in group["params"])
+        except Exception:  # noqa: BLE001
+            return False
+
     def _before_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
         if self._closed:
             return
         if not self._owns(optimizer):
             self._foreign_stepped = True
             if not self._stopped:
-                self._note_foreign_step()
+                self._note_foreign_step(optimizer)
             return
         # PyTorch wraps each optimizer class's own `step` with the global hooks, so an
         # optimizer that subclasses another and calls `super().step()` fires them again,
@@ -2207,6 +2275,13 @@ class Session:
                 )
         self._grads_recorded = True
 
+    def _grad_ring(self) -> torch.Tensor:
+        """The ring's gradient rows, made the first time a step with gradients read is committed in
+        the router-only mode (`record_grads` called by hand); made at `init` in every other mode."""
+        if self._ring_grad is None:
+            self._ring_grad = torch.zeros(self.every, *self._grad.shape, dtype=self._grad.dtype, device=self._grad.device)
+        return self._ring_grad
+
     def _grad_not_read(self, index: int, why: str) -> None:
         """Keep why parameter `index`'s gradient was not read, for `grads_not_read` (`_flush`)."""
         self._grad_why.setdefault(self.param_names[index], why)
@@ -2458,7 +2533,15 @@ class Session:
         else:
             self._clip.add_(float(norm) ** 2)
         self._clip_recorded = True
-        self._clip_calls += 1
+        if torch.compiler.is_compiling():
+            # Written, never read, while traced (lane AD3): `+= 1` read the count, and Dynamo guarded
+            # on its value, so a compiled step that clips recompiled at every step until its
+            # recompile limit and then ran eagerly. A new marker still tells a wrapper that compares
+            # the count before and after a call (`accelerator._clip_grad_norm`) that this call recorded.
+            self._clip_calls = _ClipCall()
+        else:
+            calls = self._clip_calls
+            self._clip_calls = calls + 1 if type(calls) is int else 1
 
     def log(self, values: Mapping[str, Any] | None = None, **named: Any) -> None:
         """Record scalars such as the loss for the step in progress, without a GPU sync.
@@ -2893,6 +2976,55 @@ class Session:
             if found
         }
 
+    def _moe_forms(self, counts: torch.Tensor, n: int, refused: Mapping[str, str]) -> dict[str, dict[str, str]]:
+        """`moe_source` for each router counted in this block and not said before (contract part 7):
+        `form` from the slots `_count_width` keeps for it, read from `counts`, already on the CPU, on
+        the first step of the block that counted the router; `point` from the form.
+
+        Scores are the router's requests: TensorQuill took their top-k itself, so nothing the model
+        does after (a capacity limit, dropping, padding) is in them. Indices and maps are what the
+        model gave at the hooked module, which may come before or after its capacity handling, and a
+        forward hook on that module cannot tell which: `"unknown"`. No path writes `"dispatched"`:
+        the hook runs when the hooked module returns, and nothing at that point establishes that the
+        model has finished assigning (its dispatcher runs after the router). On the host, no sync."""
+        out: dict[str, dict[str, str]] = {}
+        offset = 0
+        for name, spec in self._routers.items():
+            width, e = _count_width(spec), spec.n_experts
+            size = n * width
+            if name not in self._moe_source_written and name not in refused:
+                rows = counts[offset : offset + size].reshape(n, width)[:, 2 * e + 2 :].tolist()
+                for ids, _, maps, scores in rows:
+                    form = "indices" if ids else "map" if maps else "scores" if scores else None
+                    if form is not None:
+                        out[name] = {"form": form, "point": "requested" if form == "scores" else "unknown"}
+                        self._moe_source_written.add(name)
+                        break
+            offset += size
+        return out
+
+    def _layers_not_read(self, floats: torch.Tensor | None, n: int) -> dict[str, str]:
+        """`layers_not_read` for this block (contract part 7, the author's word: a once-per-run note of
+        a persistent limitation): each watched block whose hook found it could not read its output and
+        that was read on no step so far, this block's included, with the hook's reason. Read from the
+        `seen` column of the block's statistics, already on the CPU. A block read on any step is never
+        named, so one that fails on some steps and is read on others is left out, as v1 states. A block
+        named here and read on a later step stays named: the note is said once. On the host, no sync."""
+        try:
+            if floats is not None and n > 0 and self.layer_names:
+                size = n * len(self.layer_names) * (_SEEN + 1)
+                seen = floats[:size].reshape(n, len(self.layer_names), _SEEN + 1)[:, :, _SEEN]
+                self._layers_ever_read.update(int(row) for row in seen.amax(0).nonzero().reshape(-1).tolist())
+            found = {
+                name: problems[0]
+                for row, (name, problems) in enumerate(zip(self.layer_names, self._layer_problems))
+                if problems and row not in self._layers_ever_read and name not in self._layers_not_read_written
+            }
+        except Exception:  # noqa: BLE001  # the note is lost, never the block
+            return {}
+        self._layers_not_read_written.update(found)
+        return found
+
     def _say_router_problems(self, stacklevel: int) -> None:
         for name, reason in self._router_refusals().items():
             if name not in self._router_problems_said:
@@ -2984,13 +3116,13 @@ class Session:
         hooked = ([self._act] if has_act else []) + self._counts_list
         hooked_versions = [buf._version for buf in hooked]
         if has_act and self._grads_recorded:
-            torch._foreach_copy_((self._ring_act[row], self._ring_grad[row]), (self._act, self._grad))
+            torch._foreach_copy_((self._ring_act[row], self._grad_ring()[row]), (self._act, self._grad))
             torch._foreach_zero_((self._act, self._grad))
         elif has_act:
             self._ring_act[row].copy_(self._act)
             self._act.zero_()
         elif self._grads_recorded:
-            self._ring_grad[row].copy_(self._grad)
+            self._grad_ring()[row].copy_(self._grad)
             self._grad.zero_()
         self._ring_grad_seen.append(self._grads_recorded)
         self._ring_weight_seen.append(
@@ -3214,9 +3346,11 @@ class Session:
         self._param_ids = {id(p) for p in self._params}
         self._param_index = {id(p): index for index, p in enumerate(self._params)}
         self._grad = torch.cat([self._grad, self._grad.new_zeros(k, self._grad.shape[1])])
-        self._ring_grad = torch.cat(
-            [self._ring_grad, self._ring_grad.new_zeros(self._ring_grad.shape[0], k, self._ring_grad.shape[2])], dim=1
-        )
+        if self._ring_grad is not None:
+            self._ring_grad = torch.cat(
+                [self._ring_grad, self._ring_grad.new_zeros(self._ring_grad.shape[0], k, self._ring_grad.shape[2])],
+                dim=1,
+            )
         if self.updates:
             self._update = torch.cat([self._update, self._update.new_zeros(k, self._update.shape[1])])
             self._ring_update = torch.cat(
@@ -3276,7 +3410,7 @@ class Session:
             return
         # One transfer for the float statistics, one for the integer expert counts.
         has_act = self._act.numel() > 0
-        has_grads = any(self._ring_grad_seen) and self._grad.numel() > 0
+        has_grads = any(self._ring_grad_seen) and self._grad.numel() > 0 and self._ring_grad is not None
         if has_act and has_grads:
             floats: torch.Tensor | None = torch.cat(
                 [self._ring_act[:n].reshape(-1), self._ring_grad[:n].reshape(-1)]
@@ -3341,6 +3475,8 @@ class Session:
         refused = self._router_refusals()
         announce = {name: why for name, why in refused.items() if name not in self._router_refusals_written}
         self._router_refusals_written.update(announce)
+        sources = self._moe_forms(counts, n, refused) if counts is not None else {}
+        layers_why = self._layers_not_read(floats if has_act else None, n)
         self._ring_ts = []
         self._steps = []
         self._ring_lr = []
@@ -3354,7 +3490,7 @@ class Session:
             steps, lrs, floats, counts, spreads, clips, clip_seen, grad_seen, weight_seen,
             spread_seen, scalars, probes, stamps, amps, data_rows, checkpoints, waits, system,
             refused, announce, updates, update_seen, update_why, grad_why, obs, obs_sig, obs_seen, scopes,
-            self.param_names,
+            self.param_names, sources, layers_why,
         )
         if hold_newest:
             first = self._hold_newest(dict(zip(_BLOCK_FIELDS, block)), act_size=self._act.numel() if has_act else 0,
@@ -3401,7 +3537,7 @@ class Session:
         # What is said once for the block goes on its first record, written now (with one step, on
         # that step); the system readings on its last, as for any block.
         last = n == 1
-        for key in ("announce", "update_why", "grad_why"):
+        for key in ("announce", "update_why", "grad_why", "moe_source", "layers_not_read"):
             first[key], held[key] = (None, block[key]) if last else (block[key], {})
         first["system"], held["system"] = None, block["system"]
         first["refused"] = held["refused"] = block["refused"]
@@ -3438,7 +3574,8 @@ class Session:
             block["scalars"] = _scalars_to_cpu(self._ring_scalars)
         if "update" in dirty:
             block["updates"] = _cpu_copy(self._ring_update[:1])
-        if "grad" in dirty and block["floats"] is not None:
+        if "grad" in dirty and block["floats"] is not None and self._ring_grad is not None:
+            # Marked only by a weight check read again (`_follow`), so the rows are four wide here.
             weights = block["floats"][held["act_size"] :].view(-1, 4)
             weights[:, 2:] = self._ring_grad[0, :, 2:].cpu()
         update_why = {name: why for name, why in self._update_why.items() if name not in self._update_why_written}
@@ -3789,6 +3926,8 @@ class Session:
         obs_seen: list[Any] | None = None,
         scopes: list[list[int] | None] | None = None,
         param_names: Sequence[str] | None = None,
+        moe_source: Mapping[str, Mapping[str, str]] | None = None,
+        layers_not_read: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         # The parameters the block was made with: `_take_unfrozen` may add some after it was queued.
         names = self.param_names if param_names is None else param_names
@@ -3799,9 +3938,11 @@ class Session:
             if n_layers > 0 and floats is not None
             else None
         )
+        # Two columns a parameter, or four with the weight check (`Session.__init__`): read from the
+        # block's own size, so a block is decoded as it was made.
         grad = (
-            floats[split:].reshape(n, n_params, 4).tolist()
-            if any(grad_seen) and n_params > 0 and floats is not None
+            floats[split:].reshape(n, n_params, -1).tolist()
+            if any(grad_seen) and n_params > 0 and floats is not None and floats.numel() > split
             else None
         )
         spread_rows = (
@@ -3833,7 +3974,7 @@ class Session:
         records = []
         for i, step in enumerate(steps):
             grad_norms = (
-                {name: norm for name, (norm, seen, _, _) in zip(names, grad[i]) if seen}
+                {name: row[0] for name, row in zip(names, grad[i]) if row[1]}
                 if grad is not None and grad_seen[i]
                 else {}
             )
@@ -3948,6 +4089,12 @@ class Session:
             # Once per router and session: the reason it is not counted, so a reader of the
             # records (the evidence, the server) can say MoE was not checked for it.
             records[0]["moe_refused"] = dict(announce)
+        if moe_source and records:
+            # Once per router (contract part 7): how its counts reached the capture and from where.
+            records[0]["moe_source"] = {name: dict(source) for name, source in moe_source.items()}
+        if layers_not_read and records:
+            # Once per block (contract part 7): a watched block whose output this capture cannot read.
+            records[0]["layers_not_read"] = dict(layers_not_read)
         if update_why and records:
             # Once for each: why an optimizer's update size is not in these records, so a reader
             # can say the update size was not checked, and not that nothing was found.
@@ -3965,7 +4112,7 @@ _BLOCK_FIELDS = (
     "steps", "lrs", "floats", "counts", "spreads", "clips", "clip_seen", "grad_seen", "weight_seen",
     "spread_seen", "scalars", "probes", "stamps", "amps", "data_rows", "checkpoints", "waits", "system",
     "refused", "announce", "updates", "update_seen", "update_why", "grad_why", "obs", "obs_sig", "obs_seen",
-    "scopes", "param_names",
+    "scopes", "param_names", "moe_source", "layers_not_read",
 )
 
 
