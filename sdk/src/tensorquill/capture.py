@@ -2840,18 +2840,21 @@ class Session:
         `scaler_applied: true`; with no such verdict for this update there is no key. Left out,
         the record says what the scaler said, as before, and nothing without a scaler. `skipped`
         takes only `True`, `False` or `None`; anything else raises `TypeError` here, before
-        anything of the step is recorded.
+        anything of the step is recorded, on the sessions a wrong `lr` raises on: a closed session,
+        or one whose capture has stopped, returns without raising for either.
         """
-        if skipped is not None and not isinstance(skipped, bool):
-            # A bool only: not 1 or 0, and not a tensor, whose truth would be a device sync (and so
-            # is its repr: the message names the type alone).
-            raise TypeError(f"skipped must be True, False or None, not {type(skipped).__name__}")
         if self._closed_call("step()"):
             if self._stopped and not self._closed and not self.auto_step:
                 self._count_stopped(step)  # the drift check's schedule goes on (`_count_stopped`)
             return
         if self.auto_step:
             raise RuntimeError("step() is called automatically; pass auto_step=False to call it yourself")
+        if skipped is not None and not isinstance(skipped, bool):
+            # Refused on the sessions a wrong `lr` is refused on: a closed one, or one whose capture
+            # stopped, has returned above with no raise, as for `lr`. Here it comes before anything of
+            # the step is recorded. A bool only: not 1 or 0, and not a tensor, whose truth would be a
+            # device sync (and so is its repr: the message names the type alone).
+            raise TypeError(f"skipped must be True, False or None, not {type(skipped).__name__}")
         if not self._grads_recorded and self._should_record_grads():
             self.record_grads()
         if lr is not None:
