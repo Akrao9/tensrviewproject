@@ -140,6 +140,11 @@ def _resolved(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     again by first appearance can take the original attempt for the later one and drop the whole
     restart. The same rule leaves raw rows whose attempts do not overlap as they are, though
     `load_records` would drop an attempt that appears first wholly above a later one.
+
+    The guard is still needed with `first_divergence(..., resolved=True)`, which `compare`
+    passes (lane AD5, Nov 21, 2026): a caller that hands rows resolved across several files
+    without the keyword gets them as they are, and raw rows whose first attempt sits wholly
+    above a later one look exactly like those rows, so they are still read unresolved here.
     """
     from .evidence import _run_of, resolve_attempts
 
@@ -163,7 +168,7 @@ def _resolved(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
 class _Run:
     """One rank's series of one run: `series[id][step] = value`."""
 
-    def __init__(self, records: Iterable[Mapping[str, Any]], rank: int) -> None:
+    def __init__(self, records: Iterable[Mapping[str, Any]], rank: int, resolved: bool = False) -> None:
         self.series: dict[str, dict[int, float]] = {}
         self.about: dict[str, dict[str, Any]] = {}
         self.layer_order: dict[str, int] = {}
@@ -180,7 +185,7 @@ class _Run:
             if record_rank != rank or record.get("step") is None:
                 continue
             own.append(record)
-        kept = _resolved(own)
+        kept = own if resolved else _resolved(own)
         self.replaced = len(own) - len(kept)
         for record in kept:
             self.records += 1
@@ -422,6 +427,7 @@ def first_divergence(
     records_b: Iterable[Mapping[str, Any]],
     *,
     rank: int = 0,
+    resolved: bool = False,
 ) -> dict[str, Any]:
     """The first step, and the series, where run B leaves its early agreement with run A.
 
@@ -433,6 +439,13 @@ def first_divergence(
     left out and not read as the run's (lane AC4, Nov 20, 2026). Rows resolved already are read
     as they are: only a run ID whose attempts' step ranges overlap is resolved, so resolving
     again changes nothing. Rows with no step are not step records and are skipped.
+
+    `resolved=True` says the rows are resolved already, as `compare` gives them (each rank's
+    files resolved in the attempts' own order, `resolve_attempts_across`): they are read as
+    they are and never resolved again, so no attempt of theirs can be dropped here, and the
+    result has no `replaced_records` (lane AD5, Nov 21, 2026). Without it a caller's rows go
+    through the overlap rule above, which raw rows whose first attempt sits wholly above a later
+    one do not meet: give those `load_records(rows)` and `resolved=True` to have them resolved.
 
     Compared: every logged scalar that is not a wall-clock reading, the total gradient norm,
     each parameter's gradient norm and weight norm, each captured module's activation
@@ -452,7 +465,7 @@ def first_divergence(
     - `runs.a` / `runs.b` hold `replaced_records`, the rows of that rank a later attempt
       replaced and that were left out, only when there were some.
     """
-    a, b = _Run(records_a, rank), _Run(records_b, rank)
+    a, b = _Run(records_a, rank, resolved), _Run(records_b, rank, resolved)
     common = sorted(a.steps & b.steps)
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,

@@ -897,12 +897,16 @@ def compare_incidents(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
             group = groups.setdefault(incident_identity(incident), {"kind": incident["kind"], "runs": {}})
             step = incident.get("step") if _is_step(incident.get("step")) else None
             shown = group["runs"].get(label)
+            # A router flagged since its first sample began at `step` and became reportable later
+            # (DETECTOR_RULES_CONTRACT.md, part 3, lane AD5): kept apart, never read as found at `step`.
+            reportable = incident.get("reportable_step") if incident.get("since_start") is True else None
             if shown is None:
-                shown = group["runs"][label] = {"first_step": step, "count": 1, "where": incident_where(incident), "ranks": set()}
+                shown = group["runs"][label] = {"first_step": step, "count": 1, "where": incident_where(incident), "ranks": set(),
+                                                "reportable_step": reportable}
             else:
                 shown["count"] += 1
                 if step is not None and (shown["first_step"] is None or step < shown["first_step"]):
-                    shown.update(first_step=step, where=incident_where(incident))
+                    shown.update(first_step=step, where=incident_where(incident), reportable_step=reportable)
             if ranks is not None:
                 shown["ranks"].update(ranks)
     order = {kind: index for index, kind in enumerate(INCIDENT_CLASSES)}
@@ -926,6 +930,9 @@ def compare_incidents(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
             "class": own_class or "unclassified",
             "in": [label for label in labels if label in shown],
             "first_step": {label: shown[label]["first_step"] for label in labels if label in shown},
+            **({"reportable_step": {label: shown[label]["reportable_step"] for label in labels
+                                    if label in shown and shown[label]["reportable_step"] is not None}}
+               if any(s["reportable_step"] is not None for s in shown.values()) else {}),
             "where": {label: shown[label]["where"] for label in labels if label in shown},
             **({"count": {label: s["count"] for label, s in shown.items()}} if any(s["count"] > 1 for s in shown.values()) else {}),
             # For a run read on every rank: the ranks that show it there.
@@ -1014,7 +1021,8 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_
     except (OSError, ValueError, ImportError) as error:  # ImportError: a store's parts need pyarrow
         return {"state": "no_records", "detail": f"the step records could not be read for where the runs part ({error})"}
     left_out = {label: [rank] for label, rank, (_, torn) in zip(labels, ranks, read) if torn}
-    found = first_divergence(read[0][0], read[1][0], rank=ranks[0])
+    # Resolved already (`_step_records`): not resolved a second time (lane AD5).
+    found = first_divergence(read[0][0], read[1][0], rank=ranks[0], resolved=True)
     lines = divergence_summary(found)
     series = found.get("series") or {}
     kept = {name: entry for name, entry in series.items() if entry.get("status") != "agrees"}
@@ -1131,7 +1139,7 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
                 torn_in.setdefault(label, []).append(rank)
         pair = [records for records, _ in read]
         del read
-        found = first_divergence(pair[0], pair[1], rank=rank)
+        found = first_divergence(pair[0], pair[1], rank=rank, resolved=True)  # `_step_records` resolved them
         summaries[rank] = divergence_summary(found)
         series = found.get("series") or {}
         answers[rank] = {**found, "series": {name: e for name, e in series.items() if e.get("status") != "agrees"},
@@ -1384,7 +1392,9 @@ def summary_text(result: Mapping[str, Any]) -> str:
         else:
             head = (", ".join(shown) + " only") if len(shown) == 1 else ", ".join(shown)
         on = entry.get("ranks") or {}
+        since = entry.get("reportable_step") or {}
         steps = ", ".join((f"{label} step {step}" if step is not None else f"{label} (no step)")
+                          + (f" (collapsed since step {step}, reportable at step {since[label]})" if label in since else "")
                           + (f" (on {_rank_text(on[label])})" if label in on else "")
                           for label, step in entry["first_step"].items())
         first = entry["where"][shown[0]]

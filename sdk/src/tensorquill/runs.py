@@ -96,6 +96,19 @@ file is its furthest rank's, each rank's read from its last line in the last meg
 A run without a manifest (every run recorded before the manifest existed) is listed under
 `uncategorized` with its run ID as its name.
 
+Steps newer than the last judgment (CLI-10, lane AD5, Nov 21, 2026): a local row whose evidence
+files do not cover the newest step its records reach has `freshness`, `{"current": false,
+"judged_to_step", "records_to_step", "why"}`, and the printed listing a note `as of step J;
+records reach step R` (in words where a step is not known). `why` is `records_newer` (the row
+keeps its evidence's state and incidents beside the block, as before), `nothing_judged` (the
+evidence judged no step: no result is carried over and the state is unknown) or
+`thresholds_changed` (the same, for a reader that gives thresholds; the listing gives none, so
+it never says this). A file the command line writes does not name the step it judged, so its
+`judged_to_step` is null and its judgment is dated by the file's time, as `older_than_records`
+always was; a watcher's evidence taken from a server's report names it. A row whose evidence
+covers the newest step has no such key, and is as before. A store's row has none: a rank whose
+report stops before its newest stored part is already unknown there, with nothing carried over.
+
 `compare` (`compare.py`) finds runs by ID or name through `find_run` here.
 """
 
@@ -694,7 +707,11 @@ def _first(incidents: Iterable[Any]) -> dict[str, Any] | None:
         return value if isinstance(value, int) and not isinstance(value, bool) else float("inf")
 
     first = min(stepped, key=step)  # the earliest step; the evidence's own order breaks a tie
-    return {"kind": first.get("kind"), "step": first.get("step")}
+    # A router flagged since its first sample (DETECTOR_RULES_CONTRACT.md, part 3): `step` is when it
+    # began, and it became reportable later; the two are kept apart (lane AD5).
+    since = ({"since_start": True, "reportable_step": first.get("reportable_step")}
+             if first.get("since_start") is True else {})
+    return {"kind": first.get("kind"), "step": first.get("step"), **since}
 
 
 def _kinds_checked(kind_checks: Any) -> dict[str, int] | None:
@@ -945,7 +962,7 @@ def _local_row(run: Mapping[str, Any], known: Mapping[str, Any] | None) -> dict[
     row["incidents"] = _by_class(incidents)
     row["first_incident"] = _first(incidents)
     row["kinds_checked"] = _kinds_checked(evidence.get("kind_checks"))
-    return row
+    return _with_freshness(row, freshness([(evidence, look, step)], step))
 
 
 def _file_step(path: Path, last: Mapping[str, Any] | None, known: Mapping[str, Any]) -> int | None:
@@ -1016,7 +1033,103 @@ def _local_shared_file_row(records: Path, known: Mapping[str, Any], row: dict[st
                   "and what was checked is not counted for the run (python -m tensorquill compare reads every rank)"
                   + ("; the records have grown since it was written" if look["state"] == "older_than_records" else ""),
     }
+    return _with_freshness(row, freshness([(evidence, look, row.get("last_step"))], row.get("last_step")))
+
+
+# Steps newer than the last judgment (CLI-10, lane AD5, Nov 21, 2026): the names lane AD1 uses in
+# the watchers. A row whose evidence does not cover the newest step its records reach has
+# `"freshness": {"current": false, "judged_to_step", "records_to_step", "why"}`; a row whose
+# evidence covers it has no such key, as before. With `records_newer` the evidence's result is
+# shown as it is, beside the block; with the other two no earlier result is carried over and the
+# state is unknown. The listing reads no threshold, so `thresholds_changed` is never found here:
+# it is named for a reader that gives thresholds, and handled as `nothing_judged` is.
+FRESHNESS_WHY = ("records_newer", "thresholds_changed", "nothing_judged")
+
+
+def _judged_to_step(evidence: Mapping[str, Any] | None) -> int | None:
+    """The last step an evidence file says its incidents were judged to, or None when it does not
+    say. Only a watcher's evidence taken from a server's report says so today: its `detection`
+    (`source` "server") names the report's `report_last_step`. A file the command line writes
+    names no step, so its judgment is dated by the file's time alone (`_read_evidence_file`)."""
+    detection = (evidence or {}).get("detection")
+    if not isinstance(detection, Mapping) or detection.get("source") != "server" or detection.get("state") != "current":
+        return None
+    step = detection.get("report_last_step")
+    return step if isinstance(step, int) and not isinstance(step, bool) else None
+
+
+def _judged_nothing(evidence: Mapping[str, Any] | None) -> bool:
+    """Whether an evidence file judged no step: its run state says `no_steps`."""
+    reasons = ((evidence or {}).get("run_state") or {}).get("reasons") if isinstance(evidence, Mapping) else None
+    return any(isinstance(r, Mapping) and r.get("code") == "no_steps" for r in reasons or ())
+
+
+def freshness(looked: Iterable[tuple[Mapping[str, Any] | None, Mapping[str, Any], int | None]],
+              records_to_step: int | None) -> dict[str, Any] | None:
+    """The row's `freshness` block, or None when its evidence covers the newest step its records
+    reach. `looked` has, for each rank whose evidence file was read, `(evidence, look, step)`:
+    the evidence, what `_read_evidence_file` said of it, and the last step of that rank's records.
+
+    A rank is covered when no step of its records was read (there is none to be newer), when its
+    evidence names a judged step at or past its records' last step, or, naming none, when the
+    file is not older than its records and judged some step. It is not
+    covered when its records have a step and its evidence judged none (`nothing_judged`), when
+    the step it names is below its records' (`records_newer`), or when it names none and the
+    file is older than the records (`records_newer`, `judged_to_step` null: the file does not say
+    how far it got). `nothing_judged` only when every rank's evidence judged nothing; otherwise
+    `records_newer`, as of the lowest judged step when every rank names one."""
+    listed = [(evidence, look, step) for evidence, look, step in looked if evidence is not None]
+    if not listed:
+        return None
+    judged = [_judged_to_step(evidence) for evidence, _, _ in listed]
+    nothing = [_judged_nothing(evidence) and step is not None for evidence, _, step in listed]
+
+    def covered(at: int) -> bool:
+        evidence, look, step = listed[at]
+        if step is None:  # no step read of its records: none to be newer than the judgment
+            return True
+        if nothing[at]:
+            return False
+        if judged[at] is not None:
+            return judged[at] >= step
+        return look.get("state") != "older_than_records"
+
+    if all(covered(at) for at in range(len(listed))):
+        return None
+    if all(nothing):
+        return {"current": False, "judged_to_step": None, "records_to_step": records_to_step, "why": "nothing_judged"}
+    named = [step for step, empty in zip(judged, nothing) if not empty]
+    return {"current": False, "judged_to_step": min(named) if named and all(s is not None for s in named) else None,
+            "records_to_step": records_to_step, "why": "records_newer"}
+
+
+def _with_freshness(row: dict[str, Any], block: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Put `block` on `row`. With `records_newer` the row is as its evidence made it; with the
+    other two the evidence's result is not carried over: the state is unknown, and the incidents,
+    the first incident and the kinds checked are not known."""
+    if block is None:
+        return row
+    row["freshness"] = dict(block)
+    if block["why"] != "records_newer":
+        row["run_state"] = "unknown"
+        row["incidents"] = row["first_incident"] = row["kinds_checked"] = None
+        for key in ("ranks_with_incidents", "rank_incidents_not_known", "kinds_not_stated"):
+            row.pop(key, None)
     return row
+
+
+def freshness_text(block: Mapping[str, Any]) -> str:
+    """`as of step 40; records reach step 55`, and in words where a step is not known."""
+    judged, reach = block.get("judged_to_step"), block.get("records_to_step")
+    said = (f"as of step {judged}" if judged is not None
+            else "as of no step judged" if block.get("why") == "nothing_judged"
+            else "as of a step its evidence file does not name")
+    said += f"; records reach step {reach}" if reach is not None else "; the step its records reach is not known"
+    if block.get("why") == "thresholds_changed":
+        said += "; judged under other thresholds, so its earlier result is not shown and its state is unknown"
+    elif block.get("why") == "nothing_judged":
+        said += "; its evidence judged no step, so no result is shown and its state is unknown"
+    return said
 
 
 EVIDENCE_ENDINGS = (".evidence.json", ".evidence.compact.json")  # the full file, and the one `--compact` writes
@@ -1092,6 +1205,7 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
     steps: list[int] = []
     shared: list[tuple[Path, dict[str, Any] | None, dict[str, Any]]] = []
     split: dict[int, str] = {}
+    looked: list[tuple[dict[str, Any] | None, dict[str, Any], int | None]] = []  # for `freshness`
     for number in sorted(files):
         records = files[number]
         if number in (more or {}):
@@ -1111,6 +1225,8 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
         steps += list((known["last_steps"].get(records) or {}).values()) or ([step] if step is not None else [])
         evidence, look = _read_evidence_file(records)
         looks[number] = look
+        rank_steps = list((known["last_steps"].get(records) or {}).values()) or ([step] if step is not None else [])
+        looked.append((evidence, look, max(rank_steps) if rank_steps else None))
         if records in known["several"]:
             shared.append((records, evidence, look))
         elif evidence is None:
@@ -1193,7 +1309,7 @@ def _local_all_ranks_row(files: Mapping[int, Path], row: dict[str, Any], known: 
             row["run_state"] = max((row.get("run_state") or "healthy", theirs), key=RUN_STATES.index)
             if not per_rank:
                 row["rank_incidents_not_known"] = True
-    return row
+    return _with_freshness(row, freshness(looked, row.get("last_step")))
 
 
 def _incident_cells(row: dict[str, Any], view: Mapping[str, Any]) -> None:
@@ -1523,7 +1639,9 @@ def _cells(row: Mapping[str, Any]) -> list[str]:
         str(row["rank_count"]) if row.get("rank_count") else f"{len(row['ranks'])}+" if row.get("ranks") else "?",
         "?" if row.get("last_step") is None else str(row["last_step"]),
         _incidents_text(row),
-        f"{first['kind']} at step {first['step']}" if first else ("-" if row.get("incidents") is not None else "?"),
+        (f"{first['kind']} since step {first['step']}, reportable at step {first.get('reportable_step')}"
+         if first and first.get("since_start") else f"{first['kind']} at step {first['step']}" if first
+         else ("-" if row.get("incidents") is not None else "?")),
         f"{checked['checked']} of {checked['of']}" if checked else "?",
         str(row.get("started") or "?").replace("T", " ").rstrip("Z"),
         _end_text(row.get("end")),
@@ -1565,6 +1683,8 @@ def listing_text(rows: list[Mapping[str, Any]], source: str | Path, project: str
             if row.get("also_in_store"):
                 notes.append(f"{row['run_id']}: also in the store at {row['also_in_store']}; listed once, from its local "
                              "files, which hold every record")
+            if isinstance(row.get("freshness"), Mapping):
+                notes.append(f"{row['run_id']}: {freshness_text(row['freshness'])}")
             if row.get("rank_count_not_known"):
                 notes.append(f"{row['run_id']}: ranks not counted: {row['rank_count_not_known']}")
             if isinstance(row.get("dropped_rows"), Mapping):
