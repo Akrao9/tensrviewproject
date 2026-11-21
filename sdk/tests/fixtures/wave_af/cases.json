@@ -1,0 +1,1765 @@
+{
+ "base": "76a3b5d51d0c8108d4043c3deb1582275f00e13f",
+ "cases": {
+  "attempt_absent": {
+   "expected": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   },
+   "field": "attempt",
+   "given": {
+    "record": {
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "pin",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   }
+  },
+  "attempt_float": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "attempt",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "attempt",
+     "traceback": false
+    },
+    "python": {
+     "field": "attempt",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "attempt",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "attempt",
+   "given": {
+    "record": {
+     "attempt": 1.5,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: 1.5",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: 1.5"
+    }
+   }
+  },
+  "attempt_negative": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "attempt",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "attempt",
+     "traceback": false
+    },
+    "detect": {
+     "exit": 1,
+     "names": "attempt"
+    },
+    "python": {
+     "field": "attempt",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "attempt",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "attempt",
+   "given": {
+    "record": {
+     "attempt": -3,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "detect": {
+     "rank": 0,
+     "reads": true,
+     "steps": 1
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   }
+  },
+  "attempt_null": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "attempt",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "attempt",
+     "traceback": false
+    },
+    "detect": {
+     "exit": 1,
+     "names": "attempt"
+    },
+    "python": {
+     "field": "attempt",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "attempt",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "attempt",
+   "given": {
+    "record": {
+     "attempt": null,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: None",
+     "traceback": true
+    },
+    "detect": {
+     "exit": 1,
+     "last_line": "tensorquill-server: cannot read the Arrow IPC stream: Invalid argument error: Column 'attempt' is declared as non-nullable but contains null values"
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: None"
+    }
+   }
+  },
+  "attempt_text": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "attempt",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "attempt",
+     "traceback": false
+    },
+    "python": {
+     "field": "attempt",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "attempt",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "attempt",
+   "given": {
+    "record": {
+     "attempt": "1",
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: '1'",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: '1'"
+    }
+   }
+  },
+  "attempt_true": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "attempt",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "attempt",
+     "traceback": false
+    },
+    "python": {
+     "field": "attempt",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "attempt",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "attempt",
+   "given": {
+    "record": {
+     "attempt": true,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: True",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: True"
+    }
+   }
+  },
+  "attempt_whole_float": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "attempt",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "attempt",
+     "traceback": false
+    },
+    "python": {
+     "field": "attempt",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "attempt",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "attempt",
+   "given": {
+    "record": {
+     "attempt": 1.0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: 1.0",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: 1.0"
+    }
+   }
+  },
+  "divergence_provenance_keys_are_not_series": {
+   "expected": {
+    "not_compared_has": []
+   },
+   "given": {
+    "records_a": [
+     {
+      "attempt": 0,
+      "layers_not_read": {
+       "x": "why"
+      },
+      "moe_source": {
+       "router": "counted"
+      },
+      "rank": 0,
+      "run_id": "a",
+      "scalars": {
+       "loss": 1.0
+      },
+      "schema_version": 1,
+      "step": 0
+     },
+     {
+      "attempt": 0,
+      "layers_not_read": {
+       "x": "why"
+      },
+      "moe_source": {
+       "router": "counted"
+      },
+      "rank": 0,
+      "run_id": "a",
+      "scalars": {
+       "loss": 1.0
+      },
+      "schema_version": 1,
+      "step": 1
+     }
+    ],
+    "records_b": [
+     {
+      "attempt": 0,
+      "layers_not_read": {
+       "x": "why"
+      },
+      "moe_source": {
+       "router": "counted"
+      },
+      "rank": 0,
+      "run_id": "a",
+      "scalars": {
+       "loss": 1.0
+      },
+      "schema_version": 1,
+      "step": 0
+     },
+     {
+      "attempt": 0,
+      "layers_not_read": {
+       "x": "why"
+      },
+      "moe_source": {
+       "router": "counted"
+      },
+      "rank": 0,
+      "run_id": "a",
+      "scalars": {
+       "loss": 2.0
+      },
+      "schema_version": 1,
+      "step": 1
+     }
+    ]
+   },
+   "section": 2,
+   "status": "new",
+   "today": {
+    "not_compared_has": [
+     "layers_not_read",
+     "moe_source"
+    ]
+   }
+  },
+  "rank_absent": {
+   "expected": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   },
+   "field": "rank",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "pin",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   }
+  },
+  "rank_float": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "rank",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "rank",
+     "traceback": false
+    },
+    "python": {
+     "field": "rank",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "rank",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "rank",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 1.5,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: 1.5",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: 1.5"
+    }
+   }
+  },
+  "rank_negative": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "rank",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "rank",
+     "traceback": false
+    },
+    "detect": {
+     "exit": 1,
+     "names": "rank"
+    },
+    "python": {
+     "field": "rank",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "rank",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "rank",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": -3,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "detect": {
+     "rank": -3,
+     "reads": true,
+     "steps": 1
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   }
+  },
+  "rank_null": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "rank",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "rank",
+     "traceback": false
+    },
+    "detect": {
+     "exit": 1,
+     "names": "rank"
+    },
+    "python": {
+     "field": "rank",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "rank",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "rank",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": null,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "exit": 1,
+     "last_line": "TypeError: int() argument must be a string, a bytes-like object or a real number, not 'NoneType'",
+     "traceback": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: int() argument must be a string, a bytes-like object or a real number, not 'NoneType'",
+     "traceback": true
+    },
+    "detect": {
+     "exit": 1,
+     "last_line": "tensorquill-server: cannot read the Arrow IPC stream: Invalid argument error: Column 'rank' is declared as non-nullable but contains null values"
+    },
+    "python": {
+     "raises": "TypeError",
+     "text": "int() argument must be a string, a bytes-like object or a real number, not 'NoneType'"
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "int() argument must be a string, a bytes-like object or a real number, not 'NoneType'"
+    }
+   }
+  },
+  "rank_text": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "rank",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "rank",
+     "traceback": false
+    },
+    "python": {
+     "field": "rank",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "rank",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "rank",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": "1",
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: '1'",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: '1'"
+    }
+   }
+  },
+  "rank_true": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "rank",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "rank",
+     "traceback": false
+    },
+    "python": {
+     "field": "rank",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "rank",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "rank",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": true,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: True",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: True"
+    }
+   }
+  },
+  "rank_whole_float": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "rank",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "rank",
+     "traceback": false
+    },
+    "python": {
+     "field": "rank",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "rank",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "rank",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 1.0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: 1.0",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: 1.0"
+    }
+   }
+  },
+  "run_id_absent": {
+   "expected": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   },
+   "field": "run_id",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "pin",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   }
+  },
+  "run_id_null": {
+   "expected": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   },
+   "field": "run_id",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": null,
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "pin",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   }
+  },
+  "run_id_number": {
+   "expected": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   },
+   "field": "run_id",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": 7,
+     "schema_version": 1,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "pin",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   }
+  },
+  "schema_version_99": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "detect": {
+     "exit": 1,
+     "names": "schema_version"
+    },
+    "python": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "schema_version",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 99,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "detect": {
+     "rank": 0,
+     "reads": true,
+     "steps": 1
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   }
+  },
+  "schema_version_absent": {
+   "expected": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   },
+   "field": "schema_version",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "pin",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   }
+  },
+  "schema_version_float": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "python": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "schema_version",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1.5,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: 1.5",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: 1.5"
+    }
+   }
+  },
+  "schema_version_negative": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "detect": {
+     "exit": 1,
+     "names": "schema_version"
+    },
+    "python": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "schema_version",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": -3,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "detect": {
+     "rank": 0,
+     "reads": true,
+     "steps": 1
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   }
+  },
+  "schema_version_null": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "detect": {
+     "exit": 1,
+     "names": "schema_version"
+    },
+    "python": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "schema_version",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": null,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: None",
+     "traceback": true
+    },
+    "detect": {
+     "exit": 1,
+     "last_line": "tensorquill-server: cannot read the Arrow IPC stream: Invalid argument error: Column 'schema_version' is declared as non-nullable but contains null values"
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: None"
+    }
+   }
+  },
+  "schema_version_text": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "python": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "schema_version",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": "1",
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: '1'",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: '1'"
+    }
+   }
+  },
+  "schema_version_true": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "python": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "schema_version",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": true,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: True",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: True"
+    }
+   }
+  },
+  "schema_version_whole_float": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "schema_version",
+     "traceback": false
+    },
+    "python": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "schema_version",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "schema_version",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1.0,
+     "step": 0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: 1.0",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: 1.0"
+    }
+   }
+  },
+  "step_absent": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "python": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "step",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "exit": 1,
+     "last_line": "KeyError: 'step'",
+     "traceback": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "KeyError: 'step'",
+     "traceback": true
+    },
+    "python": {
+     "raises": "KeyError",
+     "text": "'step'"
+    },
+    "rust": {
+     "raises": "KeyError",
+     "text": "'step'"
+    }
+   }
+  },
+  "step_float": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "python": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "step",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 1.5
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: 1.5",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: 1.5"
+    }
+   }
+  },
+  "step_negative": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "detect": {
+     "exit": 1,
+     "names": "step"
+    },
+    "python": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "step",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": -3
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "reads": true
+    },
+    "detect": {
+     "rank": 0,
+     "reads": true,
+     "steps": 1
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "reads": true
+    }
+   }
+  },
+  "step_null": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "detect": {
+     "exit": 1,
+     "names": "step"
+    },
+    "python": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "step",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": null
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "exit": 1,
+     "last_line": "TypeError: int() argument must be a string, a bytes-like object or a real number, not 'NoneType'",
+     "traceback": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: int() argument must be a string, a bytes-like object or a real number, not 'NoneType'",
+     "traceback": true
+    },
+    "detect": {
+     "exit": 1,
+     "last_line": "tensorquill-server: cannot read the Arrow IPC stream: Invalid argument error: Column 'step' is declared as non-nullable but contains null values"
+    },
+    "python": {
+     "raises": "TypeError",
+     "text": "int() argument must be a string, a bytes-like object or a real number, not 'NoneType'"
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "int() argument must be a string, a bytes-like object or a real number, not 'NoneType'"
+    }
+   }
+  },
+  "step_text": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "python": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "step",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": "1"
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: '1'",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: '1'"
+    }
+   }
+  },
+  "step_true": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "python": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "step",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": true
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: True",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: True"
+    }
+   }
+  },
+  "step_whole_float": {
+   "expected": {
+    "cli_python": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "cli_rust": {
+     "exit": 2,
+     "names": "step",
+     "traceback": false
+    },
+    "python": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    },
+    "rust": {
+     "field": "step",
+     "raises": "MalformedRecordError"
+    }
+   },
+   "field": "step",
+   "given": {
+    "record": {
+     "attempt": 0,
+     "grad_norm": 1.0,
+     "rank": 0,
+     "run_id": "r",
+     "schema_version": 1,
+     "step": 1.0
+    }
+   },
+   "section": 1,
+   "status": "new",
+   "today": {
+    "cli_python": {
+     "reads": true
+    },
+    "cli_rust": {
+     "exit": 1,
+     "last_line": "TypeError: not an integer: 1.0",
+     "traceback": true
+    },
+    "python": {
+     "reads": true
+    },
+    "rust": {
+     "raises": "TypeError",
+     "text": "not an integer: 1.0"
+    }
+   }
+  }
+ },
+ "contract": "WAVE_AF_CONTRACT.md"
+}
