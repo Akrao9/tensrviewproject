@@ -3147,6 +3147,7 @@ State as of Nov 16, 2026.
   - *The one failure.* Python 3.13 with PyTorch 2.15: `test_lane_aa1_writer.py::test_l25_generation_0_keeps_todays_keys_and_a_later_one_adds_its_own` (1 failed, 2,417 passed). The worker of rank 0 of the second start exited with code 0, printed nothing and wrote no result. The test's helper wrote one shared script file anew for each rank it started, and this test starts its two ranks with no delay, so the rank started first could open the file while the second start of the helper was rewriting it and run an empty script. That reading is inferred from the log; it was not reproduced (the five L25 tests passed five times here before and after). It is a fault of the test, not of the exchange keys.
   - *Fixed (`bdfa5f5`).* Each rank of each start gets a script file of its own. The two other helpers that write a worker script write it once before any process starts.
   - *Also.* `PENDING_CODING_TASKS.md`, which is untracked, was brought up to the state after wave AA on the author's word.
+  - *The fix pushed (the author's words: "Yes, push it"), as `7a33b78`, and CI on it.* All 15 jobs that run passed; the GPU compiler gate was skipped; Server wheels did not start, since nothing under `server/` changed. Python 3.13 with PyTorch 2.15 passed (2,418 passed, 279 skipped); the server job gave 3,307 passed and 93 skipped. The race was intermittent, so one green run does not prove it gone; the helper no longer shares a script file between ranks, which is what the race needed.
 
 ## Sources
 
