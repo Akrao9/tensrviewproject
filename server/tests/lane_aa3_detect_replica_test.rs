@@ -44,6 +44,18 @@ fn cases() -> Vec<(String, String, Vec<Value>, Value, f64)> {
     out
 }
 
+/// What section 4a's `earlier_cases` says attribution adds to an earlier case: an empty list for a
+/// case it does not name (an absent key and an empty list are the same there).
+fn earlier_attribution(name: &str) -> Value {
+    let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk/tests/fixtures/replica");
+    let text = std::fs::read_to_string(folder.join("attribution_cases.json")).expect("section 4a's cases");
+    let document: Value = serde_json::from_str(&text).unwrap();
+    document["earlier_cases"]
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| json!([]))
+}
+
 /// One rank's rows of one attempt in the shape the server stores (`flight.py`'s `record_to_row`):
 /// the key columns, `replica_spread` in its map column, `replica` and `replica_spread_scope` in
 /// `extra_json`.
@@ -159,10 +171,18 @@ async fn detect_run_gives_every_contract_case_its_expected_replica_result_from_s
         want.as_object_mut()
             .unwrap()
             .extend(expected.as_object().unwrap().clone());
-        if document["replica"] != want {
+        // Section 4a: everything but `attribution` with the earlier file, `attribution` with
+        // `earlier_cases`.
+        let mut got = document["replica"].clone();
+        let attribution = got
+            .as_object_mut()
+            .and_then(|got| got.remove("attribution"))
+            .unwrap_or_else(|| json!([]));
+        if got != want || attribution != earlier_attribution(name) {
             wrong.push(format!(
-                "{file}:{name}\n  got      {}\n  expected {want}",
-                document["replica"]
+                "{file}:{name}\n  got      {}\n  expected {want}\n  with attribution {}",
+                document["replica"],
+                earlier_attribution(name)
             ));
         }
     }

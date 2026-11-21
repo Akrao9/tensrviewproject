@@ -184,7 +184,9 @@ def test_the_runs_document_holds_each_ranks_report_and_says_what_was_compared():
     clean = server_run_report(RUNS["different batches"])
     assert clean["duplicate_batches"] is None and clean["ranks_compared"] == [0, 1]  # compared, and clean
     alone = server_run_report(RUNS["one rank"])
-    assert alone["duplicate_batches"] is None and alone["ranks_compared"] == [0]  # nothing to compare with
+    # Nothing to compare with: one rank observed, zero peers compared, so no rank is listed
+    # (STEP_AND_EVIDENCE_CONTRACT.md, section 2; rewritten by lane AB2, which made it so).
+    assert alone["duplicate_batches"] is None and alone["ranks_compared"] == []
 
     # The thresholds go to every rank's detectors, as for one rank.
     options = {"overload_threshold": 0.5, "top_k": 2}
