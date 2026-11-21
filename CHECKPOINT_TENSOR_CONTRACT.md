@@ -169,7 +169,7 @@ A capture written after it is different, and that is expected, not a regression.
 - **A load that is not recorded,** and a first load at the run's first step, which is not a resume and is not judged today either.
 - **A parameter frozen after the call.** It is counted as trainable, so it is raised if missing.
 - **A source that is ambiguous or a weak match.** Nothing is named as missing, and the evidence says coverage is unavailable. Naming the entry with `model_state=` resolves it.
-- **A model whose modules replace PyTorch's own walk of parameters.** Coverage is unavailable.
+- **A model whose modules replace PyTorch's own walk of parameters.** Coverage is unavailable. In the clones read on Nov 21, 2026, PyTorch's own FSDP wrapper (`FullyShardedDataParallel`), its activation-checkpoint wrapper (`CheckpointWrapper`) and `RemoteModule` do; nothing in Transformers, Lightning, Accelerate, DeepSpeed or Megatron-LM does.
 
 ## 6. Who builds what
 

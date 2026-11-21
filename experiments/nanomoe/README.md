@@ -58,7 +58,7 @@ Both are on the arm with nanoMoE's own settings, so both are false alarms on a h
 | 5 | 145 | 156 |
 | 8 | never | never |
 
-The largest ratio of any module is 7.92 (balance-on, `transformer.h.0`, step 693) and 7.73 (balance-off), and every one of the six modules reaches at least 5.9. A model trained from scratch grows its activations several times over its first 50 steps as it learns, so no factor under 8 is quiet on these two runs. On the six recorded fine-tunes (v3 plan, Nov 20, 2026) the healthy ratios stay under 1.4 and the seeded ones are near 100. Nothing was changed: these are measurements only.
+The largest ratio of any module is 7.92 (balance-on, `transformer.h.0`, step 693) and 7.73 (balance-off), and every one of the six modules reaches at least 5.9. A model trained from scratch grows its activations several times over its first 50 steps as it learns. Of the factors tried, 2 to 5 all fire on both runs and 8 does not; a factor above the largest ratio, 7.92, would be quiet on these two runs, which says nothing of another healthy run. On the six recorded fine-tunes (v3 plan, Nov 20, 2026) the healthy ratios stay under 1.4 and the seeded ones are near 100. Nothing was changed: these are measurements only.
 
 ## Not shown
 
