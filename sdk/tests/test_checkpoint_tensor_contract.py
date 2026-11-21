@@ -24,12 +24,12 @@ DOCUMENT = json.loads((Path(__file__).parent / "fixtures" / "checkpoint" / "case
 CASES = DOCUMENT["cases"]
 COVERAGE = [(name, body) for name, body in CASES.items() if body["group"] == "coverage"]
 RECORDS = [(name, body) for name, body in CASES.items() if body["group"] == "records"]
-LISTS = ("missing", "missing_frozen", "missing_buffers", "unexpected", "shape_differs")
+LISTS = ("missing", "missing_frozen", "missing_buffers", "unexpected", "shape_differs", "tied")
 
 
 def test_the_file_holds_the_cases_the_page_names():
     page = (ROOT / "CHECKPOINT_TENSOR_CONTRACT.md").read_text()
-    assert len(COVERAGE) == 22 and len(RECORDS) == 16
+    assert len(COVERAGE) == 24 and len(RECORDS) == 16
     assert sum(body["status"] == "pin" for body in CASES.values()) == 4
     for name, body in CASES.items():
         assert f"`{name}`" in page, f"{name} is not named on the page"

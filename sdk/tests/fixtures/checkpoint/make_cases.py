@@ -5,8 +5,8 @@ with the SDK on the path:
 
 Two groups. `coverage` cases are the SDK's: a model and what a checkpoint holds, and the
 `tensors` object the load's manifest must carry. A model's tensor is `[name, shape, kind]`, kind
-"p" a trainable parameter, "f" a frozen parameter, "b" a buffer; a checkpoint's tensor is its
-shape. `records` cases are the readers': step records in, and what `resume_incomplete` and the
+"p" a trainable parameter, "f" a frozen parameter, "b" a buffer, with a fourth element when it is
+the same parameter as another name (a tied weight); a checkpoint's tensor is its shape. `records` cases are the readers': step records in, and what `resume_incomplete` and the
 evidence's `checkpoint_tensors` must say, alike in the Python detectors and the Rust server.
 
 Every case states what the code answers today (`today`), computed here and checked by
@@ -50,16 +50,19 @@ NORMED = [
     ["bn.running_var", [8], "b"],
     ["bn.num_batches_tracked", [], "b"],
 ]
+DECODER = [["layers.0.weight", [8, 8], "p"], ["layers.0.bias", [8], "p"], ["out.weight", [4, 8], "p"], ["out.bias", [4], "p"]]
+ENCODER = {f"encoder.layers.{i}.{part}": [8, 8] for i in range(3) for part in ("weight", "bias")}
+TIED = [["wte.weight", [65, 16], "p"], ["block.weight", [16, 16], "p"], ["lm_head.weight", [65, 16], "p", "wte.weight"]]
 DEEP = [[f"blocks.{i:02d}.weight", [4, 4], "p"] for i in range(60)] + [["head.weight", [2, 4], "p"]]
 
 
 def held(model, without=(), prefix=""):
     """The model's tensors as a checkpoint entry holds them, leaving `without` out."""
-    return {prefix + name: shape for name, shape, _ in model if name not in without}
+    return {prefix + tensor[0]: tensor[1] for tensor in model if tensor[0] not in without}
 
 
 def names(model, only):
-    return sorted(name for name, _, kind in model if name in only or kind == only)
+    return sorted(tensor[0] for tensor in model if tensor[0] in only or tensor[2] == only)
 
 
 CACHE = {"layers.0.k": [2, 2], "layers.0.v": [2, 2]}
@@ -69,7 +72,7 @@ OPTIMIZER = "an optimizer's state"  # stands for {"state": {...}, "param_groups"
 
 def compared(model, entry, checkpoint, matched, **lists):
     out = {"state": "compared", "entry": entry, "model": len(model),
-           "trainable": sum(kind == "p" for _, _, kind in model), "checkpoint": checkpoint, "matched": matched}
+           "trainable": sum(tensor[2] == "p" for tensor in model), "checkpoint": checkpoint, "matched": matched}
     for key, found in lists.items():
         if key == "prefix":
             out[key] = found
@@ -241,7 +244,7 @@ cases = {
         "new", "An entry named `model` that shares no name with the model. It is not this model's state.",
         {"model": LSTM, "checkpoint": {"model": OTHER_MODEL}}, unavailable("not_identified"), False),
     "names_that_mostly_differ": coverage(
-        "new", "One of the entry's eight names is the model's. Under half: the names follow another scheme"
+        "new", "One of the entry's eight names is the model's. Under half of the entry's names and under half of the model's: the names follow another scheme"
         " or another model, so nothing is named as missing. The closest entry is recorded.",
         {"model": LSTM, "checkpoint": {"model": {**dict(list(OTHER_MODEL.items())[:7]), "head.bias": [65]}}},
         unavailable("not_identified", closest={"entry": "model", "checkpoint": 8, "matched": 1}), False),
@@ -251,6 +254,19 @@ cases = {
                                                  "old.weight": [4], "old.bias": [4]}}},
         compared(LSTM, "model", 4, 2, missing=[n for n, _, _ in LSTM if not n.startswith("head.")],
                  unexpected=["old.weight", "old.bias"]), True),
+    "one_part_of_a_larger_model": coverage(
+        "new", "The session watches a decoder; the checkpoint was saved from the whole model, whose larger"
+        " encoder gives the entry most of its names. Under half of the entry's names are the model's, but every"
+        " name of the model is in the entry, and that is enough: half of either side's names.",
+        {"model": DECODER, "checkpoint": {"model": {**ENCODER, **held(DECODER, prefix="decoder.")}}},
+        compared(DECODER, "model", 10, 4, unexpected=list(ENCODER), prefix={"side": "checkpoint", "removed": "decoder."}),
+        True),
+    "a_tied_weight_saved_once": coverage(
+        "new", "`lm_head.weight` is the same parameter as `wte.weight`, and the save wrote it once, as"
+        " safetensors' `save_model` does. A name that is the same parameter as a name the entry holds is"
+        " not missing; it is counted and named as tied.",
+        {"model": TIED, "checkpoint": {"model": held(TIED, ("lm_head.weight",))}},
+        compared(TIED, "model", 2, 2, tied=["lm_head.weight"]), True),
     "an_adapter_only_checkpoint": coverage(
         "new", "Only the trainable adapter was saved. The frozen base is not in the checkpoint; a frozen"
         " parameter is counted and named apart, and is not a missing tensor.",

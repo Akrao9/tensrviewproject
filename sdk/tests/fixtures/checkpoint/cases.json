@@ -1248,7 +1248,7 @@
   "names_that_mostly_differ": {
    "group": "coverage",
    "status": "new",
-   "says": "One of the entry's eight names is the model's. Under half: the names follow another scheme or another model, so nothing is named as missing. The closest entry is recorded.",
+   "says": "One of the entry's eight names is the model's. Under half of the entry's names and under half of the model's: the names follow another scheme or another model, so nothing is named as missing. The closest entry is recorded.",
    "given": {
     "model": [
      [
@@ -1460,6 +1460,184 @@
       "names": [
        "old.bias",
        "old.weight"
+      ]
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "one_part_of_a_larger_model": {
+   "group": "coverage",
+   "status": "new",
+   "says": "The session watches a decoder; the checkpoint was saved from the whole model, whose larger encoder gives the entry most of its names. Under half of the entry's names are the model's, but every name of the model is in the entry, and that is enough: half of either side's names.",
+   "given": {
+    "model": [
+     [
+      "layers.0.weight",
+      [
+       8,
+       8
+      ],
+      "p"
+     ],
+     [
+      "layers.0.bias",
+      [
+       8
+      ],
+      "p"
+     ],
+     [
+      "out.weight",
+      [
+       4,
+       8
+      ],
+      "p"
+     ],
+     [
+      "out.bias",
+      [
+       4
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "encoder.layers.0.weight": [
+       8,
+       8
+      ],
+      "encoder.layers.0.bias": [
+       8,
+       8
+      ],
+      "encoder.layers.1.weight": [
+       8,
+       8
+      ],
+      "encoder.layers.1.bias": [
+       8,
+       8
+      ],
+      "encoder.layers.2.weight": [
+       8,
+       8
+      ],
+      "encoder.layers.2.bias": [
+       8,
+       8
+      ],
+      "decoder.layers.0.weight": [
+       8,
+       8
+      ],
+      "decoder.layers.0.bias": [
+       8
+      ],
+      "decoder.out.weight": [
+       4,
+       8
+      ],
+      "decoder.out.bias": [
+       4
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 4,
+     "trainable": 4,
+     "checkpoint": 10,
+     "matched": 4,
+     "unexpected": {
+      "count": 6,
+      "names": [
+       "encoder.layers.0.bias",
+       "encoder.layers.0.weight",
+       "encoder.layers.1.bias",
+       "encoder.layers.1.weight",
+       "encoder.layers.2.bias",
+       "encoder.layers.2.weight"
+      ]
+     },
+     "prefix": {
+      "side": "checkpoint",
+      "removed": "decoder."
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "a_tied_weight_saved_once": {
+   "group": "coverage",
+   "status": "new",
+   "says": "`lm_head.weight` is the same parameter as `wte.weight`, and the save wrote it once, as safetensors' `save_model` does. A name that is the same parameter as a name the entry holds is not missing; it is counted and named as tied.",
+   "given": {
+    "model": [
+     [
+      "wte.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "block.weight",
+      [
+       16,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lm_head.weight",
+      [
+       65,
+       16
+      ],
+      "p",
+      "wte.weight"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "wte.weight": [
+       65,
+       16
+      ],
+      "block.weight": [
+       16,
+       16
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "model": 3,
+     "trainable": 3,
+     "checkpoint": 2,
+     "matched": 2,
+     "tied": {
+      "count": 1,
+      "names": [
+       "lm_head.weight"
       ]
      }
     }
