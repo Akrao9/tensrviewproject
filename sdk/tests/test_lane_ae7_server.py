@@ -38,6 +38,9 @@ DOCUMENT = json.loads((Path(__file__).parent / "fixtures" / "wave_ae" / "cases.j
 CASES = [(name, body) for name, body in DOCUMENT["cases"].items() if body["section"] in (1, 2, 4)]
 REASON = ("clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter, "
           "so {n} comparison(s) of update_spike were not made")
+# Added when no pair was compared at all (the author: "the reader must make clear that zero were
+# judged"); the page asks only that the reason say so, and these words are this lane's.
+NONE_MADE = "; none of the comparisons of update_spike was made, so nothing was judged"
 
 
 def _options(given: dict) -> dict | None:
@@ -71,6 +74,8 @@ def answer(document: dict, expected: dict) -> dict:
             out[key] = None if not entries else {k: entries[0].get(k) for k in (want or entries[0])}
         elif key == "skipped_updates":
             out[key] = document.get("skipped_updates")
+        elif key == "update_spike_check":
+            out[key] = document["kind_checks"]["update_spike"]["value"]
         elif key == "counters_at_end":
             shown = {"recorded_steps": document["kind_checks"]["loss_scale_trouble"]["records"]}
             if scale is not None:
@@ -95,11 +100,17 @@ def test_evidence_from_the_rust_detectors_gives_each_case_its_expected(name, bod
     evidence = ev.build_evidence(given["records"], detectors="rust", **options)
     assert answer(evidence, body["expected"]) == body["expected"]
     if body["expected"].get("clip_groups_entry"):
-        # The entry names update_spike, which stays checked: every other pair was judged. And as any
-        # `not_checked` entry does, it makes the run read degraded (this page's reading).
-        assert evidence["kind_checks"]["update_spike"]["value"] == "checked"
+        # The entry names update_spike, which stays checked while some pair was compared, and reads
+        # unavailable with the entry's reason when none was. As any `not_checked` entry does, it
+        # makes the run read degraded (approved by the author).
         entry = next(e for e in evidence["not_checked"] if e["check"] == "clip_groups")
-        assert entry["reason"] == REASON.format(n=entry["comparisons"])
+        check = evidence["kind_checks"]["update_spike"]
+        if entry["compared"]:
+            assert check["value"] == "checked"
+            assert entry["reason"] == REASON.format(n=entry["comparisons"])
+        else:
+            assert check["value"] == "unavailable" and check["reason"] == entry["reason"]
+            assert entry["reason"] == REASON.format(n=entry["comparisons"]) + NONE_MADE
         degraded = [r for r in evidence["run_state"]["reasons"] if r["state"] == "degraded"]
         assert any("clip_groups" in str(r) for r in degraded), evidence["run_state"]
         if body["expected"]["update_spike_step"] is None:
@@ -128,6 +139,7 @@ def _blocks(document: dict) -> dict:
 LIVE = [
     ("after_a_pair_that_is_not_compared_the_next_is", (5,)),
     ("two_pairs_that_are_not_compared", (5, 6)),
+    ("every_pair_needs_a_split_and_none_is_compared", (1, 3)),
     ("a_stall_does_not_carry_across_a_resume", (3,)),
     ("a_stall_does_not_carry_across_a_resume", (3, 5)),
     ("five_full_skips_one_partial_step_five_full_skips", (5,)),

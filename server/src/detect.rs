@@ -2119,6 +2119,10 @@ struct Updates {
     /// by more than one call, and the step of the later row of the first (section 1).
     clip_groups: u64,
     clip_groups_step: Option<i64>,
+    /// The pairs that were compared, the `clip_groups` entry's `compared`: at zero, while some
+    /// pair was not compared, `update_spike` reads `unavailable` (section 1, the author's
+    /// second word).
+    compared: u64,
 }
 
 impl Updates {
@@ -2150,6 +2154,7 @@ impl Updates {
             // has no total there, so it was not one that went uncompared either.
             self.clip_groups = 0;
             self.clip_groups_step = None;
+            self.compared = 0;
         }
         let Some(sizes) = &columns.update_rms else { return };
         let entries = sizes.row(row);
@@ -2208,7 +2213,9 @@ impl Updates {
             let split = shared_totals(total, grads.as_deref(), before.total, before.grads.as_deref());
             let (now, then) = split.unwrap_or((total, before.total));
             let (change, rise) = ((largest - was).abs(), (now - then).max(0.0));
-            if split.is_some() && (clipped || before.clip_calls) {
+            let suppressed = split.is_some() && (clipped || before.clip_calls);
+            self.compared += u64::from(!suppressed);
+            if suppressed {
                 // The split assumes one call scaled every gradient by one factor (section 1): the
                 // pair is not compared, nothing is flagged and its change joins no baseline. This
                 // row is still the one the next is compared with.
@@ -2314,19 +2321,27 @@ impl Updates {
 
     /// The `clip_groups` entry of `not_checked` (`WAVE_AE_CONTRACT.md`, section 1): the pairs
     /// not compared because more than one clip call clipped either row, dated at the later row
-    /// of the first. `update_spike` stays `checked`: every other pair was judged.
+    /// of the first, with `compared`, the pairs that were. While `compared` is above zero
+    /// `update_spike` stays `checked`; at zero it reads `unavailable`, and the reason says that
+    /// none of the comparisons was made (the author: "if every eligible comparison was
+    /// suppressed, the reader must make clear that zero were judged").
     fn clip_groups_not_checked(&self) -> Option<Value> {
         let step = self.clip_groups_step?;
         let n = self.clip_groups;
+        let mut reason = format!(
+            "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter, \
+             so {n} comparison(s) of update_spike were not made"
+        );
+        if self.compared == 0 {
+            reason.push_str("; none of the comparisons of update_spike was made, so nothing was judged");
+        }
         Some(json!({
             "check": CLIP_GROUPS,
             "kinds": ["update_spike"],
             "comparisons": n,
+            "compared": self.compared,
             "step": step,
-            "reason": format!(
-                "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by \
-                 parameter, so {n} comparison(s) of update_spike were not made"
-            ),
+            "reason": reason,
         }))
     }
 }
@@ -4510,10 +4525,10 @@ impl RankDetectors {
             let (records, needs) = (counts[at], INPUT_NEEDS[at].1);
             let needed = records_needed(kind, &self.thresholds);
             let enough = records >= needed;
-            // A `clip_groups` entry names `update_spike` and leaves it `checked`: only some pairs
-            // were not compared (`WAVE_AE_CONTRACT.md`, section 1).
+            // A `clip_groups` entry names `update_spike` and leaves it `checked` while some pair was
+            // compared; with none compared it makes it `unavailable` (`WAVE_AE_CONTRACT.md`, section 1).
             let names = |item: &&Value| {
-                item["check"] != CLIP_GROUPS
+                (item["check"] != CLIP_GROUPS || item["compared"] == 0)
                     && match item["kinds"].as_array() {
                         Some(kinds) => kinds.iter().any(|named| named == kind),
                         None => CHECK_KINDS

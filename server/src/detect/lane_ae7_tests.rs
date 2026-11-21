@@ -214,6 +214,7 @@ fn answer(detectors: &RankDetectors, expected: &Value) -> Value {
                     Value::Object(fixed)
                 }),
             "skipped_updates" => report.get("skipped_updates").cloned().unwrap_or(Value::Null),
+            "update_spike_check" => report["kind_checks"]["update_spike"]["value"].clone(),
             "counters_at_end" => {
                 let rule = &detectors.loss_scale;
                 json!({
@@ -233,7 +234,7 @@ fn answer(detectors: &RankDetectors, expected: &Value) -> Value {
 #[test]
 fn every_case_of_sections_1_2_and_4_gives_its_expected() {
     let all = cases();
-    assert_eq!(all.len(), 29, "the 34 cases less section 5's five");
+    assert_eq!(all.len(), 30, "the 35 cases less section 5's five");
     let mut wrong = Vec::new();
     for (name, body) in &all {
         let found = answer(&judged(&body["given"]), &body["expected"]);
@@ -274,9 +275,9 @@ fn the_counters_at_the_end_agree_with_what_the_report_shows() {
 
 #[test]
 fn the_clip_groups_entry_has_the_pages_words_and_update_spike_stays_checked() {
-    for (name, comparisons) in [
-        ("a_split_pair_with_two_clip_calls_is_not_compared", 1),
-        ("two_pairs_that_are_not_compared", 2),
+    for (name, comparisons, compared) in [
+        ("a_split_pair_with_two_clip_calls_is_not_compared", 1, 4),
+        ("two_pairs_that_are_not_compared", 2, 4),
     ] {
         let report = report("ae7", 0, &judged(&case(name)["given"]), 0);
         let entries: Vec<&Value> = report["not_checked"]
@@ -292,6 +293,7 @@ fn the_clip_groups_entry_has_the_pages_words_and_update_spike_stays_checked() {
                 "check": "clip_groups",
                 "kinds": ["update_spike"],
                 "comparisons": comparisons,
+                "compared": compared,
                 "step": 5,
                 "reason": format!(
                     "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by \
@@ -303,6 +305,37 @@ fn the_clip_groups_entry_has_the_pages_words_and_update_spike_stays_checked() {
         assert_eq!(report["kind_checks"]["update_spike"]["value"], "checked", "{name}");
         assert!(report["kind_checks"]["update_spike"].get("check").is_none(), "{name}");
     }
+}
+
+/// With every pair needing a split, none is compared: the entry says zero were, its reason says
+/// none of the comparisons was made, and `update_spike` reads `unavailable` with that reason.
+#[test]
+fn with_no_pair_compared_update_spike_is_unavailable_and_says_so() {
+    let report = report(
+        "ae7",
+        0,
+        &judged(&case("every_pair_needs_a_split_and_none_is_compared")["given"]),
+        0,
+    );
+    let entry = report["not_checked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["check"] == "clip_groups")
+        .unwrap()
+        .clone();
+    let reason = "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by \
+                  parameter, so 5 comparison(s) of update_spike were not made; none of the comparisons of \
+                  update_spike was made, so nothing was judged";
+    assert_eq!(
+        entry,
+        json!({"check": "clip_groups", "kinds": ["update_spike"], "comparisons": 5, "compared": 0, "step": 1,
+               "reason": reason})
+    );
+    let check = &report["kind_checks"]["update_spike"];
+    assert_eq!(check["value"], "unavailable");
+    assert_eq!(check["check"], "clip_groups");
+    assert_eq!(check["reason"], reason);
 }
 
 /// A record's key changes nothing where its condition does not hold: the report on the records
