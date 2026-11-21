@@ -2205,7 +2205,7 @@ impl Updates {
         });
         let clipped = clip_calls(columns, row);
         if let Some((before, (largest, was))) = compared {
-            let split = split_totals(total, grads.as_deref(), before.total, before.grads.as_deref());
+            let split = shared_totals(total, grads.as_deref(), before.total, before.grads.as_deref());
             let (now, then) = split.unwrap_or((total, before.total));
             let (change, rise) = ((largest - was).abs(), (now - then).max(0.0));
             if split.is_some() && (clipped || before.clip_calls) {
@@ -2358,7 +2358,7 @@ fn shared_largest(own: &[(String, f64)], largest: f64, before: &UpdateRow) -> Op
 /// shared parameter, or norms that are all 0). Only a pair this splits is one that more than one
 /// clip call keeps from being compared (`WAVE_AE_CONTRACT.md`, section 1). Sums as Python's
 /// `fsum` sums them.
-fn split_totals(
+fn shared_totals(
     total: f64,
     grads: Option<&[(String, f64)]>,
     before: f64,
