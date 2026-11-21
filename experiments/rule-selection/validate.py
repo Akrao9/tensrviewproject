@@ -29,3 +29,16 @@ for name, rows, entry in inputs.load(sys.argv[1] if len(sys.argv) > 1 else "vali
     now = rules.imbalance(rows)
     print("  moe_imbalance proposed:   ", now and (now["step"], now["router"], now["overloaded"], now.get("since_start")))
     print("  gradient_trend:           ", rules.gradient_trend(rows))
+    # Was the drift rule tested at all? Count the modules, those with 110 records, and what they reached.
+    counts: dict[str, int] = {}
+    for r in rows:
+        for module, stats in (r.get("layers") or {}).items():
+            if all(rules.finite(stats.get(k)) is not None for k in ("std", "abs_max", "zero_frac")):
+                counts[module] = counts.get(module, 0) + 1
+    eligible = [m for m, n in counts.items() if n >= rules.DRIFT_NEEDS]
+    import measure_drift
+    found = measure_drift.measure(rows)
+    print(f"  modules {len(counts)}, with {rules.DRIFT_NEEDS} records or more {len(eligible)}, records each {sorted(set(counts.values()))};"
+          f" judged from step {found['judged_from'].get('TRAILX')};"
+          f" largest ratio by the proposed rule {found['worst'].get('TRAILX')}, by today's {found['worst'].get('D0')};"
+          f" judged records per module {max(0, max(counts.values(), default=0) - rules.DRIFT_NEEDS + 1)}")

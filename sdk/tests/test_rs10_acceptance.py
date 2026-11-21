@@ -10,8 +10,11 @@ byte offset as the sender does. Each batch claims 100 bytes a row: A ends at 300
 800.
 
 `TODAY` is what the server of `eb5a71b` answers, pinned so that the change is seen. `EXPECTED` is
-what the contract states. Lane AD2 builds the server's side and lane AD4 the sender's; the test of
-`EXPECTED` is marked as an expected failure until then, strictly, so that it cannot pass unseen.
+what the contract states: after a confirmed refusal of B at bytes 300 to 500 the client restarts
+at 500, sends C directly, and only A and C are stored. Its test is marked as an expected failure,
+strictly, until lane AD2 builds the server's side. The production sender's own handling, and a
+refusal that is lost or names another range, are in `test_rs10_sender.py`. Sending the refused
+bytes again is a case of its own here.
 """
 
 from __future__ import annotations
@@ -30,30 +33,29 @@ pytestmark = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is no
 RUN = "rs10-acceptance"
 A, B, C = (0, 1, 2), (3, 4), (5, 6, 7)
 
-# What the server holds after the whole run, and what it told the client on the way.
+# What the client observed, batch by batch, and what the server held at the end.
 TODAY = {
+    "sent": ["A 0-300", "B 300-500"],   # every batch with rows the client sent, with its byte range
     "ack_after_a": 300,
-    "refusal_answer": None,          # the stream ends with INVALID_ARGUMENT and no answer first
-    "refusal_status": "step",        # the status names the column
-    "probe_names_an_offset": False,  # a new stream's first answer names the store, and offset 0
-    "restart_before_c": 300,         # so the sender restarts from its own saved offset: B again
-    "b_sent_again_refused": True,
-    "ack_after_c": None,             # C waits behind B for as long as B is refused
-    "restart_after_the_run": 300,
+    "refusal_answer": None,              # the stream ends with INVALID_ARGUMENT and no answer first
+    "refusal_status": "step",            # the status names the column, and no byte range
+    "probe_names_an_offset": False,      # a new stream's first answer names the store, and offset 0
+    "restart_at": 300,                   # not confirmed for good: the client keeps its last confirmed offset
+    "ack_after_c": None,                 # so C is not sent
     "stored_steps": [0, 1, 2],
-    "refused_batches": 1,            # B sent twice is counted once
+    "refused_batches": 1,
     "refused_batch_keys": {"step": 1},
 }
 EXPECTED = {
     **TODAY,
-    # Before it ends the stream, the server says on the acknowledgement channel which bytes it
-    # refused for good and why, beside the offset it holds. A sender that reads it does not send
-    # those bytes again: it counts them, saves their end as its offset, and goes on from there.
-    "refusal_answer": {"end_byte_offset": 300, "refused": {"end_byte_offset": 500, "column": "step"}},
-    "restart_before_c": 500,
+    # Before it ends the stream, the server confirms on the acknowledgement channel which bytes it
+    # refused for good: the range it was sent, and the column. A sender that reads its own range
+    # there does not send those bytes again: it saves their end as its offset and goes on.
+    "refusal_answer": {"end_byte_offset": 300, "refused": {"start_byte_offset": 300, "end_byte_offset": 500, "column": "step"}},
+    "restart_at": 500,
+    "sent": ["A 0-300", "B 300-500", "C 500-800"],   # C directly, and B once
     "ack_after_c": 800,
-    "restart_after_the_run": 800,
-    "stored_steps": [0, 1, 2, 5, 6, 7],
+    "stored_steps": [0, 1, 2, 5, 6, 7],              # only A's and C's
 }
 
 
@@ -127,40 +129,39 @@ def _refused(store: Path) -> tuple[int, dict]:
 
 
 def the_run(tmp_path: Path) -> dict[str, Any]:
-    """The client follows the sender's rules: it goes on from its saved offset, which moves when
-    the server acknowledges stored rows and when the server says bytes were refused for good."""
+    """The client follows the sender's rule: its offset moves when the server confirms stored rows,
+    and when the server confirms, naming the very range it was sent, that it refused them for good.
+    Every batch it sends is recorded, so the run shows what was sent and not what was meant."""
     store = tmp_path / "store"
     server = Server(store)
-    seen: dict[str, Any] = {}
+    seen: dict[str, Any] = {"sent": []}
     try:
         client = Client(server.endpoint)
+        seen["sent"].append("A 0-300")
         answers, status = client.send(A)
         assert status is None, status
         seen["ack_after_a"] = client.offset = int(answers[-1]["end_byte_offset"])
 
+        seen["sent"].append("B 300-500")
         answers, status = client.send(B, step_as_text=True)
         refusal = next((a for a in answers if "refused" in a), None)
         seen["refusal_answer"] = refusal and {"end_byte_offset": refusal["end_byte_offset"], "refused": {
-            key: refusal["refused"][key] for key in ("end_byte_offset", "column")}}
+            key: refusal["refused"].get(key) for key in ("start_byte_offset", "end_byte_offset", "column")}}
         seen["refusal_status"] = "step" if status and "`step`" in status and "refused" in status else status
-        if refusal:
-            client.offset = int(refusal["refused"]["end_byte_offset"])
+        confirmed = bool(refusal) and (refusal["refused"].get("start_byte_offset"), refusal["refused"].get("end_byte_offset")) == (300, 500)
+        if confirmed:
+            client.offset = 500
 
-        # The disconnect and the return. The server's first answer on a new stream names no offset
-        # of its own, so the sender restarts from the offset it saved.
+        # The disconnect and the return. A new stream's first answer names no offset of the
+        # server's, so the client restarts from the offset it holds.
         seen["probe_names_an_offset"] = client.ask() != 0
-        seen["restart_before_c"] = client.offset
-        if client.offset == 300:  # not told the refusal is for good: the same bytes go again
-            _, status = client.send(B, step_as_text=True)
-            seen["b_sent_again_refused"] = bool(status and "refused" in status)
-            seen["ack_after_c"] = None
-        else:
-            seen["b_sent_again_refused"] = TODAY["b_sent_again_refused"]  # sent once more below, to count it
-            client.send(B, step_as_text=True)
+        seen["restart_at"] = client.offset
+        seen["ack_after_c"] = None
+        if confirmed:  # C directly, from the end of the refused bytes
+            seen["sent"].append("C 500-800")
             answers, status = client.send(C)
             assert status is None, status
             seen["ack_after_c"] = client.offset = int(answers[-1]["end_byte_offset"])
-        seen["restart_after_the_run"] = client.offset
     finally:
         server.terminate()
     seen["refused_batches"], seen["refused_batch_keys"] = _refused(store)  # the status as the server left it
@@ -172,6 +173,24 @@ def test_the_run_as_the_server_answers_today(tmp_path):
     assert the_run(tmp_path) == TODAY
 
 
-@pytest.mark.xfail(strict=True, reason="wave AD: the server's side is lane AD2's and the sender's lane AD4's")
+@pytest.mark.xfail(strict=True, reason="wave AD: the server's side is lane AD2's; the sender's side is in test_rs10_sender.py")
 def test_the_run_as_the_contract_states_it(tmp_path):
     assert the_run(tmp_path) == EXPECTED
+
+
+def test_the_same_refused_bytes_sent_again_are_counted_once(tmp_path):
+    """Apart from the run: a sender that was not told replays the original byte range. The count is
+    of batches refused, not of times one was sent."""
+    store = tmp_path / "store"
+    server = Server(store)
+    try:
+        client = Client(server.endpoint)
+        answers, _ = client.send(A)
+        client.offset = int(answers[-1]["end_byte_offset"])
+        for _ in range(3):
+            _, status = client.send(B, step_as_text=True)  # bytes 300 to 500, each time
+            assert status and "refused" in status
+    finally:
+        server.terminate()
+    assert _refused(store) == (1, {"step": 1})
+    assert sorted(int(r["step"]) for r in stored_records(store, RUN)) == [0, 1, 2]
