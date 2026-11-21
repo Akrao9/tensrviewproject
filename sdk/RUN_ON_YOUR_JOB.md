@@ -2,7 +2,7 @@
 
 This guide adds TensorQuill to a training job you already run. So far TensorQuill has been tested on benchmarks with planted failures. Your job is the test that matters, and it needs one normal training run.
 
-TensorQuill only records and reports. It never pauses or stops your training, and what it does on its own raises nothing into the training loop. A call you make with a wrong argument raises at that call, before anything of it is recorded: `init` with a bad setting, or `session.step` with a `skipped=` that is not `True` or `False` (below).
+TensorQuill only records and reports: it does not stop your training. A call you make with a wrong argument raises at that call, before anything of it is recorded: `init` with a bad setting, or `session.step` with a `skipped=` that is not `True` or `False` (below).
 
 ## 1. Install
 
@@ -43,9 +43,9 @@ Without the binary, the commands in section 5 still work with the Python detecto
 
 | Your model | Call | Cost measured on Granite |
 | --- | --- | --- |
-| MoE model | `tensorquill.init(model, routers={...})`: router-only, the default | +0.02% to +0.78% on an RTX PRO 6000; +1.1% to +1.3% on an A100 at one commit and +0.4% to +0.95% at a later one |
-| MoE model, while debugging | add `capture="full"` | about +4% |
-| Dense model | `tensorquill.init(model)`: full capture | about +4% on Granite; not measured on a dense model |
+| MoE model | `tensorquill.init(model, routers={...})`: router-only, the default | +0.02% to +0.78% on an RTX PRO 6000; +1.06% to +1.33% on an A100 at one commit and +0.41% to +0.95% at a later one |
+| MoE model, while debugging | add `capture="full"` | +4.15% on an RTX PRO 6000 |
+| Dense model | `tensorquill.init(model)`: full capture | +4.15% on Granite (RTX PRO 6000); not measured on a dense model |
 
 Router-only records each router's expert load every step. Full capture adds per-block activation statistics, per-parameter gradient norms every step and a weight check every 50 steps. In either mode, if your job clips gradients, TensorQuill records the total gradient norm that clipping already computes. That is enough to detect gradient spikes.
 
@@ -130,7 +130,7 @@ for batch in loader:
 session.close()
 ```
 
-- **Mixed precision with `torch.amp.GradScaler`:** pass it, `init(..., scaler=scaler)`. Steps the scaler skips on overflow are then still counted. Each record says whether the step was skipped (`step_skipped`) and which loss scale was used (`grad_scale`), and the summary reports a run of skips or a collapsing loss scale. What the detectors do with a skipped step is under "Skipped steps" below.
+- **Mixed precision with `torch.amp.GradScaler`:** pass it, `init(..., scaler=scaler)`. Steps the scaler skips on overflow are then still counted. Each record says whether the step was skipped (`step_skipped`) and which loss scale was used (`grad_scale`), and the summary reports a run of skips or a collapsing loss scale. What the detectors do with a skipped step is under "Steps you count yourself, and skipped steps" below.
 - **Logging the loss and other scalars:** `session.log` takes the values your tracker logs, as numbers or one-element tensors, and attaches them to the step in progress. Call it before `optimizer.step()`; afterwards, the value lands on the next step. Log the unscaled loss, not `scaler.scale(loss)`. With gradient accumulation, log the step's mean once, since a name logged twice keeps the last value.
 - **Histograms and attention:** pass `probe=` a fixed batch, for example `probe={"input_ids": fixed_batch}`, to run it through the model every 1,000 steps (`probe_every=`) for activation histograms per block and attention statistics per layer. It runs without the compiler and without gradients, so expect a pause of about one forward pass each time. On a model that does not use `scaled_dot_product_attention`, only histograms are recorded.
 - **Two optimizers on one model**, such as Muon and AdamW: steps count training iterations, not optimizer steps. Nothing to change.
@@ -141,7 +141,7 @@ session.close()
 
 Some frameworks step copies of the weights, so TensorQuill's optimizer hooks never see a step (Megatron-LM and DeepSpeed ZeRO, below). Then pass `auto_step=False` to `init` and call `session.step()` yourself:
 
-- **Once per optimizer update that was due.** An accumulation microstep is not a step: make no call there.
+- **Once per optimizer update that was due.** An accumulation micro-batch is not a step: make no call there.
 - **Say whether the update happened, by keyword.** `session.step(skipped=True)` for an update that was due and not applied, `session.step(skipped=False)` for one that was applied. Leave it out, and the record says only what a scaler given to `init` said. `skipped` takes only `True`, `False` or nothing; any other value, such as `1` or a tensor, raises `TypeError` at the call, before any of the step is recorded. On a closed session, or one whose capture has stopped, the call returns without raising.
 - **What is recorded.** `step_skipped` is true when either you or the scaler given to `init` says so. `step_skipped_by` says who: `"caller"`, `"scaler"` or `"both"`. On a skip you reported for an update the scaler was seen to apply, the record also carries `scaler_applied: true`.
 - **With a `GradScaler` as well, call `scaler.update()` before `session.step()`.** The scaler's verdict is taken at `scaler.update()`. If `session.step()` comes first, the scaler's outcome for that update is unknown when the step ends: your skip gets no `scaler_applied`, and the scaler's own `step_skipped` and `grad_scale` land on the next record, one step late.
@@ -165,7 +165,7 @@ trainer = L.Trainer(callbacks=[TensorQuillCallback(routers=routers)], logger=MLF
 
 - **Run ID.** It reads the run from the trainer's logger (`MLFlowLogger.run_id`, or `WandbLogger`'s run) on rank 0 and passes it to `init`, which shares it with every rank through the process group's store, so you do not pass `run_id=`. Under Lightning's XLA strategy, which starts no `torch.distributed` group, the other ranks each write under an ID of their own.
 - **Steps** are counted from optimizer steps, like Lightning's `global_step`, and start at `trainer.global_step`, so a resumed fit continues the numbering.
-- **Loss** is logged as `train/loss` for each optimizer step, summed over `accumulate_grad_batches` microbatches (which Lightning has already divided, so it is their mean). Change the name with `loss_name=`, or turn it off with `loss_name=None`.
+- **Loss** is logged as `train/loss` for each optimizer step, summed over `accumulate_grad_batches` micro-batches (which Lightning has already divided, so it is their mean). Change the name with `loss_name=`, or turn it off with `loss_name=None`.
 - **Mixed precision.** With `precision="16-mixed"`, the plugin's `GradScaler` is passed in, so skipped steps are counted and marked.
 - **Clipping.** `Trainer(gradient_clip_val=...)` is recorded as `clip_grad_norm`.
 - Other keyword arguments go to `tensorquill.init`, for example `capture="full"` or `probe=`.
@@ -193,7 +193,7 @@ session.step(step=iteration, lr=optimizer.param_groups[0]["lr"], skipped=not upd
 
 This follows Megatron's `train_step` in `megatron/training/training.py` (at `4b11b8168`: `optimizer.step()` at line 3645, the model-parallel AND at 3676, and the learning-rate scheduler stepped only when `update_successful`, at 3691, as `skipped_iter` records). It has not been run on Megatron. The block above is run by `sdk/tests/test_lane_v8_examples.py` with a stand-in optimizer that skips its update.
 
-A step Megatron skipped (Inf or NaN gradients under its loss scaler) is still a step in the record, numbered by the iteration it was attempted at, with `step_skipped: true`, `step_skipped_by: "caller"` and `scalars["megatron/update_successful"]` 0. The detectors read it as "Skipped steps" above says. It is your report, not a scaler's, so it never counts toward `loss_scale_trouble`, even though Megatron's own loss scaler caused it.
+A step Megatron skipped (Inf or NaN gradients under its loss scaler) is still a step in the record, numbered by the iteration it was attempted at, with `step_skipped: true`, `step_skipped_by: "caller"` and `scalars["megatron/update_successful"]` 0. The detectors read it as "Steps you count yourself, and skipped steps" above says. It is your report, not a scaler's, so it never counts toward `loss_scale_trouble`, even though Megatron's own loss scaler caused it.
 
 With `routers=`, a `TopKRouter`'s output `(probs, routing_map)` is counted from the map, so an assignment dropped at `moe_expert_capacity_factor` is not counted, and with `pad_to_capacity` the padding is left out. With a routing map, `moe_left_out` gives the entries left out for each expert. That was run on a CPU stand-in that follows Megatron's code (Nov 19, 2026), not on Megatron.
 
@@ -211,7 +211,7 @@ Install the `huggingface` extra (section 1). `SFTTrainer` and the other TRL trai
 
 - **Run ID.** `Trainer` starts the W&B or MLflow run on the main process only; `init` reads it there and shares it with the other ranks through the process group's store.
 - **Steps** are counted from optimizer steps, like `global_step`, and start at `state.global_step`, so a resumed run continues the numbering.
-- **Loss** is logged as `train/loss` for each optimizer step: the loss `Trainer` back-propagates, summed over `gradient_accumulation_steps` microbatches, which is their mean. `loss_name=None` turns it off. The interval averages `Trainer` logs every `logging_steps`, and evaluation metrics, are not recorded.
+- **Loss** is logged as `train/loss` for each optimizer step: the loss `Trainer` back-propagates, summed over `gradient_accumulation_steps` micro-batches, which is their mean. `loss_name=None` turns it off. The interval averages `Trainer` logs every `logging_steps`, and evaluation metrics, are not recorded.
 - **Clipping.** The norm before clipping is recorded as `clip_grad_norm`, including with `max_grad_norm=0`, where `Trainer` still computes it.
 - **Mixed precision.** Accelerate's `GradScaler`, when it has one, is passed in, so skipped steps are counted and marked. Not run: it needs a GPU.
 - **`torch_compile=True`** works: the compiled forward is traced on its first call, after the callback has added its hooks.
@@ -230,7 +230,7 @@ watch_accelerator(session)
 ```
 
 - **Clipping.** The norm `accelerator.clip_grad_norm_` returns, before clipping, is recorded as `clip_grad_norm`. Without `watch_accelerator` this depends on the Accelerate version: up to 1.15.0 it is recorded anyway, and the development version (1.16.0.dev0) clips another way and is not.
-- **Loss.** The loss passed to `accelerator.backward` is logged as `train/loss` for each optimizer step, as the mean over gradient-accumulation microbatches. `loss_name=None` turns it off; do that if two models train through Accelerate in one process, since every loss passed to `backward` counts.
+- **Loss.** The loss passed to `accelerator.backward` is logged as `train/loss` for each optimizer step, as the mean over gradient-accumulation micro-batches. `loss_name=None` turns it off; do that if two models train through Accelerate in one process, since every loss passed to `backward` counts.
 - **Mixed precision.** Pass `scaler=accelerator.scaler` to `init`; it is `None` when there is no scaler, which is fine.
 - **`init` refuses a model that is already compiled**, so call it before `accelerator.prepare` if Accelerate compiles the model.
 - **Clipping a single tensor** (`accelerator.clip_grad_norm_(weight, max_norm)`) is not recorded. Accelerate, unlike PyTorch, iterates a bare tensor into its rows and returns 0 for it, so there is no real norm to record. Pass a list (`[weight]`) or `model.parameters()`.
@@ -259,7 +259,7 @@ if micro % accumulation == 0:  # your own count: this micro-batch ended an updat
     session.step(step=engine.global_steps - 1, skipped=not engine.was_step_applied())
 ```
 
-- **Why your own count.** `engine.was_step_applied()` is false at an ordinary accumulation micro-batch as well as after an overflow, so it says whether an update was skipped only at a micro-batch that ended one. And `engine.step()` advances DeepSpeed's own micro-batch counter as it finishes, so `engine.is_gradient_accumulation_boundary()` asked after it is about the next micro-batch (DeepSpeed 0.20.1's `engine.py`, read, not run).
+- **Why your own count.** `engine.was_step_applied()` is false at an ordinary accumulation micro-batch as well as after an overflow, so it says whether an update was skipped only at a micro-batch that ended one. And `engine.step()` advances DeepSpeed's own micro-batch counter as it finishes, so `engine.is_gradient_accumulation_boundary()` asked after it is about the next micro-batch (DeepSpeed 0.20.1's `engine.py`, read, not run). The count above fits DeepSpeed's default, where it counts micro-batches itself. With `managed_gradient_accumulation` off, every `engine.step()` is an update, and with `engine.set_gradient_accumulation_boundary()` you decide the boundary yourself: then call `session.step` where your own code ends an update.
 - **Skipped steps.** After an overflow the step is still recorded, numbered as DeepSpeed numbers it (its `global_steps` goes up on an overflow too), and marked `step_skipped_by: "caller"`.
 - **Without ZeRO (stage 0)** the default `tensorquill.init(engine.module)` counts steps and reads per-layer gradient norms. DeepSpeed clips with its own function there, so `clip_grad_norm` is not recorded.
 - **Per-layer gradient norms and weight checks** are not recorded in the recipe above; `clip_grad_norm` carries DeepSpeed's global norm, which the gradient-spike detector uses.
