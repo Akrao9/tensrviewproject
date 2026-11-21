@@ -1,6 +1,36 @@
+import os
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
+
+SERVER_BIN_ENV = "TENSORQUILL_SERVER_BIN"
+_TARGET = Path(__file__).resolve().parents[2] / "server" / "target"
+
+
+def built_server_binary(target: Path = _TARGET) -> Path | None:
+    """The newer of `debug/` and `release/` `tensorquill-server` under `target`, or None. The choice
+    `_server_binary()` in test_flight_e2e.py makes when the variable is not set."""
+    built = [p for p in (target / "debug" / "tensorquill-server", target / "release" / "tensorquill-server")
+             if p.exists()]
+    return max(built, key=lambda p: p.stat().st_mtime) if built else None
+
+
+def name_built_server(environ=os.environ, target: Path = _TARGET) -> Path | None:
+    """Make the SDK's own lookup (`server_detect.find_binary`: the variable, then beside the interpreter,
+    then PATH) find the binary the tests find under `server/target`. A variable that is set, even to a
+    wrong path, is left exactly as it is, and when nothing is built nothing is set. Returns what it set."""
+    if environ.get(SERVER_BIN_ENV):
+        return None
+    chosen = built_server_binary(target)
+    if chosen is not None:
+        environ[SERVER_BIN_ENV] = str(chosen)
+    return chosen
+
+
+# Before any test module is imported, so the tests' skip decision and the Rust detectors agree for the run.
+name_built_server()
 
 
 class ToyMoE(nn.Module):
