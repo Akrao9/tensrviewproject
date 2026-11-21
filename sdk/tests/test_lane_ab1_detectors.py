@@ -419,6 +419,9 @@ def test_silent_after_a_restart_that_stored_nothing_names_no_earlier_step():
     step. The earlier attempt reached step 100; the new one stored nothing, even where the status
     still shows the earlier attempt's step."""
     body = BEHAVIOUR["silent_after_a_restart_that_stored_nothing"]
+    # The second shape (the earlier attempt's step still on the entry) is not one today's server
+    # writes: `take_attempt` (server/src/watchdog.rs) clears `last_step`. It is read for the two
+    # keys only; the rank's own sentence then shows the step the status gives.
     for entry in (body["given"]["status_entry"], {**body["given"]["status_entry"], "last_step": 100}):
         status = _silent_status(entry)
         status["ranks"][0]["last_step"] = 7
@@ -536,3 +539,29 @@ def test_a_caller_skip_the_scaler_applied_ends_the_streak_and_is_a_recorded_obse
     counts = ev.input_counts(_rows([{"step": 0, "step_skipped": True, "step_skipped_by": "caller"},
                                     {"step": 1, "step_skipped": True, "step_skipped_by": "caller", "scaler_applied": True}]))
     assert counts["loss_scale"] == 1
+
+
+def test_the_store_view_keeps_each_ranks_skipped_updates_from_its_report(tmp_path):
+    run = _store(tmp_path, {})
+    evidence = ev.all_ranks_evidence(run)
+    assert evidence["skipped_updates_by_rank"] == [{"rank": 0, "skipped_updates": {"caller": 1, "scaler": 0, "both": 0}}]
+
+
+def test_the_rust_path_says_what_the_python_path_says_of_skips_and_unread_gradients():
+    from tensorquill.server_detect import rust_ready
+
+    try:
+        rust_ready()
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    rows = _rows([{"step": s, "grad_norm": 1.0, "grad_norms": {"blk.weight": 1.0},
+                   **({"step_skipped": True, "step_skipped_by": "caller", "grad_norm": "nan"} if s == 3 else {})}
+                  for s in range(6)])
+    rows[0]["grads_not_read"] = {"emb.weight": "a sparse gradient"}
+    python, rust = ev.build_evidence(rows), ev.build_evidence(rows, detectors="rust")
+    assert rust["skipped_updates"] == python["skipped_updates"] == {
+        "caller": 1, "scaler": 0, "both": 0,
+        "non_finite_gradients": {"steps": 1, "first_step": 3, "gradients": ["<total>"]}}
+    for found in (python, rust):
+        assert found["kind_checks"]["stalled_weights"].get("parameters_not_judged") == ["emb.weight"]
+        assert found["kind_checks"]["grad_spike"]["value"] == "unavailable"
