@@ -1,6 +1,6 @@
 # Skipped steps, due checks and wording: what both engines say
 
-Written Nov 20, 2026, from the author's decisions of that day (v3 plan, "The author's decisions on the wave's calls"), and approved by the author the same day with two amendments, made here: who reported a skipped update (section 1) and the last step of a rank that was started again (section 3). Three smaller rules of section 1 are this page's own reading of the first amendment and are marked "awaiting the author". It covers four small things that the Python detectors and the Rust server must say alike, so each is written once here, with cases, before either engine is changed. The cases are in `sdk/tests/fixtures/behaviour/cases.json`, checked by `sdk/tests/test_step_and_evidence_contract.py`.
+Written Nov 20, 2026, from the author's decisions of that day (v3 plan, "The author's decisions on the wave's calls"), and approved by the author the same day with two amendments, made here: who reported a skipped update (section 1) and the last step of a rank that was started again (section 3). Three smaller rules of section 1, this page's own reading of the first amendment, were signed off by the author the same day, and the second was then amended by the author: what a caller's skip does to the scaler's streak depends on whether the SDK saw the scaler apply the update. It covers four small things that the Python detectors and the Rust server must say alike, so each is written once here, with cases, before either engine is changed. The cases are in `sdk/tests/fixtures/behaviour/cases.json`, checked by `sdk/tests/test_step_and_evidence_contract.py`.
 
 Each case is marked. A **pin** is behaviour today's Python detectors already have; the test runs it, so it cannot move unnoticed. A **new** case is not built: its expectation is the target, in the words used here, and the lane that builds it turns it into a test of its own engine. A new case over records also states what today's Python detector answers on them, which is not the target, and the test runs that: the case cannot pass before its rule is built.
 
@@ -16,7 +16,8 @@ Outside this page: the checkpoint-to-model check (B14), the median-and-MAD score
 |---|---|---|---|---|
 | `session.step(skipped=False)` | None, or one that applied the step | `false` | No key | `an_update_due_and_applied` (new) |
 | `session.step(skipped=True)` | None | `true` | `"caller"` | `an_update_due_and_skipped` (new) |
-| `session.step(skipped=True)` | One that applied the step | `true` | `"caller"` | `a_skip_only_the_caller_reported` (new) |
+| `session.step(skipped=True)` | One the SDK observed apply this update | `true` | `"caller"`, with `scaler_applied: true` | `a_skip_only_the_caller_reported` (new) |
+| `session.step(skipped=True)` | One that did not act on this update, so its outcome is unknown | `true` | `"caller"` | `a_skip_the_caller_reported_with_no_scaler_outcome` (new) |
 | `session.step(skipped=False)` | One that skipped the step | `true` | `"scaler"` | `a_skip_only_the_scaler_reported` (new) |
 | `session.step(skipped=True)` | One that skipped the step | `true` | `"both"` | `a_skip_both_reported` (new) |
 | `session.step()` | One that skipped the step | `true` | `"scaler"` | `nothing_said_with_a_scaler` (new) |
@@ -24,6 +25,8 @@ Outside this page: the checkpoint-to-model check (B14), the median-and-MAD score
 | No call | Any | No record is ended: an accumulation microstep is not a step | | `an_accumulation_microstep` (new) |
 
 The step is skipped when either the caller or the scaler says so. `step_skipped_by` is written only on a record whose `step_skipped` is true, and it is not a column of the Arrow schema: it travels in `extra_json`, as `grads_not_read` does, so no schema changes. `skipped` takes only `True`, `False` or nothing; anything else is refused at the call, as a wrong `lr` is, and never inside training's own step.
+
+**What the scaler did on a caller's skip.** A record whose `step_skipped_by` is `"caller"` covers two cases that `loss_scale_trouble` reads differently, so the record keeps them apart. When the SDK observed the scaler apply the update, the record also carries `scaler_applied: true`. When the scaler's outcome is unknown (there is no scaler, or it did not act on this update), the record has no such key. The key is written on no other record, and it travels in `extra_json` too.
 
 **A capture written before this key.** A record with `step_skipped: true` and no `step_skipped_by` was written by a scaler, the only thing that could write it then, and is read as `"scaler"`. Every kind reads such a capture as it did before (`ten_skips_in_a_row_with_no_loss_scale`, `a_gradient_not_finite_on_a_skipped_step`, `an_activation_not_finite_on_a_skipped_step`, pins). Its evidence has no `skipped_updates` (`a_capture_written_before_the_key`, new).
 
@@ -50,11 +53,15 @@ The step is skipped when either the caller or the scaler says so. `step_skipped_
 
 `steps` is how many such steps there were, and `gradients` names what was not finite at the first of them, as a `non_finite` incident names it (a parameter, `<total>` or `<total before clipping>`). The key raises nothing, and changes neither the value `non_finite` reads nor the run's state. When a layer statistic is not finite on the same step, `non_finite` is raised for the layer with an empty `gradients`, as on any skipped step, and the gradient is kept here (`an_activation_and_a_gradient_not_finite_on_a_skip_the_caller_reported`, new). The Python reader writes the key in `build_evidence`; the server writes the same object in the rank's report beside `not_checked`, and a reader of that report passes it on unchanged. How the all-ranks view shows it is the Python lane's call, and it must not drop it.
 
-**Three rules awaiting the author.** The amendment does not say these, and the two engines would part on each, so each is fixed here with a case:
+**Three rules the amendment does not state, signed off by the author on Nov 20, 2026.** The two engines would part on each, so each is fixed here with a case, and both engines use the same words and counters:
 
-1. *A skipped step and a stall's streak.* A skipped step, whoever reported it, is read by `stalled_weights` as a row whose total gradient norm is not finite already is: it adds nothing to a streak, and its resets apply. So two unchanged checks, a skipped one and a third unchanged check raise the stall at the third, not at the skipped step (`a_stall_across_a_skipped_step`, new).
-2. *A caller's skip inside a run of the scaler's.* `loss_scale_trouble` passes over a skip only the caller reported: it neither adds to the streak nor ends it, and is in neither `skipped_steps` nor `recorded_steps`. Five scaler skips, three caller skips and five more scaler skips are ten in a row (`caller_skips_inside_a_run_of_scaler_skips`, new).
-3. *The loss scale on a caller's skip.* A loss scale recorded on such a step is still read against the floor: it is the scale's own reading, not the skip's (`a_low_loss_scale_on_a_skip_only_the_caller_reported`, pin).
+1. *A skipped step and a stall's streak.* A skipped update cannot advance a stall's streak, whoever reported it. A streak that exists carries across it, and the usual resets still apply, as for a row whose total gradient norm is not finite. So two qualifying unchanged checks, a skip and a third qualifying check raise the stall at the third check, not at the skip (`a_stall_across_a_skipped_step`, new).
+2. *A caller's skip inside a run of the scaler's.* Amended by the author after the sign-off. A skip only the caller reported keeps `step_skipped: true` and never adds a scaler-confirmed skip. What it does to the scaler's streak depends on what the SDK saw of the scaler on that update:
+   - *Outcome unknown* (no `scaler_applied`): the streak is left as it is. The step is not an observation this rule judges, and adds to neither `skipped_steps` nor `recorded_steps`.
+   - *The SDK observed the scaler apply the update* (`scaler_applied: true`): the streak ends, as at any recorded applied update. It adds nothing to `skipped_steps`.
+
+   The streak is described as "10 consecutive scaler-confirmed skips among observations judged by this rule", which says that it can span more training steps than it counts. The paired cases: five scaler-confirmed skips, one caller-only skip and five more. With the middle outcome unknown the streak reaches ten and the rule is raised (`a_caller_skip_of_unknown_scaler_outcome_inside_scaler_skips`, new). With the middle one known to be applied it ends at five, and nothing is raised (`a_caller_skip_the_scaler_applied_inside_scaler_skips`, new). Three caller-only skips of unknown outcome between two fives raise it the same way, over 13 training steps (`caller_skips_inside_a_run_of_scaler_skips`, new). One count is this page's reading and awaits the author: a caller's skip the scaler was seen to apply is an observation of the scaler, so it counts in `recorded_steps` (`ten_scaler_skips_after_a_caller_skip_the_scaler_applied`, new).
+3. *The loss scale on a caller's skip.* A measured `grad_scale` below the floor on a skip only the caller reported raises `loss_scale_trouble` with reason `scale`: the low measurement is the evidence, whoever reported the skip. That step still adds nothing to the scaler's skip counts (`a_low_loss_scale_on_a_skip_only_the_caller_reported`, pin).
 
 A step with `step_skipped: false`, or with no key, is judged by every kind as today (`a_spike_on_an_applied_step`, `a_spike_with_nothing_said`, pins).
 
@@ -96,7 +103,7 @@ The status does not carry the step at which capture stopped apart from the last 
 
 | Section | SDK | Python detectors | Rust server |
 |---|---|---|---|
-| 1 | `capture.py`: the argument, and `step_skipped_by` on the record | `stalled_weights`, `loss_scale_trouble`, the evidence's `skipped_updates`, and the labels that say a skip is the scaler's | The same, reading `step_skipped_by` from `extra_json` |
+| 1 | `capture.py`: the argument, and `step_skipped_by` and `scaler_applied` on the record | `stalled_weights`, `loss_scale_trouble`, the evidence's `skipped_updates`, and the labels that say a skip is the scaler's | The same, reading `step_skipped_by` and `scaler_applied` from `extra_json` |
 | 2, unread gradients | Nothing | The three kinds' entries | Reading `grads_not_read`, which it does not do today, and the same entries |
 | 2, a rank with no peer | Nothing | The words | `ranks_compared` |
 | 3 | Nothing | The incident's two keys and text | The same keys in its incident |
@@ -104,7 +111,7 @@ The status does not carry the step at which capture stopped apart from the last 
 
 ## 6. Not settled here
 
-- The three rules of section 1 marked "awaiting the author".
 - How the all-ranks view shows `skipped_updates`.
+- Whether a caller's skip the scaler was seen to apply counts in `recorded_steps` (section 1, rule 2).
 - Whether the first step of a comparison, while its last rank's record is still on its way, should be given a short grace before the kind reads `unavailable`. Today it is visible at once and clears when the record arrives.
 - Whether the heartbeat should carry the step at which capture stopped, where it can differ from the last step stored.

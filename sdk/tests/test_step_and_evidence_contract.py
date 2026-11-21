@@ -34,7 +34,7 @@ def _numbers(value):
 
 def test_the_file_holds_the_cases_the_page_names():
     page = (ROOT / "STEP_AND_EVIDENCE_CONTRACT.md").read_text()
-    assert len(CASES) == 41 and len(PINS) == 12
+    assert len(CASES) == 45 and len(PINS) == 12
     for name, body in CASES.items():
         assert f"`{name}`" in page, f"{name} is not named on the page"
         assert body["section"] in (1, 2, 3, 4) and body["says"] and body["expected"]
