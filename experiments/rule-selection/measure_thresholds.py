@@ -3,7 +3,8 @@ beside it. Measurement only: no rule, threshold or detector is changed, and noth
 one. Wave AE, lane AE2.
 
     python measure_thresholds.py                      # from this folder, with the project's .venv
-    python measure_thresholds.py --traincheck-from /path/to/checkout
+    python measure_thresholds.py --traincheck-from /path/to/checkout   # the sweep is in another checkout
+    python measure_thresholds.py --no-traincheck                       # measure without it
 
 The four, as `tensorquill.evidence` applies them:
 
@@ -63,6 +64,7 @@ STARVE_RATIOS = [0.05, 0.1, 0.2]
 STARVE_WINDOWS = [25, 50, 100]
 STALL_STEPS = [2, 3, 5]
 NEVER = 10**9  # a sustain no excursion reaches
+NOT_SWEEP = ("-probe", "-pytest")  # TrainCheck run folders that are not configurations of the sweep
 PYTHON = Path("/Users/ak/Documents/tensrview/tensrviewproject/.venv/bin/python")
 
 # The collapse seeded in the Granite job (`install_collapse`, allowlist `role_by_rule`): its steps
@@ -167,11 +169,85 @@ def generate(entry: dict) -> str | None:
     return None
 
 
-def read_inputs(traincheck_from: Path | None) -> tuple[list[tuple[str, list[dict], dict]], list[tuple[str, str]]]:
-    """Every entry `everything()` would give, one entry at a time, with the entries that gave none."""
-    found, unread = [], []
+class SweepError(RuntimeError):
+    """The TrainCheck sweep read is not the intended one. Raised, never skipped."""
+
+
+def intended_sweep(checkout: Path) -> list[str]:
+    """The 34 run IDs of the TrainCheck sweep: each entry's `run_id` in the committed `results.json`,
+    whose keys must be every configuration `catalog.py` names (each bug's `runs`, buggy and healthy)."""
+    folder = checkout / "experiments" / "traincheck-bugs"
+    results = json.loads((folder / "results.json").read_text())
+    catalog = inputs._module(folder / "catalog.py")
+    configs = {f"{bug['id']}|{tag}|{variant}" for bug in catalog.BUGS if bug.get("script")
+               for tag, _ in bug.get("runs", []) for variant in ("buggy", "healthy")}
+    if configs != set(results):
+        raise SweepError(f"results.json and catalog.py disagree: only in the catalog {sorted(configs - set(results))},"
+                         f" only in results.json {sorted(set(results) - configs)}")
+    ids = sorted(entry["run_id"] for entry in results.values())
+    if len(set(ids)) != len(ids):
+        raise SweepError(f"results.json repeats a run_id: {ids}")
+    return ids
+
+
+def check_sweep(sets: list[tuple[str, list[dict], dict]], root: Path) -> tuple[list, list[dict], list[str]]:
+    """The sets of the intended sweep, a row for each of its run IDs, and the folders left out.
+    Raises SweepError when a run ID has no records, a set read is not one of them, or a rank file
+    of a run is empty (it then gives no records, so the loader returns fewer ranks than files)."""
+    out = root / "experiments" / "traincheck-bugs" / "out"
+    ids = intended_sweep(inputs.WORKTREE)
+    by_id: dict[str, list[tuple[str, list[dict], dict]]] = {}
+    for one in sets:
+        by_id.setdefault(one[0].split(".rank")[0], []).append(one)
+    left_out = sorted(run for run in by_id if run.endswith(NOT_SWEEP))
+    read = {run: found for run, found in by_id.items() if not run.endswith(NOT_SWEEP)}
+    extra = sorted(set(read) - set(ids))
+    missing = sorted(set(ids) - set(read))
+    short_of_files = []
+    rows = []
+    for run in ids:
+        files = sorted(path.name for path in (out / run).glob(f"{run}.rank*.jsonl"))  # names only
+        found = read.get(run, [])
+        if len(files) != len(found) or any(not records for _, records, _ in found):
+            short_of_files.append(f"{run} ({len(files)} rank files, {len(found)} with records)")
+        manifest_path = out / run / f"{run}.run.json"
+        manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+        rows.append({"run_id": run, "ranks": len(found), "records": [len(records) for _, records, _ in found],
+                     "sdk_version": manifest.get("sdk_version"), "created_at": manifest.get("created_at"),
+                     "commit": next((k for _, records, _ in found for r in records[:1]
+                                     for k in r if "commit" in k.lower() or "git" in k.lower()), None)})
+    if extra or missing or short_of_files:
+        raise SweepError(f"the TrainCheck sweep under {out} is not the intended one: read but not in the sweep {extra};"
+                         f" in the sweep but not read {missing}; rank files without records {short_of_files}")
+    return [one for run in ids for one in read[run]], rows, left_out
+
+
+def read_inputs(traincheck_from: Path | None, no_traincheck: bool) -> tuple[list, list[tuple[str, str]], list[dict]]:
+    """Every entry `everything()` would give, one entry at a time, with the entries that gave none,
+    and the TrainCheck sweep's rows (`check_sweep`)."""
+    found, unread, sweep = [], [], []
     for entry_id, entry in inputs.ENTRIES.items():
         if entry["kind"] in ("in-script", "validation"):
+            continue
+        if entry_id == "traincheck":
+            if no_traincheck:
+                unread.append((entry_id, "left out with --no-traincheck"))
+                continue
+            root = traincheck_from or inputs.WORKTREE
+            if not (root / "experiments" / "traincheck-bugs" / "out").is_dir():
+                raise SweepError(f"no TrainCheck sweep under {root}: give --traincheck-from <a checkout that has"
+                                 " experiments/traincheck-bugs/out>, or --no-traincheck to measure without it")
+            # The loader's own glob and refusals, with the checkout that holds the sweep's output.
+            kept = inputs.WORKTREE
+            inputs.WORKTREE = root
+            try:
+                sets = inputs.load(entry_id)
+            finally:
+                inputs.WORKTREE = kept
+            sets, sweep, left_out = check_sweep(sets, root)
+            if left_out:
+                unread.append((entry_id, f"left out, not part of the sweep: {', '.join(left_out)}"))
+            found.extend(sets)
             continue
         if entry["kind"] == "generated":
             why = generate(entry)
@@ -179,26 +255,16 @@ def read_inputs(traincheck_from: Path | None) -> tuple[list[tuple[str, list[dict
                 unread.append((entry_id, why))
                 continue
         try:
-            if entry_id == "traincheck" and traincheck_from is not None:
-                # The loader's own glob and refusals, with the checkout that holds the sweep's output.
-                kept = inputs.WORKTREE
-                inputs.WORKTREE = traincheck_from
-                try:
-                    sets = inputs.load(entry_id)
-                finally:
-                    inputs.WORKTREE = kept
-            else:
-                sets = inputs.load(entry_id)
+            sets = inputs.load(entry_id)
         except Exception as error:  # noqa: BLE001: a missing file is reported, not raised
             unread.append((entry_id, f"{type(error).__name__}: {error}"))
             continue
         if not sets:
-            root = traincheck_from if entry_id == "traincheck" and traincheck_from else (
-                inputs.MAIN if entry.get("root") == "main" else inputs.WORKTREE)
+            root = inputs.MAIN if entry.get("root") == "main" else inputs.WORKTREE
             unread.append((entry_id, f"nothing matches {entry.get('path')} under {root}"))
             continue
         found.extend(sets)
-    return found, unread
+    return found, unread, sweep
 
 
 def before(rows: list[dict], step: int) -> list[dict]:
@@ -468,16 +534,23 @@ def main() -> None:
     parser.add_argument("--traincheck-from", type=Path,
                         help="a checkout whose experiments/traincheck-bugs/out holds the TrainCheck sweep "
                              "(the allowlist reads it from this checkout by default)")
+    parser.add_argument("--no-traincheck", action="store_true",
+                        help="measure without the TrainCheck sweep (otherwise its absence is an error)")
     parser.add_argument("--json", type=Path, default=inputs.GENERATED / "thresholds.json")
     args = parser.parse_args()
 
-    sets, unread = read_inputs(args.traincheck_from)
+    sets, unread, sweep = read_inputs(args.traincheck_from, args.no_traincheck)
     print(f"# Record sets read: {len(sets)}\n")
     for entry_id, why in unread:
         print(f"- not read: `{entry_id}`: {why}")
     print()
+    if sweep:
+        print(f"## The TrainCheck sweep: {len(sweep)} run IDs, each in results.json and catalog.py, each read\n")
+        table(["Run ID", "Ranks", "Records per rank", "Manifest sdk_version", "Manifest created_at", "Commit in the records"],
+              [[row["run_id"], row["ranks"], ", ".join(map(str, row["records"])), row["sdk_version"], row["created_at"],
+                row["commit"] or "not recorded"] for row in sweep])
 
-    results: dict[str, dict] = {"unread": unread, "rules": {}}
+    results: dict[str, dict] = {"unread": unread, "sweep": sweep, "rules": {}}
     cache: dict[tuple[str, int], dict] = {}
 
     def measured(rule: str, name: str, rows: list[dict]) -> dict:
