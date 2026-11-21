@@ -204,10 +204,9 @@ def _ranks_compared(by_rank: Mapping[int, list[tuple[int, int, str]]]) -> list[i
     """The ranks a comparison is made for: each that wrote, among its last `DUPLICATE_WINDOW`
     hashed steps, a hash of a kind another rank wrote there too. Hashes of two kinds are never
     compared (C16, Nov 19, 2026: every rank with a hash was listed, which claimed comparisons
-    across an encoding change that were never made). A lone rank with hashed batches is listed,
-    as before (`detect_duplicate_batches` makes no incident for it)."""
-    if len(by_rank) == 1:
-        return sorted(by_rank)
+    across an encoding change that were never made). A lone rank with hashed batches is not
+    listed: it was compared with no other rank (STEP_AND_EVIDENCE_CONTRACT.md, section 2, "one
+    rank observed, zero peers compared"), as the server's `ranks_compared` has it."""
     kinds = {rank: {hash_kind(digest) for _, _, digest in rows[-DUPLICATE_WINDOW:]} for rank, rows in by_rank.items()}
     return sorted(rank for rank in by_rank if any(kinds[rank] & kinds[other] for other in by_rank if other != rank))
 
@@ -331,7 +330,10 @@ def _state_findings(
         components = manifest.get("components") if isinstance(manifest.get("components"), Mapping) else {}
         for name in _expected_components(lr_varies, first_scale is not None):
             if name not in components:
-                findings.append({"component": name, "finding": "missing"})
+                # Which entry is the model's state is found by a rule over names and keys, which can
+                # miss one that is there: not found is not absent (STEP_AND_EVIDENCE_CONTRACT.md,
+                # section 4). `missing` stays for the other components.
+                findings.append({"component": name, "finding": "not_identified" if name == "model" else "missing"})
         optimizer = components.get("optimizer")
         if isinstance(optimizer, Mapping) and _int(optimizer.get("entries")) == 0:
             findings.append({"component": "optimizer", "finding": "empty_in_checkpoint"})

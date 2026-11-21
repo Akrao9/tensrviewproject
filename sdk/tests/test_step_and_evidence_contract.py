@@ -74,14 +74,6 @@ def test_a_new_case_states_a_target_in_the_pages_words(name, body):
         assert value in ("checked", "not_configured", "unavailable")
 
 
-def test_the_one_new_detector_rule_of_section_1_is_not_built_yet():
-    """`stalled_weights` does not read `step_skipped` today. When it does, this test is the one to
-    remove, and `weights_unchanged_across_skipped_steps` becomes a pin."""
-    import inspect
-
-    assert "step_skipped" not in inspect.getsource(ev.detect_stalled_weights)
-
-
 NOT_BUILT = [(name, body) for name, body in NEW if "today" in body]
 
 
@@ -98,14 +90,6 @@ def test_a_new_case_over_records_is_not_what_the_python_detectors_do_today(name,
         return  # raised today, and the target is that it is not
     carried = expected["incident_carries"]
     assert any(found.get(key) != value for key, value in carried.items()), "today's answer is already the target"
-
-
-def test_who_reported_a_skip_is_read_by_no_detector_yet():
-    """No Python detector reads `step_skipped_by` today: a capture with the key is judged as one
-    without it. When one does, this test is the one to remove."""
-    import inspect
-
-    assert "step_skipped_by" not in inspect.getsource(ev)
 
 
 def test_the_three_provenances_are_the_same_records_but_for_who_reported():

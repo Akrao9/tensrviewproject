@@ -4,10 +4,10 @@
 
 Written by hand from the page. `status` is `pin` for behaviour today's Python detectors already
 have (the test runs those) or `new` for what is not built: there `expected` is the target, in the
-page's words, for the lane that builds it. A `new` case over records also says, under `today`, what
-today's Python detector answers on them, which is not the target: the test runs that, so the case
-cannot pass before its rule is built. The lane that builds the rule removes `today` and makes the
-case a pin. A value that is not finite is written as the string "nan", as JSON has no such number;
+page's words, for the lane that builds it. A `new` case over records said, under `today`, what the
+Python detector answered on them before its rule was built; lane AB1 (wave AB) built the rules of
+sections 1 and 2 that are read from records, removed `today` from their cases, and runs each
+against the real code in `sdk/tests/test_lane_ab1_detectors.py`. A value that is not finite is written as the string "nan", as JSON has no such number;
 the test turns it back.
 """
 import json
@@ -82,30 +82,25 @@ cases = {
  "nothing_said_without_a_scaler": new(1, "The argument is left out and there is no scaler. The record has no such key, as today.",
     {"init": {"auto_step": False}, "calls": ["session.step()"]}, {"records_lack": ["step_skipped"]}),
  "weights_unchanged_across_skipped_steps": new(1, "A parameter's norm is unchanged across three steps, and all three were skipped updates. That is not a stall: the weights were not meant to move.",
-    {"records": unchanged(3)}, {"incident_kinds_absent": ["stalled_weights"]},
-    today("detect_stalled_weights", True, kind="stalled_weights", step=2)),
+    {"records": unchanged(3)}, {"incident_kinds_absent": ["stalled_weights"]}),
  **{f"weights_unchanged_across_skips_{who}_reported": new(1, f"The same three steps, skipped updates that {WHO[by]}. Not a stall, whoever reported them.",
-    {"records": unchanged(3, by)}, {"incident_kinds_absent": ["stalled_weights"]},
-    today("detect_stalled_weights", True, kind="stalled_weights", step=2)) for who, by in BY.items()},
- "a_stall_across_a_skipped_step": new(1, "Awaiting the author. A parameter is unchanged at two applied steps, at a skipped one, and at one more applied step. The skipped step adds nothing to the streak and does not end it, so the stall is raised at the last step.",
+    {"records": unchanged(3, by)}, {"incident_kinds_absent": ["stalled_weights"]}) for who, by in BY.items()},
+ "a_stall_across_a_skipped_step": new(1, "A parameter is unchanged at two applied steps, at a skipped one, and at one more applied step. The skipped step adds nothing to the streak and does not end it, so the stall is raised at the last step.",
     {"records": [{"step": s, **({"step_skipped": True, "step_skipped_by": "caller"} if s == 2 else {"step_skipped": False}),
                   "weights_unchanged": ["blk.weight"], "grad_norms": {"blk.weight": 0.5}} for s in range(4)]},
-    {"incident_kinds_present": ["stalled_weights"], "incident_carries": {"step": 3}},
-    today("detect_stalled_weights", True, kind="stalled_weights", step=2)),
+    {"incident_kinds_present": ["stalled_weights"], "incident_carries": {"step": 3}}),
  "ten_skips_only_the_caller_reported": new(1, "Ten skipped updates in a row that only the caller reported. They are not the loss scale's trouble, and nothing is raised.",
-    {"records": skips(10, "caller")}, {"incident_kinds_absent": ["loss_scale_trouble"]},
-    today("detect_loss_scale_trouble", True, kind="loss_scale_trouble", step=14)),
+    {"records": skips(10, "caller")}, {"incident_kinds_absent": ["loss_scale_trouble"]}),
  "ten_skips_the_scaler_reported": pin(1, "Ten skipped updates in a row that the scaler reported, on a capture that says so. Raised.",
     "detect_loss_scale_trouble", skips(10, "scaler"), True, kind="loss_scale_trouble", step=14, reason="skips", consecutive_skips=10),
  "ten_skips_both_reported": pin(1, "Ten skipped updates in a row that the caller and the scaler both reported. The scaler confirmed each, so the streak is raised.",
     "detect_loss_scale_trouble", skips(10, "both"), True, kind="loss_scale_trouble", step=14, reason="skips", consecutive_skips=10),
- "caller_skips_inside_a_run_of_scaler_skips": new(1, "Awaiting the author. Two applied steps, five skips the scaler reported, three only the caller reported, five more the scaler reported. The caller's are passed over: they neither add to the streak nor end it, and are in neither count. Ten in a row are reached at the last step.",
+ "caller_skips_inside_a_run_of_scaler_skips": new(1, "Two applied steps, five skips the scaler reported, three only the caller reported, five more the scaler reported. The caller's are passed over: they neither add to the streak nor end it, and are in neither count. Ten in a row are reached at the last step.",
     {"records": skips(5, "scaler", before=2) + [{"step": 7 + k, "step_skipped": True, "step_skipped_by": "caller"} for k in range(3)]
                 + [{"step": 10 + k, "step_skipped": True, "step_skipped_by": "scaler"} for k in range(5)]},
     {"incident_kinds_present": ["loss_scale_trouble"],
-     "incident_carries": {"step": 14, "reason": "skips", "consecutive_skips": 10, "skipped_steps": 10, "recorded_steps": 12}},
-    today("detect_loss_scale_trouble", True, kind="loss_scale_trouble", step=11, skipped_steps=13, recorded_steps=15)),
- "a_low_loss_scale_on_a_skip_only_the_caller_reported": pin(1, "Awaiting the author. A loss scale below the floor is recorded on a step whose skip only the caller reported. The scale is still read: it is the scale's own reading, not the skip's.",
+     "incident_carries": {"step": 14, "reason": "skips", "consecutive_skips": 10, "skipped_steps": 10, "recorded_steps": 12}}),
+ "a_low_loss_scale_on_a_skip_only_the_caller_reported": pin(1, "A loss scale below the floor is recorded on a step whose skip only the caller reported. The scale is still read: it is the scale's own reading, not the skip's.",
     "detect_loss_scale_trouble", [{"step": 3, "step_skipped": True, "step_skipped_by": "caller", "grad_scale": 0.5}], True,
     kind="loss_scale_trouble", step=3, reason="scale"),
  **{f"an_activation_not_finite_on_a_skip_{who}_reported": pin(1, f"A layer statistic is not finite on a skip that {WHO[by]}. Raised for the layer, with no gradient named.",

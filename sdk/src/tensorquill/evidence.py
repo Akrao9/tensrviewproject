@@ -275,6 +275,21 @@ def _finite(value: Any) -> float | None:
     return float(value) if math.isfinite(value) else None
 
 
+SKIPPED_BY = ("caller", "scaler", "both")
+
+
+def skipped_by(record: Mapping[str, Any]) -> str | None:
+    """Who reported that a record's update was skipped (STEP_AND_EVIDENCE_CONTRACT.md, section 1):
+    `caller` (`session.step(skipped=True)`), `scaler` (the loss scaler given to `init`) or
+    `both`; None when the update was not skipped. A skipped record without `step_skipped_by`
+    was written before the key, when only a scaler could write it, and is read as `scaler`; so
+    is a value that is not one of the three."""
+    if not record.get("step_skipped"):
+        return None
+    by = record.get("step_skipped_by")
+    return by if by in SKIPPED_BY else "scaler"
+
+
 def _median(values: list[float]) -> float:
     ordered = sorted(values)
     mid = len(ordered) // 2
@@ -575,9 +590,14 @@ def update_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[st
     }
 
 
-# The kinds judged from each parameter's own gradient norm (`grad_norms`): a parameter whose
-# gradient was not read is not judged by them.
-GRADS_NOT_READ_KINDS = ("grad_spike", "stalled_weights", "non_finite")
+# What a gradient that was not read does to each kind is decided by what the kind is judged from
+# (STEP_AND_EVIDENCE_CONTRACT.md, section 2, which replaces lane Z2's call that made all three
+# `unavailable`): `grad_spike` is judged from the total gradient norm, which leaves the unread
+# parameter out, so it is `unavailable`. `non_finite` (layer statistics and each norm that was
+# read) stays `checked`, and `stalled_weights` (each parameter's own history) is `checked` for
+# the parameters read and names the unread ones under `parameters_not_judged`.
+GRADS_NOT_READ_KINDS = ("grad_spike",)
+GRADS_NOT_READ_NAMED = "stalled_weights"
 
 
 def grads_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
@@ -586,10 +606,11 @@ def grads_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str
     The capture leaves such a gradient out of `grad_norms` on its own (one on `meta`, a nested
     one, or one whose norm raised) and says which parameter, and why, once, under
     `grads_not_read` on the first record it wrote after it knew (`record_grads`). Without this
-    entry the kinds judged from each parameter's gradient (`GRADS_NOT_READ_KINDS`) would read
-    "nothing found" for a parameter that was never looked at. As for `update_size`, the kinds are
-    `unavailable` and the run `degraded`. The server writes no such entry yet; `build_evidence`
-    adds this one to a report that has none.
+    entry a kind would read "nothing found" for a parameter that was never looked at. The kinds
+    the entry lists (`GRADS_NOT_READ_KINDS`) are `unavailable`; `stalled_weights` stays checked
+    and names the parameters it did not judge (`name_gradients_not_judged`); a finding on what
+    was read always stands; and the run is `degraded`, as for any entry. The server writes no
+    such entry yet; `build_evidence` adds this one to a report that has none.
     """
     first: dict[str, tuple[int, str]] = {}
     for record in records:
@@ -608,6 +629,17 @@ def grads_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str
         "reason": "gradient not read for " + "; ".join(f"{name}: {first[name][1]}" for name in names),
         "step": min(step for step, _ in first.values()),
     }
+
+
+def name_gradients_not_judged(checks: dict[str, dict[str, Any]], not_checked: Iterable[Mapping[str, Any]]) -> None:
+    """Name the parameters whose gradient was not read on the `stalled_weights` entry of
+    `checks`, as `parameters_not_judged`, when a `gradients` entry of `not_checked` lists them
+    and the kind is not itself `unavailable` (STEP_AND_EVIDENCE_CONTRACT.md, section 2)."""
+    names = sorted({str(name) for item in not_checked if isinstance(item, Mapping) and item.get("check") == "gradients"
+                    for name in item.get("parameters") or ()})
+    check = checks.get(GRADS_NOT_READ_NAMED)
+    if names and isinstance(check, dict) and check.get("value") != "unavailable":
+        check["parameters_not_judged"] = names
 
 
 def _spiking_parameters(
@@ -1055,12 +1087,14 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
     if places:
         common["stuck_at"] = places
     if status["summary"] == "stalled":
+        held = [r for r in ranks if r.get("state") not in ("finished",)]
         return [{
             "kind": "job_stalled",
             "step": max(steps, default=0),
-            "ranks": [r for r in ranks if r.get("state") not in ("finished",)],
+            "ranks": held,
             "missing_ranks": list(status.get("missing_ranks", ())),
             **common,
+            **_capture_stopped_keys(held),
         }]
     affected = [r for r in stopped]
     behind = [r["last_step"] for r in affected if r.get("last_step") is not None]
@@ -1076,7 +1110,40 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
         "missing_ranks": list(status.get("missing_ranks", ())),
         "newest_step": max(steps, default=0),
         **common,
+        **_capture_stopped_keys(affected),
     }]
+
+
+def _capture_stopped_keys(ranks: list[dict[str, Any]]) -> dict[str, Any]:
+    """A silence incident's link to a rank whose capture had stopped while training went on
+    (STEP_AND_EVIDENCE_CONTRACT.md, section 3): each such rank's entry gains `capture_last_step`,
+    the last step its current attempt stored, or null when that attempt stored none (a rank the
+    status marks `attempt_without_steps`: a step an earlier attempt stored is not this one's);
+    and the incident gains `capture_stopped` (the status entry's value, unchanged) and
+    `capture_last_step` of the first such rank, by rank. Nothing for a rank whose capture never
+    stopped."""
+    stopped = sorted((r for r in ranks if r.get("capture_stopped") is not None), key=lambda r: r.get("rank", 0))
+    for entry in stopped:
+        entry["capture_last_step"] = None if entry.get("attempt_without_steps") else entry.get("last_step")
+    if not stopped:
+        return {}
+    return {"capture_stopped": stopped[0]["capture_stopped"], "capture_last_step": stopped[0]["capture_last_step"]}
+
+
+def _capture_stopped_text(incident: Mapping[str, Any]) -> str:
+    """The sentence for a silence incident whose rank's capture had stopped (`_capture_stopped_keys`)."""
+    if incident.get("capture_stopped") is None:
+        return ""
+    named = next((r for r in incident.get("ranks") or () if isinstance(r, Mapping) and r.get("capture_stopped") is not None), {})
+    said = incident["capture_stopped"]
+    reason = said.get("reason") if isinstance(said, Mapping) else said
+    ago = _finite(said.get("seconds")) if isinstance(said, Mapping) else None
+    why = f"{reason}" + (f", {ago:.0f} s ago" if ago is not None else "")
+    last = incident.get("capture_last_step")
+    when = f"after step {last}" if last is not None else "before this attempt stored a step"
+    who = f"Rank {named['rank']}'s capture" if "rank" in named else "Capture"
+    return (f" {who} had stopped {when} ({why}) while training went on: TensorQuill cannot tell from this rank"
+            " whether training itself stalled.")
 
 
 def _optimizer_evidence(ownership: Mapping[str, Any] | None, stalled: list[str]) -> dict[str, Any]:
@@ -1110,8 +1177,10 @@ def detect_stalled_weights(
       history, so a later streak can still fire.
 
     A row whose total gradient norm is not finite adds nothing to a streak (mixed-precision
-    loss scaling skips those optimizer steps on purpose) but its resets apply. A row
-    without the list is no weight check, and every streak holds.
+    loss scaling skips those optimizer steps on purpose) but its resets apply. A skipped
+    update (`step_skipped`), whoever reported it, is read the same way: the weights were not
+    meant to move (STEP_AND_EVIDENCE_CONTRACT.md, section 1): a streak carries across it. A
+    row without the list is no weight check, and every streak holds.
 
     There is one incident, dated at the first step any parameter stalled; `step`,
     `parameters`, `stalled` and `optimizer` describe that first onset. Every parameter is
@@ -1146,7 +1215,8 @@ def detect_stalled_weights(
         unchanged = record.get("weights_unchanged")
         if unchanged is None:
             continue
-        evidence = _finite(record.get("grad_norm")) is not None or record.get("grad_norm") is None
+        evidence = (_finite(record.get("grad_norm")) is not None or record.get("grad_norm") is None) \
+            and skipped_by(record) is None
         grads = record.get("grad_norms", {})
         unchanged_set = set(unchanged)
         for name in streak:
@@ -1446,15 +1516,25 @@ def detect_loss_scale_trouble(
     records: list[dict[str, Any]], *, run: int = SCALE_SKIP_RUN, floor: float = SCALE_FLOOR
 ) -> dict[str, Any] | None:
     """Return the first step where mixed-precision loss scaling is in trouble, or None:
-    `run` or more optimizer steps in a row skipped by the scaler, or the loss scale below
-    `floor`. Needs `step_skipped` and `grad_scale`, recorded with `init(..., scaler=)`."""
+    `run` or more consecutive scaler-confirmed skips among observations judged by this rule, or
+    the loss scale below `floor`. Needs `step_skipped` and `grad_scale`, recorded with
+    `init(..., scaler=)`.
+
+    Only a skip the scaler confirmed counts (`step_skipped_by` `scaler` or `both`, or no such
+    key: STEP_AND_EVIDENCE_CONTRACT.md, section 1, signed off by the author). A skip only the
+    caller reported is passed over: it neither adds to the streak nor ends it, and is in neither
+    `skipped_steps` nor `recorded_steps`, so a streak can span more training steps than it
+    counts. A recorded applied update ends it. A loss scale recorded on a caller's skip is still
+    read against `floor`, and raises with reason `scale` and the skip counts unchanged."""
     streak, skipped, total, first = 0, 0, 0, None
     for record in sorted(records, key=lambda r: r["step"]):
         if "step_skipped" not in record:
             continue
-        total += 1
-        skipped += bool(record["step_skipped"])
-        streak = streak + 1 if record["step_skipped"] else 0
+        by = skipped_by(record)
+        if by != "caller":
+            total += 1
+            skipped += by is not None
+            streak = streak + 1 if by is not None else 0
         scale = _finite(record.get("grad_scale"))
         if first is None and (streak >= run or (scale is not None and scale < floor)):
             first = {
@@ -2225,7 +2305,7 @@ INPUT_NEEDS: dict[str, str] = {
     "update": "update_rms with grad_norm or clip_grad_norm (updates=True)",
     "weight_check": "weights_unchanged with grad_norms (full capture)",
     "steps": "step records",
-    "loss_scale": "step_skipped (scaler=)",
+    "loss_scale": "step_skipped (scaler= or session.step(skipped=))",
     "lr": "lr",
     "data": "data (session.watch_loader)",
     "checkpoint": "checkpoint, or grad_scale (scaler=)",
@@ -2268,7 +2348,7 @@ KIND_INPUTS: dict[str, str] = {
 #   update_spike          one record to compare the first with, the `update_window` option
 #                         (UPDATE_WINDOW) changes that make the first baseline, and the one judged
 #   stalled_weights       STALL_STEPS weight checks in a row
-#   loss_scale_trouble    a scale below the floor 1; SCALE_SKIP_RUN skips in a row
+#   loss_scale_trouble    a scale below the floor 1; SCALE_SKIP_RUN consecutive scaler-confirmed skips
 #   data_stalled          no batch: DATA_STALL_STEPS steps in a row, 3; the same batch: the
 #                         batch and DATA_STALL_STEPS steps that repeat it
 #   epoch_order_repeated  the shortest pass that can be repeated has two different batches,
@@ -2364,7 +2444,8 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
             and not record.get("step_skipped")
         )
         counts["weight_check"] += record.get("weights_unchanged") is not None and norms
-        counts["loss_scale"] += record.get("step_skipped") is not None
+        # A skip only the caller reported is not the loss scale's to judge (`detect_loss_scale_trouble`).
+        counts["loss_scale"] += record.get("step_skipped") is not None and skipped_by(record) != "caller"
         counts["lr"] += _lr_values(record) is not None
         counts["data"] += isinstance(record.get("data"), Mapping)
         # `resume_incomplete` judges a resume from a checkpoint manifest or from the loss scale
@@ -3052,10 +3133,11 @@ def _report_evidence(
     incidents.extend(i for i in record_incidents if i.get("kind") == "replica_drift")
     with_classes(incidents)
     applied = report.get("thresholds") or {}
+    own_rank = report.get("rank") if isinstance(report.get("rank"), int) else _own_rank(folder)
     evidence = {
         "schema_version": 1,
         "run_id": report.get("run_id"),
-        "rank": report.get("rank") if isinstance(report.get("rank"), int) else _own_rank(folder),
+        "rank": own_rank,
         "run": _manifest.run_block(report.get("run_id"), _manifest.find_manifest(folder, report.get("run_id"))),
         "overload_threshold": applied.get("overload_threshold", OVERLOAD_THRESHOLD),
         "starve_window": applied.get("starve_window", STARVE_WINDOW),
@@ -3066,13 +3148,15 @@ def _report_evidence(
         "detection": {**_detection(look, "server", None), "moe_flagged": report.get("moe_flagged"),
                       "thresholds": applied_thresholds(report)},
         **({"not_checked": not_checked} if not_checked else {}),
+        # The server's count of skipped updates by who reported them, passed on unchanged.
+        **({"skipped_updates": dict(found)} if isinstance(found := report.get("skipped_updates"), Mapping) else {}),
         **({"head_trends": dict(heads)} if isinstance(heads := report.get("head_trends"), Mapping) and heads else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
         **({"traincheck": traincheck_summary} if traincheck_summary else {}),
-        **({"watchdog": {k: status[k] for k in (
+        **({"watchdog": {**{k: status[k] for k in (
             "summary", "written_at_ms", "world_size", "pauses", "recommended_silent_seconds",
             "silent_floor_seconds", "critical_seconds",
-        ) if k in status}} if status else {}),
+        ) if k in status}, **_rank_dropped_rows_said(status, own_rank)}} if status else {}),
     }
     # What was checked: the server's own values for the kinds it judges, and this reader's for
     # the rest. A store is expected to hold the server's status. A report from a server older
@@ -3983,6 +4067,10 @@ def _group_incidents(looks: Mapping[int, Mapping[str, Any]], judged: list[int]) 
 #      say would read as the run's.
 #   7. `degraded` is as before and agrees with it: a judged rank's `not_checked` entry makes
 #      a kind `unavailable` on that rank, so for the run, and already degrades the run state.
+# What is said of a cross-rank kind when one rank was observed (STEP_AND_EVIDENCE_CONTRACT.md,
+# section 2, and REPLICA_OBSERVATION_CONTRACT.md, section 4a): it was compared with nothing, and is
+# never said to agree.
+NO_PEER_WORDS = "one rank observed, zero peers compared"
 _CROSS_RANK_NEEDS = {
     "duplicate_batches": "data (session.watch_loader) on every judged rank, at least two ranks, and the server's"
                          " progress status (watchdog.json)",
@@ -4119,7 +4207,11 @@ def run_kind_checks(
         listed = set(compared) if len(set(compared)) >= 2 else set()
         duplicates = _cross_rank_check("duplicate_batches", brings(lambda rank: rank in listed, _DATA_KIND))
         missed = sorted(rank for rank in recorded if rank not in compared)
-        if missed:
+        if len(recorded) == 1 and not listed:
+            # One rank observed: it has no rank to be compared with (contract, section 2).
+            duplicates["value"], duplicates["enough_history"] = "not_configured", False
+            duplicates["note"] = NO_PEER_WORDS
+        elif missed:
             duplicates["not_compared_ranks"] = missed
             many = len(missed) != 1
             duplicates["note"] = (
@@ -4257,6 +4349,8 @@ def combine_rank_evidence(
         # Each judged rank's probe head numbers, from its evidence (L20).
         **({"head_trends_by_rank": heads} if (heads := _head_trends_by_rank(
             {n: per_rank[n].get("head_trends") for n in judged})) else {}),
+        **({"skipped_updates_by_rank": skips} if (skips := _skipped_updates_by_rank(
+            {n: per_rank[n].get("skipped_updates") for n in judged})) else {}),
     }
     stated = {n: found for n in judged if (found := stated_kind_checks(per_rank[n])) is not None}
     silent = [n for n in judged if n not in stated]
@@ -4305,6 +4399,15 @@ def _head_trends_by_rank(found: Mapping[int, Any]) -> list[dict[str, Any]]:
     under `head_trends`, which one rank's evidence has and a reader of it takes as one rank's."""
     return [{"rank": number, "head_trends": dict(trends)} for number, trends in sorted(found.items())
             if isinstance(trends, Mapping) and trends]
+
+
+def _skipped_updates_by_rank(found: Mapping[int, Any]) -> list[dict[str, Any]]:
+    """Each judged rank's `skipped_updates` (STEP_AND_EVIDENCE_CONTRACT.md, section 1), for the
+    all-ranks view's `skipped_updates_by_rank`: `{"rank", "skipped_updates"}` for each rank whose
+    evidence or report has the key, by rank, unchanged. Not added up: each rank's skips are its
+    own, and a rank without the key has a capture written before it."""
+    return [{"rank": number, "skipped_updates": dict(skips)} for number, skips in sorted(found.items())
+            if isinstance(skips, Mapping)]
 
 
 def _all_ranks_reported(evidence: Mapping[str, Any]) -> dict[Any, set[int]]:
@@ -4556,6 +4659,8 @@ def _all_ranks_evidence(
         # Each judged rank's probe head numbers, from its current report (L20): no part is read.
         **({"head_trends_by_rank": heads} if (heads := _head_trends_by_rank(
             {n: looks[n]["report"].get("head_trends") for n in judged})) else {}),
+        **({"skipped_updates_by_rank": skips} if (skips := _skipped_updates_by_rank(
+            {n: looks[n]["report"].get("skipped_updates") for n in judged})) else {}),
         "ranks": entries,
         **({"not_checked": not_checked} if not_checked else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
@@ -4591,6 +4696,23 @@ def _dropped_rows_said(status: Mapping[str, Any] | None) -> dict[str, Any]:
         return {}
     return {"dropped_rows": {"rows": found["rows"], **({"by_key": found["by_key"]} if found.get("by_key") else {}),
                              "rank_ranges": _rank_ranges((item["rank"] for item in found["ranks"]), 8),
+                             "upper_bound": True, "note": found["note"]}}
+
+
+def _rank_dropped_rows_said(status: Mapping[str, Any] | None, rank: Any) -> dict[str, Any]:
+    """`{"dropped_rows": ...}` for one rank's evidence built from a server report: the rows the
+    server dropped from this rank for a null key, from its entry in the status (`runs.dropped_rows`
+    over that entry alone), or nothing when it dropped none, so the block is as before. An upper
+    bound, as in the all-ranks view (`_dropped_rows_said`)."""
+    from .runs import dropped_rows
+
+    entries = status.get("ranks") if isinstance(status, Mapping) else None
+    if not isinstance(rank, int) or not isinstance(entries, list):
+        return {}
+    found = dropped_rows({"ranks": [e for e in entries if isinstance(e, Mapping) and e.get("rank") == rank]})
+    if found is None:
+        return {}
+    return {"dropped_rows": {"rows": found["rows"], **({"by_key": found["by_key"]} if found.get("by_key") else {}),
                              "upper_bound": True, "note": found["note"]}}
 
 
@@ -4921,12 +5043,51 @@ def _diversity_from_counts(counts: list[int], n_experts: int) -> float:
     return math.exp(entropy) / n_experts
 
 
+def _non_finite_gradients(record: Mapping[str, Any]) -> list[str]:
+    """What is not finite among a record's gradient norms, as a `non_finite` incident names it:
+    each parameter, else `<total>`, and `<total before clipping>`."""
+    bad = [name for name, norm in (record.get("grad_norms") or {}).items() if _is_non_finite(norm)]
+    if _is_non_finite(record.get("grad_norm")) and not bad:
+        bad.append("<total>")
+    if _is_non_finite(record.get("clip_grad_norm")):
+        bad.append("<total before clipping>")
+    return bad
+
+
+def skipped_updates(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """One rank's skipped updates by who reported them (STEP_AND_EVIDENCE_CONTRACT.md, section 1),
+    the evidence's `skipped_updates`: `{"caller", "scaler", "both"}` counts, with
+    `non_finite_gradients` (`steps`, `first_step`, and `gradients` named at the first, as
+    `non_finite` names them) only when a skip the caller reported, alone or with the scaler, had
+    a gradient norm that was not finite. None unless a record carries `step_skipped_by`, so the
+    evidence of a capture written before the key is what it was; there, a skip without the key
+    counts as the scaler's (`skipped_by`). It raises nothing and changes no kind's verdict."""
+    listed = sorted((r for r in records if isinstance(r, Mapping)), key=lambda r: r["step"])
+    if not any("step_skipped_by" in r for r in listed):
+        return None
+    counts = dict.fromkeys(SKIPPED_BY, 0)
+    kept: dict[str, Any] | None = None
+    for record in listed:
+        by = skipped_by(record)
+        if by is None:
+            continue
+        counts[by] += 1
+        bad = _non_finite_gradients(record) if by in ("caller", "both") else []
+        if bad:
+            if kept is None:
+                kept = {"steps": 0, "first_step": int(record["step"]), "gradients": bad}
+            kept["steps"] += 1
+    return {**counts, **({"non_finite_gradients": kept} if kept is not None else {})}
+
+
 def detect_non_finite(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Return the first step where a layer statistic or gradient norm is NaN or Inf.
 
-    On steps a loss scaler skipped (`step_skipped`), Inf or NaN gradients are what the
-    scaler expects and handles, so only activations are checked there; the skips
-    themselves are counted in `detect_loss_scale_trouble`.
+    On a skipped update (`step_skipped`, whoever reported it), Inf or NaN gradients are what
+    the skip is for, so only activations are checked there: a layer statistic that is not
+    finite is raised with no gradient named. A gradient that is not finite on a skip the caller
+    reported is kept in the evidence's `skipped_updates` instead (STEP_AND_EVIDENCE_CONTRACT.md,
+    section 1); the scaler's skips are counted in `detect_loss_scale_trouble`.
     """
     for record in records:
         bad_layers = [
@@ -4934,16 +5095,7 @@ def detect_non_finite(records: list[dict[str, Any]]) -> dict[str, Any] | None:
             for name, stats in record.get("layers", {}).items()
             if any(_is_non_finite(v) for v in stats.values())
         ]
-        skipped = bool(record.get("step_skipped"))
-        bad_grads = [
-            name
-            for name, norm in ({} if skipped else record.get("grad_norms", {})).items()
-            if _is_non_finite(norm)
-        ]
-        if not skipped and _is_non_finite(record.get("grad_norm")) and not bad_grads:
-            bad_grads.append("<total>")
-        if not skipped and _is_non_finite(record.get("clip_grad_norm")):
-            bad_grads.append("<total before clipping>")
+        bad_grads = [] if record.get("step_skipped") else _non_finite_gradients(record)
         if bad_layers or bad_grads:
             return {
                 "kind": "non_finite",
@@ -5429,6 +5581,8 @@ def replica_kind_check(
     if value == "unavailable":
         out["check"] = "replica_coverage"
         out["reason"] = _replica_reason(coverage)
+    elif value == "not_configured" and alone:
+        out["note"] = NO_PEER_WORDS
     out["coverage"] = coverage
     if differ:
         out["signatures_differ"] = differ[-REPLICA_NOT_COMPARED_LISTED:]
@@ -5948,6 +6102,7 @@ def build_evidence(
             not_checked.append(grads_unread)
         rank_checks = kind_checks(
             input_counts(records), not_checked, starve_window=starve_window, update_window=update_window)
+    name_gradients_not_judged(rank_checks, not_checked)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
     # A status is expected where a server stores the run (a directory of its parts, or one
     # part) or when one was named. A local file or a list of records has no server to miss.
@@ -6033,6 +6188,10 @@ def build_evidence(
         **({"replica": replica} if replica is not None else {}),
         **({"run_end": read_end_marker(ended)} if (ended := _records_file(source, records_file)) else {}),
         **({"not_checked": not_checked} if not_checked else {}),
+        # Skipped updates by who reported them: the server's, else counted here (contract, section 1).
+        **({"skipped_updates": skipped} if (skipped := (
+            dict(report["skipped_updates"]) if from_rust is not None and isinstance(report.get("skipped_updates"), Mapping)
+            else skipped_updates(records))) else {}),
         **({"lines_left_out": left_out} if left_out else {}),
         # Rows of an attempt after a later attempt's first row (contract 1): kept, not progress.
         **({"superseded_rows": late} if (late := superseded_rows(every_attempt)) else {}),
@@ -6270,7 +6429,7 @@ def _describe_stream(incident: Mapping[str, Any]) -> str:
     tail += "]"
     if corroboration == "collective_hang":
         tail = " PyTorch's Flight Recorder shows a stuck collective." + tail
-    tail = _describe_stuck(incident) + tail
+    tail = _describe_stuck(incident) + _capture_stopped_text(incident) + tail
     started_again = [r.get("rank") for r in incident.get("ranks", ()) if r.get("attempt_without_steps")]
     if started_again:
         # The server saw a new attempt in the heartbeats (the job was started again) that has stored
@@ -6544,7 +6703,8 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         )
     if kind == "resume_incomplete":
         change = incident["changes"][0]
-        words = {"missing": "not in the checkpoint", "empty": "started empty", "empty_in_checkpoint": "empty in the checkpoint",
+        words = {"missing": "not in the checkpoint", "not_identified": "state could not be identified",
+                 "empty": "started empty", "empty_in_checkpoint": "empty in the checkpoint",
                  "step_reset": "step counter back at 1", "position": "last_epoch far from the step",
                  "initial_scale": "back at its initial value"}
         found = "; ".join(f"{f['component']} {words.get(f['finding'], f['finding'])}" for f in change["findings"])
@@ -6578,7 +6738,7 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
         )
     if kind == "loss_scale_trouble":
         why = (
-            f"{incident['consecutive_skips']} optimizer steps in a row skipped on Inf or NaN gradients"
+            f"{incident['consecutive_skips']} consecutive scaler-confirmed skips among observations judged by this rule"
             if incident["reason"] == "skips"
             else f"loss scale fell to {incident['grad_scale']:g}"
         )
@@ -7091,7 +7251,7 @@ def export_rerun(
                     training_paths["/training/grad_scale"] = "Loss scale"
                 if "step_skipped" in record:
                     rr.log("/training/step_skipped", rr.Scalars(float(bool(record["step_skipped"]))))
-                    training_paths["/training/step_skipped"] = "Step skipped by the loss scaler"
+                    training_paths["/training/step_skipped"] = "Update skipped (by the loss scaler or the caller)"
                 for name, val in (record.get("scalars") or {}).items():
                     value = _finite(val)
                     if value is not None:
