@@ -707,7 +707,11 @@ def _first(incidents: Iterable[Any]) -> dict[str, Any] | None:
         return value if isinstance(value, int) and not isinstance(value, bool) else float("inf")
 
     first = min(stepped, key=step)  # the earliest step; the evidence's own order breaks a tie
-    return {"kind": first.get("kind"), "step": first.get("step")}
+    # A router flagged since its first sample (DETECTOR_RULES_CONTRACT.md, part 3): `step` is when it
+    # began, and it became reportable later; the two are kept apart (lane AD5).
+    since = ({"since_start": True, "reportable_step": first.get("reportable_step")}
+             if first.get("since_start") is True else {})
+    return {"kind": first.get("kind"), "step": first.get("step"), **since}
 
 
 def _kinds_checked(kind_checks: Any) -> dict[str, int] | None:
@@ -1635,7 +1639,9 @@ def _cells(row: Mapping[str, Any]) -> list[str]:
         str(row["rank_count"]) if row.get("rank_count") else f"{len(row['ranks'])}+" if row.get("ranks") else "?",
         "?" if row.get("last_step") is None else str(row["last_step"]),
         _incidents_text(row),
-        f"{first['kind']} at step {first['step']}" if first else ("-" if row.get("incidents") is not None else "?"),
+        (f"{first['kind']} since step {first['step']}, reportable at step {first.get('reportable_step')}"
+         if first and first.get("since_start") else f"{first['kind']} at step {first['step']}" if first
+         else ("-" if row.get("incidents") is not None else "?")),
         f"{checked['checked']} of {checked['of']}" if checked else "?",
         str(row.get("started") or "?").replace("T", " ").rstrip("Z"),
         _end_text(row.get("end")),

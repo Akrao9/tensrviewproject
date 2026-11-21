@@ -580,6 +580,7 @@ def _brief(entry: Mapping[str, Any]) -> dict[str, Any]:
     incident = entry["incident"]
     out: dict[str, Any] = {
         "id": entry["id"], "kind": incident.get("kind"), "class": _class_of(incident), "step": incident.get("step"),
+        **_since_start(incident),
         "where": _where(incident),
     }
     group = entry.get("group")
@@ -673,6 +674,21 @@ def _refused(opened: Mapping[str, Any]) -> dict[str, Any] | None:
     return _runs.refused_batches(read_watchdog(Path(opened["source"]["path"]) / "watchdog.json"))
 
 
+def _capture_stopped(opened: Mapping[str, Any]) -> dict[int, dict[str, Any]]:
+    """Each rank's `capture_stopped` from the run folder's `watchdog.json`, copied as written, by
+    rank: empty for any other source and for a rank whose capture did not stop."""
+    if opened["source"].get("kind") != "store":
+        return {}
+    status = read_watchdog(Path(opened["source"]["path"]) / "watchdog.json")
+    found: dict[int, dict[str, Any]] = {}
+    for entry in (status or {}).get("ranks") or ():
+        if isinstance(entry, Mapping) and isinstance(entry.get("capture_stopped"), Mapping):
+            rank = entry.get("rank")
+            if isinstance(rank, int) and not isinstance(rank, bool):
+                found[rank] = copy.deepcopy(dict(entry["capture_stopped"]))
+    return found
+
+
 def _dropped_shown(dropped: Any) -> Any:
     """`dropped_rows` or `refused_batches` as an answer shows it: the total and the keys whole,
     and the ranks up to `PER_RANK_ROWS` (`ranks_omitted` counts the rest; `rank=` gives one
@@ -698,18 +714,104 @@ def _rank_dropped(dropped: Mapping[str, Any] | None, rank: int) -> dict[str, Any
 # `checkpoint_tensors`; the all-ranks view has `skipped_updates_by_rank` and
 # `checkpoint_tensors_by_rank` (STEP_AND_EVIDENCE_CONTRACT.md, section 1;
 # CHECKPOINT_TENSOR_CONTRACT.md, section 4).
-EVIDENCE_BLOCKS = ("skipped_updates", "skipped_updates_by_rank", "checkpoint_tensors", "checkpoint_tensors_by_rank")
+# The four measurements of DETECTOR_RULES_CONTRACT.md, part 6: numbers with no threshold, which no rule
+# reads; and the routing source of part 7 (`moe_source`, a router's `form` and `point`).
+MEASUREMENT_BLOCKS = ("gradient_trend", "attention_trends", "update_trends", "weight_jumps")
+EVIDENCE_BLOCKS = ("skipped_updates", "skipped_updates_by_rank", "checkpoint_tensors", "checkpoint_tensors_by_rank",
+                   *MEASUREMENT_BLOCKS)
 # Of a kind's entry in `kind_checks`, what `kinds` (names by value) leaves out: the parameters a
 # stall did not judge for want of their gradient, and the replica observations' coverage. And the
 # entry's `note` when it is the words for a rank with no peer (contract, section 2); a kind's other
 # notes are not carried.
-KIND_CHECK_KEYS = ("parameters_not_judged", "coverage")
+# Since the detector rules contract (wave AD): a router still in the state it started in
+# (`moe_imbalance.starting_state`, part 3), the ranks' lists of parameters not judged
+# (`stalled_weights.parameters_not_judged_by_rank`, part 5) and the modules an activation kind did
+# not judge (`modules_not_judged`, part 7).
+KIND_CHECK_KEYS = ("parameters_not_judged", "parameters_not_judged_by_rank", "modules_not_judged", "coverage",
+                   "starting_state")
 # The blocks an incident's own answer carries, by its kind: what bears on reading that incident.
 _SKIPS = ("skipped_updates", "skipped_updates_by_rank")
 INCIDENT_BLOCKS = {
     "resume_incomplete": ("checkpoint_tensors", "checkpoint_tensors_by_rank"),
-    **{kind: _SKIPS for kind in ("non_finite", "grad_spike", "update_spike", "stalled_weights", "loss_scale_trouble")},
+    **{kind: _SKIPS for kind in ("non_finite", "update_spike", "stalled_weights", "loss_scale_trouble")},
+    "grad_spike": (*_SKIPS, "gradient_trend"),
+    "update_spike": (*_SKIPS, "update_trends", "weight_jumps"),
+    **{kind: ("attention_trends",) for kind in ("attention_collapse", "attention_uniform", "attention_logit_growth")},
 }
+
+# What a reader shows for a score (DETECTOR_RULES_CONTRACT.md, part 1): the number to one decimal place,
+# or why there is none. A null score is never shown as 0, and the line is never left out.
+SCORE_WORDS = {
+    "short_history": "no score: fewer than 10 earlier values",
+    "no_dispersion": "no score: the earlier values had zero median absolute deviation",
+}
+# How a reader names a router's assignments by where they were taken (part 7): "dispatched" only
+# when the capture says `point` is "dispatched".
+ROUTING_WORDS = {
+    "dispatched": "the dispatched assignments",
+    "requested": "the assignments the router asked for",
+    "unknown": "the assignments the model gave; whether a capacity limit was applied before this point is not known",
+}
+
+
+def score_display(entry: Mapping[str, Any]) -> str | None:
+    """The words for an entry's `score` (`score 31.2`, or why there is none); None for an entry
+    that has neither `score` nor `score_note`, as one written before the score."""
+    if "score" not in entry and "score_note" not in entry:
+        return None
+    score = entry.get("score")
+    if isinstance(score, (int, float)) and not isinstance(score, bool) and math.isfinite(score):
+        return f"score {score:.1f}"
+    return SCORE_WORDS.get(str(entry.get("score_note")), "no score")
+
+
+def _scores(incident: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Each `ratio` of an incident that has a score beside it, with the words: the incident's own,
+    then those of its `parameters` and `modules`, in their order."""
+    found: list[dict[str, Any]] = []
+
+    def add(at: str, entry: Mapping[str, Any]) -> None:
+        said = score_display(entry)
+        if said is not None and "ratio" in entry:
+            found.append({"at": at, "ratio": entry.get("ratio"), "score": entry.get("score"),
+                          **({"score_note": entry["score_note"]} if "score_note" in entry else {}), "display": said})
+
+    add("incident", incident)
+    for key in ("parameters", "modules"):
+        listed = incident.get(key)
+        for item in listed if isinstance(listed, list) else ():
+            if isinstance(item, Mapping):
+                name = item.get("name", item.get("module"))
+                add(f"{key}: {name}" + (f" ({item['stat']})" if isinstance(item.get("stat"), str) else ""), item)
+    return found
+
+
+def _since_start(incident: Mapping[str, Any]) -> dict[str, Any]:
+    """For a `moe_imbalance` incident of a router flagged since its first sample (part 3): when it
+    began (`step`) and when it became reportable, kept apart, with the words. Empty otherwise."""
+    if incident.get("since_start") is not True:
+        return {}
+    return {"since_start": True, "reportable_step": incident.get("reportable_step"),
+            "when": f"collapsed since step {incident.get('step')}, reportable at step {incident.get('reportable_step')}"}
+
+
+def routing_words(source: Any) -> str | None:
+    """The words for one router's `moe_source` entry (`{"form", "point"}`); None without one."""
+    return ROUTING_WORDS.get(source.get("point")) if isinstance(source, Mapping) else None
+
+
+def _routing(sources: Any, routers: Iterable[Any] | None = None) -> dict[str, Any]:
+    """`moe_source` (of `routers`, when given) and `moe_source_words` beside it; empty when the
+    evidence or records have no `moe_source`, so a reader makes no claim."""
+    if not isinstance(sources, Mapping):
+        return {}
+    wanted = set(routers) if routers is not None else None
+    kept = {router: copy.deepcopy(dict(entry)) for router, entry in sources.items()
+            if isinstance(entry, Mapping) and (wanted is None or router in wanted)}
+    if not kept:
+        return {}
+    words = {router: said for router, entry in kept.items() if (said := routing_words(entry)) is not None}
+    return {"moe_source": kept, **({"moe_source_words": words} if words else {})}
 
 
 def _kind_check_keys(evidence: Mapping[str, Any], kinds: Iterable[Any] | None = None) -> dict[str, Any] | None:
@@ -810,6 +912,7 @@ def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, An
     # L29 (lane AD5): skipped updates, the checkpoint's tensors, and what `kinds` leaves out of a
     # kind's entry. With `rank` on a run folder, that rank's entries of the all-ranks lists.
     _carry_blocks(evidence, answer, ranks=[rank] if opened["shape"] == "all_ranks" and rank is not None else None)
+    answer.update(_routing(evidence.get("moe_source")))
     kind_keys = _kind_check_keys(evidence)
     if kind_keys is not None:
         answer["kind_checks"] = kind_keys
@@ -924,6 +1027,7 @@ def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
     answer: dict[str, Any] = {
         "source": opened["source"], "id": entry["id"], "kind": incident.get("kind"), "class": found,
         "class_meaning": CLASS_MEANINGS.get(found, CLASS_MEANINGS["unclassified"]), "step": incident.get("step"),
+        **_since_start(incident),
         "where": _where(incident),
     }
     group = entry.get("group")
@@ -958,6 +1062,13 @@ def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
     kind_keys = _kind_check_keys(opened["evidence"], [incident.get("kind")])
     if kind_keys is not None:
         answer["kind_checks"] = kind_keys
+    # The score beside each ratio, in the words a reader shows (DETECTOR_RULES_CONTRACT.md, part 1),
+    # and how the router's assignments were taken (part 7).
+    scores = _scores(incident)
+    if scores:
+        answer["scores"] = scores
+    if isinstance(incident.get("router"), str):
+        answer.update(_routing(opened["evidence"].get("moe_source"), [incident["router"]]))
     if incident.get("kind") == "moe_imbalance":
         sample = _sample_context(opened["evidence"], incident)
         if sample is not None:
@@ -1321,6 +1432,11 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
         }
         if kind == "router":
             answer["experts_are_numbered_from"] = 1
+            # How the routing reached the capture (part 7): said once, on the first record that knows.
+            said = next((r["moe_source"] for r in (records if held is not None else ())
+                         if isinstance(r.get("moe_source"), Mapping) and name in r["moe_source"]),
+                        (evidence or {}).get("moe_source"))
+            answer.update(_routing(said, [name]))
             flagged = [step for step, point in inside if point.get("overloaded") or point.get("dead")]
             if flagged:
                 answer["first_flagged_step"] = flagged[0]
@@ -1416,6 +1532,14 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
     kind_keys = _kind_check_keys(evidence)
     if kind_keys is not None:
         answer["kind_checks"] = kind_keys
+    # A rank whose capture stopped, as the server's status says it (DETECTOR_RULES_CONTRACT.md, part 7):
+    # its `capture_stopped` as written, so `step` 0, `step` null and no `step` stay three things.
+    stopped = _capture_stopped(opened)
+    if rank is not None and rank in stopped:
+        answer["rank"] = {**answer["rank"], "capture_stopped": stopped[rank]}
+    for item in answer.get("per_rank") or ():
+        if item.get("rank") in stopped:
+            item["capture_stopped"] = stopped[item["rank"]]
     summary = _summary(evidence)
     if summary:
         answer["summary"] = summary
@@ -1526,6 +1650,39 @@ _KIND_KEYS_WORDS = (
     " one rank and had no other to compare it with, which is why it reads not_configured. With no `kind_checks`,"
     " no kind's entry has any of these."
 )
+# The keys the detector rules contract adds (DETECTOR_RULES_CONTRACT.md, wave AD), said once (lane AD5).
+_MEASUREMENTS_WORDS = (
+    " `gradient_trend`, `attention_trends`, `update_trends` and `weight_jumps`, each only where the records hold"
+    " what it reads, are descriptions of the run: numbers with no threshold, which no rule reads and which change"
+    " no state. They are not findings or warnings, and a large `growth`, a low `update_trends` ratio or a large"
+    " `weight_jumps` ratio is not by itself a fault (a healthy run can rise more than a faulty one). With no key the"
+    " records do not hold what it reads (`gradient_trend` needs six points)."
+)
+_RULES_WORDS = (
+    " A `moe_imbalance` incident with `since_start` true began at `step` and became reportable only at"
+    " `reportable_step` (`when` says \"collapsed since step S, reportable at step R\"): it was not found at `step`."
+    " `kind_checks.moe_imbalance.starting_state` lists routers still flagged on every sample since step 0 and"
+    " not yet reportable (`{\"router\", \"samples\"}`); the kind then has not enough history for them."
+    " `kind_checks.<kind>.modules_not_judged` names modules an activation kind did not judge because the capture"
+    " could not read them (the `layers` entry of not_checked, with `coverage` `partial`; with `coverage` `none` the"
+    " kinds are unavailable). `stalled_weights.parameters_not_judged_by_rank` gives each rank's list when ranks"
+    " differ. `moe_source`, only where the capture said how it read the routing, gives each router's `form`"
+    " (scores, indices or map: the representation only) and `point`; `moe_source_words` says what the assignments"
+    " are: \"the dispatched assignments\" only for `point` dispatched, \"the assignments the router asked for\""
+    " for requested, and for unknown that whether a capacity limit came first is not known. With no `moe_source`,"
+    " nothing is said of where the routing was taken."
+)
+_SCORES_WORDS = (
+    " `scores` lists each `ratio` of the incident that has a `score` beside it (the incident's own, then each"
+    " parameter's or module's, named under `at`), with `display`: \"score 31.2\", \"no score: fewer than 10 earlier"
+    " values\" or \"no score: the earlier values had zero median absolute deviation\". A null score is no score,"
+    " never 0. The score is how far the value is from the median of the earlier values, in units of their spread: a"
+    " description, from which nothing is judged. An incident written before the score has no `scores`. A"
+    " `moe_imbalance` incident with `since_start` has `when` (\"collapsed since step S, reportable at step R\");"
+    " an `update_spike` incident may carry `lr` and `lr_before`, the learning rates at the step and at the step it"
+    " was compared with; a router's incident carries its `moe_source` and `moe_source_words` where the capture said."
+)
+
 _INCIDENT_BLOCKS_WORDS = (
     " By its kind, and only where the evidence has them, it also carries what bears on it, as list_incidents"
     " describes each: `skipped_updates` for non_finite, grad_spike, update_spike, stalled_weights and"
@@ -1569,7 +1726,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " known to have finished (still running, killed or never closed look the same)."
             " Where one rank's evidence has them, `head_trends` gives the probe's language-model head numbers over"
             " the run: values with no threshold, never an incident (get_series with kind head gives each probe's). "
-            + _SKIPS_WORDS + _TENSORS_WORDS + _BY_RANK_WORDS + _KIND_KEYS_WORDS
+            + _SKIPS_WORDS + _TENSORS_WORDS + _BY_RANK_WORDS + _KIND_KEYS_WORDS + _MEASUREMENTS_WORDS + _RULES_WORDS
         ),
         "inputSchema": {
             "type": "object",
@@ -1590,7 +1747,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " detector recorded, what its class means, the ranks that show it, for an MoE incident the sample it"
             " points at (largest expert shares, and the sample before; from compact evidence that left the steps"
             " between out, the last earlier one it keeps is `previous_kept_sample` instead), and the get_series"
-            " calls that show the data behind it, with the rank to read." + _INCIDENT_BLOCKS_WORDS
+            " calls that show the data behind it, with the rank to read." + _INCIDENT_BLOCKS_WORDS + _SCORES_WORDS
+            + " By its kind it also carries the measurement that bears on it (`gradient_trend` for grad_spike,"
+            " `update_trends` and `weight_jumps` for update_spike, `attention_trends` for the attention kinds): a"
+            " description, never a finding."
         ),
         "inputSchema": {
             "type": "object",
@@ -1620,7 +1780,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " not lost. Narrow `start` and `end` to see each step. Numbers have six significant digits; a NaN or"
             ' Inf is the string "nan", "inf" or "-inf". A router\'s series from compact evidence that left steps'
             " out says under `compact` which steps it covers. A rank's records that hold more than one run ID are"
-            " refused with the IDs, as list_incidents refuses them: a series is of one run."
+            " refused with the IDs, as list_incidents refuses them: a series is of one run. A router's series carries"
+            " `moe_source` and `moe_source_words` where the capture said how it read the routing: \"the dispatched"
+            " assignments\" only when `point` is dispatched."
         ),
         "inputSchema": {
             "type": "object",
@@ -1676,6 +1838,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " Each judged rank's skipped updates and checkpoint tensors, as list_incidents describes them for one rank:"
             + _BY_RANK_WORDS + " " + _SKIPS_WORDS.replace("`skipped_updates`", "A rank's `skipped_updates`", 1)
             + _TENSORS_WORDS.replace(" `checkpoint_tensors`", " A rank's `checkpoint_tensors`", 1) + _KIND_KEYS_WORDS
+            + " `per_rank[].capture_stopped` (and the `rank` entry's), only for a rank whose capture stopped, is the"
+            " server's status as written: `reason`, and `step`, the last step the session committed before it"
+            " stopped. `step` 0 is step 0; `step` null means it committed none; no `step` key means the sender is older"
+            " than the key and the step is not known."
         ),
         "inputSchema": {
             "type": "object",

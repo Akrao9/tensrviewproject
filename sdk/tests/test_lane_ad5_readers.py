@@ -428,3 +428,176 @@ def test_a_series_of_a_file_with_two_run_ids_is_refused_as_its_incidents_are(tmp
     steps = series["steps"]
     assert steps == sorted(set(steps)) and len(steps) == 51
 
+
+
+# --- 6. The keys of the detector rules contract (DETECTOR_RULES_CONTRACT.md) ---------------------
+#
+# The engine lanes build these keys after this lane, so each test gives the readers an evidence
+# document that already holds them, taken from the cases' `expected` (`fixtures/rules/cases.json`,
+# read here and not changed).
+
+RULES = json.loads((FIXTURES / "rules" / "cases.json").read_text())["cases"]
+
+
+def expected(name: str) -> Any:
+    return json.loads(json.dumps(RULES[name]["expected"]))  # a copy
+
+
+def document(run: str = "r1", **keys: Any) -> dict[str, Any]:
+    """One rank's evidence as `build_evidence` writes it today, with the contract's keys put in."""
+    found = ev.build_evidence(plain_rows(run, range(20)))
+    found.update(keys)
+    return found
+
+
+def served(tmp_path: Path, doc: dict[str, Any], name: str = "r1") -> Path:
+    return ev.write_evidence(doc, tmp_path / f"{name}.rank0.evidence.json")
+
+
+def test_a_score_is_shown_in_the_cases_words_and_a_null_score_is_never_0(tmp_path):
+    # The arithmetic cases: the words a reader shows for each.
+    for name, body in RULES.items():
+        if name.startswith("score_") and "display" in body["expected"]:
+            assert mcp_server.score_display(body["expected"]) == body["expected"]["display"], name
+    by_total = expected("score_on_grad_spike_by_the_total")["incident"]
+    short = {**by_total, "step": 61, "score": None, "score_note": "short_history",
+             "parameters": [{**by_total["parameters"][0], "score": None, "score_note": "no_dispersion"}]}
+    activation = expected("score_on_activation_spike")["incident"]
+    path = served(tmp_path, document(incidents=[by_total, short, activation]))
+    found = call(path, "get_incident", {"id": "grad_spike@60"})
+    assert found["incident"] == by_total  # the incident whole, `score` beside each `ratio`
+    assert found["scores"] == [
+        {"at": "incident", "ratio": 9.8, "score": by_total["score"], "display": "score 593.6"},
+        {"at": "parameters: w", "ratio": by_total["parameters"][0]["ratio"], "score": by_total["parameters"][0]["score"],
+         "display": "score 981.8"}]
+    nulls = call(path, "get_incident", {"id": "grad_spike@61"})["scores"]
+    assert [s["display"] for s in nulls] == ["no score: fewer than 10 earlier values",
+                                             "no score: the earlier values had zero median absolute deviation"]
+    assert all(s["score"] is None for s in nulls)
+    assert call(path, "get_incident", {"id": "activation_spike@80"})["scores"] == [
+        {"at": "modules: blk (abs_max)", "ratio": 10.2, "score": activation["modules"][0]["score"], "display": "score 620.5"}]
+    # An incident written before the score: no `scores`.
+    before = {**{k: v for k, v in by_total.items() if k != "score"},
+              "parameters": [{k: v for k, v in by_total["parameters"][0].items() if k != "score"}]}
+    old = served(tmp_path, document(incidents=[before]), "old")
+    assert "scores" not in call(old, "get_incident", {"id": "grad_spike@60"})
+
+
+def test_a_router_collapsed_since_step_0_is_said_to_be_reportable_later_in_every_reader(tmp_path):
+    collapsed = expected("start_ten_samples_is_reported")["incident"]
+    starting = expected("start_and_the_capture_ends")["starting_state"]
+    doc = document(incidents=[collapsed])
+    doc["kind_checks"]["moe_imbalance"] = {**doc["kind_checks"]["moe_imbalance"], "starting_state": starting}
+    path = served(tmp_path, doc)
+    listed = call(path, "list_incidents")
+    [brief] = listed["incidents"]
+    assert (brief["step"], brief["since_start"], brief["reportable_step"]) == (0, True, 9)
+    assert brief["when"] == "collapsed since step 0, reportable at step 9"
+    assert listed["kind_checks"]["moe_imbalance"] == {"starting_state": [{"router": "r", "samples": 5}]}
+    one = call(path, "get_incident", {"id": brief["id"]})
+    assert one["when"] == "collapsed since step 0, reportable at step 9" and one["incident"] == collapsed
+    # `runs`: the first incident's cell, and `compare`'s line.
+    capture = write_capture(tmp_path / "local" / "m1.rank0.jsonl", plain_rows("m1", range(20)))
+    newer(evidence_beside(capture, {**document("m1"), "incidents": [collapsed]}), capture)
+    row = only_row(tmp_path / "local")
+    assert row["first_incident"] == {"kind": "moe_imbalance", "step": 0, "since_start": True, "reportable_step": 9}
+    assert "moe_imbalance since step 0, reportable at step 9" in runs_module.listing_text([row], tmp_path)
+    other = served(tmp_path, document("r2"), "r2")
+    result = compare_module.compare_runs(str(other), str(path))
+    [entry] = [e for e in result["incidents"]["entries"] if e["kind"] == "moe_imbalance"]
+    assert entry["first_step"] == {"B": 0} and entry["reportable_step"] == {"B": 9}
+    assert "first at B step 0 (collapsed since step 0, reportable at step 9)" in compare_module.summary_text(result)
+    # A router judged as today has none of it.
+    later = {**collapsed, "step": 40}
+    for key in ("since_start", "reportable_step"):
+        later.pop(key)
+    assert not {"since_start", "when"} & set(call(served(tmp_path, document(incidents=[later]), "r3"),
+                                                   "list_incidents")["incidents"][0])
+
+
+def test_the_learning_rate_on_update_spike_and_the_measurements_are_carried_as_descriptions(tmp_path):
+    spike = expected("update_spike_carries_the_learning_rate")["incident"]
+    blocks = {key: expected(name)[key] for key, name in (
+        ("gradient_trend", "gradient_trend_a_steady_rise"), ("attention_trends", "attention_trends_a_slow_rise"),
+        ("update_trends", "update_trends_one_parameter_collapses"), ("weight_jumps", "weight_jumps_one_tensor_jumps"))}
+    grad = expected("score_on_grad_spike_by_the_total")["incident"]
+    path = served(tmp_path, document(incidents=[spike, grad], **blocks))
+    listed = call(path, "list_incidents")
+    for key, block in blocks.items():
+        assert listed[key] == block, key
+    on_update = call(path, "get_incident", {"id": f"update_spike@{spike['step']}"})
+    assert (on_update["incident"]["lr"], on_update["incident"]["lr_before"]) == ([0.003, 0.0003], [0.001, 0.0001])
+    assert on_update["update_trends"] == blocks["update_trends"] and on_update["weight_jumps"] == blocks["weight_jumps"]
+    assert "gradient_trend" not in on_update
+    assert call(path, "get_incident", {"id": "grad_spike@60"})["gradient_trend"] == blocks["gradient_trend"]
+    # A case whose block is absent (`gradient_trend` under six points): no key.
+    assert expected("gradient_trend_under_six_points")["gradient_trend"] is None
+    assert not set(blocks) & set(call(served(tmp_path, document(), "bare"), "list_incidents"))
+    # The compact file keeps every one of these keys unchanged (it keeps every key but `samples`).
+    whole = document(incidents=[spike, grad], **blocks)
+    kept = compact.compact_evidence(whole)
+    assert {k: kept[k] for k in blocks} == blocks and kept["incidents"] == [spike, grad]
+    # Described, never worded as a finding.
+    text = {tool["name"]: tool["description"] for tool in mcp_server.TOOLS}["list_incidents"]
+    assert "are descriptions of the run: numbers with no threshold" in text
+    assert "They are not findings or warnings" in text
+
+
+def test_the_routing_source_is_said_in_the_cases_words(tmp_path):
+    for name in ("moe_source_scores_are_what_the_router_asked_for", "moe_source_indices_at_an_unknown_point",
+                 "moe_source_a_map_after_dispatch", "moe_source_absent"):
+        want = expected(name)
+        folder = tmp_path / name
+        # From the records, as `get_series` reads a router's series.
+        capture = write_capture(folder / "m.rank0.jsonl", [{"schema_version": 1, "run_id": "m", "rank": 0, "attempt": 1,
+                                                           "step": r["step"], **{k: v for k, v in r.items() if k != "step"}}
+                                                          for r in RULES[name]["records"]])
+        series = call(capture, "get_series", {"name": "r", "kind": "router"})
+        # From an evidence document holding the key, as the engines will write it.
+        doc = document(**({"moe_source": want["moe_source"]} if want["moe_source"] is not None else {}),
+                       incidents=[expected("start_ten_samples_is_reported")["incident"]])
+        path = served(folder, doc)
+        listed, incident = call(path, "list_incidents"), call(path, "get_incident", {"id": "moe_imbalance@0"})
+        for answer in (series, listed, incident):
+            if want["moe_source"] is None:
+                assert "moe_source" not in answer and "moe_source_words" not in answer, name
+            else:
+                assert answer["moe_source"] == want["moe_source"] and answer["moe_source_words"] == want["words"], name
+        said = json.dumps([series, listed, incident])
+        assert ("dispatched assignments" in said) == (name == "moe_source_a_map_after_dispatch"), name
+
+
+def test_layers_not_read_and_the_parameters_not_judged_by_rank(tmp_path):
+    some = expected("layers_not_read_some_modules")
+    doc = document(not_checked=some["not_checked"])
+    for kind, entry in some["kind_checks"].items():
+        doc["kind_checks"][kind] = {**doc["kind_checks"][kind], **entry}
+    listed = call(served(tmp_path, doc), "list_incidents")
+    assert some["not_checked"][0] in listed["not_checked"] and listed["not_checked"][0]["coverage"] == "partial"
+    assert listed["kind_checks"] == {kind: {"modules_not_judged": ["blk1"]} for kind in some["kind_checks"]}
+    # The all-ranks view's entry, from an all-ranks evidence file holding the contract's key.
+    stated = ev.kind_checks({**dict.fromkeys(ev.INPUT_NEEDS, 0), "steps": 10}, [])
+    view = ev.all_ranks_evidence(store(tmp_path / "st", "run", {0: {"kind_checks": stated}, 1: {"kind_checks": stated}}))
+    by_rank = expected("the_all_ranks_view_names_them_by_rank_when_ranks_differ")["kind_checks"]["stalled_weights"]
+    view["kind_checks"]["stalled_weights"] = {**view["kind_checks"]["stalled_weights"], **by_rank}
+    path = ev.write_evidence(view, tmp_path / "run.all-ranks.evidence.json")
+    assert call(path, "get_all_ranks_status")["kind_checks"] == {"stalled_weights": by_rank}
+
+
+def test_where_capture_stopped_step_0_null_and_no_step_stay_three_things(tmp_path):
+    stopped = {rank: expected(name)["status"]["capture_stopped"] for rank, name in enumerate(
+        ("capture_stopped_at_step_0", "capture_stopped_before_any_step", "capture_stopped_from_an_older_sender"))}
+    folder = store(tmp_path, "run", {0: {}, 1: {}, 2: {}, 3: {}})
+    status = json.loads((folder / "watchdog.json").read_text())
+    for entry in status["ranks"]:
+        if entry["rank"] in stopped:
+            entry["capture_stopped"] = stopped[entry["rank"]]
+    (folder / "watchdog.json").write_text(json.dumps(status))
+    answer = call(folder, "get_all_ranks_status")
+    shown = {item["rank"]: item.get("capture_stopped", "absent") for item in answer["per_rank"]}
+    assert shown == {0: {"reason": "sink_error", "step": 0}, 1: {"reason": "sink_error", "step": None},
+                     2: {"reason": "sink_error"}, 3: "absent"}
+    assert call(folder, "get_all_ranks_status", {"rank": 1})["rank"]["capture_stopped"] == {"reason": "sink_error", "step": None}
+    assert "capture_stopped" not in call(folder, "get_all_ranks_status", {"rank": 3})["rank"]
+    text = {tool["name"]: tool["description"] for tool in mcp_server.TOOLS}["get_all_ranks_status"]
+    assert "`step` 0 is step 0; `step` null means it committed none; no `step` key" in text
