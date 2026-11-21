@@ -248,3 +248,85 @@ def test_item2_the_store_path_of_compare_through_the_combined_view(tmp_path):
     # fail-before: no `watchdog` block
     assert opened["evidence"]["watchdog"]["dropped_rows"]["rows"] == 7
     assert opened["evidence"]["watchdog"]["refused_batches"]["batches"] == 2
+
+
+# --- Item 3: which thresholds a reader used ---------------------------------------------------------
+
+LISTED = {"overload_threshold": 0.5, "drift_tolerance": 0.001, "starve_window": 20, "starve_ratio": 0.5,
+          "top_k": None, "update_window": 30}
+
+
+def _report_look(tmp_path: Path, thresholds: dict) -> tuple[Path, dict]:
+    run = _run(tmp_path)
+    _part(run, 0, 1, 0, 9)
+    report = _report(0, 1, 9)
+    report["thresholds"] = {**thresholds, "spike_sustain": ev.SPIKE_SUSTAIN}
+    _write_report(run, report)
+    look = ev.read_server_report(run / "rank=0")
+    assert look["state"] == "current"
+    return run, look
+
+
+def test_item3_a_report_reader_gives_one_value_for_each_threshold_and_says_which_it_assumed(tmp_path):
+    # A report whose starve_window is not a window the detectors take, and that lists no top_k
+    # (a server older than the key): the reader cannot know what was applied for either.
+    odd = {k: v for k, v in LISTED.items() if k != "top_k"} | {"starve_window": "20"}
+    run, look = _report_look(tmp_path / "odd", odd)
+    evidence = ev._report_evidence(run / "rank=0", look, None)
+    # fail-before: the top said "20", `detection.thresholds` 50
+    assert evidence["starve_window"] == evidence["detection"]["thresholds"]["starve_window"] == ev.STARVE_WINDOW
+    assert evidence["overload_threshold"] == evidence["detection"]["thresholds"]["overload_threshold"] == 0.5
+    assert evidence["detection"]["thresholds_assumed"] == ["starve_window", "top_k"]
+    assert ev.thresholds_assumed(look["report"]) == ["starve_window", "top_k"]
+    # A report of this version's server lists all six, `top_k` null included: nothing is assumed.
+    run, look = _report_look(tmp_path / "whole", LISTED)
+    whole = ev._report_evidence(run / "rank=0", look, None)
+    assert "thresholds_assumed" not in whole["detection"] and whole["detection"]["thresholds"] == LISTED
+    assert ev.thresholds_assumed(look["report"]) == []
+
+
+def test_item3_the_all_ranks_view_says_which_thresholds_a_rank_s_report_did_not_list(tmp_path):
+    run = _run(tmp_path)
+    for rank, thresholds in ((0, LISTED), (1, {"overload_threshold": 0.5})):
+        _part(run, rank, 1, 0, 9)
+        _write_report(run, _report(rank, 1, 9) | {"thresholds": {**thresholds, "spike_sustain": ev.SPIKE_SUSTAIN}})
+    evidence = ev.all_ranks_evidence(run)
+    entries = {e["rank"]: e["detection"] for e in evidence["ranks"]}
+    assert "thresholds_assumed" not in entries[0]
+    # fail-before: KeyError
+    assert entries[1]["thresholds_assumed"] == ["drift_tolerance", "starve_window", "starve_ratio", "top_k",
+                                                "update_window"]
+
+
+def test_item3_the_combined_view_says_which_ranks_were_judged_with_which_thresholds():
+    by_server = {"rank": 0, "incidents": [], "last_step": 9,
+                 "detection": {"source": "server", "state": "current", "report_attempt": 1, "thresholds": LISTED}}
+    here = {"rank": 1, "incidents": [], "last_step": 9}  # `build_evidence` at the defaults lists none
+    combined = ev.combine_rank_evidence({0: by_server, 1: here})
+    # fail-before: neither key, so the two ranks read as judged under one set (none said)
+    assert combined["thresholds"] == LISTED
+    assert combined["thresholds_by_rank"] == [
+        {"ranks": [0], "rank_ranges": "0", "thresholds": LISTED},
+        {"ranks": [1], "rank_ranges": "1", "thresholds": ev.THRESHOLD_DEFAULTS},
+    ]
+    line = ev.thresholds_line(combined)
+    assert line.startswith("Thresholds that are not the defaults: the ranks were judged with on rank 0: ")
+    assert "starve_window 20 (default: 50)" in line
+    # Every rank under one set off the defaults: `thresholds` alone, as `build_evidence` would list it.
+    one = ev.combine_rank_evidence({0: by_server, 1: {**here, "thresholds": LISTED}})
+    assert one["thresholds"] == LISTED and "thresholds_by_rank" not in one
+    assert "the ranks were judged with" in ev.thresholds_line(one)
+    # At the defaults throughout, the combined view is what it was: neither key, and no line.
+    quiet = ev.combine_rank_evidence({0: here, 1: {**here, "rank": 1}})
+    assert "thresholds" not in quiet and "thresholds_by_rank" not in quiet and ev.thresholds_line(quiet) is None
+
+
+# --- Item 7: `run_of`, the public name of `_run_of` ------------------------------------------------
+
+def test_item7_run_of_is_public_and_the_private_name_still_works():
+    # fail-before: AttributeError, no `run_of`
+    assert ev.run_of({"run_id": "a"}) == "a" and ev.run_of({}) == "" and ev.run_of({"run_id": 7}) == ""
+    assert ev._run_of is ev.run_of
+    from tensorquill.evidence import _run_of  # what divergence.py imports until the merge
+
+    assert _run_of({"run_id": "b"}) == "b"

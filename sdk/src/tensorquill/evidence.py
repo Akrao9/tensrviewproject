@@ -2018,12 +2018,17 @@ def check_one_run(records: Iterable[Mapping[str, Any]]) -> None:
         )
 
 
-def _run_of(record: Mapping[str, Any]) -> str:
+def run_of(record: Mapping[str, Any]) -> str:
     """A record's run ID, with "" for a record that names none (written before `run_id` existed,
     or not a string): as the Rust detectors read it (`server_detect.records_stream`), so rows
     with no run ID make one stream with each other and none with a named run."""
     run = record.get("run_id")
     return run if isinstance(run, str) else ""
+
+
+# The private name `run_of` had until lane AD1, kept for the modules that import it (`divergence.py`,
+# switched to `run_of` when wave AD is merged).
+_run_of = run_of
 
 
 _PART_NAME = re.compile(r"part-(-?\d+)-(-?\d+)\.parquet$")
@@ -2904,26 +2909,68 @@ def _count(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
-def applied_thresholds(report: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The six thresholds a server's report says it applied (its `thresholds`), in the shape
-    `build_evidence` takes them. One the report does not list reads as the default: a server
-    from before `--thresholds` applied the defaults and listed no `top_k`."""
+def _read_thresholds(report: Mapping[str, Any] | None) -> tuple[dict[str, Any], list[str]]:
+    """`applied_thresholds`, and the names of the six that the report does not list in a form
+    read here, each of which is given as this version's default (`thresholds_assumed`)."""
     listed = (report or {}).get("thresholds")
     listed = listed if isinstance(listed, Mapping) else {}
     out = dict(THRESHOLD_DEFAULTS)
+    read: set[str] = set()
     for name in ("overload_threshold", "drift_tolerance", "starve_ratio"):
         value = listed.get(name)
         if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
             out[name] = value
+            read.add(name)
     for name in ("starve_window", "update_window"):
         if _count(listed.get(name)):
             out[name] = listed[name]
+            read.add(name)
     top_k = listed.get("top_k")
     if _count(top_k):
         out["top_k"] = top_k
     elif isinstance(top_k, Mapping) and top_k and all(_count(k) for k in top_k.values()):
         out["top_k"] = {str(name): k for name, k in top_k.items()}
-    return out
+    if "top_k" in listed and (top_k is None or out["top_k"] is not None):
+        read.add("top_k")  # null is listed: "what the run recorded"
+    return out, [name for name in THRESHOLD_NAMES if name not in read]
+
+
+def applied_thresholds(report: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The six thresholds a server's report says it applied (its `thresholds`), in the shape
+    `build_evidence` takes them. One the report does not list reads as the default: a server
+    from before `--thresholds` applied the defaults and listed no `top_k`. Which ones were read
+    so is `thresholds_assumed`."""
+    return _read_thresholds(report)[0]
+
+
+def thresholds_assumed(report: Mapping[str, Any] | None) -> list[str]:
+    """The names of the six thresholds that a server's report does not list in a form this
+    version reads (not there, as from a server older than the threshold, or of another type),
+    and that `applied_thresholds` therefore gives as this version's defaults, which that server
+    may not have applied. Empty for a report of this version's server, which lists all six."""
+    return _read_thresholds(report)[1]
+
+
+def _judged_thresholds(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """The six thresholds one rank's evidence was judged with: those it lists as applied
+    (`detection.thresholds`, a server's or this process's), else `build_evidence`'s `thresholds`,
+    which it lists only when one is not the default, else the six defaults."""
+    detection = evidence.get("detection")
+    if isinstance(detection, Mapping) and isinstance(detection.get("thresholds"), Mapping):
+        return {**THRESHOLD_DEFAULTS, **detection["thresholds"]}
+    if isinstance(evidence.get("thresholds"), Mapping):
+        return {**THRESHOLD_DEFAULTS, **evidence["thresholds"]}
+    return dict(THRESHOLD_DEFAULTS)
+
+
+def _thresholds_by_rank(sets: Mapping[int, Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Each set of thresholds the ranks were judged with, with its ranks, in the order of the
+    first rank judged with it: the all-ranks view's `thresholds_by_rank` entries."""
+    judged_by: dict[str, dict[str, Any]] = {}
+    for number, values in sets.items():
+        judged_by.setdefault(json.dumps(values, sort_keys=True), {"ranks": [], "thresholds": dict(values)})["ranks"].append(number)
+    return [{"ranks": found["ranks"], "rank_ranges": _rank_ranges(found["ranks"]), "thresholds": found["thresholds"]}
+            for found in judged_by.values()]
 
 
 def _same_threshold(asked: Any, applied: Any) -> bool:
@@ -2963,9 +3010,12 @@ def thresholds_line(evidence: Mapping[str, Any]) -> str | None:
     differ. Evidence with no `detection` (a local `.jsonl` file, or a store's parts read without
     `--watch`) is `build_evidence`'s: it lists the six as `thresholds` only when one is not the
     default, so at the defaults it lists none and gives None, as evidence from before the key does.
+    The ranks put together by `combine_rank_evidence` (`compare`'s, which has `judged_ranks` and no
+    `view`) are read as the all-ranks view is, set by set: some may be judged by their server's
+    report and some here (lane AD1).
     """
-    if evidence.get("view") == ALL_RANKS_VIEW:
-        who = "the server applied"
+    if evidence.get("view") == ALL_RANKS_VIEW or ("judged_ranks" in evidence and "detection" not in evidence):
+        who = "the server applied" if evidence.get("view") == ALL_RANKS_VIEW else "the ranks were judged with"
         sets = evidence.get("thresholds_by_rank")
         if isinstance(sets, list) and len(sets) > 1:
             named = []
@@ -3160,21 +3210,25 @@ def _report_evidence(
     )
     incidents.extend(i for i in record_incidents if i.get("kind") == "replica_drift")
     with_classes(incidents)
-    applied = report.get("thresholds") or {}
+    # The same values at the top as in `detection.thresholds` (lane AD1: the top took the report's
+    # values as they were, and `detection` only those it can read, so one that is not a threshold
+    # the detectors take was on top and the default below).
+    applied, assumed = _read_thresholds(report)
     own_rank = report.get("rank") if isinstance(report.get("rank"), int) else _own_rank(folder)
     evidence = {
         "schema_version": 1,
         "run_id": report.get("run_id"),
         "rank": own_rank,
         "run": _manifest.run_block(report.get("run_id"), _manifest.find_manifest(folder, report.get("run_id"))),
-        "overload_threshold": applied.get("overload_threshold", OVERLOAD_THRESHOLD),
-        "starve_window": applied.get("starve_window", STARVE_WINDOW),
-        "starve_ratio": applied.get("starve_ratio", STARVE_RATIO),
+        "overload_threshold": applied["overload_threshold"],
+        "starve_window": applied["starve_window"],
+        "starve_ratio": applied["starve_ratio"],
         "incidents": incidents,
         "samples": [],
-        # `thresholds`: the six the server judged by, which a reader takes unless it gave its own.
+        # `thresholds`: the six the server judged by, which a reader takes unless it gave its own;
+        # `thresholds_assumed`: those of them the report does not list, given as the defaults.
         "detection": {**_detection(look, "server", None), "moe_flagged": report.get("moe_flagged"),
-                      "thresholds": applied_thresholds(report)},
+                      "thresholds": applied, **({"thresholds_assumed": assumed} if assumed else {})},
         **({"not_checked": not_checked} if not_checked else {}),
         # The server's count of skipped updates by who reported them, passed on unchanged.
         **({"skipped_updates": dict(found)} if isinstance(found := report.get("skipped_updates"), Mapping) else {}),
@@ -4377,12 +4431,21 @@ def combine_rank_evidence(
     with_classes(run_incidents)
     not_checked = [dict(item) for n in judged for item in per_rank[n].get("not_checked") or () if isinstance(item, Mapping)]
     steps = [s for n in judged if isinstance(s := per_rank[n].get("last_step"), int) and not isinstance(s, bool)]
+    # What the judged ranks were judged with (lane AD1): some by their server's report, some by the
+    # detectors here, each with its own six. As the all-ranks view lists them, and only when one of
+    # them is not the default or the ranks differ, as `build_evidence` lists its own: a run judged
+    # at the defaults throughout is what it was.
+    by_thresholds = _thresholds_by_rank({n: _judged_thresholds(per_rank[n]) for n in judged})
+    differing = len(by_thresholds) > 1
     combined: dict[str, Any] = {
         "rank_count": len(set(judged) | set(unknown)),
         "judged_ranks": judged,
         "unknown_ranks": sorted(unknown),
         "ranks_with_incidents": sorted({n for group in groups for n in group["ranks"]}),
         "last_step": {"min": min(steps), "max": max(steps)} if steps else None,
+        **({"thresholds": by_thresholds[0]["thresholds"]}
+           if by_thresholds and (differing or _off_default(by_thresholds[0]["thresholds"])) else {}),
+        **({"thresholds_by_rank": by_thresholds} if differing else {}),
         "incident_groups": groups,
         "run_incidents": run_incidents,
         **({"stopped_stacks": stacks} if (stacks := group_stopped_stacks(status)) else {}),
@@ -4643,6 +4706,9 @@ def _all_ranks_evidence(
         if number in by_rank:
             if report.get("moe_flagged") is not None:
                 detection["moe_flagged"] = report["moe_flagged"]
+            if assumed := thresholds_assumed(report):
+                # Not listed by the rank's server: given in `thresholds` as this version's defaults.
+                detection["thresholds_assumed"] = assumed
             entry["incidents"] = by_rank[number]
             unchecked = [dict(i) for i in report.get("not_checked") or ()
                          if isinstance(i, dict) and i.get("check") not in ("flight_recorder", "traincheck")]
@@ -4692,14 +4758,7 @@ def _all_ranks_evidence(
     run_ids = [str(r["run_id"]) for n in judged if (r := looks[n]["report"]).get("run_id") is not None]
     # The thresholds each judged rank's server applied. One server judges a run, so they agree,
     # unless it was restarted with others and some ranks have not been rebuilt since.
-    judged_by: dict[str, dict[str, Any]] = {}
-    for number in judged:
-        values = applied_thresholds(looks[number]["report"])
-        judged_by.setdefault(json.dumps(values, sort_keys=True), {"ranks": [], "thresholds": values})["ranks"].append(number)
-    by_thresholds = [
-        {"ranks": found["ranks"], "rank_ranges": _rank_ranges(found["ranks"]), "thresholds": found["thresholds"]}
-        for found in judged_by.values()
-    ]
+    by_thresholds = _thresholds_by_rank({number: applied_thresholds(looks[number]["report"]) for number in judged})
     evidence = {
         "view": ALL_RANKS_VIEW,
         "view_version": ALL_RANKS_VIEW_VERSION,
