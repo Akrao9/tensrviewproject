@@ -1053,7 +1053,10 @@ def test_trial_merge_server_mode(tmp_path, world, hold):
         if hold != "none":
             argv += ["--hold-rank", str(world - 1), "--release", hold]
         done = _torchrun(world, *argv)
-        [verdict] = [json.loads(p.read_text()) for p in (tmp_path / "out").glob("*/verdict.json")]
+        verdicts = [json.loads(p.read_text()) for p in (tmp_path / "out").glob("*/verdict.json")]
+        # No verdict file is the driver ending before it judged: say how it ended (CI, Nov 21, 2026).
+        assert len(verdicts) == 1, f"{len(verdicts)} verdict files, exit {done.returncode}\n{done.stdout}{done.stderr}"
+        [verdict] = verdicts
         assert _passed(verdict), done.stdout + done.stderr
         assert done.returncode == 0 and f"PASS server on {world} ranks" in done.stdout
     finally:
