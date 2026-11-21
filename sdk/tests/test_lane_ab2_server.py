@@ -113,7 +113,7 @@ def test_each_case_over_records_holds_on_the_real_server(tmp_path, name, body):
 
 
 def test_every_case_over_records_is_run_here():
-    assert len(OVER_RECORDS) == 27
+    assert len(OVER_RECORDS) == 30
 
 
 # --- D1 ------------------------------------------------------------------------------------------

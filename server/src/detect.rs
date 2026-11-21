@@ -708,7 +708,12 @@ fn text(column: Option<&StringArray>, row: usize) -> Option<&str> {
 /// Who reported a skipped update (`STEP_AND_EVIDENCE_CONTRACT.md`, section 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SkippedBy {
-    Caller,
+    /// Only the caller reported it. `applied` is the record's `scaler_applied: true`: the SDK
+    /// observed the scaler apply this update (section 1, rule 2 as amended by the author). Without
+    /// it the scaler's outcome is unknown.
+    Caller {
+        applied: bool,
+    },
     Scaler,
     Both,
 }
@@ -716,19 +721,22 @@ enum SkippedBy {
 /// A row's skipped update: None when `step_skipped` is not true, else who reported it, from
 /// `step_skipped_by` in `extra_json`, which is parsed only on a row that names it. A skipped row
 /// without the key was written by a scaler, the only thing that could write it before the key, and
-/// is read as the scaler's; so is a value this version does not know. The second value says
+/// is read as the scaler's; so is a value this version does not know. `scaler_applied`, which
+/// travels beside it, is read on a caller's skip only, and only as `true`. The second value says
 /// whether the row carries the key at all (the rank's `skipped_updates` is present only then).
 fn skipped_by(columns: &Columns, row: usize) -> (Option<SkippedBy>, bool) {
-    let said: Option<Value> = text(columns.extra, row)
+    let extra: Option<Value> = text(columns.extra, row)
         .filter(|extra| extra.contains("\"step_skipped_by\""))
-        .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
-        .and_then(|extra| extra.get("step_skipped_by").cloned());
+        .and_then(|extra| serde_json::from_str::<Value>(extra).ok());
+    let said = extra.as_ref().and_then(|extra| extra.get("step_skipped_by"));
     let carried = said.is_some();
     if !flag(columns.step_skipped, row) {
         return (None, carried);
     }
-    let by = match said.as_ref().and_then(Value::as_str) {
-        Some("caller") => SkippedBy::Caller,
+    let by = match said.and_then(Value::as_str) {
+        Some("caller") => SkippedBy::Caller {
+            applied: extra.as_ref().is_some_and(|extra| extra["scaler_applied"] == true),
+        },
         Some("both") => SkippedBy::Both,
         _ => SkippedBy::Scaler,
     };
@@ -3012,18 +3020,28 @@ impl LossScale {
             return;
         }
         self.flagged += 1;
-        // Only a skip the scaler confirmed counts. One only the caller reported is passed over: it
-        // neither adds to the streak nor ends it, and is in neither `skipped_steps` nor
-        // `recorded_steps`; a recorded applied update ends the streak. So `consecutive_skips: 10`
-        // reads "10 consecutive scaler-confirmed skips among observations judged by this rule",
-        // which can span more training steps than it counts. A measured loss scale below the
-        // floor on a caller's skip still raises, with reason `scale` and the counts unchanged
-        // (contract section 1, the three rules signed off by the author on Nov 20, 2026).
-        if by != Some(SkippedBy::Caller) {
-            let skipped = by.is_some();
-            self.recorded += 1;
-            self.skipped += u64::from(skipped);
-            self.streak = if skipped { self.streak + 1 } else { 0 };
+        // Only a skip the scaler confirmed counts. A recorded applied update ends the streak. A
+        // skip only the caller reported never adds a scaler-confirmed skip: with no
+        // `scaler_applied` (the scaler's outcome unknown) it is passed over, neither adding to the
+        // streak nor ending it, and is in neither `skipped_steps` nor `recorded_steps`; with
+        // `scaler_applied: true` it is an applied update to this rule, which ends the streak and
+        // counts in `recorded_steps` (that count is the contract session's reading, awaiting the
+        // author). So `consecutive_skips: 10` reads "10 consecutive scaler-confirmed skips among
+        // observations judged by this rule", which can span more training steps than it counts. A
+        // measured loss scale below the floor on either kind of caller's skip still raises, with
+        // reason `scale` and the counts unchanged (contract section 1: rules 1 and 3 signed off by
+        // the author on Nov 20, 2026, rule 2 as the author amended it).
+        match by {
+            Some(SkippedBy::Caller { applied: false }) => {}
+            Some(SkippedBy::Caller { applied: true }) | None => {
+                self.recorded += 1;
+                self.streak = 0;
+            }
+            Some(SkippedBy::Scaler | SkippedBy::Both) => {
+                self.recorded += 1;
+                self.skipped += 1;
+                self.streak += 1;
+            }
         }
         let scale = value(columns.grad_scale, row).filter(|scale| scale.is_finite());
         if self.first.is_none() && (self.streak >= SCALE_SKIP_RUN || scale.is_some_and(|scale| scale < SCALE_FLOOR)) {
@@ -3104,7 +3122,7 @@ impl SkippedUpdates {
         self.carried |= carried;
         let Some(by) = by else { return };
         match by {
-            SkippedBy::Caller => self.caller += 1,
+            SkippedBy::Caller { .. } => self.caller += 1,
             SkippedBy::Scaler => self.scaler += 1,
             SkippedBy::Both => self.both += 1,
         }

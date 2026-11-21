@@ -599,7 +599,7 @@ fn every_case_of_sections_1_and_2_that_holds_records_holds_on_the_server() {
             wrong.push(format!("{name}: {why}"));
         }
     }
-    assert_eq!(ran, 27, "the page's cases over records");
+    assert_eq!(ran, 30, "the page's cases over records");
     assert!(wrong.is_empty(), "{} cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
@@ -608,12 +608,23 @@ fn every_case_of_sections_1_and_2_that_holds_records_holds_on_the_server() {
 #[test]
 fn the_signed_off_rules_of_section_1_give_these_counters() {
     let cases = behaviour();
-    let records = |name: &str| cases[name]["records"].as_array().or(cases[name]["given"]["records"].as_array()).unwrap().clone();
+    let records = |name: &str| {
+        cases[name]["records"]
+            .as_array()
+            .or(cases[name]["given"]["records"].as_array())
+            .unwrap()
+            .clone()
+    };
     // A caller's skip with a loss scale below the floor: raised for the scale, no skip counted.
     let report = judged(&records("a_low_loss_scale_on_a_skip_only_the_caller_reported"));
     let found = incident(&report, "loss_scale_trouble").unwrap();
     assert_eq!(
-        (&found["reason"], &found["consecutive_skips"], &found["skipped_steps"], &found["recorded_steps"]),
+        (
+            &found["reason"],
+            &found["consecutive_skips"],
+            &found["skipped_steps"],
+            &found["recorded_steps"]
+        ),
         (&json!("scale"), &json!(0), &json!(0), &json!(0)),
         "{found}"
     );
@@ -622,13 +633,70 @@ fn the_signed_off_rules_of_section_1_give_these_counters() {
     let report = judged(&records("caller_skips_inside_a_run_of_scaler_skips"));
     let found = incident(&report, "loss_scale_trouble").unwrap();
     assert_eq!(
-        (&found["step"], &found["consecutive_skips"], &found["skipped_steps"], &found["recorded_steps"]),
+        (
+            &found["step"],
+            &found["consecutive_skips"],
+            &found["skipped_steps"],
+            &found["recorded_steps"]
+        ),
         (&json!(14), &json!(10), &json!(10), &json!(12)),
         "{found}"
     );
     // A stall across a skipped step: raised at the third qualifying check, step 3.
     let report = judged(&records("a_stall_across_a_skipped_step"));
     assert_eq!(incident(&report, "stalled_weights").unwrap()["step"], 3);
+    // Rule 2 as the author amended it: a caller's skip of unknown scaler outcome leaves the streak
+    // as it is; one the scaler was seen to apply ends it, and counts in `recorded_steps`.
+    let raised = |name: &str| {
+        let report = judged(&records(name));
+        incident(&report, "loss_scale_trouble").map(|found| {
+            (
+                found["step"].clone(),
+                found["consecutive_skips"].clone(),
+                found["skipped_steps"].clone(),
+                found["recorded_steps"].clone(),
+            )
+        })
+    };
+    assert_eq!(
+        raised("a_caller_skip_of_unknown_scaler_outcome_inside_scaler_skips"),
+        Some((json!(12), json!(10), json!(10), json!(12)))
+    );
+    assert_eq!(raised("a_caller_skip_the_scaler_applied_inside_scaler_skips"), None);
+    assert_eq!(
+        raised("ten_scaler_skips_after_a_caller_skip_the_scaler_applied"),
+        Some((json!(17), json!(10), json!(15), json!(18)))
+    );
+}
+
+/// `scaler_applied` is read on a caller's skip only: beside the scaler's own skip, or on an
+/// applied step, it changes nothing; and a caller's skip it marks is still a caller's skip in
+/// `skipped_updates`.
+#[test]
+fn scaler_applied_is_read_on_a_callers_skip_only() {
+    let scaler = |step: i64, extra: Value| {
+        let mut record = json!({"step": step, "step_skipped": true, "step_skipped_by": "scaler"});
+        record
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        record
+    };
+    let mut records: Vec<Value> = (0..10)
+        .map(|step| scaler(step, json!({"scaler_applied": true})))
+        .collect();
+    records.push(json!({"step": 10, "step_skipped": true, "step_skipped_by": "caller", "scaler_applied": true}));
+    let report = judged(&records);
+    let found = incident(&report, "loss_scale_trouble").unwrap();
+    assert_eq!((&found["step"], &found["consecutive_skips"]), (&json!(9), &json!(10)));
+    assert_eq!(report["skipped_updates"], json!({"caller": 1, "scaler": 10, "both": 0}));
+    assert_eq!(found["recorded_steps"], 11);
+    // `scaler_applied` that is not `true` is an unknown outcome.
+    let mut records: Vec<Value> = (0..5).map(|step| scaler(step, json!({}))).collect();
+    records.push(json!({"step": 5, "step_skipped": true, "step_skipped_by": "caller", "scaler_applied": "yes"}));
+    records.extend((6..11).map(|step| scaler(step, json!({}))));
+    let found = incident(&judged(&records), "loss_scale_trouble").cloned().unwrap();
+    assert_eq!((&found["step"], &found["recorded_steps"]), (&json!(10), &json!(10)));
 }
 
 /// A row with `step_skipped_by` and no skip, a value this version does not know, and a skipped row
