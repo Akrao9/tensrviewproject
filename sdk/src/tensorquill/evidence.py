@@ -2325,7 +2325,7 @@ INPUT_NEEDS: dict[str, str] = {
     "update": "update_rms with grad_norm or clip_grad_norm (updates=True)",
     "weight_check": "weights_unchanged with grad_norms (full capture)",
     "steps": "step records",
-    "loss_scale": "step_skipped (scaler= or session.step(skipped=))",
+    "loss_scale": "step_skipped (scaler=)",
     "lr": "lr",
     "data": "data (session.watch_loader)",
     "checkpoint": "checkpoint, or grad_scale (scaler=)",
