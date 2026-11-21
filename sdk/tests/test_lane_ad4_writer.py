@@ -297,3 +297,59 @@ def test_fr_the_analyzers_own_console_handler_writes_to_the_real_stderr(tmp_path
     """)
     done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
     assert done.stdout.strip() == "real", done.stdout + done.stderr
+
+
+# --- Item 3: a sink written again after a write that failed partway --------------------------
+
+_SINK_SCRIPT = """
+import json, resource, signal, sys
+from pathlib import Path
+sys.path.insert(0, {src!r})
+from tensorquill.evidence import read_jsonl
+from tensorquill.flight import parse_lines, read_lines
+from tensorquill.sink import JsonlSink
+
+path, pad = Path({path!r}), {pad}
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)  # write(2) then writes what fits and fails with EFBIG
+soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+
+def rec(step):
+    return {{"schema_version": 1, "run_id": "r", "rank": 0, "attempt": 1, "step": step, "ts": 1.0,
+            "grad_norm": 1.0, "pad": "x" * pad}}
+
+sink = JsonlSink(path)
+sink.write([rec(0), rec(1)])
+resource.setrlimit(resource.RLIMIT_FSIZE, (path.stat().st_size + pad // 2, hard))
+try:
+    sink.write([rec(2)])
+    failed = False
+except OSError:
+    failed = True
+torn = not path.read_bytes().endswith(b"\\n")
+resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+sink.write([rec(3), rec(4)])  # the same sink again, the limit gone: this write returns
+sink.close()
+records, left_out = read_jsonl(path)
+lines, _ = read_lines(path, 0, 1000, 1 << 22)
+sent, skipped = parse_lines(lines, "r")
+print(json.dumps({{"failed": failed, "torn": torn, "read": [r["step"] for r in records], "left_out": left_out,
+                  "sent": [r["step"] for r in sent], "skipped": skipped}}))
+"""
+
+
+@pytest.mark.skipif(not hasattr(__import__("signal"), "SIGXFSZ"), reason="needs RLIMIT_FSIZE and SIGXFSZ")
+@pytest.mark.parametrize("pad", [150, 20000], ids=["a line under Python's buffer", "a line over it"])
+def test_sink_the_next_write_after_one_that_failed_partway_is_read(tmp_path, pad):
+    """A real partial write: a file-size limit lets the third step's line in part, then fails it.
+    With the limit raised, the same sink's next write returns, and its two steps must be read by the
+    evidence reader and the stream sender alike. Under the buffer, Python keeps the rest of the
+    failed line and completes it, so nothing is lost. Over it, the rest is dropped at the failure:
+    before, the next step was appended onto the fragment and read by neither (steps 0, 1, 4)."""
+    script = _SINK_SCRIPT.format(src=_src(), path=str(tmp_path / "r.rank0.jsonl"), pad=pad)
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    found = __import__("json").loads(done.stdout)
+    assert found["failed"] and found["torn"]  # the write did fail partway, and left part of a line
+    expected = [0, 1, 2, 3, 4] if pad < 8192 else [0, 1, 3, 4]  # only the failed write's step can be lost
+    assert found["read"] == expected and found["sent"] == expected
+    assert found["left_out"] == found["skipped"] == (0 if pad < 8192 else 1)
