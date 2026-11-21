@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import re
+import time
+import warnings
 from pathlib import Path
 
 import pytest
@@ -246,14 +248,101 @@ def test_none_is_the_argument_left_out():
     assert "step_skipped" not in sink.records[0] and "step_skipped_by" not in sink.records[0]
 
 
-def test_a_refusal_on_a_closed_session_is_still_a_refusal():
-    """The type is checked before anything else, a closed session included: a wrong argument is the
-    caller's mistake and is said whatever state the capture is in (a call for the author)."""
+class _FailingSink(tensorquill.MemorySink):
+    """Raises on every write, as a disk that is full: capture stops (`_stop`), training goes on."""
+
+    def write(self, records):
+        raise OSError("disk gone")
+
+
+def _stopped_session() -> tuple[capture_module.Session, nn.Module]:
+    """A manual-step session whose capture has stopped: its sink failed at the first write, and the
+    next step on the training thread turned the writer's error into the stop (`_commit`)."""
     model = _model()
-    session = tensorquill.init(model, sink=tensorquill.MemorySink(), every=1, auto_step=False)
+    session = tensorquill.init(model, sink=_FailingSink(), capture="full", every=1, auto_step=False)
+    deadline = time.monotonic() + 30
+    while not session._stopped and time.monotonic() < deadline:
+        model(torch.ones(2, 4)).sum().backward()
+        session.step()
+        if session._error is None:
+            time.sleep(0.01)  # give the writer thread its turn
+    assert session._stopped and not session._closed
+    return session, model
+
+
+def test_on_a_closed_session_a_wrong_skipped_does_what_a_wrong_lr_does():
+    """What a wrong `lr` does on a closed session: nothing. `step()` returns at once, raises nothing,
+    records nothing and counts nothing (`_closed_call`). A wrong `skipped` does the same."""
+    model = _model()
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=1, auto_step=False)
+    model(torch.ones(2, 4)).sum().backward()
+    session.step()
     session.close()
-    with pytest.raises(TypeError):
+    written, next_step = len(sink.records), session._next_step
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # no warning either: one would raise under `python -W error`
+        session.step(lr="not a number")
+        assert (len(sink.records), session._next_step) == (written, next_step)
+        for wrong in (1, "yes", torch.tensor(True)):
+            session.step(skipped=wrong)
+        session.step(lr="not a number", skipped=1)
+    assert (len(sink.records), session._next_step) == (written, next_step)
+
+
+def test_on_a_stopped_session_a_wrong_skipped_does_what_a_wrong_lr_does():
+    """What a wrong `lr` does on a session whose capture has stopped: no raise and no warning (its one
+    warning was given when it stopped), nothing recorded, and only the step count goes on, so the
+    drift check's schedule stays with the other ranks (`_count_stopped`). A wrong `skipped` does the
+    same, step for step."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the stop's own warning
+        session, model = _stopped_session()
+    first, committed, held = session._next_step, session._steps_committed, list(session._steps)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        session.step(lr="not a number")
+        assert session._next_step == first + 1
         session.step(skipped=1)
+        assert session._next_step == first + 2
+        session.step(skipped=torch.tensor(True))
+        session.step(step=40, skipped="yes")
+        assert session._next_step == 41
+        session.step(lr="not a number", skipped=1)
+        assert session._next_step == 42
+    assert (session._steps_committed, session._steps) == (committed, held)  # nothing recorded
+    session.close()
+
+
+def test_on_a_live_session_a_wrong_lr_and_a_wrong_skipped_are_both_refused():
+    """The sessions that refuse one refuse the other. A wrong `skipped` is refused before anything of
+    the step is recorded (no gradients read); a wrong `lr` is refused after the gradients are read,
+    as before this lane, and neither ends the step."""
+    model = _model()
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, capture="full", every=1, auto_step=False)
+    model(torch.ones(2, 4)).sum().backward()
+    with pytest.raises(TypeError, match="skipped must be True, False or None"):
+        session.step(skipped=1)
+    assert session._grads_recorded is False and session._steps_committed == 0
+    with pytest.raises((TypeError, ValueError)):
+        session.step(lr="not a number")
+    assert session._steps_committed == 0
+    with pytest.raises(TypeError, match="skipped must be True, False or None"):
+        session.step(lr="not a number", skipped=1)  # both wrong: `skipped` is said first
+    session.step(skipped=False)
+    session.close()
+    assert [(r["step"], r["step_skipped"]) for r in sink.records] == [(0, False)]
+
+
+def test_an_auto_step_session_refuses_the_call_itself_whatever_skipped_is():
+    """`step()` under `auto_step` raises its own RuntimeError before either argument is read."""
+    model = _model()
+    session = tensorquill.init(model, sink=tensorquill.MemorySink(), every=1)
+    for kwargs in ({"skipped": 1}, {"lr": "not a number"}, {"skipped": True}):
+        with pytest.raises(RuntimeError, match="auto_step=False"):
+            session.step(**kwargs)
+    session.close()
 
 
 def _scaler_run(auto_step: bool, overflow_at: set[int], steps: int = 6) -> list[dict]:
