@@ -368,6 +368,7 @@ def test_sdk26_a_folder_given_as_a_path_is_the_checkpoint_folder(tmp_path):
     from types import SimpleNamespace
 
     pytest.importorskip("transformers")
+    pytest.importorskip("accelerate")  # tensorquill.huggingface imports both
     from tensorquill.huggingface import _checkpoint_folder
 
     args, state = SimpleNamespace(output_dir=str(tmp_path / "out")), SimpleNamespace(global_step=3)
