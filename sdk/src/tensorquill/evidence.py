@@ -2649,12 +2649,16 @@ def _write_output(evidence: Mapping[str, Any], path: Path, named: bool, compact_
 class _Tail:
     """Reads what is new in a `.jsonl` file or a directory of Parquet parts.
 
-    What was read is read again from the start when it is no longer what the source holds (lane
-    AD11): a `.jsonl` file that is shorter than what was read, that is another file at the path, or
-    whose first bytes or last bytes read have changed; a part that was read and has changed (its
-    size, time or file) or is gone. Before, such a file was read on from where it was, or not at
-    all, and the evidence went on showing rows the source no longer holds. A rewrite that keeps the
-    file as long, the same file, and both of those stretches of bytes is not seen."""
+    A file cut short, replaced or rewritten is read again from the start (lane AD11): a `.jsonl`
+    file that is shorter than what was read, that is another file at the path (another device or
+    inode), or whose first CHECKED_BYTES or last CHECKED_BYTES read have changed; and a part that was
+    read and has changed (its size, time or file) or is gone. Before, such a file was read on from
+    where it was, or not at all, and the evidence went on showing rows the source no longer holds.
+
+    The limit: a rewrite in place that keeps the same file, at least the same length, and the same
+    first and last CHECKED_BYTES (4 KiB) of what was read is not detected, and the watcher goes on
+    reading from its offset. A file cut to empty is read again but holds no record, so the watcher
+    still writes nothing for it and the last evidence file stays as it was."""
 
     CHECKED_BYTES = 4096  # at the start of a `.jsonl` file, and before the end of what was read
 
@@ -4321,6 +4325,12 @@ def watch(
     options; otherwise they judge every record again (`_Incremental`, lane AD11). The evidence is the
     same either way. The `samples` handed to `on_update` are the ones kept for the next look: read
     them, do not change them in place.
+
+    A `.jsonl` file cut short, replaced or rewritten under the watcher is read again from the start,
+    and so is a store whose parts read have changed or are gone (`_Tail`). The limit: a rewrite in
+    place that keeps the same file, at least the same length, and the same first and last 4 KiB of
+    what was read is not detected, and the watcher goes on from its offset. A file cut to empty still
+    writes nothing: the last evidence file is left as it was until the file holds a record again.
 
     The five thresholds (`overload_threshold`, `drift_tolerance`, `starve_window`,
     `starve_ratio`, `top_k`) are the caller's only when given. For a server's store, one left
@@ -6801,8 +6811,9 @@ class _Incremental:
       sizes, their top-k, and whether the run clips (`clip_grad_norm`), which picks the gradient
       series of every step;
     - a record judged before that is not the same or not in its place: rows that came late and sort
-      before the newest step, an attempt that replaced steps already judged, a file that was
-      rewritten or cut short and read again;
+      before the newest step, an attempt that replaced steps already judged, a file that was cut
+      short, replaced or rewritten and read again from the start (`_Tail` says which rewrite it does
+      not detect);
     - a step that is not a whole number, which the states' own step order might not keep.
 
     Everything else in the evidence is made again at every look from every record, as before: those
