@@ -736,7 +736,7 @@ def test_a_missing_count_beside_an_observed_zero():
     assert "R over B: 6 / 0: not measured" in table
 
 
-def test_zero_human_seconds_over_zero_is_not_measured():
+def test_a_zero_human_seconds_denominator_is_not_measured():
     _, seconds, verdict = speed([row("B", seconds=0.0, agent=False), row("R", seconds=90.0, agent=False)])
     assert seconds.startswith(f"{SECONDS}, R over B: 90.0 / 0.0: not measured")
     assert verdict is None
