@@ -50,10 +50,16 @@ at each listing, about 1.5 GB a second on the recorded captures here from the pa
 slowly as a full parse for some files (the notes above `_RECORD_HEAD`);
 within one process a file that only grew is scanned from where the last scan stopped.
 
-A store's run whose server dropped rows for a null key (`dropped_rows` and `dropped_row_keys` on
-a rank's entry of `watchdog.json`) has `dropped_rows` on its row, in all, by key and by rank, and
+A store's run whose server dropped rows (`dropped_rows` and `dropped_row_keys` on a rank's entry
+of `watchdog.json`), for a null key or, since wave AA, for a `schema_version` it does not support
+(`unsupported_schema_version`), has `dropped_rows` on its row, in all, by key and by rank, and
 the printed listing a note. The count is an upper bound: a batch sent again after a lost
 acknowledgement is counted again (L22, lane Z5). A run that dropped none has no such key.
+Batches the server refused whole, because a key column was missing or of another type
+(`refused_batches` and `refused_batch_keys` on a rank's entry, RS10, wave AA), are not dropped
+rows: they are `refused_batches` on the row, in all, by column and by rank, with a note of their
+own, and are never added to the rows dropped (lane AB5, Nov 20, 2026). A run that refused none
+has no such key.
 
 How many ranks: a file named `<run_id>.rank<N>.jsonl` holds the ranks its lines name. Every
 line of it is read for that: the last megabyte parsed, and the part before it scanned for each
@@ -1239,10 +1245,12 @@ def _count(value: Any) -> bool:
 
 
 def dropped_rows(status: Mapping[str, Any] | None) -> dict[str, Any] | None:
-    """The rows the server dropped for a null key (RS10), from its status (`watchdog.json`): on
-    each rank's entry, `dropped_rows` (the rank's total) and `dropped_row_keys` (by the first
-    null key of each row). `{"rows", "by_key", "ranks", "upper_bound", "note"}`, or None when
-    no rank dropped any (a rank that dropped none has neither key, and the row is as before).
+    """The rows the server dropped (RS10), from its status (`watchdog.json`): on each rank's
+    entry, `dropped_rows` (the rank's total) and `dropped_row_keys` (by the first null key of
+    each row, and, since wave AA, `unsupported_schema_version` for a row whose schema version
+    the server does not support). `{"rows", "by_key", "ranks", "upper_bound", "note"}`, or None
+    when no rank dropped any (a rank that dropped none has neither key, and the row is as
+    before). Batches refused whole are not here: `refused_batches`, never added to these.
 
     The count is an upper bound (L22, lane Z5, Nov 20, 2026): a batch whose acknowledgement was
     lost and that was sent again is counted again, since its rows were never stored and nothing
@@ -1273,6 +1281,61 @@ def dropped_rows(status: Mapping[str, Any] | None) -> dict[str, Any] | None:
             "note": DROPPED_ROWS_NOTE_WITH_VERSIONS if UNSUPPORTED_VERSION_KEY in by_key else DROPPED_ROWS_NOTE}
 
 
+REFUSED_BATCHES_NOTE = (
+    "batches the server refused whole because a key column of theirs was missing or of another type, so no row of "
+    "them was stored and the stream that sent each one ended; the same batch sent again is not counted again, so this "
+    "counts batches, not rows, and is not added to the rows dropped"
+)
+
+
+def refused_batches(status: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The batches the server refused whole (RS10, wave AA), from its status (`watchdog.json`):
+    on each rank's entry, `refused_batches` (the rank's total) and `refused_batch_keys` (by the
+    key column that was missing or of another type). `{"batches", "by_key", "ranks", "note"}`,
+    or None when no rank refused any, so such a row is as before.
+
+    A sibling of `dropped_rows`, never added to it: a refused batch is a count of batches, of
+    which no row was read, and a dropped row is a row. The server counts a batch sent again
+    after its stream ended (the same column and end offset as the rank's last refusal) once,
+    so this is not called an upper bound. Only the rank entries are read (`restart[]` carries
+    the same counts); a value that is not a count above zero is left out; nothing here raises
+    (lane AB5, Nov 20, 2026)."""
+    entries = status.get("ranks") if isinstance(status, Mapping) else None
+    if not isinstance(entries, list):
+        return None
+    ranks: list[dict[str, Any]] = []
+    by_key: dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        rank, batches = entry.get("rank"), entry.get("refused_batches")
+        if not (isinstance(rank, int) and not isinstance(rank, bool) and rank >= 0) or not _count(batches):
+            continue
+        keys = entry.get("refused_batch_keys")
+        keys = {str(k): v for k, v in sorted(keys.items()) if isinstance(k, str) and _count(v)} if isinstance(keys, Mapping) else {}
+        for key, count in keys.items():
+            by_key[key] = by_key.get(key, 0) + count
+        ranks.append({"rank": rank, "batches": batches, **({"by_key": keys} if keys else {})})
+    if not ranks:
+        return None
+    ranks.sort(key=lambda item: item["rank"])
+    return {"batches": sum(item["batches"] for item in ranks), **({"by_key": dict(sorted(by_key.items()))} if by_key else {}),
+            "ranks": ranks, "note": REFUSED_BATCHES_NOTE}
+
+
+def _refused_text(refused: Mapping[str, Any]) -> str:
+    """The listing's note for `refused_batches`, apart from the dropped rows'."""
+    batches, ranks = refused["batches"], refused["ranks"]
+    shown = ", ".join(f"rank {item['rank']}: {item['batches']:,}" for item in ranks[:8])
+    shown += f" and {len(ranks) - 8} more ranks" if len(ranks) > 8 else ""
+    keys = refused.get("by_key") or {}
+    by_key = "; by key column: " + ", ".join(f"{key} {count:,}" for key, count in keys.items()) if keys else ""
+    return (f"the server refused {batches:,} batch{'es' if batches != 1 else ''} whole because a key column was missing "
+            f"or of another type, and stored no row of {'them' if batches != 1 else 'it'} ({shown}{by_key}); a batch "
+            "sent again is not counted again, and these are batches, not rows, so they are not in any count of rows "
+            "dropped")
+
+
 def _dropped_text(dropped: Mapping[str, Any]) -> str:
     """The listing's note for `dropped_rows`."""
     rows, ranks = dropped["rows"], dropped["ranks"]
@@ -1295,9 +1358,14 @@ def _store_row(run: Mapping[str, Any]) -> dict[str, Any]:
     folder = Path(run["path"])
     row: dict[str, Any] = {}
     # L22: the rows the server dropped, when it dropped any (no key otherwise).
-    dropped = dropped_rows(read_watchdog(folder / "watchdog.json"))
+    status = read_watchdog(folder / "watchdog.json")
+    dropped = dropped_rows(status)
     if dropped is not None:
         row["dropped_rows"] = dropped
+    # RS10: the batches the server refused whole, apart from the rows (no key when none).
+    refused = refused_batches(status)
+    if refused is not None:
+        row["refused_batches"] = refused
     try:
         view = all_ranks_evidence(folder)
     except (OSError, ValueError) as error:
@@ -1501,6 +1569,8 @@ def listing_text(rows: list[Mapping[str, Any]], source: str | Path, project: str
                 notes.append(f"{row['run_id']}: ranks not counted: {row['rank_count_not_known']}")
             if isinstance(row.get("dropped_rows"), Mapping):
                 notes.append(f"{row['run_id']}: {_dropped_text(row['dropped_rows'])}")
+            if isinstance(row.get("refused_batches"), Mapping):
+                notes.append(f"{row['run_id']}: {_refused_text(row['refused_batches'])}")
             if not row["has_manifest"]:
                 notes.append(f"{row['run_id']}: no run manifest (recorded before there was one, or by a sink with no "
                              f"file), so it is listed under {_manifest.DEFAULT_PROJECT!r} with its run ID as its name")
