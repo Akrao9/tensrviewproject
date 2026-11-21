@@ -135,6 +135,9 @@ session.close()
 - **Histograms and attention:** pass `probe=` a fixed batch, for example `probe={"input_ids": fixed_batch}`, to run it through the model every 1,000 steps (`probe_every=`) for activation histograms per block and attention statistics per layer. It runs without the compiler and without gradients, so expect a pause of about one forward pass each time. On a model that does not use `scaled_dot_product_attention`, only histograms are recorded.
 - **Two optimizers on one model**, such as Muon and AdamW: steps count training iterations, not optimizer steps. Nothing to change.
 - **Resuming from a checkpoint:** pass `start_step=` the step you resume from, or step numbers start at 0 again. If the checkpoint is older than the last recorded step, the steps written again replace the earlier ones in the evidence. Keep the run ID as well: pass the same `run_id=`, or let the tracker or the launcher give it. A resume under another run ID is a second run with a file of its own, and the resume checks do not reach across the two.
+- **Clipping groups separately.** With more than one `clip_grad_norm_` call in a step the record says so (`clip_calls`), and `update_spike` leaves out the comparisons that would need the total split by parameter, saying how many under `not_checked` (`clip_groups`). Under `torch.compile` the number of calls is not known and there is no key.
+- **Several optimizers.** The first optimizer that ever steps ends each step. If another optimizer sits before it in your loop, pass `init(..., ends_step=optimizer)` with the optimizer whose step closes the iteration; it cannot be combined with `scaler=` or `auto_step=False`. The Lightning, Hugging Face and Accelerate adapters do not pass it.
+- **Several optimizers through one `GradScaler`.** A step on which the scaler skipped some and applied others is recorded as a partial step (`step_skipped_part`) and does not count toward `loss_scale_trouble`'s ten skips in a row.
 - **`from torch.nn.utils import clip_grad_norm_` at the top of your script** binds the function before `init` wraps it. Either call `torch.nn.utils.clip_grad_norm_`, or pass the returned norm yourself: `session.record_grad_norm(norm)`.
 
 ### Steps you count yourself, and skipped steps
@@ -215,10 +218,10 @@ Install the `huggingface` extra (section 1). `SFTTrainer` and the other TRL trai
 - **Clipping.** The norm before clipping is recorded as `clip_grad_norm`, including with `max_grad_norm=0`, where `Trainer` still computes it.
 - **Mixed precision.** Accelerate's `GradScaler`, when it has one, is passed in, so skipped steps are counted and marked. Not run: it needs a GPU.
 - **`torch_compile=True`** works: the compiled forward is traced on its first call, after the callback has added its hooks.
-- **A failed run.** `Trainer` has no event for an exception. If `trainer.train()` raises, call `callback.close()` to write what was captured.
+- **A failed run.** `Trainer` has no event for an exception. The callback closes its session when the process ends, when `callback.close()` is called, or at the next `train()`, and writes the end marker as raised. In a process that goes on after the raise (a notebook, a caught `KeyboardInterrupt`), call `callback.close()` in a `finally:`. A rank that torchrun stops with SIGTERM because another rank failed loses its newest step and leaves no marker.
 - Other keyword arguments go to `tensorquill.init`, for example `routers=` or `probe=`.
 
-Tested on CPU, one process, with Transformers 5.23.0 and Accelerate 1.15.0, and with their development versions (5.24.0.dev0, 1.16.0.dev0). Not tested: several ranks, FSDP, DeepSpeed, `nn.DataParallel` (several GPUs in one process), and a GPU.
+Tested on CPU, one process, with Transformers 5.23.0 and Accelerate 1.15.0, and with their development versions (5.24.0.dev0, 1.16.0.dev0). An interrupted run was also run on two CPU ranks under torchrun. Not tested: FSDP, DeepSpeed, `nn.DataParallel` (several GPUs in one process), and a GPU.
 
 ### Hugging Face Accelerate, in your own loop
 
