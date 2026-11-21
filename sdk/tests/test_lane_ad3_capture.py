@@ -4,7 +4,9 @@
   past float32's range on MPS; logits near float32's largest value with both signs in one row),
   and the third (a BF16 logit past BF16's range) stays counted.
 - Router counting allocates in proportion to the assignments, not experts by assignments.
-- The ring allocates no gradient rows in the router-only mode.
+- The ring allocates no gradient rows in the router-only mode, and two columns without the weight check.
+- A session made before `to_empty` says why it counts no step at the first step.
+- Clipping inside a compiled optimizer step no longer recompiles at every step.
 
 Every test here fails on `eb5a71b` and passes with the lane's change.
 """
@@ -299,11 +301,31 @@ def test_compiled_router_counts_are_as_before_and_the_graph_holds_no_experts_by_
     assert nodes and max(nodes) < TOKENS * K * E, max(nodes)  # the logits (7,680) are the largest now
 
 
+def _cost_holds(path, largest):
+    if path == "routing map":
+        return largest.of_size == 2 * 3  # two map-sized masks a forward, not four
+    return largest.largest <= TOKENS * K * 2  # not a matrix of assignments by experts
+
+
+def _same_counts(records, eager):
+    for key in ("moe", "moe_unassigned", "moe_left_out"):
+        assert [r.get(key, {}).get("router") for r in records] == [r.get(key, {}).get("router") for r in eager], key
+
+
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
-def test_router_counts_under_aot_and_inductor_match_eager_and_make_no_matrix(device, backend, tmp_path, monkeypatch):
-    if device == "mps" and backend == "inductor":
-        pytest.skip("Inductor on MPS is not what this lane measures")
+@pytest.mark.parametrize("path", list(PATHS))
+def test_router_counts_under_aot_eager_match_eager_on_every_path(path, device):
+    eager, seen, largest, _ = _count(path, device, None)
+    records, _, _, _ = _count(path, device, "aot_eager")
+    assert len(records) == 3 and all("moe_refused" not in r for r in records)
+    _same_counts(records, eager)
+    per_step = len(seen) // 3
+    assert [r["moe"]["router"] for r in records] == [
+        _expected(seen[i * per_step:(i + 1) * per_step], path)[0] for i in range(3)]
+    assert _cost_holds(path, largest), (largest.largest, largest.of_size)
+
+
+def test_router_counts_under_inductor_match_eager_and_make_no_matrix(tmp_path, monkeypatch):
     # A cache of its own: other processes on this machine compile into the shared one at the same time.
     # Its precompiled header is shared too, and another process rebuilding it fails this compile.
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
@@ -311,11 +333,10 @@ def test_router_counts_under_aot_and_inductor_match_eager_and_make_no_matrix(dev
 
     monkeypatch.setattr(inductor_config, "cpp_cache_precompile_headers", False, raising=False)
     torch._dynamo.reset()
-    eager, _, largest, _ = _count("integer ids", device, None)
-    records, _, _, _ = _count("integer ids", device, backend)
-    assert [r["moe"]["router"] for r in records] == [r["moe"]["router"] for r in eager]
-    assert [r["moe_unassigned"]["router"] for r in records] == [r["moe_unassigned"]["router"] for r in eager]
-    assert largest.largest <= TOKENS * K * 2
+    eager, _, largest, _ = _count("integer ids", "cpu", None)
+    records, _, _, _ = _count("integer ids", "cpu", "inductor")
+    _same_counts(records, eager)
+    assert _cost_holds("integer ids", largest)
 
 
 # --- The ring allocates only the signals that are on -----------------------------------------------
@@ -435,7 +456,7 @@ def test_a_session_made_before_to_empty_says_why_at_the_first_step():
     assert sink.records == []  # nothing is written for the old parameters, no zero among it
 
 
-def test_an_optimizer_of_new_parameters_beside_the_lead_is_not_said_to_be_replaced_once_the_lead_steps():
+def test_an_optimizer_of_parameters_assigned_after_init_is_warned_of_once_and_the_lead_still_records():
     model = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 1))
     sink = tensorquill.MemorySink()
     session = tensorquill.init(model, sink=sink, every=2)
@@ -494,3 +515,33 @@ def test_clipping_inside_a_compiled_step_does_not_recompile_at_every_step():
     graphs, clips, truth = run(True)
     assert graphs == control and sum(graphs[1:]) == 0, (graphs, control)
     assert clips == pytest.approx(truth, rel=1e-5)
+
+
+def test_a_fullgraph_compiled_clip_no_longer_raises_into_training_at_the_recompile_limit():
+    # Before, each step recompiled on the call count, and under fullgraph=True the eighth step raised
+    # FailOnRecompileLimitHit out of the user's training step. Now it compiles once.
+    from torch._dynamo.utils import counters
+
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 1))
+    opt = torch.optim.SGD(model.parameters(), lr=0.01)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=5)
+
+    @torch.compile(backend="eager", fullgraph=True)
+    def clip():
+        return torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    counters.clear()
+    try:
+        for _ in range(10):
+            model(torch.randn(4, 8)).pow(2).mean().backward()
+            clip()
+            opt.step()
+            opt.zero_grad()
+    finally:
+        session.close()
+        torch._dynamo.reset()
+    assert counters["stats"]["unique_graphs"] == 1
+    assert len(sink.records) == 10 and all("clip_grad_norm" in r for r in sink.records)
