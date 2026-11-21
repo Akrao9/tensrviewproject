@@ -45,6 +45,10 @@ class Refusing(pa_flight.FlightServerBase):
         self.stored: list[int] = []
         self.batches: list[dict] = []   # every batch with rows that arrived: its steps and byte range
         self.held = 0                   # the end of the last bytes stored
+        # Where the sender's next stream begins, as far as this server has settled its bytes: `held`,
+        # or the end of a range it refused and named exactly (lane AD4: a new stream's first batch was
+        # taken to begin at `held`, which after a confirmed refusal is the start of the refused bytes).
+        self.settled = 0
         self._thread = threading.Thread(target=self.serve, daemon=True)
         self._thread.start()
 
@@ -66,7 +70,7 @@ class Refusing(pa_flight.FlightServerBase):
                 writer.write(pa.py_buffer(json.dumps({"end_byte_offset": 0}).encode()))
                 continue
             with self.lock:
-                begin = self.held if start is None else start
+                begin = self.settled if start is None else start
                 self.batches.append({"steps": steps, "start": begin, "end": end})
                 if self.refuse in steps:
                     if self.answer is not None:
@@ -74,9 +78,11 @@ class Refusing(pa_flight.FlightServerBase):
                                  "start": (begin + 1, end), "end": (begin, end + 1)}[self.answer]
                         writer.write(pa.py_buffer(json.dumps({"end_byte_offset": self.held, "refused": {
                             "start_byte_offset": named[0], "end_byte_offset": named[1], "column": "step"}}).encode()))
+                        if self.answer == "exact":
+                            self.settled = end
                     raise pa.ArrowInvalid(REFUSED)
                 self.stored += [s for s in steps if s not in self.stored]
-                self.held = start = end
+                self.held = self.settled = start = end
             writer.write(pa.py_buffer(json.dumps({"end_byte_offset": end}).encode()))
 
     def seen(self, steps: range) -> int:
@@ -120,7 +126,6 @@ def the_run(tmp_path: Path, server: Refusing) -> dict:
     return {"path": path, "sender": sender, "after_a": after_a, "after_b": after_b, "after_c": path.stat().st_size}
 
 
-@pytest.mark.xfail(strict=True, reason="wave AD, lane AD4: the sender does not read a refusal's answer yet")
 def test_a_confirmed_refusal_moves_the_offset_to_the_end_of_the_refused_bytes(tmp_path, server):
     one = server("exact")
     run = the_run(tmp_path, one)
@@ -130,6 +135,7 @@ def test_a_confirmed_refusal_moves_the_offset_to_the_end_of_the_refused_bytes(tm
     assert one.seen(B) == 1                             # B was sent once and not again
     assert [b["steps"] for b in one.batches] == [list(A), list(B), list(C)]
     assert one.batches[2]["start"] == run["after_b"]    # C was sent from the end of the refused bytes
+    assert one.batches[2]["end"] == run["after_c"]      # and held C's bytes only: those after B's end
     assert read_binding(offset_path(run["path"]))["offset"] == run["after_c"]
     assert run["sender"].refused_batches == 1
 

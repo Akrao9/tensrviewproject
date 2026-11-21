@@ -43,6 +43,10 @@ STACK_FRAMES = 40  # frames kept of the main thread, innermost first
 STACK_OTHER_FRAMES = 4  # and of each other thread
 STACK_THREADS = 8  # at most 68 frames in all: under 10 KB a rank in the server's status file
 CLOSE_TIMEOUT = 5.0
+# At most this long, a stream that failed waits for its ack reader to finish, so a last answer the
+# server sent before the status that ended the stream (an ack, or a refusal's range, RS10) is taken
+# before the next stream chooses where it starts.
+ACK_DRAIN_SECONDS = 1.0
 POLL_SECONDS = 0.2
 ENDPOINT_ENV = "TENSORQUILL_ENDPOINT"
 TOKEN_ENV = "TENSORQUILL_TOKEN"
@@ -526,6 +530,11 @@ def rows_to_send(
     return batch, [row["step"] for row in rows], skipped
 
 
+class BatchRefused(ConnectionError):
+    """The stream ended because the server refused a batch for good and named its byte range (RS10):
+    the sender's `last_error` after such a stream. Its bytes are not sent again."""
+
+
 class LocalFileUnreadable(OSError):
     """The local `.jsonl` file cannot be read: it was deleted or moved, or is not readable.
     This is not "nothing left to send": `close()` returns False and says so."""
@@ -611,6 +620,12 @@ class FlightSender:
         # `last_error` when a stream fails before `done_writing`, and kept after later progress,
         # which clears `last_error`. See `_note_stream_end`. Holds no token and no header.
         self.last_stream_end: dict[str, Any] | None = None
+        # RS10 (detector rules contract, part 8): batches the server refused for good, naming the
+        # exact byte range this sender sent. Their bytes are passed over: the saved offset moves to
+        # the refused range's end. `last_refused` is the last such range, with its column.
+        self.refused_batches = 0
+        self.last_refused: dict[str, Any] | None = None
+        self._said_refused = False
         self._life: dict[str, Any] | None = None  # the stream now open: when, and what it carried
         self._location = _location(endpoint)
         self._token = token if token is not None else os.environ.get(TOKEN_ENV)
@@ -640,6 +655,7 @@ class FlightSender:
         self._head = b""  # the file's first bytes and the bytes just before `sent`, to bind acks
         self._tail = b""
         self._pending: dict[int, dict[str, str]] = {}  # batch end offset -> the file's identity there
+        self._starts: dict[int, int] = {}  # batch end offset -> its start, for a refusal's range (RS10)
         self._pending_lock = threading.Lock()
         self._progress = False
         self._reported = False
@@ -729,11 +745,21 @@ class FlightSender:
         retried_on_close = False
         while True:
             was_closing = self._closing.is_set()
+            refused = self.refused_batches
             try:
                 self._stream()
                 return
             except BaseException as error:  # noqa: BLE001  the stream must never raise into training
                 self.last_error = _without_traceback(error)
+                if self.refused_batches != refused and self.last_refused is not None:
+                    # RS10: the stream ended because the server refused a batch for good, and said so.
+                    named = self.last_refused
+                    column = f" (column {named['column']!r})" if named.get("column") else ""
+                    self.last_error = BatchRefused(
+                        f"the server refused bytes {named['start_byte_offset']} to {named['end_byte_offset']} for good"
+                        f"{column}, {self.refused_batches} batch(es) so far; the stream goes on from byte "
+                        f"{named['end_byte_offset']} ({self._scrub(str(error))[:200]})"
+                    )
                 self._note_stream_end(error)
             if self._progress:
                 self._progress = False
@@ -811,6 +837,7 @@ class FlightSender:
         self._head, self._tail = head, tail
         with self._pending_lock:
             self._pending.clear()
+            self._starts.clear()
         return 0 if reason else offset
 
     def _bound(self, store_id: str | None) -> str | None:
@@ -834,6 +861,7 @@ class FlightSender:
         self._head, self._tail = b"", b""
         with self._pending_lock:
             self._pending.clear()
+            self._starts.clear()
         if "store" in reason and not self._said_store:
             self._said_store = True
             saved, named = _store_of(self._binding), self._store_id
@@ -898,6 +926,54 @@ class FlightSender:
         except Exception:  # noqa: BLE001  an error whose str() raises
             return type(error).__name__
 
+    def _refusal(self, refused: Any) -> None:
+        """A batch the server refused for good (RS10, detector rules contract part 8), told on the
+        acknowledgement channel before the status that ends the stream:
+        `{"start_byte_offset": S, "end_byte_offset": E, "column": ...}`.
+
+        The saved offset moves for two reasons only: the server stored the bytes (`_ack`), or it
+        refused, naming exactly the range this sender sent, a batch: S is the last offset the server
+        confirmed and E the end of a batch this stream sent that began at S. Then the batch is
+        counted (`refused_batches`), E is saved as the offset, as an ack of E would be, and the next
+        stream goes on from E without sending those bytes again. Anything else (no range, a start or
+        an end that is not this sender's, an answer that cannot be read) moves nothing: the bytes go
+        again from the last confirmed offset, as before. Runs on the ack thread."""
+        try:
+            start, end = refused["start_byte_offset"], refused["end_byte_offset"]
+            column = refused.get("column")
+        except Exception:  # noqa: BLE001  not a range: nothing moves
+            return
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (start, end)) or end <= start:
+            return
+        with self._pending_lock:
+            identity = self._pending.get(end)
+            began = self._starts.get(end)
+        if identity is None or began != start or start != self._acked:
+            return
+        store = {"store_id": self._store_id} if self._store_id is not None else {}
+        write_offset(self.offset_path, end, {**self._destination, **identity, **store})
+        self._acked = end
+        with self._pending_lock:
+            for done in [done for done in self._pending if done <= end]:
+                del self._pending[done]
+                self._starts.pop(done, None)
+        self.refused_batches += 1
+        self.last_refused = {"start_byte_offset": start, "end_byte_offset": end,
+                             "column": column if isinstance(column, str) else None}
+        self._progress = True  # the offset moved: the next stream goes at once, not after a backoff
+        if not self._said_refused:
+            self._said_refused = True
+            try:
+                print(
+                    f"tensorquill: {self.endpoint} refused bytes {start} to {end} of {self.path} for good"
+                    f"{f' (column {column!r})' if isinstance(column, str) else ''}, so those steps are not stored "
+                    f"and are not sent again; the stream goes on from byte {end}. The local file has them. "
+                    "Said once; sender.refused_batches counts them.",
+                    file=sys.stderr,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
     def _say_moved(self, moved: list[tuple[int, str]]) -> None:
         """Count fields sent in `extra_json` because their column cannot hold the value, and say the
         first once per sender. Never raises."""
@@ -924,6 +1000,7 @@ class FlightSender:
         self._tail = (self._tail + data[-TAIL_BYTES:])[-TAIL_BYTES:]
         with self._pending_lock:
             self._pending[end] = {"head": _digest(self._head), "tail": _digest(self._tail)}
+            self._starts[end] = end - len(data)  # where the batch that ends here began (RS10)
 
     def _ack(self, offset: int, store_id: str | None = None) -> None:
         """Take the server's ack of `offset`, which names `store_id` when the server names its store.
@@ -955,6 +1032,7 @@ class FlightSender:
             with self._pending_lock:
                 for end in [end for end in self._pending if end <= offset]:
                     del self._pending[end]
+                    self._starts.pop(end, None)
             self._progress = True
             self.last_error = None
 
@@ -1006,6 +1084,8 @@ class FlightSender:
                             if not chose:
                                 return  # the stream failed before it chose: nothing of this store is taken
                         self._ack(offset, store_id)
+                        if "refused" in document:
+                            self._refusal(document["refused"])
                 except BaseException as error:  # noqa: BLE001
                     failure.append(error)
                     life["ack_error"] = self._brief(error)  # text only: an error's traceback holds this stream
@@ -1099,11 +1179,13 @@ class FlightSender:
                     writer.close()
                 except BaseException as error:  # noqa: BLE001  the first failure is the one to report
                     life["close_error"] = self._brief(error)
+                ended.wait(ACK_DRAIN_SECONDS)  # the answers sent before the status are taken first
                 raise
             try:
                 writer.close()
             except BaseException as error:
                 life["close_error"] = self._brief(error)
+                ended.wait(ACK_DRAIN_SECONDS)
                 raise
             if failure:
                 raise failure[0]
@@ -1285,6 +1367,10 @@ class Heartbeat:
         self._place_since = 0.0
         self.phase = "train"
         self.capture_stopped: str | None = None  # the stop's reason, once the session stopped capture
+        # The last step the session committed before it stopped, or None when it committed none
+        # (detector rules contract, part 7). Set before `capture_stopped`, so a beat that reads the
+        # reason reads the step that goes with it.
+        self.capture_stopped_step: int | None = None
         self._stop_told = False  # a beat carrying the stop was taken by the server
         self._counter: Any = None  # a callable returning the work done so far (steps + ticks)
         self.attempt: int | None = None  # the session's attempt, once it has handed over its counter
@@ -1339,11 +1425,16 @@ class Heartbeat:
         self.phase = str(phase)[:40] or "train"
         self._changed.set()
 
-    def stop_capture(self, reason: str) -> None:
+    def stop_capture(self, reason: str, step: int | None = None) -> None:
         """The session stopped capture (contract 3): from now on every beat says so, with `reason`,
-        and the next beat goes at once."""
+        and the next beat goes at once. Each such beat also carries `capture_stopped_step`
+        (detector rules contract, part 7): `step`, the last step the session committed before it
+        stopped, or null when it committed none or the caller gives none. Step 0 is a step, not
+        null. A value that is not a whole number of 0 or more (a bool among them) is sent as null."""
         if os.getpid() != self._pid or self.capture_stopped is not None:
             return
+        ok = isinstance(step, int) and not isinstance(step, bool) and step >= 0
+        self.capture_stopped_step = int(step) if ok else None
         self.capture_stopped = str(reason)[:40] or "unknown"
         self._changed.set()
 
@@ -1382,12 +1473,14 @@ class Heartbeat:
                     kwargs["tls_root_certs"] = self._tls_root_certs
                 client = flight.FlightClient(self._location, **kwargs)
             stopped = self.capture_stopped  # read once: the same value is sent and marked told
+            stopped_step = self.capture_stopped_step  # set before the reason (`stop_capture`)
             payload: dict[str, Any] = {"run_id": self._run_id, "rank": self._rank, "phase": self.phase,
                                        "interval_seconds": self.interval}
             if self.attempt is not None:
                 payload["attempt"] = self.attempt
             if stopped is not None:
                 payload["capture_stopped"] = stopped
+                payload["capture_stopped_step"] = stopped_step  # null: no step committed (part 7)
             if self.counter is not None:
                 payload["work"] = int(self.counter())
                 stack = None if stopped is not None else self._stalled_stack(payload["work"])

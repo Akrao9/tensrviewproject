@@ -585,3 +585,119 @@ def test_stream_end_a_stream_the_sender_closed_keeps_nothing(tmp_path, stand_in)
     sender = _sender(path, stand_in.endpoint)
     assert sender.close(timeout=20) is True
     assert sender.last_stream_end is None and sender.last_error is None
+
+
+# --- Item 6 (RS10): is the refusal's answer read before the status that ends the stream? -----
+
+def test_rs10_the_answer_is_read_before_the_status_every_time_with_pyarrows_server(tmp_path):
+    """The rule needs the sender's ack reader to take the server's last message (the refused range)
+    before the error status ends the call. With pyarrow's own server (the stand-in of
+    `test_rs10_sender.py`), 20 runs: each time the refusal is counted once, B is not sent again and
+    the saved offset reaches the end of C. Not shown for the real server, which is checked on the trial
+    tree. A stream that fails waits for its ack reader (`ACK_DRAIN_SECONDS`) before the next one
+    chooses where to start, so an answer that came before the status is never left unread."""
+    pytest.importorskip("pyarrow")
+    sys.path.insert(0, str(Path(__file__).parent))
+    import test_rs10_sender as rs10
+
+    from tensorquill.flight import offset_path, read_binding
+
+    for attempt in range(20):
+        one = rs10.Refusing(rs10.B[0], "exact")
+        try:
+            run = rs10.the_run(tmp_path / f"run{attempt}", one) if (tmp_path / f"run{attempt}").mkdir() is None else None
+            rs10.wait_for(lambda: one.held == run["after_c"], timeout=10.0)
+            assert run["sender"].close(timeout=5.0) is True
+            assert run["sender"].refused_batches == 1 and one.seen(rs10.B) == 1, attempt
+            assert read_binding(offset_path(run["path"]))["offset"] == run["after_c"], attempt
+            assert run["sender"].last_refused == {"start_byte_offset": run["after_a"],
+                                                  "end_byte_offset": run["after_b"], "column": "step"}
+        finally:
+            one.stop()
+
+
+# --- Item 7: the step at which capture stopped, on the heartbeat -----------------------------
+
+@pytest.fixture
+def beats():
+    import json
+
+    flight = _flight()
+
+    class Beats(flight.FlightServerBase):
+        def __init__(self) -> None:
+            super().__init__("grpc://127.0.0.1:0")
+            self.bodies: list[dict] = []
+
+        def do_action(self, context, action):
+            self.bodies.append(json.loads(action.body.to_pybytes()))
+            return iter([])
+
+    server = Beats()
+    threading.Thread(target=server.serve, daemon=True).start()
+    server.endpoint = f"grpc://127.0.0.1:{server.port}"
+    yield server
+    server.shutdown()
+
+
+def _beat_after_stop(beats, *stop):
+    from tensorquill.flight import Heartbeat
+
+    beat = Heartbeat(beats.endpoint, "run", 0, interval=30.0, stack_seconds=None)
+    beat.counter = lambda: 0  # the first beat goes at once
+    try:
+        _wait(lambda: len(beats.bodies) >= 1)
+        before = dict(beats.bodies[-1])
+        if stop:
+            beat.stop_capture(*stop[:1], **({"step": stop[1]} if len(stop) > 1 else {}))
+            _wait(lambda: any("capture_stopped" in body for body in beats.bodies))
+        return before, [body for body in beats.bodies if "capture_stopped" in body][-1] if stop else None
+    finally:
+        beat.close()
+
+
+def _case(name):
+    import json
+
+    cases = json.loads((Path(__file__).parent / "fixtures" / "rules" / "cases.json").read_text())
+    return cases["cases"][name]["heartbeat"]
+
+
+@pytest.mark.parametrize("case, step", [("capture_stopped_at_step_0", 0), ("capture_stopped_before_any_step", None)])
+def test_capture_stopped_step_a_beat_carries_the_cases_keys(beats, case, step):
+    """`capture_stopped_at_step_0` and `capture_stopped_before_any_step` (detector rules contract,
+    part 7): the beat after `stop_capture("sink_error", step)` carries `capture_stopped` and
+    `capture_stopped_step` as the case writes them: 0 and null stay apart."""
+    before, after = _beat_after_stop(beats, "sink_error", step)
+    expected = _case(case)
+    assert "capture_stopped" not in before and "capture_stopped_step" not in before
+    assert after["capture_stopped"] == expected["capture_stopped"]
+    assert "capture_stopped_step" in after and after["capture_stopped_step"] == expected["capture_stopped_step"]
+    assert (after["capture_stopped_step"] is None) is (step is None)
+
+
+def test_capture_stopped_step_a_caller_that_passes_no_step_sends_null(beats):
+    """The call site in `capture.py` passes no step until the merge changes it: its beats carry null."""
+    _, after = _beat_after_stop(beats, "writer_behind")
+    assert after["capture_stopped"] == "writer_behind" and after["capture_stopped_step"] is None
+
+
+@pytest.mark.parametrize("bad", [True, -1, 2.0, "7"])
+def test_capture_stopped_step_a_value_that_is_not_a_step_is_sent_as_null(beats, bad):
+    _, after = _beat_after_stop(beats, "sink_error", bad)
+    assert after["capture_stopped_step"] is None
+
+
+def test_capture_stopped_step_later_beats_keep_the_first_stop(beats):
+    from tensorquill.flight import Heartbeat
+
+    beat = Heartbeat(beats.endpoint, "run", 0, interval=0.05, stack_seconds=None)
+    beat.counter = lambda: 0
+    try:
+        beat.stop_capture("sink_error", 41)
+        beat.stop_capture("close_timeout", 99)  # a second stop changes nothing
+        _wait(lambda: sum("capture_stopped" in body for body in beats.bodies) >= 3)
+        stopped = [body for body in beats.bodies if "capture_stopped" in body]
+        assert all((b["capture_stopped"], b["capture_stopped_step"]) == ("sink_error", 41) for b in stopped)
+    finally:
+        beat.close()
