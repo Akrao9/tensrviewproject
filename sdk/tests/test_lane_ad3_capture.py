@@ -545,3 +545,148 @@ def test_a_fullgraph_compiled_clip_no_longer_raises_into_training_at_the_recompi
         torch._dynamo.reset()
     assert counters["stats"]["unique_graphs"] == 1
     assert len(sink.records) == 10 and all("clip_grad_norm" in r for r in sink.records)
+
+
+# --- Item 7 (contract part 7): `layers_not_read` and `moe_source` on the record ---------------------
+
+import json  # noqa: E402
+
+from tensorquill import flight  # noqa: E402
+
+
+class _Out(nn.Module):
+    """A block whose output is unreadable (`bad(step)` true: a sparse tensor) or a plain tensor."""
+
+    def __init__(self, bad) -> None:
+        super().__init__()
+        self.lin = nn.Linear(4, 4)
+        self.bad = bad
+        self.calls = 0
+
+    def forward(self, x):
+        y = self.lin(x)
+        bad = self.bad(self.calls)
+        self.calls += 1
+        return y.to_sparse() if bad else y
+
+
+class _Blocks(nn.Module):
+    def __init__(self, bad0, bad1) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList([_Out(bad0), _Out(bad1)])
+
+    def forward(self, x):
+        total = 0
+        for block in self.blocks:
+            out = block(x)
+            total = total + (out.to_dense() if out.layout != torch.strided else out).sum()
+        return total
+
+
+def _layer_records(bad0, bad1, steps=4, every=2):
+    model = _Blocks(bad0, bad1)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=every, layers=["blocks.0", "blocks.1"])
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    for _ in range(steps):
+        model(torch.randn(3, 4)).backward()
+        opt.step()
+        opt.zero_grad()
+    session.close()
+    return sink.records
+
+
+NEVER, ALWAYS = (lambda step: False), (lambda step: True)
+SPARSE = "its output is a sparse_coo tensor, not a dense one"
+
+
+def test_layers_not_read_names_the_module_that_is_never_read_once_on_the_first_record():
+    records = _layer_records(NEVER, ALWAYS)
+    assert records[0]["layers_not_read"] == {"blocks.1": SPARSE}
+    assert all("layers_not_read" not in r for r in records[1:])
+    assert all(set(r["layers"]) == {"blocks.0"} for r in records)
+
+
+def test_layers_not_read_names_every_module_when_none_is_read():
+    records = _layer_records(ALWAYS, ALWAYS)
+    assert records[0]["layers_not_read"] == {"blocks.0": SPARSE, "blocks.1": SPARSE}
+    assert all(r["layers"] == {} for r in records)
+    assert all("layers_not_read" not in r for r in records[1:])
+
+
+def test_a_module_unread_on_some_steps_and_read_on_others_is_not_named():
+    # Unreadable at the first step of the block and read on the others: a gap, not a limitation of
+    # the capture. Its records lack it on that step only, as v1 states.
+    # Beside it, a module never read, which is named.
+    records = _layer_records(ALWAYS, lambda step: step == 0, steps=4, every=4)
+    assert records[0]["layers_not_read"] == {"blocks.0": SPARSE}
+    assert all("layers_not_read" not in r for r in records[1:])
+    assert "blocks.1" not in records[0]["layers"] and all("blocks.1" in r["layers"] for r in records[1:])
+
+
+def test_layers_not_read_travels_in_extra_json_as_moe_refused_does():
+    records = _layer_records(NEVER, ALWAYS)
+    row = flight.record_to_row(records[0])
+    assert json.loads(row["extra_json"])["layers_not_read"] == {"blocks.1": SPARSE}
+    assert flight.row_to_record(row)["layers_not_read"] == {"blocks.1": SPARSE}
+
+
+SOURCES = {
+    "logits": {"form": "scores", "point": "requested"},
+    "integer ids": {"form": "indices", "point": "unknown"},
+    "indices=": {"form": "indices", "point": "unknown"},
+    "routing map": {"form": "map", "point": "unknown"},
+}
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("backend", [None, "aot_eager"], ids=["eager", "compiled"])
+@pytest.mark.parametrize("path", list(PATHS))
+def test_moe_source_says_the_form_and_the_point_once_on_the_first_record(path, backend, device):
+    records, _, _, _ = _count(path, device, backend)
+    assert records[0]["moe_source"] == {"router": SOURCES[path]}
+    assert all("moe_source" not in r for r in records[1:])
+    # Counts are as before: the two slots added for the form are not in `moe`.
+    assert all(len(r["moe"]["router"]) == E for r in records)
+
+
+def test_moe_source_never_says_dispatched_and_travels_in_extra_json():
+    for path in PATHS:
+        records, _, _, _ = _count(path, "cpu", None)
+        assert records[0]["moe_source"]["router"]["point"] != "dispatched"
+        row = flight.record_to_row(records[0])
+        assert flight.row_to_record(row)["moe_source"] == {"router": SOURCES[path]}
+
+
+def test_a_refused_router_has_no_moe_source_and_the_counted_one_beside_it_has():
+    torch.manual_seed(0)
+    model = _Net(lambda logits: logits)
+    model.other = _Gate(lambda logits: logits[..., :3])  # logits of another width: refused
+    forward = model.forward
+    model.forward = lambda x: (model.other(model.embed(x)), forward(x))[1]
+    sink = tensorquill.MemorySink()
+    with pytest.warns(RuntimeWarning, match="not counting the router 'other'"):
+        session = tensorquill.init(model, sink=sink, every=2, capture="routers",
+                                   routers={"router": Router(E, K), "other": Router(E, K)})
+        _router_steps(model, 2)
+        session.close()
+    assert "other" in sink.records[0]["moe_refused"]
+    assert sink.records[0]["moe_source"] == {"router": SOURCES["logits"]}
+
+
+def test_moe_source_waits_for_the_first_step_that_counted_the_router():
+    torch.manual_seed(0)
+    model = _Net(lambda logits: logits)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=1, capture="routers", routers={"router": Router(E, K)})
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    for step in range(3):
+        if step == 0:
+            model.head(model.embed(torch.randn(6, 20, 4))).pow(2).mean().backward()  # the router not called
+        else:
+            model(torch.randn(6, 20, 4)).backward()
+        opt.step()
+        opt.zero_grad()
+    session.close()
+    assert [("moe_source" in r) for r in sink.records] == [False, True, False]
+    assert sink.records[1]["moe_source"] == {"router": SOURCES["logits"]}
