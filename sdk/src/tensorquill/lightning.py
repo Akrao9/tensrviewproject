@@ -108,9 +108,11 @@ class TensorQuillCallback(L.Callback):
 
     def on_load_checkpoint(self, trainer: L.Trainer, pl_module: L.LightningModule, checkpoint: dict[str, Any]) -> None:
         # Lightning restores before `on_fit_start`, where the session begins: kept until then.
-        from .data import checkpoint_manifest
+        # Compared here with the module `init` is given there, and Lightning loads the checkpoint's
+        # `state_dict` into it, so that is the loader's entry (CHECKPOINT_TENSOR_CONTRACT.md).
+        from .data import load_manifest
 
-        self._loaded = checkpoint_manifest(checkpoint)
+        self._loaded = load_manifest(checkpoint, pl_module, model_state=checkpoint.get("state_dict"))
         step = checkpoint.get("global_step")
         self._loaded_step = step if isinstance(step, int) and not isinstance(step, bool) else 0
 

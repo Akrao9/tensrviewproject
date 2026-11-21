@@ -34,11 +34,13 @@ from torch.optim.optimizer import (
 )
 
 from .data import (
+    FOLDER_TENSORS,
     DataStep,
     WatchedLoader,
     checkpoint_manifest,
     data_fields,
     files_manifest,
+    load_manifest,
     optimizer_entries,
     optimizer_step_value,
 )
@@ -2540,7 +2542,7 @@ class Session:
             return loader
         return WatchedLoader(self, loader, ids=ids, epoch=epoch)
 
-    def checkpoint(self, state: Mapping[str, Any], *, event: str = "save") -> None:
+    def checkpoint(self, state: Mapping[str, Any], *, event: str = "save", model_state: Any = None) -> None:
         """Record what a checkpoint holds: call it with the dict passed to `torch.save`
         (`event="save"`) or the one loaded to resume (`event="load"`, before the first step).
 
@@ -2549,10 +2551,21 @@ class Session:
         `last_epoch`, the loss scale. A save is recorded with the last step taken (as
         `after_step`); a load with the next step, the first of the resumed run. The detectors
         then say what a resume did not restore.
+
+        At a load the checkpoint's tensors are also compared with the model given to `init`, by
+        name and shape (`tensors` on the manifest; CHECKPOINT_TENSOR_CONTRACT.md): the model is
+        read from its modules' own parameter and buffer tables, never through `state_dict()`, and
+        no tensor's values are read. `model_state=` is the mapping passed to `load_state_dict`
+        (`model_state=state["model"]`), which says which entry is the model's; without it the
+        entry is found by its key and its names. A save is not compared, and `model_state` is
+        not read there.
         """
         if self._closed_call("checkpoint()"):
             return
-        self._record_manifest(checkpoint_manifest(state), event)
+        if event == "load":
+            self._record_manifest(load_manifest(state, self._model, model_state=model_state), event)
+        else:
+            self._record_manifest(checkpoint_manifest(state), event)
 
     def checkpoint_files(self, folder: str | Path, *, event: str = "save") -> None:
         """`checkpoint` for a checkpoint folder, as the Hugging Face `Trainer` and Accelerate's
@@ -2565,7 +2578,10 @@ class Session:
             names = [entry.name for entry in Path(folder).iterdir()]
         except OSError:
             return
-        self._record_manifest(files_manifest(names), event)
+        manifest = files_manifest(names)
+        if event == "load":  # no file is opened, so no tensor name is known
+            manifest["tensors"] = dict(FOLDER_TENSORS)
+        self._record_manifest(manifest, event)
 
     def _record_manifest(self, manifest: dict[str, Any], event: str) -> None:
         if event not in ("save", "load"):

@@ -10,7 +10,9 @@ identities of each (counts, an optimizer's step, a scheduler's `last_epoch`, a l
   yields (map-style datasets) or the ids a callable takes from each batch (`ids=`, needed for
   an `IterableDataset`, whose sampler yields no indices).
 - `session.checkpoint(state, event="save" | "load")` records the manifest of the state dict
-  that was saved or loaded.
+  that was saved or loaded. At a load the checkpoint's tensors are also compared with the
+  model's by name and shape (`load_manifest`, CHECKPOINT_TENSOR_CONTRACT.md): names and shapes
+  only, read from each module's own tables, never through `state_dict()`.
 
 The hash is BLAKE2b (8 bytes, unkeyed) over each batch's length and bytes, in order, so
 every process, rank and attempt that draws the same samples in the same order gets the same
@@ -663,6 +665,362 @@ def files_manifest(names: Iterable[str]) -> dict[str, Any]:
         if kind is not None:
             components.setdefault(kind, {"files": []})["files"].append(name)
     return {"components": {name: components[name] for name in COMPONENTS if name in components}}
+
+
+# --- a checkpoint's tensors against the model's (CHECKPOINT_TENSOR_CONTRACT.md) ----------------
+#
+# At a load only. The model is read from each module's own parameter and buffer tables, through
+# `torch.nn.Module`'s own functions, never through `state_dict()`: a distributed wrapper's state
+# export can gather from other ranks, and a state-dict hook may do anything. Only names, shapes,
+# `requires_grad` and which names are one parameter are read; no tensor's values, so nothing waits
+# on a device. The checkpoint's side is the names and shapes of the mapping already in memory.
+
+NAMES_LISTED = 50  # a list's names in the manifest, sorted; `count` is the whole number
+FOLDER_TENSORS = {"state": "unavailable", "why": "folder"}  # `checkpoint_files` at a load: no file is opened
+_WRAPPERS = ("module.", "_orig_mod.")  # DDP's and `torch.compile`'s, removed from every name on both sides
+# A key is conventional when its last word (a trailing `state`, `states` or `dict` set aside) is one
+# of these, or it is `state_dict`, and none of its words names an averaged copy.
+_CONVENTIONAL_WORDS = frozenset(("model", "net", "module", "network", "weights"))
+_AVERAGED_WORDS = frozenset(("ema", "swa", "shadow", "avg", "average", "averaged"))
+# The functions of `torch.nn.Module` the walk below calls, and the ones the contract names: a module
+# that replaces any of them with its own is not read (`model_not_readable`).
+_WALK = ("named_parameters", "named_buffers", "named_modules", "named_children")
+
+
+class _NotReadable(Exception):
+    """The model cannot be read by the local path: a module replaces PyTorch's own walk."""
+
+
+def _strip_wrappers(name: str) -> str:
+    while True:
+        for wrapper in _WRAPPERS:
+            if name.startswith(wrapper):
+                name = name[len(wrapper):]
+                break
+        else:
+            return name
+
+
+def _replaces_walk(module: Any) -> bool:
+    own = vars(module)
+    cls = type(module)
+    return any(name in own or getattr(cls, name, None) is not getattr(torch.nn.Module, name) for name in _WALK)
+
+
+def _read_model(model: Any) -> list[tuple[str, list[int], str, int | None]]:
+    """The model's tensors as `state_dict()` would name them, without calling it: `(name, shape,
+    kind, identity)`, kind "p" a trainable parameter, "f" a frozen one, "b" a saved buffer; the
+    identity (`id`) of a parameter tells two names that are one parameter.
+
+    Each module is checked before anything of it is called. Its parameters and buffers are read
+    with `torch.nn.Module.named_parameters` and `named_buffers`, not recursing, duplicates kept (as
+    `state_dict()` writes a tied weight under each name); a buffer named in the module's
+    `_non_persistent_buffers_set` is left out, and a module without that set lists no buffer. Its
+    children are `torch.nn.Module.named_children`, which lists a module held twice by one parent
+    once; `state_dict()` would name it twice."""
+    if not isinstance(model, torch.nn.Module):
+        raise _NotReadable
+    out: list[tuple[str, list[int], str, int | None]] = []
+    on_path: set[int] = set()
+
+    def walk(prefix: str, module: Any) -> None:
+        if _replaces_walk(module):
+            raise _NotReadable
+        on_path.add(id(module))
+        for name, parameter in torch.nn.Module.named_parameters(module, recurse=False, remove_duplicate=False):
+            out.append((prefix + name, list(parameter.shape), "p" if parameter.requires_grad else "f", id(parameter)))
+        not_saved = vars(module).get("_non_persistent_buffers_set")
+        if isinstance(not_saved, (set, frozenset)):
+            for name, buffer in torch.nn.Module.named_buffers(module, recurse=False, remove_duplicate=False):
+                if name not in not_saved:
+                    out.append((prefix + name, list(buffer.shape), "b", None))
+        for name, child in torch.nn.Module.named_children(module):
+            if id(child) not in on_path:  # a module that holds itself: state_dict() would not end
+                walk(f"{prefix}{name}.", child)
+        on_path.discard(id(module))
+
+    walk("", model)
+    return out
+
+
+def _entry_shapes(value: Any, *, loose: bool = False) -> dict[str, list[int]] | None:
+    """`{key: shape}` of a mapping that holds a model's tensors under string keys: every entry a
+    tensor or a module's extra state, at least one tensor. None when it is not one. `loose` (the
+    entry the loader named) takes the tensors under string keys and passes over the rest."""
+    if not isinstance(value, Mapping):
+        return None
+    shapes: dict[str, list[int]] = {}
+    for key, item in value.items():
+        if isinstance(item, torch.Tensor) and isinstance(key, str):
+            shapes[key] = list(item.shape)
+        elif not loose and not _extra_state_key(key):
+            return None
+    return shapes or (None if not loose else {})
+
+
+def _not_looked_at(key: str, value: Any) -> bool:
+    found = _classify(key, value) if isinstance(value, Mapping) else None
+    return found is not None and found[0] in ("optimizer", "scheduler", "scaler")
+
+
+def _entries(state: Mapping[Any, Any]) -> list[tuple[str | None, Mapping[Any, Any], dict[str, list[int]]]]:
+    """Every mapping of tensors in the checkpoint, at the top level or one level down (`outer.inner`),
+    or the checkpoint itself when its tensors sit directly in it (key None). An optimizer's, a
+    scheduler's or a scaler's state is not looked at."""
+    own = _entry_shapes(state)
+    if own is not None:
+        return [(None, state, own)]
+    found: list[tuple[str | None, Mapping[Any, Any], dict[str, list[int]]]] = []
+    for key, value in state.items():
+        key = str(key)
+        if not isinstance(value, Mapping) or _not_looked_at(key, value):
+            continue
+        shapes = _entry_shapes(value)
+        if shapes is not None:
+            found.append((key, value, shapes))
+            continue
+        for child_key, child in value.items():
+            inner = f"{key}.{child_key}"
+            if isinstance(child, Mapping) and not _not_looked_at(inner, child):
+                shapes = _entry_shapes(child)
+                if shapes is not None:
+                    found.append((inner, child, shapes))
+    return found
+
+
+def _conventional(key: str | None) -> bool:
+    """A key that names a model and no averaged copy: `model`, `state_dict`, `net`, `module`,
+    `network`, `weights`, by the last word of its last dotted part; not `ema`, `model_ema`,
+    `swa_model`, `shadow`, `avg_net`."""
+    if key is None:
+        return False
+    name = key.rsplit(".", 1)[-1].lower()
+    if any(word in _AVERAGED_WORDS for word in _WORD_BREAKS.split(name)):
+        return False
+    word = _last_word(name)
+    return word == "state_dict" or word in _CONVENTIONAL_WORDS
+
+
+def _leading_paths(name: str) -> Iterator[str]:
+    start = name.find(".")
+    while 0 < start < len(name) - 1:
+        yield name[:start + 1]
+        start = name.find(".", start + 1)
+
+
+def _passes(matched: int, entry_names: int, model_names: int) -> bool:
+    """The filter: at least half of the entry's names are the model's, or at least half of the
+    model's names are in the entry (and at least one name is shared)."""
+    return matched > 0 and (2 * matched >= entry_names or 2 * matched >= model_names)
+
+
+def _stripped(names: Iterable[str], path: str) -> set[str]:
+    return {name[len(path):] if name.startswith(path) else name for name in names}
+
+
+class _Match:
+    """One entry set against the model: its names made comparable, and how many both hold."""
+
+    def __init__(self, key: str | None, mapping: Mapping[Any, Any], shapes: dict[str, list[int]],
+                 model: dict[str, tuple[list[int], str, int | None]]) -> None:
+        self.key, self.mapping, self.shapes = key, mapping, shapes
+        self.entry = {}  # comparable name -> the entry's own key
+        for raw in shapes:
+            self.entry.setdefault(_strip_wrappers(raw), raw)
+        self.model = {name: name for name in model}  # comparable name -> the model's name
+        self.prefix: dict[str, str] | None = None
+        self.matched = sum(name in self.model for name in self.entry)
+        if not self.passes():
+            self._try_prefix()
+
+    def passes(self) -> bool:
+        return _passes(self.matched, len(self.entry), len(self.model))
+
+    def _try_prefix(self) -> None:
+        """One leading dotted path removed from one side, the one that leaves the most names in
+        common, kept when the entry then passes. Scored in one pass over each name's paths (an
+        upper bound: two names can become one), then counted exactly from the best down."""
+        entry, model = set(self.entry), set(self.model)
+        bound: collections.Counter[tuple[int, int, str]] = collections.Counter()
+        for side, names, other in ((0, entry, model), (1, model, entry)):
+            for name in names:
+                for path in _leading_paths(name):
+                    bound[(side, len(path), path)] += (name[len(path):] in other) - (name in other)
+        best: tuple[int, tuple[int, int, str]] | None = None
+        for (side, length, path), gain in sorted(bound.items(), key=lambda kv: (-kv[1], kv[0])):
+            # A removal that adds no name in common cannot make a failing entry pass, and one whose
+            # bound is no more than the best counted cannot beat it (ties keep the first in order).
+            if gain <= 0 or (best is not None and self.matched + gain <= best[0]):
+                break
+            exact = len((_stripped(entry, path) & model) if side == 0 else (_stripped(model, path) & entry))
+            if best is None or exact > best[0]:
+                best = (exact, (side, length, path))
+        if best is None or not _passes(best[0], len(self.entry), len(self.model)):
+            return
+        side, _, path = best[1]
+        if side == 0:
+            self.entry = {}
+            for raw in self.shapes:
+                name = _strip_wrappers(raw)
+                self.entry.setdefault(name[len(path):] if name.startswith(path) else name, raw)
+        else:
+            self.model = {}
+            for name in model:
+                self.model.setdefault(name[len(path):] if name.startswith(path) else name, name)
+        self.matched = sum(name in self.model for name in self.entry)
+        self.prefix = {"side": "checkpoint" if side == 0 else "model", "removed": path}
+
+    def closest(self) -> dict[str, Any]:
+        return {"entry": self.key, "checkpoint": len(self.shapes), "matched": self.matched}
+
+
+def _holds_half(match: _Match, model: dict[str, tuple[list[int], str, int | None]]) -> bool:
+    """Whether an inferred entry (rules 2 and 4) holds at least half of the model's names: a share,
+    not a count, with a name that is the same parameter as a name the entry holds counted as held."""
+    held = {match.model[name] for name in match.entry if name in match.model}
+    identities = {model[name][2] for name in held if model[name][1] != "b"}
+    tied = sum(1 for name, (_, kind, identity) in model.items()
+               if name not in held and kind != "b" and identity in identities)
+    return 2 * (len(held) + tied) >= len(model)
+
+
+def _listed(names: Iterable[str]) -> dict[str, Any]:
+    found = sorted(names)
+    return {"count": len(found), "names": found[:NAMES_LISTED]}
+
+
+def _compared(match: _Match, by: str, model: dict[str, tuple[list[int], str, int | None]]) -> dict[str, Any]:
+    held = {match.model[name] for name in match.entry if name in match.model}  # the model's names the entry holds
+    held_parameters = {model[name][2] for name in held if model[name][1] != "b"}
+    lists: dict[str, list[str]] = {key: [] for key in (
+        "missing", "missing_frozen", "missing_buffers", "unexpected", "shape_differs", "tied")}
+    shapes: dict[str, dict[str, list[int]]] = {}
+    by_model_name = {model_name: comparable for comparable, model_name in match.model.items()}
+    for name, (shape, kind, identity) in model.items():
+        if name in held:
+            theirs = match.shapes[match.entry[by_model_name[name]]]
+            if theirs != shape:
+                lists["shape_differs"].append(name)
+                shapes[name] = {"model": shape, "checkpoint": theirs}
+        elif kind != "b" and identity in held_parameters:
+            lists["tied"].append(name)
+        else:
+            lists[{"p": "missing", "f": "missing_frozen", "b": "missing_buffers"}[kind]].append(name)
+    lists["unexpected"] = [raw for name, raw in match.entry.items() if name not in match.model]
+    out: dict[str, Any] = {
+        "state": "compared", "entry": match.key, "by": by, "model": len(model),
+        "trainable": sum(kind == "p" for _, kind, _ in model.values()),
+        "checkpoint": len(match.shapes), "matched": match.matched,
+    }
+    for key, names in lists.items():
+        if names:
+            out[key] = _listed(names)
+    if "shape_differs" in out:
+        out["shape_differs"]["shapes"] = {name: shapes[name] for name in out["shape_differs"]["names"]}
+    if match.prefix is not None:
+        out["prefix"] = match.prefix
+    return out
+
+
+def _key_of(state: Mapping[Any, Any], mapping: Mapping[Any, Any]) -> str | None:
+    """The key under which `state` holds `mapping` itself (by identity), at the top level or one
+    level down as `outer.inner`; None for the checkpoint itself, or a mapping it does not hold."""
+    for key, value in state.items():
+        if value is mapping:
+            return str(key)
+    for key, value in state.items():
+        if isinstance(value, Mapping):
+            for child_key, child in value.items():
+                if child is mapping:
+                    return f"{key}.{child_key}"
+    return None
+
+
+def _unavailable(why: str, **more: Any) -> dict[str, Any]:
+    return {"state": "unavailable", "why": why, **more}
+
+
+def tensor_coverage(
+    state: Mapping[Any, Any], model: Any, *, model_state: Any = None
+) -> tuple[dict[str, Any], _Match | None]:
+    """The load manifest's `tensors` object (CHECKPOINT_TENSOR_CONTRACT.md, sections 1 to 3), and
+    the entry it names as the model's (compared, or the loader's entry whose names differ). May
+    raise; `load_manifest` turns a raise into `error`."""
+    try:
+        rows = _read_model(model)
+    except _NotReadable:
+        return _unavailable("model_not_readable"), None
+    names: dict[str, tuple[list[int], str, int | None]] = {}
+    for name, shape, kind, identity in rows:
+        names.setdefault(_strip_wrappers(name), (shape, kind, identity))
+    # Rule 1: the loader named the entry (`model_state=`, the Lightning adapter): the very mapping
+    # given to `load_state_dict`, found among the entries by identity.
+    if isinstance(model_state, Mapping):
+        match = _Match(_key_of(state, model_state), model_state, _entry_shapes(model_state, loose=True) or {}, names)
+        if match.passes():
+            return _compared(match, "loader", names), match
+        return _unavailable("names_differ", closest=match.closest()), match
+    matches = [_Match(key, mapping, shapes, names) for key, mapping, shapes in _entries(state)]
+    passing = [m for m in matches if m.passes()]
+    conventional = [m for m in passing if _conventional(m.key)]
+    if len(conventional) == 1:  # rule 2: the key says which entry is looked at, its names whether it is compared
+        match = conventional[0]
+        if _holds_half(match, names):
+            return _compared(match, "name", names), match
+        return _unavailable("weak_match", closest=match.closest()), None
+    if len(conventional) > 1:  # rule 3
+        return _unavailable("ambiguous", candidates=sorted(str(m.key) for m in conventional)), None
+    if len(passing) == 1:  # rule 4
+        match = passing[0]
+        if _holds_half(match, names):
+            return _compared(match, "names", names), match
+        return _unavailable("weak_match", closest=match.closest()), None
+    if len(passing) > 1:  # rule 5
+        return _unavailable("ambiguous", candidates=sorted(str(m.key) for m in passing)), None
+    # Rule 6: no entry passes. The closest is the one that shares the most names, when one shares any.
+    sharing = sorted((m for m in matches if m.matched > 0), key=lambda m: (-m.matched, str(m.key)))
+    return (_unavailable("not_identified", closest=sharing[0].closest()) if sharing
+            else _unavailable("not_identified")), None
+
+
+def _with_model_entry(manifest: dict[str, Any], tensors: Mapping[str, Any], match: _Match | None) -> dict[str, Any]:
+    """`components.model` at a load (section 2): the entry compared, or the loader's entry whose
+    names differ; absent when no entry is the model's; otherwise today's."""
+    components = dict(manifest["components"])
+    other = list(manifest.get("other", ()))
+    today = components.get("model")
+    today_keys = list(today.get("keys", ())) if isinstance(today, Mapping) else []
+    if match is not None:
+        own = set(map(str, match.mapping)) if match.key is None else {match.key}
+        components["model"] = {
+            "tensors": sum(isinstance(v, torch.Tensor) for v in match.mapping.values()),
+            "keys_hash": _keys_hash(match.mapping.keys()),
+            "keys": ([] if match.key is None else [match.key]) + [k for k in today_keys if k != match.key],
+        }
+        other = [k for k in other if k not in own]
+    elif tensors.get("why") == "not_identified" and today is not None:
+        del components["model"]
+        other = (other + [k for k in today_keys if k not in other])[:_MAX_OTHER]
+    out = {**manifest, "components": {name: components[name] for name in COMPONENTS if name in components}}
+    if other:
+        out["other"] = other
+    else:
+        out.pop("other", None)
+    return out
+
+
+def load_manifest(state: Mapping[str, Any], model: Any, *, model_state: Any = None) -> dict[str, Any]:
+    """`checkpoint_manifest(state)` for a load, compared with `model`: with `tensors`, and
+    `components.model` as section 2 of CHECKPOINT_TENSOR_CONTRACT.md says. Never raises from the
+    comparison: the manifest is then today's with `{"state": "unavailable", "why": "error"}`."""
+    manifest = checkpoint_manifest(state)
+    try:
+        tensors, match = tensor_coverage(state, model, model_state=model_state)
+        out = _with_model_entry(manifest, tensors, match)
+    except Exception:  # noqa: BLE001  nothing here may stop the training
+        return {**manifest, "tensors": _unavailable("error")}
+    out["tensors"] = tensors
+    return out
 
 
 def optimizer_entries(optimizer: Any) -> int:

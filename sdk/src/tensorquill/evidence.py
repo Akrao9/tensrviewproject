@@ -26,7 +26,13 @@ from typing import Any, Iterable, Mapping
 
 from . import manifest as _manifest
 from .sink import read_end_marker
-from .data_checks import DATA_STALL_STEPS, detect_data_stalled, detect_epoch_order_repeated, detect_resume_state
+from .data_checks import (
+    CHANGES_LISTED,
+    DATA_STALL_STEPS,
+    detect_data_stalled,
+    detect_epoch_order_repeated,
+    detect_resume_state,
+)
 from .evidence_system import (
     INPUT_WINDOW,
     MEMORY_GROWTH_READINGS,
@@ -3172,6 +3178,8 @@ def _report_evidence(
         **({"not_checked": not_checked} if not_checked else {}),
         # The server's count of skipped updates by who reported them, passed on unchanged.
         **({"skipped_updates": dict(found)} if isinstance(found := report.get("skipped_updates"), Mapping) else {}),
+        # The server's `checkpoint_tensors` block (CHECKPOINT_TENSOR_CONTRACT.md, section 4), unchanged.
+        **({"checkpoint_tensors": dict(served)} if isinstance(served := report.get("checkpoint_tensors"), Mapping) else {}),
         **({"head_trends": dict(heads)} if isinstance(heads := report.get("head_trends"), Mapping) and heads else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
         **({"traincheck": traincheck_summary} if traincheck_summary else {}),
@@ -4373,6 +4381,8 @@ def combine_rank_evidence(
             {n: per_rank[n].get("head_trends") for n in judged})) else {}),
         **({"skipped_updates_by_rank": skips} if (skips := _skipped_updates_by_rank(
             {n: per_rank[n].get("skipped_updates") for n in judged})) else {}),
+        **({"checkpoint_tensors_by_rank": blocks} if (blocks := _checkpoint_tensors_by_rank(
+            {n: per_rank[n].get("checkpoint_tensors") for n in judged})) else {}),
     }
     stated = {n: found for n in judged if (found := stated_kind_checks(per_rank[n])) is not None}
     silent = [n for n in judged if n not in stated]
@@ -4430,6 +4440,25 @@ def _skipped_updates_by_rank(found: Mapping[int, Any]) -> list[dict[str, Any]]:
     own, and a rank without the key has a capture written before it."""
     return [{"rank": number, "skipped_updates": dict(skips)} for number, skips in sorted(found.items())
             if isinstance(skips, Mapping)]
+
+
+def _checkpoint_tensors_by_rank(found: Mapping[int, Any]) -> list[dict[str, Any]]:
+    """Each judged rank's `checkpoint_tensors` (CHECKPOINT_TENSOR_CONTRACT.md, section 4), for the
+    all-ranks view's `checkpoint_tensors_by_rank`, as `skipped_updates_by_rank` carries its key:
+    `{"rank", "checkpoint_tensors"}` for each rank whose evidence or report has the block, by rank,
+    unchanged. Each rank loaded its own checkpoint, so the blocks are not added up."""
+    return [{"rank": number, "checkpoint_tensors": dict(block)} for number, block in sorted(found.items())
+            if isinstance(block, Mapping)]
+
+
+def checkpoint_tensors_block(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The evidence's `checkpoint_tensors` (CHECKPOINT_TENSOR_CONTRACT.md, section 4): how many
+    judged resumes' loads recorded `tensors` that is `compared` or `unavailable`, and the first
+    five by step, as `resume_incomplete` lists its changes. None when there is none, so a capture
+    written before the key gives the evidence it gave."""
+    if not entries:
+        return None
+    return {"resumes": len(entries), "entries": sorted(entries, key=lambda e: e["step"])[:CHANGES_LISTED]}
 
 
 def _all_ranks_reported(evidence: Mapping[str, Any]) -> dict[Any, set[int]]:
@@ -4683,6 +4712,8 @@ def _all_ranks_evidence(
             {n: looks[n]["report"].get("head_trends") for n in judged})) else {}),
         **({"skipped_updates_by_rank": skips} if (skips := _skipped_updates_by_rank(
             {n: looks[n]["report"].get("skipped_updates") for n in judged})) else {}),
+        **({"checkpoint_tensors_by_rank": blocks} if (blocks := _checkpoint_tensors_by_rank(
+            {n: looks[n]["report"].get("checkpoint_tensors") for n in judged})) else {}),
         "ranks": entries,
         **({"not_checked": not_checked} if not_checked else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
@@ -6024,6 +6055,7 @@ def build_evidence(
     not_checked: list[dict[str, Any]]
     rank_checks: dict[str, dict[str, Any]]
     from_rust: list[dict[str, Any]] | None = None
+    tensor_entries: list[dict[str, Any]] = []  # each judged resume's `tensors` (`checkpoint_tensors`)
     if detectors == "rust" and every_attempt:
         from .server_detect import server_report
 
@@ -6120,7 +6152,8 @@ def build_evidence(
         resume_hit = detect_resume_lr_changes(every_attempt, not_checked=not_checked)
         if resume_hit is not None:
             incidents.append(resume_hit)
-        incidents.extend(hit for hit in detect_resume_state(every_attempt, not_checked=not_checked) if hit is not None)
+        incidents.extend(hit for hit in detect_resume_state(
+            every_attempt, not_checked=not_checked, tensors=tensor_entries) if hit is not None)
         for data_detector in (detect_data_stalled, detect_epoch_order_repeated):
             data_hit = data_detector(records)
             if data_hit is not None:
@@ -6232,6 +6265,11 @@ def build_evidence(
         **({"skipped_updates": skipped} if (skipped := (
             dict(report["skipped_updates"]) if from_rust is not None and isinstance(report.get("skipped_updates"), Mapping)
             else skipped_updates(records))) else {}),
+        # What each judged resume's load said of the checkpoint's tensors (CHECKPOINT_TENSOR_CONTRACT.md,
+        # section 4): the server's block, else built here; only where a load recorded `tensors`.
+        **({"checkpoint_tensors": tensors_block} if (tensors_block := (
+            (dict(served) if isinstance(served := report.get("checkpoint_tensors"), Mapping) else None)
+            if from_rust is not None else checkpoint_tensors_block(tensor_entries))) else {}),
         **({"lines_left_out": left_out} if left_out else {}),
         # Rows of an attempt after a later attempt's first row (contract 1): kept, not progress.
         **({"superseded_rows": late} if (late := superseded_rows(every_attempt)) else {}),
@@ -6549,6 +6587,27 @@ def _describe_attention(incident: Mapping[str, Any]) -> str:
     )
 
 
+# The words of a `resume_incomplete` finding on a load's tensors (CHECKPOINT_TENSOR_CONTRACT.md,
+# section 4): singular and plural, then the names, at most five.
+_TENSOR_WORDS = {
+    "missing_tensors": ("trainable tensor", "trainable tensors", "not in the checkpoint"),
+    "shape_differs": ("tensor", "tensors", "with another shape in the checkpoint"),
+}
+TENSORS_NAMED = 5
+
+
+def _tensor_words(finding: Mapping[str, Any]) -> str | None:
+    """ "2 trainable tensors not in the checkpoint: a, b"; past five names, "and 55 more"."""
+    said = _TENSOR_WORDS.get(finding.get("finding"))  # type: ignore[arg-type]
+    count = finding.get("count")
+    if said is None or not isinstance(count, int) or isinstance(count, bool):
+        return None
+    names = [str(name) for name in finding.get("tensors") or ()][:TENSORS_NAMED]
+    more = count - len(names)
+    listed = ", ".join(names) + (f" and {more} more" if more > 0 and names else "")
+    return f"{count} {said[0] if count == 1 else said[1]} {said[2]}" + (f": {listed}" if listed else "")
+
+
 def _describe(incident: Mapping[str, Any]) -> str | None:
     kind = incident["kind"]
     if kind == "update_spike":
@@ -6747,7 +6806,8 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
                  "empty": "started empty", "empty_in_checkpoint": "empty in the checkpoint",
                  "step_reset": "step counter back at 1", "position": "last_epoch far from the step",
                  "initial_scale": "back at its initial value"}
-        found = "; ".join(f"{f['component']} {words.get(f['finding'], f['finding'])}" for f in change["findings"])
+        found = "; ".join(f"{f['component']} {_tensor_words(f) or words.get(f['finding'], f['finding'])}"
+                          for f in change["findings"])
         source = {"load": " (from the loaded checkpoint's manifest and the first step)",
                   "save": f" (assuming it loaded the save after step {change.get('saved_after_step')})"}.get(change["source"], "")
         return (
