@@ -11,6 +11,8 @@ parameter drift.
 from __future__ import annotations
 
 import argparse
+import bisect
+import contextvars
 import copy
 import json
 import math
@@ -7091,21 +7093,43 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
     from .compact import require_table
 
     compared_here = require_table(evidence, step, layer)
-    samples = {(int(s["step"]), int(s["layer"])): s for s in evidence.get("samples", ())}
-    prior_steps = [s for s, l in samples if l == layer and s < step]
-    active_priors = [
-        s
-        for s in prior_steps
-        if not samples[s, layer].get("missing") and samples[s, layer].get("routed_tokens", 0) > 0
-    ]
-    previous: int | None
-    if active_priors:
-        previous = max(active_priors)
-    elif prior_steps:
-        previous = max(prior_steps)
-    else:
-        previous = None  # the layer's first step: nothing earlier to compare it with
-    return _expert_load_text(evidence, samples, step, layer, previous, compared_here)
+    lookup = _TABLE_LOOKUP.get()
+    if lookup is None or lookup.evidence is not evidence:
+        lookup = _SampleLookup(evidence)  # for this table alone
+    return _expert_load_text(evidence, lookup.samples, step, layer, lookup.previous(step, layer), compared_here)
+
+
+class _SampleLookup:
+    """The samples of one evidence by `(step, layer)` (the last of a key wins), and each layer's steps
+    in order, all of them and those on which the router routed tokens: what `expert_load_table`
+    reads. `export_rerun` makes one for the whole recording and puts it in `_TABLE_LOOKUP` while it
+    tables every step (lane AD11: each table made it again, so the export was quadratic in the steps)."""
+
+    def __init__(self, evidence: Mapping[str, Any]) -> None:
+        self.evidence = evidence
+        self.samples = {(int(s["step"]), int(s["layer"])): s for s in evidence.get("samples", ())}
+        steps: dict[Any, list[int]] = {}
+        for step, layer in self.samples:
+            steps.setdefault(layer, []).append(step)
+        self.steps = {layer: sorted(found) for layer, found in steps.items()}
+        self.routed = {
+            layer: [s for s in found if not self.samples[s, layer].get("missing")
+                    and self.samples[s, layer].get("routed_tokens", 0) > 0]
+            for layer, found in self.steps.items()
+        }
+
+    def previous(self, step: int, layer: int) -> int | None:
+        """The step `step` is compared with: the last earlier one of the layer on which the router routed
+        tokens, else the last earlier one, else None (the layer's first step: nothing to compare it with)."""
+        for found in (self.routed.get(layer, ()), self.steps.get(layer, ())):
+            index = bisect.bisect_left(found, step)
+            if index:
+                return found[index - 1]
+        return None
+
+
+# The lookup `export_rerun` made for the evidence it is recording, while it tables its steps.
+_TABLE_LOOKUP: contextvars.ContextVar[_SampleLookup | None] = contextvars.ContextVar("tensorquill_table_lookup", default=None)
 
 
 def _expert_load_text(
@@ -7116,9 +7140,8 @@ def _expert_load_text(
     previous: int | None,
     compared_here: bool,
 ) -> str:
-    """`expert_load_table`'s text, from its lookup of the samples by `(step, layer)` and the step it
-    compares with (`previous`, None at the layer's first step). `export_rerun` builds the lookup once
-    and walks the steps in order, where a table built step by step rebuilt it for every step (lane AD11)."""
+    """`expert_load_table`'s text, from the samples by `(step, layer)` and the step it is compared
+    with (`previous`, None at the layer's first step), as `_SampleLookup` finds them."""
     expert_count = int(evidence.get("expert_count", 0))
     sample = samples.get((step, layer)) or _missing_sample(step, layer, expert_count)
     if not compared_here:
@@ -8036,33 +8059,20 @@ def export_rerun(
                 )
             )
             # Every step, the first among them: a one-step recording has its table too (DET-14).
-            # The table of each step is `expert_load_table`'s, from the one lookup `by_key` (lane AD11:
-            # building it for every step made the export quadratic in the number of steps). The step
-            # compared with is the last earlier one of the layer on which the router routed tokens,
-            # else the last earlier one, found walking the layer's steps in order.
-            from .compact import require_table
-
-            layer_steps = sorted(s for s, l in by_key if l == incident_layer)
-            walked = 0
-            prior: int | None = None
-            active_prior: int | None = None
-            for step in steps:
-                rr.set_time("training_step", sequence=step)
-                compared_here = require_table(evidence, step, incident_layer)
-                while walked < len(layer_steps) and layer_steps[walked] < step:
-                    prior = layer_steps[walked]
-                    earlier = by_key[prior, incident_layer]
-                    if not earlier.get("missing") and earlier.get("routed_tokens", 0) > 0:
-                        active_prior = prior
-                    walked += 1
-                rr.log(
-                    "/incident/expert_load",
-                    rr.TextDocument(
-                        _expert_load_text(evidence, by_key, step, incident_layer,
-                                          active_prior if active_prior is not None else prior, compared_here),
-                        media_type=rr.MediaType.MARKDOWN,
-                    ),
-                )
+            # The tables read one lookup of the samples, made here (lane AD11).
+            looked_up = _TABLE_LOOKUP.set(_SampleLookup(evidence))
+            try:
+                for step in steps:
+                    rr.set_time("training_step", sequence=step)
+                    rr.log(
+                        "/incident/expert_load",
+                        rr.TextDocument(
+                            expert_load_table(evidence, step, incident_layer),
+                            media_type=rr.MediaType.MARKDOWN,
+                        ),
+                    )
+            finally:
+                _TABLE_LOOKUP.reset(looked_up)
             for layer in range(1, layer_count + 1):
                 rr.log(
                     f"/routing/layers/layer-{layer:02}",
