@@ -30,11 +30,20 @@ CASES = Path(__file__).parent / "fixtures" / "replica"
 FILES = ("no_incident_cases.json", "incident_cases.json")
 
 
+# D1 (contract 4a): `attribution` is compared with the file that holds it, everything else with the
+# two earlier files. Each case's `expected` here is the earlier file's with the attribution entries
+# that `attribution_cases.json` says D1 adds to it (none: no key).
+SAID_OF_EARLIER = json.loads((CASES / "attribution_cases.json").read_text())["earlier_cases"]
+
+
 def _load() -> list[tuple[str, str, dict, float]]:
     out = []
     for name in FILES:
         document = json.loads((CASES / name).read_text())
-        out += [(name, case, body, document["tolerance"]) for case, body in document["cases"].items()]
+        for case, body in document["cases"].items():
+            if SAID_OF_EARLIER.get(case):
+                body["expected"] = {**body["expected"], "attribution": SAID_OF_EARLIER[case]}
+            out.append((name, case, body, document["tolerance"]))
     return out
 
 
@@ -181,8 +190,9 @@ def test_drift_between_ranks_is_raised_in_the_all_ranks_view_of_local_files():
     assert combined["replica"]["replica_drift"] == body["expected"]["replica_drift"]
     assert combined["kind_checks"]["replica_drift"]["value"] == "checked"
     assert combined["run_state"]["state"] == "unhealthy"
-    # D1 is held: nothing names which rank drifted.
+    # D1: two ranks name no rank, and the incident has no rank of its own.
     assert "rank" not in found and "ranks" not in found
+    assert [e["why"] for e in found["attribution"]] == ["two_ranks"]
     text = ev._describe(found)
     assert text.startswith(f"Replicas diverged at step {wanted['step']}") and "observations of ranks 0-1" in text
 

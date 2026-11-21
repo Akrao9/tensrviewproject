@@ -951,12 +951,6 @@
     "incident_kinds_absent": [
      "stalled_weights"
     ]
-   },
-   "today": {
-    "detector": "detect_stalled_weights",
-    "fires": true,
-    "kind": "stalled_weights",
-    "step": 2
    }
   },
   "weights_unchanged_across_skips_the_caller_reported": {
@@ -1004,12 +998,6 @@
     "incident_kinds_absent": [
      "stalled_weights"
     ]
-   },
-   "today": {
-    "detector": "detect_stalled_weights",
-    "fires": true,
-    "kind": "stalled_weights",
-    "step": 2
    }
   },
   "weights_unchanged_across_skips_the_scaler_reported": {
@@ -1057,12 +1045,6 @@
     "incident_kinds_absent": [
      "stalled_weights"
     ]
-   },
-   "today": {
-    "detector": "detect_stalled_weights",
-    "fires": true,
-    "kind": "stalled_weights",
-    "step": 2
    }
   },
   "weights_unchanged_across_skips_both_reported": {
@@ -1110,18 +1092,12 @@
     "incident_kinds_absent": [
      "stalled_weights"
     ]
-   },
-   "today": {
-    "detector": "detect_stalled_weights",
-    "fires": true,
-    "kind": "stalled_weights",
-    "step": 2
    }
   },
   "a_stall_across_a_skipped_step": {
    "section": 1,
    "status": "new",
-   "says": "Awaiting the author. A parameter is unchanged at two applied steps, at a skipped one, and at one more applied step. The skipped step adds nothing to the streak and does not end it, so the stall is raised at the last step.",
+   "says": "A parameter is unchanged at two applied steps, at a skipped one, and at one more applied step. The skipped step adds nothing to the streak and does not end it, so the stall is raised at the last step.",
    "given": {
     "records": [
      {
@@ -1174,12 +1150,6 @@
     "incident_carries": {
      "step": 3
     }
-   },
-   "today": {
-    "detector": "detect_stalled_weights",
-    "fires": true,
-    "kind": "stalled_weights",
-    "step": 2
    }
   },
   "ten_skips_only_the_caller_reported": {
@@ -1264,12 +1234,6 @@
     "incident_kinds_absent": [
      "loss_scale_trouble"
     ]
-   },
-   "today": {
-    "detector": "detect_loss_scale_trouble",
-    "fires": true,
-    "kind": "loss_scale_trouble",
-    "step": 14
    }
   },
   "ten_skips_the_scaler_reported": {
@@ -1445,7 +1409,7 @@
   "caller_skips_inside_a_run_of_scaler_skips": {
    "section": 1,
    "status": "new",
-   "says": "Awaiting the author. Two applied steps, five skips the scaler reported, three only the caller reported, five more the scaler reported. The caller's are passed over: they neither add to the streak nor end it, and are in neither count. Ten in a row are reached at the last step.",
+   "says": "Two applied steps, five skips the scaler reported, three only the caller reported, five more the scaler reported. The caller's are passed over: they neither add to the streak nor end it, and are in neither count. Ten in a row are reached at the last step.",
    "given": {
     "records": [
      {
@@ -1534,20 +1498,12 @@
      "skipped_steps": 10,
      "recorded_steps": 12
     }
-   },
-   "today": {
-    "detector": "detect_loss_scale_trouble",
-    "fires": true,
-    "kind": "loss_scale_trouble",
-    "step": 11,
-    "skipped_steps": 13,
-    "recorded_steps": 15
    }
   },
   "a_low_loss_scale_on_a_skip_only_the_caller_reported": {
    "section": 1,
    "status": "pin",
-   "says": "Awaiting the author. A loss scale below the floor is recorded on a step whose skip only the caller reported. The scale is still read: it is the scale's own reading, not the skip's.",
+   "says": "A loss scale below the floor is recorded on a step whose skip only the caller reported. The scale is still read: it is the scale's own reading, not the skip's.",
    "detector": "detect_loss_scale_trouble",
    "records": [
     {
@@ -1913,14 +1869,6 @@
      "skipped_steps": 10,
      "streak": 10
     }
-   },
-   "today": {
-    "detector": "detect_loss_scale_trouble",
-    "fires": true,
-    "kind": "loss_scale_trouble",
-    "step": 9,
-    "skipped_steps": 11,
-    "recorded_steps": 11
    }
   },
   "a_caller_skip_the_scaler_applied_inside_scaler_skips": {
@@ -1996,12 +1944,6 @@
      "skipped_steps": 10,
      "streak": 5
     }
-   },
-   "today": {
-    "detector": "detect_loss_scale_trouble",
-    "fires": true,
-    "kind": "loss_scale_trouble",
-    "step": 9
    }
   },
   "ten_scaler_skips_after_a_caller_skip_the_scaler_applied": {
@@ -2112,12 +2054,6 @@
      "skipped_steps": 15,
      "recorded_steps": 18
     }
-   },
-   "today": {
-    "detector": "detect_loss_scale_trouble",
-    "fires": true,
-    "kind": "loss_scale_trouble",
-    "step": 11
    }
   },
   "a_nan_layer_beside_an_unread_gradient": {

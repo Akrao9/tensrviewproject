@@ -341,7 +341,8 @@ def test_z6_a_resume_from_a_checkpoint_holding_only_a_dotted_cache_finds_the_mod
         "optimizer": {"state": {0: {"step": 3}}, "param_groups": [{}]},
     })}}
     findings, _, checked = data_checks._state_findings(first, 3, 3, None, False, None, None)
-    assert checked and {"component": "model", "finding": "missing"} in findings
+    # Wave AB (STEP_AND_EVIDENCE_CONTRACT.md, section 4): not found is `not_identified`, not `missing`.
+    assert checked and {"component": "model", "finding": "not_identified"} in findings
 
 
 @pytest.mark.parametrize("key, entries", [

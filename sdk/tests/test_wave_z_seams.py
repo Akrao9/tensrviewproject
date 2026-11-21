@@ -22,12 +22,20 @@ from tensorquill import evidence as ev
 FIXTURES = Path(__file__).parent / "fixtures" / "replica"
 
 
+# D1 (contract 4a): `attribution` is compared with the file that holds it, everything else with the
+# two earlier files, so each `expected` here gains the entries `attribution_cases.json` gives it.
+SAID_OF_EARLIER = json.loads((FIXTURES / "attribution_cases.json").read_text())["earlier_cases"]
+
+
 def _load() -> list[tuple[str, dict]]:
     out = []
     for name in ("no_incident_cases.json", "incident_cases.json"):
         document = json.loads((FIXTURES / name).read_text())
         assert document["tolerance"] == ev.DRIFT_TOLERANCE  # `open_run` uses the default tolerance
-        out += list(document["cases"].items())
+        for case, body in document["cases"].items():
+            if SAID_OF_EARLIER.get(case):
+                body["expected"] = {**body["expected"], "attribution": SAID_OF_EARLIER[case]}
+            out.append((case, body))
     return out
 
 

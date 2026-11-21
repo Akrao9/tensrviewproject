@@ -239,7 +239,8 @@ def test_xc9_a_resume_whose_checkpoint_holds_only_cached_tensors_finds_the_model
         "optimizer": {"state": {0: {"step": 3}}, "param_groups": [{}]},
     })}}
     findings, _, checked = data_checks._state_findings(first, 3, 3, None, False, None, None)
-    assert checked and {"component": "model", "finding": "missing"} in findings
+    # Wave AB (STEP_AND_EVIDENCE_CONTRACT.md, section 4): not found is `not_identified`, not `missing`.
+    assert checked and {"component": "model", "finding": "not_identified"} in findings
 
 
 class _Batched(torch.nn.Module):
