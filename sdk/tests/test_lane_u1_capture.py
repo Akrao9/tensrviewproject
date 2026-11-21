@@ -1289,7 +1289,12 @@ def test_a_subclass_that_raises_on_eq_is_refused_under_fullgraph():
 def test_eager_mode_still_reads_subclasses_through_its_try(wrap):
     """Eager mode is as before: nothing is refused for its type; what raises is caught."""
     records = _sub_run(wrap, backend=None)
-    assert "counting its output raised RuntimeError" in records[0]["moe_refused"]["router"]
+    if wrap == "no_eq":
+        # Lane AD3: the count no longer compares ids with `==` (it adds each at its slot), so a subclass
+        # that raises on `eq` raises nothing there and its router is counted: 3 tokens at top-2 a step.
+        assert "moe_refused" not in records[0] and all(sum(r["moe"]["router"]) == 6 for r in records)
+    else:
+        assert "counting its output raised RuntimeError" in records[0]["moe_refused"]["router"]
     assert all("blocks.0" not in r["layers"] for r in records)  # its reading raised, and was caught
 
 
