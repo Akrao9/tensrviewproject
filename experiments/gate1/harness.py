@@ -504,7 +504,14 @@ def gate_checks(rows: list[dict]) -> list[str]:
             if b[field] is None or o[field] is None:
                 lines.append(f"{label[0].upper() + label[1:]}, B against {other}: not measured (no correct trials in both arms).")
                 continue
-            ratio = o[field] / b[field] if b[field] else math.inf
+            if b[field] == 0:
+                # Amendment of Nov 20, 2026: a zero denominator gives no ratio. Both medians are shown
+                # as they are, and the measure is left out of the speed line, neither a pass nor a failure.
+                lines.append(f"{label[0].upper() + label[1:]}, {other} over B: {_fmt(o[field])} / {_fmt(b[field])}: "
+                             f"not measured (arm B's median is zero, so the ratio is undefined; it counts neither "
+                             f"for nor against the speed line).")
+                continue
+            ratio = o[field] / b[field]
             speedups.append(ratio >= GATE_SPEEDUP)
             lines.append(f"{label[0].upper() + label[1:]}, {other} over B: {_fmt(o[field])} / {_fmt(b[field])} = "
                          f"{ratio:.2f}× ({'meets' if ratio >= GATE_SPEEDUP else 'below'} 2.0×).")
