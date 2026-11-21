@@ -1521,17 +1521,23 @@ def detect_loss_scale_trouble(
     `init(..., scaler=)`.
 
     Only a skip the scaler confirmed counts (`step_skipped_by` `scaler` or `both`, or no such
-    key: STEP_AND_EVIDENCE_CONTRACT.md, section 1, signed off by the author). A skip only the
-    caller reported is passed over: it neither adds to the streak nor ends it, and is in neither
+    key: STEP_AND_EVIDENCE_CONTRACT.md, section 1, as the author amended it). A skip only the
+    caller reported never adds a skip. With the scaler's outcome unknown (no `scaler_applied`)
+    it is passed over: it neither adds to the streak nor ends it, and is in neither
     `skipped_steps` nor `recorded_steps`, so a streak can span more training steps than it
-    counts. A recorded applied update ends it. A loss scale recorded on a caller's skip is still
-    read against `floor`, and raises with reason `scale` and the skip counts unchanged."""
+    counts. Where the SDK observed the scaler apply that update (`scaler_applied: true`) it ends
+    the streak, as a recorded applied update does, and counts in `recorded_steps` (that count
+    awaits the author). A loss scale recorded on a caller's skip is still read against `floor`,
+    and raises with reason `scale` and the skip counts unchanged."""
     streak, skipped, total, first = 0, 0, 0, None
     for record in sorted(records, key=lambda r: r["step"]):
         if "step_skipped" not in record:
             continue
         by = skipped_by(record)
-        if by != "caller":
+        if by == "caller" and record.get("scaler_applied") is True:
+            total += 1  # the scaler applied this update: observed, and the streak ends
+            streak = 0
+        elif by != "caller":
             total += 1
             skipped += by is not None
             streak = streak + 1 if by is not None else 0
@@ -2444,8 +2450,10 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
             and not record.get("step_skipped")
         )
         counts["weight_check"] += record.get("weights_unchanged") is not None and norms
-        # A skip only the caller reported is not the loss scale's to judge (`detect_loss_scale_trouble`).
-        counts["loss_scale"] += record.get("step_skipped") is not None and skipped_by(record) != "caller"
+        # A skip only the caller reported is not the loss scale's to judge unless the scaler was seen
+        # to apply that update (`detect_loss_scale_trouble`).
+        counts["loss_scale"] += record.get("step_skipped") is not None and (
+            skipped_by(record) != "caller" or record.get("scaler_applied") is True)
         counts["lr"] += _lr_values(record) is not None
         counts["data"] += isinstance(record.get("data"), Mapping)
         # `resume_incomplete` judges a resume from a checkpoint manifest or from the loss scale

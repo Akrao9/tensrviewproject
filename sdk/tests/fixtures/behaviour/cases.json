@@ -1872,14 +1872,6 @@
      "skipped_steps": 10,
      "recorded_steps": 12
     }
-   },
-   "today": {
-    "detector": "detect_loss_scale_trouble",
-    "fires": true,
-    "kind": "loss_scale_trouble",
-    "step": 11,
-    "skipped_steps": 11,
-    "recorded_steps": 13
    }
   },
   "a_caller_skip_the_scaler_applied_inside_scaler_skips": {
@@ -1958,12 +1950,6 @@
     "incident_kinds_absent": [
      "loss_scale_trouble"
     ]
-   },
-   "today": {
-    "detector": "detect_loss_scale_trouble",
-    "fires": true,
-    "kind": "loss_scale_trouble",
-    "step": 11
    }
   },
   "ten_scaler_skips_after_a_caller_skip_the_scaler_applied": {
@@ -2074,12 +2060,6 @@
      "skipped_steps": 15,
      "recorded_steps": 18
     }
-   },
-   "today": {
-    "detector": "detect_loss_scale_trouble",
-    "fires": true,
-    "kind": "loss_scale_trouble",
-    "step": 11
    }
   },
   "a_nan_layer_beside_an_unread_gradient": {

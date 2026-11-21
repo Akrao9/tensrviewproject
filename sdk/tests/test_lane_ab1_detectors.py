@@ -211,7 +211,7 @@ DETECTORS = {"stalled_weights": "detect_stalled_weights", "loss_scale_trouble": 
 
 
 def test_every_case_over_records_is_built_and_none_keeps_today():
-    assert len(OVER_RECORDS) == 15
+    assert len(OVER_RECORDS) == 18
     assert not [name for name, body in BEHAVIOUR.items() if "today" in body]
 
 
@@ -513,3 +513,24 @@ def test_the_loss_scale_streak_is_worded_as_scaler_confirmed_skips():
     text = ev._describe(found)
     assert "10 consecutive scaler-confirmed skips among observations judged by this rule" in text
     assert "10 of 12 steps skipped in all" in text
+
+
+def test_a_caller_skip_the_scaler_applied_ends_the_streak_and_is_a_recorded_observation():
+    """The author's amended rule 2: with `scaler_applied: true` the caller's skip ends the scaler's
+    streak and counts in `recorded_steps` (that count awaits the author); with the outcome unknown
+    it is passed over."""
+    unknown = ev.detect_loss_scale_trouble(_rows(BEHAVIOUR["a_caller_skip_of_unknown_scaler_outcome_inside_scaler_skips"]["given"]["records"]))
+    assert (unknown["step"], unknown["consecutive_skips"], unknown["skipped_steps"], unknown["recorded_steps"]) == (12, 10, 10, 12)
+    applied = _rows(BEHAVIOUR["a_caller_skip_the_scaler_applied_inside_scaler_skips"]["given"]["records"])
+    assert ev.detect_loss_scale_trouble(applied) is None
+    after = ev.detect_loss_scale_trouble(_rows(BEHAVIOUR["ten_scaler_skips_after_a_caller_skip_the_scaler_applied"]["given"]["records"]))
+    assert (after["step"], after["consecutive_skips"], after["skipped_steps"], after["recorded_steps"]) == (17, 10, 15, 18)
+    # The low-scale floor is read on either kind of caller's skip.
+    for extra in ({}, {"scaler_applied": True}):
+        low = ev.detect_loss_scale_trouble(_rows([{"step": 3, "step_skipped": True, "step_skipped_by": "caller",
+                                                   "grad_scale": 0.5, **extra}]))
+        assert low["reason"] == "scale" and low["consecutive_skips"] == 0 and low["skipped_steps"] == 0
+    # As input: a caller's skip the scaler applied is an observation; one of unknown outcome is not.
+    counts = ev.input_counts(_rows([{"step": 0, "step_skipped": True, "step_skipped_by": "caller"},
+                                    {"step": 1, "step_skipped": True, "step_skipped_by": "caller", "scaler_applied": True}]))
+    assert counts["loss_scale"] == 1
