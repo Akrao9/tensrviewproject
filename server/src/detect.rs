@@ -89,6 +89,8 @@ mod lane_ad8_score_tests;
 #[cfg(test)]
 mod lane_ad8_tests;
 #[cfg(test)]
+mod lane_ae7_tests;
+#[cfg(test)]
 mod lane_v7_tests;
 #[cfg(test)]
 mod lane_w3_tests;
@@ -362,6 +364,11 @@ pub const KIND_NOTES: [(&str, &str); 1] = [(
      and the same wrong result goes back to every rank, so the replicas stay equal (SCOUT, arXiv 2608.11034, \
      pp. 1 and 3)",
 )];
+
+/// The `not_checked` entry of the `update_spike` pairs that more than one clip call kept from
+/// being compared (`WAVE_AE_CONTRACT.md`, section 1). It names the kind and does not make it
+/// `unavailable`.
+const CLIP_GROUPS: &str = "clip_groups";
 
 /// The kinds a `not_checked` entry stands for when it lists none itself.
 const CHECK_KINDS: [(&str, &str); 3] = [
@@ -801,14 +808,19 @@ enum SkippedBy {
 /// is read as the scaler's; so is a value this version does not know. `scaler_applied`, which
 /// travels beside it, is read on a caller's skip only, and only as `true`. The second value says
 /// whether the row carries the key at all (the rank's `skipped_updates` is present only then).
-fn skipped_by(columns: &Columns, row: usize) -> (Option<SkippedBy>, bool) {
+///
+/// The third says the skip is a partial step (`WAVE_AE_CONTRACT.md`, section 4): a skip the
+/// scaler confirmed (alone or with the caller) whose `step_skipped_part`, also in `extra_json`
+/// and parsed only on a row that names it, is two whole numbers with 0 < skipped < of. On a skip
+/// only the caller reported, and on an applied step, the key says nothing.
+fn skipped_by(columns: &Columns, row: usize) -> (Option<SkippedBy>, bool, bool) {
     let extra: Option<Value> = text(columns.extra, row)
-        .filter(|extra| extra.contains("\"step_skipped_by\""))
+        .filter(|extra| extra.contains("\"step_skipped_by\"") || extra.contains("\"step_skipped_part\""))
         .and_then(|extra| serde_json::from_str::<Value>(extra).ok());
     let said = extra.as_ref().and_then(|extra| extra.get("step_skipped_by"));
     let carried = said.is_some();
     if !flag(columns.step_skipped, row) {
-        return (None, carried);
+        return (None, carried, false);
     }
     let by = match said.and_then(Value::as_str) {
         Some("caller") => SkippedBy::Caller {
@@ -817,7 +829,13 @@ fn skipped_by(columns: &Columns, row: usize) -> (Option<SkippedBy>, bool) {
         Some("both") => SkippedBy::Both,
         _ => SkippedBy::Scaler,
     };
-    (Some(by), carried)
+    let part = extra.as_ref().and_then(|extra| extra.get("step_skipped_part"));
+    let mixed = part.is_some_and(|part| {
+        let count = |key| part.get(key).and_then(Value::as_u64);
+        matches!((count("skipped"), count("of")), (Some(skipped), Some(of)) if 0 < skipped && skipped < of)
+    });
+    let partial = mixed && matches!(by, SkippedBy::Scaler | SkippedBy::Both);
+    (Some(by), carried, partial)
 }
 
 /// The gradients that are not finite on a row, named as a `non_finite` incident names them: each
@@ -2064,6 +2082,21 @@ struct UpdateRow {
     grads: Option<Vec<(String, f64)>>,
     /// The row's learning rates, as `_lr_values` reads them: an incident's `lr_before` (part 4).
     lr: Option<Vec<f64>>,
+    /// The row's `clip_calls` is above 1: more than one `clip_grad_norm_` call clipped the step
+    /// (`WAVE_AE_CONTRACT.md`, section 1), so its pre-clipping total cannot be split by parameter.
+    clip_calls: bool,
+}
+
+/// A row's `clip_calls` (`WAVE_AE_CONTRACT.md`, section 1): from `extra_json`, parsed only on a row
+/// that names it, as `step_skipped_by` is. True only for a whole number above 1; anything else
+/// (1, text, a fraction, a boolean, `2.0`) says nothing, and an absent key means one call or a
+/// count that is not known.
+fn clip_calls(columns: &Columns, row: usize) -> bool {
+    text(columns.extra, row)
+        .filter(|extra| extra.contains("\"clip_calls\""))
+        .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
+        .and_then(|extra| extra.get("clip_calls").and_then(Value::as_u64))
+        .is_some_and(|calls| calls > 1)
 }
 
 /// Python's `detect_update_spikes` and `update_not_read_not_checked`.
@@ -2082,6 +2115,10 @@ struct Updates {
     /// Optimizers whose update size the capture could not read (`update_not_read`, said once
     /// on a record), each with the first step it was said on and why.
     not_read: BTreeMap<String, (i64, String)>,
+    /// The pairs not compared because their totals would be split while either row was clipped
+    /// by more than one call, and the step of the later row of the first (section 1).
+    clip_groups: u64,
+    clip_groups_step: Option<i64>,
 }
 
 impl Updates {
@@ -2109,6 +2146,10 @@ impl Updates {
             self.first = None;
             self.spikes = 0;
             self.spike_steps.clear();
+            // Python reads every row's total from `clip_grad_norm` then: a pair judged before
+            // has no total there, so it was not one that went uncompared either.
+            self.clip_groups = 0;
+            self.clip_groups_step = None;
         }
         let Some(sizes) = &columns.update_rms else { return };
         let entries = sizes.row(row);
@@ -2162,10 +2203,18 @@ impl Updates {
                     .collect()
             })
         });
+        let clipped = clip_calls(columns, row);
         if let Some((before, (largest, was))) = compared {
-            let (now, then) = shared_totals(total, grads.as_deref(), before.total, before.grads.as_deref());
+            let split = split_totals(total, grads.as_deref(), before.total, before.grads.as_deref());
+            let (now, then) = split.unwrap_or((total, before.total));
             let (change, rise) = ((largest - was).abs(), (now - then).max(0.0));
-            if self.recent.len() < window {
+            if split.is_some() && (clipped || before.clip_calls) {
+                // The split assumes one call scaled every gradient by one factor (section 1): the
+                // pair is not compared, nothing is flagged and its change joins no baseline. This
+                // row is still the one the next is compared with.
+                self.clip_groups += 1;
+                self.clip_groups_step.get_or_insert(step);
+            } else if self.recent.len() < window {
                 self.recent.push_back(change);
             } else {
                 // The mean of the last `window` unflagged changes, summed as Python's `fsum` sums.
@@ -2234,6 +2283,7 @@ impl Updates {
             own,
             grads,
             lr: columns.lr(row),
+            clip_calls: clipped,
         });
     }
 
@@ -2261,6 +2311,24 @@ impl Updates {
             "step": step,
         }))
     }
+
+    /// The `clip_groups` entry of `not_checked` (`WAVE_AE_CONTRACT.md`, section 1): the pairs
+    /// not compared because more than one clip call clipped either row, dated at the later row
+    /// of the first. `update_spike` stays `checked`: every other pair was judged.
+    fn clip_groups_not_checked(&self) -> Option<Value> {
+        let step = self.clip_groups_step?;
+        let n = self.clip_groups;
+        Some(json!({
+            "check": CLIP_GROUPS,
+            "kinds": ["update_spike"],
+            "comparisons": n,
+            "step": step,
+            "reason": format!(
+                "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by \
+                 parameter, so {n} comparison(s) of update_spike were not made"
+            ),
+        }))
+    }
 }
 
 /// The largest update over the parameters both `own` and `before` name, on this row's side and
@@ -2285,21 +2353,20 @@ fn shared_largest(own: &[(String, f64)], largest: f64, before: &UpdateRow) -> Op
 
 /// The gradient totals of two rows compared by `update_spike`, over the parameters both name:
 /// Python's `_shared_totals` (L13), each row's total times `sqrt(shared² / all²)` over its
-/// `grad_norms`. The whole totals when both rows name the same parameters, and when they cannot
-/// be split: a row without `grad_norms`, a norm that is not finite, no shared parameter, or
-/// norms that are all 0. Sums as Python's `fsum` sums them.
-fn shared_totals(
+/// `grad_norms`. None when the whole totals are used instead: both rows name the same
+/// parameters, or they cannot be split (a row without `grad_norms`, a norm that is not finite, no
+/// shared parameter, or norms that are all 0). Only a pair this splits is one that more than one
+/// clip call keeps from being compared (`WAVE_AE_CONTRACT.md`, section 1). Sums as Python's
+/// `fsum` sums them.
+fn split_totals(
     total: f64,
     grads: Option<&[(String, f64)]>,
     before: f64,
     grads_before: Option<&[(String, f64)]>,
-) -> (f64, f64) {
-    let whole = (total, before);
-    let (Some(now), Some(then)) = (grads, grads_before) else {
-        return whole;
-    };
+) -> Option<(f64, f64)> {
+    let (now, then) = (grads?, grads_before?);
     if now.len() == then.len() && now.iter().zip(then).all(|((a, _), (b, _))| a == b) {
-        return whole; // the usual row: the same parameters in the same order
+        return None; // the usual row: the same parameters in the same order
     }
     let known: HashMap<&str, f64> = then.iter().map(|(name, norm)| (name.as_str(), *norm)).collect();
     let shared: Vec<(f64, f64)> = now
@@ -2308,21 +2375,21 @@ fn shared_totals(
         .collect();
     let named_alike = shared.len() == now.len() && known.len() == now.len();
     if named_alike || shared.is_empty() || now.iter().chain(then).any(|(_, norm)| !norm.is_finite()) {
-        return whole;
+        return None;
     }
     let (all_now, all_then) = (
         fsum(now.iter().map(|(_, v)| v * v)),
         fsum(then.iter().map(|(_, v)| v * v)),
     );
     if all_now <= 0.0 || all_then <= 0.0 {
-        return whole;
+        return None;
     }
     let part_now = fsum(shared.iter().map(|(v, _)| v * v));
     let part_then = fsum(shared.iter().map(|(_, v)| v * v));
-    (
+    Some((
         total * (part_now / all_now).sqrt(),
         before * (part_then / all_then).sqrt(),
-    )
+    ))
 }
 
 // --- head_trends ---------------------------------------------------------------------------
@@ -3117,6 +3184,9 @@ struct Weight {
 
 #[derive(Default)]
 struct Stalled {
+    /// The attempt of the row read last: at a row of another attempt every streak starts again
+    /// (`WAVE_AE_CONTRACT.md`, section 2).
+    attempt: Option<i64>,
     weights: Named<Weight>,
     first: Option<Value>,
     stalled_steps: u64,
@@ -3127,7 +3197,18 @@ struct Stalled {
 
 impl Stalled {
     /// `skipped` says the row's update was skipped, whoever reported it.
-    fn row(&mut self, step: i64, columns: &Columns, row: usize, skipped: bool) {
+    fn row(&mut self, attempt: i64, step: i64, columns: &Columns, row: usize, skipped: bool) {
+        // Over the rank's rows that count, in step order: when a row's attempt differs from that
+        // of the row before it, every streak starts again before the row is read, and the first
+        // check after the resume is the baseline. What was seen changing and what was already
+        // reported are kept, so a stall raised before the resume stands (section 2, amending
+        // contract 2 in the author's words: "Reset the streak at the attempt boundary").
+        if self.attempt.is_some_and(|before| before != attempt) {
+            for (_, weight) in &mut self.weights.items {
+                weight.streak = 0;
+            }
+        }
+        self.attempt = Some(attempt);
         // No list: no weight check on this step, and every streak holds. An empty list is a
         // check that showed no parameter unchanged (contract 2).
         let Some(unchanged) = &columns.weights_unchanged else {
@@ -3270,12 +3351,15 @@ struct LossScale {
     /// The observations this rule judges, `recorded_steps`, and also the kind's input count: a
     /// caller's skip of unknown scaler outcome is not one (contract section 1, rule 2).
     recorded: u64,
+    /// Skips the scaler confirmed with a mixed outcome (`WAVE_AE_CONTRACT.md`, section 4).
+    partial: u64,
     first: Option<Value>,
 }
 
 impl LossScale {
-    /// `by` is who reported the row's skipped update, None when it was not skipped.
-    fn row(&mut self, step: i64, columns: &Columns, row: usize, by: Option<SkippedBy>) {
+    /// `by` is who reported the row's skipped update, None when it was not skipped; `partial`
+    /// says the scaler skipped some optimizers and applied others ([`skipped_by`]).
+    fn row(&mut self, step: i64, columns: &Columns, row: usize, by: Option<SkippedBy>, partial: bool) {
         if columns.step_skipped.is_none_or(|skips| skips.is_null(row)) {
             return;
         }
@@ -3290,7 +3374,15 @@ impl LossScale {
         // measured loss scale below the floor on either kind of caller's skip still raises, with
         // reason `scale` and the counts unchanged (contract section 1: rules 1 and 3 signed off by
         // the author on Nov 20, 2026, rule 2 as the author amended it).
+        // A confirmed mixed outcome counts once in `recorded_steps`, apart as `partial_steps`, and
+        // ends the streak of fully skipped updates: an update occurred (section 4, amending
+        // section 1 of `STEP_AND_EVIDENCE_CONTRACT.md` in the author's words).
         match by {
+            Some(SkippedBy::Scaler | SkippedBy::Both) if partial => {
+                self.recorded += 1;
+                self.partial += 1;
+                self.streak = 0;
+            }
             Some(SkippedBy::Caller { applied: false }) => {}
             Some(SkippedBy::Caller { applied: true }) | None => {
                 self.recorded += 1;
@@ -3318,6 +3410,9 @@ impl LossScale {
         if let Some(mut first) = self.first.clone() {
             first["skipped_steps"] = json!(self.skipped);
             first["recorded_steps"] = json!(self.recorded);
+            if self.partial > 0 {
+                first["partial_steps"] = json!(self.partial);
+            }
             out.push(first);
         }
     }
@@ -3371,16 +3466,19 @@ struct SkippedUpdates {
     caller: u64,
     scaler: u64,
     both: u64,
+    /// Partial steps (section 4), under no other name.
+    partial: u64,
     non_finite_steps: u64,
     /// The first such step, and what was not finite there.
     first: Option<(i64, Vec<String>)>,
 }
 
 impl SkippedUpdates {
-    fn row(&mut self, step: i64, columns: &Columns, row: usize, by: Option<SkippedBy>, carried: bool) {
+    fn row(&mut self, step: i64, columns: &Columns, row: usize, by: Option<SkippedBy>, carried: bool, partial: bool) {
         self.carried |= carried;
         let Some(by) = by else { return };
         match by {
+            _ if partial => self.partial += 1,
             SkippedBy::Caller { .. } => self.caller += 1,
             SkippedBy::Scaler => self.scaler += 1,
             SkippedBy::Both => self.both += 1,
@@ -3403,6 +3501,9 @@ impl SkippedUpdates {
             return None;
         }
         let mut out = json!({"caller": self.caller, "scaler": self.scaler, "both": self.both});
+        if self.partial > 0 {
+            out["partial"] = json!(self.partial);
+        }
         if let Some((step, gradients)) = &self.first {
             out["non_finite_gradients"] =
                 json!({"steps": self.non_finite_steps, "first_step": step, "gradients": gradients});
@@ -4131,10 +4232,14 @@ impl RankDetectors {
             self.gradients.row(step, &columns, row, &mut self.scalars);
             self.updates
                 .row(self.attempt, step, &columns, row, self.thresholds.update_window);
-            let (skipped_by, carried) = skipped_by(&columns, row);
-            self.stalled.row(step, &columns, row, skipped_by.is_some());
-            self.loss_scale.row(step, &columns, row, skipped_by);
-            self.skipped_updates.row(step, &columns, row, skipped_by, carried);
+            let (skipped_by, carried, partial) = skipped_by(&columns, row);
+            // A partial step is read by the kinds judged by parameter as a skipped one: the record
+            // does not say which optimizer's update was applied (section 4).
+            self.stalled
+                .row(self.attempt, step, &columns, row, skipped_by.is_some());
+            self.loss_scale.row(step, &columns, row, skipped_by, partial);
+            self.skipped_updates
+                .row(step, &columns, row, skipped_by, carried, partial);
             self.grads_not_read.row(step, &columns, row);
             self.notes.row(step, &columns, row);
             self.activations.row(step, layers);
@@ -4350,6 +4455,7 @@ impl RankDetectors {
         self.system.not_checked(&mut out);
         out.extend(self.moe.refused_not_checked());
         out.extend(self.updates.not_read_not_checked());
+        out.extend(self.updates.clip_groups_not_checked());
         out.extend(self.grads_not_read.not_checked());
         out.extend(self.notes.layers_not_checked(self.inputs.layers > 0));
         out
@@ -4404,11 +4510,16 @@ impl RankDetectors {
             let (records, needs) = (counts[at], INPUT_NEEDS[at].1);
             let needed = records_needed(kind, &self.thresholds);
             let enough = records >= needed;
-            let names = |item: &&Value| match item["kinds"].as_array() {
-                Some(kinds) => kinds.iter().any(|named| named == kind),
-                None => CHECK_KINDS
-                    .iter()
-                    .any(|(check, stands_for)| item["check"] == *check && *stands_for == kind),
+            // A `clip_groups` entry names `update_spike` and leaves it `checked`: only some pairs
+            // were not compared (`WAVE_AE_CONTRACT.md`, section 1).
+            let names = |item: &&Value| {
+                item["check"] != CLIP_GROUPS
+                    && match item["kinds"].as_array() {
+                        Some(kinds) => kinds.iter().any(|named| named == kind),
+                        None => CHECK_KINDS
+                            .iter()
+                            .any(|(check, stands_for)| item["check"] == *check && *stands_for == kind),
+                    }
             };
             let mut entry = match not_checked.iter().find(names) {
                 Some(item) => json!({
