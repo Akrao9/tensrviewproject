@@ -129,3 +129,190 @@ def test_c22_both_signs_are_read_in_the_record():
     assert heads and all(h["positions"] == 6 and "overflow_positions" not in h for h in heads)
     assert heads[-1]["mean"] == pytest.approx(float(torch.tensor([3e38, 3e38, -3e38, 0.0]).double().mean()), rel=1e-6)
     assert math.isfinite(heads[-1]["gap_relative"])
+
+
+# --- Router counting in proportion to the assignments ----------------------------------------------
+
+from torch.utils._python_dispatch import TorchDispatchMode  # noqa: E402
+
+from tensorquill.capture import Router  # noqa: E402
+
+TOKENS, E, K = 120, 64, 4  # experts by assignments is 30,720 entries; the logits are 7,680
+
+
+class _Largest(TorchDispatchMode):
+    """The most elements any op that is not a view made while it was on, and how many outputs of
+    `size` elements there were."""
+
+    def __init__(self, size: int) -> None:
+        super().__init__()
+        self.largest, self.size, self.of_size = 0, size, 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        if not func.is_view:
+            for t in out if isinstance(out, (tuple, list)) else (out,):
+                if isinstance(t, torch.Tensor):
+                    self.largest = max(self.largest, t.numel())
+                    self.of_size += t.numel() == self.size
+        return out
+
+
+class _Gate(nn.Module):
+    def __init__(self, make) -> None:
+        super().__init__()
+        self.w = nn.Linear(16, E, bias=False)
+        self.make = make
+
+    def forward(self, x):
+        return self.make(self.w(x))
+
+
+class _Net(nn.Module):
+    def __init__(self, make) -> None:
+        super().__init__()
+        self.embed = nn.Linear(4, 16)
+        self.router = _Gate(make)
+        self.head = nn.Linear(16, 1)
+
+    def forward(self, x):
+        hidden = self.embed(x)
+        self.router(hidden)
+        return self.head(hidden).pow(2).mean()
+
+
+def _ids_with_none(logits):
+    ids = logits.topk(K, dim=-1).indices
+    return torch.where(logits[..., :K] > 1.0, torch.full_like(ids, -1), ids)  # some "no route" (-1)
+
+
+def _routing_map(logits):
+    probs = logits.softmax(-1)
+    top = probs.topk(K, dim=-1)
+    weights = torch.zeros_like(probs).scatter(-1, top.indices, top.values)
+    weights = torch.where(weights < 0.02, torch.zeros_like(weights), weights)  # some routed with weight 0
+    return weights, torch.zeros_like(probs, dtype=torch.bool).scatter(-1, top.indices, True)
+
+
+PATHS = {
+    "logits": (lambda logits: logits, None),
+    "integer ids": (_ids_with_none, None),
+    "indices=": (lambda logits: (logits, logits.topk(K, dim=-1).indices.to(torch.int32)),
+                 lambda out: out[1]),
+    "routing map": (_routing_map, None),
+}
+
+
+def _expected(outputs, path):
+    """The counts the hook made before lane AD3, from the outputs it saw: experts by assignments."""
+    total, unassigned, left_out = torch.zeros(E, dtype=torch.int64), 0, torch.zeros(E, dtype=torch.int64)
+    for out in outputs:
+        if path == "routing map":
+            weights, routing = out
+            total += (routing & (weights != 0)).reshape(-1, E).sum(0)
+            left_out += (routing & (weights == 0)).reshape(-1, E).sum(0)
+            continue
+        ids = out.topk(K, dim=-1).indices if path == "logits" else out[1] if path == "indices=" else out
+        flat = ids.reshape(-1, 1).long()
+        total += (flat == torch.arange(E)).sum(0)
+        unassigned += int((flat < 0).sum())
+    return total.tolist(), unassigned, left_out.tolist()
+
+
+def _count(path, device, backend, steps=3):
+    make, indices = PATHS[path]
+    torch.manual_seed(0)
+    model = _Net(make).to(device)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=steps, capture="routers",
+                               routers={"router": Router(E, K, indices=indices)})
+    seen: list = []
+    largest = _Largest(TOKENS * E)
+    nodes: list[int] = []
+
+    def keep(module, args, output):
+        seen.append(tuple(t.detach().cpu() for t in output) if isinstance(output, tuple) else output.detach().cpu())
+
+    handles = []
+    if backend is None:
+        def enter(*_):
+            largest.__enter__()  # returns None, so the output is left as it is
+
+        def leave(*_):
+            largest.__exit__(None, None, None)
+
+        handles.append(model.router.register_forward_hook(enter, prepend=True))
+        handles.append(model.router.register_forward_hook(leave))
+        handles.append(model.router.register_forward_hook(keep))  # after `leave`: its copy is not counted
+        stepped = model
+    else:
+        def record(gm, example_inputs):
+            for node in gm.graph.nodes:
+                value = node.meta.get("example_value")
+                if node.op == "call_function" or node.op == "call_method":
+                    for t in value if isinstance(value, (tuple, list)) else (value,):
+                        if isinstance(t, torch.Tensor):
+                            nodes.append(t.numel())
+            return gm.forward
+
+        handles.append(model.router.register_forward_hook(keep))
+        stepped = torch.compile(model, backend=record if backend == "graph" else backend)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    for _ in range(steps):
+        optimizer.zero_grad()
+        stepped(torch.randn(6, 20, 4, device=device)).backward()
+        optimizer.step()
+    for h in handles:
+        h.remove()
+    session.close()
+    if path == "indices=":
+        seen = [(None, out) for out in [s[1] for s in seen]]
+    return sink.records, seen, largest, nodes
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("path", list(PATHS))
+def test_router_counts_are_as_before_and_no_experts_by_assignments_matrix_is_made(path, device):
+    records, seen, largest, _ = _count(path, device, None)
+    assert len(records) == 3 and all("moe_refused" not in r for r in records)
+    per_step = len(seen) // 3
+    for i, record in enumerate(records):
+        counts, unassigned, left_out = _expected(seen[i * per_step:(i + 1) * per_step], path)
+        assert record["moe"]["router"] == counts
+        if path in ("integer ids", "indices="):
+            assert record["moe_unassigned"]["router"] == unassigned
+        if path == "routing map":
+            assert record["moe_left_out"]["router"] == left_out
+    if path == "routing map":
+        # The map is tokens x experts already: the hook makes two bool masks of that size, not four.
+        assert largest.of_size == 2 * 3, largest.of_size
+    else:
+        # Before, a bool matrix of assignments by experts (TOKENS * K * E = 30,720 entries).
+        assert largest.largest <= TOKENS * K * 2, largest.largest
+
+
+@pytest.mark.parametrize("path", ["logits", "integer ids", "indices="])
+def test_compiled_router_counts_are_as_before_and_the_graph_holds_no_experts_by_assignments_matrix(path):
+    eager, _, _, _ = _count(path, "cpu", None)
+    records, _, _, nodes = _count(path, "cpu", "graph")
+    assert [r["moe"]["router"] for r in records] == [r["moe"]["router"] for r in eager]
+    assert nodes and max(nodes) < TOKENS * K * E, max(nodes)  # the logits (7,680) are the largest now
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_router_counts_under_aot_and_inductor_match_eager_and_make_no_matrix(device, backend, tmp_path, monkeypatch):
+    if device == "mps" and backend == "inductor":
+        pytest.skip("Inductor on MPS is not what this lane measures")
+    # A cache of its own: other processes on this machine compile into the shared one at the same time.
+    # Its precompiled header is shared too, and another process rebuilding it fails this compile.
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
+    import torch._inductor.config as inductor_config
+
+    monkeypatch.setattr(inductor_config, "cpp_cache_precompile_headers", False, raising=False)
+    torch._dynamo.reset()
+    eager, _, largest, _ = _count("integer ids", device, None)
+    records, _, _, _ = _count("integer ids", device, backend)
+    assert [r["moe"]["router"] for r in records] == [r["moe"]["router"] for r in eager]
+    assert [r["moe_unassigned"]["router"] for r in records] == [r["moe_unassigned"]["router"] for r in eager]
+    assert largest.largest <= TOKENS * K * 2

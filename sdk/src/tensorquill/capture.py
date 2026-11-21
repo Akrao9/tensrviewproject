@@ -587,9 +587,11 @@ def _router_hook(
     out before anything is read, so an evaluation batch is neither counted nor refused."""
     phase = phase or _Evaluating()
     experts = spec.n_experts
-    # Constant tails of the slots `_count_width` lays out, made once on the counts' device.
-    ids_tail = torch.zeros(experts + 2, dtype=counts.dtype, device=counts.device)
-    ids_tail[experts] = 1  # the ids were checked; no routing map
+    # What one forward adds to `counts` before its assignments (`_count_width`), made once on the
+    # counts' device: for expert ids, the slot that says they were checked; for the top-k of
+    # logits, nothing. `expert_ids` is no longer read (lane AD3): the count goes by index.
+    ids_start = torch.zeros(_count_width(spec), dtype=counts.dtype, device=counts.device)
+    ids_start[2 * experts + 2] = 1  # the ids were checked; no routing map
     no_ids = torch.zeros(2, dtype=counts.dtype, device=counts.device)
     map_checked = torch.tensor([0, 1], dtype=counts.dtype, device=counts.device)
     unchecked = torch.zeros(experts + 4, dtype=counts.dtype, device=counts.device)
@@ -695,9 +697,11 @@ def _router_hook(
                     # so that check did not apply (no `moe_left_out` for this forward).
                     hits = torch.cat([kept.reshape(-1, experts).sum(0), unchecked])
                 else:
-                    zero = paired.detach() == 0
-                    left = (kept & zero).reshape(-1, experts).sum(0)
-                    hits = torch.cat([(kept & ~zero).reshape(-1, experts).sum(0), no_ids, left, map_checked])
+                    # The map is tokens x experts already, so its own size is the floor here; the
+                    # routed count is the map's sum less what is left out, with no second mask.
+                    left = (kept & (paired.detach() == 0)).reshape(-1, experts).sum(0)
+                    routed = kept.reshape(-1, experts).sum(0) - left
+                    hits = torch.cat([routed, no_ids, left, map_checked])
             else:
                 logits = _first_tensor(output, integer=False)
                 if logits is None:
@@ -734,18 +738,26 @@ def _router_hook(
                     if spec.top_k <= 1
                     else logits.topk(spec.top_k, dim=-1).indices
                 )
-        # Fixed output shape: `bincount` would make the shape depend on the data.
+        # Fixed output shape: `bincount` would make the shape depend on the data. Each assignment
+        # adds one at its slot (`index_add_`), so what is made is in proportion to the assignments
+        # and the counts' width: before lane AD3 every id was compared with every expert, a bool
+        # matrix of assignments by experts (16,384 tokens at top-8 over 256 experts: 33.5 million
+        # entries a forward). Integer adds, so the counts are exact in any order, and PyTorch takes
+        # a deterministic path for `index_add_` on CUDA when deterministic algorithms are on.
         # Accumulate across gradient-accumulation microbatches; `_commit` zeroes `counts`.
         if idx is not None:
-            flat = idx.detach().reshape(-1, 1)
-            hits = (flat == expert_ids).sum(0)
+            flat = idx.detach().reshape(-1).to(torch.int64)
             if spec.indices is not None or logits is None:
                 # Ids the router or its `indices=` function gave: those below 0 are no assignment
-                # (counted, not refused), those at or above n_experts refuse the router at the flush
-                # (`_judge_index_ranges`). Device work only; no sync here.
-                hits = torch.cat([hits, (flat < 0).sum().reshape(1), (flat >= experts).sum().reshape(1), ids_tail])
+                # (counted at slot E, not refused), those at or above n_experts at slot E + 1, which
+                # refuses the router at the flush (`_judge_index_ranges`). Every slot is in range, so
+                # no device assert. Device work only; no sync here.
+                slot = torch.where(flat < 0, experts, torch.where(flat >= experts, experts + 1, flat))
+                hits = ids_start.clone()
             else:
-                hits = torch.cat([hits, unchecked])  # top-k of logits: always in range, nothing to check
+                slot = flat  # top-k of logits: always in range, nothing to check
+                hits = torch.zeros_like(ids_start)
+            hits.index_add_(0, slot, torch.ones_like(slot))
         if torch.compiler.is_compiling():
             _add_compiled(counts, hits)
         else:
