@@ -7016,9 +7016,7 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
     from .compact import require_table
 
     compared_here = require_table(evidence, step, layer)
-    expert_count = int(evidence.get("expert_count", 0))
     samples = {(int(s["step"]), int(s["layer"])): s for s in evidence.get("samples", ())}
-    sample = samples.get((step, layer)) or _missing_sample(step, layer, expert_count)
     prior_steps = [s for s, l in samples if l == layer and s < step]
     active_priors = [
         s
@@ -7032,6 +7030,22 @@ def expert_load_table(evidence: Mapping[str, Any], step: int, layer: int) -> str
         previous = max(prior_steps)
     else:
         previous = None  # the layer's first step: nothing earlier to compare it with
+    return _expert_load_text(evidence, samples, step, layer, previous, compared_here)
+
+
+def _expert_load_text(
+    evidence: Mapping[str, Any],
+    samples: Mapping[tuple[int, int], Mapping[str, Any]],
+    step: int,
+    layer: int,
+    previous: int | None,
+    compared_here: bool,
+) -> str:
+    """`expert_load_table`'s text, from its lookup of the samples by `(step, layer)` and the step it
+    compares with (`previous`, None at the layer's first step). `export_rerun` builds the lookup once
+    and walks the steps in order, where a table built step by step rebuilt it for every step (lane AD11)."""
+    expert_count = int(evidence.get("expert_count", 0))
+    sample = samples.get((step, layer)) or _missing_sample(step, layer, expert_count)
     if not compared_here:
         previous = None  # left out of a compact file: never an earlier window's step instead
     baseline = samples.get((previous, layer)) if previous is not None else None
@@ -7947,12 +7961,30 @@ def export_rerun(
                 )
             )
             # Every step, the first among them: a one-step recording has its table too (DET-14).
+            # The table of each step is `expert_load_table`'s, from the one lookup `by_key` (lane AD11:
+            # building it for every step made the export quadratic in the number of steps). The step
+            # compared with is the last earlier one of the layer on which the router routed tokens,
+            # else the last earlier one, found walking the layer's steps in order.
+            from .compact import require_table
+
+            layer_steps = sorted(s for s, l in by_key if l == incident_layer)
+            walked = 0
+            prior: int | None = None
+            active_prior: int | None = None
             for step in steps:
                 rr.set_time("training_step", sequence=step)
+                compared_here = require_table(evidence, step, incident_layer)
+                while walked < len(layer_steps) and layer_steps[walked] < step:
+                    prior = layer_steps[walked]
+                    earlier = by_key[prior, incident_layer]
+                    if not earlier.get("missing") and earlier.get("routed_tokens", 0) > 0:
+                        active_prior = prior
+                    walked += 1
                 rr.log(
                     "/incident/expert_load",
                     rr.TextDocument(
-                        expert_load_table(evidence, step, incident_layer),
+                        _expert_load_text(evidence, by_key, step, incident_layer,
+                                          active_prior if active_prior is not None else prior, compared_here),
                         media_type=rr.MediaType.MARKDOWN,
                     ),
                 )
