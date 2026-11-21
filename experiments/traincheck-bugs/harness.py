@@ -3,9 +3,11 @@
 Every bug script calls `start` once per process and `finish` at the end. Records go to
 `out/<run_id>/<run_id>.rank<r>.jsonl` inside this folder (never `tensorquill-out/` in the
 working directory). `finish` closes the session, builds the evidence for every rank file the
-run wrote (`tensorquill.build_evidence`, the same code `python -m tensorquill` runs), runs the
-cross-rank `duplicate_batches` check the per-rank evidence leaves out when there are several
-ranks, and writes `out/<run_id>/result.json`:
+run wrote (`tensorquill.build_evidence`, the same code `python -m tensorquill` runs), and, when
+there are several ranks, the all-ranks view of the run (`all_ranks`), which is where the ranks'
+replicas are compared: one rank's evidence does not hold `replica_drift` (since wave Z, Nov 20,
+2026, a rank records an observation and the comparison is made across ranks). It writes
+`out/<run_id>/result.json`:
 the symptom the script measured with plain torch (independent of TensorQuill), the incidents
 with kind, class and step, which kinds were checked, and what was not checked.
 
@@ -25,7 +27,7 @@ from typing import Any
 import torch
 
 import tensorquill
-from tensorquill.evidence import build_evidence, load_records
+from tensorquill.evidence import build_evidence, combine_rank_evidence, load_records, resolve_attempts
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "out"
@@ -118,10 +120,58 @@ def summarize(evidence: Mapping[str, Any], relevant: tuple[str, ...] = ()) -> di
     }
 
 
-def cross_rank(files: list[Path]) -> list[dict[str, Any]]:
-    """`duplicate_batches`, the cross-rank data check per-rank evidence does not run.
-    (`memory_imbalance`, the other cross-rank kind, reads CUDA allocator readings, which a CPU
-    run does not have.)"""
+def _rank_of(path: Path) -> int:
+    return int(path.name.rsplit(".rank", 1)[1].split(".")[0])
+
+
+def all_ranks(files: list[Path], per_rank: Mapping[int, Mapping[str, Any]],
+              relevant: tuple[str, ...] = ()) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The all-ranks view of a run of local files, and the parts of it the results table needs.
+
+    Built as `python -m tensorquill compare` builds it for local files: each rank's evidence with
+    its last step, put together by `combine_rank_evidence`, which compares the ranks' replica
+    observations from every rank's records as written (not the resolved ones: a restart's rows
+    are needed there). The run's own incidents (`run_incidents`: `replica_drift`, and
+    `memory_imbalance` where the ranks have memory readings, which a CPU run does not) are in no
+    rank's evidence.
+
+    Each `relevant` kind's entry is the view's, with its `coverage` for `replica_drift` (the
+    steps with an observation and how many of them were compared across the ranks): a run whose
+    replicas were never compared has no `replica_drift` incident either, and must not read as
+    one whose replicas agree."""
+    written: list[dict[str, Any]] = []
+    with_step: dict[int, dict[str, Any]] = {}
+    for path in files:
+        own = load_records(path, all_attempts=True)
+        written.extend(own)
+        steps = [r["step"] for r in resolve_attempts(own) if isinstance(r.get("step"), int) and not isinstance(r.get("step"), bool)]
+        with_step[_rank_of(path)] = {**per_rank[_rank_of(path)], "last_step": max(steps) if steps else None}
+    combined = combine_rank_evidence(with_step, replica_records=written)
+    checks = combined.get("kind_checks") or {}
+    kinds: dict[str, Any] = {}
+    for kind in relevant:
+        if kind not in checks:
+            continue
+        kinds[kind] = {k: checks[kind].get(k) for k in ("value", "records", "records_needed", "enough_history", "reason")
+                       if checks[kind].get(k) is not None}
+        coverage = checks[kind].get("coverage")
+        if isinstance(coverage, Mapping):
+            kinds[kind]["coverage"] = {k: coverage.get(k) for k in ("steps", "compared") if coverage.get(k) is not None}
+    summary = {
+        "run_state": (combined.get("run_state") or {}).get("state"),
+        "judged_ranks": combined.get("judged_ranks"),
+        "unknown_ranks": combined.get("unknown_ranks"),
+        "incidents": [{"kind": i.get("kind"), "class": i.get("class"), "step": i.get("step"), "detail": _short(i)}
+                      for i in combined.get("run_incidents") or []],
+        "relevant_kinds": kinds,
+    }
+    return combined, summary
+
+
+def duplicate_batches(files: list[Path]) -> list[dict[str, Any]]:
+    """`duplicate_batches` over every rank's records. The all-ranks view of local files does not
+    make this comparison (only the server does: its entry there is `not_configured`), so it is
+    made here, as before."""
     records: list[dict[str, Any]] = []
     for path in files:
         records.extend(load_records(path))
@@ -144,11 +194,20 @@ def finish(session: tensorquill.Session | None, run_id: str, *, bug: str, varian
     folder = OUT / run_id
     files = sorted(folder.glob(f"{run_id}.rank*.jsonl"))
     per_rank = {}
+    evidences: dict[int, dict[str, Any]] = {}
     for path in files:
         evidence = build_evidence(path)
         r = path.name.rsplit(".rank", 1)[1].split(".")[0]
         (folder / f"{run_id}.rank{r}.evidence.json").write_text(json.dumps(evidence, indent=1, default=str))
         per_rank[f"rank{r}"] = summarize(evidence, relevant)
+        evidences[int(r)] = evidence
+    run: dict[str, Any] | None = None
+    across: list[dict[str, Any]] = []
+    if len(files) > 1:
+        combined, run = all_ranks(files, evidences, relevant)
+        (folder / f"{run_id}.all-ranks.evidence.json").write_text(json.dumps(combined, indent=1, default=str))
+        across = [{"kind": i["kind"], "step": i["step"], "detail": i["detail"]} for i in run["incidents"]]
+        across += [i for i in duplicate_batches(files) if (i["kind"], i["step"]) not in {(a["kind"], a["step"]) for a in across}]
     result = {
         "bug": bug,
         "variant": variant,
@@ -157,7 +216,8 @@ def finish(session: tensorquill.Session | None, run_id: str, *, bug: str, varian
         "settings": dict(settings),
         "symptom": dict(symptom),
         "ranks": per_rank,
-        "cross_rank": cross_rank(files) if len(files) > 1 else [],
+        "cross_rank": across,
+        **({"all_ranks": run} if run is not None else {}),
         "world_size": world_size,
         "relevant": list(relevant),
     }

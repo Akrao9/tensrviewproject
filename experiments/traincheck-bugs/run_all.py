@@ -19,6 +19,12 @@ status 0, a `RESULT` line naming a readable `result.json`, one summary per rank,
 symptom measured as true or false, with the healthy control's false. Otherwise the table says
 why it was not judged. A run that fails, exits nonzero or passes `TIMEOUT` is recorded for its
 own case, with its output in the log, and the sweep goes on.
+
+A run of several ranks is read through the all-ranks view (`harness.all_ranks`), where the ranks'
+replicas are compared: its `replica_drift` is the run's incident, in no rank's evidence. Such a
+run has valid observations only with that view in its result, and a pair whose bug is one of
+replica drift is judged only when both runs compared their replicas on at least one step, so
+that a run nobody compared does not read as a healthy one.
 """
 
 from __future__ import annotations
@@ -130,10 +136,25 @@ def problem(entry: dict[str, Any] | None) -> str | None:
         return "a rank summary has no incidents list"
     if not isinstance(result.get("cross_rank", []), list):
         return "cross_rank is not a list"
+    if world > 1 and not isinstance((result.get("all_ranks") or {}).get("relevant_kinds"), dict):
+        return "a run of several ranks without the all-ranks view, where its replicas are compared"
     symptom = result.get("symptom")
     if not isinstance(symptom, dict) or not isinstance(symptom.get("bug_present"), bool):
         return "the symptom was not measured (bug_present is not true or false)"
     return None
+
+
+def replicas_not_compared(entry: dict[str, Any]) -> str | None:
+    """For a completed run whose relevant kinds name `replica_drift`: why its replicas count as
+    not compared, or None when the all-ranks view compared them on at least one step."""
+    result = entry["result"]
+    if "replica_drift" not in (result.get("relevant") or []):
+        return None
+    check = ((result.get("all_ranks") or {}).get("relevant_kinds") or {}).get("replica_drift") or {}
+    compared = (check.get("coverage") or {}).get("compared")
+    if check.get("value") == "checked" and isinstance(compared, int) and not isinstance(compared, bool) and compared >= 1:
+        return None
+    return f"replica_drift is {check.get('value', 'not stated')}, with {compared if compared is not None else 'no'} steps compared"
 
 
 def key(bug: str, tag: str, variant: str) -> str:
@@ -169,7 +190,7 @@ def _incidents(entry: dict[str, Any]) -> list[tuple[str, int, str]]:
         for incident in summary["incidents"]:
             seen.setdefault((incident["kind"], incident["step"]), []).append(rank.replace("rank", ""))
     for incident in result.get("cross_rank", []):
-        seen.setdefault((incident["kind"], incident["step"]), []).append("all")
+        seen.setdefault((incident["kind"], incident["step"]), []).append("across")
     multi = result.get("world_size", 1) > 1
     return [(kind, step, ",".join(ranks) if multi else "") for (kind, step), ranks in sorted(seen.items(), key=lambda kv: (kv[0][1], kv[0][0]))]
 
@@ -177,7 +198,13 @@ def _incidents(entry: dict[str, Any]) -> list[tuple[str, int, str]]:
 def _fmt(incidents: list[tuple[str, int, str]]) -> str:
     if not incidents:
         return "none"
-    return ", ".join(f"`{k}` @ {s}" + (f" (ranks {r})" if r else "") for k, s, r in incidents)
+    def where(ranks: str) -> str:
+        if not ranks:
+            return ""
+        own = ",".join(r for r in ranks.split(",") if r != "across")
+        return " (" + " and ".join(x for x in (f"ranks {own}" if own else "", "across ranks" if "across" in ranks.split(",") else "") if x) + ")"
+
+    return ", ".join(f"`{k}` @ {s}{where(r)}" for k, s, r in incidents)
 
 
 def _pair(results: dict[str, Any], bug: str, tag: str) -> dict[str, Any]:
@@ -197,6 +224,11 @@ def _pair(results: dict[str, Any], bug: str, tag: str) -> dict[str, Any]:
         out["why"] = "the bug showed on the healthy control, so it is not a control"
     if not out["healthy_problem"]:
         out["false"] = _incidents(healthy)
+    for variant, entry in (("healthy control", healthy), ("buggy run", buggy)):
+        if not out.get("why") and not problem(entry):
+            uncompared = replicas_not_compared(entry)
+            if uncompared:
+                out["why"] = f"the ranks' replicas were not compared on the {variant} ({uncompared})"
     if out["buggy_problem"] or out.get("why"):
         return out
     b = _incidents(buggy)
@@ -272,12 +304,16 @@ def write_table(results: dict[str, Any]) -> None:
                     failure = problem(entry)
                     if failure is None:
                         r0 = entry["result"]["ranks"].get("rank0", {})
+                        run = entry["result"].get("all_ranks") or {}  # a run of several ranks: the view of all of them
                         short = ", ".join(r0.get("checked_without_enough_history", [])) or "none"
-                        relevant = "; ".join(f"{k}: {v.get('value')} ({v.get('records')} of {v.get('records_needed')})"
-                                             for k, v in r0.get("relevant_kinds", {}).items())
+                        relevant = "; ".join(
+                            f"{k}: {v.get('value')} ({v.get('records')} of {v.get('records_needed')}"
+                            + (f"; {v['coverage'].get('compared')} of {v['coverage'].get('steps')} steps compared"
+                               if isinstance(v.get("coverage"), dict) else "") + ")"
+                            for k, v in (run.get("relevant_kinds") or r0.get("relevant_kinds", {})).items())
                         nc = "; ".join(f"{n.get('check')}: {str(n.get('reason'))[:90]}" for n in r0.get("not_checked", [])) or "none"
                         detail.append(f"| {entry['run_id']} | {_settings(entry)} | {_symptom(entry)} | {_fmt(_incidents(entry))} | "
-                                      f"{r0.get('run_state')} | {relevant} | {short} | {nc} |")
+                                      f"{run.get('run_state') or r0.get('run_state')} | {relevant} | {short} | {nc} |")
                     else:
                         detail.append(f"| {bug['id']} {c['tag']} {variant} | args {entry['args']} | run failed: {failure[:200]} | | | | | |")
     header = (
@@ -293,7 +329,10 @@ def write_table(results: dict[str, Any]) -> None:
         "# TrainCheck's 20 silent errors against TensorQuill: results\n\n"
         "Written by `run_all.py` from `results.json`; do not edit by hand. What the table shows and does not show is in "
         "[README.md](README.md). Steps are TensorQuill's (0-based optimizer steps). \"default\" is each script's own "
-        "configuration; the others are named after what they change.\n\n"
+        "configuration; the others are named after what they change. A run of several ranks is read through the "
+        "all-ranks view: an incident marked \"across ranks\" is the run's own, from comparing the ranks, and that "
+        "run's state and relevant kinds are the view's, with how many steps' replicas were compared. Its last two "
+        "columns are rank 0's.\n\n"
         "## One row per bug\n\n" + header + "\n" + "\n".join(rows) + "\n\n"
         "## Every run\n\n" + detail_header + "\n" + "\n".join(detail) + "\n"
     )
