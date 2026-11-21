@@ -4266,7 +4266,7 @@ def _report_freshness(look: Mapping[str, Any], judged: bool) -> dict[str, Any] |
 
 # `watch` keeps the costly detectors' states between looks (`_Incremental`, lane AD11). False judges
 # every record again at every look, as before; the tests compare the two.
-INCREMENTAL_WATCH = True
+_INCREMENTAL_WATCH = True
 
 
 def watch(
@@ -4367,7 +4367,7 @@ def watch(
     picked_rank = rank
     tail = _Tail(source, picked_rank)
     # The costly detectors' states, kept between looks and fed only the new records (lane AD11).
-    memo = _Incremental() if INCREMENTAL_WATCH else None
+    memo = _Incremental() if _INCREMENTAL_WATCH else None
     written: Path | None = None
     done = 0
     status_file = build_options.pop("watchdog", None)
@@ -4417,7 +4417,7 @@ def watch(
                         emitted = None
                         emitted_grace = None
                         tail = _Tail(source, picked_rank)
-                        memo = _Incremental() if INCREMENTAL_WATCH else None
+                        memo = _Incremental() if _INCREMENTAL_WATCH else None
                     else:
                         tail.rank = picked_rank
                     dirs = None
@@ -4487,7 +4487,7 @@ def watch(
                         picked_rank = default_rank
                         others_seen |= ranks_seen
                         tail = _Tail(source, picked_rank)
-                        memo = _Incremental() if INCREMENTAL_WATCH else None
+                        memo = _Incremental() if _INCREMENTAL_WATCH else None
                         grown = tail.poll()
                         folder = _rank_folder(source, picked_rank) if server_reports else None
                         emitted = None
@@ -4536,7 +4536,8 @@ def watch(
             emitted = seen
             emitted_grace = grace_key
             written = _write_output(evidence, path, output is not None, compact_window,
-                                    memo.samples_text(evidence) if memo is not None and report_look is None else None)
+                                    memo.samples_text(evidence)
+                                    if memo is not None and report_look is None and compact_window is None else None)
             if on_update is not None:
                 on_update(evidence, written)
             if trigger is not None:

@@ -361,7 +361,7 @@ def test_a_threshold_that_changes_judges_every_record_again():
 def test_the_server_s_thresholds_moving_under_the_watcher_judges_every_record_again(tmp_path, monkeypatch, watched):
     """A store whose report is behind, so the detectors run here with the thresholds the server
     applied (`adopted`); the server's thresholds change between two looks. Each look is compared
-    with the same looks judged in full (`INCREMENTAL_WATCH` off), and with `build_evidence` on the
+    with the same looks judged in full (`_INCREMENTAL_WATCH` off), and with `build_evidence` on the
     rank's folder with the thresholds in force, outside the keys the watcher writes itself."""
     from test_lane_ad1_readers import LISTED, _report, _run, _write_report
     from test_watchdog import _write_rank_part
@@ -369,7 +369,7 @@ def test_the_server_s_thresholds_moving_under_the_watcher_judges_every_record_ag
     other = {**LISTED, "overload_threshold": 0.7, "starve_window": 10}
 
     def play(root, incremental):
-        monkeypatch.setattr(ev, "INCREMENTAL_WATCH", incremental)
+        monkeypatch.setattr(ev, "_INCREMENTAL_WATCH", incremental)
         run = _run(root)
         folder = run / "rank=0"
         seen = []
@@ -460,3 +460,39 @@ def test_a_look_after_steps_are_appended_feeds_the_states_only_the_new_records(t
     ev.watch(path, out, interval=0.0, polls=2, trigger=script)
     assert looks[1] == ([("_MoeSamples", 5), ("_GradSpikes", 5), ("_ActivationAnomalies", 5), ("_NonFinite", 5)], 11)
     assert looks[0][1] == 401  # 400 samples and the rest, on the first look
+
+
+def test_a_stored_part_that_changes_or_goes_is_read_again(tmp_path, watched):
+    """A server's store under the watcher (no report, so the detectors run here): a part read is
+    written again with other rows, then one is removed. Each look is what `build_evidence` gives on
+    the records the folder then holds; on the base the part's old rows stayed."""
+    from test_watchdog import _write_rank_part
+
+    run = tmp_path / "store" / "runs" / "parts"
+    folder = run / "rank=0"
+    rows = lambda scale: {"grad_norms": {"a": scale, "b": 0.5 * scale}}
+
+    class Look:
+        changes = [
+            lambda: [_write_rank_part(run, 0, range(low, low + 20), extra=rows(1.0)) for low in (0, 20, 40)],
+            lambda: _write_rank_part(run, 0, range(20, 40), extra=rows(9.0)),  # the part read, written again
+            lambda: (folder / "attempt=1" / "part-00000040-00000059.parquet").unlink(),  # a part gone
+            lambda: _write_rank_part(run, 0, range(40, 60), extra=rows(1.0)),
+        ]
+        looks, paths, steps = 0, [], []
+
+        def tick(self):
+            self.changes[self.looks]()
+            self.looks += 1
+
+        def look(self, evidence, written, rank=None):
+            full = ev.build_evidence(ev.load_records(folder, all_attempts=True), run_manifest=folder, records_file=folder)
+            assert _text({k: v for k, v in evidence.items() if k != "detection"}) == _text(full)
+            self.paths.append(watched[0].path)
+            self.steps.append(len(evidence["samples"]))
+
+    look = Look()
+    ev.watch(folder, tmp_path / "out.json", interval=0.0, polls=4, trigger=look, server_reports=False)
+    assert look.steps == [60, 60, 40, 60]
+    assert look.paths == [("full", "first look"), ("full", "records judged before changed"),
+                          ("full", "records judged before changed"), ("incremental", 20)]
