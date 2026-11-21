@@ -70,14 +70,18 @@ use serde_json::{json, Value};
 use crate::storage::{Error, Storage};
 
 mod data;
+mod measure;
 pub use data::{detect_run, duplicate_batches, ranks_compared, read_batches};
 use data::{DataProgress, DataRow, ResumeFound, ResumePass, ResumeRow};
+use measure::Measurements;
 mod system;
 use system::{System, SystemColumns};
 #[cfg(test)]
 mod lane_ab2_tests;
 #[cfg(test)]
 mod lane_ac2_tests;
+#[cfg(test)]
+mod lane_ad10_tests;
 #[cfg(test)]
 mod lane_ad8_score_tests;
 #[cfg(test)]
@@ -853,6 +857,8 @@ struct Columns<'a> {
     /// The RMS of the optimizer's update to each parameter. A sender from before the column
     /// has none, and `update_spike` is then not configured.
     update_rms: Option<MapColumn<'a, Float64Array>>,
+    /// Each tensor's norm at a weight check, read only by the measurement `weight_jumps`.
+    weight_norms: Option<MapColumn<'a, Float64Array>>,
     scalars: Option<MapColumn<'a, Float64Array>>,
     moe_top_k: Option<MapColumn<'a, Int32Array>>,
     moe_counts: Option<MapColumn<'a, ListArray>>,
@@ -887,6 +893,7 @@ impl<'a> Columns<'a> {
             step_skipped: column(batch, "step_skipped"),
             grad_norms: MapColumn::new(batch, "grad_norms"),
             update_rms: MapColumn::new(batch, "update_rms"),
+            weight_norms: MapColumn::new(batch, "weight_norms"),
             scalars: MapColumn::new(batch, "scalars"),
             moe_top_k: MapColumn::new(batch, "moe_top_k"),
             moe_counts: moe_counts.filter(|_| moe_count_values.is_some()),
@@ -2895,12 +2902,24 @@ struct Attention {
 }
 
 impl Attention {
-    fn row(&mut self, step: i64, columns: &Columns, row: usize, scalars: &mut Scalars) {
+    fn row(
+        &mut self,
+        step: i64,
+        columns: &Columns,
+        row: usize,
+        scalars: &mut Scalars,
+        measurements: &mut Measurements,
+    ) {
         let Some(text) = text(columns.probe, row) else { return };
         self.asked += u64::from(text.trim_start().starts_with('{'));
         let Ok(probe) = serde_json::from_str::<Probe>(text) else {
             return;
         };
+        // The measurement `attention_trends` reads a probe's modules whether or not it says
+        // `error`, as Python's does; the rules below do not.
+        if let Some(Members(attention)) = &probe.attention {
+            measurements.probe(step, attention);
+        }
         if let Some(error) = &probe.error {
             self.failed += 1;
             if self.first_failure.is_none() {
@@ -4018,6 +4037,8 @@ pub struct RankDetectors {
     activations: Activations,
     attention: Attention,
     head: HeadTrends,
+    /// The four measurements of the rules contract, part 6: read by no rule.
+    measurements: Measurements,
     non_finite: NonFinite,
     skipped_updates: SkippedUpdates,
     grads_not_read: GradsNotRead,
@@ -4107,7 +4128,9 @@ impl RankDetectors {
             self.grads_not_read.row(step, &columns, row);
             self.notes.row(step, &columns, row);
             self.activations.row(step, layers);
-            self.attention.row(step, &columns, row, &mut self.scalars);
+            self.attention
+                .row(step, &columns, row, &mut self.scalars, &mut self.measurements);
+            self.measurements.row(step, &columns, row);
             self.head.row(step, &columns, row);
             self.non_finite.row(step, &columns, row, layers);
             self.replica_drift
@@ -4267,6 +4290,13 @@ impl RankDetectors {
     /// built from this report carries.
     pub fn head_trends(&self) -> Value {
         self.head.value()
+    }
+
+    /// The measurements of the rules contract, part 6, that the rows hold, by their report keys:
+    /// `gradient_trend`, `attention_trends`, `update_trends` and `weight_jumps`. A block the rows
+    /// do not hold is left out, never written as null.
+    pub fn measurements(&self) -> Vec<(&'static str, Value)> {
+        self.measurements.blocks()
     }
 
     /// The rank's `skipped_updates` (contract section 1), present only when a row carried
@@ -4620,6 +4650,10 @@ pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64)
     });
     if let Some(source) = detectors.moe_source() {
         report["moe_source"] = source;
+    }
+    // The four measurements (rules contract, part 6), each only where the rows hold what it reads.
+    for (name, block) in detectors.measurements() {
+        report[name] = block;
     }
     if let Some(skipped) = detectors.skipped_updates() {
         report["skipped_updates"] = skipped;
