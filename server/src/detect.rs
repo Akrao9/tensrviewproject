@@ -81,6 +81,8 @@ mod lane_ab2_tests;
 #[cfg(test)]
 mod lane_ac2_tests;
 #[cfg(test)]
+mod lane_ad10_off_tests;
+#[cfg(test)]
 mod lane_ad10_tests;
 #[cfg(test)]
 mod lane_ad8_score_tests;
@@ -4066,22 +4068,19 @@ impl RankDetectors {
         }
     }
 
-    /// Detectors for a run read once from start to end, as `tensorquill-server detect` and
-    /// `detect --run` read it: they also keep the series of `gradient_trend` and
-    /// `attention_trends` (rules contract, part 6), which take memory for every step and every
-    /// probe, so the server's own detectors, which it holds for a whole run, do not keep them
-    /// and their report has neither block.
-    pub fn whole_run(thresholds: &Arc<Thresholds>) -> Self {
-        let mut detectors = Self::new(thresholds);
-        detectors.measurements.series = true;
-        detectors
+    /// Detectors that keep no series for `gradient_trend` and `attention_trends`, whose report then
+    /// has neither block: for the tests of that setting only, which no build of the server uses.
+    #[cfg(test)]
+    pub(crate) fn without_trend_series(mut self) -> Self {
+        self.measurements.no_series = true;
+        self
     }
 
     /// Detectors that also keep every MoE sample they judge ([`samples`](Self::samples)).
     /// For a run read once from start to end, as `tensorquill-server detect --samples`
     /// reads it: the samples take memory for every step, so the server does not keep them.
     pub fn with_samples(thresholds: &Arc<Thresholds>) -> Self {
-        let mut detectors = Self::whole_run(thresholds);
+        let mut detectors = Self::new(thresholds);
         detectors.moe.kept = Some(Kept::default());
         detectors
     }
@@ -4482,8 +4481,6 @@ pub fn resolve(order: &[(i64, i64)]) -> BTreeMap<i64, Option<i64>> {
 /// attempt's rows resent late). The whole rank is read, not its last window, and the rows a
 /// later attempt rolled back are read too: a held baseline, the first incidents and the
 /// counts all reach back to the start, and a resume is compared with what it replaced.
-/// These are the detectors the live server holds and appends to, so they keep no trend series
-/// (see [`RankDetectors::whole_run`]).
 pub async fn replay(
     storage: &Storage,
     run_id: &str,
@@ -4574,10 +4571,9 @@ fn in_step_order(pieces: Vec<(i64, RecordBatch)>) -> Result<Vec<(i64, RecordBatc
 /// refused. Within an attempt the rows are read in step order, rows of one step in the order
 /// given (lane W3's step-order rule: the first fault is the lowest step, and an attempt's
 /// resume boundary is its lowest step, not its first row). A batch without an `attempt`
-/// column is attempt 0, and one without a `step` column is ignored. The detectors are
-/// [`RankDetectors::whole_run`]'s, which keep the trend series.
+/// column is attempt 0, and one without a `step` column is ignored.
 pub fn judge(rank: i32, batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Result<RankDetectors, String> {
-    judge_with(RankDetectors::whole_run(thresholds), rank, batches)
+    judge_with(RankDetectors::new(thresholds), rank, batches)
 }
 
 /// [`judge`] with detectors made by the caller, which have read nothing yet.
@@ -4682,7 +4678,7 @@ pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64)
 /// SDK sends, and its [`report`] out. Rows of a second run or rank are refused, because the
 /// detectors judge one rank's steps.
 pub fn detect_stream(input: impl std::io::Read, thresholds: &Arc<Thresholds>) -> Result<Value, String> {
-    let (run_id, rank, detectors) = detect_rows(input, RankDetectors::whole_run(thresholds))?;
+    let (run_id, rank, detectors) = detect_rows(input, RankDetectors::new(thresholds))?;
     Ok(report(&run_id, rank, &detectors, 0))
 }
 

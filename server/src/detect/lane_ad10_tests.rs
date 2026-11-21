@@ -6,9 +6,9 @@
 //! [`judge`], and the rank's [`report`] is compared with the case's `expected`. An `expected` of
 //! null is a block that must be absent: a missing key, never `null`. Numbers agree to one part in
 //! 1e12; everything else is exact. The tests after the cases pin what no case states, with numbers
-//! worked out by hand from `make_cases.py`'s functions. `judge` and `detect_run` keep the two
-//! trends' series ([`RankDetectors::whole_run`]); the live path's detectors do not, and one test
-//! holds them to that.
+//! worked out by hand from `make_cases.py`'s functions. Every path keeps the two trends' series; one
+//! test holds the setting without them (`RankDetectors::without_trend_series`, which no build uses)
+//! so that it is not left untested.
 
 use std::sync::Arc;
 
@@ -20,7 +20,7 @@ use super::{judge, report, RankDetectors, Thresholds};
 
 const BLOCKS: [&str; 4] = ["gradient_trend", "attention_trends", "update_trends", "weight_jumps"];
 
-fn measurement_cases() -> Vec<(String, Value)> {
+pub(super) fn measurement_cases() -> Vec<(String, Value)> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk/tests/fixtures/rules/cases.json");
     let document: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("the page's cases")).unwrap();
     document["cases"]
@@ -80,7 +80,7 @@ fn differs(at: &str, got: &Value, expected: &Value, out: &mut Vec<String>) {
 }
 
 /// Where a report differs from what `expected` states of the block `key`: a null is a missing key.
-fn block_differs(name: &str, report: &Value, key: &str, expected: &Value, out: &mut Vec<String>) {
+pub(super) fn block_differs(name: &str, report: &Value, key: &str, expected: &Value, out: &mut Vec<String>) {
     match (report.get(key), expected) {
         (None, Value::Null) => {}
         (Some(got), Value::Null) => out.push(format!("{name}: {key} is {got}, expected absent")),
@@ -131,8 +131,8 @@ fn every_measurement_case_holds_through_detect_run() {
     assert_eq!(held, 10);
 }
 
-/// Detectors that keep the trend series ([`RankDetectors::whole_run`], as `judge` makes them) and
-/// read a rank one batch per row give the blocks of the whole read as one batch, and they are there.
+/// Detectors that read a rank one batch per row give the blocks of the whole read as one batch, and
+/// they are there.
 #[test]
 fn a_rank_read_row_by_row_gives_the_blocks_of_the_whole() {
     let mut out = Vec::new();
@@ -162,12 +162,12 @@ fn a_rank_read_row_by_row_gives_the_blocks_of_the_whole() {
 }
 
 /// The live server's detectors ([`RankDetectors::new`], which `replay` makes and the live path
-/// appends to) keep no trend series: their report has no `gradient_trend` and no
-/// `attention_trends`, never a shorter trend, and the two bounded blocks as `detect` gives them.
+/// appends to) keep every series (option A, the author's decision of Nov 21, 2026): appended a row
+/// at a time, their four blocks are the cases' and `detect`'s.
 #[test]
-fn the_live_paths_detectors_keep_no_trend_series_and_give_the_bounded_blocks() {
+fn the_live_paths_detectors_give_the_four_blocks_of_detect() {
     let mut out = Vec::new();
-    let mut bounded = 0;
+    let mut present = 0;
     for (name, body) in measurement_cases() {
         let records = body["records"].as_array().unwrap();
         let mut detectors = RankDetectors::new(&Arc::new(Thresholds::default()));
@@ -175,23 +175,105 @@ fn the_live_paths_detectors_keep_no_trend_series_and_give_the_bounded_blocks() {
             detectors.append(0, &stored(std::slice::from_ref(record)));
         }
         let live = report("ad10", 0, &detectors, 0);
-        for block in ["gradient_trend", "attention_trends"] {
-            if let Some(got) = live.get(block) {
-                out.push(format!("{name}: the live report has {block} {got}"));
-            }
-        }
-        for block in ["update_trends", "weight_jumps"] {
+        let detect = judged(records);
+        for block in BLOCKS {
             if let Some(expected) = body["expected"].get(block) {
                 block_differs(&name, &live, block, expected, &mut out);
-                bounded += usize::from(!expected.is_null());
+                present += usize::from(!expected.is_null());
             }
-            if live.get(block) != judged(records).get(block) {
+            if live.get(block) != detect.get(block) {
                 out.push(format!("{name}: {block} differs from detect's"));
             }
         }
     }
-    assert_eq!(bounded, 2);
+    assert_eq!(present, 6);
     assert!(out.is_empty(), "{}", out.join("\n"));
+}
+
+/// A run that holds every block: a total norm on every step, update sizes, a weight check and a
+/// probe of two attention modules every ten steps. `scale` changes every value, so a second attempt
+/// that replaces steps gives other numbers than the rows it rolls back.
+fn workload(attempt: i64, steps: std::ops::Range<i64>, scale: f64) -> Vec<Value> {
+    steps
+        .map(|step| {
+            let x = step as f64;
+            let wobble = 1.0 + ((step * 37) % 21) as f64 / 100.0;
+            let mut record = json!({"attempt": attempt, "step": step, "grad_norm": scale * (1.0 + x / 50.0) * wobble,
+                                    "update_rms": {"w": scale * 1e-3 * wobble, "v": scale * 1e-3 / (1.0 + x / 40.0)}});
+            if step % 10 == 0 {
+                record["weight_norms"] = json!({"w": scale * (5.0 + x / 10.0), "v": 3.0 + (step % 30) as f64});
+                record["probe"] = json!({"attention": {"a.0": {"max_logit": [scale * (2.0 + x / 20.0)]},
+                                                       "a.1": {"max_logit": [scale * 3.0 * wobble]}}});
+            }
+            record
+        })
+        .collect()
+}
+
+fn blocks(report: &Value) -> Vec<Option<Value>> {
+    BLOCKS.iter().map(|block| report.get(*block).cloned()).collect()
+}
+
+/// A rebuild from the store, as after a restart or a new attempt (`replay`, which the live path
+/// uses), gives the four blocks of `detect` on the same records, and those of the resolved run:
+/// the rows a second attempt rolled back are in no series. The live path then appends to the
+/// rebuilt detectors, and still agrees with `detect`.
+#[tokio::test]
+async fn a_rebuild_from_the_store_gives_the_blocks_of_the_resolved_run() {
+    use object_store::memory::InMemory;
+    let thresholds = Arc::new(Thresholds::default());
+    let storage = crate::storage::Storage::new(Arc::new(InMemory::new()), "store".into());
+    let (first, second) = (workload(1, 0..60, 1.0), workload(1, 60..120, 1.0));
+    storage.write_part("ad8", 0, 1, &[stored(&first)], 0, 59).await.unwrap();
+    storage
+        .write_part("ad8", 0, 1, &[stored(&second)], 60, 119)
+        .await
+        .unwrap();
+
+    // After a restart: the whole store is read again.
+    let attempt_1: Vec<Value> = first.iter().chain(&second).cloned().collect();
+    let rebuilt = super::replay(&storage, "ad8", 0, &thresholds).await.unwrap();
+    let after_restart = report("ad8", 0, &rebuilt, 0);
+    assert!(blocks(&after_restart).iter().all(Option::is_some), "{after_restart}");
+    assert_eq!(blocks(&after_restart), blocks(&judged(&attempt_1)));
+
+    // A second attempt restarts at step 80, below the last step 119, with other values.
+    let resumed = workload(2, 80..150, 1.5);
+    storage
+        .write_part("ad8", 0, 2, &[stored(&resumed)], 80, 149)
+        .await
+        .unwrap();
+    let rebuilt = super::replay(&storage, "ad8", 0, &thresholds).await.unwrap();
+    let after_resume = report("ad8", 0, &rebuilt, 0);
+    let every_attempt: Vec<Value> = attempt_1.iter().chain(&resumed).cloned().collect();
+    assert_eq!(blocks(&after_resume), blocks(&judged(&every_attempt)));
+    // The resolved run: attempt 1 below step 80, then attempt 2, as one attempt.
+    let resolved: Vec<Value> = attempt_1
+        .iter()
+        .filter(|r| r["step"].as_i64().unwrap() < 80)
+        .chain(&resumed)
+        .map(|r| {
+            let mut r = r.clone();
+            r["attempt"] = json!(0);
+            r
+        })
+        .collect();
+    assert_eq!(blocks(&after_resume), blocks(&judged(&resolved)));
+    assert_ne!(
+        blocks(&after_resume),
+        blocks(&after_restart),
+        "the resume changed nothing"
+    );
+    assert_eq!(after_resume["gradient_trend"]["points"], 150);
+    assert_eq!(after_resume["gradient_trend"]["last_step"], 149);
+
+    // The live path appends the next part of attempt 2 to the rebuilt detectors.
+    let mut live = rebuilt;
+    let more = workload(2, 150..200, 1.5);
+    assert!(live.continues(2, 150));
+    live.append(2, &stored(&more));
+    let every_attempt: Vec<Value> = every_attempt.into_iter().chain(more).collect();
+    assert_eq!(blocks(&report("ad8", 0, &live, 0)), blocks(&judged(&every_attempt)));
 }
 
 /// No rule reads a block: the incidents, `kind_checks` and `not_checked` of a run are the same with
