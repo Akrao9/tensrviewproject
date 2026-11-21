@@ -1,0 +1,34 @@
+--- a/train.py
++++ b/train.py
+@@ -238,6 +238,15 @@
+ if init_from == 'resume':
+     optimizer.load_state_dict(checkpoint['optimizer'])
+ checkpoint = None # free up memory
++
++# TensorQuill: watch the model before it is compiled or wrapped. A router's inner linear layer
++# (`w_g`) gives the logits, so the counts are the assignments the router asked for.
++import tensorquill
++tq_session = tensorquill.init(
++    model, capture="full", project=wandb_project, name=wandb_run_name, config=config,
++    routers={name: tensorquill.Router(n_exp, top_k=top_k)
++             for name, _ in model.named_modules() if name.endswith("router.w_g")} or None,
++) if master_process else None
+ 
+ # compile the model
+ if compile:
+@@ -345,6 +354,8 @@
+     if grad_clip != 0.0:
+         scaler.unscale_(optimizer)
+         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
++    if tq_session is not None:
++        tq_session.log({"train/loss": loss.detach() * gradient_accumulation_steps})
+     # step the optimizer and scaler if training in fp16
+     scaler.step(optimizer)
+     scaler.update()
+@@ -372,3 +383,6 @@
+ 
+ if ddp:
+     destroy_process_group()
++
++if tq_session is not None:
++    tq_session.close()
