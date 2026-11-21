@@ -375,3 +375,45 @@ def test_a_caller_skip_before_the_scalers_update_has_no_scaler_outcome():
     assert first["step_skipped"] is True and first["step_skipped_by"] == "caller"
     assert "scaler_applied" not in first and "grad_scale" not in first
     assert second["step_skipped"] is False and "scaler_applied" not in second
+
+
+def _order_run(plan: list[tuple[bool, bool, bool]]) -> list[dict]:
+    """Each step is (an optimizer goes through `scaler.step`, the `skipped` given, `scaler.update()`
+    comes after `session.step` rather than before it)."""
+    model = _model()
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    amp = torch.amp.GradScaler("cpu", init_scale=1024.0)
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, capture="full", every=1, auto_step=False, scaler=amp)
+    for through, skipped, late in plan:
+        opt.zero_grad()
+        loss = model(torch.ones(2, 4)).sum()
+        (amp.scale(loss) if through else loss).backward()
+        if through:
+            amp.step(opt)
+            if not late:
+                amp.update()
+        else:
+            opt.step()
+        session.step(skipped=skipped)
+        if through and late:
+            amp.update()
+    session.close()
+    return sink.records
+
+
+def test_a_late_verdict_of_an_earlier_update_never_says_the_scaler_applied_a_caller_skip():
+    """With `scaler.update()` after `session.step`, each verdict reaches the record after its own
+    update's (as today). It is of an update already ended, so it never gives `scaler_applied`: not
+    on the next update's caller skip in the same order, and not on a next update that went to the
+    optimizer directly. A next update whose own verdict came before its `session.step` has it."""
+    late_then_late = _order_run([(True, False, True), (True, True, True)])
+    late_then_direct = _order_run([(True, False, True), (False, True, False)])
+    late_then_in_time = _order_run([(True, False, True), (True, True, False)])
+    for records in (late_then_late, late_then_direct, late_then_in_time):
+        assert [r.get("step_skipped_by", "-") for r in records] == ["-", "caller"]
+    assert "scaler_applied" not in late_then_late[1]
+    assert "scaler_applied" not in late_then_direct[1]
+    assert late_then_in_time[1]["scaler_applied"] is True
+    in_time = _order_run([(True, True, False), (True, True, False)])
+    assert [r.get("scaler_applied", "-") for r in in_time] == [True, True]

@@ -96,6 +96,10 @@ UPDATES_NO_OPTIMIZER = "no optimizer"
 # The key under which `step(skipped=...)` keeps the caller's verdict from `_commit` to `_decode`;
 # never written to a record, which says `step_skipped`, `step_skipped_by` and `scaler_applied` instead.
 _CALLER_SKIPPED = "caller_skipped"
+# Kept beside a scaler verdict that `scaler.update()` gave after the `session.step()` of its update
+# had already ended that step (`step`, `_record_scaler`): it is not this record's update, so it never
+# says the scaler applied a caller's skip (`scaler_applied`). Never written to a record either.
+_SCALER_LATE = "scaler_verdict_late"
 # Settings per capture mode. Router load is the always-on signal; layer statistics and
 # gradient and weight norms are a debugging mode, as in Composer's ActivationMonitor,
 # wandb.watch and Lightning's grad_norm.
@@ -1493,6 +1497,10 @@ class Session:
         self._ring_scalars: list[dict[str, Any]] = []
         self._ring_amp: list[dict[str, Any]] = []
         self._pending_amp: dict[str, Any] = {}
+        # Under `auto_step=False`: `session.step()` ended a step while the scaler still held an
+        # optimizer's state that its `update()` had not read, so the verdict `update()` gives next
+        # is of an update already ended (`_record_scaler`, `_SCALER_LATE`).
+        self._scaler_verdict_late = False
         self._pending_scalars: dict[str, Any] = {}
         self._ring_probe: list[dict[str, Any] | None] = []
         # Data progress (`data`): None until the first batch is noted, then every step has one.
@@ -2118,6 +2126,9 @@ class Session:
             return False
         skipped = torch.stack([f.to(scale.device).reshape(()) for f in found]).sum() > 0
         self._pending_amp = {"step_skipped": skipped.float(), "grad_scale": scale.detach().clone()}
+        if self._scaler_verdict_late:
+            self._scaler_verdict_late = False
+            self._pending_amp[_SCALER_LATE] = True
         return True
 
     @torch.no_grad()
@@ -2845,6 +2856,14 @@ class Session:
             self.record_grads()
         if lr is not None:
             self._pending_lr = [float(lr)] if isinstance(lr, (int, float)) else [float(v) for v in lr]
+        if self._scaler is not None:
+            # An optimizer went through `scaler.step` (or `unscale_`) and `scaler.update()` has not
+            # run yet: its verdict, when it comes, is of the update this call ends. Read on the
+            # host, from the scaler's own dict, as a stopped session reads it (`_scaler_before_update`).
+            self._scaler_verdict_late = any(
+                state.get("found_inf_per_device")
+                for state in getattr(self._scaler, "_per_optimizer_states", {}).values()
+            )
         self._commit(step, caller_skipped=skipped)
 
     def _router_refusals(self) -> dict[str, str]:
@@ -3854,10 +3873,11 @@ class Session:
                     record["grad_scale"] = amp["grad_scale"]
                 if by_scaler or by_caller:
                     record["step_skipped_by"] = "both" if by_scaler and by_caller else "scaler" if by_scaler else "caller"
-                if by_caller and not by_scaler and "step_skipped" in amp:
+                if by_caller and not by_scaler and "step_skipped" in amp and not amp.get(_SCALER_LATE):
                     # A caller's skip on an update the scaler was seen to apply: an optimizer went
-                    # through the scaler and `update()` found no Inf or NaN (`_record_scaler`). With no
-                    # verdict of the scaler's for this update its outcome is unknown, and no key is written.
+                    # through the scaler and `update()` found no Inf or NaN (`_record_scaler`), before
+                    # this step ended. With no verdict of the scaler's for this update (none, or one
+                    # of an earlier update that came late) its outcome is unknown: no key.
                     record["scaler_applied"] = True
             if scalars is not None and scalars[i]:
                 record["scalars"] = scalars[i]
