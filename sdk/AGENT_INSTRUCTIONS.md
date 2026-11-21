@@ -22,7 +22,11 @@ Most agent hosts take an entry like this one:
 {"mcpServers": {"tensorquill": {"command": "python", "args": ["-m", "tensorquill.mcp_server", "PATH"]}}}
 ```
 
-The server has six tools and all six only read. Four answer about the run at `PATH`: `list_incidents`, `get_incident`, `get_series` and `get_all_ranks_status`. Two look at the runs kept beside it: `list_runs` and `compare_runs`. It reads `PATH` again at every call, so the answers follow a run that is still going. No answer is longer than about 50 KB.
+The server has six tools and all six only read. Four answer about the run at `PATH`: `list_incidents`, `get_incident`, `get_series` and `get_all_ranks_status`. Two look at the runs kept beside it: `list_runs` and `compare_runs`. It reads `PATH` again at every call, so the answers follow a run that is still going. No answer is longer than 50,000 bytes.
+
+The server does not send this page. It sends its tools' descriptions and a short paragraph of its own, so put this page in the agent's instructions yourself.
+
+A few keys this page names are in the evidence file and in no tool's answer: `skipped_updates`, and `parameters_not_judged` and the notes under `kind_checks`. Where this page says so, read them from the evidence file when there is one. Reading it is not changing it.
 
 "Beside it" is the folder `PATH` is in, or for a run folder the store's `runs/` folder. Add `--runs FOLDER` to the command to name another folder of local files or another store. The two tools take run IDs and names found there, never a path.
 
@@ -35,6 +39,8 @@ The trigger wakes you for an invariant, and for a stall once the server calls it
 When a critical stall woke you, it is still an observation and not a verdict. The server saw no new step for a long time; it cannot tell a hang from a long pause or a dead sender. It can tell a rank whose connection dropped and did not come back: then `assessment` is `lost_connection` (also in `TENSORQUILL_INCIDENT_ASSESSMENT`, with the lost ranks in `lost_ranks`), which means the process was most likely killed or crashed, an out-of-memory kill among them, or the network failed. Do not call that a hang; the ranks still connected are most likely waiting for the lost one. You are woken once for a stall episode, whatever kind it becomes later; a job that steps past the stall, or is started again, and then stalls again wakes you again (a job started again that hangs before it stores a step does too, once its start window has passed; the status then marks its rank `attempt_without_steps`, and the step shown is the earlier attempt's), and the file you are handed is the compact evidence. Read the incident's `assessment`, its `stuck_at` (where each stopped rank's main thread was, and for how long it had not moved) and how long each rank has been quiet, say which of those explanations the evidence supports and which it cannot rule out, and take no action on the job.
 
 When ranks are stopped, `get_all_ranks_status` may name an odd group in `stopped_stacks`: report it as where those ranks were, never as the cause, and name no rank when its `verdict` is not `odd_group`. A local file's `run_end` other than `closed` means the run is not known to have finished.
+
+A stall can come from a rank whose capture had already stopped while training went on. The incident then carries `capture_stopped` (the reason, such as `sink_error`, and how long ago) and `capture_last_step`, the last step that rank's current attempt stored. Say first that its records end there, for that reason, and that the evidence cannot tell whether training itself stalled after that. When `capture_last_step` is null, the current attempt stored no step: name no step, and never an earlier attempt's last one.
 
 Work in this order.
 
@@ -60,7 +66,26 @@ Every diagnosis states three things, in the tools' own words:
   When `where` gives a count next to a list, the list is the first twelve; the full list is in the incident.
 - **The kind.** Use the incident's `kind` as written, such as `grad_spike`, an anomaly. Do not rename it.
 
-For a run folder, also name the ranks from `on_ranks`. When `numbers_differ` is true, the numbers shown are one rank's, and the answer says which.
+For a run folder, also name the ranks from `on_ranks`. When `numbers_differ` is true, the numbers shown are one rank's, and the answer says which. Ranks are put in one group when their incidents have the same kind, step and names; a group does not mean their numbers agree.
+
+## Which rank a drift is attributed to
+
+A replica-drift incident says that the copies of a parameter held by data-parallel ranks differ. It is an invariant. Its `attribution` entries say, for each parameter on its own, which ranks stand apart. Read each entry's `verdict`:
+
+- `attributed`: `outliers` lists the ranks that stand apart from a strict majority. Call them the ranks that differ from the majority. Never call them the faulty ranks: a fault shared by every other rank would name the healthy one.
+- `inconclusive`: `why` says why no rank can be named. `two_ranks`: two ranks that differ show a divergence and cannot say which is wrong. `no_outlier`: the ranks spread over the tolerance, but none is far from the median. `no_majority`: no strict majority. Name no rank. Do not pick one yourself, from the numbers, from rank 0, or from another parameter's entry.
+
+One step can name different ranks for different parameters. An entry with `by` set to `signatures` is evidence only and raised nothing. A step on which a rank's observation is missing has no attribution at all. A group of one rank is never said to agree: it reads "one rank observed, zero peers compared".
+
+## Skipped updates
+
+A record can say that its update was due and was not applied: `step_skipped` is true, and `step_skipped_by` says who said so. `"caller"` is the training code, through `session.step(skipped=True)`, as with Megatron-LM or DeepSpeed. `"scaler"` is the loss scaler given to TensorQuill. `"both"` is both. A skipped record with no `step_skipped_by` was written before the key existed, and is the scaler's.
+
+- No gradient spike or update-size jump is judged on a skipped step, and a skipped step does not advance a stalled-weights streak.
+- Only skips the scaler confirmed count toward the loss-scale kind. A run of skips the caller reported raises nothing there, even when the framework's own loss scaler caused them. So in a run whose skips are all the caller's, the loss-scale kind finding nothing does not mean there was no overflow.
+- A gradient that is not finite on a skip the caller reported raises nothing by itself. The evidence file keeps it under `skipped_updates`: the skipped steps counted by who reported them, and `non_finite_gradients` (how many such steps, the first, and what was not finite there). An all-ranks file has `skipped_updates_by_rank`. No tool's answer has this key. When you cite it, say that the update of that step was reported skipped.
+- A layer statistic that is not finite on a skipped step still raises `non_finite`, an invariant.
+- In a capture written before `step_skipped_by`, the scaler's skips no longer extend a stall's streak, so a stalled-weights incident can count fewer steps (`stalled_steps`) than an older version reported for the same file. That is the rule, not a change in the run.
 
 ## How to read a series
 
@@ -110,7 +135,7 @@ These are healthy causes, or causes outside what TensorQuill sees, that look lik
 
 **Router load.** Before you read the MoE imbalance kind or the starved-experts kind as a fault, ask how the model picks its experts, and say in the diagnosis that you asked:
 
-- **Router counts are the routing only when the model picks the plain top-k of the hooked scores.** For a router whose output has no integer tensor, TensorQuill counts the top-k of the scores it hooks. A per-expert balancing bias used only for the choice (DeepSeek-V3, Motif 3, Mamoda2.5), noise added to the router logits after the hooked module, or a capacity limit applied after it makes those counts wrong, and a healthy model then shows overloaded and dead experts. The evidence does not say how a router was read, so ask a person or read the model's code. If the model does any of these, the counts are not evidence of a fault until the router is declared with an `indices=` function that applies the bias, or the module that returns the chosen experts is hooked instead.
+- **Router counts are the routing only when the model picks the plain top-k of the hooked scores.** For a router declared with no `indices=` function and whose output has neither an integer tensor nor a routing map, TensorQuill counts the top-k of the scores it hooks. A per-expert balancing bias used only for the choice (DeepSeek-V3, Motif 3, Mamoda2.5), noise added to the router logits after the hooked module, or a capacity limit applied after it makes those counts wrong, and a healthy model then shows overloaded and dead experts. The evidence does not say how a router was read, so ask a person or read the model's code. If the model does any of these, the counts are not evidence of a fault until the router is declared with an `indices=` function that applies the bias, or the module that returns the chosen experts is hooked instead.
 - **A narrow data domain routes unevenly in a healthy MoE.** On one domain an expert can take nearly all tokens, and the first MoE layer settles later than the others (OLMoE). Check whether the batch or the fine-tune is one domain and whether only the first layer is affected. A large routing shift during fine-tuning is the unusual thing.
 - **A healthy run can route very unevenly inside one sequence.** In one paper's measurement, a model trained with a balancing bias and no balancing loss used about half the experts or fewer per sequence and still trained as well (Omi, Sen and Farhadi); DeepSeek-V3 also names imbalance within sequences and small batches. On steps of very few sequences, the dead-expert rule could then fire on a healthy run; that is a reading of the rule, not a run.
 - **Padding tokens all route to the same experts**, because they reach the router as the same vector; this is correct counting, and one report had about 5% padding in training (Laguna).
@@ -147,6 +172,12 @@ These are healthy causes, or causes outside what TensorQuill sees, that look lik
 - **not configured**: the capture was never set up to record it. A router-only capture has no weight or activation checks, a run without `scaler=` has no loss-scale check, a run without `replica_group=` has no drift check (and a drift check that found nothing does not rule out silent data corruption: a corrupted gradient reaches every replica alike, so the replicas stay equal), and a local file that no server was watching has no stall check. This is not a fault and does not change the run state. Never write "no stalled weights" or "activations look fine" for a kind listed here: write that it was not captured, and what would capture it.
 - **unavailable**: it was asked for and could not be judged: a probe that failed, a reading that could not be taken, a resume that could not be compared, a file that could not be read, a server's store without its progress status. Each has a reason. This makes the run `degraded`.
 
+**Gradients that were not read.** A `not_checked` entry with `check` set to `gradients` names parameters whose gradient could not be read. The run is `degraded`, and each kind reads by what it is judged from:
+
+- Only `grad_spike`, an anomaly, is unavailable for it, because the total gradient norm leaves those parameters out. A spike it reports in the total as read still stands.
+- The stalled-weights kind stays as it was for the parameters that were read, and the file's `kind_checks` names the others under `parameters_not_judged`. Never write that those weights were moving, or that they were not.
+- The NaN-or-Inf check stays checked for everything that was read.
+
 `records_needed` is a floor. Reaching it means the count is what the kind's slowest rule needs, not that every parameter, module or router has that much history of its own. Below it, that rule cannot have fired. A kind can still report an incident before it has enough history, through one of its rules that needs less: the incident stands, and the kind's other rules are still warming up. The listing marks such a kind with `reported`, and the summary with "but reported by a faster rule".
 
 The summary's line "N of 33 kinds checked" is the count, and it names the kinds without enough history: "6 of 33 kinds checked, 1 of them without enough history yet (grad_spike 3 of 13 records)". Say both when you report that nothing was found.
@@ -164,7 +195,8 @@ The summary's line "N of 33 kinds checked" is the count, and it names the kinds 
 - One unavailable rank makes the kind unavailable for the run, and the run `degraded`, as for one rank.
 - The summary's count line names the same things: "6 of 33 kinds checked on the 3 judged ranks of 4 (rank 3 not judged, so not counted), 1 of them without enough history yet (grad_spike 5 of 13 records on rank 2), 27 not configured, 1 of them checked on some ranks only (stalled_weights on rank 0)".
 - When there is no `kinds`, `kinds_not_stated` gives the reason: no rank is judged, or a judged rank's report was written by a server that does not say what it checked. Then nothing is counted for the run, and the summary says "What was checked is not stated". Say so, and do not infer it.
-- The invariant `duplicate_batches` is compared by the server, and its status lists the ranks it compared as `ranks_compared`, whether or not it found a duplicate, so `checked` means every judged rank was compared. A judged rank the server did not compare, for example right after a server restart, or one whose batches carry no batch hash, makes it `not_configured` and is named under `not_compared_ranks`: do not read that rank as free of duplicates. A status from an older server does not list the ranks compared and its entry has a `note` saying so; then read `checked` as "every judged rank recorded its batches and a status was read", not as proof that every rank was compared.
+- The invariant `duplicate_batches` is compared by the server, and its status lists the ranks it compared as `ranks_compared`, whether or not it found a duplicate, so `checked` means every judged rank was compared. A judged rank the server did not compare, for example right after a server restart, or one whose batches carry no batch hash, makes it `not_configured` and is named under `not_compared_ranks`: do not read that rank as free of duplicates. A status from an older server does not list the ranks compared and its entry has a `note` saying so; then read `checked` as "every judged rank recorded its batches and a status was read", not as proof that every rank was compared. A rank is listed as compared only when it was compared with at least one other, so a run with one rank of batch hashes reads `not_configured`, with the note "one rank observed, zero peers compared": nothing was compared, so never call it free of duplicates.
+- **Rows the server did not store.** For a run in a server's store, `dropped_rows` counts rows the server dropped (a null key, or a schema version it does not support; an upper bound, since a batch sent again is counted again), and `refused_batches` counts whole batches it refused (a key column missing or of another type). The two are separate counts, never added together. Nothing in them was stored or judged, so when either is present say that some of the run's steps may be missing from the evidence, and which ranks. They appear in `list_incidents` (under `rank`), `get_all_ranks_status`, `list_runs` and `compare_runs` for a store run only. A local file has neither count, so their absence there says nothing.
 
 A check listed under `not_checked` was not made, and each entry gives the reason. It is not a finding of "nothing wrong". Every unavailable kind is named by one of these entries, or by the reason `no_status`.
 
@@ -207,3 +239,4 @@ The TensorQuill tools cannot do any of these things. The rule also covers every 
 - A rank whose state is `capture_stopped` was not judged after its capture stopped: training went on, the records did not. Treat the run as `unknown`, never as healthy, and give the reason it carries (`sink_error`, `writer_behind`, `close_timeout`).
 - `moe_unassigned` and `moe_left_out` are 0 (or all zeros) when the check ran and found nothing. When they are absent, the check did not run or the record is older than the fields: that is unknown, not zero.
 - In a stalled-weights incident, `trained_before` counts parameters that were changed or not compared at an earlier check. It is not proof that a weight ever moved.
+- In a resume-incomplete incident, a model component whose finding is `not_identified` reads "model state could not be identified": the rule that looks for the model's entry in the checkpoint found none it knows. It is not `missing`. Do not write that the checkpoint lacks the model's state.
