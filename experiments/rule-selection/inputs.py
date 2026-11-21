@@ -82,11 +82,15 @@ def load(entry_id: str) -> list[tuple[str, list[dict], dict]]:
             for rank, rows in _file(Path(name)).items():
                 found.append((entry_id, rows, entry))
         return found
+    if kind == "validation":  # run once against the proposed rules; never part of `everything()`
+        return [(entry_id, rows, entry) for name in sorted(glob.glob(str(WORKTREE / entry["path"])))
+                for rows in _file(Path(name)).values()]
     raise ValueError(f"unknown kind {kind!r}")
 
 
 def everything() -> list[tuple[str, list[dict], dict]]:
-    return [one for entry_id in ENTRIES for one in load(entry_id)]
+    return [one for entry_id, entry in ENTRIES.items() if entry["kind"] not in ("in-script", "validation")
+            for one in load(entry_id)]
 
 
 def role(name: str, entry: dict) -> str:

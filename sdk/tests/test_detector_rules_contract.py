@@ -3,7 +3,9 @@ rules, and four measurements.
 
 Nothing of the page is built when this file is written. It checks that every case is named on the
 page, that the file is what its generator writes, and what each rule case's `today` records: the
-answer of `eb5a71b`, which the engine lanes replace with the case's `expected`.
+answer of `eb5a71b`. The two tests named `..._records_what_the_rule_says_today` hold the code to that
+answer: the Python detector lane (AD7) replaces each with a test of the case's `expected` when it
+builds the rule. `today` in the file is a literal, so the generator's output does not move.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ ROOT = Path(__file__).parents[2]
 FOLDER = Path(__file__).parent / "fixtures" / "rules"
 DOCUMENT = json.loads((FOLDER / "cases.json").read_text())
 CASES = DOCUMENT["cases"]
-PARTS = {"score": 7, "activation_drift": 9, "moe_imbalance": 9, "measurements": 10}
+PARTS = {"score": 7, "activation_drift": 9, "moe_imbalance": 10, "measurements": 10}
 
 
 def of(part):
@@ -72,6 +74,9 @@ def test_the_cases_show_each_thing_the_page_says_a_rule_gives_up_or_keeps():
     assert start["start_ten_samples_is_reported"] == {**start["start_ten_samples_is_reported"], "step": 0, "since_start": True}
     assert start["not_at_step_0_is_not_a_start"]["step"] == 5 and "since_start" not in start["not_at_step_0_is_not_a_start"]
     assert start["one_router_starts_another_fails"]["router"] == "b"
+    assert start["start_and_the_capture_ends"] is None
+    assert CASES["start_and_the_capture_ends"]["expected"]["starting_state"] == [{"router": "r", "samples": 5}]
+    assert CASES["start_two_samples_then_even"]["expected"]["starting_state"] == []
     assert CASES["score_no_dispersion"]["expected"] == {"score": None, "score_note": "no_dispersion"}
     assert CASES["score_nine_earlier_values"]["expected"] == {"score": None, "score_note": "short_history"}
     assert CASES["gradient_trend_a_plateau"]["expected"]["gradient_trend"]["growth"] == 1.0

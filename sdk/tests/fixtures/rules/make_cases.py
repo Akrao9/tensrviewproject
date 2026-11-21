@@ -29,6 +29,20 @@ TREND_MIN = 6           # points a trend needs
 LISTED = 10             # entries a measurement lists
 
 
+# What `eb5a71b` gave for each rule case: the step of its incident, or None. Literals, measured once
+# on that commit (Nov 21, 2026), so that this file gives the same `cases.json` after the rules change.
+TODAY = {
+    "drift_growth_from_scratch_is_not_a_shift": 140, "drift_a_step_change_is_named": 305, "drift_a_fall_is_named_too": 205,
+    "drift_just_under_the_factor": None, "drift_a_slow_drift_is_not_seen": 981,
+    "drift_a_change_in_the_first_records_is_not_seen": 75, "drift_not_judged_before_110_records": 100,
+    "drift_the_outlier_ratio": 205, "drift_one_of_two_modules": 255,
+    "start_two_samples_then_even": 0, "start_nine_samples_then_even": 0, "start_ten_samples_is_reported": 0,
+    "start_then_a_later_overload": 0, "start_ends_and_comes_back": 0, "not_at_step_0_is_not_a_start": 5,
+    "start_in_a_sparse_capture": 0, "one_router_starts_another_fails": 0, "a_healthy_router": None,
+    "start_and_the_capture_ends": 0,
+}
+
+
 def finite(value):
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
 
@@ -131,11 +145,10 @@ def drift_cases():
     sets["drift_one_of_two_modules"] = ("two modules, `b` goes from 1 to 4 at record 250", two)
     out = {}
     for name, (says, records) in sets.items():
-        today = next((i for i in ev.detect_activation_anomalies(records) if i["kind"] == "activation_drift"), None)
         out[name] = {"part": "activation_drift", "says": says, "records": records,
                      "expected": {"incident": drift(records), "enough_history": len(records) >= DRIFT_NEEDS,
                                   "records_needed": DRIFT_NEEDS},
-                     "today": {"step": today and today["step"]}}
+                     "today": {"step": TODAY[name]}}
     return out
 
 
@@ -171,6 +184,19 @@ def imbalance(records):
             **({"since_start": True} if since_start else {})}
 
 
+def starting(records):
+    """The routers still in the state they started in when the records end: flagged from step 0 on
+    every sample so far, and fewer than START_GRACE of them. `kind_checks` names them."""
+    sizes = ev._router_sizes(records)
+    samples = ev._moe_samples(records, sizes, ev._router_top_k(records, list(sizes), None), ev.OVERLOAD_THRESHOLD)
+    by_router: dict[str, list[dict]] = {}
+    for sample in samples:
+        if not sample.get("missing") and sample.get("routed_tokens", 0) > 0:
+            by_router.setdefault(sample["router"], []).append(sample)
+    return [{"router": router, "samples": len(seq)} for router, seq in by_router.items()
+            if seq[0]["step"] == 0 and len(seq) < START_GRACE and all(s.get("overloaded") or s.get("dead") for s in seq)]
+
+
 EVEN, LOADED = [32] * 8, [102, 22, 22, 22, 22, 22, 22, 22]  # 256 assignments; 102 is 39.8%, over the 35% line
 
 
@@ -195,14 +221,14 @@ def imbalance_cases():
         "one_router_starts_another_fails": ("router `a` overloaded at steps 0 and 1; router `b` even until step 3",
                                             moe_records({"a": "xx" + "." * 10, "b": "..." + "x" * 9}, routers=("a", "b"))),
         "a_healthy_router": ("even throughout", moe_records({"r": "." * 30})),
+        "start_and_the_capture_ends": ("overloaded on all five samples of a five-step capture: nothing is reported, and the check names the router as still in its starting state",
+                                       moe_records({"r": "x" * 5})),
     }
     out = {}
     for name, (says, records) in sets.items():
-        sizes = ev._router_sizes(records)
-        samples = ev._moe_samples(records, sizes, ev._router_top_k(records, list(sizes), None), ev.OVERLOAD_THRESHOLD)
-        today = ev.first_incident({"samples": samples})
         out[name] = {"part": "moe_imbalance", "says": says, "records": records,
-                     "expected": {"incident": imbalance(records)}, "today": {"step": today and today["step"]}}
+                     "expected": {"incident": imbalance(records), "starting_state": starting(records)},
+                     "today": {"step": TODAY[name]}}
     return out
 
 

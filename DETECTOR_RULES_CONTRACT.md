@@ -49,7 +49,14 @@ Cases: `score_above`, `score_below_is_negative`, `score_ten_earlier_values`, `sc
 - The incident keeps its shape: `step`, `modules` (each with `module`, `stat`, `baseline`, `recent`, `ratio`, and now `score`), `affected`, `affected_steps`.
 - `dead_activations`, which shares the function, is not changed.
 
-**Measured** (the table is in `RESULTS.md`): quiet on all 28 healthy record sets, with a largest ratio of 1.68 against the factor of 3. The three recorded GPU faults fire at step 254, as today, with ratios near 100.
+**Measured** (the table is in `RESULTS.md`): no healthy record set fires, with a largest ratio of 1.68 against the factor of 3. The three recorded GPU faults fire at step 254, as today, with ratios near 100.
+
+**How far that evidence goes.**
+
+- **It is in-sample.** The plain trailing baseline was tried first and fired on one healthy run at step 59. "Never use a module's first 50 records" was added after seeing that. So the result on these runs is a fit to them, not a test.
+- **22 of the 28 healthy record sets are judged at all.** The other six have no layers or fewer than 110 records. B4's healthy run, the one the plain trailing rule fired on, has 102 records: it is quiet here because it is never judged, not because it was judged and passed.
+- **The 22 are about ten distinct workloads.** Granite in three capture modes is one job. B9, B10 and the hardware simulation share one model and give the same numbers. The two nanoMoE arms share a model and a seed.
+- **One fresh run is the check.** A from-scratch MoE job of another shape, not used to choose the rule, is run once against this rule as written. Its result is in `RESULTS.md` under "Validation".
 
 **What it gives up, stated so it is signed knowingly.**
 
@@ -73,9 +80,13 @@ Cases: `drift_growth_from_scratch_is_not_a_shift`, `drift_a_step_change_is_named
 
 **Measured.** Not judging step 0 alone moves nanoMoE's incident to step 1. A rule that asks for three flagged samples in a row misses the practice fixture's overload, which is on the last two of four sampled steps. This rule is quiet on nanoMoE with its balance loss, fires at step 7 on another router without it, and reports every seeded collapse at the step and router today's rule does. A limit of 5 or of 50 gives the same answers on these inputs.
 
+**While a router is still in its starting state.** A short capture must not read as checked and clean. When the records end with a router flagged on every sample since step 0 and fewer than 10 of them, nothing is reported for it, and the `moe_imbalance` entry of `kind_checks` carries `starting_state`: a list of `{"router", "samples"}`. With that key present `enough_history` is false, so the kind reads as checked without enough history (`start_and_the_capture_ends`).
+
+**The public function.** `first_incident()` follows this rule, since `build_evidence` and the Rerun export both take the incident from it. The per-step samples it reads are unchanged.
+
 **What it gives up.** A router collapsed from its first step is reported 10 samples later than today.
 
-Cases: `start_two_samples_then_even`, `start_nine_samples_then_even`, `start_ten_samples_is_reported`, `start_then_a_later_overload`, `start_ends_and_comes_back`, `not_at_step_0_is_not_a_start`, `start_in_a_sparse_capture`, `one_router_starts_another_fails`, `a_healthy_router`.
+Cases: `start_two_samples_then_even`, `start_nine_samples_then_even`, `start_ten_samples_is_reported`, `start_then_a_later_overload`, `start_ends_and_comes_back`, `not_at_step_0_is_not_a_start`, `start_in_a_sparse_capture`, `one_router_starts_another_fails`, `a_healthy_router`, `start_and_the_capture_ends`.
 
 ## 4. The learning rate on `update_spike`
 
@@ -143,7 +154,19 @@ Two facts the run established, which shape the choice:
 - **What must not happen:** a refusal skips rows the server could have stored. The sender moves its offset only to the end the server named, and only on an answer that carries `refused`.
 - **Left as it is:** when every batch of a sender is refused (a sender newer than its server), each batch costs one stream and one backoff. This wave sets no rule to stop sending after several refusals in a row.
 
+**What the acceptance run does not cover.**
+
+- **It does not use the real sender.** TensorQuill's sender builds every batch from one schema, so it cannot send a batch the server refuses for a key column. The run's client is a raw Flight client that follows the sender's rules as this part states them. The real sender's handling of the answer is lane AD4's, tested against the fake server in `sdk/tests/flight_fake_server.py`.
+- **"An answer, then the status" is not yet shown to arrive.** Whether a Flight client reads a last message on the acknowledgement channel before the error status ends the call was not tried. Lanes AD2 and AD4 show it first. If it does not arrive, the status text carries the same two values (the refused end offset and the column) and the sender reads them from there; the numbers in the table stay as they are.
+
 The alternative, if the author prefers it: change nothing on the wire, and have the sender keep its offset and retry only at its backoff ceiling. Then C never arrives while B is refused, and nothing valid is ever skipped.
+
+## What has cases and what does not
+
+- **With shared cases (36):** the score's arithmetic (7), `activation_drift` (9), `moe_imbalance` (10), the four measurements (10).
+- **With an acceptance test:** RS10.
+- **Prose only, so far:** the learning rate on `update_spike` (part 4), `parameters_not_judged` (part 5, where "the run-level check" is the run-level part of the all-ranks view, `combine_rank_evidence`), and the three wire keys (part 7).
+- **Still to add before the engine lanes start:** a records-level case of the score for `grad_spike`, whose two parameter paths take different baselines, and for `activation_spike`. Without them the two engines would first meet on the score's windows at the merge.
 
 ## 9. Held out of this page
 

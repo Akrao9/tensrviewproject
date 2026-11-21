@@ -54,6 +54,12 @@ Each seeded fault, by the recommended candidate:
 | The hand-written planted drift | Fires at step 185, as today. Its ratio and its count of affected steps change |
 | TrainCheck's buggy runs, nanoMoE without the balance loss | No activation fault is planted: the signal was never in the capture |
 
+How far this goes:
+
+- **The recommended candidate was shaped on these runs.** The plain trailing rule was tried first; leaving a module's start out of the baseline was added after it fired on B04's healthy run at step 59. So this table is a fit, not a test.
+- **B04's healthy run is not judged by it.** That run has 102 records and the candidate needs 110. It is quiet there for want of history.
+- **The 22 judged record sets are about ten distinct workloads:** Granite (three capture modes of one job), the two nanoMoE arms (one model, one seed), the seeded-failure toy, B1, B3, B6, B14, B19, and one model shared by B9, B10 and the hardware simulation.
+
 What the recommended candidate gives up:
 
 - **A slow drift.** A level that changes by less than 3 times within 60 records never fires, however far it goes in the end.
@@ -91,7 +97,9 @@ What it gives up: a router that is collapsed from its first step is reported 10 
 - One seed of each from-scratch run. No large model trained from scratch, and no run longer than 2,001 steps.
 - No healthy run here has a learning-rate restart or a resume, either of which could move activations within 60 records.
 - The three GPU faults are all step changes of about 100 times. No recorded fault is small or gradual.
-- The spike, diversity, starvation and stall thresholds were not re-measured in this pass.
+- The spike, diversity, starvation and stall thresholds were not re-measured in this pass, though the plan said they would be read on the same runs.
+- Of the sibling repositories, only LLM-Training-Debugger was read for how it scores against a baseline.
+- `trainer-check-block` is listed with its fault at step 253; its activation spike shows at step 250, as in the other `Trainer` run. The table's "fires at 254" holds either way.
 
 ## A robust local trend, for Q1 and B4 (the author's request, Nov 21, 2026)
 

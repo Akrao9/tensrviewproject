@@ -2,7 +2,8 @@
  "cases": {
   "a_healthy_router": {
    "expected": {
-    "incident": null
+    "incident": null,
+    "starting_state": []
    },
    "part": "moe_imbalance",
    "records": [
@@ -51547,7 +51548,8 @@
      ],
      "router": "r",
      "step": 5
-    }
+    },
+    "starting_state": []
    },
    "part": "moe_imbalance",
    "records": [
@@ -51785,7 +51787,8 @@
      ],
      "router": "b",
      "step": 3
-    }
+    },
+    "starting_state": []
    },
    "part": "moe_imbalance",
    "records": [
@@ -52447,6 +52450,114 @@
     null
    ]
   },
+  "start_and_the_capture_ends": {
+   "expected": {
+    "incident": null,
+    "starting_state": [
+     {
+      "router": "r",
+      "samples": 5
+     }
+    ]
+   },
+   "part": "moe_imbalance",
+   "records": [
+    {
+     "moe": {
+      "r": [
+       102,
+       22,
+       22,
+       22,
+       22,
+       22,
+       22,
+       22
+      ]
+     },
+     "moe_top_k": {
+      "r": 1
+     },
+     "step": 0
+    },
+    {
+     "moe": {
+      "r": [
+       102,
+       22,
+       22,
+       22,
+       22,
+       22,
+       22,
+       22
+      ]
+     },
+     "moe_top_k": {
+      "r": 1
+     },
+     "step": 1
+    },
+    {
+     "moe": {
+      "r": [
+       102,
+       22,
+       22,
+       22,
+       22,
+       22,
+       22,
+       22
+      ]
+     },
+     "moe_top_k": {
+      "r": 1
+     },
+     "step": 2
+    },
+    {
+     "moe": {
+      "r": [
+       102,
+       22,
+       22,
+       22,
+       22,
+       22,
+       22,
+       22
+      ]
+     },
+     "moe_top_k": {
+      "r": 1
+     },
+     "step": 3
+    },
+    {
+     "moe": {
+      "r": [
+       102,
+       22,
+       22,
+       22,
+       22,
+       22,
+       22,
+       22
+      ]
+     },
+     "moe_top_k": {
+      "r": 1
+     },
+     "step": 4
+    }
+   ],
+   "says": "overloaded on all five samples of a five-step capture: nothing is reported, and the check names the router as still in its starting state",
+   "today": {
+    "step": 0
+   }
+  },
   "start_ends_and_comes_back": {
    "expected": {
     "incident": {
@@ -52459,7 +52570,8 @@
      ],
      "router": "r",
      "step": 4
-    }
+    },
+    "starting_state": []
    },
    "part": "moe_imbalance",
    "records": [
@@ -52752,7 +52864,8 @@
      "router": "r",
      "since_start": true,
      "step": 0
-    }
+    },
+    "starting_state": []
    },
    "part": "moe_imbalance",
    "records": [
@@ -52944,7 +53057,8 @@
   },
   "start_nine_samples_then_even": {
    "expected": {
-    "incident": null
+    "incident": null,
+    "starting_state": []
    },
    "part": "moe_imbalance",
    "records": [
@@ -53507,7 +53621,8 @@
      "router": "r",
      "since_start": true,
      "step": 0
-    }
+    },
+    "starting_state": []
    },
    "part": "moe_imbalance",
    "records": [
@@ -54069,7 +54184,8 @@
      ],
      "router": "r",
      "step": 20
-    }
+    },
+    "starting_state": []
    },
    "part": "moe_imbalance",
    "records": [
@@ -54621,7 +54737,8 @@
   },
   "start_two_samples_then_even": {
    "expected": {
-    "incident": null
+    "incident": null,
+    "starting_state": []
    },
    "part": "moe_imbalance",
    "records": [
