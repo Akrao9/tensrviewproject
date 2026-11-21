@@ -714,9 +714,10 @@ impl Ingest {
     /// plan whose streams ended with an h2 error were left with no cause): the run, the rank, the gRPC
     /// code and message, the cause the transport gave, the batches, rows and bytes received, the
     /// last offset acknowledged on the stream, whether the request had ended first (a half-close,
-    /// or a reset hyper reads as one: a call whose deadline passed reads so, with the response
-    /// closed, and is passed to the watchdog as a clean end, as before), whether the response was
-    /// still open, and how long the stream was open. A rank's clean ends get at most one
+    /// or a reset hyper reads as one: a call whose deadline passed reads so, and is passed to the
+    /// watchdog as a clean end, as before), whether the response was open when the line was
+    /// written (the state seen then and no more: after a reset the transport closes the response
+    /// on its own task, so such a call is written either way), and how long the stream was open. A rank's clean ends get at most one
     /// line per `STREAM_ERROR_LOG_INTERVAL`, and its errors, apart, as many; the ones held back are
     /// counted in the next. A stream that never named its rank shares one limit with every other.
     /// The message of a refused request is cut at its first `: `, after which a decoder's or JSON
@@ -2268,10 +2269,6 @@ fn batch_bytes(batch: &RecordBatch) -> Result<usize, Status> {
     Ok(bytes)
 }
 
-/// How long a stream whose request ended cleanly waits for its response to close before its ending
-/// is said (`do_put`): long enough for the transport to drop the response of a call that was reset.
-const RESPONSE_CLOSE_WAIT: Duration = Duration::from_millis(50);
-
 /// Says on stderr how a `DoPut` stream ended (`Ingest::stream_closed`), once: when its task gives the
 /// status, or, if the task panicked or was dropped before it could, when it goes.
 struct StreamEnd {
@@ -2287,6 +2284,10 @@ impl StreamEnd {
         if std::mem::replace(&mut self.said, true) {
             return;
         }
+        // Whether the response is open is read here, as the line is written, and means no more than
+        // that. A client that resets its call (a deadline that passed) ends the request and has
+        // its response dropped by the transport on another task, so such a call can be written as
+        // open or as closed; a response written as open may close a moment later.
         let response_open = !self.ack.responses.is_closed();
         self.ingest.stream_closed(
             self.key.as_ref(),
@@ -2364,16 +2365,6 @@ impl FlightService for IngestService {
             if let Some(key) = &end.key {
                 ingest.stream_ended(key, stream_id, result.is_ok());
                 ingest.detach(key, &ack).await;
-            }
-            if result.is_ok() && !ack.responses.is_closed() {
-                // The request ended with no error. A client whose deadline passed resets the call,
-                // which ends the request and drops the response, but the transport drops the
-                // response on its own task, a moment after this one sees the request end. Sampled at
-                // once, such a call read as a half-close about one time in four (seen at the trial
-                // of wave AE, on `main` and on the trial tree alike). So the response is given a
-                // bounded moment to close before the line says which it was. A true half-close
-                // waits it out: its response ends that much later, and nothing else changes.
-                let _ = tokio::time::timeout(RESPONSE_CLOSE_WAIT, ack.responses.closed()).await;
             }
             end.say(result.as_ref().err());
             if let Err(status) = result {

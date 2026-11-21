@@ -215,6 +215,17 @@ fn answer(detectors: &RankDetectors, expected: &Value) -> Value {
                 }),
             "skipped_updates" => report.get("skipped_updates").cloned().unwrap_or(Value::Null),
             "update_spike_check" => report["kind_checks"]["update_spike"]["value"].clone(),
+            // Where the entry sits among the entries the case names (added at the trial merge).
+            "not_checked_checks" => {
+                let named = expected[key].as_array().unwrap();
+                report["not_checked"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["check"].clone())
+                    .filter(|check| named.contains(check))
+                    .collect()
+            }
             "counters_at_end" => {
                 let rule = &detectors.loss_scale;
                 json!({
@@ -234,7 +245,7 @@ fn answer(detectors: &RankDetectors, expected: &Value) -> Value {
 #[test]
 fn every_case_of_sections_1_2_and_4_gives_its_expected() {
     let all = cases();
-    assert_eq!(all.len(), 30, "the 35 cases less section 5's five");
+    assert_eq!(all.len(), 31, "the 36 cases less section 5's five");
     let mut wrong = Vec::new();
     for (name, body) in &all {
         let found = answer(&judged(&body["given"]), &body["expected"]);

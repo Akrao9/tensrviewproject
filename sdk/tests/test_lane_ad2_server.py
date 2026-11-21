@@ -6,7 +6,7 @@ could say which side ended them. The server now writes one line on stderr per en
 run, the rank, the gRPC code and message, the cause the transport gave, the batches, rows and bytes
 received, the last offset acknowledged on the stream, whether the request had ended first (a
 half-close, or a reset the server cannot tell from one: a call whose deadline passed), whether the
-response was still open, and how long the stream was open. Clean ends of a rank are
+response was open as the line was written, and how long the stream was open. Clean ends of a rank are
 held to one line per 10 s, and so are its errors, apart; another rank has limits of its own.
 
 Every test here runs the real binary (`TENSORQUILL_SERVER_BIN`, or the newest build under
@@ -199,25 +199,40 @@ def test_a_sender_killed_mid_stream_is_said_to_have_ended_it_without_half_closin
     assert "broken pipe" in cause or "connection reset" in cause, lines
 
 
-def test_a_call_whose_deadline_passed_reads_as_an_ended_request_with_the_response_closed(tmp_path):
-    """The server cannot tell this from a half-close by the request alone; the closed response is
-    what sets it apart (measured with pyarrow's gRPC client)."""
+def test_a_call_whose_deadline_passed_is_timed_out_for_the_sender_and_gets_one_line_at_its_offset(tmp_path):
+    """Each side is held to what it can establish. The sender: its batch was acknowledged at its
+    offset, and the call then reached its deadline (the response ends about when the deadline
+    passes, with the writer and reader still held so no half-close was sent, and closing the writer
+    afterwards is refused as timed out). The server: exactly one line for the
+    stream, for that run, at that offset. `the response was open|closed` is what the server saw as
+    it wrote the line: after a reset the transport closes the response on its own task, so either
+    is right here, and the line's pattern admits both. A real half-close is the clean-end test's."""
     server = Server(tmp_path)
     try:
         client = flight.FlightClient(server.endpoint)
         writer, reader = client.do_put(flight.FlightDescriptor.for_path("runs", "ad2-deadline", "rank=0"), flight_schema(),
                                        flight.FlightCallOptions(timeout=1.0))
+        opened = time.monotonic()
         metadata = {"schema_version": 1, "run_id": "ad2-deadline", "rank": 0, "min_step": 0, "max_step": 0, "end_byte_offset": 7}
         writer.write_with_metadata(records_to_batch([rec("ad2-deadline", 0, 0)]), pa.py_buffer(json.dumps(metadata).encode()))
         assert json.loads(reader.read().to_pybytes())["end_byte_offset"] == 7
-        lines = server.wait_lines(1, seconds=10.0)  # writer and reader still held: no half-close is sent
+        assert reader.read() is None  # nothing more is sent: the response ends when the deadline passes
+        waited = time.monotonic() - opened
+        assert 0.9 <= waited < 10.0, waited
+        server.wait_lines(1, seconds=10.0)  # writer and reader still held: no half-close was sent
+        with pytest.raises(flight.FlightTimedOutError):  # and the call says why it ended
+            writer.close()
         del writer, reader
         client.close()
     finally:
         assert server.stop() == 0
+    lines = server.lines()  # read after the server stopped: every line it wrote
     assert len(lines) == 1, lines
     line = parsed(lines[0])
-    assert (line["how"], line["offset"], line["half"], line["response"]) == ("ended (code Ok)", "7", "had", "closed"), lines
+    assert (line["run"], line["rank"], line["offset"]) == ("ad2-deadline", "0", "7"), lines
+    assert line["response"] in ("open", "closed"), lines
+    # The request ended with no error, which is how hyper reads the reset (200 of 200 under load).
+    assert (line["how"], line["half"]) == ("ended (code Ok)", "had"), lines
 
 
 def test_each_rank_has_its_own_limit_and_a_ranks_clean_ends_do_not_hold_back_its_error(tmp_path):
