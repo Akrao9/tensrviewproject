@@ -1112,10 +1112,12 @@ def test_duplicate_batches_is_checked_on_the_ranks_the_servers_status_says_it_co
     check = evidence["kind_checks"]["duplicate_batches"]
     assert (check["value"], check["ranks"]) == ("not_configured", {"checked": [0, 1], "not_configured": [2]})
     assert "not_compared_ranks" not in check and "note" not in check
-    # One rank listed compared with nothing.
+    # One rank listed compared with nothing. Wave AB (STEP_AND_EVIDENCE_CONTRACT.md, section 2): the
+    # words say so.
     one = hand_store(tmp_path / "one", {0: steps(60, **data), 1: steps(60)}, ranks_compared=[0])
     evidence, _, _ = three_ways(one, tmp_path)
-    assert evidence["kind_checks"]["duplicate_batches"] == {"value": "not_configured", "enough_history": False, "needs": needs}
+    assert evidence["kind_checks"]["duplicate_batches"] == {"value": "not_configured", "enough_history": False, "needs": needs,
+                                                            "note": "one rank observed, zero peers compared"}
     # A status that does not say which ranks, or says it in another shape, is read as one from a
     # server before the key: what the ranks recorded, with the note (the test above).
     for odd in ("0,1", [0, "1"], {"0": True}):
