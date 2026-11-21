@@ -407,3 +407,90 @@ def test_gradients_without_the_weight_check_take_two_columns_and_read_as_before(
     for record, expected in zip(sink.records, norms):
         assert record["grad_norms"] == pytest.approx(expected, rel=1e-6)
         assert "weight_norms" not in record and set(record["layers"]) == {"blocks.0", "blocks.1"}
+
+
+# --- Item 5: a session made before to_empty ---------------------------------------------------------
+
+
+def test_a_session_made_before_to_empty_says_why_at_the_first_step():
+    # `to_empty` replaces the meta parameters with new objects; the optimizer, made after, steps those,
+    # so the session counts no step. Before, the first word was a warning after ten steps naming
+    # DeepSpeed and Megatron; now the first step says the parameters were replaced.
+    with torch.device("meta"):
+        model = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 1))
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=2, weights=1)
+    model.to_empty(device="cpu")
+    for p in model.parameters():
+        nn.init.normal_(p, std=0.1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    with pytest.warns(RuntimeWarning, match="replaced the ones it had when tensorquill.init ran") as caught:
+        model(torch.randn(3, 4)).pow(2).mean().backward()
+        opt.step()
+    assert sum("TensorQuill" in str(w.message) for w in caught) == 1
+    for _ in range(11):  # no second warning, and the old one with another cause is not given
+        model(torch.randn(3, 4)).pow(2).mean().backward()
+        opt.step()
+    session.close()
+    assert sink.records == []  # nothing is written for the old parameters, no zero among it
+
+
+def test_an_optimizer_of_new_parameters_beside_the_lead_is_not_said_to_be_replaced_once_the_lead_steps():
+    model = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 1))
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=2)
+    main = torch.optim.SGD(model[0].parameters(), lr=0.1)
+    model[2] = nn.Linear(4, 1)  # a head assigned after init, stepped by an optimizer of its own
+    head = torch.optim.SGD(model[2].parameters(), lr=0.1)
+    with pytest.warns(RuntimeWarning, match="replaced the ones it had"):
+        model(torch.randn(3, 4)).pow(2).mean().backward()
+        head.step()  # before the main optimizer has ever stepped
+    main.step()
+    for _ in range(2):
+        model(torch.randn(3, 4)).pow(2).mean().backward()
+        main.step()
+        head.step()
+    session.close()
+    assert [r["step"] for r in sink.records] == [0, 1, 2]
+
+
+# --- Item 5: clipping inside a compiled optimizer step ---------------------------------------------
+
+
+def test_clipping_inside_a_compiled_step_does_not_recompile_at_every_step():
+    # Before, `record_grad_norm` read and wrote its call count while traced, Dynamo guarded on the
+    # count, and the step recompiled at steps 1 to 7, then hit the recompile limit and ran eagerly.
+    # The control without TensorQuill compiles once; so does the watched step now.
+    from torch._dynamo.utils import counters
+
+    def run(watched):
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 1))
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        sink = tensorquill.MemorySink()
+        session = tensorquill.init(model, sink=sink, every=5) if watched else None
+
+        @torch.compile(backend="eager")
+        def update():
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+        counters.clear()
+        graphs, truth = [], []
+        for _ in range(10):
+            model(torch.randn(4, 8)).pow(2).mean().backward()
+            truth.append(math.sqrt(sum(float(p.grad.norm()) ** 2 for p in model.parameters())))
+            before = counters["stats"]["unique_graphs"]
+            update()
+            graphs.append(counters["stats"]["unique_graphs"] - before)
+            opt.zero_grad()
+        if session is not None:
+            session.close()
+        torch._dynamo.reset()
+        return graphs, [r.get("clip_grad_norm") for r in sink.records], truth
+
+    control, _, _ = run(False)
+    graphs, clips, truth = run(True)
+    assert graphs == control and sum(graphs[1:]) == 0, (graphs, control)
+    assert clips == pytest.approx(truth, rel=1e-5)

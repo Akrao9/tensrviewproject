@@ -1096,6 +1096,13 @@ def _clip_grad_norm_wrapper(parameters: Any, *args: Any, **kwargs: Any) -> Any:
     return total_norm
 
 
+class _ClipCall:
+    """What `record_grad_norm` writes as `Session._clip_calls` under `torch.compile`: a new object at each
+    call, unequal to any count, so a wrapper that compares the count before and after sees the call."""
+
+    __slots__ = ()
+
+
 def _clip_is_l2(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
     """Whether a `clip_grad_norm_(parameters, max_norm, norm_type=2.0, ...)` call computes an
     L2 norm, the only kind recorded. Torch's and Accelerate's both take `norm_type` after
@@ -1430,7 +1437,9 @@ class Session:
         self._ring_clip = torch.zeros(every, **f32)
         self._clip_recorded = False
         self._foreign_steps = 0
-        self._clip_calls = 0  # lets an outer wrapper see that an inner one already recorded
+        # Lets an outer wrapper see that an inner one already recorded: a count, or a `_ClipCall` written
+        # under `torch.compile`; compared for equality only.
+        self._clip_calls: int | _ClipCall = 0
         self._ring_clip_seen: list[bool] = []
         # The size of the optimizer's update to each parameter (`updates=True`): its RMS and
         # whether it was read this step, and the ring. Empty when the option is off.
@@ -1776,11 +1785,25 @@ class Session:
         # The every-th, 2*every-th, ... step, counting from 1 (as Lightning and wandb do).
         return every > 0 and (self._steps_committed + 1) % every == 0
 
-    def _note_foreign_step(self) -> None:
+    def _note_foreign_step(self, optimizer: Any = None) -> None:
         # DeepSpeed's ZeRO optimizers and Megatron's mixed-precision optimizer step copies
         # of the weights, so the optimizer that steps holds none of the model's
         # parameters and no step would ever be counted. Say so instead of writing nothing.
         if self._lead is not None or self._foreign_steps < 0:
+            return
+        if self._foreign_steps == 0 and optimizer is not None and self._replaced_parameters(optimizer):
+            # Lane AD3: a session made before `to_empty` (a model built on meta) holds the meta
+            # parameters, which `to_empty` replaces with new ones; the optimizer, made after, steps the
+            # new ones. Said at the first step, with the cause, instead of after ten with another.
+            self._foreign_steps = -1
+            _warn(
+                "TensorQuill is not counting this optimizer's steps: it holds parameters the model has now "
+                "that replaced the ones it had when tensorquill.init ran (to_empty on a model made on meta, or "
+                "a parameter assigned after init), and the session reads the old ones, so no step is recorded "
+                "until an optimizer of those steps. Call tensorquill.init after to_empty, once the parameters "
+                "are materialised.",
+                stacklevel=3,
+            )
             return
         self._foreign_steps += 1
         if self._foreign_steps == FOREIGN_STEPS_WARNING:
@@ -1792,13 +1815,23 @@ class Session:
                 stacklevel=2,
             )
 
+    def _replaced_parameters(self, optimizer: Any) -> bool:
+        """Whether `optimizer` holds a parameter the model has now that it did not have at `init`: one
+        pass over the model's parameters, on the host, at the first step of an optimizer that holds
+        none of the session's, once a session. Never raises."""
+        try:
+            now = {id(p) for p in self._model.parameters()} - self._model_param_ids
+            return bool(now) and any(id(p) in now for group in optimizer.param_groups for p in group["params"])
+        except Exception:  # noqa: BLE001
+            return False
+
     def _before_optimizer_step(self, optimizer: Any, args: Any, kwargs: Any) -> None:
         if self._closed:
             return
         if not self._owns(optimizer):
             self._foreign_stepped = True
             if not self._stopped:
-                self._note_foreign_step()
+                self._note_foreign_step(optimizer)
             return
         # PyTorch wraps each optimizer class's own `step` with the global hooks, so an
         # optimizer that subclasses another and calls `super().step()` fires them again,
@@ -2484,7 +2517,15 @@ class Session:
         else:
             self._clip.add_(float(norm) ** 2)
         self._clip_recorded = True
-        self._clip_calls += 1
+        if torch.compiler.is_compiling():
+            # Written, never read, while traced (lane AD3): `+= 1` read the count, and Dynamo guarded
+            # on its value, so a compiled step that clips recompiled at every step until its
+            # recompile limit and then ran eagerly. A new marker still tells a wrapper that compares
+            # the count before and after a call (`accelerator._clip_grad_norm`) that this call recorded.
+            self._clip_calls = _ClipCall()
+        else:
+            calls = self._clip_calls
+            self._clip_calls = calls + 1 if type(calls) is int else 1
 
     def log(self, values: Mapping[str, Any] | None = None, **named: Any) -> None:
         """Record scalars such as the loss for the step in progress, without a GPU sync.
