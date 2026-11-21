@@ -98,6 +98,25 @@ fn every_attribution_case_gives_its_coverage_attribution_and_incident_count() {
     );
 }
 
+/// Every case `earlier_cases` names is one of the 39 earlier cases, so none is left uncompared by a
+/// misspelt name, and each named one has an entry.
+#[test]
+fn every_earlier_case_named_exists() {
+    let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk/tests/fixtures/replica");
+    let mut earlier = std::collections::BTreeSet::new();
+    for file in ["no_incident_cases.json", "incident_cases.json"] {
+        let document: Value = serde_json::from_str(&std::fs::read_to_string(folder.join(file)).unwrap()).unwrap();
+        earlier.extend(document["cases"].as_object().unwrap().keys().cloned());
+    }
+    assert_eq!(earlier.len(), 39);
+    let named = attribution_document()["earlier_cases"].as_object().unwrap().clone();
+    assert_eq!(named.len(), 14);
+    for (name, entries) in named {
+        assert!(earlier.contains(&name), "{name}");
+        assert!(!entries.as_array().unwrap().is_empty(), "{name}");
+    }
+}
+
 /// A list present only when it has an entry: a result with no difference is spelled as before.
 #[test]
 fn a_result_with_no_difference_has_no_attribution_key() {
@@ -630,7 +649,7 @@ fn who_reported_a_skip_is_read_from_extra_json() {
     assert_eq!(report["kind_checks"]["loss_scale_trouble"]["records"], 5);
     assert_eq!(
         report["kind_checks"]["loss_scale_trouble"]["needs"],
-        "step_skipped (scaler=, or session.step(skipped=))"
+        "step_skipped (scaler= or session.step(skipped=))"
     );
 }
 
@@ -782,6 +801,13 @@ mod silence {
             incident["capture_last_step"],
             expected["incident_carries"]["capture_last_step"]
         );
+        // The rank's entry in the incident carries it too; the rank still training does not.
+        let ranks = incident["ranks"].as_array().unwrap();
+        assert_eq!(ranks.len(), 1, "{incident}");
+        assert_eq!(
+            (&ranks[0]["rank"], &ranks[0]["capture_last_step"]),
+            (&json!(1), &json!(120))
+        );
     }
 
     #[test]
@@ -853,6 +879,17 @@ mod silence {
             assert_eq!(incident["capture_stopped"]["reason"], "sink_error");
             assert_eq!(incident["capture_last_step"], Value::Null, "{incident}");
             assert!(incident.get("capture_last_step").is_some());
+            let named: Vec<&Value> = incident["ranks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|rank| rank.get("capture_last_step").is_some())
+                .collect();
+            assert_eq!(named.len(), 1, "{incident}");
+            assert_eq!(
+                (&named[0]["rank"], &named[0]["capture_last_step"]),
+                (&json!(1), &Value::Null)
+            );
         }
     }
 }

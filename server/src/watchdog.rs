@@ -1781,32 +1781,48 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
         incident["stuck_at"] = json!(places);
     }
     // A stopped rank whose capture had stopped before it went silent (`STEP_AND_EVIDENCE_CONTRACT.md`,
-    // section 3): the incident keeps its kind and carries the status entry's `capture_stopped`
-    // unchanged, with `capture_last_step`, the last step the rank's current attempt stored, or null
-    // when it stored none (the entry's `last_step`, which a new attempt clears: a step an earlier
-    // attempt stored is not this one's). The first such rank by rank, when several are.
-    if let Some(rank) = stopped
-        .iter()
-        .find(|rank| rank.get("capture_stopped").is_some_and(Value::is_object))
-    {
-        incident["capture_stopped"] = rank["capture_stopped"].clone();
-        incident["capture_last_step"] = if rank["attempt_without_steps"] == true {
+    // section 3): its entry gains `capture_last_step`, the last step the rank's current attempt
+    // stored, or null when it stored none (the entry's `last_step`, which a new attempt clears: a
+    // step an earlier attempt stored is not this one's), and the incident keeps its kind and
+    // carries the first such rank's (by rank) `capture_stopped`, the status entry's value
+    // unchanged, and `capture_last_step`. Python's `_capture_stopped_keys`.
+    let capture_last_step = |rank: &Value| {
+        if rank["attempt_without_steps"] == true {
             Value::Null
         } else {
             rank["last_step"].clone()
-        };
+        }
+    };
+    let capture_stopped = |rank: &Value| {
+        matches!(rank["state"].as_str(), Some("silent" | "lost" | "unresponsive"))
+            && rank.get("capture_stopped").is_some_and(Value::is_object)
+    };
+    if let Some(rank) = stopped.iter().find(|rank| capture_stopped(rank)) {
+        incident["capture_stopped"] = rank["capture_stopped"].clone();
+        incident["capture_last_step"] = capture_last_step(rank);
     }
+    let with_last_step = |rank: &Value| {
+        let mut rank = rank.clone();
+        if capture_stopped(&rank) {
+            rank["capture_last_step"] = capture_last_step(&rank);
+        }
+        rank
+    };
     if summary == "stalled" {
         incident["kind"] = json!("job_stalled");
         incident["step"] = json!(newest);
-        incident["ranks"] = ranks.iter().filter(|rank| state(rank) != "finished").cloned().collect();
+        incident["ranks"] = ranks
+            .iter()
+            .filter(|rank| state(rank) != "finished")
+            .map(with_last_step)
+            .collect();
     } else {
         incident["kind"] = json!("rank_silent");
         incident["step"] = json!(last_steps(&mut stopped.iter().copied())
             .into_iter()
             .min()
             .unwrap_or(newest));
-        incident["ranks"] = json!(stopped);
+        incident["ranks"] = stopped.iter().copied().map(with_last_step).collect();
         // The ranks that are not stopped, briefly, as Python's `_progress_incidents` lists them.
         incident["other_ranks"] = ranks
             .iter()
