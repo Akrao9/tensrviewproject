@@ -58,7 +58,7 @@ _TAKE = _TakeThreads()
 
 
 @contextlib.contextmanager
-def _messages_of_this_thread(logger: logging.Logger) -> Iterator[list[str]]:
+def _messages_of_this_thread(logger: logging.Logger, *, lower: bool = True) -> Iterator[list[str]]:
     """The messages `logger` gets from this thread while the block runs, kept from its handlers.
 
     The logger's handler list and `propagate` are never touched, so two analyses in two threads,
@@ -66,13 +66,15 @@ def _messages_of_this_thread(logger: logging.Logger) -> Iterator[list[str]]:
     logger when the first analysis on it starts and removed when the last one ends. The analyzer's culprit sentence is
     logged at INFO: if the logger is set above INFO, it is lowered to INFO while any analysis runs
     and set back when the last one ends, unless other code has set another level meanwhile; while
-    it is lowered, another thread's INFO records on that logger reach its handlers too."""
+    it is lowered, another thread's INFO records on that logger reach its handlers too. `lower=False`
+    leaves the level alone: around the analyzer's first import, which sets the logger to INFO itself
+    and would otherwise be undone at the end of the block."""
     messages: list[str] = []
     ident, key = threading.get_ident(), id(logger)
     with _lock:
         if not _users.get(key):
             logger.addFilter(_TAKE)
-            if not logger.isEnabledFor(logging.INFO):
+            if lower and not logger.isEnabledFor(logging.INFO):
                 _lowered[key] = logger.level
                 logger.setLevel(logging.INFO)
         _users[key] = _users.get(key, 0) + 1
@@ -120,7 +122,7 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
         # `sys.stdout` and `sys.stderr`: they are the whole process's, so two analyses at once could
         # leave either one a dead buffer, and the analyzer's own console handler, made at that import,
         # would write into the buffer for good.
-        with _messages_of_this_thread(logging.getLogger(_LOGGER_NAME)):
+        with _messages_of_this_thread(logging.getLogger(_LOGGER_NAME), lower=False):
             from torch.distributed.flight_recorder.components.builder import build_db
             from torch.distributed.flight_recorder.components.config_manager import JobConfig
             from torch.distributed.flight_recorder.components.fr_logger import FlightRecorderLogger

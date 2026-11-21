@@ -292,11 +292,13 @@ def test_fr_the_analyzers_own_console_handler_writes_to_the_real_stderr(tmp_path
         sys.path.insert(0, {_src()!r})
         from tensorquill.collectives import analyze_flight_recorder
         analyze_flight_recorder({str(directory)!r})
-        streams = [h.stream for h in logging.getLogger("Flight Recorder").handlers if hasattr(h, "stream")]
+        logger = logging.getLogger("Flight Recorder")
+        streams = [h.stream for h in logger.handlers if hasattr(h, "stream")]
         print("real" if streams and all(s is sys.__stderr__ for s in streams) else f"not real: {{streams}}")
+        print(logger.level)  # INFO, as the analyzer's first import sets it: not undone by the analysis
     """)
     done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
-    assert done.stdout.strip() == "real", done.stdout + done.stderr
+    assert done.stdout.split() == ["real", str(logging.INFO)], done.stdout + done.stderr
 
 
 # --- Item 3: a sink written again after a write that failed partway --------------------------
@@ -392,17 +394,18 @@ def stand_in():
     pa = pytest.importorskip("pyarrow")
 
     class StandIn(flight.FlightServerBase):
-        """Keeps every row and acks every batch, unless `ending` says how to end a stream after its
-        first batch: "unavailable" raises UNAVAILABLE, "return" ends it with OK."""
+        """Keeps every row and acks every batch, except that with `ending` set it ends one stream, once,
+        at the second batch of rows it has been sent: "unavailable" raises UNAVAILABLE, "return" ends
+        the stream with OK. Later streams are taken whole, so a sender's retry does not end again."""
 
         def __init__(self) -> None:
             super().__init__("grpc://127.0.0.1:0")
             self.rows: list[dict] = []
             self.ending: str | None = None
-            self.headers: list = []
+            self.batches = 0
+            self.ended = 0
 
         def do_put(self, context, descriptor, reader, writer):
-            batches = 0
             while True:
                 try:
                     chunk = reader.read_chunk()
@@ -410,10 +413,11 @@ def stand_in():
                     return
                 metadata = json.loads(chunk.app_metadata.to_pybytes())
                 if chunk.data is not None and chunk.data.num_rows:
-                    batches += 1
-                    if batches >= 2 and self.ending == "unavailable":
-                        raise flight.FlightUnavailableError("going away")
-                    if batches >= 2 and self.ending == "return":
+                    self.batches += 1
+                    if self.ending and self.batches == 2:
+                        self.ended += 1
+                        if self.ending == "unavailable":
+                            raise flight.FlightUnavailableError("going away")
                         return
                     self.rows.extend(chunk.data.to_pylist())
                 writer.write(pa.py_buffer(json.dumps({"end_byte_offset": metadata["end_byte_offset"]}).encode()))
@@ -510,15 +514,47 @@ def test_stream_end_a_server_that_ends_the_stream_with_unavailable_is_explained(
         assert end["batches_sent"] >= 1 and end["bytes_sent"] >= first_ack and end["arrow_bytes_sent"] > 0
         assert end["acks"] >= 1 and end["last_acked_offset"] == first_ack and end["start_offset"] == 0
         assert end["sender_closing"] is False
+        assert end["ack_reader_error"] is None or isinstance(end["ack_reader_error"], str)
+        assert end["writer_close_error"] is None or isinstance(end["writer_close_error"], str)
         assert "SECRET" not in json.dumps(end) and "authorization" not in json.dumps(end).lower()
-        # The server takes the rest again: progress clears `last_error`, and the explanation stays.
-        stand_in.ending = None
+        # The next stream takes the rest: progress clears `last_error`, and the explanation stays.
         _wait(lambda: sender.acked_offset == path.stat().st_size)
         _wait(lambda: sender.last_error is None)
-        assert sender.last_stream_end["grpc_status"] == "UNAVAILABLE"
+        assert sender.last_stream_end == end and stand_in.ended == 1
     finally:
-        stand_in.ending = None
         assert sender.close(timeout=20) is True
+
+
+def test_stream_end_keeps_no_frame_of_the_stream_alive(tmp_path, stand_in):
+    """What is kept of a stream's ending is text: an error kept whole holds its traceback, and through
+    it the stream's frames and its gRPC objects, the cycle `_without_traceback` is there to avoid."""
+    import gc
+
+    stand_in.ending = "unavailable"
+    path = tmp_path / "run-a.rank0.jsonl"
+    _append(path, [_record(0)])
+    gc.collect()
+    gc.disable()  # so a cycle the failed stream leaves is still there to be found
+    try:
+        sender = _sender(path, stand_in.endpoint, batch_steps=1)
+        try:
+            _wait(lambda: sender.acked_offset > 0)
+            _append(path, [_record(1)])
+            _wait(lambda: sender.last_stream_end is not None)
+            _wait(lambda: sender.acked_offset == path.stat().st_size)
+            assert all(isinstance(v, (str, int, float, bool, type(None))) for v in sender.last_stream_end.values())
+            gc.set_debug(gc.DEBUG_SAVEALL)
+            try:
+                gc.collect()
+                kept = [o for o in gc.garbage if isinstance(o, types.FrameType) and o.f_code.co_name == "_stream"]
+            finally:
+                gc.set_debug(0)
+                gc.garbage.clear()
+            assert kept == []
+        finally:
+            assert sender.close(timeout=20) is True
+    finally:
+        gc.enable()
 
 
 def test_stream_end_a_server_that_ends_the_stream_with_ok_is_kept_too(tmp_path, stand_in):
@@ -534,7 +570,6 @@ def test_stream_end_a_server_that_ends_the_stream_with_ok_is_kept_too(tmp_path, 
         assert end["grpc_status"] is None and end["grpc_code"] is None and end["error"] == "ConnectionError"
         assert "ended the stream" in end["details"] and end["batches_sent"] >= 2
     finally:
-        stand_in.ending = None
         assert sender.close(timeout=20) is True
 
 

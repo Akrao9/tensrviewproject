@@ -867,8 +867,8 @@ class FlightSender:
                 "grpc_code": _GRPC_CODES.get(name) if name else None,
                 "grpc_status": name,
                 "details": text[:500],
-                "ack_reader_error": self._brief(life.get("ack_error")) if life else None,
-                "writer_close_error": self._brief(life.get("close_error")) if life else None,
+                "ack_reader_error": life.get("ack_error") if life else None,
+                "writer_close_error": life.get("close_error") if life else None,
                 "stream_opened": opened is not None,
                 "seconds_open": round(time.monotonic() - opened, 3) if opened is not None else None,
                 "start_offset": life.get("start", 0) if life else 0,
@@ -889,9 +889,14 @@ class FlightSender:
         return text
 
     def _brief(self, error: BaseException | None) -> str | None:
+        """`error` as short text, the token cut out. Only text is kept of an error here: its traceback
+        holds the stream's frames, the cycle `_without_traceback` is there to avoid. Never raises."""
         if error is None:
             return None
-        return self._scrub(f"{type(error).__name__}: {error}")[:300]
+        try:
+            return self._scrub(f"{type(error).__name__}: {error}")[:300]
+        except Exception:  # noqa: BLE001  an error whose str() raises
+            return type(error).__name__
 
     def _say_moved(self, moved: list[tuple[int, str]]) -> None:
         """Count fields sent in `extra_json` because their column cannot hold the value, and say the
@@ -1003,7 +1008,7 @@ class FlightSender:
                         self._ack(offset, store_id)
                 except BaseException as error:  # noqa: BLE001
                     failure.append(error)
-                    life["ack_error"] = error
+                    life["ack_error"] = self._brief(error)  # text only: an error's traceback holds this stream
                 finally:
                     ended.set()
 
@@ -1093,12 +1098,12 @@ class FlightSender:
                 try:
                     writer.close()
                 except BaseException as error:  # noqa: BLE001  the first failure is the one to report
-                    life["close_error"] = error
+                    life["close_error"] = self._brief(error)
                 raise
             try:
                 writer.close()
             except BaseException as error:
-                life["close_error"] = error
+                life["close_error"] = self._brief(error)
                 raise
             if failure:
                 raise failure[0]
@@ -1123,22 +1128,31 @@ _FLIGHT_ERRORS = {
 
 
 def _grpc_status_name(text: str, error: BaseException) -> str | None:
-    """The gRPC status an error from pyarrow's Flight client names: from its text ("gRPC client debug
-    context: UNAVAILABLE:..." or "grpc_status:14"), else from its class; None for an error that is not
-    gRPC's (a server that ended the stream with OK, a local error)."""
+    """The gRPC status an error from pyarrow's Flight client stands for: from its class where pyarrow
+    gives the status one, else "grpc_status:N" in its text, else the name that opens pyarrow's
+    "gRPC client debug context: UNAVAILABLE:..." (a text can name another status further in, "last
+    error: UNKNOWN: ..."); None for an error that is not gRPC's (a server that ended the stream with
+    OK, a local error)."""
+    name = _FLIGHT_ERRORS.get(type(error).__name__)
+    if name is not None:
+        return name
+    at = text.find("grpc_status:")
+    if at >= 0:
+        digits = ""
+        for c in text[at + len("grpc_status:"):].lstrip():
+            if not c.isdigit():
+                break
+            digits += c
+        for name, code in _GRPC_CODES.items():
+            if digits and code == int(digits):
+                return name
     marker = "gRPC client debug context: "
     at = text.find(marker)
     if at >= 0:
         name = text[at + len(marker):].split(":", 1)[0].strip()
         if name in _GRPC_CODES:
             return name
-    at = text.find("grpc_status:")
-    if at >= 0:
-        digits = "".join(c for c in text[at + len("grpc_status:"):at + len("grpc_status:") + 3] if c.isdigit())
-        for name, code in _GRPC_CODES.items():
-            if digits and code == int(digits):
-                return name
-    return _FLIGHT_ERRORS.get(type(error).__name__)
+    return None
 
 
 def _without_traceback(error: BaseException) -> BaseException:
