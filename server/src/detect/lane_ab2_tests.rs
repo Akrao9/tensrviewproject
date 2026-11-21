@@ -645,27 +645,44 @@ fn the_signed_off_rules_of_section_1_give_these_counters() {
     // A stall across a skipped step: raised at the third qualifying check, step 3.
     let report = judged(&records("a_stall_across_a_skipped_step"));
     assert_eq!(incident(&report, "stalled_weights").unwrap()["step"], 3);
-    // Rule 2 as the author amended it: a caller's skip of unknown scaler outcome leaves the streak
-    // as it is; one the scaler was seen to apply ends it, and counts in `recorded_steps`.
-    let raised = |name: &str| {
-        let report = judged(&records(name));
-        incident(&report, "loss_scale_trouble").map(|found| {
-            (
-                found["step"].clone(),
-                found["consecutive_skips"].clone(),
-                found["skipped_steps"].clone(),
-                found["recorded_steps"].clone(),
-            )
-        })
-    };
+    // Rule 2 as the author amended it and counted it: a caller's skip of unknown scaler outcome
+    // adds nothing and leaves the streak; one the scaler was seen to apply adds one recorded step
+    // and resets the streak. The incident each case gives, and the rule's own running counters
+    // after the last row (`counters_at_end`), checked for the case that raises nothing too.
+    for name in [
+        "a_caller_skip_of_unknown_scaler_outcome_inside_scaler_skips",
+        "a_caller_skip_the_scaler_applied_inside_scaler_skips",
+        "ten_scaler_skips_after_a_caller_skip_the_scaler_applied",
+    ] {
+        let expected = &cases[name]["expected"];
+        let detectors = judge(0, &[stored(&records(name), 1)], &Arc::new(Thresholds::default())).unwrap();
+        let written = super::report("ab2", 0, &detectors, 0);
+        let found = incident(&written, "loss_scale_trouble");
+        if expected["incident_kinds_absent"]
+            .as_array()
+            .is_some_and(|absent| absent.contains(&json!("loss_scale_trouble")))
+        {
+            assert!(found.is_none(), "{name}: {found:?}");
+        } else {
+            let found = found.unwrap_or_else(|| panic!("{name}: nothing raised"));
+            for (key, value) in expected["incident_carries"].as_object().unwrap() {
+                assert_eq!(&found[key], value, "{name}: {key}");
+            }
+        }
+        let scale = &detectors.loss_scale;
+        let at_end = json!({"recorded_steps": scale.recorded, "skipped_steps": scale.skipped, "streak": scale.streak});
+        if let Some(wanted) = expected.get("counters_at_end") {
+            assert_eq!(&at_end, wanted, "{name}");
+        }
+    }
+    let wanted = |name: &str| cases[name]["expected"]["counters_at_end"].clone();
     assert_eq!(
-        raised("a_caller_skip_of_unknown_scaler_outcome_inside_scaler_skips"),
-        Some((json!(12), json!(10), json!(10), json!(12)))
+        wanted("a_caller_skip_of_unknown_scaler_outcome_inside_scaler_skips"),
+        json!({"recorded_steps": 10, "skipped_steps": 10, "streak": 10})
     );
-    assert_eq!(raised("a_caller_skip_the_scaler_applied_inside_scaler_skips"), None);
     assert_eq!(
-        raised("ten_scaler_skips_after_a_caller_skip_the_scaler_applied"),
-        Some((json!(17), json!(10), json!(15), json!(18)))
+        wanted("a_caller_skip_the_scaler_applied_inside_scaler_skips"),
+        json!({"recorded_steps": 11, "skipped_steps": 10, "streak": 5})
     );
 }
 
