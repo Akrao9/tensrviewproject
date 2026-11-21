@@ -118,10 +118,8 @@ def workload(name: str) -> str:
     """What workload a record set is. Ranks and configurations of one script are one workload."""
     if name.startswith("granite"):
         return "Granite 3.0 1B MoE fine-tune (one job)"
-    if name.startswith("dense-layer8"):
-        return "SmolLM2-360M fine-tune (GPU)"
-    if name.startswith("trainer-check"):
-        return "Hugging Face Trainer fine-tune (GPU, both runs)"
+    if name.startswith(("dense-layer8", "trainer-check")):
+        return "SmolLM2-360M fine-tune on GPU (one model: its own loop, and two Trainer runs)"
     if name.startswith("nanomoe"):
         return "nanoMoE from scratch (one model, one seed)"
     if name.startswith(("B09", "B10", "HW-P2P")):
