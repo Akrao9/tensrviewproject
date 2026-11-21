@@ -317,10 +317,10 @@ def test_the_stand_in_reader_gives_what_the_real_compare_replicas_gives(which):
     if which == "with a legacy record":
         records = records + [_legacy_record()]
     real = compare_replicas(records, tolerance=1e-6)
-    # D1 (contract 4a): the stand-in reads sections 2 to 6, so `attribution` is held to the second
-    # reading of section 4a and everything else to the stand-in.
+    # D1 (contract 4a): `attribution` is held to the second reading of section 4a. Since lane AB4 the
+    # stand-in carries the key too (wave AB's seam: lane AB1 wrote this test for a stand-in without
+    # it), so the two results are compared whole.
     assert real.get("attribution", []) == attribution(records, 1e-6)
-    real = {k: v for k, v in real.items() if k != "attribution"}
     stand_in = _stand_in_compare_replicas(records, tolerance=1e-6)
     assert set(stand_in) == set(real) and "v" not in real and "tolerance" not in real
     assert ("legacy" in real) == (which == "with a legacy record")
