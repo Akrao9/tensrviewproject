@@ -603,29 +603,32 @@ fn every_case_of_sections_1_and_2_that_holds_records_holds_on_the_server() {
     assert!(wrong.is_empty(), "{} cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
-/// The new cases over records also say what today's detector answers; it is not the target, and
-/// the server no longer gives it: each such case cannot pass before its rule is built.
+/// The three rules of section 1 the author signed off on Nov 20, 2026, with the counters each case
+/// leaves to the engine's own test.
 #[test]
-fn what_today_answers_on_the_new_cases_is_no_longer_what_the_server_says() {
-    for (name, body) in behaviour() {
-        let Some(today) = body.get("today") else { continue };
-        let records = body["given"]["records"].as_array().unwrap();
-        let report = judged(records);
-        let kind = today["kind"].as_str().unwrap();
-        let same = incident(&report, kind).is_some_and(|found| {
-            today
-                .as_object()
-                .unwrap()
-                .iter()
-                .filter(|(key, _)| !["detector", "fires", "kind"].contains(&key.as_str()))
-                .all(|(key, value)| &found[key] == value)
-        });
-        assert!(
-            !same,
-            "{name}: the server still answers as today: {}",
-            report["incidents"]
-        );
-    }
+fn the_signed_off_rules_of_section_1_give_these_counters() {
+    let cases = behaviour();
+    let records = |name: &str| cases[name]["records"].as_array().or(cases[name]["given"]["records"].as_array()).unwrap().clone();
+    // A caller's skip with a loss scale below the floor: raised for the scale, no skip counted.
+    let report = judged(&records("a_low_loss_scale_on_a_skip_only_the_caller_reported"));
+    let found = incident(&report, "loss_scale_trouble").unwrap();
+    assert_eq!(
+        (&found["reason"], &found["consecutive_skips"], &found["skipped_steps"], &found["recorded_steps"]),
+        (&json!("scale"), &json!(0), &json!(0), &json!(0)),
+        "{found}"
+    );
+    // Caller's skips inside a run of the scaler's: 10 consecutive scaler-confirmed skips among the
+    // 12 observations judged by the rule, raised at step 14.
+    let report = judged(&records("caller_skips_inside_a_run_of_scaler_skips"));
+    let found = incident(&report, "loss_scale_trouble").unwrap();
+    assert_eq!(
+        (&found["step"], &found["consecutive_skips"], &found["skipped_steps"], &found["recorded_steps"]),
+        (&json!(14), &json!(10), &json!(10), &json!(12)),
+        "{found}"
+    );
+    // A stall across a skipped step: raised at the third qualifying check, step 3.
+    let report = judged(&records("a_stall_across_a_skipped_step"));
+    assert_eq!(incident(&report, "stalled_weights").unwrap()["step"], 3);
 }
 
 /// A row with `step_skipped_by` and no skip, a value this version does not know, and a skipped row

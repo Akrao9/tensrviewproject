@@ -2868,7 +2868,8 @@ impl Stalled {
         // A loss scaler skips the optimizer step on purpose when a gradient is not finite: such
         // a row adds nothing to a streak, but what it shows changing still breaks one. A skipped
         // update, whoever reported it, is read the same way: the weights were not meant to move
-        // (contract section 1, the first rule awaiting the author).
+        // (contract section 1, signed off by the author on Nov 20, 2026): a skip cannot advance a
+        // streak, a streak that exists carries across it, and the usual resets still apply.
         let evidence = !skipped && !value(columns.grad_norm, row).is_some_and(|norm| !norm.is_finite());
         let unchanged: HashSet<&str> = listed
             .filter(|at| !unchanged.values.is_null(*at))
@@ -3012,9 +3013,12 @@ impl LossScale {
         }
         self.flagged += 1;
         // Only a skip the scaler confirmed counts. One only the caller reported is passed over: it
-        // neither adds to the streak nor ends it, and is in neither count (contract section 1, the
-        // second rule awaiting the author). Its loss scale is still read against the floor (the
-        // third): it is the scale's own reading.
+        // neither adds to the streak nor ends it, and is in neither `skipped_steps` nor
+        // `recorded_steps`; a recorded applied update ends the streak. So `consecutive_skips: 10`
+        // reads "10 consecutive scaler-confirmed skips among observations judged by this rule",
+        // which can span more training steps than it counts. A measured loss scale below the
+        // floor on a caller's skip still raises, with reason `scale` and the counts unchanged
+        // (contract section 1, the three rules signed off by the author on Nov 20, 2026).
         if by != Some(SkippedBy::Caller) {
             let skipped = by.is_some();
             self.recorded += 1;
