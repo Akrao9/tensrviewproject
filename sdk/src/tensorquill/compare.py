@@ -50,12 +50,17 @@ A run's `last_step` is where it stands after any resume: the highest step of the
 detectors judge (`evidence.resolve_attempts`), not of every attempt. A rank whose records are
 in several local files is read from all of them, the attempts resolved across them.
 
-A run in a server's store whose server dropped rows with a null key (`dropped_rows` and
-`dropped_row_keys` on a rank's entry of `watchdog.json`) has `dropped_rows` on its entry in
-`runs` (`runs.dropped_rows`: in all, by key and by rank; with `rank`, that rank's alone) and a
-line under it in the summary. The count is an upper bound: a batch sent again after a lost
-acknowledgement is counted again (L22, lane AA5, Nov 20, 2026). A run that dropped none, and
-every local run, has no such key, and its result is as before.
+A run in a server's store whose server dropped rows (`dropped_rows` and `dropped_row_keys` on a
+rank's entry of `watchdog.json`), for a null key or a `schema_version` it does not support, has
+`dropped_rows` on its entry in `runs` (`runs.dropped_rows`: in all, by key and by rank; with
+`rank`, that rank's alone) and a line under it in the summary. The count is an upper bound: a
+batch sent again after a lost acknowledgement is counted again (L22, lane AA5, Nov 20, 2026).
+Batches the server refused whole, because a key column was missing or of another type
+(`refused_batches` and `refused_batch_keys`), are `refused_batches` beside it, in the same
+shape counted in batches (`runs.refused_batches`), with a line of their own; the two are
+never added together (lane AB5). Both are read from `watchdog.json` on every store path: from
+the server's reports alone, and where a rank's parts are judged here. A run that dropped and
+refused none, and every local run, has neither key, and its result is as before.
 
 `compare_runs` returns the result and writes nothing. The command line writes `compare.json`.
 """
@@ -596,14 +601,17 @@ def open_run(wanted: str | Path, source: str | Path | None = None, project: str 
     # With `rank`, the rank read: a run of one rank is read on the rank it has (`_open_store`).
     read = opened["read_from"].get("rank") if rank is not None else None
     dropped = _store_dropped(Path(run["path"]), read) if run["source"] != "local" else None
+    refused = _store_refused(Path(run["path"]), read) if run["source"] != "local" else None
     return {"run_id": run["run_id"], "manifest": run.get("manifest"),
             "block": _manifest.run_block(run["run_id"], run.get("manifest")), **opened,
-            **({"dropped_rows": dropped} if dropped is not None else {})}
+            **({"dropped_rows": dropped} if dropped is not None else {}),
+            **({"refused_batches": refused} if refused is not None else {})}
 
 
 def _store_dropped(folder: Path, rank: int | None) -> dict[str, Any] | None:
-    """The rows a store run's server dropped for a null key (`runs.dropped_rows`, from its
-    `watchdog.json`; L22, lane AA5, Nov 20, 2026): the whole run's, or with `rank` (the rank
+    """The rows a store run's server dropped, for a null key or an unsupported schema version
+    (`runs.dropped_rows`, from its `watchdog.json`; L22, lane AA5, Nov 20, 2026): the whole
+    run's, or with `rank` (the rank
     read) that rank's alone, in the same shape. None when none was dropped (of that rank), so such a run's result
     is as before. An upper bound: a batch sent again after a lost acknowledgement is counted
     again. Never raises."""
@@ -619,8 +627,33 @@ def _store_dropped(folder: Path, rank: int | None) -> dict[str, Any] | None:
     if not mine:
         return None
     (item,) = mine
+    # The note of the rank's own reasons: a rank that dropped rows for null keys alone is not
+    # said to have dropped any for their schema version because another rank did.
+    note = (_runs.DROPPED_ROWS_NOTE_WITH_VERSIONS if _runs.UNSUPPORTED_VERSION_KEY in (item.get("by_key") or {})
+            else _runs.DROPPED_ROWS_NOTE)
     return {"rows": item["rows"], **({"by_key": item["by_key"]} if item.get("by_key") else {}), "ranks": mine,
-            "upper_bound": True, "note": dropped["note"]}
+            "upper_bound": True, "note": note}
+
+
+def _store_refused(folder: Path, rank: int | None) -> dict[str, Any] | None:
+    """The batches a store run's server refused whole (`runs.refused_batches`, from its
+    `watchdog.json`; RS10, lane AB5, Nov 20, 2026): the whole run's, or with `rank` (the rank
+    read) that rank's alone, in the same shape. None when none was refused (of that rank).
+    Never added to `_store_dropped`. Never raises."""
+    from .evidence import read_watchdog
+
+    try:
+        refused = _runs.refused_batches(read_watchdog(folder / "watchdog.json"))
+    except (OSError, ValueError):
+        return None
+    if refused is None or rank is None:
+        return refused
+    mine = [item for item in refused["ranks"] if item.get("rank") == rank]
+    if not mine:
+        return None
+    (item,) = mine
+    return {"batches": item["batches"], **({"by_key": item["by_key"]} if item.get("by_key") else {}), "ranks": mine,
+            "note": refused["note"]}
 
 
 # --- Part 1: the setup ----------------------------------------------------------------------
@@ -1207,6 +1240,8 @@ def compare_runs(*runs: str | Path, source: str | Path | None = None, project: s
             "read_from": run["read_from"],
             # L22: only for a store run whose server dropped rows (of the rank read, with `rank`).
             **({"dropped_rows": run["dropped_rows"]} if run.get("dropped_rows") else {}),
+            # RS10 (lane AB5): the batches it refused whole, apart from the rows.
+            **({"refused_batches": run["refused_batches"]} if run.get("refused_batches") else {}),
         } for label, wanted, run in zip(labels, runs, opened)],
         # The order of the four parts is part of the format: what was checked is read before
         # the incidents.
@@ -1295,6 +1330,8 @@ def summary_text(result: Mapping[str, Any]) -> str:
         )
         if run.get("dropped_rows"):
             lines.append(f"      {run['label']}: {_runs._dropped_text(run['dropped_rows'])}")
+        if run.get("refused_batches"):
+            lines.append(f"      {run['label']}: {_runs._refused_text(run['refused_batches'])}")
 
     setup = result["setup"]
     lines.append(f"1. Setup: {len(setup['differs'])} difference{'s' if len(setup['differs']) != 1 else ''}")

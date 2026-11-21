@@ -642,27 +642,40 @@ def _rank_entry(evidence: Mapping[str, Any], rank: int) -> dict[str, Any]:
 
 
 def _dropped(opened: Mapping[str, Any]) -> dict[str, Any] | None:
-    """The rows the server dropped for a null key, from the run folder's `watchdog.json` (L22,
+    """The rows the server dropped, for a null key or for a `schema_version` it does not support
+    (`unsupported_schema_version`, since wave AA), from the run folder's `watchdog.json` (L22,
     lane Z5, Nov 20, 2026; `runs.dropped_rows`): None for any other source, and when no rank
-    dropped a row, so every answer of such a run is as before. The evidence's own `watchdog`
-    block does not carry them. An upper bound: a batch sent again after a lost acknowledgement
-    is counted again."""
+    dropped a row, so every answer of such a run is as before. Batches refused whole are not
+    rows and are not here (`_refused`). An upper bound: a batch sent again after a lost
+    acknowledgement is counted again."""
     if opened["source"].get("kind") != "store":
         return None
     return _runs.dropped_rows(read_watchdog(Path(opened["source"]["path"]) / "watchdog.json"))
 
 
+def _refused(opened: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The batches the server refused whole because a key column was missing or of another type
+    (RS10, wave AA; `runs.refused_batches`), from the run folder's `watchdog.json`: None for any
+    other source, and when no rank refused one, so every answer of such a run is as before. A
+    count of batches, never added to `_dropped`'s rows (lane AB5, Nov 20, 2026)."""
+    if opened["source"].get("kind") != "store":
+        return None
+    return _runs.refused_batches(read_watchdog(Path(opened["source"]["path"]) / "watchdog.json"))
+
+
 def _dropped_shown(dropped: Any) -> Any:
-    """`dropped_rows` as an answer shows it: the total and the keys whole, and the ranks up to
-    `PER_RANK_ROWS` (`ranks_omitted` counts the rest; `rank=` gives one rank's). A null key
-    usually hits every rank, so the list would otherwise grow with the run."""
+    """`dropped_rows` or `refused_batches` as an answer shows it: the total and the keys whole,
+    and the ranks up to `PER_RANK_ROWS` (`ranks_omitted` counts the rest; `rank=` gives one
+    rank's). A missing key or an old sender usually hits every rank, so the list would otherwise
+    grow with the run."""
     if not isinstance(dropped, dict) or len(dropped.get("ranks") or ()) <= PER_RANK_ROWS:
         return dropped
     return {**dropped, "ranks": dropped["ranks"][:PER_RANK_ROWS], "ranks_omitted": len(dropped["ranks"]) - PER_RANK_ROWS}
 
 
 def _rank_dropped(dropped: Mapping[str, Any] | None, rank: int) -> dict[str, Any] | None:
-    """One rank's part of `_dropped`: `{"rows", "by_key"}`, or None when it dropped none."""
+    """One rank's part of `_dropped` (`{"rows", "by_key"}`) or of `_refused` (`{"batches",
+    "by_key"}`), or None when it dropped or refused none."""
     for item in (dropped or {}).get("ranks") or ():
         if item.get("rank") == rank:
             return {key: value for key, value in item.items() if key != "rank"}
@@ -696,6 +709,9 @@ def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, An
             mine = _rank_dropped(_dropped(opened), rank)
             if mine is not None:  # L22: no key when the rank dropped none
                 answer["rank"]["dropped_rows"] = mine
+            refused = _rank_dropped(_refused(opened), rank)
+            if refused is not None:  # RS10: no key when the rank refused none
+                answer["rank"]["refused_batches"] = refused
     state = evidence.get("run_state")
     answer["run_state"] = state if isinstance(state, dict) else None
     if not isinstance(state, dict):
@@ -1280,11 +1296,17 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
     dropped = _dropped(opened)
     if dropped is not None:  # L22: no key when no rank dropped a row
         answer["dropped_rows"] = _dropped_shown(dropped)
+    refused = _refused(opened)
+    if refused is not None:  # RS10: no key when no rank refused a batch
+        answer["refused_batches"] = _dropped_shown(refused)
     if rank is not None:
         answer["rank"] = _rank_entry(evidence, rank)
         mine = _rank_dropped(dropped, rank)
         if mine is not None:
             answer["rank"] = {**answer["rank"], "dropped_rows": mine}  # a copy: the entry is the kept evidence's
+        theirs = _rank_dropped(refused, rank)
+        if theirs is not None:
+            answer["rank"] = {**answer["rank"], "refused_batches": theirs}
     elif len(rows) <= PER_RANK_ROWS:
         answer["per_rank"] = [
             {"rank": number, "report": (entry.get("detection") or {}).get("state"),
@@ -1297,7 +1319,9 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
                  "checked", "not_enough_history", "not_configured", "unavailable")}}
                 if isinstance(entry.get("kind_counts"), dict) else {}),
              **({"stream": entry["stream"]} if isinstance(entry.get("stream"), dict) else {}),
-             **({"dropped_rows": mine["rows"]} if (mine := _rank_dropped(dropped, number)) is not None else {})}
+             **({"dropped_rows": mine["rows"]} if (mine := _rank_dropped(dropped, number)) is not None else {}),
+             **({"refused_batches": theirs["batches"]} if (theirs := _rank_dropped(refused, number)) is not None
+                else {})}
             for number, entry in sorted(rows.items(), key=lambda item: item[0] if isinstance(item[0], int) else -1)
         ]
     else:
@@ -1312,7 +1336,8 @@ def get_all_ranks_status(source: Source, arguments: Mapping[str, Any]) -> dict[s
 
 _ROW_KEYS = ("project", "name", "run_id", "group", "tags", "has_manifest", "source", "started", "run_state", "last_step",
              "incidents", "first_incident", "kinds_checked", "ranks", "evidence", "rank_count", "ranks_with_incidents",
-             "kinds_not_stated", "rank_count_not_known", "end", "dropped_rows")
+             "kinds_not_stated", "rank_count_not_known", "end", "dropped_rows", "refused_batches")
+_BOUNDED_ROW_KEYS = ("dropped_rows", "refused_batches")  # their ranks listed up to PER_RANK_ROWS
 
 
 def _text_argument(arguments: Mapping[str, Any], name: str) -> str | None:
@@ -1347,7 +1372,7 @@ def list_runs(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]:
            if len(shown) < len(rows) else {}),
         # A row says nothing it did not read: `run_state` null with `evidence.state` "missing"
         # means no evidence file was written for that run, not that the run is clean.
-        "runs": [{key: _dropped_shown(row[key]) if key == "dropped_rows" else row[key] for key in _ROW_KEYS if key in row}
+        "runs": [{key: _dropped_shown(row[key]) if key in _BOUNDED_ROW_KEYS else row[key] for key in _ROW_KEYS if key in row}
                  for row in shown],
     }
 
@@ -1366,8 +1391,9 @@ def compare_runs(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
         # A run that is not there, a name that fits several runs (the message lists their IDs),
         # or records that cannot be read.
         raise ToolError(f"{error} (the runs are looked up at {folder}; list_runs shows them)") from None
-    # L22 (lane AA5): a store run's dropped rows, with the ranks bounded as the other answers bound them.
-    result["runs"] = [{**run, "dropped_rows": _dropped_shown(run["dropped_rows"])} if "dropped_rows" in run else run
+    # L22 (lane AA5): a store run's dropped rows, and its refused batches (RS10, lane AB5), with the
+    # ranks bounded as the other answers bound them.
+    result["runs"] = [{**run, **{key: _dropped_shown(run[key]) for key in _BOUNDED_ROW_KEYS if key in run}}
                       for run in result["runs"]]
     return result
 
@@ -1402,9 +1428,11 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " means that part was not judged."
             " For a run folder the incidents are grouped across ranks, and `rank` keeps one rank's; `kinds` is"
             " then the whole run's, read as get_all_ranks_status describes; `rank.dropped_rows`, only when the server"
-            " dropped rows of that rank for a null key, counts them (an upper bound). For a local .jsonl file, `run_end` says"
-            " whether its session closed it: any state but `closed` means not known to have finished (still running,"
-            " killed or never closed look the same)."
+            " dropped rows of that rank (for a null key or a schema version it does not support), counts them (an"
+            " upper bound); `rank.refused_batches`, only when it refused whole batches of that rank because a key"
+            " column was missing or of another type, counts those batches apart (never added to the rows)."
+            " For a local .jsonl file, `run_end` says whether its session closed it: any state but `closed` means not"
+            " known to have finished (still running, killed or never closed look the same)."
             " Where one rank's evidence has them, `head_trends` gives the probe's language-model head numbers over"
             " the run: values with no threshold, never an incident (get_series with kind head gives each probe's)."
         ),
@@ -1500,9 +1528,14 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " stopped, `stopped_stacks` groups those that sent a stack by where their main thread was and names an odd"
             " group only when one is clearly apart (`verdict`); it is an observation, never the cause (see its"
             " `caveats`), and the ranks with no stack are listed, not compared. `dropped_rows`, only when the"
-            " server dropped rows of the run because a key of theirs was null (they were never stored): how many in"
-            " all, by null key and by rank (`per_rank[].dropped_rows`, and in the `rank` entry). It is an upper"
-            " bound: a batch sent again after a lost acknowledgement is counted again. With no key, none was dropped."
+            " server dropped rows of the run (never stored) because a key of theirs was null or their schema version"
+            " is one it does not support: how many in all, by key (`unsupported_schema_version` for the version) and"
+            " by rank (`per_rank[].dropped_rows`, and in the `rank` entry). It is an upper bound: a batch sent again"
+            " after a lost acknowledgement is counted again. With no key, none was dropped. `refused_batches`, only"
+            " when the server refused whole batches of the run because a key column was missing or of another type"
+            " (no row of them stored): how many batches in all, by key column and by rank (`per_rank[].refused_batches`,"
+            " and in the `rank` entry). A count of batches, not rows, never added to `dropped_rows`; the same batch"
+            " sent again is not counted again. With no key, none was refused."
             " `rank` gives one rank's entry in full. On one rank's capture or evidence file this is an error that says so."
         ),
         "inputSchema": {
@@ -1529,9 +1562,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " (`ranks_with_incidents` names them), and a kind counts as checked only when every judged rank checked"
             " it. A rank without a current report or evidence file is unknown (`evidence.unknown_ranks`), never"
             " clean; `kinds_not_stated` says why there is no count. `dropped_rows`, on a store run's row only when"
-            " the server dropped rows of it because a key of theirs was null (never stored): how many in all, by null"
-            " key and by rank; an upper bound, since a batch sent again after a lost acknowledgement is counted"
-            " again. No key means none was dropped."
+            " the server dropped rows of it (never stored) because a key of theirs was null or their schema version is"
+            " one it does not support: how many in all, by key and by rank; an upper bound, since a batch sent again"
+            " after a lost acknowledgement is counted again. No key means none was dropped. `refused_batches`, on a"
+            " store run's row only when the server refused whole batches of it because a key column was missing or of"
+            " another type: how many batches in all, by key column and by rank, never added to `dropped_rows`. No key"
+            " means none was refused."
         ),
         "inputSchema": {
             "type": "object",
@@ -1568,9 +1604,13 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " are judged here. A run in a server's store is read from the server's reports and no part is opened; a"
             " rank whose report is not current is unknown, and when no rank's is, the tool says so and compares"
             " nothing. `runs[].dropped_rows`, only for a run in a server's store whose server dropped rows with a"
-            " null key (with `rank`, that rank's): the rows in all, by null key and by rank, the ranks listed up to"
+            " null key or a schema version it does not support (with `rank`, that rank's): the rows in all, by key"
+            " and by rank, the ranks listed up to"
             f" {PER_RANK_ROWS} (`ranks_omitted` counts the rest). It is an upper bound: a batch sent again after a"
             " lost acknowledgement is counted again. A run that dropped none has no such key."
+            " `runs[].refused_batches`, only for such a run whose server refused whole batches because a key column"
+            " was missing or of another type: the batches in all, by key column and by rank, bounded the same way;"
+            " a count of batches, never added to `dropped_rows`. A run that refused none has no such key."
         ),
         "inputSchema": {
             "type": "object",
