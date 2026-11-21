@@ -1,0 +1,8253 @@
+{
+ "contract": "WAVE_AE_CONTRACT.md",
+ "base": "265311c",
+ "cases": {
+  "a_split_pair_with_two_clip_calls_is_not_compared": {
+   "section": 1,
+   "status": "new",
+   "says": "Step 5 names a parameter step 4 does not, so comparing them needs each record's pre-clipping total split by parameter, and step 5 was clipped by two calls. The pair is not compared: no incident, and one `not_checked` entry says so. Today the split is made as if one call had clipped everything, and the pair is flagged.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.0,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.01,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.02,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.03,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 4,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.04,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 5,
+      "clip_grad_norm": 2.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8,
+       "c": 1.0
+      },
+      "update_rms": {
+       "a": 2.0,
+       "b": 0.5,
+       "c": 0.1
+      },
+      "clip_calls": 2
+     }
+    ],
+    "window": 3
+   },
+   "expected": {
+    "update_spike_step": null,
+    "clip_groups_entry": {
+     "check": "clip_groups",
+     "kinds": [
+      "update_spike"
+     ],
+     "comparisons": 1,
+     "step": 5
+    }
+   },
+   "today": {
+    "update_spike_step": 5,
+    "clip_groups_entry": null
+   }
+  },
+  "a_split_pair_whose_earlier_record_had_two_clip_calls": {
+   "section": 1,
+   "status": "new",
+   "says": "The same, with the two calls on the earlier record of the pair. Either record is enough.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.0,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.01,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.02,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.03,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 4,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.04,
+       "b": 0.5
+      },
+      "clip_calls": 2
+     },
+     {
+      "step": 5,
+      "clip_grad_norm": 2.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8,
+       "c": 1.0
+      },
+      "update_rms": {
+       "a": 2.0,
+       "b": 0.5,
+       "c": 0.1
+      }
+     }
+    ],
+    "window": 3
+   },
+   "expected": {
+    "update_spike_step": null,
+    "clip_groups_entry": {
+     "check": "clip_groups",
+     "kinds": [
+      "update_spike"
+     ],
+     "comparisons": 1,
+     "step": 5
+    }
+   },
+   "today": {
+    "update_spike_step": 5,
+    "clip_groups_entry": null
+   }
+  },
+  "after_a_pair_that_is_not_compared_the_next_is": {
+   "section": 1,
+   "status": "new",
+   "says": "The pair of steps 4 and 5 is not compared, and its change joins no baseline. Step 5 is still the record step 6 is compared with: they name the same parameters, so their totals are used as recorded, and step 6's jump is flagged. Today the incident is at step 5.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.0,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.01,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.02,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.03,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 4,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.04,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 5,
+      "clip_grad_norm": 2.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8,
+       "c": 1.0
+      },
+      "update_rms": {
+       "a": 2.0,
+       "b": 0.5,
+       "c": 0.1
+      },
+      "clip_calls": 2
+     },
+     {
+      "step": 6,
+      "clip_grad_norm": 4.0,
+      "grad_norms": {
+       "a": 1.2,
+       "b": 1.6,
+       "c": 2.0
+      },
+      "update_rms": {
+       "a": 6.0,
+       "b": 0.5,
+       "c": 0.1
+      }
+     }
+    ],
+    "window": 3
+   },
+   "expected": {
+    "update_spike_step": 6,
+    "clip_groups_entry": {
+     "check": "clip_groups",
+     "kinds": [
+      "update_spike"
+     ],
+     "comparisons": 1,
+     "step": 5
+    }
+   },
+   "today": {
+    "update_spike_step": 5,
+    "clip_groups_entry": null
+   }
+  },
+  "a_split_pair_with_one_clip_call_is_compared": {
+   "section": 1,
+   "status": "pin",
+   "says": "The control: the same records with no `clip_calls`. The split is made and step 5 is flagged, as on the base.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.0,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.01,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.02,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.03,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 4,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.04,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 5,
+      "clip_grad_norm": 2.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8,
+       "c": 1.0
+      },
+      "update_rms": {
+       "a": 2.0,
+       "b": 0.5,
+       "c": 0.1
+      }
+     }
+    ],
+    "window": 3
+   },
+   "expected": {
+    "update_spike_step": 5,
+    "clip_groups_entry": null
+   }
+  },
+  "a_pair_naming_the_same_parameters_is_compared_whatever_the_clip_calls": {
+   "section": 1,
+   "status": "pin",
+   "says": "Both records name `a` and `b`, so their totals are compared as recorded and nothing is split. Two clip calls on both change nothing: step 5 is flagged, and there is no `not_checked` entry.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.0,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.01,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.02,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.03,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 4,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.04,
+       "b": 0.5
+      },
+      "clip_calls": 2
+     },
+     {
+      "step": 5,
+      "clip_grad_norm": 2.0,
+      "grad_norms": {
+       "a": 1.2,
+       "b": 1.6
+      },
+      "update_rms": {
+       "a": 2.0,
+       "b": 0.5
+      },
+      "clip_calls": 2
+     }
+    ],
+    "window": 3
+   },
+   "expected": {
+    "update_spike_step": 5,
+    "clip_groups_entry": null
+   }
+  },
+  "clip_calls_that_is_one_is_read_as_no_key": {
+   "section": 1,
+   "status": "pin",
+   "says": "`clip_calls` is a whole number above 1, or it says nothing. Here it is 1: the pair is compared as if the key were absent.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.0,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.01,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.02,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.03,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 4,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.04,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 5,
+      "clip_grad_norm": 2.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8,
+       "c": 1.0
+      },
+      "update_rms": {
+       "a": 2.0,
+       "b": 0.5,
+       "c": 0.1
+      },
+      "clip_calls": 1
+     }
+    ],
+    "window": 3
+   },
+   "expected": {
+    "update_spike_step": 5,
+    "clip_groups_entry": null
+   }
+  },
+  "clip_calls_that_is_text_is_read_as_no_key": {
+   "section": 1,
+   "status": "pin",
+   "says": "`clip_calls` is a whole number above 1, or it says nothing. Here it is '2': the pair is compared as if the key were absent.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.0,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.01,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.02,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.03,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 4,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.04,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 5,
+      "clip_grad_norm": 2.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8,
+       "c": 1.0
+      },
+      "update_rms": {
+       "a": 2.0,
+       "b": 0.5,
+       "c": 0.1
+      },
+      "clip_calls": "2"
+     }
+    ],
+    "window": 3
+   },
+   "expected": {
+    "update_spike_step": 5,
+    "clip_groups_entry": null
+   }
+  },
+  "clip_calls_that_is_a_fraction_is_read_as_no_key": {
+   "section": 1,
+   "status": "pin",
+   "says": "`clip_calls` is a whole number above 1, or it says nothing. Here it is 2.5: the pair is compared as if the key were absent.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.0,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.01,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.02,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.03,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 4,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.04,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 5,
+      "clip_grad_norm": 2.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8,
+       "c": 1.0
+      },
+      "update_rms": {
+       "a": 2.0,
+       "b": 0.5,
+       "c": 0.1
+      },
+      "clip_calls": 2.5
+     }
+    ],
+    "window": 3
+   },
+   "expected": {
+    "update_spike_step": 5,
+    "clip_groups_entry": null
+   }
+  },
+  "clip_calls_that_is_true_is_read_as_no_key": {
+   "section": 1,
+   "status": "pin",
+   "says": "`clip_calls` is a whole number above 1, or it says nothing. Here it is True: the pair is compared as if the key were absent.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.0,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.01,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.02,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.03,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 4,
+      "clip_grad_norm": 1.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8
+      },
+      "update_rms": {
+       "a": 1.04,
+       "b": 0.5
+      }
+     },
+     {
+      "step": 5,
+      "clip_grad_norm": 2.0,
+      "grad_norms": {
+       "a": 0.6,
+       "b": 0.8,
+       "c": 1.0
+      },
+      "update_rms": {
+       "a": 2.0,
+       "b": 0.5,
+       "c": 0.1
+      },
+      "clip_calls": true
+     }
+    ],
+    "window": 3
+   },
+   "expected": {
+    "update_spike_step": 5,
+    "clip_groups_entry": null
+   }
+  },
+  "a_stall_does_not_carry_across_a_resume": {
+   "section": 2,
+   "status": "new",
+   "says": "`p` is unchanged at the checks of steps 50 and 100. The job is resumed at step 101. The new process's first check, at 150, compares nothing; `p` is unchanged at 200, 250 and 300. The streak starts again at the new attempt, so the stall is raised at 300. Today the two checks before the resume count, and it is raised at 200, on three comparisons with the interval from 100 to 150 never compared.",
+   "given": {
+    "records": [
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      }
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 100,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 101,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      }
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 150,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      }
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 200,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 250,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 300,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     }
+    ]
+   },
+   "expected": {
+    "stalled_weights_step": 300
+   },
+   "today": {
+    "stalled_weights_step": 200
+   }
+  },
+  "a_new_attempt_whose_first_check_compared": {
+   "section": 2,
+   "status": "new",
+   "says": "The same, but the new attempt's first weight check carries a list (a capture that could compare). It counts as the first check of the new streak, so the stall is raised at 250. Today it is raised at 150.",
+   "given": {
+    "records": [
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      }
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 100,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 101,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      }
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 150,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 200,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 250,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     }
+    ]
+   },
+   "expected": {
+    "stalled_weights_step": 250
+   },
+   "today": {
+    "stalled_weights_step": 150
+   }
+  },
+  "a_stall_in_one_attempt": {
+   "section": 2,
+   "status": "pin",
+   "says": "The control without a resume: unchanged at 50, 100 and 150 raises the stall at 150, as on the base.",
+   "given": {
+    "records": [
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      }
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 100,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 150,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 200,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     }
+    ]
+   },
+   "expected": {
+    "stalled_weights_step": 150
+   }
+  },
+  "a_stall_wholly_inside_the_resumed_attempt": {
+   "section": 2,
+   "status": "pin",
+   "says": "`p` changed at both checks before the resume and is unchanged at three after it: raised at 300, on the base and after.",
+   "given": {
+    "records": [
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      }
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": []
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 100,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": []
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 101,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      }
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 150,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      }
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 200,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 250,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 300,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     }
+    ]
+   },
+   "expected": {
+    "stalled_weights_step": 300
+   }
+  },
+  "a_stall_raised_before_the_resume_stands": {
+   "section": 2,
+   "status": "pin",
+   "says": "The stall is raised at 150, before the resume at 151. What comes after does not take it back or date it again.",
+   "given": {
+    "records": [
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      }
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 100,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 1,
+      "step": 150,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 151,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      }
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 200,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      }
+     },
+     {
+      "rank": 0,
+      "attempt": 2,
+      "step": 250,
+      "grad_norm": 1.0,
+      "grad_norms": {
+       "p": 0.5,
+       "q": 0.5
+      },
+      "weights_unchanged": [
+       "p"
+      ]
+     }
+    ]
+   },
+   "expected": {
+    "stalled_weights_step": 150
+   }
+  },
+  "five_full_skips_one_partial_step_five_full_skips": {
+   "section": 4,
+   "status": "new",
+   "says": "Five updates the scaler skipped for every optimizer, one step on which it skipped one optimizer of two and applied the other, and five more full skips. An update occurred at the sixth step, so the streak of fully skipped updates ends there: 11 recorded, 10 skipped, 1 partial, a streak of 5, and nothing is raised. Today the partial step counts as a skip and the rule is raised at the tenth in a row.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 3,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 4,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 5,
+      "step_skipped": true,
+      "step_skipped_by": "scaler",
+      "step_skipped_part": {
+       "skipped": 1,
+       "of": 2
+      }
+     },
+     {
+      "step": 6,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 7,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 8,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 9,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 10,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     }
+    ]
+   },
+   "expected": {
+    "loss_scale_trouble_step": null,
+    "reason": null,
+    "consecutive_skips": null,
+    "counters_at_end": {
+     "recorded_steps": 11,
+     "skipped_steps": 10,
+     "streak": 5,
+     "partial_steps": 1
+    }
+   },
+   "today": {
+    "loss_scale_trouble_step": 9,
+    "reason": "skips",
+    "consecutive_skips": 10,
+    "counters_at_end": {
+     "recorded_steps": 11,
+     "skipped_steps": 11,
+     "streak": 11,
+     "partial_steps": 0
+    }
+   }
+  },
+  "a_partial_step_the_caller_also_reported": {
+   "section": 4,
+   "status": "new",
+   "says": "The same, with the caller reporting a skip on the partial step as well. The scaler confirmed a mixed outcome, so the counts are the same: 11 recorded, 10 skipped, 1 partial, a streak of 5.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 3,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 4,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 5,
+      "step_skipped": true,
+      "step_skipped_by": "both",
+      "step_skipped_part": {
+       "skipped": 1,
+       "of": 2
+      }
+     },
+     {
+      "step": 6,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 7,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 8,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 9,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 10,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     }
+    ]
+   },
+   "expected": {
+    "loss_scale_trouble_step": null,
+    "reason": null,
+    "consecutive_skips": null,
+    "counters_at_end": {
+     "recorded_steps": 11,
+     "skipped_steps": 10,
+     "streak": 5,
+     "partial_steps": 1
+    }
+   },
+   "today": {
+    "loss_scale_trouble_step": 9,
+    "reason": "skips",
+    "consecutive_skips": 10,
+    "counters_at_end": {
+     "recorded_steps": 11,
+     "skipped_steps": 11,
+     "streak": 11,
+     "partial_steps": 0
+    }
+   }
+  },
+  "a_partial_step_then_ten_full_skips": {
+   "section": 4,
+   "status": "new",
+   "says": "A partial step and then ten full skips. The ten raise the rule at the tenth of them, step 10, and the incident carries `partial_steps: 1`. Today the partial step is the first of the ten and the rule is raised at step 9.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "scaler",
+      "step_skipped_part": {
+       "skipped": 1,
+       "of": 2
+      }
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 3,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 4,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 5,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 6,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 7,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 8,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 9,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 10,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     }
+    ]
+   },
+   "expected": {
+    "loss_scale_trouble_step": 10,
+    "reason": "skips",
+    "consecutive_skips": 10,
+    "incident_partial_steps": 1,
+    "counters_at_end": {
+     "recorded_steps": 11,
+     "skipped_steps": 10,
+     "streak": 10,
+     "partial_steps": 1
+    }
+   },
+   "today": {
+    "loss_scale_trouble_step": 9,
+    "reason": "skips",
+    "consecutive_skips": 10,
+    "counters_at_end": {
+     "recorded_steps": 11,
+     "skipped_steps": 11,
+     "streak": 11,
+     "partial_steps": 0
+    }
+   }
+  },
+  "eleven_full_skips_with_one_optimizer": {
+   "section": 4,
+   "status": "pin",
+   "says": "The single-optimizer control: eleven skips with no `step_skipped_part`. Raised at the tenth, step 9, as on the base.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 3,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 4,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 5,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 6,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 7,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 8,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 9,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 10,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     }
+    ]
+   },
+   "expected": {
+    "loss_scale_trouble_step": 9,
+    "reason": "skips",
+    "consecutive_skips": 10,
+    "counters_at_end": {
+     "recorded_steps": 11,
+     "skipped_steps": 11,
+     "streak": 11,
+     "partial_steps": 0
+    }
+   }
+  },
+  "a_part_key_that_says_every_optimizer_skipped_is_a_full_skip": {
+   "section": 4,
+   "status": "pin",
+   "says": "`step_skipped_part` states a mixed outcome only as two whole numbers with 0 < skipped < of. Here it is {\"skipped\": 2, \"of\": 2} on a skipped step: no update is known to have occurred, so the step is a full skip, and the rule is raised at the tenth in a row, step 9.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 3,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 4,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 5,
+      "step_skipped": true,
+      "step_skipped_by": "scaler",
+      "step_skipped_part": {
+       "skipped": 2,
+       "of": 2
+      }
+     },
+     {
+      "step": 6,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 7,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 8,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 9,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 10,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     }
+    ]
+   },
+   "expected": {
+    "loss_scale_trouble_step": 9,
+    "reason": "skips",
+    "consecutive_skips": 10,
+    "counters_at_end": {
+     "recorded_steps": 11,
+     "skipped_steps": 11,
+     "streak": 11,
+     "partial_steps": 0
+    }
+   }
+  },
+  "a_part_key_that_says_no_optimizer_skipped_is_a_full_skip": {
+   "section": 4,
+   "status": "pin",
+   "says": "`step_skipped_part` states a mixed outcome only as two whole numbers with 0 < skipped < of. Here it is {\"skipped\": 0, \"of\": 2} on a skipped step: no update is known to have occurred, so the step is a full skip, and the rule is raised at the tenth in a row, step 9.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 3,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 4,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 5,
+      "step_skipped": true,
+      "step_skipped_by": "scaler",
+      "step_skipped_part": {
+       "skipped": 0,
+       "of": 2
+      }
+     },
+     {
+      "step": 6,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 7,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 8,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 9,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 10,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     }
+    ]
+   },
+   "expected": {
+    "loss_scale_trouble_step": 9,
+    "reason": "skips",
+    "consecutive_skips": 10,
+    "counters_at_end": {
+     "recorded_steps": 11,
+     "skipped_steps": 11,
+     "streak": 11,
+     "partial_steps": 0
+    }
+   }
+  },
+  "a_part_key_that_is_not_two_counts_is_a_full_skip": {
+   "section": 4,
+   "status": "pin",
+   "says": "`step_skipped_part` states a mixed outcome only as two whole numbers with 0 < skipped < of. Here it is \"1 of 2\" on a skipped step: no update is known to have occurred, so the step is a full skip, and the rule is raised at the tenth in a row, step 9.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 3,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 4,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 5,
+      "step_skipped": true,
+      "step_skipped_by": "scaler",
+      "step_skipped_part": "1 of 2"
+     },
+     {
+      "step": 6,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 7,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 8,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 9,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 10,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     }
+    ]
+   },
+   "expected": {
+    "loss_scale_trouble_step": 9,
+    "reason": "skips",
+    "consecutive_skips": 10,
+    "counters_at_end": {
+     "recorded_steps": 11,
+     "skipped_steps": 11,
+     "streak": 11,
+     "partial_steps": 0
+    }
+   }
+  },
+  "a_low_loss_scale_on_a_partial_step": {
+   "section": 4,
+   "status": "pin",
+   "says": "A loss scale below the floor measured on a partial step raises the rule with reason `scale`: the measurement is the evidence, as on any step.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 3,
+      "step_skipped": true,
+      "step_skipped_by": "scaler",
+      "step_skipped_part": {
+       "skipped": 1,
+       "of": 2
+      },
+      "grad_scale": 1e-09
+     }
+    ]
+   },
+   "expected": {
+    "loss_scale_trouble_step": 3,
+    "reason": "scale"
+   }
+  },
+  "a_stall_across_a_partial_step": {
+   "section": 4,
+   "status": "pin",
+   "says": "The record does not say which optimizer's update was applied, so a partial step is read by the per-parameter kinds as a skipped one: it adds nothing to a stall's streak and does not end it. Unchanged at two applied steps, at the partial one and at one more applied step raises the stall at the last, step 3.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": false,
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 1,
+      "step_skipped": false,
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler",
+      "step_skipped_part": {
+       "skipped": 1,
+       "of": 2
+      },
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     },
+     {
+      "step": 3,
+      "step_skipped": false,
+      "weights_unchanged": [
+       "blk.weight"
+      ],
+      "grad_norms": {
+       "blk.weight": 0.5
+      }
+     }
+    ]
+   },
+   "expected": {
+    "stalled_weights_step": 3
+   }
+  },
+  "skipped_updates_counts_a_partial_step_apart": {
+   "section": 4,
+   "status": "new",
+   "says": "The evidence's `skipped_updates` counts the partial step under `partial` and under no other name. The key `partial` is there only when its count is above zero.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 3,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 4,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 5,
+      "step_skipped": true,
+      "step_skipped_by": "scaler",
+      "step_skipped_part": {
+       "skipped": 1,
+       "of": 2
+      }
+     },
+     {
+      "step": 6,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 7,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 8,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 9,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 10,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     }
+    ]
+   },
+   "expected": {
+    "skipped_updates": {
+     "caller": 0,
+     "scaler": 10,
+     "both": 0,
+     "partial": 1
+    }
+   },
+   "today": {
+    "skipped_updates": {
+     "caller": 0,
+     "scaler": 11,
+     "both": 0
+    }
+   }
+  },
+  "skipped_updates_without_a_partial_step": {
+   "section": 4,
+   "status": "pin",
+   "says": "With no partial step the block is what it is on the base, with no `partial` key.",
+   "given": {
+    "records": [
+     {
+      "step": 0,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 1,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 2,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 3,
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
+     },
+     {
+      "step": 4,
+      "step_skipped": true,
+      "step_skipped_by": "caller"
+     },
+     {
+      "step": 5,
+      "step_skipped": true,
+      "step_skipped_by": "both"
+     }
+    ]
+   },
+   "expected": {
+    "skipped_updates": {
+     "caller": 1,
+     "scaler": 4,
+     "both": 1
+    }
+   }
+  },
+  "two_clean_runs_with_different_ids_are_compared": {
+   "section": 5,
+   "status": "pin",
+   "says": "Run A is all `r1` and run B all `r2`. That is what the call is for: the two are compared, and the answer is not `no_answer`.",
+   "given": {
+    "records_a": [
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 2.0
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 1,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.99
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 2,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.98
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 3,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.97
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 4,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.96
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 5,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.95
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 6,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.94
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 7,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.93
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 8,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.92
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 9,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.91
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 10,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.9
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 11,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.89
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 12,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.88
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 13,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.87
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 14,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.8599999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 15,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.85
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 16,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.84
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 17,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.83
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 18,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.82
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 19,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.81
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 20,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.8
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 21,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.79
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 22,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.78
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 23,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.77
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 24,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.76
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 25,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.75
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 26,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.74
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 27,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.73
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 28,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.72
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 29,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.71
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 30,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.7
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 31,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.69
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 32,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.68
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 33,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.67
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 34,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.66
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 35,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.65
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 36,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.6400000000000001
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 37,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.63
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 38,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.62
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 39,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.6099999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 40,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.6
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 41,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.5899999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 42,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.58
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 43,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.57
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 44,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.56
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 45,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.55
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 46,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.54
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 47,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.53
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 48,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.52
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 49,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.51
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.5
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 51,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.49
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 52,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.48
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 53,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.47
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 54,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.46
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 55,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.45
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 56,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.44
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 57,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.43
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 58,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.42
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 59,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.4100000000000001
+      }
+     }
+    ],
+    "records_b": [
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 2.0
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 1,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.99
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 2,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.98
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 3,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.97
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 4,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.96
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 5,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.95
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 6,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.94
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 7,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.93
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 8,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.92
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 9,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.91
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 10,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.9
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 11,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.89
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 12,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.88
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 13,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.87
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 14,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.8599999999999999
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 15,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.85
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 16,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.84
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 17,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.83
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 18,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.82
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 19,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.81
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 20,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.8
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 21,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.79
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 22,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.78
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 23,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.77
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 24,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.76
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 25,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.75
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 26,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.74
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 27,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.73
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 28,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.72
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 29,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.71
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 30,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.7
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 31,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.69
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 32,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.68
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 33,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.67
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 34,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.66
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 35,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.65
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 36,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.6400000000000001
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 37,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.63
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 38,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.62
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 39,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.6099999999999999
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 40,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.6
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 41,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.5899999999999999
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 42,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.58
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 43,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.57
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 44,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.56
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 45,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.55
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 46,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.54
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 47,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.53
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 48,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.52
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 49,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.51
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.5
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 51,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.49
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 52,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.48
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 53,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.47
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 54,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.46
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 55,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.45
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 56,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.44
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 57,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.43
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 58,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.42
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 59,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.4100000000000001
+      }
+     }
+    ]
+   },
+   "expected": {
+    "answer": "no_divergence",
+    "several_run_ids": null
+   }
+  },
+  "an_input_with_another_run_id_only_in_the_middle": {
+   "section": 5,
+   "status": "new",
+   "says": "Run A's rows say `r1` at the start and at the end and `r2` in between; run B is clean. A is not one run, so there is no answer, and the result names the side and its IDs. A reader that looks only at the first and last rows would not see it. Today the rows are read as one run.",
+   "given": {
+    "records_a": [
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 2.0
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 1,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.99
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 2,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.98
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 3,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.97
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 4,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.96
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 5,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.95
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 6,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.94
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 7,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.93
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 8,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.92
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 9,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.91
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 10,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.9
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 11,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.89
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 12,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.88
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 13,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.87
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 14,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.8599999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 15,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.85
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 16,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.84
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 17,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.83
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 18,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.82
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 19,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.81
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 20,
+      "grad_norm": 5.006,
+      "scalars": {
+       "train/loss": 9.8
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 21,
+      "grad_norm": 5.0,
+      "scalars": {
+       "train/loss": 9.79
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 22,
+      "grad_norm": 5.001,
+      "scalars": {
+       "train/loss": 9.78
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 23,
+      "grad_norm": 5.002,
+      "scalars": {
+       "train/loss": 9.77
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 24,
+      "grad_norm": 5.003,
+      "scalars": {
+       "train/loss": 9.76
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 25,
+      "grad_norm": 5.004,
+      "scalars": {
+       "train/loss": 9.75
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 26,
+      "grad_norm": 5.005,
+      "scalars": {
+       "train/loss": 9.74
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 27,
+      "grad_norm": 5.006,
+      "scalars": {
+       "train/loss": 9.73
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 28,
+      "grad_norm": 5.0,
+      "scalars": {
+       "train/loss": 9.72
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 29,
+      "grad_norm": 5.001,
+      "scalars": {
+       "train/loss": 9.71
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 30,
+      "grad_norm": 5.002,
+      "scalars": {
+       "train/loss": 9.7
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 31,
+      "grad_norm": 5.003,
+      "scalars": {
+       "train/loss": 9.69
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 32,
+      "grad_norm": 5.004,
+      "scalars": {
+       "train/loss": 9.68
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 33,
+      "grad_norm": 5.005,
+      "scalars": {
+       "train/loss": 9.67
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 34,
+      "grad_norm": 5.006,
+      "scalars": {
+       "train/loss": 9.66
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 35,
+      "grad_norm": 5.0,
+      "scalars": {
+       "train/loss": 9.65
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 36,
+      "grad_norm": 5.001,
+      "scalars": {
+       "train/loss": 9.64
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 37,
+      "grad_norm": 5.002,
+      "scalars": {
+       "train/loss": 9.63
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 38,
+      "grad_norm": 5.003,
+      "scalars": {
+       "train/loss": 9.62
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 39,
+      "grad_norm": 5.004,
+      "scalars": {
+       "train/loss": 9.61
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 40,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.6
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 41,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.5899999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 42,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.58
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 43,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.57
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 44,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.56
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 45,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.55
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 46,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.54
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 47,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.53
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 48,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.52
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 49,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.51
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.5
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 51,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.49
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 52,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.48
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 53,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.47
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 54,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.46
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 55,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.45
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 56,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.44
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 57,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.43
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 58,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.42
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 59,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.4100000000000001
+      }
+     }
+    ],
+    "records_b": [
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 2.0
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 1,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.99
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 2,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.98
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 3,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.97
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 4,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.96
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 5,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.95
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 6,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.94
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 7,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.93
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 8,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.92
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 9,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.91
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 10,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.9
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 11,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.89
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 12,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.88
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 13,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.87
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 14,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.8599999999999999
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 15,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.85
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 16,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.84
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 17,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.83
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 18,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.82
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 19,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.81
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 20,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.8
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 21,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.79
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 22,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.78
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 23,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.77
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 24,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.76
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 25,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.75
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 26,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.74
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 27,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.73
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 28,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.72
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 29,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.71
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 30,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.7
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 31,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.69
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 32,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.68
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 33,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.67
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 34,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.66
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 35,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.65
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 36,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.6400000000000001
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 37,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.63
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 38,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.62
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 39,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.6099999999999999
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 40,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.6
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 41,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.5899999999999999
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 42,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.58
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 43,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.57
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 44,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.56
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 45,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.55
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 46,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.54
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 47,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.53
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 48,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.52
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 49,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.51
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.5
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 51,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.49
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 52,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.48
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 53,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.47
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 54,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.46
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 55,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.45
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 56,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.44
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 57,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.43
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 58,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.42
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 59,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.4100000000000001
+      }
+     }
+    ]
+   },
+   "expected": {
+    "answer": "no_answer",
+    "several_run_ids": {
+     "a": [
+      "r1",
+      "r2"
+     ]
+    }
+   },
+   "today": {
+    "answer": "no_divergence",
+    "several_run_ids": null
+   }
+  },
+  "the_other_input_with_two_run_ids": {
+   "section": 5,
+   "status": "new",
+   "says": "The same with the mixed rows given as run B: the result names side `b`.",
+   "given": {
+    "records_a": [
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 2.0
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 1,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.99
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 2,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.98
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 3,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.97
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 4,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.96
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 5,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.95
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 6,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.94
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 7,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.93
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 8,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.92
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 9,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.91
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 10,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.9
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 11,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.89
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 12,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.88
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 13,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.87
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 14,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.8599999999999999
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 15,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.85
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 16,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.84
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 17,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.83
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 18,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.82
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 19,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.81
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 20,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.8
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 21,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.79
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 22,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.78
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 23,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.77
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 24,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.76
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 25,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.75
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 26,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.74
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 27,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.73
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 28,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.72
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 29,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.71
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 30,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.7
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 31,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.69
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 32,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.68
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 33,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.67
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 34,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.66
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 35,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.65
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 36,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.6400000000000001
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 37,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.63
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 38,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.62
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 39,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.6099999999999999
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 40,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.6
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 41,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.5899999999999999
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 42,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.58
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 43,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.57
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 44,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.56
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 45,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.55
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 46,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.54
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 47,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.53
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 48,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.52
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 49,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.51
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.5
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 51,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.49
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 52,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.48
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 53,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.47
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 54,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.46
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 55,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.45
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 56,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.44
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 57,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.43
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 58,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.42
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 59,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.4100000000000001
+      }
+     }
+    ],
+    "records_b": [
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 2.0
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 1,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.99
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 2,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.98
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 3,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.97
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 4,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.96
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 5,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.95
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 6,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.94
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 7,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.93
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 8,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.92
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 9,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.91
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 10,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.9
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 11,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.89
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 12,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.88
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 13,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.87
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 14,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.8599999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 15,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.85
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 16,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.84
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 17,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.83
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 18,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.82
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 19,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.81
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 20,
+      "grad_norm": 5.006,
+      "scalars": {
+       "train/loss": 9.8
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 21,
+      "grad_norm": 5.0,
+      "scalars": {
+       "train/loss": 9.79
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 22,
+      "grad_norm": 5.001,
+      "scalars": {
+       "train/loss": 9.78
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 23,
+      "grad_norm": 5.002,
+      "scalars": {
+       "train/loss": 9.77
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 24,
+      "grad_norm": 5.003,
+      "scalars": {
+       "train/loss": 9.76
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 25,
+      "grad_norm": 5.004,
+      "scalars": {
+       "train/loss": 9.75
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 26,
+      "grad_norm": 5.005,
+      "scalars": {
+       "train/loss": 9.74
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 27,
+      "grad_norm": 5.006,
+      "scalars": {
+       "train/loss": 9.73
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 28,
+      "grad_norm": 5.0,
+      "scalars": {
+       "train/loss": 9.72
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 29,
+      "grad_norm": 5.001,
+      "scalars": {
+       "train/loss": 9.71
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 30,
+      "grad_norm": 5.002,
+      "scalars": {
+       "train/loss": 9.7
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 31,
+      "grad_norm": 5.003,
+      "scalars": {
+       "train/loss": 9.69
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 32,
+      "grad_norm": 5.004,
+      "scalars": {
+       "train/loss": 9.68
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 33,
+      "grad_norm": 5.005,
+      "scalars": {
+       "train/loss": 9.67
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 34,
+      "grad_norm": 5.006,
+      "scalars": {
+       "train/loss": 9.66
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 35,
+      "grad_norm": 5.0,
+      "scalars": {
+       "train/loss": 9.65
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 36,
+      "grad_norm": 5.001,
+      "scalars": {
+       "train/loss": 9.64
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 37,
+      "grad_norm": 5.002,
+      "scalars": {
+       "train/loss": 9.63
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 38,
+      "grad_norm": 5.003,
+      "scalars": {
+       "train/loss": 9.62
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 39,
+      "grad_norm": 5.004,
+      "scalars": {
+       "train/loss": 9.61
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 40,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.6
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 41,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.5899999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 42,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.58
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 43,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.57
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 44,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.56
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 45,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.55
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 46,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.54
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 47,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.53
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 48,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.52
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 49,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.51
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.5
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 51,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.49
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 52,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.48
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 53,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.47
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 54,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.46
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 55,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.45
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 56,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.44
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 57,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.43
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 58,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.42
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 59,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.4100000000000001
+      }
+     }
+    ]
+   },
+   "expected": {
+    "answer": "no_answer",
+    "several_run_ids": {
+     "b": [
+      "r1",
+      "r2"
+     ]
+    }
+   },
+   "today": {
+    "answer": "no_divergence",
+    "several_run_ids": null
+   }
+  },
+  "both_inputs_with_two_run_ids": {
+   "section": 5,
+   "status": "new",
+   "says": "Both inputs hold two run IDs: both sides are named.",
+   "given": {
+    "records_a": [
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 2.0
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 1,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.99
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 2,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.98
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 3,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.97
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 4,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.96
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 5,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.95
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 6,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.94
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 7,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.93
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 8,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.92
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 9,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.91
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 10,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.9
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 11,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.89
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 12,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.88
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 13,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.87
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 14,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.8599999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 15,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.85
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 16,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.84
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 17,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.83
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 18,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.82
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 19,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.81
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 20,
+      "grad_norm": 5.006,
+      "scalars": {
+       "train/loss": 9.8
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 21,
+      "grad_norm": 5.0,
+      "scalars": {
+       "train/loss": 9.79
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 22,
+      "grad_norm": 5.001,
+      "scalars": {
+       "train/loss": 9.78
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 23,
+      "grad_norm": 5.002,
+      "scalars": {
+       "train/loss": 9.77
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 24,
+      "grad_norm": 5.003,
+      "scalars": {
+       "train/loss": 9.76
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 25,
+      "grad_norm": 5.004,
+      "scalars": {
+       "train/loss": 9.75
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 26,
+      "grad_norm": 5.005,
+      "scalars": {
+       "train/loss": 9.74
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 27,
+      "grad_norm": 5.006,
+      "scalars": {
+       "train/loss": 9.73
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 28,
+      "grad_norm": 5.0,
+      "scalars": {
+       "train/loss": 9.72
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 29,
+      "grad_norm": 5.001,
+      "scalars": {
+       "train/loss": 9.71
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 30,
+      "grad_norm": 5.002,
+      "scalars": {
+       "train/loss": 9.7
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 31,
+      "grad_norm": 5.003,
+      "scalars": {
+       "train/loss": 9.69
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 32,
+      "grad_norm": 5.004,
+      "scalars": {
+       "train/loss": 9.68
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 33,
+      "grad_norm": 5.005,
+      "scalars": {
+       "train/loss": 9.67
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 34,
+      "grad_norm": 5.006,
+      "scalars": {
+       "train/loss": 9.66
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 35,
+      "grad_norm": 5.0,
+      "scalars": {
+       "train/loss": 9.65
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 36,
+      "grad_norm": 5.001,
+      "scalars": {
+       "train/loss": 9.64
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 37,
+      "grad_norm": 5.002,
+      "scalars": {
+       "train/loss": 9.63
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 38,
+      "grad_norm": 5.003,
+      "scalars": {
+       "train/loss": 9.62
+      }
+     },
+     {
+      "run_id": "r2",
+      "rank": 0,
+      "attempt": 1,
+      "step": 39,
+      "grad_norm": 5.004,
+      "scalars": {
+       "train/loss": 9.61
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 40,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.6
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 41,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.5899999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 42,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.58
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 43,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.57
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 44,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.56
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 45,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.55
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 46,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.54
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 47,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.53
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 48,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.52
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 49,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.51
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.5
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 51,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.49
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 52,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.48
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 53,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.47
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 54,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.46
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 55,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.45
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 56,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.44
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 57,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.43
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 58,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.42
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 59,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.4100000000000001
+      }
+     }
+    ],
+    "records_b": [
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 2.0
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 1,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.99
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 2,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.98
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 3,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.97
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 4,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.96
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 5,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.95
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 6,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.94
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 7,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.93
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 8,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.92
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 9,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.91
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 10,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.9
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 11,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.89
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 12,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.88
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 13,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.87
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 14,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.8599999999999999
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 15,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.85
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 16,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.84
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 17,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.83
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 18,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.82
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 19,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.81
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 20,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.8
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 21,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.79
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 22,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.78
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 23,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.77
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 24,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.76
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 25,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.75
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 26,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.74
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 27,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.73
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 28,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.72
+      }
+     },
+     {
+      "run_id": "r3",
+      "rank": 0,
+      "attempt": 1,
+      "step": 29,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.71
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 30,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.7
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 31,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.69
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 32,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.68
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 33,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.67
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 34,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.66
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 35,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.65
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 36,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.6400000000000001
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 37,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.63
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 38,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.62
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 39,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.6099999999999999
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 40,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.6
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 41,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.5899999999999999
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 42,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.58
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 43,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.57
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 44,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.56
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 45,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.55
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 46,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.54
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 47,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.53
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 48,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.52
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 49,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.51
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.5
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 51,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.49
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 52,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.48
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 53,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.47
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 54,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.46
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 55,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.45
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 56,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.44
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 57,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.43
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 58,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.42
+      }
+     },
+     {
+      "run_id": "r4",
+      "rank": 0,
+      "attempt": 1,
+      "step": 59,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.4100000000000001
+      }
+     }
+    ]
+   },
+   "expected": {
+    "answer": "no_answer",
+    "several_run_ids": {
+     "a": [
+      "r1",
+      "r2"
+     ],
+     "b": [
+      "r3",
+      "r4"
+     ]
+    }
+   },
+   "today": {
+    "answer": "no_divergence",
+    "several_run_ids": null
+   }
+  },
+  "a_step_written_twice_within_one_run": {
+   "section": 5,
+   "status": "pin",
+   "says": "Run B holds step 30 twice, both rows of its own run ID. That is one run, and it is compared: the later row is the one read. (The base's test of this made its second row from another run's, which is now two run IDs.)",
+   "given": {
+    "records_a": [
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 2.0
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 1,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.99
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 2,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.98
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 3,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.97
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 4,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.96
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 5,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.95
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 6,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.94
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 7,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.93
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 8,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.92
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 9,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.91
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 10,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.9
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 11,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.89
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 12,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.88
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 13,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.87
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 14,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.8599999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 15,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.85
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 16,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.84
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 17,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.83
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 18,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.82
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 19,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.81
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 20,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.8
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 21,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.79
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 22,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.78
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 23,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.77
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 24,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.76
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 25,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.75
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 26,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.74
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 27,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.73
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 28,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.72
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 29,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.71
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 30,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.7
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 31,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.69
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 32,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.68
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 33,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.67
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 34,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.66
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 35,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.65
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 36,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.6400000000000001
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 37,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.63
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 38,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.62
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 39,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.6099999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 40,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.6
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 41,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.5899999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 42,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.58
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 43,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.57
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 44,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.56
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 45,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.55
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 46,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.54
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 47,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.53
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 48,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.52
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 49,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.51
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.5
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 51,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.49
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 52,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.48
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 53,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.47
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 54,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.46
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 55,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.45
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 56,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.44
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 57,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.43
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 58,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.42
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 59,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.4100000000000001
+      }
+     }
+    ],
+    "records_b": [
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 0,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 2.0
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 1,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.99
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 2,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.98
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 3,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.97
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 4,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.96
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 5,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.95
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 6,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.94
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 7,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.93
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 8,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.92
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 9,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.91
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 10,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.9
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 11,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.89
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 12,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.88
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 13,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.87
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 14,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.8599999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 15,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.85
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 16,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.84
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 17,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.83
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 18,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.82
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 19,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.81
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 20,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.8
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 21,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.79
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 22,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.78
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 23,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.77
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 24,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.76
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 25,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.75
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 26,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.74
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 27,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.73
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 28,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.72
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 29,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.71
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 30,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.7
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 31,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.69
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 32,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.68
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 33,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.67
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 34,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.66
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 35,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.65
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 36,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.6400000000000001
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 37,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.63
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 38,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.62
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 39,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.6099999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 40,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.6
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 41,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.5899999999999999
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 42,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.58
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 43,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.57
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 44,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.56
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 45,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.55
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 46,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.54
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 47,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.53
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 48,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.52
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 49,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.51
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 50,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.5
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 51,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.49
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 52,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.48
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 53,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.47
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 54,
+      "grad_norm": 1.005,
+      "scalars": {
+       "train/loss": 1.46
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 55,
+      "grad_norm": 1.006,
+      "scalars": {
+       "train/loss": 1.45
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 56,
+      "grad_norm": 1.0,
+      "scalars": {
+       "train/loss": 1.44
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 57,
+      "grad_norm": 1.001,
+      "scalars": {
+       "train/loss": 1.43
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 58,
+      "grad_norm": 1.002,
+      "scalars": {
+       "train/loss": 1.42
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 59,
+      "grad_norm": 1.003,
+      "scalars": {
+       "train/loss": 1.4100000000000001
+      }
+     },
+     {
+      "run_id": "r1",
+      "rank": 0,
+      "attempt": 1,
+      "step": 30,
+      "grad_norm": 1.004,
+      "scalars": {
+       "train/loss": 1.7
+      }
+     }
+    ]
+   },
+   "expected": {
+    "answer": "no_divergence",
+    "several_run_ids": null
+   }
+  }
+ }
+}
