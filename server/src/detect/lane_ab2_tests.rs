@@ -733,12 +733,91 @@ fn who_reported_a_skip_is_read_from_extra_json() {
         json!({"caller": 1, "scaler": 2, "both": 1,
             "non_finite_gradients": {"steps": 2, "first_step": 3, "gradients": ["<total>", "<total before clipping>"]}})
     );
-    // The loss scale's input is every row that says whether it skipped, whoever said so.
-    assert_eq!(report["kind_checks"]["loss_scale_trouble"]["records"], 5);
+    // The loss scale's input is what the rule judges: every row but the caller's skip of unknown
+    // scaler outcome (step 3). Only a scaler given to `init` feeds the kind, as the label says.
+    assert_eq!(report["kind_checks"]["loss_scale_trouble"]["records"], 4);
     assert_eq!(
         report["kind_checks"]["loss_scale_trouble"]["needs"],
-        "step_skipped (scaler= or session.step(skipped=))"
+        "step_skipped (scaler=)"
     );
+}
+
+/// The loss scale's input count is exactly what the rule adds to `recorded_steps`: a caller's
+/// skip of unknown scaler outcome is no observation of this rule, so it is no input either. The
+/// cases the trial merge found the engines parting on, by name, with the Python reader's values.
+#[test]
+fn the_loss_scale_input_count_is_what_the_rule_judges() {
+    let cases = behaviour();
+    let wanted: [(&str, &str, u64, bool); 9] = [
+        (
+            "weights_unchanged_across_skips_the_caller_reported",
+            "not_configured",
+            0,
+            false,
+        ),
+        ("a_stall_across_a_skipped_step", "checked", 3, false),
+        ("ten_skips_only_the_caller_reported", "checked", 5, false),
+        ("caller_skips_inside_a_run_of_scaler_skips", "checked", 12, true),
+        (
+            "a_caller_skip_of_unknown_scaler_outcome_inside_scaler_skips",
+            "checked",
+            10,
+            true,
+        ),
+        (
+            "an_activation_not_finite_on_a_skip_the_caller_reported",
+            "not_configured",
+            0,
+            false,
+        ),
+        (
+            "a_gradient_not_finite_on_a_skip_the_caller_reported",
+            "not_configured",
+            0,
+            false,
+        ),
+        (
+            "an_activation_and_a_gradient_not_finite_on_a_skip_the_caller_reported",
+            "not_configured",
+            0,
+            false,
+        ),
+        // Raised from the scale on a step the count leaves out: the report says `not_configured`
+        // with no record, and the Python reader makes it `checked` with its note over either engine.
+        (
+            "a_low_loss_scale_on_a_skip_only_the_caller_reported",
+            "not_configured",
+            0,
+            false,
+        ),
+    ];
+    for (name, value, records, enough) in wanted {
+        let body = &cases[name];
+        let given = body
+            .get("records")
+            .or(body["given"].get("records"))
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let report = judged(given);
+        let check = &report["kind_checks"]["loss_scale_trouble"];
+        assert_eq!(
+            (&check["value"], &check["records"], &check["enough_history"]),
+            (&json!(value), &json!(records), &json!(enough)),
+            "{name}: {check}"
+        );
+        assert_eq!(check["needs"], "step_skipped (scaler=)");
+        // The count is the rule's own `recorded_steps` wherever the rule raises.
+        if let Some(found) = incident(&report, "loss_scale_trouble") {
+            assert_eq!(found["recorded_steps"], check["records"], "{name}");
+        }
+    }
+    // A caller's skip the scaler was seen to apply is an observation, and an input.
+    let records = vec![
+        json!({"step": 0, "step_skipped": true, "step_skipped_by": "caller", "scaler_applied": true}),
+        json!({"step": 1, "step_skipped": true, "step_skipped_by": "caller"}),
+    ];
+    assert_eq!(judged(&records)["kind_checks"]["loss_scale_trouble"]["records"], 1);
 }
 
 /// The `gradients` entry of `not_checked`, in Python's shape: each parameter once, with the first

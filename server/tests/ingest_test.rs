@@ -1984,6 +1984,56 @@ async fn the_status_names_the_ranks_whose_batches_were_compared_found_or_not() {
     assert_eq!(status["incidents"][0]["kind"], "duplicate_batches");
 }
 
+/// A rank that sends again after a restart has its store read, and the batches it drew before the
+/// restart are compared again. Shown by a duplicate that only those stored rows can make: rank 1
+/// drew its batches for steps 0..10 under the first server, and after the restart rank 2 draws the
+/// same ones at steps 0..5. Until lane AB2 the sign was a lone rank 1 listed in `ranks_compared`,
+/// which the lone-rank rule (`STEP_AND_EVIDENCE_CONTRACT.md`, section 2) took away.
+#[tokio::test]
+async fn after_a_restart_a_ranks_stored_batches_are_compared_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = IngestConfig {
+        flush_steps: 10,
+        ..watch_config(60_000)
+    };
+    let own = |rank: i32| move |step: i64| Some(format!("r{rank}-{step}"));
+    let status = |server: &TestServer| server.ingest.watchdog_statuses()[RUN].clone();
+    let old = start(dir.path(), config.clone(), None).await;
+    let mut rank1 = open_with(&old.address, RUN, 1, None, data_schema()).await;
+    rank1.send(data_batch(1, 0..10, own(1)), 1).await;
+    assert_eq!(rank1.ack().await, Ok(1));
+    old.ingest.write_watchdog().await;
+    let _old_stream = rank1;
+    drop(old);
+
+    let new = start(dir.path(), config, None).await;
+    assert_eq!(new.ingest.restore_watchdog().await.unwrap(), 1);
+    // Rank 1 sends again: only its steps 10..20 reach this server on the stream.
+    let mut rank1 = open_with(&new.address, RUN, 1, None, data_schema()).await;
+    rank1.send(data_batch(1, 10..20, own(1)), 2).await;
+    assert_eq!(rank1.ack().await, Ok(2));
+    // Rank 2 draws rank 1's batches of steps 0..5, which this server holds only in the store.
+    let mut rank2 = open_with(&new.address, RUN, 2, None, data_schema()).await;
+    rank2
+        .send(
+            data_batch(2, 0..10, |step| if step < 5 { own(1)(step) } else { own(2)(step) }),
+            1,
+        )
+        .await;
+    assert_eq!(rank2.ack().await, Ok(1));
+    until_within("the duplicate of rank 1's stored batches found", SLOW_BOUND, || {
+        status(&new)["duplicate_batches"].is_object()
+    })
+    .await;
+    let status = status(&new);
+    assert_eq!(
+        status["duplicate_batches"],
+        serde_json::json!({"step": 0, "ranks": [1, 2], "duplicated_steps": 5, "ranks_compared": [1, 2]}),
+        "{status}"
+    );
+    assert_eq!(status["ranks_compared"], serde_json::json!([1, 2]));
+}
+
 /// A server process that is killed when dropped, so a failed assertion leaves none running.
 struct Reaped(std::process::Child);
 

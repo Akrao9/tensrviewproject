@@ -228,7 +228,7 @@ pub const INPUT_NEEDS: [(&str, &str); 16] = [
     ("update", "update_rms with grad_norm or clip_grad_norm (updates=True)"),
     ("weight_check", "weights_unchanged with grad_norms (full capture)"),
     ("steps", "step records"),
-    ("loss_scale", "step_skipped (scaler= or session.step(skipped=))"),
+    ("loss_scale", "step_skipped (scaler=)"),
     ("lr", "lr"),
     ("data", "data (session.watch_loader)"),
     ("checkpoint", "checkpoint, or grad_scale (scaler=)"),
@@ -3006,10 +3006,9 @@ impl Stalled {
 struct LossScale {
     streak: u64,
     skipped: u64,
+    /// The observations this rule judges, `recorded_steps`, and also the kind's input count: a
+    /// caller's skip of unknown scaler outcome is not one (contract section 1, rule 2).
     recorded: u64,
-    /// Rows with `step_skipped`, whoever reported a skip: the kind's input count, as Python's
-    /// `input_counts` counts it.
-    flagged: u64,
     first: Option<Value>,
 }
 
@@ -3019,7 +3018,6 @@ impl LossScale {
         if columns.step_skipped.is_none_or(|skips| skips.is_null(row)) {
             return;
         }
-        self.flagged += 1;
         // Only a skip the scaler confirmed counts. A recorded applied update ends the streak. A
         // skip only the caller reported never adds a scaler-confirmed skip: with no
         // `scaler_applied` (the scaler's outcome unknown) it is passed over, neither adding to the
@@ -4000,7 +3998,7 @@ impl RankDetectors {
             self.updates.carried,
             self.inputs.weight_check,
             self.rows,
-            self.loss_scale.flagged,
+            self.loss_scale.recorded,
             self.inputs.lr,
             self.inputs.data,
             self.inputs.checkpoint,
