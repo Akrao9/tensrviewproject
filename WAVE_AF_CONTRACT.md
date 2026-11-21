@@ -122,7 +122,7 @@ Each regression runs the same records through every view the row names and asser
 
 **The base.** Two maps of the cross-rank state have nothing that removes from them, so they grow with the run.
 
-**The target.** They are pruned by the horizon the state's other maps already use; no new setting. A verdict that the base gives is unchanged: the regression runs a long stream, asserts the maps' sizes stay bounded, and asserts the status and the reports equal the base's on the same rows.
+**The target.** They are pruned by the rule the state's other maps are already pruned by; no new setting. If lane D finds no such rule to follow, it builds nothing here and brings the choice to the author with what each map holds and how fast it grows. A verdict that the base gives is unchanged: the regression runs a long stream, asserts the maps' sizes stay bounded, and asserts the status and the reports equal the base's on the same rows.
 
 Router counts of mixed sign (`[-2, 10]`) read as checked with no incident in both engines. That is RS17's accepted limit and stays (pin).
 
