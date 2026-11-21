@@ -8,6 +8,10 @@ What is here, in the order the driver uses it:
   parameter and one step: `add`, `neg` or `swap`, the three it has always planted, which move the
   fingerprints; or `ulp` and `negzero`, which change the bits and leave the fingerprints within
   the tolerance (contract 5: a signature-only difference is evidence and raises nothing).
+- Two arms (`--arm`). `control`, the default: SGD with `lr=0`, every rank's weights reset to one
+  base each step, then the plants. `learning`: SGD with `--lr` above zero, a batch of its own on
+  each rank, no reset and no plant, so the replicas' weights really change; `learning_batch` and
+  `weight_change` are its parts.
 - `ProofSink`: wraps each rank's `JsonlSink`. It logs when each line reaches the file, and, on the
   held rank, holds that rank's lines back (released later, or never). The suppression lives here,
   in the driver's own files, never in the SDK. In server mode it also logs, on a thread of its own,
@@ -15,11 +19,13 @@ What is here, in the order the driver uses it:
 - `VerdictLog`: every result object the driver saw (the server's `replica` in `watchdog.json`, or
   the file reader's), kept by launch, group and step, with when each state was first seen. A
   server may bound how many steps it lists, so nothing is judged from the last look alone.
-- `check_result`, `check_history`, `check_no_wait`, `check_latency`, `check_kinds`: the assertions.
-  Each returns a list of failures, empty when it holds; none asserts which rank drifted (D1 is
-  released and not built).
+- `check_result`, `check_history`, `check_no_wait`, `check_latency`, `check_kinds`,
+  `check_attribution`, `check_weights`: the assertions. Each returns a list of failures, empty when
+  it holds. `check_attribution` is section 4a (D1): which rank a planted step names, read from the
+  result's `attribution` key, and a failure saying "attribution not present" when no look carried it.
 - `healthy_signatures`: on how many compared steps with no plant the signatures differed, by
-  parameter. Reported, and failed only with `--healthy-mismatch fail`.
+  parameter. Reported, and failed only with `--healthy-mismatch fail`. Written into `verdict.json`
+  as `healthy_signatures` for the control arm and as `learning_signatures` for the learning arm.
 
 The contract is `REPLICA_OBSERVATION_CONTRACT.md` at the repository root.
 """
@@ -42,7 +48,8 @@ from typing import Any, Callable, Iterable, Mapping
 #
 # `tensorquill.evidence.compare_replicas(records, *, tolerance, attempt_order=None)`: one run's
 # records (`ValueError` for more than one) in, `{"steps", "replica_drift"}` out, with `legacy` when
-# there is one. It gives no `v` and no `tolerance`: those two are added by the server, which carries
+# there is one, and with `attribution` (contract 4a, D1) at the top level when it has an entry: a
+# list, absent when empty. The server carries the same key in its `replica` object. It gives no `v` and no `tolerance`: those two are added by the server, which carries
 # the same lists under `replica` in `watchdog.json` (contract section 8). The driver passes every
 # rank's lines, file by file in line order, which is each rank's attempt order for one local file,
 # so `attempt_order` is not given. A reader that raises is said
@@ -72,6 +79,13 @@ LOUD_KINDS = ("add", "neg", "swap")
 QUIET_KINDS = ("ulp", "negzero")
 KINDS = LOUD_KINDS + QUIET_KINDS
 ZERO_INDEX = -1  # the last element of every parameter; the loud kinds touch elements 0, 1 and 2 only
+
+# The two arms. `control`: lr 0 and every rank's weights reset to one base each step, so a step
+# with no plant compares equal bits (whether equal bits read as equal). `learning`: lr above 0, no
+# reset, no plant, a batch of its own on each rank (DDP averages the gradients), so a step compares
+# weights that training has moved (whether training keeps the replicas bit-equal).
+ARMS = ("control", "learning")
+LEARNING_LR = 0.05
 
 
 @dataclass(frozen=True)
@@ -160,6 +174,40 @@ def reset_and_plant(model: Any, base: Mapping[str, Any], plants: Iterable[Plant]
                 flat[ZERO_INDEX].neg_()
 
 
+def learning_batch(rank: int, step: int, device: Any) -> tuple[Any, Any]:
+    """The learning arm's batch: eight inputs of four, drawn from a generator seeded by the rank
+    and the step (on the CPU, then moved, so every device sees the same numbers), and a target the
+    model can approach, so the loss stays bounded and the gradient does not vanish. Each rank's
+    batch is its own; DDP averages the gradients, so every replica takes the same update."""
+    import torch
+
+    generator = torch.Generator().manual_seed(1_000_003 * (rank + 1) + step)
+    x = torch.randn(8, 4, generator=generator)
+    y = x.sum(dim=1, keepdim=True) * 0.5 + 1.0
+    return x.to(device), y.to(device)
+
+
+def weight_change(model: Any, start: Mapping[str, Any], before: Mapping[str, Any], report: dict) -> dict[str, Any]:
+    """After one learning step: per parameter, whether it differs from its starting value, the
+    largest change from it, whether every value is finite, and on how many steps it changed from
+    the step before (`before`). Returns this step's values, the next call's `before`."""
+    import torch
+
+    now = {}
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            value = param.detach().clone()
+            entry = report.setdefault(name, {"changed_from_start": False, "max_abs_change": 0.0,
+                                             "steps_changed": 0, "finite": True})
+            entry["changed_from_start"] = not torch.equal(value, start[name])
+            entry["max_abs_change"] = float((value - start[name]).abs().max())
+            entry["finite"] = entry["finite"] and bool(torch.isfinite(value).all())
+            if not torch.equal(value, before[name]):
+                entry["steps_changed"] += 1
+            now[name] = value
+    return now
+
+
 # --- Arguments --------------------------------------------------------------------------------
 
 
@@ -192,6 +240,8 @@ class Plan:
     run_id: str | None = None
     final_seconds: float = 60.0
     healthy_mismatch: str = "report"  # "report" or "fail": a step with no plant whose signatures differ
+    arm: str = "control"  # "control" (lr 0, reset each step, the plants) or "learning" (lr above 0, neither)
+    lr: float = 0.0
 
     @property
     def group(self) -> list[int]:
@@ -219,6 +269,11 @@ class Plan:
     def never_judged(self, step: int) -> bool:
         return self.held(step) and self.release == "never"
 
+    @property
+    def summary_key(self) -> str:
+        """Where this arm's count of healthy steps goes in `verdict.json`."""
+        return "learning_signatures" if self.arm == "learning" else "healthy_signatures"
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -240,6 +295,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"plant a divergence (PARAM one of {', '.join(PARAM_NAMES)}; KIND one of {', '.join(KINDS)});"
                         " repeat for more; default: three plants on steps 1, 3 and 5")
     p.add_argument("--no-plants", action="store_true", help="plant nothing: every step must read clean")
+    p.add_argument("--arm", choices=ARMS, default="control",
+                   help="control (the default): lr 0, every rank's weights reset to one base each step, the plants;"
+                        " learning: --lr above 0, no reset, no plant, a batch of its own on each rank, and the run"
+                        " fails unless every rank's weights changed from their start")
+    p.add_argument("--lr", type=float, default=None,
+                   help=f"the learning arm's SGD learning rate (default {LEARNING_LR}); the control arm keeps 0")
     p.add_argument("--healthy-mismatch", choices=("report", "fail"), default="report",
                    help="a step with no plant whose signatures differ: report it in the count (the default: how"
                         " often that happens on healthy steps is what the eight-GPU run measures) or fail the run")
@@ -295,8 +356,16 @@ def validate(argv: list[str] | None, env: Mapping[str, str], cuda_devices: int |
         raise UsageError("--step-seconds, --latency-margin and --wait-slack are 0 or more; --look-seconds above 0")
     if args.no_plants and args.plant:
         raise UsageError("--no-plants and --plant are opposites")
+    if args.arm == "learning" and args.plant:
+        raise UsageError("--arm learning plants nothing: its steps are the healthy ones; plant in the control arm")
+    if args.arm == "control" and args.lr is not None:
+        raise UsageError("--lr is the learning arm's: the control arm keeps lr 0 and resets the weights each step")
+    lr = (LEARNING_LR if args.lr is None else args.lr) if args.arm == "learning" else 0.0
+    if not (lr >= 0 and math.isfinite(lr)):
+        raise UsageError(f"--lr {args.lr} must be a finite number of 0 or more")
     try:
-        plants = [] if args.no_plants else [parse_plant(t) for t in args.plant] if args.plant else default_plants(world)
+        plants = ([] if args.no_plants or args.arm == "learning" else [parse_plant(t) for t in args.plant]
+                  if args.plant else default_plants(world))
     except ValueError as error:
         raise UsageError(str(error)) from None
     scheduled = {s for s in range(args.steps) if (s + 1) % args.replica_every == 0}
@@ -320,7 +389,7 @@ def validate(argv: list[str] | None, env: Mapping[str, str], cuda_devices: int |
         replica_every=args.replica_every, step_seconds=args.step_seconds, plants=plants,
         hold_steps=args.hold_steps, margin=args.latency_margin, wait_slack=args.wait_slack,
         endpoint=args.endpoint, store=args.store, reader=args.reader, cpu=args.cpu, run_id=args.run_id,
-        final_seconds=args.final_seconds, healthy_mismatch=args.healthy_mismatch,
+        final_seconds=args.final_seconds, healthy_mismatch=args.healthy_mismatch, arm=args.arm, lr=lr,
     )
     if args.hold_rank is not None:
         if not 0 <= args.hold_rank < world:
@@ -558,6 +627,21 @@ def _incident_key(incident: Mapping[str, Any]) -> str:
     return json.dumps(incident, sort_keys=True)
 
 
+def _step_key(entry: Mapping[str, Any]) -> tuple:
+    group = entry.get("group")
+    return (entry.get("step"), entry.get("launch"), tuple(group) if isinstance(group, list) else None)
+
+
+def _attribution_key(entry: Mapping[str, Any]) -> tuple:
+    return (*_step_key(entry), entry.get("parameter"), entry.get("by"))
+
+
+def _order(key: tuple) -> tuple:
+    """Section 4a's order (step, launch, group, parameter, by), with a missing value last."""
+    return tuple((value is None, value if isinstance(value, (int, tuple)) and not isinstance(value, bool)
+                  else str(value)) for value in key)
+
+
 @dataclass
 class VerdictLog:
     """Every result object seen, merged: the newest entry per launch, group and step, every
@@ -568,6 +652,11 @@ class VerdictLog:
     looks: int = 0
     last_t: float | None = None
     errors: list[str] = field(default_factory=list)
+    # Section 4a's entries, by (step, launch, group, parameter, by). A look that lists a step
+    # replaces that step's entries; a step it no longer lists keeps them (a server drops a step's
+    # entries with the step). `attribution_seen`: whether any look carried the key at all.
+    attribution: dict[tuple, dict] = field(default_factory=dict)
+    attribution_seen: bool = False
 
     @staticmethod
     def state(entry: Mapping[str, Any]) -> tuple:
@@ -592,9 +681,19 @@ class VerdictLog:
         for incident in result.get("replica_drift") or []:
             if isinstance(incident, Mapping):
                 self.incidents.setdefault(_incident_key(incident), dict(incident))
+        if "attribution" in result:
+            self.attribution_seen = True
+        listed = {_step_key(e) for e in result.get("steps") or [] if isinstance(e, Mapping)}
+        self.attribution = {k: v for k, v in self.attribution.items() if k[:3] not in listed}
+        for entry in result.get("attribution") or []:
+            if isinstance(entry, Mapping):
+                self.attribution[_attribution_key(entry)] = dict(entry)
 
     def as_result(self) -> dict:
-        return {"steps": list(self.entries.values()), "replica_drift": list(self.incidents.values())}
+        out = {"steps": list(self.entries.values()), "replica_drift": list(self.incidents.values())}
+        if self.attribution_seen:
+            out["attribution"] = [self.attribution[k] for k in sorted(self.attribution, key=_order)]
+        return out
 
     def first(self, launch: str, group: list[int], step: int, state: tuple) -> float | None:
         return self.first_seen.get(((launch, tuple(group), step, None), state))
@@ -840,7 +939,8 @@ def check_kinds(records: list[dict], plan: Plan, launch: str | None) -> tuple[li
     the projection; `ulp` keeps all three within the tolerance; `negzero` leaves all three exactly
     equal across ranks; and each of the two bits-only kinds leaves the planted parameter's `sig`
     not the same on every rank. Also prints each rank's fingerprints of the planted parameter, the
-    evidence D1 will count, without naming any rank, and the spreads of a bits-only plant.
+    rows section 4a reads (which rank they name is `check_attribution`'s), and the spreads of a
+    bits-only plant.
     Returns (failures, lines)."""
     failures: list[str] = []
     lines: list[str] = []
@@ -864,7 +964,7 @@ def check_kinds(records: list[dict], plan: Plan, launch: str | None) -> tuple[li
             sigs = {rank: obs["params"][param].get("sig") for rank, obs in by_rank.items()}
             lines.append(f"step {step} {param}: {len(values)} distinct fingerprint(s) and"
                          f" {len(set(sigs.values()))} distinct signature(s) among {len(fps)} ranks"
-                         f" (D1 held: no rank is named) " + "; ".join(f"rank {r} {fps[r]}" for r in sorted(fps)))
+                         f" (the rows section 4a reads) " + "; ".join(f"rank {r} {fps[r]}" for r in sorted(fps)))
             scale = max(1e-12, sum(v[0] for v in fps.values()) / len(fps))
 
             def spread(column: int) -> float:
@@ -875,7 +975,7 @@ def check_kinds(records: list[dict], plan: Plan, launch: str | None) -> tuple[li
 
             norm, total, projection = spread(0), spread(1), spread(2)
             if kinds & set(QUIET_KINDS):
-                lines.append(f"step {step} {param} ({', '.join(sorted(kinds))}; D1 held: no rank is named): spreads"
+                lines.append(f"step {step} {param} ({', '.join(sorted(kinds))}): spreads"
                              f" {norm!r} (norm), {total!r} (sum), {projection!r} (projection), tolerance {TOLERANCE}")
                 if len(set(sigs.values())) < 2:
                     failures.append(f"step {step} {param}: {', '.join(sorted(kinds))} left the signature the same on"
@@ -901,6 +1001,206 @@ def check_kinds(records: list[dict], plan: Plan, launch: str | None) -> tuple[li
     return failures, lines
 
 
+# --- Section 4a (D1): which rank a planted step names -------------------------------------------
+
+
+def _majority_signature(records: list[dict], step: int, param: str, launch: str | None,
+                        group: list[int]) -> tuple[list[int] | None, dict[int, Any]]:
+    """From every rank's record of `step`: the ranks that do not hold the one signature a strict
+    majority holds (section 4a, by signatures), or None when no value is held by more than half;
+    and each rank's signature. Each rank's first record of the step under `launch` is the one
+    compared (section 2: one local file is in attempt order)."""
+    sigs: dict[int, Any] = {}
+    for record in records:
+        replica = record.get("replica")
+        if record.get("step") != step or not isinstance(replica, Mapping) or replica.get("launch") != launch:
+            continue
+        try:
+            sigs.setdefault(record["rank"], replica["params"][param].get("sig"))
+        except (KeyError, TypeError, AttributeError):
+            continue
+    if set(sigs) != set(group):
+        return None, sigs
+    held: dict[str, list[int]] = {}
+    for rank in group:
+        held.setdefault(str(sigs[rank]), []).append(rank)
+    most = max(held.values(), key=len)
+    if 2 * len(most) <= len(group):
+        return None, sigs
+    return sorted(r for r in group if r not in most), sigs
+
+
+def _said(entry: Mapping[str, Any]) -> str:
+    if entry.get("verdict") == "attributed":
+        return f"attributed, outliers {entry.get('outliers')}"
+    return f"{entry.get('verdict')}, why {entry.get('why')}"
+
+
+def check_attribution(result: Mapping[str, Any], plan: Plan, launch: str | None,
+                      records: list[dict]) -> tuple[list[str], list[str]]:
+    """Section 4a (D1), on each planted step that was judged (coverage `complete`), from the
+    result's `attribution` key, never from one rank's record:
+
+    - a plant that moves the fingerprints: one entry by `fingerprints` for each planted parameter.
+      With two ranks, `inconclusive` with why `two_ranks` and no rank named; with three or more and
+      the planted ranks of that parameter a strict minority, `attributed` with `outliers` exactly
+      the planted ranks;
+    - a bits-only plant (`ulp`, `negzero`): no entry by `fingerprints` for the parameter;
+    - for both, one entry by `signatures` for each planted parameter whose signatures differ:
+      with two ranks `two_ranks`; with three or more, `attributed` with the ranks that do not hold
+      the one signature a strict majority of the records hold, which must be the planted ranks, or
+      `inconclusive` with why `no_majority` where no value is held by more than half.
+
+    Anywhere: no entry on a step that is not `complete`; no entry by fingerprints on a parameter
+    that did not drift, nor by signatures on one whose signatures did not differ; each entry
+    spelled as 4a spells it, once. When no look carried the key and an entry is due, one failure
+    says "attribution not present". Returns (failures, lines)."""
+    failures: list[str] = []
+    lines: list[str] = []
+    group = plan.group
+    steps = {e.get("step"): e for e in result.get("steps") or []
+             if isinstance(e, Mapping) and e.get("launch") == launch and e.get("group") == group
+             and e.get("coverage") != "not_established"}
+    present = "attribution" in result
+    entries = [e for e in result.get("attribution") or [] if isinstance(e, Mapping)]
+    by_key: dict[tuple, list[Mapping[str, Any]]] = {}
+    for entry in entries:
+        if entry.get("launch") != launch or entry.get("group") != group:
+            failures.append(f"an attribution entry of another launch or group ({entry.get('launch')!r},"
+                            f" {entry.get('group')}): {dict(entry)}")
+            continue
+        by_key.setdefault((entry.get("step"), entry.get("parameter"), entry.get("by")), []).append(entry)
+    for (step, param, by), found in sorted(by_key.items(), key=lambda kv: _order(kv[0])):
+        entry, said = found[0], steps.get(step) or {}
+        if len(found) > 1:
+            failures.append(f"step {step} {param} by {by}: {len(found)} attribution entries where one is due")
+        if said.get("coverage") != "complete":
+            failures.append(f"step {step}: an attribution entry where coverage is {said.get('coverage')}"
+                            f" (section 4a reads complete steps only): {dict(entry)}")
+            continue
+        if by == "fingerprints" and param not in (said.get("drift_parameters") or []):
+            failures.append(f"step {step}: attribution by fingerprints on {param}, which did not drift: {dict(entry)}")
+        elif by == "signatures" and param not in (said.get("signature_parameters") or []):
+            failures.append(f"step {step}: attribution by signatures on {param}, whose signatures did not differ:"
+                            f" {dict(entry)}")
+        elif by not in ("fingerprints", "signatures"):
+            failures.append(f"step {step}: an attribution entry by {by!r}: {dict(entry)}")
+        verdict = entry.get("verdict")
+        if verdict == "attributed":
+            if not entry.get("outliers") or "why" in entry:
+                failures.append(f"step {step} {param} by {by}: attributed with outliers {entry.get('outliers')!r}"
+                                f" and why {entry.get('why')!r}: {dict(entry)}")
+        elif verdict == "inconclusive":
+            if "outliers" in entry or entry.get("why") not in ("two_ranks", "no_majority", "no_outlier"):
+                failures.append(f"step {step} {param} by {by}: inconclusive must give why (two_ranks, no_majority"
+                                f" or no_outlier) and name no rank: {dict(entry)}")
+        else:
+            failures.append(f"step {step} {param} by {by}: verdict {verdict!r}: {dict(entry)}")
+        if not plan.plants_at(step):
+            lines.append(f"step {step} {param} by {by} (no plant): {_said(entry)}")
+
+    due_steps: list[int] = []
+    for step in sorted({p.step for p in plan.plants}):
+        said = steps.get(step)
+        if plan.never_judged(step) or said is None or said.get("coverage") != "complete":
+            continue  # check_result says what is wrong with a planted step not judged; nothing is due here
+        planted: dict[str, list[int]] = {}
+        quiet: dict[str, bool] = {}
+        for plant in plan.plants_at(step):
+            planted.setdefault(plant.param, []).append(plant.rank)
+            quiet[plant.param] = quiet.get(plant.param, True) and plant.quiet
+        for param in sorted(planted):
+            ranks = sorted(set(planted[param]))
+            minority = 2 * (len(group) - len(ranks)) > len(group)
+            wanted: list[tuple[str, dict | None, str]] = []  # (by, expected, why it is expected)
+            if quiet[param]:
+                if (step, param, "fingerprints") in by_key:
+                    failures.append(f"step {step} {param}: attribution by fingerprints for a bits-only plant, whose"
+                                    f" fingerprints agree: {dict(by_key[(step, param, 'fingerprints')][0])}")
+            elif plan.world == 2:
+                wanted.append(("fingerprints", {"verdict": "inconclusive", "why": "two_ranks"}, "two ranks"))
+            elif minority:
+                wanted.append(("fingerprints", {"verdict": "attributed", "outliers": ranks},
+                               f"planted on rank(s) {ranks}"))
+            else:
+                wanted.append(("fingerprints", None, f"planted on {len(ranks)} of {len(group)} ranks, not a strict"
+                                                     " minority: not asserted"))
+            if param in (said.get("signature_parameters") or []):
+                outliers, _ = _majority_signature(records, step, param, launch, group)
+                if plan.world == 2:
+                    wanted.append(("signatures", {"verdict": "inconclusive", "why": "two_ranks"}, "two ranks"))
+                elif outliers is None:
+                    wanted.append(("signatures", {"verdict": "inconclusive", "why": "no_majority"},
+                                   "no signature is held by more than half of the records"))
+                else:
+                    if minority and outliers != ranks:
+                        failures.append(f"step {step} {param}: the records' signatures set apart rank(s) {outliers},"
+                                        f" not the planted {ranks}")
+                    wanted.append(("signatures", {"verdict": "attributed", "outliers": outliers},
+                                   f"the records' majority signature sets apart rank(s) {outliers}"))
+            for by, expected, why in wanted:
+                due_steps.append(step)
+                found = by_key.get((step, param, by))
+                if not found:
+                    if present:
+                        failures.append(f"step {step} {param} by {by}: no attribution entry, where one is due ({why})")
+                    lines.append(f"step {step} {param} by {by}: attribution not present ({why})")
+                    continue
+                entry = found[0]
+                lines.append(f"step {step} {param} by {by}: {_said(entry)} ({why})")
+                if expected is None:
+                    continue
+                got = {k: entry.get(k) for k in ("verdict", "outliers", "why") if k in entry}
+                if got != expected:
+                    failures.append(f"step {step} {param} by {by}: {_said(expected)} is due ({why}); got {_said(entry)}")
+    if due_steps and not present:
+        failures.append(f"attribution not present: no look of the {'reader ' + plan.reader if plan.mode == 'files' else 'server'}"
+                        f" carried the `attribution` key (contract 4a), where steps {sorted(set(due_steps))} are each"
+                        " due an entry")
+    return failures, lines
+
+
+# --- The learning arm ---------------------------------------------------------------------------
+
+
+def check_weights(reports: Mapping[int, Mapping[str, Any]], plan: Plan) -> list[str]:
+    """The learning arm only: on every rank, every parameter differs from its starting value at
+    the end, and every value stayed finite. A rank that reports no weights fails."""
+    if plan.arm != "learning":
+        return []
+    failures: list[str] = []
+    for rank in plan.group:
+        report = reports.get(rank)
+        if report is None:
+            continue  # check_no_wait says the rank left no report
+        weights = report.get("weights")
+        if not isinstance(weights, Mapping) or set(weights) != set(PARAM_NAMES):
+            failures.append(f"rank {rank} reported no change of its weights (got {weights!r}): the learning arm"
+                            " cannot show that training moved them")
+            continue
+        unchanged = [name for name in PARAM_NAMES if not weights[name].get("changed_from_start")]
+        if unchanged:
+            failures.append(f"rank {rank}: {unchanged} did not change from their starting values with lr {plan.lr};"
+                            " the learning arm compared the same weights it started from")
+        broken = [name for name in PARAM_NAMES if not weights[name].get("finite")]
+        if broken:
+            failures.append(f"rank {rank}: {broken} did not stay finite with lr {plan.lr}")
+    return failures
+
+
+def learning_signatures(result: Mapping[str, Any], plan: Plan, launch: str | None,
+                        reports: Mapping[int, Mapping[str, Any]]) -> dict:
+    """The learning arm's count, apart from the control's: `healthy_signatures`'s keys (every
+    step of this arm has no plant), the learning rate, each rank's weight change by parameter, and
+    the attribution entries by signatures on the steps whose signatures differed (evidence: which
+    rank's bits stood apart, if any)."""
+    healthy = healthy_signatures(result, plan, launch)
+    attribution = [dict(e) for e in result.get("attribution") or []
+                   if isinstance(e, Mapping) and e.get("by") == "signatures" and e.get("launch") == launch]
+    weights = {str(rank): (reports.get(rank) or {}).get("weights") for rank in plan.group}
+    return {**healthy, "lr": plan.lr, "steps": plan.steps, "weights": weights, "attribution": attribution}
+
+
 def check_records(records: list[dict], plan: Plan) -> list[str]:
     """Each rank's own file holds every step it was due to write, each with the loss: every step on
     a rank that reported, the steps before the hold on one that never did."""
@@ -924,9 +1224,10 @@ def healthy_signatures(result: Mapping[str, Any], plan: Plan, launch: str | None
     so 0 of 0 never reads as clean. Whether a difference here is a fault is the question the
     eight-GPU run answers, so it fails the run only with `--healthy-mismatch fail`.
 
-    What it can show: every step resets each rank's weights to one base with `lr=0`, so the count
-    says whether equal bits are read as equal on these devices, not whether training keeps the
-    replicas bit-equal."""
+    What it can show depends on the arm. In the control arm every step resets each rank's weights
+    to one base with `lr=0`, so the count says whether equal bits are read as equal on these
+    devices, not whether training keeps the replicas bit-equal; the learning arm's count, under
+    `learning_signatures`, is the one that says that."""
     clean = [s for s in plan.scheduled if not plan.plants_at(s)]
     entries = {e.get("step"): e for e in result.get("steps") or []
                if isinstance(e, Mapping) and e.get("launch") == launch and e.get("group") == plan.group
@@ -954,8 +1255,24 @@ def healthy_signatures(result: Mapping[str, Any], plan: Plan, launch: str | None
             "not_judged": not_judged, "on_mismatch": plan.healthy_mismatch}
 
 
-def healthy_line(healthy: Mapping[str, Any]) -> str:
+def healthy_line(healthy: Mapping[str, Any], arm: str = "control") -> str:
     by = healthy.get("by_parameter") or {}
+    if arm == "learning":
+        weights = healthy.get("weights") or {}
+        moved = sum(1 for w in weights.values() if isinstance(w, Mapping) and w
+                    and all(v.get("changed_from_start") for v in w.values()))
+        steps_changed = sorted({v.get("steps_changed") for w in weights.values() if isinstance(w, Mapping)
+                                for v in w.values()})
+        named = [f"step {e.get('step')} {e.get('parameter')}: {_said(e)}" for e in healthy.get("attribution") or []]
+        return (f"learning arm (lr {healthy.get('lr')}, no reset, no plant): signatures differed on"
+                f" {healthy.get('signatures_differ')} of {healthy.get('compared')} compared steps"
+                f" ({healthy.get('steps_without_plant')} scheduled; by parameter"
+                f" {', '.join(f'{p} {n}' for p, n in by.items()) or 'none'}; signatures not compared"
+                f" {healthy.get('not_compared') or 'on none'}; never judged {healthy.get('not_judged') or 'none'});"
+                f" {'reported, not failed' if healthy.get('on_mismatch') == 'report' else 'any fails the run'}."
+                f" Weights changed from their start on {moved} of {len(weights)} ranks (steps on which a parameter"
+                f" changed from the step before: {steps_changed} of {healthy.get('steps')});"
+                f" by signatures: {'; '.join(named) or 'no entry'}")
     return (f"healthy steps: signatures differed on {healthy.get('signatures_differ')} of {healthy.get('compared')}"
             f" compared steps with no plant ({healthy.get('steps_without_plant')} scheduled; by parameter"
             f" {', '.join(f'{p} {n}' for p, n in by.items()) or 'none'}; signatures not compared"
@@ -970,15 +1287,29 @@ class Verdict:
     code: int
     lines: list[str]
     failures: list[str]
-    healthy: dict = field(default_factory=dict)  # `healthy_signatures`, written into verdict.json
+    healthy: dict = field(default_factory=dict)  # `healthy_signatures` (control) or `learning_signatures`
+    arm: str = "control"
+
+    def document(self) -> dict:
+        """What `verdict.json` holds: the arm's count under its own key."""
+        key = "learning_signatures" if self.arm == "learning" else "healthy_signatures"
+        return {"code": self.code, "failures": self.failures, "arm": self.arm, key: self.healthy}
 
 
 def evaluate(plan: Plan, log: VerdictLog, seen_while: Mapping[int, int], reports: Mapping[int, Mapping[str, Any]],
              launch: str | None, records: list[dict], reader_found: bool) -> Verdict:
     """Every check, composed once, for the driver and its tests alike: PASS only when each holds;
     NOT PROVEN when the file reader was not found (whatever else held); FAIL otherwise."""
-    lines = [f"{plan.world} ranks, mode {plan.mode}, launch {launch}, group {plan.group},"
+    lines = [f"{plan.world} ranks, mode {plan.mode}, arm {plan.arm}"
+             f"{f' (lr {plan.lr}, no reset)' if plan.arm == 'learning' else ' (lr 0, reset each step)'},"
+             f" launch {launch}, group {plan.group},"
              f" plants: {'; '.join(map(str, plan.plants)) or 'none'}; healthy mismatches: {plan.healthy_mismatch}"]
+
+    def summary(result: Mapping[str, Any]) -> dict:
+        if plan.arm == "learning":
+            return learning_signatures(result, plan, launch, reports)
+        return healthy_signatures(result, plan, launch)
+
     if plan.hold_rank is not None:
         held = reports.get(plan.hold_rank, {})
         lines.append(f"rank {plan.hold_rank} held from step {plan.hold_from} ({plan.release}): held steps"
@@ -986,16 +1317,16 @@ def evaluate(plan: Plan, log: VerdictLog, seen_while: Mapping[int, int], reports
                      f"{' (at its close)' if held.get('released_at_close') else ''}, dropped {held.get('dropped')}"
                      f" records; step {plan.hold_from} still read insufficient while rank 0 trained step"
                      f" {seen_while.get(plan.hold_from)}")
-    failures = check_no_wait(reports, plan) + check_records(records, plan)
+    failures = check_no_wait(reports, plan) + check_records(records, plan) + check_weights(reports, plan)
     if plan.mode == "files" and not reader_found:
         lines += [f"FAIL {f}" for f in failures]
         lines.append(f"NOT PROVEN: the reader {plan.reader} was not found (lane Z2's function; --reader or"
                      f" {READER_ENV} names another). Trained {plan.steps} steps on {len(reports)} of {plan.world}"
                      " ranks; no verdict was read.")
         return Verdict(EXIT_FAIL if failures else EXIT_NOT_PROVEN, lines, failures,
-                       healthy_signatures(log.as_result(), plan, launch))
+                       summary(log.as_result()), plan.arm)
     result = log.as_result()
-    healthy = healthy_signatures(result, plan, launch)
+    healthy = summary(result)
     for entry in sorted(result["steps"], key=lambda e: (e.get("step") is None, e.get("step") or 0)):
         lines.append(f"  step {entry.get('step')}: {entry.get('coverage')}"
                      + (f" missing {entry.get('missing')}" if entry.get("missing") else "")
@@ -1009,20 +1340,22 @@ def evaluate(plan: Plan, log: VerdictLog, seen_while: Mapping[int, int], reports
                               else None, seen_while)
     late, clock_lines = check_latency(log, plan, launch, reports)
     kinds, d1_lines = check_kinds(records, plan, launch)
-    failures += late + kinds
+    attributed, attribution_lines = check_attribution(result, plan, launch, records)
+    failures += late + kinds + attributed
     if log.errors:
         # The reader is given whole lines of one run only, so a raise is the reader's verdict on
         # those records, not a look that came too early: it fails the check, with what it said.
         failures.append(f"the reader {plan.reader} raised at {len(log.errors)} of {log.looks} looks; first:"
                         f" {log.errors[0]}")
     lines += [f"  {line}" for line in clock_lines + d1_lines]
-    lines.append(f"  {healthy_line(healthy)}")
+    lines += [f"  attribution: {line}" for line in attribution_lines]
+    lines.append(f"  {healthy_line(healthy, plan.arm)}")
     lines += [f"  reader error at a look: {error}" for error in log.errors[:5]]
     lines += [f"FAIL {f}" for f in failures]
     if failures:
-        return Verdict(EXIT_FAIL, lines, failures, healthy)
+        return Verdict(EXIT_FAIL, lines, failures, healthy, plan.arm)
     lines.append(f"PASS {plan.mode} on {plan.world} ranks ({log.looks} looks)")
-    return Verdict(EXIT_PASS, lines, failures, healthy)
+    return Verdict(EXIT_PASS, lines, failures, healthy, plan.arm)
 
 
 # --- The observer -----------------------------------------------------------------------------
