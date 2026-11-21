@@ -129,6 +129,37 @@ def _is_wall_clock(name: str) -> bool:
     return not WALL_CLOCK_WORDS.isdisjoint(_WORD_BREAKS.split(name.lower()))
 
 
+def _resolved(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """One rank's step records with the rows a later attempt replaced left out, as `load_records`
+    leaves them out (`evidence.resolve_attempts`), in the order given (lane AC4, Nov 20, 2026).
+
+    Only a run ID whose attempts' step ranges overlap is resolved: rows resolved already, in any
+    order of their attempts, never overlap, and are read as they are. That keeps a second
+    resolution from changing them: `compare` resolves a rank's several files in the attempts' own
+    order (`resolve_attempts_across`), which the rows alone do not show, and resolving its rows
+    again by first appearance can take the original attempt for the later one and drop the whole
+    restart. The same rule leaves raw rows whose attempts do not overlap as they are, though
+    `load_records` would drop an attempt that appears first wholly above a later one.
+    """
+    from .evidence import _run_of, resolve_attempts
+
+    ranges: dict[str, dict[Any, list[int]]] = {}
+    for row in rows:
+        step = int(row["step"])
+        span = ranges.setdefault(_run_of(row), {}).setdefault(row.get("attempt", 0), [step, step])
+        span[0], span[1] = min(span[0], step), max(span[1], step)
+
+    def overlap(spans: Iterable[list[int]]) -> bool:
+        ordered = sorted(spans)
+        return any(later[0] <= earlier[1] for earlier, later in zip(ordered, ordered[1:]))
+
+    runs = {run for run, attempts in ranges.items() if overlap(attempts.values())}
+    if not runs:
+        return rows
+    kept = {id(row) for row in resolve_attempts([row for row in rows if _run_of(row) in runs])}  # type: ignore[arg-type]
+    return [row for row in rows if _run_of(row) not in runs or id(row) in kept]
+
+
 class _Run:
     """One rank's series of one run: `series[id][step] = value`."""
 
@@ -142,11 +173,16 @@ class _Run:
         self.wall_clock: set[str] = set()
         self.not_compared: set[str] = set()
         self.records = 0
+        own: list[Mapping[str, Any]] = []
         for record in records:
             record_rank = record.get("rank", 0)
             self.ranks_seen.add(record_rank)
             if record_rank != rank or record.get("step") is None:
                 continue
+            own.append(record)
+        kept = _resolved(own)
+        self.replaced = len(own) - len(kept)
+        for record in kept:
             self.records += 1
             if record.get("run_id") not in self.run_ids:
                 self.run_ids.append(record.get("run_id"))
@@ -211,6 +247,8 @@ class _Run:
             "records": self.records,
             "first_step": min(self.steps) if self.steps else None,
             "last_step": max(self.steps) if self.steps else None,
+            # Only when rows were left out, so a result on resolved rows is as it was.
+            **({"replaced_records": self.replaced} if self.replaced else {}),
         }
 
 
@@ -387,11 +425,18 @@ def first_divergence(
 ) -> dict[str, Any]:
     """The first step, and the series, where run B leaves its early agreement with run A.
 
-    `records_a` and `records_b` are two runs' step records as `load_records` returns them. One
-    rank's records are read (`rank`, named in the result). Compared: every logged scalar that is
-    not a wall-clock reading, the total gradient norm, each parameter's gradient norm and weight
-    norm, each captured module's activation statistics, and each MoE router's largest expert
-    share and share of experts with no tokens.
+    `records_a` and `records_b` are two runs' step records: as `load_records` returns them, or
+    raw, every attempt that was written (`load_records(..., all_attempts=True)`, or a capture's
+    rows read as they are). One rank's records are read (`rank`, named in the result), and each
+    run's attempts of that rank are resolved first as `load_records` resolves them: the rows a
+    later attempt replaced (a job that resumed from an earlier checkpoint rolled them back) are
+    left out and not read as the run's (lane AC4, Nov 20, 2026). Rows resolved already are read
+    as they are: only a run ID whose attempts' step ranges overlap is resolved, so resolving
+    again changes nothing. Rows with no step are not step records and are skipped.
+
+    Compared: every logged scalar that is not a wall-clock reading, the total gradient norm,
+    each parameter's gradient norm and weight norm, each captured module's activation
+    statistics, and each MoE router's largest expert share and share of experts with no tokens.
 
     The result is plain data, ready for `json.dumps(..., allow_nan=False)`:
 
@@ -404,6 +449,8 @@ def first_divergence(
     - `series`: for each series, what was compared, on how many common steps, and how it ended.
     - `not_comparable`: series in one run only, too short, or not agreeing early, each with why.
     - `thresholds`, `rank`, `runs`, `common_steps`, `early`, `agreement`, `left_out`.
+    - `runs.a` / `runs.b` hold `replaced_records`, the rows of that rank a later attempt
+      replaced and that were left out, only when there were some.
     """
     a, b = _Run(records_a, rank), _Run(records_b, rank)
     common = sorted(a.steps & b.steps)
