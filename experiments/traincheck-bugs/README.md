@@ -111,6 +111,7 @@ Because `activation_drift` fires on almost every small run that learns, it never
   - The guide ("after the model is on its device and before `torch.compile`") allows both.
 - **`init` raises when Dynamo traces it** (B8).
 - **`resume_incomplete` does not compare a checkpoint's model tensors with the model** (B14).
+  - **Fixed since (Nov 21, 2026, wave AC):** at `session.checkpoint(state, event="load")` the checkpoint's tensor names are compared with the model's (`CHECKPOINT_TENSOR_CONTRACT.md`). `b14_tf29903.py` was run again in its two default configurations on the merged tree: the buggy run raises `resume_incomplete` at step 100 with the finding `missing_tensors` naming `lstm.bias_hh_l0` and `lstm.weight_hh_l0` (4 of the model's 6 tensors matched), from the Python detectors and from the server alike, and the healthy run raises none (6 of 6 matched). The two `--checkpoint minimal` configurations were not run again. `RESULTS.md`, `results.json` and the B14 row of the table above were not rewritten, so they still show the result measured before the fix.
 - **The batch hash is over indices**, so identical content from different indices is not seen (B6).
 - **`grad_spike` does not see a steady climb** of the gradient norm (B4).
 - **`replica_drift` at its default interval** sees a desync up to 49 steps after it starts. TrainCheck's paper reports one iteration. With `replica_every=1` it is step 0 (B10) or 1 (B3), at a cost not measured here.
