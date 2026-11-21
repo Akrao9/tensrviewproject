@@ -65,7 +65,7 @@ def test_a_new_case_states_a_target_in_the_pages_words(name, body):
     assert set(body) - {"today"} == {"section", "status", "says", "given", "expected"}
     allowed = {"incident_kinds_present", "incident_kinds_absent", "incident_kind_one_of", "kind_values", "not_checked",
                "run_state", "status", "words", "words_absent", "incident_carries", "incident_lacks", "findings",
-               "records_carry", "records_lack", "records", "evidence_carries", "evidence_lacks"}
+               "records_carry", "records_lack", "records", "evidence_carries", "evidence_lacks", "counters_at_end"}
     assert set(body["expected"]) <= allowed, set(body["expected"]) - allowed
     for kind in (*body["expected"].get("incident_kinds_present", ()), *body["expected"].get("incident_kinds_absent", ()),
                  *body["expected"].get("incident_kind_one_of", ()), *body["expected"].get("kind_values", {})):
