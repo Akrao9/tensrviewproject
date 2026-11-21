@@ -31,19 +31,39 @@ in the driver's own sink (`replica_proof.ProofSink`), never in the SDK:
 - `--release never` (a rank that never reports): the steps stay `insufficient` naming R, nothing is
   raised for them, and training runs to its end on every rank.
 
-Which rank drifted is printed as evidence and not asserted: D1 is released and not built. With two
-ranks the default plants are two ranks that disagree; with three or more, one outlier among the rest.
+Which rank a planted step names (contract section 4a, D1), from the result's `attribution` key: in
+files mode the top-level key of what `tensorquill.evidence:compare_replicas` returns, in server mode
+the same key in the `replica` object of `watchdog.json`. With two ranks the default plants are two
+ranks that disagree, and every entry of a planted parameter must read `inconclusive`, why
+`two_ranks`, naming no rank; with three or more, one outlier among the rest, and the entry by
+fingerprints must be `attributed` with `outliers` exactly the planted rank. The two bits-only
+plants have no entry by fingerprints; their entry by signatures (as every planted parameter's whose
+signatures differ) names the ranks apart from the one signature a strict majority holds, which must
+be the planted rank, or reads `no_majority`. When no look carried the key and an entry is due, the
+run fails saying "attribution not present"; it never passes for want of the key.
 
-At the end rank 0 prints, and writes into `verdict.json` under `healthy_signatures`, how many
-compared steps had no plant and on how many of those the signatures differed, by parameter. That
-is reported, not failed, unless `--healthy-mismatch fail`: how often it happens on healthy steps is
-what the eight-GPU run measures. Every step resets the weights to one base with `lr=0`, so the count
-says whether equal bits read as equal on those devices, not whether training keeps them equal.
+Two arms (`--arm`):
+
+- `control`, the default: SGD with `lr=0`; every step resets every rank's weights to one base, then
+  plants. At the end rank 0 prints, and writes into `verdict.json` under `healthy_signatures`, how
+  many compared steps had no plant and on how many of those the signatures differed, by parameter.
+  That count says whether equal bits read as equal on those devices, not whether training keeps
+  them equal.
+- `learning`: SGD with `--lr` (default 0.05), no reset and no plant; each rank trains on a batch of
+  its own and DDP averages the gradients. Every rank checks that each parameter changed from its
+  starting value, and the run fails if one did not or turned not finite. The same count, with the
+  learning rate, each rank's weight change and the attribution entries by signatures, goes into
+  `verdict.json` under `learning_signatures`, apart from the control's.
+
+Either count is reported, not failed, unless `--healthy-mismatch fail`: how often signatures differ
+on healthy steps is what the eight-GPU run measures.
 
 Exit status: 0 PASS, 1 FAIL, 2 bad arguments, 3 NOT PROVEN (the reader could not be found).
 
     python -m torch.distributed.run --nproc-per-node=3 --master-addr 127.0.0.1 --master-port 29531 \\
         examples/replica_check.py --cpu --out runs/replica
+    python -m torch.distributed.run --nproc-per-node=3 --master-addr 127.0.0.1 --master-port 29532 \\
+        examples/replica_check.py --cpu --out runs/replica --arm learning --steps 40
 """
 
 from __future__ import annotations
@@ -167,10 +187,13 @@ def main(argv: list[str] | None = None) -> int:
             return proof.EXIT_USAGE
         model = proof.build_model(device)
         base = proof.base_values(model)
-        proof.reset_and_plant(model, base, ())
+        proof.reset_and_plant(model, base, ())  # both arms start from one base on every rank
         ddp = DDP(model, device_ids=device_ids)
-        optimizer = torch.optim.SGD(ddp.parameters(), lr=0)
+        learning = plan.arm == "learning"
+        optimizer = torch.optim.SGD(ddp.parameters(), lr=plan.lr)
         x = torch.ones(2, 4, device=device)
+        weights: dict = {}  # the learning arm's change of each parameter, by `proof.weight_change`
+        before = {name: value.clone() for name, value in base.items()}
 
         records_file = proof.rank_file(work, run_id, rank)
         progress = proof.Progress()
@@ -194,11 +217,18 @@ def main(argv: list[str] | None = None) -> int:
             for step in range(plan.steps):
                 started = time.perf_counter()
                 optimizer.zero_grad(set_to_none=True)
-                loss = ddp(x).sum()
+                if learning:
+                    inputs, target = proof.learning_batch(rank, step, device)
+                    loss = torch.nn.functional.mse_loss(ddp(inputs), target)
+                else:
+                    loss = ddp(x).sum()
                 loss.backward()
                 session.log({"train/loss": loss})
                 optimizer.step()
-                proof.reset_and_plant(model, base, plan.plants_at(step, rank))
+                if learning:
+                    before = proof.weight_change(model, base, before, weights)
+                else:
+                    proof.reset_and_plant(model, base, plan.plants_at(step, rank))
                 session.step(step)
                 if plan.step_seconds:
                     time.sleep(plan.step_seconds)
@@ -206,8 +236,10 @@ def main(argv: list[str] | None = None) -> int:
                 progress.step = step
         sink.stop()
         _fingerprint_time(model, device, rank)
-        _write_json(work / f"done.rank{rank}.json",
-                    {"rank": rank, "steps_done": len(durations), "durations": durations, **sink.report()})
+        done = {"rank": rank, "steps_done": len(durations), "durations": durations, **sink.report()}
+        if learning:
+            done["weights"] = weights
+        _write_json(work / f"done.rank{rank}.json", done)
         if rank != 0:
             print(f"rank {rank}: trained {len(durations)} steps; rank 0 reads the verdict")
             return proof.EXIT_PASS
@@ -233,8 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"run {run_id}:")
         for line in verdict.lines:
             print(line)
-        _write_json(work / "verdict.json", {"code": verdict.code, "failures": verdict.failures,
-                                            "healthy_signatures": verdict.healthy})
+        _write_json(work / "verdict.json", verdict.document())
         return verdict.code
     finally:
         dist.destroy_process_group()

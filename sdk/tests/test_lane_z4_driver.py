@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
 import replica_proof as proof  # noqa: E402
 from tensorquill.flight import offset_path, write_offset  # noqa: E402
 from tensorquill.sink import JsonlSink  # noqa: E402
+from test_replica_attribution_contract import attribution  # noqa: E402
 from test_replica_contract import CASES, reference  # noqa: E402
 
 LAUNCH = "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47"
@@ -331,7 +332,8 @@ def test_check_kinds_reads_every_rank_and_names_no_rank():
     records = _records(plan)
     failures, lines = proof.check_kinds(records, plan, LAUNCH)
     assert failures == []
-    assert all("D1 held" in line for line in lines)
+    # Which rank a step names is check_attribution's (lane AB4); these lines name none.
+    assert all("the rows section 4a reads" in line for line in lines if "distinct fingerprint" in line)
     assert not any("outlier" in line or "drifted" in line for line in lines)
     # A swap that also moved the sum, or an add that kept the norm, is not what was planted.
     for step, column in ((5, 1), (1, 0)):
@@ -481,7 +483,7 @@ def _passing(world: int = 3):
     plan = _plan(world, "--steps", "8")
     records = _records(plan)
     log = proof.VerdictLog()
-    log.add(100.5, reference(records, 1e-6))
+    log.add(100.5, _stand_in_compare_replicas(records))
     reports = {r: {"rank": r, "steps_done": 8, "durations": [0.2] * 8,
                    "written": [{"step": s, "end": 10 * (s + 1), "t": 100.0, "replica": True} for s in range(8)],
                    "offsets": []} for r in plan.group}
@@ -540,12 +542,18 @@ def test_the_default_reader_is_lane_z2s_compare_replicas():
 
 def _stand_in_compare_replicas(records, *, tolerance=1e-6, attempt_order=None):
     """`tensorquill.evidence.compare_replicas`'s signature and return shape, with the reference
-    reading inside: ValueError for records of more than one run; otherwise `steps` and
+    readings inside: ValueError for records of more than one run; otherwise `steps` and
     `replica_drift`, with `legacy` when there is one, and no `v` or `tolerance` (those two are the
-    server's, in `watchdog.json`). test_lane_aa6_driver.py holds it equal to the real one."""
+    server's, in `watchdog.json`); and, since lane AB4, section 4a's `attribution` when it has an
+    entry, from `test_replica_attribution_contract.attribution`, as the reader gives it once lane AB1
+    builds D1. test_lane_aa6_driver.py holds it equal to the real one (red until that merge)."""
     if len({r.get("run_id") for r in records}) > 1:
         raise ValueError("records of more than one run")
-    return reference(list(records), tolerance)
+    out = reference(list(records), tolerance)
+    entries = attribution(list(records), tolerance)
+    if entries:
+        out["attribution"] = entries
+    return out
 
 
 def _look_with(reader, tmp_path: Path, records: list[dict]) -> proof.Observer:
@@ -747,7 +755,8 @@ class FakeServer:
         if self.acked:
             scratch = self.status.with_name("w.tmp")
             scratch.write_text(json.dumps({"schema_version": 1, "ranks": [],
-                                           "replica": {"v": 1, "tolerance": 1e-6, **reference(self.acked, 1e-6)}}))
+                                           "replica": {"v": 1, "tolerance": 1e-6,
+                                                       **_stand_in_compare_replicas(self.acked)}}))
             os.replace(scratch, self.status)
         acked = []
         for rank in range(self.world):
@@ -796,7 +805,7 @@ def _simulate(tmp_path: Path, plan: proof.Plan, *, hold: bool = True, block_on_h
             JsonlSink(path), hold_from=plan.hold_from if held else None, never=plan.release == "never",
             release_file=work / "release", progress=progress,
             offsets=offset_path(path) if plan.mode == "server" else None, poll=0.002)
-    reader = (lambda records: reference(records, 1e-6)) if plan.mode == "files" else None
+    reader = _stand_in_compare_replicas if plan.mode == "files" else None
     observer = proof.Observer(plan, work, run_id, progress, lambda: sinks[0].launch, reader)
     durations = {rank: [] for rank in plan.group}
     server = (FakeServer(work, plan.store, run_id, plan.world, server_interval or plan.interval)
@@ -839,6 +848,7 @@ def _simulate(tmp_path: Path, plan: proof.Plan, *, hold: bool = True, block_on_h
         "latency": latency, "lines": lines,
         "kinds": proof.check_kinds(records, plan, launch)[0],
         "records": proof.check_records(records, plan),
+        "attribution": proof.check_attribution(observer.log.as_result(), plan, launch, records)[0],
         # what the driver itself prints and exits with, from the same inputs
         "verdict": proof.evaluate(plan, observer.log, observer.seen_while, reports, launch, records,
                                   reader_found=plan.mode == "server" or reader is not None),
@@ -858,7 +868,8 @@ def _sim_plan(world: int, mode: str, release: str, tmp_path: Path) -> proof.Plan
 
 
 def _failures(outcome: dict) -> list[str]:
-    failures = [f for key in ("result", "history", "no_wait", "latency", "kinds", "records") for f in outcome[key]]
+    failures = [f for key in ("result", "history", "no_wait", "latency", "kinds", "records", "attribution")
+                for f in outcome[key]]
     verdict = outcome["verdict"]
     assert (verdict.code == proof.EXIT_PASS) == (not failures), verdict.lines
     assert sorted(verdict.failures) == sorted(failures), verdict.lines
