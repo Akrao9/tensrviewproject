@@ -1837,16 +1837,18 @@
   "a_caller_skip_of_unknown_scaler_outcome_inside_scaler_skips": {
    "section": 1,
    "status": "new",
-   "says": "Two applied steps, five skips the scaler reported, one only the caller reported with the scaler's outcome unknown, five more the scaler reported. The streak is left as it is across the caller's skip and reaches ten at the last step.",
+   "says": "Five skips the scaler reported, one only the caller reported with the scaler's outcome unknown, five more the scaler reported. The streak is left as it is across the caller's skip and reaches ten at the last step: 10 recorded, 10 skipped, a streak of 10.",
    "given": {
     "records": [
      {
       "step": 0,
-      "step_skipped": false
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
      },
      {
       "step": 1,
-      "step_skipped": false
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
      },
      {
       "step": 2,
@@ -1866,7 +1868,7 @@
      {
       "step": 5,
       "step_skipped": true,
-      "step_skipped_by": "scaler"
+      "step_skipped_by": "caller"
      },
      {
       "step": 6,
@@ -1876,7 +1878,7 @@
      {
       "step": 7,
       "step_skipped": true,
-      "step_skipped_by": "caller"
+      "step_skipped_by": "scaler"
      },
      {
       "step": 8,
@@ -1890,16 +1892,6 @@
      },
      {
       "step": 10,
-      "step_skipped": true,
-      "step_skipped_by": "scaler"
-     },
-     {
-      "step": 11,
-      "step_skipped": true,
-      "step_skipped_by": "scaler"
-     },
-     {
-      "step": 12,
       "step_skipped": true,
       "step_skipped_by": "scaler"
      }
@@ -1910,35 +1902,42 @@
      "loss_scale_trouble"
     ],
     "incident_carries": {
-     "step": 12,
+     "step": 10,
      "reason": "skips",
      "consecutive_skips": 10,
      "skipped_steps": 10,
-     "recorded_steps": 12
+     "recorded_steps": 10
+    },
+    "counters_at_end": {
+     "recorded_steps": 10,
+     "skipped_steps": 10,
+     "streak": 10
     }
    },
    "today": {
     "detector": "detect_loss_scale_trouble",
     "fires": true,
     "kind": "loss_scale_trouble",
-    "step": 11,
+    "step": 9,
     "skipped_steps": 11,
-    "recorded_steps": 13
+    "recorded_steps": 11
    }
   },
   "a_caller_skip_the_scaler_applied_inside_scaler_skips": {
    "section": 1,
    "status": "new",
-   "says": "The same steps, but the SDK observed the scaler apply the update the caller reported as skipped. The streak ends at five there, and five more do not raise the rule.",
+   "says": "The same steps, but the SDK observed the scaler apply the update the caller reported as skipped. The streak ends at five there, and five more do not raise the rule: 11 recorded, 10 skipped, a streak of 5.",
    "given": {
     "records": [
      {
       "step": 0,
-      "step_skipped": false
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
      },
      {
       "step": 1,
-      "step_skipped": false
+      "step_skipped": true,
+      "step_skipped_by": "scaler"
      },
      {
       "step": 2,
@@ -1958,7 +1957,8 @@
      {
       "step": 5,
       "step_skipped": true,
-      "step_skipped_by": "scaler"
+      "step_skipped_by": "caller",
+      "scaler_applied": true
      },
      {
       "step": 6,
@@ -1968,8 +1968,7 @@
      {
       "step": 7,
       "step_skipped": true,
-      "step_skipped_by": "caller",
-      "scaler_applied": true
+      "step_skipped_by": "scaler"
      },
      {
       "step": 8,
@@ -1985,35 +1984,30 @@
       "step": 10,
       "step_skipped": true,
       "step_skipped_by": "scaler"
-     },
-     {
-      "step": 11,
-      "step_skipped": true,
-      "step_skipped_by": "scaler"
-     },
-     {
-      "step": 12,
-      "step_skipped": true,
-      "step_skipped_by": "scaler"
      }
     ]
    },
    "expected": {
     "incident_kinds_absent": [
      "loss_scale_trouble"
-    ]
+    ],
+    "counters_at_end": {
+     "recorded_steps": 11,
+     "skipped_steps": 10,
+     "streak": 5
+    }
    },
    "today": {
     "detector": "detect_loss_scale_trouble",
     "fires": true,
     "kind": "loss_scale_trouble",
-    "step": 11
+    "step": 9
    }
   },
   "ten_scaler_skips_after_a_caller_skip_the_scaler_applied": {
    "section": 1,
    "status": "new",
-   "says": "Awaiting the author for one count. Two applied steps, five scaler skips, a caller's skip the scaler was seen to apply, then ten scaler skips. Raised at the last step with ten in a row; the caller's skip adds no skip and counts as a recorded observation of the scaler.",
+   "says": "Two applied steps, five scaler skips, a caller's skip the scaler was seen to apply, then ten scaler skips. Raised at the last step with ten in a row; the caller's skip adds no skip and counts as a recorded observation of the scaler.",
    "given": {
     "records": [
      {
