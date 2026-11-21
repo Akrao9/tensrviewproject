@@ -331,6 +331,25 @@ def skipped_by(record: Mapping[str, Any]) -> str | None:
     return by if by in SKIPPED_BY else "scaler"
 
 
+def partial_step(record: Mapping[str, Any]) -> bool:
+    """Whether a record is a step on which the scaler skipped some optimizers and applied others
+    (WAVE_AE_CONTRACT.md, section 4): a skip the scaler confirmed (`skipped_by` `scaler` or
+    `both`) whose `step_skipped_part` is `{"skipped": n, "of": m}`, two whole numbers with
+    0 < n < m. The key is the scaler's verdict, so on a skip only the caller reported, and on an
+    applied step, it says nothing; a key that states no mixed outcome (every optimizer skipped,
+    none, or not two counts) leaves the record a full skip."""
+    if skipped_by(record) not in ("scaler", "both"):
+        return False
+    part = record.get("step_skipped_part")
+    if not isinstance(part, Mapping):
+        return False
+    skipped, of = part.get("skipped"), part.get("of")
+    return type(skipped) is int and type(of) is int and 0 < skipped < of
+
+
+PARTIAL_STEP_WORDS = "{n} step(s) on which the scaler skipped some optimizers and applied others"
+
+
 def _median(values: list[float]) -> float:
     ordered = sorted(values)
     mid = len(ordered) // 2
@@ -613,11 +632,69 @@ def detect_update_spikes(
     record before, largest first, so the incident says where the jump is. `lr` and `lr_before`
     are the learning rates of the flagged record and of the record it was compared with, each
     only when that record carries `lr`.
+
+    Separately clipped groups (WAVE_AE_CONTRACT.md, section 1): a pair whose totals would be
+    split by parameter (`_split_totals`) is not compared when either record says it was clipped
+    by more than one `clip_grad_norm_` call (`clip_calls`, `_clip_calls`), since the split
+    assumes one call scaled every gradient by one factor. Nothing is flagged on it, its change
+    joins no baseline, and its later record is still the record the next is compared with. A
+    pair that needs no split is compared as before, whatever its `clip_calls`. The pairs not
+    compared are said by `update_spike_not_checked`.
     """
+    return _update_spikes_judged(records, window=window, alpha=alpha)[0]
+
+
+def _clip_calls(record: Mapping[str, Any]) -> int | None:
+    """A record's `clip_calls` (WAVE_AE_CONTRACT.md, section 1): the number of `clip_grad_norm_`
+    calls of its step when that is a whole number above 1, else None. An absent key means one
+    call, or a count that is not known (under `torch.compile`, or a capture written before the
+    key); a value that is not a whole number above 1 (1, text, a fraction, a boolean, and a float
+    such as 2.0, which the capture never writes) is read as no key."""
+    calls = record.get("clip_calls")
+    return calls if type(calls) is int and calls > 1 else None
+
+
+CLIP_GROUPS_REASON = (
+    "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter,"
+    " so {n} comparison(s) of update_spike were not made"
+)
+# With no pair compared (WAVE_AE_CONTRACT.md, section 1, the author's second word): "the reader must
+# make clear that zero were judged".
+CLIP_GROUPS_NONE_REASON = (
+    "clipped by more than one clip_grad_norm_ call: the pre-clipping total cannot be split by parameter,"
+    " so none of the {n} comparison(s) of update_spike was made, and no pair was judged"
+)
+
+
+def update_spike_not_checked(not_compared: Mapping[str, int] | None) -> dict[str, Any] | None:
+    """The `clip_groups` entry of `not_checked` (WAVE_AE_CONTRACT.md, section 1), from what
+    `_update_spikes_judged` gives as its second value: `comparisons` the pairs of `update_spike`
+    that were not made because either record was clipped by more than one call and the pair
+    needed a per-parameter split, `compared` the pairs that were made (those in the first
+    `window`, which are not judged, among them), and `step` the later record of the first pair
+    not made. None when every pair was made. While `compared` is above zero `update_spike` stays
+    `checked` (`_PARTIAL_CHECKS`); at zero it reads `unavailable` with this entry's reason, which
+    then says that none was made."""
+    if not not_compared:
+        return None
+    count, compared = int(not_compared["comparisons"]), int(not_compared["compared"])
+    reason = (CLIP_GROUPS_REASON if compared else CLIP_GROUPS_NONE_REASON).format(n=count)
+    return {"check": "clip_groups", "kinds": ["update_spike"], "comparisons": count, "compared": compared,
+            "step": int(not_compared["step"]), "reason": reason}
+
+
+def _update_spikes_judged(
+    records: list[dict[str, Any]], *, window: int = UPDATE_WINDOW, alpha: float = UPDATE_ALPHA
+) -> tuple[dict[str, Any] | None, dict[str, int] | None]:
+    """`detect_update_spikes`'s incident, and the pairs it did not compare because a split total
+    met more than one clip call: `{"comparisons", "step", "compared"}`, with `compared` the pairs
+    it did compare, or None when every pair was compared."""
     key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
     # attempt, total, each parameter's update size, each parameter's gradient norm (or None), the
-    # learning rates the record carries (or None)
-    before: tuple[Any, float, dict[str, float], Mapping[str, Any] | None, list[float] | None] | None = None
+    # learning rates the record carries (or None), its clip calls above 1 (or None)
+    before: tuple[Any, float, dict[str, float], Mapping[str, Any] | None, list[float] | None, int | None] | None = None
+    not_compared: dict[str, int] | None = None
+    compared = 0  # the pairs compared, judged or among the first `window`
     recent: deque[float] = deque(maxlen=window)  # the last `window` changes that were not flagged
     first: dict[str, Any] | None = None
     spike_count, spikes = 0, []  # every flagged record counted; the first 20 kept (lane AD11)
@@ -639,9 +716,18 @@ def detect_update_spikes(
         # and their change joins no baseline. The gradient totals are taken over the parameters
         # both name too (`_shared_totals`).
         shared = [name for name in own if name in before[2]] if before is not None and before[0] == attempt else []
-        if shared:
+        calls = _clip_calls(record)
+        split = _split_totals(total, grads, before[1], before[3]) if shared else None
+        if shared and split is not None and (calls is not None or before[5] is not None):
+            # The split assumes one clip call scaled every gradient by one factor (WAVE_AE_CONTRACT.md,
+            # section 1): with more than one the pair is not compared, and its change joins no baseline.
+            if not_compared is None:
+                not_compared = {"comparisons": 0, "step": int(record["step"])}
+            not_compared["comparisons"] += 1
+        elif shared:
+            compared += 1
             largest, was = max(own[name] for name in shared), max(before[2][name] for name in shared)
-            now, then = _shared_totals(total, grads, before[1], before[3])
+            now, then = split if split is not None else (total, before[1])
             change, rise = abs(largest - was), max(0.0, now - then)
             if len(recent) < window:
                 recent.append(change)
@@ -673,10 +759,12 @@ def detect_update_spikes(
                             **({"lr": lr} if lr is not None else {}),
                             **({"lr_before": lr_before} if lr_before is not None else {}),
                         }
-        before = (attempt, total, own, grads, _lr_list(record))
+        before = (attempt, total, own, grads, _lr_list(record), calls)
+    if not_compared is not None:
+        not_compared["compared"] = compared
     if first is None:
-        return None
-    return {"kind": "update_spike", **first, "spike_count": spike_count, "spike_steps": spikes}
+        return None, not_compared
+    return {"kind": "update_spike", **first, "spike_count": spike_count, "spike_steps": spikes}, not_compared
 
 
 def _lr_list(record: Mapping[str, Any]) -> list[float] | None:
@@ -703,17 +791,27 @@ def _shared_totals(
     parameters never change is judged otherwise), and when they cannot be split: a record
     without `grad_norms`, a norm there that is not a finite number, no shared parameter, or a
     record whose norms are all 0. The server's rule is the same (`shared_totals`, detect.rs)."""
+    split = _split_totals(total, grads, before, grads_before)
+    return (total, before) if split is None else split
+
+
+def _split_totals(
+    total: float, grads: Mapping[str, Any] | None, before: float, grads_before: Mapping[str, Any] | None
+) -> tuple[float, float] | None:
+    """`_shared_totals` when it splits the totals by parameter, and None when it uses them whole.
+    A split is a split whatever its factor, 1 included (a parameter whose norm is 0): whether the
+    pair needs one is read from the records' `grad_norms`, not from the numbers it gives."""
     if grads is None or grads_before is None or grads.keys() == grads_before.keys():
-        return total, before
+        return None
     shared = [name for name in grads if name in grads_before]
     sides = []
     for side, norms in ((total, grads), (before, grads_before)):
         values = [_finite(v) for v in norms.values()]
         if not shared or any(v is None for v in values):
-            return total, before
+            return None
         whole = math.fsum(v * v for v in values)
         if whole <= 0:
-            return total, before
+            return None
         part = math.fsum(norm * norm for norm in (_finite(norms[name]) for name in shared))
         sides.append(side * math.sqrt(part / whole))
     return sides[0], sides[1]
@@ -1573,8 +1671,20 @@ def detect_stalled_weights(
     A row whose total gradient norm is not finite adds nothing to a streak (mixed-precision
     loss scaling skips those optimizer steps on purpose) but its resets apply. A skipped
     update (`step_skipped`), whoever reported it, is read the same way: the weights were not
-    meant to move (STEP_AND_EVIDENCE_CONTRACT.md, section 1): a streak carries across it. A
-    row without the list is no weight check, and every streak holds.
+    meant to move (STEP_AND_EVIDENCE_CONTRACT.md, section 1): a streak carries across it. So is
+    a step on which the scaler skipped some optimizers and applied others (`step_skipped_part`,
+    WAVE_AE_CONTRACT.md, section 4): the record does not say whose update was applied. Within
+    one attempt a row without the list is no weight check, and every streak holds across it.
+
+    A resume starts every streak again (WAVE_AE_CONTRACT.md, section 2, amending contract 2 on
+    the author's word): over the records in step order, when a record's attempt differs from the
+    attempt of the record before it (a record without `attempt` is of attempt 0), every
+    parameter's streak is set to zero before that record is read, whether or not it carries the
+    list. A process's first weight check compares nothing and carries no list: it is the new
+    attempt's baseline, in the author's words, and the checks after it count. Only the streaks start
+    again: which parameters were seen changing and which were already reported are kept, so a
+    stall raised before the resume stands with its step. A parameter stalled right through a
+    resume is reported up to three checks later.
 
     There is one incident, dated at the first step any parameter stalled; `step`,
     `parameters`, `stalled` and `optimizer` describe that first onset. Every parameter is
@@ -1605,7 +1715,14 @@ def detect_stalled_weights(
     first: dict[str, Any] | None = None
     stalled_steps = 0
     onset_steps = 0
-    for record in sorted(records, key=lambda r: r["step"]):
+    attempt_before: Any = None
+    for index, record in enumerate(sorted(records, key=lambda r: r["step"])):
+        attempt = record.get("attempt", 0)
+        if index and attempt != attempt_before:
+            # A new attempt: every streak starts again; what was seen changing and reported is kept.
+            for name in streak:
+                streak[name] = 0
+        attempt_before = attempt
         unchanged = record.get("weights_unchanged")
         if unchanged is None:
             continue
@@ -1963,7 +2080,13 @@ def detect_loss_scale_trouble(
     `skipped_steps` nor `recorded_steps`, so a streak can span more training steps than it
     counts. Where the SDK observed the scaler apply that update (`scaler_applied: true`) it ends
     the streak, as a recorded applied update does, and counts in `recorded_steps`. A loss scale recorded on a caller's skip is still read against `floor`,
-    and raises with reason `scale` and the skip counts unchanged."""
+    and raises with reason `scale` and the skip counts unchanged.
+
+    A step on which the scaler skipped some optimizers and applied others (`partial_step`,
+    WAVE_AE_CONTRACT.md, section 4, amending section 1 of STEP_AND_EVIDENCE_CONTRACT.md on the
+    author's word) is counted once in `recorded_steps`, not in `skipped_steps`, and apart as
+    `partial_steps`; an update occurred, so it ends the streak of fully skipped updates. The
+    incident carries `partial_steps` only when it is above zero."""
     return _loss_scale_judged(records, run=run, floor=floor)[0]
 
 
@@ -1972,14 +2095,19 @@ def _loss_scale_judged(
 ) -> tuple[dict[str, Any] | None, dict[str, int]]:
     """`detect_loss_scale_trouble`'s incident, and the rule's own counters after the last record:
     `{"recorded_steps", "skipped_steps", "streak"}`, as the behaviour cases' `counters_at_end`
-    states them whether or not anything was raised."""
-    streak, skipped, total, first = 0, 0, 0, None
+    states them whether or not anything was raised, and `partial_steps` after them only when it
+    is above zero (WAVE_AE_CONTRACT.md, section 4)."""
+    streak, skipped, total, partial, first = 0, 0, 0, 0, None
     for record in sorted(records, key=lambda r: r["step"]):
         if "step_skipped" not in record:
             continue
         by = skipped_by(record)
         if by == "caller" and record.get("scaler_applied") is True:
             total += 1  # the scaler applied this update: observed, and the streak ends
+            streak = 0
+        elif partial_step(record):
+            total += 1  # some optimizers' updates were applied: counted apart, and the streak ends
+            partial += 1
             streak = 0
         elif by != "caller":
             total += 1
@@ -1994,10 +2122,12 @@ def _loss_scale_judged(
                 "grad_scale": scale,
                 "reason": "skips" if streak >= run else "scale",
             }
+    partial_count = {"partial_steps": partial} if partial else {}
     if first is not None:
         first["skipped_steps"] = skipped
         first["recorded_steps"] = total
-    return first, {"recorded_steps": total, "skipped_steps": skipped, "streak": streak}
+        first.update(partial_count)
+    return first, {"recorded_steps": total, "skipped_steps": skipped, "streak": streak, **partial_count}
 
 
 def detect_repeated_steps(records: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -2980,6 +3110,21 @@ _CHECK_KINDS: dict[str, tuple[str, ...]] = {
     "flight_recorder": ("collective_hang", "collective_desync"),
     "traincheck": ("traincheck_violation",),
 }
+# The `not_checked` entries that leave the kinds they name `checked`: some of a kind's judgments
+# were not made and every other was. `clip_groups` (WAVE_AE_CONTRACT.md, section 1) names
+# `update_spike`, whose pairs that needed no split were judged.
+_PARTIAL_CHECKS = frozenset({"clip_groups"})
+
+
+def _partial_check(item: Mapping[str, Any]) -> bool:
+    """Whether a `not_checked` entry leaves the kinds it names `checked` (`_PARTIAL_CHECKS`): some
+    of their judgments were made. A `clip_groups` entry whose `compared` is 0 says none was, and
+    makes `update_spike` `unavailable` (WAVE_AE_CONTRACT.md, section 1, the author's second word);
+    one without the key, written before it, reads as before it."""
+    if item.get("check") not in _PARTIAL_CHECKS:
+        return False
+    compared = item.get("compared")
+    return not (type(compared) is int and compared == 0)
 _STATUS_NEEDS = "the server's progress status (watchdog.json)"
 _NO_STATUS = "no progress status (the server's watchdog.json): whether the job is still making progress is not checked"
 
@@ -3040,7 +3185,7 @@ def _kinds_not_checked(not_checked: Iterable[Mapping[str, Any]]) -> dict[str, Ma
     """Each kind a `not_checked` entry names, with the first entry that names it."""
     named: dict[str, Mapping[str, Any]] = {}
     for item in not_checked:
-        if not isinstance(item, Mapping):
+        if not isinstance(item, Mapping) or _partial_check(item):
             continue
         kinds = item.get("kinds")
         if not isinstance(kinds, (list, tuple)):
@@ -5498,6 +5643,55 @@ def _all_ranks_evidence(
     return evidence
 
 
+def rows_not_newer_note(rows: int, late: int) -> str:
+    """The reader's words for the rows the server did not store because their step was not above
+    one it had kept for their attempt (WAVE_AE_CONTRACT.md, section 6), with `rows` the server's
+    `rows_not_newer` and `late` its `late_steps_confirmed` (0 when the status has none)."""
+    head = (f"The server received {rows} row(s) whose step was not above a step it had already kept for their"
+            f" attempt, and did not store them. A row sent again is counted again, so {rows} is not a number of"
+            " steps lost.")
+    if late:
+        middle = (f" {late} distinct step(s) among them are confirmed to have arrived out of order inside one stored"
+                  f" part, and are not stored. {late} is a lower bound: a late step that crosses a part boundary is"
+                  f" not in it, so the same rows can give another {late} when the parts are cut elsewhere.")
+    else:
+        middle = " None is confirmed as a step that arrived out of order."
+    return head + middle + " The other rows are not told apart from rows sent again."
+
+
+def _rows_not_newer(entries: Iterable[Any]) -> dict[str, Any] | None:
+    """`{"rows", "late_steps_confirmed"?, "ranks"}` over the rank entries of a status: each rank's
+    `rows_not_newer` and `late_steps_confirmed` as written, where each is a count above zero, and
+    the ranks with `rows_not_newer`. None when no rank has `rows_not_newer`: a status without the
+    key reads as before. A `late_steps_confirmed` without `rows_not_newer` on its rank is not
+    read, since every confirmed late step is among those rows."""
+    rows = late = 0
+    ranks: list[int] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        rank, count = entry.get("rank"), entry.get("rows_not_newer")
+        if not (type(rank) is int and rank >= 0) or not _count(count):
+            continue
+        ranks.append(rank)
+        rows += count
+        confirmed = entry.get("late_steps_confirmed")
+        late += confirmed if _count(confirmed) else 0
+    if not ranks:
+        return None
+    return {"rows": rows, **({"late_steps_confirmed": late} if late else {}), "ranks": sorted(ranks)}
+
+
+def _rows_not_newer_said(found: Mapping[str, Any], *, ranges: bool) -> dict[str, Any]:
+    """The `rows_not_newer` block of a `watchdog` block (WAVE_AE_CONTRACT.md, section 6): the
+    counts as the status wrote them, the ranks as ranges in the all-ranks view, and the note."""
+    return {"rows": found["rows"],
+            **({"late_steps_confirmed": found["late_steps_confirmed"]} if "late_steps_confirmed" in found else {}),
+            **({"rank_ranges": _rank_ranges(found["ranks"], 8)} if ranges else {}),
+            "includes_replays": True,
+            "note": rows_not_newer_note(found["rows"], found.get("late_steps_confirmed", 0))}
+
+
 def _dropped_rows_said(status: Mapping[str, Any] | None) -> dict[str, Any]:
     """`{"dropped_rows": ...}` for the all-ranks view's `watchdog` block, or nothing when no rank
     dropped a row, so such a run's block is as before (L22). The rows the server dropped because
@@ -5510,7 +5704,13 @@ def _dropped_rows_said(status: Mapping[str, Any] | None) -> dict[str, Any]:
     And `{"refused_batches": ...}` beside it, or nothing when no rank had a batch refused: the
     batches the server refused whole for a key column that was missing or of another type
     (`runs.refused_batches`, lane AB5), with the same ranges. Its own key, never added to the
-    rows, and not an upper bound: the server counts a batch sent again once (wave AB's seam)."""
+    rows, and not an upper bound: the server counts a batch sent again once (wave AB's seam).
+
+    And `{"rows_not_newer": ...}` beside them, or nothing when no rank has the key (L30,
+    WAVE_AE_CONTRACT.md, section 6): the rows the server did not store because their step was not
+    above one it had kept for their attempt, with `late_steps_confirmed` where the status has it,
+    the ranks as ranges, and the page's sentence (`rows_not_newer_note`). Never added to the rows
+    dropped."""
     from .runs import dropped_rows, refused_batches
 
     said: dict[str, Any] = {}
@@ -5524,6 +5724,10 @@ def _dropped_rows_said(status: Mapping[str, Any] | None) -> dict[str, Any]:
         said["refused_batches"] = {"batches": refused["batches"], **({"by_key": refused["by_key"]} if refused.get("by_key") else {}),
                                    "rank_ranges": _rank_ranges((item["rank"] for item in refused["ranks"]), 8),
                                    "note": refused["note"]}
+    entries = status.get("ranks") if isinstance(status, Mapping) else None
+    not_newer = _rows_not_newer(entries) if isinstance(entries, list) else None
+    if not_newer is not None:
+        said["rows_not_newer"] = _rows_not_newer_said(not_newer, ranges=True)
     return said
 
 
@@ -5532,7 +5736,9 @@ def _rank_dropped_rows_said(status: Mapping[str, Any] | None, rank: Any) -> dict
     server dropped from this rank for a null key, from its entry in the status (`runs.dropped_rows`
     over that entry alone), or nothing when it dropped none, so the block is as before. An upper
     bound, as in the all-ranks view (`_dropped_rows_said`). And `{"refused_batches": ...}` beside
-    it for the batches the server refused whole from this rank, on the same terms as there."""
+    it for the batches the server refused whole from this rank, on the same terms as there, and
+    `{"rows_not_newer": ...}` for this rank's rows not stored because their step was not newer
+    (WAVE_AE_CONTRACT.md, section 6), without ranges."""
     from .runs import dropped_rows, refused_batches
 
     entries = status.get("ranks") if isinstance(status, Mapping) else None
@@ -5548,6 +5754,9 @@ def _rank_dropped_rows_said(status: Mapping[str, Any] | None, rank: Any) -> dict
     if refused is not None:
         said["refused_batches"] = {"batches": refused["batches"], **({"by_key": refused["by_key"]} if refused.get("by_key") else {}),
                                    "note": refused["note"]}
+    not_newer = _rows_not_newer(own["ranks"])
+    if not_newer is not None:
+        said["rows_not_newer"] = _rows_not_newer_said(not_newer, ranges=False)
     return said
 
 
@@ -5940,7 +6149,10 @@ def _non_finite_gradients(record: Mapping[str, Any]) -> list[str]:
 
 def skipped_updates(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
     """One rank's skipped updates by who reported them (STEP_AND_EVIDENCE_CONTRACT.md, section 1),
-    the evidence's `skipped_updates`: `{"caller", "scaler", "both"}` counts, with
+    the evidence's `skipped_updates`: `{"caller", "scaler", "both"}` counts, then `partial`, the
+    steps on which the scaler skipped some optimizers and applied others (`partial_step`,
+    WAVE_AE_CONTRACT.md, section 4), counted there and under no other name and only when above
+    zero, with
     `non_finite_gradients` (`steps`, `first_step`, and `gradients` named at the first, as
     `non_finite` names them) only when a skip the caller reported, alone or with the scaler, had
     a gradient norm that was not finite. None unless a record carries `step_skipped_by`, so the
@@ -5950,18 +6162,23 @@ def skipped_updates(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | No
     if not any("step_skipped_by" in r for r in listed):
         return None
     counts = dict.fromkeys(SKIPPED_BY, 0)
+    partial = 0
     kept: dict[str, Any] | None = None
     for record in listed:
         by = skipped_by(record)
         if by is None:
             continue
-        counts[by] += 1
+        if partial_step(record):
+            partial += 1
+        else:
+            counts[by] += 1
         bad = _non_finite_gradients(record) if by in ("caller", "both") else []
         if bad:
             if kept is None:
                 kept = {"steps": 0, "first_step": int(record["step"]), "gradients": bad}
             kept["steps"] += 1
-    return {**counts, **({"non_finite_gradients": kept} if kept is not None else {})}
+    return {**counts, **({"partial": partial} if partial else {}),
+            **({"non_finite_gradients": kept} if kept is not None else {})}
 
 
 def detect_non_finite(records: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -7141,8 +7358,9 @@ def _build_evidence(
         starved_hit = judged["starved_hit"]
         if starved_hit is not None:
             incidents.append(starved_hit)
+        update_judged = _update_spikes_judged(records, window=update_window)
         for detector in (
-            lambda found: judged["grad_hit"], lambda found: detect_update_spikes(found, window=update_window),
+            lambda found: judged["grad_hit"], lambda found: update_judged[0],
             detect_stalled_weights, detect_repeated_steps, detect_loss_scale_trouble,
         ):
             # Only this detector looks at what a later attempt replaced.
@@ -7178,6 +7396,9 @@ def _build_evidence(
         layers_unread = layers_not_read_not_checked(records)
         if layers_unread is not None:
             not_checked.append(layers_unread)
+        clip_groups = update_spike_not_checked(update_judged[1])
+        if clip_groups is not None:
+            not_checked.append(clip_groups)
         rank_checks = kind_checks(
             input_counts(records), not_checked, starve_window=starve_window, update_window=update_window)
         _name_starting_state(rank_checks, judged["starting"])
@@ -8020,9 +8241,11 @@ def _describe(incident: Mapping[str, Any]) -> str | None:
             if incident["reason"] == "skips"
             else f"loss scale fell to {incident['grad_scale']:g}"
         )
+        partial = incident.get("partial_steps")
         return (
             f"Loss scaling in trouble at step {incident['step']}: {why}; "
             f"{incident['skipped_steps']} of {incident['recorded_steps']} steps skipped in all"
+            + (f", and {PARTIAL_STEP_WORDS.format(n=partial)}" if partial else "")
         )
     if kind == "non_finite":
         parts = [*incident.get("layers", ()), *incident.get("gradients", ())]
