@@ -524,3 +524,78 @@ def test_a_partial_skip_adds_no_device_sync_at_the_step(capture):
     assert sink.records == []
     session.close()
     assert sink.records[2]["step_skipped_part"] == {"skipped": 1, "of": 2}
+
+
+# --- The author's condition on section 3's warning: it cannot raise into training under -W error ---
+
+
+def _never_steps_loop(model, first, steps=25):
+    for _ in range(steps):
+        first.zero_grad()
+        model(torch.randn(8, 16)).pow(2).mean().backward()
+        first.step()
+
+
+def test_the_ends_step_warning_does_not_raise_under_an_error_filter(caplog):
+    model = _deep()
+    first = torch.optim.SGD(model[0].parameters(), lr=0.1)
+    never = torch.optim.SGD(model[4].parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    before = model[0].weight.detach().clone()
+    with caplog.at_level("WARNING", logger="tensorquill"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # every warning an error, as `python -W error` makes it
+            with tensorquill.init(model, sink=sink, every=4, ends_step=never):
+                _never_steps_loop(model, first)  # raises nothing
+    assert not torch.equal(before, model[0].weight)  # training went on
+    said = [r.getMessage() for r in caplog.records if "ends_step" in r.getMessage()]
+    assert len(said) == 1 and "10 steps" in said[0]  # said once, on the logger instead
+    assert sink.records == []
+
+
+def test_the_base_ten_step_warning_does_not_raise_under_an_error_filter(caplog):
+    # A control, as the base has it: an optimizer holding none of the model's parameters.
+    model = _deep()
+    elsewhere = nn.Linear(16, 1)
+    foreign = torch.optim.SGD(elsewhere.parameters(), lr=0.1)
+    sink = tensorquill.MemorySink()
+    with caplog.at_level("WARNING", logger="tensorquill"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with tensorquill.init(model, sink=sink, every=4):
+                for _ in range(12):
+                    foreign.zero_grad()
+                    elsewhere(torch.randn(8, 16)).pow(2).mean().backward()
+                    foreign.step()
+    assert any("has recorded no steps" in r.getMessage() for r in caplog.records)
+
+
+_W_ERROR_SCRIPT = """
+import torch, tensorquill
+from torch import nn
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(16, 16), nn.ReLU(), nn.Linear(16, 1))
+first = torch.optim.SGD(model[0].parameters(), lr=0.1)
+never = torch.optim.SGD(model[2].parameters(), lr=0.1)
+sink = tensorquill.MemorySink()
+with tensorquill.init(model, sink=sink, every=4, ends_step=never):
+    for _ in range(25):
+        first.zero_grad()
+        model(torch.randn(8, 16)).pow(2).mean().backward()
+        first.step()
+print("trained", len(sink.records))
+"""
+
+
+def test_the_ends_step_warning_under_python_w_error():
+    import os
+    import subprocess
+    import sys
+
+    src = os.path.join(os.path.dirname(tensorquill.__file__), os.pardir)
+    env = {**os.environ, "PYTHONPATH": os.path.abspath(src)}
+    done = subprocess.run([sys.executable, "-W", "error", "-c", _W_ERROR_SCRIPT], capture_output=True, text=True,
+                          env=env, timeout=300)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert "trained 0" in done.stdout
+    assert done.stderr.count("ends_step") == 1  # the one warning, on the logger's stderr
