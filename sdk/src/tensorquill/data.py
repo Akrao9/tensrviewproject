@@ -874,6 +874,16 @@ class _Match:
         return {"entry": self.key, "checkpoint": len(self.shapes), "matched": self.matched}
 
 
+def _holds_half(match: _Match, model: dict[str, tuple[list[int], str, int | None]]) -> bool:
+    """Whether an inferred entry (rules 2 and 4) holds at least half of the model's names: a share,
+    not a count, with a name that is the same parameter as a name the entry holds counted as held."""
+    held = {match.model[name] for name in match.entry if name in match.model}
+    identities = {model[name][2] for name in held if model[name][1] != "b"}
+    tied = sum(1 for name, (_, kind, identity) in model.items()
+               if name not in held and kind != "b" and identity in identities)
+    return 2 * (len(held) + tied) >= len(model)
+
+
 def _listed(names: Iterable[str]) -> dict[str, Any]:
     found = sorted(names)
     return {"count": len(found), "names": found[:NAMES_LISTED]}
@@ -953,13 +963,16 @@ def tensor_coverage(
     matches = [_Match(key, mapping, shapes, names) for key, mapping, shapes in _entries(state)]
     passing = [m for m in matches if m.passes()]
     conventional = [m for m in passing if _conventional(m.key)]
-    if len(conventional) == 1:  # rule 2
-        return _compared(conventional[0], "name", names), conventional[0]
+    if len(conventional) == 1:  # rule 2: the key says which entry is looked at, its names whether it is compared
+        match = conventional[0]
+        if _holds_half(match, names):
+            return _compared(match, "name", names), match
+        return _unavailable("weak_match", closest=match.closest()), None
     if len(conventional) > 1:  # rule 3
         return _unavailable("ambiguous", candidates=sorted(str(m.key) for m in conventional)), None
     if len(passing) == 1:  # rule 4
         match = passing[0]
-        if 2 * match.matched >= len(match.model):
+        if _holds_half(match, names):
             return _compared(match, "names", names), match
         return _unavailable("weak_match", closest=match.closest()), None
     if len(passing) > 1:  # rule 5

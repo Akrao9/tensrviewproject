@@ -571,3 +571,134 @@ def test_the_rust_path_carries_the_servers_block(monkeypatch):
         monkeypatch.setattr(server_detect, "server_report", report)
         evidence = ev.build_evidence(body["records"], detectors="rust")
         assert evidence.get("checkpoint_tensors") == block
+
+
+# --- the author's second amendment (Nov 21, 2026) -------------------------------------------
+
+DEEP_ROWS = CASES["one_matching_name_under_a_key_named_model"]["given"]["model"]
+
+
+def test_the_same_one_of_61_mapping_inferred_and_named_by_the_loader(tmp_path):
+    """The paired regression: the head saved alone under `model`. Inferred from the key it is too
+    little to call sixty tensors missing; named by the loader it is enough."""
+    state = {"model": {"head.weight": torch.zeros(2, 4)}}
+    inferred = load_through_a_session(tmp_path / "inferred", build_model(DEEP_ROWS), state)
+    assert inferred["tensors"] == {"state": "unavailable", "why": "weak_match",
+                                   "closest": {"entry": "model", "checkpoint": 1, "matched": 1}}
+    named = load_through_a_session(tmp_path / "named", build_model(DEEP_ROWS), state, model_state=state["model"])
+    assert (named["tensors"]["by"], named["tensors"]["missing"]["count"]) == ("loader", 60)
+
+
+@pytest.mark.parametrize("order", [("model", "net"), ("net", "model")])
+def test_two_conventional_entries_give_unavailable_in_either_order(tmp_path, order):
+    shapes = {n: s for n, s, _ in LSTM_ROWS}
+    entries = {"model": tensors({n: shapes[n] for n in ("embed.weight", "lstm.weight_ih_l0", "lstm.weight_hh_l0")}),
+               "net": tensors({n: shapes[n] for n in ("embed.weight", "lstm.weight_ih_l0", "lstm.bias_ih_l0")})}
+    manifest = load_through_a_session(tmp_path, build_model(LSTM_ROWS), {key: entries[key] for key in order})
+    assert manifest["tensors"] == {"state": "unavailable", "why": "ambiguous", "candidates": ["model", "net"]}
+
+
+def test_a_tied_name_counts_as_held_toward_half_of_the_models_names():
+    """Two of four names saved, and a third tied to one of them: three of four held, so `model` is
+    compared by its key. Without the tie the same two of four would be compared too (exactly half);
+    with one of four saved and one tied, two of four."""
+    rows = [["wte.weight", [4, 2], "p"], ["a.weight", [2], "p"], ["b.weight", [2], "p"],
+            ["lm_head.weight", [4, 2], "p", "wte.weight"]]
+    manifest = load_manifest({"model": {"wte.weight": torch.zeros(4, 2)}}, build_model(rows))
+    assert manifest["tensors"]["by"] == "name" and manifest["tensors"]["tied"]["names"] == ["lm_head.weight"]
+    untied = [row[:3] for row in rows]
+    assert load_manifest({"model": {"wte.weight": torch.zeros(4, 2)}}, build_model(untied))["tensors"]["why"] == "weak_match"
+
+
+def test_the_real_activation_checkpoint_wrapper_is_not_read():
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing
+
+    model = nn.Sequential(nn.Linear(4, 8), nn.Linear(8, 1))
+    state = {"model": {k: v.clone() for k, v in model.state_dict().items()}}
+    assert load_manifest(state, model)["tensors"]["state"] == "compared"
+    apply_activation_checkpointing(model, check_fn=lambda module: isinstance(module, nn.Linear))
+    assert load_manifest(state, model)["tensors"] == {"state": "unavailable", "why": "model_not_readable"}
+
+
+# --- records no case states (section 4, Nov 21, 2026) ---------------------------------------
+
+COMPLETE_RECORDS = CASES["a_resume_with_every_tensor_verified"]["records"]
+
+
+def _with_load(tensors_object, records=COMPLETE_RECORDS, **checkpoint):
+    out = [json.loads(json.dumps(r)) for r in records]
+    resumed = next(r for r in out if "checkpoint" in r)
+    resumed["checkpoint"]["load"]["tensors"] = tensors_object
+    resumed["checkpoint"].update(checkpoint)
+    return out
+
+
+def _judged(rows):
+    found = detect_resume_state([dict(r) for r in rows])[1]
+    block = ev.build_evidence(rows, detectors="python").get("checkpoint_tensors")
+    return (found["changes"][0]["findings"] if found else []), block
+
+
+def test_an_entrys_scalar_keys_are_copied_as_the_record_has_them():
+    findings, block = _judged(_with_load({"state": "compared", "entry": None, "by": 7, "model": "seven",
+                                          "trainable": None, "checkpoint": 1.5, "matched": [1]}))
+    assert findings == []
+    assert block["entries"][0] == {"step": 10, "rank": 0, "attempt": 2000, "state": "compared", "entry": None, "by": 7,
+                                   "model": "seven", "trainable": None, "checkpoint": 1.5, "matched": [1]}
+
+
+def test_lists_on_an_unavailable_object_are_in_its_entry_and_raise_nothing():
+    findings, block = _judged(_with_load({"state": "unavailable", "why": "folder",
+                                          "missing": {"count": 2, "names": ["a", "b"]}}))
+    assert findings == []
+    assert block["entries"][0]["missing"] == {"count": 2, "names": ["a", "b"]}
+
+
+def test_a_state_that_is_neither_gives_no_entry_and_resumes_counts_entries():
+    rows = [json.loads(json.dumps(r)) for r in COMPLETE_RECORDS]
+    rows += [{**rows[-1], "step": s, "attempt": 3000} for s in range(15, 18)]
+    for r in rows[15:]:
+        r.pop("checkpoint", None)
+    loads = {10: {"state": "compared?", "missing": {"count": 2, "names": ["a", "b"]}},
+             15: {"missing": {"count": 2, "names": ["a", "b"]}}}
+    for row in rows:
+        if row["step"] in loads and (row["step"] == 10 or row["attempt"] == 3000):
+            components = CASES["a_resume_with_every_tensor_verified"]["records"][10]["checkpoint"]["load"]["components"]
+            row["checkpoint"] = {"load": {"components": components, "tensors": loads[row["step"]]}}
+    findings, block = _judged(rows)
+    assert findings == [] and block is None
+    rows[15]["checkpoint"]["load"]["tensors"] = {"state": "unavailable", "why": "error"}
+    assert _judged(rows)[1] == {"resumes": 1, "entries": [{"step": 15, "rank": 0, "attempt": 3000,
+                                                           "state": "unavailable", "why": "error"}]}
+
+
+@pytest.mark.parametrize("count", [1.0, True, "2", 0, -1, 2**63, None])
+def test_a_count_that_is_not_a_positive_whole_number_the_server_holds_is_not_read(count):
+    findings, block = _judged(_with_load({"state": "compared", "missing": {"count": count, "names": ["a"]}}))
+    assert findings == [] and "missing" not in block["entries"][0]
+
+
+def test_the_largest_count_is_read_and_a_list_that_is_not_an_object_is_not():
+    big = 2**63 - 1
+    findings, block = _judged(_with_load({"state": "compared", "missing": {"count": big, "names": ["a"]},
+                                          "shape_differs": ["head.weight"]}))
+    assert findings == [{"component": "model", "finding": "missing_tensors", "count": big, "tensors": ["a"]}]
+    assert block["entries"][0]["missing"]["count"] == big and "shape_differs" not in block["entries"][0]
+
+
+def test_names_that_are_not_a_list_read_as_none_and_the_finding_is_still_raised():
+    findings, block = _judged(_with_load({"state": "compared", "missing": {"count": 2, "names": "a, b"}}))
+    assert findings == [{"component": "model", "finding": "missing_tensors", "count": 2, "tensors": []}]
+    assert block["entries"][0]["missing"] == {"count": 2, "names": []}
+
+
+def test_the_tensor_findings_come_after_the_optimizer_snapshots_and_the_scalers():
+    rows = _with_load({"state": "compared", "missing": {"count": 1, "names": ["a"]}},
+                      optimizer={"entries_before": 0, "entries_after": 3})
+    for row in rows:  # the scale starts at 65536, falls, and the resume starts at 65536 again
+        row["grad_scale"] = 65536.0 if row["step"] in (0, 10) else 1024.0
+    findings, _ = _judged(rows)
+    # Today's, in today's order (the scale seen makes the scaler expected, and it is not in the
+    # checkpoint), then the tensors.
+    assert [(f["component"], f["finding"]) for f in findings] == [
+        ("scaler", "missing"), ("optimizer", "empty"), ("scaler", "initial_scale"), ("model", "missing_tensors")]

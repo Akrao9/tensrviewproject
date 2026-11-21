@@ -382,13 +382,17 @@ def load_tensors(load: Any) -> Mapping[str, Any] | None:
     return tensors if isinstance(tensors, Mapping) else None
 
 
+TENSOR_COUNT_MAX = 2**63 - 1  # the largest count the server can hold; a larger one is not read
+
+
 def tensor_list(value: Any) -> tuple[int, list[Any]] | None:
-    """A list of `tensors` as `(count, names)`, read only when its `count` is a positive whole
-    number; names that are not a list are read as none."""
+    """A list of `tensors` as `(count, names)`, read only when it is an object whose `count` is a
+    whole number as `_int` reads one (never a float, a boolean or a string), above 0 and not above
+    `TENSOR_COUNT_MAX`; names that are not a list are read as none, and the list is still read."""
     if not isinstance(value, Mapping):
         return None
-    count = value.get("count")
-    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+    count = _int(value.get("count"))
+    if count is None or not 0 < count <= TENSOR_COUNT_MAX:
         return None
     names = value.get("names")
     return count, list(names) if isinstance(names, list) else []
