@@ -2228,7 +2228,7 @@
   "exactly_half_the_names_are_the_models": {
    "group": "coverage",
    "status": "new",
-   "says": "Two of the entry's four names are the model's: half is enough for the entry to be compared.",
+   "says": "Two of the entry's four names are the model's, so it passes the filter, on its own side. But it holds two of the model's seven names and nothing but its key says it is the model's: for an inferred entry that is too little to call the other five missing.",
    "given": {
     "model": [
      [
@@ -2306,9 +2306,105 @@
    "expected": {
     "model_component": true,
     "tensors": {
+     "state": "unavailable",
+     "why": "weak_match",
+     "closest": {
+      "entry": "model",
+      "checkpoint": 4,
+      "matched": 2
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "half_the_entrys_names_and_the_loader_named_it": {
+   "group": "coverage",
+   "status": "new",
+   "says": "The same entry, named by the loader. The loader's word needs only the filter, so it is compared: five trainable tensors are missing and two are unexpected.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "loader": "model",
+    "checkpoint": {
+     "model": {
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ],
+      "old.weight": [
+       4
+      ],
+      "old.bias": [
+       4
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
      "state": "compared",
      "entry": "model",
-     "by": "name",
+     "by": "loader",
      "model": 7,
      "trainable": 7,
      "checkpoint": 4,
@@ -2330,6 +2426,306 @@
        "old.weight"
       ]
      }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "a_model_of_one_tensor": {
+   "group": "coverage",
+   "status": "new",
+   "says": "A model with one tensor, saved under `model`. One name is every name the model has, so the entry is compared and complete: the rule against one matching name is about a share, not a count.",
+   "given": {
+    "model": [
+     [
+      "weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "weight": [
+       4,
+       4
+      ]
+     },
+     "optimizer": "an optimizer's state"
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "by": "name",
+     "model": 1,
+     "trainable": 1,
+     "checkpoint": 1,
+     "matched": 1
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "two_conventional_entries": {
+   "group": "coverage",
+   "status": "new",
+   "says": "`model` and `net` both name a model, both pass the filter, and the loader named neither. Nothing says which was loaded: coverage is unavailable, and nothing is named as missing.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "model": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     },
+     "net": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "unavailable",
+     "why": "ambiguous",
+     "candidates": [
+      "model",
+      "net"
+     ]
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "two_conventional_entries_in_the_other_order": {
+   "group": "coverage",
+   "status": "new",
+   "says": "The same two entries in the other order: the same answer.",
+   "given": {
+    "model": [
+     [
+      "embed.weight",
+      [
+       65,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_ih_l0",
+      [
+       128,
+       16
+      ],
+      "p"
+     ],
+     [
+      "lstm.weight_hh_l0",
+      [
+       128,
+       32
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_ih_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "lstm.bias_hh_l0",
+      [
+       128
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       65,
+       32
+      ],
+      "p"
+     ],
+     [
+      "head.bias",
+      [
+       65
+      ],
+      "p"
+     ]
+    ],
+    "checkpoint": {
+     "net": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     },
+     "model": {
+      "embed.weight": [
+       65,
+       16
+      ],
+      "lstm.weight_ih_l0": [
+       128,
+       16
+      ],
+      "lstm.weight_hh_l0": [
+       128,
+       32
+      ],
+      "lstm.bias_ih_l0": [
+       128
+      ],
+      "lstm.bias_hh_l0": [
+       128
+      ],
+      "head.weight": [
+       65,
+       32
+      ],
+      "head.bias": [
+       65
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "unavailable",
+     "why": "ambiguous",
+     "candidates": [
+      "model",
+      "net"
+     ]
     }
    },
    "today": {
@@ -3019,7 +3415,584 @@
   "more_missing_than_are_named": {
    "group": "coverage",
    "status": "new",
-   "says": "Sixty trainable tensors are missing and only the head was saved. The count is 60 and the first 50 names, sorted, are listed.",
+   "says": "The loader names an entry that holds one of the model's 61 tensors. By the loader's word it is what was loaded, so the other sixty are missing: the count is 60 and the first 50 names, sorted, are listed.",
+   "given": {
+    "model": [
+     [
+      "blocks.00.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.01.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.02.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.03.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.04.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.05.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.06.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.07.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.08.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.09.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.10.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.11.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.12.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.13.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.14.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.15.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.16.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.17.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.18.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.19.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.20.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.21.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.22.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.23.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.24.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.25.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.26.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.27.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.28.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.29.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.30.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.31.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.32.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.33.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.34.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.35.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.36.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.37.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.38.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.39.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.40.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.41.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.42.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.43.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.44.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.45.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.46.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.47.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.48.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.49.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.50.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.51.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.52.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.53.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.54.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.55.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.56.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.57.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.58.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "blocks.59.weight",
+      [
+       4,
+       4
+      ],
+      "p"
+     ],
+     [
+      "head.weight",
+      [
+       2,
+       4
+      ],
+      "p"
+     ]
+    ],
+    "loader": "model",
+    "checkpoint": {
+     "model": {
+      "head.weight": [
+       2,
+       4
+      ]
+     }
+    }
+   },
+   "expected": {
+    "model_component": true,
+    "tensors": {
+     "state": "compared",
+     "entry": "model",
+     "by": "loader",
+     "model": 61,
+     "trainable": 61,
+     "checkpoint": 1,
+     "matched": 1,
+     "missing": {
+      "count": 60,
+      "names": [
+       "blocks.00.weight",
+       "blocks.01.weight",
+       "blocks.02.weight",
+       "blocks.03.weight",
+       "blocks.04.weight",
+       "blocks.05.weight",
+       "blocks.06.weight",
+       "blocks.07.weight",
+       "blocks.08.weight",
+       "blocks.09.weight",
+       "blocks.10.weight",
+       "blocks.11.weight",
+       "blocks.12.weight",
+       "blocks.13.weight",
+       "blocks.14.weight",
+       "blocks.15.weight",
+       "blocks.16.weight",
+       "blocks.17.weight",
+       "blocks.18.weight",
+       "blocks.19.weight",
+       "blocks.20.weight",
+       "blocks.21.weight",
+       "blocks.22.weight",
+       "blocks.23.weight",
+       "blocks.24.weight",
+       "blocks.25.weight",
+       "blocks.26.weight",
+       "blocks.27.weight",
+       "blocks.28.weight",
+       "blocks.29.weight",
+       "blocks.30.weight",
+       "blocks.31.weight",
+       "blocks.32.weight",
+       "blocks.33.weight",
+       "blocks.34.weight",
+       "blocks.35.weight",
+       "blocks.36.weight",
+       "blocks.37.weight",
+       "blocks.38.weight",
+       "blocks.39.weight",
+       "blocks.40.weight",
+       "blocks.41.weight",
+       "blocks.42.weight",
+       "blocks.43.weight",
+       "blocks.44.weight",
+       "blocks.45.weight",
+       "blocks.46.weight",
+       "blocks.47.weight",
+       "blocks.48.weight",
+       "blocks.49.weight"
+      ]
+     }
+    }
+   },
+   "today": {
+    "model_component": true,
+    "tensors": false
+   }
+  },
+  "one_matching_name_under_a_key_named_model": {
+   "group": "coverage",
+   "status": "new",
+   "says": "The same mapping with nothing said by the loader. That it is the model's is inferred from its key alone, and one matching name of 61 is too little to call sixty tensors missing.",
    "given": {
     "model": [
      [
@@ -3523,67 +4496,12 @@
    "expected": {
     "model_component": true,
     "tensors": {
-     "state": "compared",
-     "entry": "model",
-     "by": "name",
-     "model": 61,
-     "trainable": 61,
-     "checkpoint": 1,
-     "matched": 1,
-     "missing": {
-      "count": 60,
-      "names": [
-       "blocks.00.weight",
-       "blocks.01.weight",
-       "blocks.02.weight",
-       "blocks.03.weight",
-       "blocks.04.weight",
-       "blocks.05.weight",
-       "blocks.06.weight",
-       "blocks.07.weight",
-       "blocks.08.weight",
-       "blocks.09.weight",
-       "blocks.10.weight",
-       "blocks.11.weight",
-       "blocks.12.weight",
-       "blocks.13.weight",
-       "blocks.14.weight",
-       "blocks.15.weight",
-       "blocks.16.weight",
-       "blocks.17.weight",
-       "blocks.18.weight",
-       "blocks.19.weight",
-       "blocks.20.weight",
-       "blocks.21.weight",
-       "blocks.22.weight",
-       "blocks.23.weight",
-       "blocks.24.weight",
-       "blocks.25.weight",
-       "blocks.26.weight",
-       "blocks.27.weight",
-       "blocks.28.weight",
-       "blocks.29.weight",
-       "blocks.30.weight",
-       "blocks.31.weight",
-       "blocks.32.weight",
-       "blocks.33.weight",
-       "blocks.34.weight",
-       "blocks.35.weight",
-       "blocks.36.weight",
-       "blocks.37.weight",
-       "blocks.38.weight",
-       "blocks.39.weight",
-       "blocks.40.weight",
-       "blocks.41.weight",
-       "blocks.42.weight",
-       "blocks.43.weight",
-       "blocks.44.weight",
-       "blocks.45.weight",
-       "blocks.46.weight",
-       "blocks.47.weight",
-       "blocks.48.weight",
-       "blocks.49.weight"
-      ]
+     "state": "unavailable",
+     "why": "weak_match",
+     "closest": {
+      "entry": "model",
+      "checkpoint": 1,
+      "matched": 1
      }
     }
    },
@@ -4833,7 +5751,7 @@
        "tensors": {
         "state": "compared",
         "entry": "model",
-        "by": "name",
+        "by": "loader",
         "model": 61,
         "trainable": 61,
         "checkpoint": 1,
@@ -5004,7 +5922,7 @@
        "attempt": 2000,
        "state": "compared",
        "entry": "model",
-       "by": "name",
+       "by": "loader",
        "model": 61,
        "trainable": 61,
        "checkpoint": 1,

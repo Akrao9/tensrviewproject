@@ -29,7 +29,7 @@ LISTS = ("missing", "missing_frozen", "missing_buffers", "unexpected", "shape_di
 
 def test_the_file_holds_the_cases_the_page_names():
     page = (ROOT / "CHECKPOINT_TENSOR_CONTRACT.md").read_text()
-    assert len(COVERAGE) == 34 and len(RECORDS) == 17
+    assert len(COVERAGE) == 39 and len(RECORDS) == 17
     assert sum(body["status"] == "pin" for body in CASES.values()) == 4
     for name, body in CASES.items():
         assert f"`{name}`" in page, f"{name} is not named on the page"

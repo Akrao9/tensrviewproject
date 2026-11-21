@@ -53,6 +53,7 @@ NORMED = [
 DECODER = [["layers.0.weight", [8, 8], "p"], ["layers.0.bias", [8], "p"], ["out.weight", [4, 8], "p"], ["out.bias", [4], "p"]]
 ENCODER = {f"encoder.layers.{i}.{part}": [8, 8] for i in range(3) for part in ("weight", "bias")}
 TIED = [["wte.weight", [65, 16], "p"], ["block.weight", [16, 16], "p"], ["lm_head.weight", [65, 16], "p", "wte.weight"]]
+ONE = [["weight", [4, 4], "p"]]
 DEEP = [[f"blocks.{i:02d}.weight", [4, 4], "p"] for i in range(60)] + [["head.weight", [2, 4], "p"]]
 
 
@@ -186,7 +187,7 @@ def records(says, rows, fires, findings=(), block=None, **more):
 
 COMPLETE = compared(LSTM, "model", 7, 7)
 TWO_MISSING = compared(LSTM, "model", 5, 5, missing=["lstm.weight_hh_l0", "lstm.bias_hh_l0"])
-MANY_MISSING = compared(DEEP, "model", 1, 1, missing=[n for n, _, _ in DEEP if n != "head.weight"])
+MANY_MISSING = compared(DEEP, "model", 1, 1, by="loader", missing=[n for n, _, _ in DEEP if n != "head.weight"])
 FROZEN_MISSING = compared(ADAPTED, "adapter", 2, 2, by="loader", missing_frozen=names(ADAPTED, "f"))
 BUFFERS_MISSING = compared(NORMED, "model", 3, 3, missing_buffers=names(NORMED, "b"))
 UNEXPECTED = compared(LSTM, "model", 9, 7, unexpected=["old_head.weight", "old_head.bias"])
@@ -287,11 +288,32 @@ cases = {
         {"model": LSTM, "checkpoint": {"model": {**dict(list(OTHER_MODEL.items())[:7]), "head.bias": [65]}}},
         unavailable("not_identified", closest={"entry": "model", "checkpoint": 8, "matched": 1}), False),
     "exactly_half_the_names_are_the_models": coverage(
-        "new", "Two of the entry's four names are the model's: half is enough for the entry to be compared.",
+        "new", "Two of the entry's four names are the model's, so it passes the filter, on its own side."
+        " But it holds two of the model's seven names and nothing but its key says it is the model's: for"
+        " an inferred entry that is too little to call the other five missing.",
         {"model": LSTM, "checkpoint": {"model": {"head.weight": [65, 32], "head.bias": [65],
                                                  "old.weight": [4], "old.bias": [4]}}},
-        compared(LSTM, "model", 4, 2, missing=[n for n, _, _ in LSTM if not n.startswith("head.")],
+        unavailable("weak_match", closest={"entry": "model", "checkpoint": 4, "matched": 2}), "as today"),
+    "half_the_entrys_names_and_the_loader_named_it": coverage(
+        "new", "The same entry, named by the loader. The loader's word needs only the filter, so it is"
+        " compared: five trainable tensors are missing and two are unexpected.",
+        {"model": LSTM, "loader": "model", "checkpoint": {"model": {"head.weight": [65, 32], "head.bias": [65],
+                                                 "old.weight": [4], "old.bias": [4]}}},
+        compared(LSTM, "model", 4, 2, by="loader", missing=[n for n, _, _ in LSTM if not n.startswith("head.")],
                  unexpected=["old.weight", "old.bias"]), True),
+    "a_model_of_one_tensor": coverage(
+        "new", "A model with one tensor, saved under `model`. One name is every name the model has, so the"
+        " entry is compared and complete: the rule against one matching name is about a share, not a count.",
+        {"model": ONE, "checkpoint": {"model": held(ONE), "optimizer": OPTIMIZER}}, compared(ONE, "model", 1, 1), True),
+    "two_conventional_entries": coverage(
+        "new", "`model` and `net` both name a model, both pass the filter, and the loader named neither."
+        " Nothing says which was loaded: coverage is unavailable, and nothing is named as missing.",
+        {"model": LSTM, "checkpoint": {"model": held(LSTM), "net": held(LSTM, ("lstm.weight_hh_l0",))}},
+        unavailable("ambiguous", candidates=["model", "net"]), "as today"),
+    "two_conventional_entries_in_the_other_order": coverage(
+        "new", "The same two entries in the other order: the same answer.",
+        {"model": LSTM, "checkpoint": {"net": held(LSTM, ("lstm.weight_hh_l0",)), "model": held(LSTM)}},
+        unavailable("ambiguous", candidates=["model", "net"]), "as today"),
     "one_part_of_a_larger_model": coverage(
         "new", "The session watches a decoder; the checkpoint was saved from the whole model, whose larger"
         " encoder gives the entry most of its names. Under half of the entry's names are the model's, but every"
@@ -329,9 +351,15 @@ cases = {
         " with both shapes.",
         {"model": LSTM, "checkpoint": {"model": {**held(LSTM), "head.weight": [10, 32]}}}, SHAPE, True),
     "more_missing_than_are_named": coverage(
-        "new", "Sixty trainable tensors are missing and only the head was saved. The count is 60 and the"
-        " first 50 names, sorted, are listed.",
-        {"model": DEEP, "checkpoint": {"model": {"head.weight": [2, 4]}}}, MANY_MISSING, True),
+        "new", "The loader names an entry that holds one of the model's 61 tensors. By the loader's word it"
+        " is what was loaded, so the other sixty are missing: the count is 60 and the first 50 names, sorted,"
+        " are listed.",
+        {"model": DEEP, "loader": "model", "checkpoint": {"model": {"head.weight": [2, 4]}}}, MANY_MISSING, True),
+    "one_matching_name_under_a_key_named_model": coverage(
+        "new", "The same mapping with nothing said by the loader. That it is the model's is inferred from"
+        " its key alone, and one matching name of 61 is too little to call sixty tensors missing.",
+        {"model": DEEP, "checkpoint": {"model": {"head.weight": [2, 4]}}},
+        unavailable("weak_match", closest={"entry": "model", "checkpoint": 1, "matched": 1}), "as today"),
     "a_checkpoint_folder": coverage(
         "new", "`session.checkpoint_files`: the components are read from file names and no file is opened,"
         " so no tensor name is known.",
