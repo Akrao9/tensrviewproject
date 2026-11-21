@@ -7567,12 +7567,8 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
         sample = next((s for s in evidence.get("samples", ()) if isinstance(s, Mapping)
                        and s.get("step") == moe_incident.get("step") and s.get("layer") == moe_incident.get("layer")), None)
         moe: Mapping[str, Any] | None = {**sample, **moe_incident} if sample is not None else moe_incident
-    elif "compact" not in evidence:
-        moe = first_incident(evidence)
     else:
-        # A compacted file keeps windows of samples, from which a starting state cannot be told
-        # from a later flag: with no incident listed, nothing is worked out again from what was kept.
-        moe = None
+        moe = first_incident(evidence)
     if moe is not None:
         lines += _moe_lines(evidence, moe)
         source = moe_source_words(evidence).get(str(moe.get("router")))

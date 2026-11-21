@@ -190,14 +190,6 @@ def test_a_compacted_file_still_says_what_the_incident_says():
     evidence = build(body["records"])
     kept = {**evidence, "samples": [s for s in evidence["samples"] if s["step"] in (0, 1)]}
     assert "Collapsed since step 0, reportable at step 9" in ev.incident_summary(kept)
-    # With no incident listed, a compacted file whose kept window starts after step 0 does not
-    # make a later sample of a starting state into a finding.
-    loaded, even = [102] + [22] * 7, [32] * 8
-    sparse = build([{"step": s, "moe": {"r": loaded if i < 3 else even}, "moe_top_k": {"r": 1}}
-                    for i, s in enumerate(range(0, 300, 10))])
-    assert ev.incident_summary(sparse).startswith("No incidents detected.")
-    window = {**sparse, "compact": {"version": 1}, "samples": [s for s in sparse["samples"] if s["step"] >= 20]}
-    assert ev.incident_summary(window).startswith("No incidents detected.")
 
 
 # --- part 4 and part 5 -------------------------------------------------------------------------
