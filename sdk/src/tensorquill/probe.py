@@ -292,45 +292,64 @@ def _head_logit_sums(hidden: torch.Tensor, weight: torch.Tensor, bias: torch.Ten
     model applies after it. Inputs and weights already in BF16 upcast exactly, so for a run whose
     head is BF16 the BF16 pass is its own computation. The vocabulary is taken in chunks
     of at most CHUNK_ELEMENTS logits. Each chunk is reduced in float32 and the chunks are
-    added in float64 (float32 on MPS, which has none). The spread is summed about each
-    position's mean over the first chunk, so a large common shift of the logits does not
-    cancel it away. A row's sum that overflows float32 though its logits are finite (eight
-    logits of 3e38) is taken again over the row divided by its largest magnitude (`_row_sum`),
-    so that mean is read, not counted as overflow (C22, lane X4). `logits_finite` says which positions' FP32 logits are all finite, read
-    from the logits themselves, so a sum that overflows is not taken for a NaN or an Inf.
+    added in float64: on the logits' device, or on the CPU for MPS, which has no float64 (C22,
+    lane AD3). Before, MPS added them in float32, where a squared norm above about 1.8e19
+    overflows though the norm is finite; now only one vector of a value per position goes to the
+    CPU for each of the five sums, a chunk at a time, and a norm, never its square, crosses in
+    float32. The spread is summed about each position's mean over the first chunk, so a large
+    common shift of the logits does not cancel it away. A row's sum that overflows float32 though
+    its logits are finite (eight logits of 3e38) is taken again over the row divided by its largest
+    magnitude (`_row_sum`), so that mean is read, not counted as overflow (C22, lane X4). A row
+    whose difference from that mean overflows float32 though its logits are finite (logits near
+    float32's largest value with both signs, such as 3e38, 3e38 and -3e38) is taken again from
+    halves, `z / 2 - shift / 2`, which cannot overflow, and its sums multiplied back in float64
+    (`_centred`; C22, lane AD3). `logits_finite` says which positions' FP32 logits are all finite,
+    read from the logits themselves, so a sum that overflows is not taken for a NaN or an Inf.
     """
     x = hidden.detach().reshape(-1, hidden.shape[-1])
     positions, vocab = x.shape[0], weight.shape[0]
-    acc = torch.float32 if x.device.type == "mps" else torch.float64
+    acc = torch.float64
+    sums_on = torch.device("cpu") if x.device.type == "mps" else x.device
     xf, xb = x.float(), x.to(torch.bfloat16)
     rows = max(1, CHUNK_ELEMENTS // max(1, positions))
     shift = None
-    zero = torch.zeros(positions, dtype=acc, device=x.device)
+    zero = torch.zeros(positions, dtype=acc, device=sums_on)
     sq, dmean, dsq, gap = zero.clone(), zero.clone(), zero.clone(), zero.clone()
-    lse = torch.full((positions,), -math.inf, dtype=acc, device=x.device)
-    logits_finite = torch.ones(positions, dtype=torch.bool, device=x.device)
+    lse = torch.full((positions,), -math.inf, dtype=acc, device=sums_on)
+    logits_finite = torch.ones(positions, dtype=torch.bool, device=sums_on)
     for v0 in range(0, vocab, rows):
         w = weight[v0 : v0 + rows].detach()
         b = bias[v0 : v0 + rows].detach() if bias is not None else None
         zf = F.linear(xf, w.float(), None if b is None else b.float())
         zb = F.linear(xb, w.to(torch.bfloat16), None if b is None else b.to(torch.bfloat16)).float()
-        logits_finite &= zf.isfinite().all(-1)
+        chunk_finite = zf.isfinite().all(-1)
+        logits_finite &= chunk_finite.to(sums_on)
         if shift is None:
             # The mean of finite float32 logits is finite, so the cast back is too.
-            shift = _row_sum(zf, acc, zf.shape[-1]).to(torch.float32).unsqueeze(-1)
+            shift = _row_sum(zf, acc, zf.shape[-1], sums_on).to(device=x.device, dtype=torch.float32).unsqueeze(-1)
         # One pass each, reduced in float32 within the chunk and added up across chunks
         # in `acc`: per-element float64 sums cost as much as the two GEMMs on CPU.
-        lse = torch.logaddexp(lse, torch.logsumexp(zf, -1).to(acc))
-        sq += _square_norm(zf, acc)
-        gap += _square_norm(zb.sub_(zf), acc)
+        lse = torch.logaddexp(lse, torch.logsumexp(zf, -1).to(sums_on).to(acc))
+        sq += _square_norm(zf, acc, sums_on)
+        gap += _square_norm(zb.sub_(zf), acc, sums_on)
         d = zf.sub_(shift)  # zf is not used again in this chunk
-        dmean += _row_sum(d, acc, vocab)  # each chunk's share of the mean: bounded on MPS too
-        dsq += _square_norm(d, acc)
+        part_mean = _row_sum(d, acc, vocab, sums_on)  # each chunk's share of the mean
+        part_sq = _square_norm(d, acc, sums_on)
+        # A float64 squared norm of finite float32 values cannot overflow, so one that is not finite
+        # is a row of `d` holding an Inf: with finite logits, a difference that overflowed. Read from
+        # one value per position, so the chunk is not passed over again.
+        where = chunk_finite.to(sums_on) & ~part_sq.isfinite()
+        if bool(where.any()):  # a sync, as the probe's histograms make: it is rare
+            broke = where.to(x.device)
+            z = F.linear(xf[broke], w.float(), None if b is None else b.float())
+            part_mean[where], part_sq[where] = _centred(z, shift[broke], acc, vocab, sums_on)
+        dmean += part_mean
+        dsq += part_sq
     assert shift is not None
     mean_d = dmean
     return {
         "norm": sq.sqrt(),
-        "mean": shift.squeeze(-1).to(acc) + mean_d,
+        "mean": shift.squeeze(-1).to(sums_on).to(acc) + mean_d,
         "var": (dsq / vocab - mean_d.square()).clamp_min(0),
         "log_z": lse,
         "gap_sq": gap,
@@ -339,37 +358,54 @@ def _head_logit_sums(hidden: torch.Tensor, weight: torch.Tensor, bias: torch.Ten
     }
 
 
-def _row_sum(t: torch.Tensor, acc: torch.dtype, divide: int) -> torch.Tensor:
-    """Each row's sum over `divide`, in `acc`. A float32 sum overflows once its partial sums pass
-    float32's range, though every entry is finite (eight logits of 3e38); then each such row is
-    divided by its largest magnitude first, summed, divided by `divide` and multiplied back in
-    `acc`, so a mean of finite values is finite even in float32 (MPS). The common case costs one
-    sum and one sync on a value per row, as `_square_norm`; only the rows whose sum is not finite
-    are taken again, so a position with a NaN does not make every row pay. A row holding a NaN or
-    an Inf stays non-finite."""
+def _centred(z: torch.Tensor, shift: torch.Tensor, acc: torch.dtype, divide: int,
+             device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """The sum over `divide` and the squared norm of `z - shift`, row by row, in `acc` on `device`,
+    for rows whose float32 difference overflows though `z` and `shift` are finite. Both are halved
+    first, which is exact for every normal float32 and leaves `z / 2 - shift / 2` within float32's
+    range (each half is at most half of its largest value); the halves' sums are doubled, and the
+    squared norm quadrupled, in `acc`. A half that falls below float32's normal range loses its
+    last bits, at a size no difference these rows hold can show."""
+    half = z * 0.5 - shift * 0.5
+    return _row_sum(half, acc, divide, device) * 2, _square_norm(half, acc, device) * 4
+
+
+def _row_sum(t: torch.Tensor, acc: torch.dtype, divide: int, device: torch.device | None = None) -> torch.Tensor:
+    """Each row's sum over `divide`, in `acc` on `device` (the rows' own when None). A float32 sum
+    overflows once its partial sums pass float32's range, though every entry is finite (eight
+    logits of 3e38); then each such row is divided by its largest magnitude first, summed, divided
+    by `divide` and multiplied back in `acc`, so a mean of finite values is finite. The common case
+    costs one sum and one sync on a value per row, as `_square_norm`; only the rows whose sum is not
+    finite are taken again, so a position with a NaN does not make every row pay. A row holding a
+    NaN or an Inf stays non-finite."""
+    device = t.device if device is None else device
     total = t.sum(-1)
     bad = ~total.isfinite()
-    out = total.to(acc) / divide
+    out = total.to(device).to(acc) / divide
     if not bool(bad.any()):  # a sync, as the probe's histograms make: it is rare
         return out
     rows = t[bad]
     top = rows.abs().amax(-1, keepdim=True)
     top = torch.where(top.isfinite() & (top > 0), top, torch.ones_like(top))
-    out[bad] = (rows / top).sum(-1).to(acc) / divide * top.squeeze(-1).to(acc)
+    scaled = (rows / top).sum(-1).to(device).to(acc)
+    out[bad.to(device)] = scaled / divide * top.squeeze(-1).to(device).to(acc)
     return out
 
 
-def _square_norm(t: torch.Tensor, acc: torch.dtype) -> torch.Tensor:
-    """Each row's squared L2 norm, in `acc`. `vector_norm` in float32 overflows once a row's
-    sum of squares passes float32's range (finite logits of about 1e19 over a large
-    vocabulary); then each row is divided by its largest magnitude first, and its norm
-    multiplied back in `acc`. A row holding a NaN or an Inf stays non-finite."""
+def _square_norm(t: torch.Tensor, acc: torch.dtype, device: torch.device | None = None) -> torch.Tensor:
+    """Each row's squared L2 norm, in `acc` on `device` (the rows' own when None). `vector_norm`
+    in float32 overflows once a row's sum of squares passes float32's range (finite logits of about
+    1e19 over a large vocabulary); then each row is divided by its largest magnitude first, and its
+    norm multiplied back in `acc`. Only the norm crosses to `device`, so a float32 norm up to
+    float32's largest value is squared in `acc`. A row holding a NaN or an Inf stays non-finite."""
+    device = t.device if device is None else device
     norm = torch.linalg.vector_norm(t, dim=-1)
     if not bool(norm.isinf().any()):  # a sync, as the probe's histograms make: it is rare
-        return norm.to(acc).square()
+        return norm.to(device).to(acc).square()
     top = t.abs().amax(-1, keepdim=True)
     top = torch.where(top.isfinite() & (top > 0), top, torch.ones_like(top))
-    return (torch.linalg.vector_norm(t / top, dim=-1).to(acc) * top.squeeze(-1).to(acc)).square()
+    scaled = torch.linalg.vector_norm(t / top, dim=-1).to(device).to(acc)
+    return (scaled * top.squeeze(-1).to(device).to(acc)).square()
 
 
 def _head_numbers(calls: list[dict[str, Any]]) -> dict[str, Any]:
@@ -377,11 +413,16 @@ def _head_numbers(calls: list[dict[str, Any]]) -> dict[str, Any]:
     included: the probe has no mask for the head). Positions whose FP32 logits hold a NaN
     or an Inf are left out and counted (`nonfinite_positions`); so are positions whose logits
     are finite but whose numbers below still overflow (`overflow_positions`, listed only when
-    there are some): a BF16 logit past BF16's range, a squared norm past `acc`'s (float32 on
-    MPS: norms above about 1.8e19), or FP32 logits within a factor of two of float32's largest
-    value with both signs, whose difference from the row's mean overflows. A mean whose float32
-    sum overflows is read (`_row_sum`). Over positions t and vocabulary
-    entries v of the FP32 logits z:
+    there are some). Since lane AD3 that is one case only: the BF16 pass overflows, a BF16 logit
+    past BF16's range (about 3.39e38, below float32's 3.40e38), or a hidden state or weight that
+    casts to an Inf in BF16. That cannot be read: BF16's own logit is then an Inf, so `gap`,
+    the distance between it and the FP32 logit, has no finite value, and any number written for it
+    would be made up. The position's other numbers are not read either, so that `positions` counts
+    the same positions for every number. Read, and no longer counted (C22): a mean whose float32
+    sum overflows (`_row_sum`, lane X4); a squared norm past float32's range on MPS, norms above
+    about 1.8e19, now added in float64 on the CPU; and FP32 logits within a factor of two of
+    float32's largest value with both signs, whose difference from the row's mean overflows
+    (`_centred`). Over positions t and vocabulary entries v of the FP32 logits z:
 
     - `norm`: the mean over t of the L2 norm of z_t over the vocabulary.
     - `mean`: the signed mean of z over every t and v.
