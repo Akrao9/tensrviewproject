@@ -47,7 +47,7 @@ fn number(value: &Value) -> Option<f64> {
 
 /// The record keys with a column of their own, as `_FIELDS` in `flight.py` names them, that these
 /// cases hold; and the key columns. Every other key travels in `extra_json`.
-const OWN: [&str; 15] = [
+const OWN: [&str; 16] = [
     "run_id",
     "rank",
     "attempt",
@@ -63,6 +63,7 @@ const OWN: [&str; 15] = [
     "moe",
     "moe_top_k",
     "scalars",
+    "probe",
 ];
 
 fn float_map(records: &[Value], key: &str) -> ArrayRef {
@@ -178,6 +179,15 @@ pub(super) fn stored(records: &[Value]) -> RecordBatch {
                 records
                     .iter()
                     .map(|r| r.get("layers").map(Value::to_string))
+                    .collect::<Vec<_>>(),
+            )),
+        ),
+        (
+            "probe_json",
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|r| r.get("probe").map(Value::to_string))
                     .collect::<Vec<_>>(),
             )),
         ),
@@ -523,5 +533,47 @@ fn a_router_reported_since_its_start_carries_what_was_logged_at_its_first_step()
     assert_eq!(
         found["scalars"],
         json!({"loss": {"value": 10.0, "median_before": null}})
+    );
+}
+
+/// Part 1's table, the rows no case has: `attention_collapse` and `attention_logit_growth` score
+/// each module against the probes of its baseline, at most `ATTN_WINDOW` = 5, so the score is
+/// always null with `short_history`; `attention_uniform` has a `rise`, not a ratio, and no score.
+#[test]
+fn the_attention_kinds_score_against_their_few_probes_and_uniform_has_no_score() {
+    let probe = |share: f64, logit: f64, uniform: f64| {
+        json!({"attention": {
+            "a": {"entropy_share": [share, share], "max_logit": [logit, logit]},
+            "b": {"entropy_share": [uniform, uniform], "max_logit": [2.0, 2.0]},
+        }})
+    };
+    let records: Vec<Value> = (0..6)
+        .map(|at| {
+            let late = at >= 3;
+            json!({"step": 100 * at, "probe": probe(if late { 0.2 } else { 0.6 }, if late { 5.0 } else { 2.0 },
+                                                    if late { 0.99 } else { 0.6 })})
+        })
+        .collect();
+    let report = judged(&records);
+    let module = |kind: &str| incident(&report, kind)["modules"][0].clone();
+    for kind in ["attention_collapse", "attention_logit_growth"] {
+        let hit = module(kind);
+        assert_eq!(hit["module"], "a", "{kind}: {hit}");
+        assert!(hit["ratio"].is_number(), "{kind}: {hit}");
+        assert_eq!(
+            (hit.get("score"), hit.get("score_note")),
+            (Some(&Value::Null), Some(&json!("short_history"))),
+            "{kind}: {hit}"
+        );
+    }
+    let uniform = module("attention_uniform");
+    assert_eq!(uniform["module"], "b", "{uniform}");
+    assert!(
+        uniform["rise"].is_number() && uniform.get("ratio").is_none(),
+        "{uniform}"
+    );
+    assert!(
+        uniform.get("score").is_none() && uniform.get("score_note").is_none(),
+        "{uniform}"
     );
 }
