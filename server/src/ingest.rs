@@ -32,7 +32,10 @@
 //! the refused bytes: `{"end_byte_offset": S, "refused": {"start_byte_offset": S, "end_byte_offset": E,
 //! "column"}, "store_id"}` (`DETECTOR_RULES_CONTRACT.md` part 8, from Nov 21, 2026; see
 //! `Ingest::confirm_refusal` for S). A sender that sent exactly bytes S to E may take E as its offset
-//! and not send them again; any other sender reads it as an acknowledgement of S, which it has.
+//! and not send them again; any other sender reads it as an acknowledgement of S, which it has. A
+//! batch's metadata may also claim where it begins, `start_byte_offset` (senders from wave AE on):
+//! a server that has acknowledged nothing for the rank since it started names the refused range
+//! from there, and acknowledges 0, as it does without the claim.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -291,6 +294,11 @@ struct BatchMetadata {
     /// attempt, and an attempt first seen in this stream's rows is placed just before it.
     #[serde(default)]
     sender_attempt: Option<i64>,
+    /// Where the batch begins in the sender's file (senders from wave AE on; RS10). A claim, read
+    /// only to name a refused batch's bytes when the server knows nothing of where they began (see
+    /// `Ingest::confirm_refusal`); never an acknowledgement and never a position the server keeps.
+    #[serde(default)]
+    start_byte_offset: Option<i64>,
 }
 
 /// One `DoPut` stream of a rank: the attempt its first batch named, and whether it counts for the
@@ -394,6 +402,27 @@ struct RankBuffer {
     /// The last offset this server acknowledged for the rank, on any of its streams: where a stream
     /// whose own batches have not been accepted yet is taken to have begun (RS10's refusal).
     acknowledged: Option<i64>,
+    /// The highest step kept for the buffered attempt when the buffered part began (L30): a row not
+    /// stored for a step above it, and not one the part kept, arrived out of order inside the part.
+    part_base: Option<i64>,
+    /// The distinct steps confirmed so far to have arrived out of order inside the buffered part and
+    /// not stored (L30), counted in `late_steps_confirmed` when the part is stored. At most one per
+    /// row received while the part is open.
+    late_steps: std::collections::BTreeSet<i64>,
+}
+
+impl RankBuffer {
+    /// The buffered part holds a row of `attempt` at `step`. Its batches' steps rise from one row to
+    /// the next and from one batch to the next, so each batch is searched by its bounds.
+    fn holds(&self, attempt: i64, step: i64) -> bool {
+        self.attempt == attempt
+            && self.batches.iter().any(|batch| {
+                batch
+                    .column_by_name("step")
+                    .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                    .is_some_and(|steps| steps.values().binary_search(&step).is_ok())
+            })
+    }
 }
 
 impl RankBuffer {
@@ -613,18 +642,33 @@ impl Ingest {
     /// Tells the sender, before the status that ends its stream, which bytes were refused for good
     /// (RS10, `DETECTOR_RULES_CONTRACT.md` part 8): one message on the acknowledgement channel,
     /// `{"end_byte_offset": S, "refused": {"start_byte_offset": S, "end_byte_offset": E, "column"},
-    /// "store_id"}`, E being the end the refused batch claimed. First everything the rank holds is
+    /// "store_id"}`, E being the end the refused batch claimed (the outer offset is 0, not S, when S
+    /// is the sender's own claim; below). First everything the rank holds is
     /// stored, so S, and every row the stream sent before the refused batch, are stored: nothing is
     /// acknowledged past the refused batch, and a sender that takes E as its offset loses no row the
     /// server could have stored. S is where the refused batch began, as far as the server can know it:
     /// the end of the last batch this stream sent that the server accepted; for a stream none of
     /// whose batches was accepted yet, the last offset this server acknowledged for the rank (the one
-    /// the sender saved, if that acknowledgement reached it); with neither, 0. A sender confirms the
-    /// refusal only when S and E are the bytes it sent, so a wrong guess moves nothing. When the store
+    /// the sender saved, if that acknowledgement reached it); with neither, the start the refused
+    /// batch's metadata claims (`start_byte_offset`, senders from wave AE on), when it is below E;
+    /// else 0. The claim names the range only: the message's own `end_byte_offset`, which every
+    /// sender reads as an acknowledgement, stays at what the server holds (the stream's accepted end,
+    /// the rank's last acknowledged offset, or 0), so the server never vouches for bytes on a
+    /// sender's word. (Until wave AE a server that had started again since the sender's last
+    /// acknowledgement named the range from byte 0, and the sender, whose range begins at its saved
+    /// offset, sent the batch again at every stream.) A sender confirms the refusal only when S and
+    /// E are the bytes it sent, so a wrong guess, or a wrong claim, moves nothing. When the store
     /// cannot be written nothing is said, and the sender keeps its offset. `store_id` is there because
     /// a sender reads every message on the channel as an acknowledgement, and the first one names
     /// the store it binds to (L3).
-    async fn confirm_refusal(&self, key: &Key, column: &'static str, end_byte_offset: i64, ack: &AckSender) {
+    async fn confirm_refusal(
+        &self,
+        key: &Key,
+        column: &'static str,
+        end_byte_offset: i64,
+        claimed: Option<i64>,
+        ack: &AckSender,
+    ) {
         let Ok(store_id) = self.store_id().await else {
             return;
         };
@@ -633,17 +677,26 @@ impl Ingest {
         if self.flush(key, &mut buffer).await.is_err() {
             return;
         }
-        let start = match ack.tally.accepted.load(Ordering::SeqCst) {
+        let accepted = ack.tally.accepted.load(Ordering::SeqCst);
+        let held = match accepted {
             accepted if accepted >= 0 => accepted,
             _ => buffer.acknowledged.unwrap_or(0),
         };
+        let start = match claimed {
+            Some(claimed)
+                if accepted < 0 && buffer.acknowledged.is_none() && (0..end_byte_offset).contains(&claimed) =>
+            {
+                claimed
+            }
+            _ => held,
+        };
         let reply = serde_json::json!({
-            "end_byte_offset": start,
+            "end_byte_offset": held,
             "refused": {"start_byte_offset": start, "end_byte_offset": end_byte_offset, "column": column},
             "store_id": store_id,
         });
         ack.acknowledge(
-            start,
+            held,
             PutResult {
                 app_metadata: reply.to_string().into(),
             },
@@ -796,11 +849,11 @@ impl Ingest {
         &self,
         key: &Key,
         batch: RecordBatch,
-        end_byte_offset: i64,
-        world_size: Option<i32>,
-        sender: Option<i64>,
+        metadata: &BatchMetadata,
         ack: &AckSender,
     ) -> Result<(), Status> {
+        let (end_byte_offset, claimed_start) = (metadata.end_byte_offset, metadata.start_byte_offset);
+        let (world_size, sender) = (metadata.world_size, metadata.sender_attempt);
         // No batch is taken before the store's ID is known, so every acknowledgement can carry it (L3).
         self.store_id()
             .await
@@ -823,7 +876,8 @@ impl Ingest {
                 Err(refused) => {
                     if let Some(column) = refused.column {
                         self.batch_refused(key, column, end_byte_offset).await;
-                        self.confirm_refusal(key, column, end_byte_offset, ack).await;
+                        self.confirm_refusal(key, column, end_byte_offset, claimed_start, ack)
+                            .await;
                     }
                     return Err(refused.status);
                 }
@@ -845,8 +899,11 @@ impl Ingest {
         let owner = self.watchdog.owner(key);
         let mut progressed: Option<(i64, i64)> = None;
         let mut superseded = 0;
+        let mut not_newer = 0;
         for (attempt, batch) in pieces {
-            if let Some((last, rows)) = self.accept_attempt(key, attempt, batch, &mut buffer).await? {
+            let (kept, discarded) = self.accept_attempt(key, attempt, batch, &mut buffer).await?;
+            not_newer += discarded;
+            if let Some((last, rows)) = kept {
                 if owner.is_none_or(|owner| owner == attempt) {
                     progressed = Some((attempt, last));
                 } else {
@@ -862,6 +919,9 @@ impl Ingest {
         }
         let now = Instant::now();
         self.watchdog.superseded(key, superseded, now);
+        // L30: every row not stored for a step that was not newer, on arrival. A row sent again is
+        // counted again; which of them arrived late is counted apart, when their part is stored.
+        self.watchdog.not_newer(key, not_newer, now);
         self.watchdog.batch(
             key,
             progressed.map_or(owner.unwrap_or(buffer.attempt), |(attempt, _)| attempt),
@@ -881,25 +941,38 @@ impl Ingest {
         // The query's answer names offset 0 on its stream. That is not an offset the rank's rows were
         // acknowledged to, so what the server last acknowledged for the rank stays as it was: a
         // refusal that follows the query names it as where the refused bytes began, which is the
-        // offset the returning sender saved (RS10, wave AD's trial).
+        // offset the returning sender saved (RS10, wave AD's trial). A server that has acknowledged
+        // nothing for the rank (one that started again since) still holds nothing after the query
+        // (wave AE; until then the query's 0 was kept, and a refusal named its bytes from byte 0).
         let held = buffer.acknowledged;
         if buffer.batches.is_empty() || buffer.rows >= self.config.flush_steps {
             self.flush(key, &mut buffer).await?;
         }
-        if question && held.is_some() {
+        if question {
             buffer.acknowledged = held;
         }
         Ok(())
     }
 
-    /// Buffers the new rows of a batch whose rows all belong to one attempt.
+    /// Buffers the new rows of a batch whose rows all belong to one attempt. Returns the last step
+    /// and the rows kept, if any, and how many rows were not kept because their step was not newer.
+    ///
+    /// Of those, the steps confirmed to have arrived out of order inside the buffered part (L30,
+    /// contract section 6) are taken into `RankBuffer::late_steps`, to be counted when the part is
+    /// stored: a step above the highest step kept when the part began (`part_base`, or the
+    /// attempt's watermark when this batch begins a part), not kept by the part or by this batch,
+    /// and not confirmed before in the part. Such a step is in no part stored before, so it is not
+    /// a replay of stored rows; it is not one this part counted, so a batch sent again while the
+    /// part is open adds nothing; and one sent again after the part is stored is at or below the
+    /// next part's base. They are taken only where the batch's rows are, after every flush that can
+    /// fail, so a batch refused and sent again is not counted twice.
     async fn accept_attempt(
         &self,
         key: &Key,
         attempt: i64,
         batch: RecordBatch,
         buffer: &mut RankBuffer,
-    ) -> Result<Option<(i64, usize)>, Status> {
+    ) -> Result<(Option<(i64, usize)>, u64), Status> {
         let watermark = match buffer.watermarks.get(&attempt) {
             Some(watermark) => *watermark,
             None => {
@@ -912,7 +985,28 @@ impl Ingest {
                 stored
             }
         };
-        let (batch, first, last) = keep_new_rows(key, batch, watermark)?;
+        let (batch, first, last, discarded) = keep_new_rows(key, batch, watermark)?;
+        // Where the part these rows go into began: the buffered part, when it is of this attempt, or
+        // a part this batch begins.
+        let open = buffer.attempt == attempt && !buffer.batches.is_empty();
+        let base = if open { buffer.part_base } else { watermark };
+        let mut late = std::collections::BTreeSet::new();
+        if !discarded.is_empty() {
+            let kept = batch
+                .column_by_name("step")
+                .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                .map(|steps| steps.values().to_vec())
+                .unwrap_or_default();
+            for &step in &discarded {
+                if base.is_none_or(|base| step > base)
+                    && kept.binary_search(&step).is_err()
+                    && !(open && (buffer.holds(attempt, step) || buffer.late_steps.contains(&step)))
+                {
+                    late.insert(step);
+                }
+            }
+        }
+        let not_newer = discarded.len() as u64;
         if batch.num_rows() > 0 {
             if buffer.sealed {
                 self.flush(key, buffer).await?;
@@ -935,7 +1029,9 @@ impl Ingest {
             if buffer.batches.is_empty() {
                 buffer.min_step = first;
                 buffer.since = Some(Instant::now());
+                buffer.part_base = watermark;
             }
+            buffer.late_steps.append(&mut late);
             buffer.attempt = attempt;
             buffer.max_step = last;
             buffer.watermarks.insert(attempt, Some(last));
@@ -943,9 +1039,11 @@ impl Ingest {
             buffer.rows += rows;
             buffer.bytes += bytes;
             buffer.batches.push(batch);
-            return Ok(Some((last, rows)));
+            return Ok((Some((last, rows)), not_newer));
         }
-        Ok(None)
+        // No row kept: a step is confirmed late only behind a row of the open part (`open`).
+        buffer.late_steps.append(&mut late);
+        Ok((None, not_newer))
     }
 
     /// Stores what the buffer holds as one part, then acknowledges the offset it covers.
@@ -989,6 +1087,9 @@ impl Ingest {
                     entry.behind_since = Some(Instant::now());
                 }
             }
+            // L30: the steps confirmed late inside the part are counted now that it is stored.
+            let late = std::mem::take(&mut buffer.late_steps).len() as u64;
+            self.watchdog.late_confirmed(key, late, Instant::now());
             self.used.fetch_sub(buffer.bytes, Ordering::SeqCst);
             stored = std::mem::take(&mut buffer.batches);
             buffer.rows = 0;
@@ -1437,15 +1538,7 @@ impl Ingest {
                 self.reconcile_streams(key);
             }
             let question = batch.num_rows() == 0 && metadata.end_byte_offset == 0;
-            self.accept(
-                key,
-                batch,
-                metadata.end_byte_offset,
-                metadata.world_size,
-                metadata.sender_attempt,
-                ack,
-            )
-            .await?;
+            self.accept(key, batch, &metadata, ack).await?;
             if !question {
                 tally.accepted.store(metadata.end_byte_offset, Ordering::SeqCst);
             }
@@ -2117,9 +2210,12 @@ fn split_by_attempt(batch: RecordBatch) -> Result<Vec<(i64, RecordBatch)>, Statu
     Ok(runs)
 }
 
+/// The kept rows of a batch, their first and last step, and the steps of the rows not kept.
+type NewRows = (RecordBatch, i64, i64, Vec<i64>);
+
 /// Drops rows whose step is not above `watermark` or above the rows before them. Returns
-/// the kept rows with their first and last step.
-fn keep_new_rows(key: &Key, batch: RecordBatch, watermark: Option<i64>) -> Result<(RecordBatch, i64, i64), Status> {
+/// the kept rows with their first and last step, and the step of every row dropped, in order.
+fn keep_new_rows(key: &Key, batch: RecordBatch, watermark: Option<i64>) -> Result<NewRows, Status> {
     fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T, Status> {
         batch
             .column_by_name(name)
@@ -2138,12 +2234,15 @@ fn keep_new_rows(key: &Key, batch: RecordBatch, watermark: Option<i64>) -> Resul
     }
     let mut mark = watermark;
     let mut first = None;
+    let mut discarded = Vec::new();
     let mut keep = BooleanBuilder::with_capacity(steps.len());
     for step in steps.values() {
         let new = mark.is_none_or(|mark| *step > mark);
         if new {
             mark = Some(*step);
             first.get_or_insert(*step);
+        } else {
+            discarded.push(*step);
         }
         keep.append_value(new);
     }
@@ -2153,7 +2252,7 @@ fn keep_new_rows(key: &Key, batch: RecordBatch, watermark: Option<i64>) -> Resul
     } else {
         filter_record_batch(&batch, &keep).map_err(|error| Status::internal(error.to_string()))?
     };
-    Ok((batch, first.unwrap_or(0), mark.unwrap_or(0)))
+    Ok((batch, first.unwrap_or(0), mark.unwrap_or(0), discarded))
 }
 
 /// The bytes the batch's rows occupy. Not `get_array_memory_size`: the columns of a decoded

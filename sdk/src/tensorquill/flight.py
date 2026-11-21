@@ -993,14 +993,18 @@ class FlightSender:
         except Exception:  # noqa: BLE001  a closed stderr is not the stream's failure
             pass
 
-    def _sent(self, data: bytes, end: int) -> None:
-        """Move the identity windows past `data`, the bytes just sent, which end at `end`."""
+    def _sent(self, data: bytes, end: int) -> int:
+        """Move the identity windows past `data`, the bytes just sent, which end at `end`, and return
+        where they begin: the start a refusal of them must name (RS10), which the batch's metadata
+        states too (`start_byte_offset`)."""
+        start = end - len(data)
         if len(self._head) < HEAD_BYTES:
             self._head += data[: HEAD_BYTES - len(self._head)]
         self._tail = (self._tail + data[-TAIL_BYTES:])[-TAIL_BYTES:]
         with self._pending_lock:
             self._pending[end] = {"head": _digest(self._head), "tail": _digest(self._tail)}
-            self._starts[end] = end - len(data)  # where the batch that ends here began (RS10)
+            self._starts[end] = start  # where the batch that ends here began (RS10)
+        return start
 
     def _ack(self, offset: int, store_id: str | None = None) -> None:
         """Take the server's ack of `offset`, which names `store_id` when the server names its store.
@@ -1097,9 +1101,13 @@ class FlightSender:
             waiting_since: float | None = None
             first_batch = True
 
-            def metadata_for(end: int, steps: list[int], asking: bool = False) -> bytes:
+            def metadata_for(end: int, steps: list[int], asking: bool = False, start: int | None = None) -> bytes:
                 """A batch's metadata. The empty batch that asks for the store (`asking`) carries no
-                manifest: that rides on the stream's first batch of rows, as before the question."""
+                manifest: that rides on the stream's first batch of rows, as before the question.
+                A batch of rows states where its bytes begin (`start`, RS10, wave AE): a server that
+                has acknowledged nothing for the rank since it started names a refusal of the batch
+                from there. It is the same number `_starts` holds, so a refusal that names it is one
+                `_refusal` can confirm; the asking batch claims no bytes and states none."""
                 nonlocal first_batch
                 metadata = {
                     "schema_version": SCHEMA_VERSION,
@@ -1108,6 +1116,8 @@ class FlightSender:
                     "min_step": min(steps) if steps else None,
                     "max_step": max(steps) if steps else None,
                     "end_byte_offset": end,
+                    # Optional, and unknown to a server older than it, which ignores it.
+                    **({"start_byte_offset": start} if start is not None and not asking else {}),
                     **({"world_size": self.world_size} if self.world_size else {}),
                     # Optional, and unknown to a server older than it, which ignores it.
                     **({"sender_attempt": self._attempt} if self._attempt is not None else {}),
@@ -1159,8 +1169,8 @@ class FlightSender:
                         self.skipped_lines += skipped + unstorable
                         if moved:
                             self._say_moved(moved)
-                        metadata = metadata_for(end, steps)
-                        self._sent(b"".join(line + b"\n" for line in lines), end)
+                        start = self._sent(b"".join(line + b"\n" for line in lines), end)
+                        metadata = metadata_for(end, steps, start=start)
                         writer.write_with_metadata(batch, pa.py_buffer(metadata))
                         sent = life["sent"] = end
                         life["batches"] += 1

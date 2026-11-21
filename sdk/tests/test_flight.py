@@ -131,7 +131,7 @@ def test_offset_file_matches_file_size_after_close(tmp_path, store, server):
     # 50 steps per batch, and the metadata the server contract names.
     assert [b["max_step"] for b in store.batches] == [49, 99, 119]
     assert store.batches[0] == {"schema_version": 1, "run_id": "run-a", "rank": 0, "min_step": 0,
-                                "max_step": 49, "rows": 50,
+                                "max_step": 49, "rows": 50, "start_byte_offset": 0,
                                 "end_byte_offset": store.batches[0]["end_byte_offset"]}
     assert store.batches[-1]["end_byte_offset"] == path.stat().st_size
 
