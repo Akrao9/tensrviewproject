@@ -218,5 +218,5 @@ The tests, and what each one shows today:
 
 ## What changes in files that are frozen or shown
 
-- **Golden files.** `everything.json` holds one `activation_drift` incident at step 185; it stays at that step with another ratio and count. Every incident with a `ratio` gains `score`. Every evidence file whose records hold gradient norms, update sizes, weight checks or six probes gains its measurement block.
+- **Golden files.** `everything.json` holds one `activation_drift` incident at step 185; it stays at that step with the same ratio (3.62), and its `affected_steps` goes from 115 to 29. (Corrected Nov 21, 2026: this note first said the ratio changes too. Lane AD8 found it does not, and the reference rule agrees.) Every incident with a `ratio` gains `score`. Every evidence file whose records hold gradient norms, update sizes, weight checks or six probes gains its measurement block.
 - **Gate 1.** Not read yet. Once this page is signed the frozen rules are run over Gate 1 once, and every change to what an arm is shown is reported for the author's amendment before the final trial.
