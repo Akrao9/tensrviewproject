@@ -85,11 +85,13 @@ def _entry(record_id, seq, state="completed"):
             "record_id": record_id, "is_p2p": False}
 
 
-def _constructed_dumps(directory: Path, skip_rank: int, skip_step: int, world: int = 3) -> None:
+def _constructed_dumps(directory: Path, skip_rank: int, skip_step: int, world: int = 3, absent=()) -> None:
     """CONSTRUCTED dumps in the analyzer's test format: one all_reduce per step, rank `skip_rank` never
-    entered step `skip_step`'s, the others started it and never finished."""
+    entered step `skip_step`'s, the others started it and never finished. Ranks in `absent` write none."""
     directory.mkdir()
     for rank in range(world):
+        if rank in absent:
+            continue
         entries = [_entry(i, i + 1) for i in range(skip_step)]
         if rank != skip_rank:
             entries.append(_entry(skip_step, skip_step + 1, "started"))
@@ -111,14 +113,27 @@ def test_the_check_holds_tensorquill_s_answer_against_the_plan(tmp_path):
     _constructed_dumps(tmp_path / "dumps", skip_rank=1, skip_step=5)
     incident = flight_recorder_incident(analyze_flight_recorder(tmp_path / "dumps", prefix=frc.PREFIX), step=3)
     evidence = {"incidents": [incident]}
-    failures, hit = frc._check(_plan(), evidence)
-    assert failures == [] and hit["kind"] == "collective_hang"
+    failures, unjudged, hit = frc._check(_plan(), evidence)
+    assert failures == [] and unjudged == [] and hit["kind"] == "collective_hang"
     # Each part of the plan is checked on its own.
     assert any("missing_ranks" in f for f in frc._check(_plan(skip_rank=2, waiting_ranks=[0, 1]), evidence)[0])
     assert any("collective_seq_id" in f for f in frc._check(_plan(collective_seq_id=5), evidence)[0])
     assert any("step" in f for f in frc._check(_plan(last_recorded_step=4), evidence)[0])
     assert any("collective 'all_reduce'" in f for f in frc._check(_plan(collective="broadcast"), evidence)[0])
     assert frc._check(_plan(), {"incidents": []})[0] == ["no collective_hang in the evidence (incidents: none)"]
+
+
+def test_a_rank_with_no_dump_is_not_taken_for_the_rank_at_fault(tmp_path):
+    # Without the skip rank's dump the analyzer's answer does not say which rank was at fault (on these
+    # constructed dumps it lists no missing rank at all); without every dump nothing is judged.
+    pytest.importorskip("torch.distributed.flight_recorder.components.builder")
+    from tensorquill.collectives import analyze_flight_recorder, flight_recorder_incident
+
+    _constructed_dumps(tmp_path / "dumps", skip_rank=1, skip_step=5, absent=(1,))
+    incident = flight_recorder_incident(analyze_flight_recorder(tmp_path / "dumps", prefix=frc.PREFIX), step=3)
+    assert incident["dumped_ranks"] == [0, 2] and incident["missing_ranks"] != [1]
+    failures, unjudged, _ = frc._check(_plan(), {"incidents": [incident]})
+    assert failures == [] and "ranks [1] wrote no dump" in unjudged[0]
 
 
 def test_the_hang_driver_refuses_a_plan_it_cannot_judge(tmp_path):
@@ -166,24 +181,41 @@ def test_the_wrapper_attaches_a_session_on_every_rank_beside_the_ground_truth(st
     assert sorted(fic.capture_files(captures)) == [0, 1, 2]
     for path in fic.capture_files(captures).values():
         steps = [record["step"] for record in fic._records(path)]
-        assert steps == list(range(1, 9))  # TensorQuill's step N is the iteration N; closed before teardown
+        assert steps == list(range(1, 31))  # TensorQuill's step N is the iteration N; closed before teardown
         assert path.with_name(path.name.replace(".jsonl", ".end.json")).exists()
 
 
 def test_tensorquill_names_the_planted_rank_and_step(stub_run):
     status, result = _compared(stub_run)
-    assert result["summary"]["found"] == 1 and result["missed"] == []
-    (occurrence,) = result["occurrences"]
-    assert occurrence["ranks"] == [2] and occurrence["iteration"] == 4
-    assert {(m["rank"], m["step"]) for m in occurrence["actions"][0]["matched_by"]} == {(2, 4)}
+    assert result["summary"]["occurrences"] == 3 and result["summary"]["found"] == 3 and result["missed"] == []
+    by_id = {o["occurrence_id"]: o for o in result["occurrences"]}
+    weight = by_id["stub-weight-noise#4"]
+    assert weight["ranks"] == [2] and {(m["rank"], m["step"]) for m in weight["actions"][0]["matched_by"]} == {(2, 4)}
     assert status == (fic.PASS if not result["false_reports"] else fic.FAIL)
+
+
+def test_the_per_rank_detectors_name_a_repeated_fault_at_each_of_its_steps(stub_run):
+    # The same kind twice on one rank: one grad_spike incident, its `step` the first and the second in
+    # `spike_steps`. Read from `step` alone, the second would have been credited only by replica attribution.
+    _, result = _compared(stub_run)
+    by_id = {o["occurrence_id"]: o for o in result["occurrences"]}
+    for occurrence, via in (("stub-gradient-scale#15", "step"), ("stub-gradient-scale#25", "spike_steps")):
+        per_rank = [m for m in by_id[occurrence]["actions"][0]["matched_by"] if m["source"] == "rank_evidence"]
+        assert [(m["kind"], m["rank"], m.get("via")) for m in per_rank] == [("grad_spike", 1, via)]
+    assert fic.incident_steps({"kind": "grad_spike", "step": 15, "spike_steps": [15, 25], "spike_count": 2,
+                               "affected_steps": 21}) == {15: "step", 25: "spike_steps"}
+
+
+def test_steps_that_are_not_the_campaign_s_iterations_are_not_proven(stub_run, tmp_path):
+    folder = _variant(stub_run, tmp_path, lambda i: i.update(completed_iterations=29))
+    assert fic.main(["--artifact-dir", str(folder)]) == fic.NOT_PROVEN
 
 
 def test_the_right_step_on_the_wrong_rank_is_not_found(stub_run, tmp_path):
     def wrong_rank(injection):
         injection["injections"][0]["execution_rank"] = 1
     status, result = _compared(_variant(stub_run, tmp_path, wrong_rank))
-    assert result["summary"]["found"] == 0 and status == fic.FAIL
+    assert "stub-weight-noise#4" in result["missed"] and status == fic.FAIL
     assert (2, 4) in {(r["rank"], r["step"]) for r in result["false_reports"]}
 
 
@@ -191,14 +223,15 @@ def test_the_right_rank_at_the_wrong_step_is_not_found(stub_run, tmp_path):
     def wrong_step(injection):
         injection["injections"][0]["iteration"] = 6
     status, result = _compared(_variant(stub_run, tmp_path, wrong_step))
-    assert result["summary"]["missed"] == 1 and status == fic.FAIL
+    assert result["missed"] == ["stub-weight-noise#4"] and status == fic.FAIL
+    assert (2, 4) in {(r["rank"], r["step"]) for r in result["false_reports"]}
 
 
 def test_a_failed_injection_is_not_scored_and_a_report_at_it_is_still_false(stub_run, tmp_path):
     def failed(injection):
         injection["injections"][0].update(status="failed", verified=False, injection_succeeded=False)
     status, result = _compared(_variant(stub_run, tmp_path, failed))
-    assert result["summary"]["occurrences"] == 0 and result["summary"]["not_injected"] == 1
+    assert result["summary"]["occurrences"] == 2 and result["summary"]["not_injected"] == 1
     at = [r for r in result["false_reports"] if (r["rank"], r["step"]) == (2, 4)]
     assert at and all(r["matches_record_not_injected"] == ["stub-weight-noise@4"] for r in at)
     assert status == fic.FAIL
@@ -216,7 +249,7 @@ def test_a_skipped_occurrence_is_left_out(stub_run, tmp_path):
     def skipped(injection):
         injection["injections"][0].update(status="skipped_probability", verified=False, injection_succeeded=False)
     _, result = _compared(_variant(stub_run, tmp_path, skipped))
-    assert result["summary"]["occurrences"] == 0 and result["summary"]["not_injected"] == 0
+    assert result["summary"]["occurrences"] == 2 and result["summary"]["not_injected"] == 0
 
 
 def test_every_action_of_a_correlated_occurrence_must_be_named_within_its_window():

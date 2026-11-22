@@ -22,7 +22,8 @@ TensorQuill's reports, from the captures alone (fixed before any run, Nov 22, 20
 from results):
 
 - every incident of every kind that the Python detectors list in each rank's evidence
-  (`tensorquill.build_evidence` on that rank's file), with that rank and the incident's `step`;
+  (`tensorquill.build_evidence` on that rank's file), with that rank, at its `step` and at each step
+  of any list of steps it holds under a key ending in `_steps` (`incident_steps`);
 - every `attributed` entry of the cross-rank replica comparison (`tensorquill.evidence.compare_replicas`
   over all ranks' records), once for each rank in its `outliers`, at its step;
 - a `replica_drift` incident names a step and no rank: listed under `unattributed`, never credited.
@@ -37,8 +38,9 @@ not injected is listed with that record, and is still false).
 
 Exit status: 0 when every occurrence is found and there is no false report (`--measure`: whenever the
 comparison was made), 1 otherwise, 2 bad arguments, 3 NOT PROVEN: no `injection.json`, a record that
-does not hold the documented fields, no capture, or captures for fewer ranks than the campaign's
-`world_size`. What counts as a pass for TensorQuill on this campaign is the author's call; strict is
+does not hold the documented fields, no capture, captures for other ranks than the campaign's
+`world_size`, or a rank whose last captured step is not the campaign's last iteration
+(`completed_iterations`; the step-to-iteration mapping is checked, not assumed). What counts as a pass for TensorQuill on this campaign is the author's call; strict is
 the default only because it hides nothing.
 
     python sdk/examples/fault_injection_check.py --artifact-dir runs/fault-injection
@@ -130,6 +132,27 @@ def _records(path: Path) -> list[dict[str, Any]]:
     return out
 
 
+def _is_step(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def incident_steps(incident: Mapping[str, Any]) -> dict[int, str]:
+    """Every step an incident names, with the key that names it. An incident is listed once per kind
+    and its `step` is the first; the later steps it covers are in a list under a key ending in
+    `_steps` (`spike_steps` of `grad_spike`, measured on a CPU toy Nov 22, 2026: a gradient scaled at
+    steps 25 and 45 gave one incident, step 25, with 45 in `spike_steps`). Such a list can be cut
+    short (`spike_count` above its length); a step beyond it is not named, and reads as a miss."""
+    steps: dict[int, str] = {}
+    if _is_step(incident.get("step")):
+        steps[incident["step"]] = "step"
+    for key, value in incident.items():
+        if key.endswith("_steps") and isinstance(value, list):
+            for step in value:
+                if _is_step(step):
+                    steps.setdefault(step, key)
+    return steps
+
+
 def tensorquill_reports(files: Mapping[int, Path]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Every rank-and-step TensorQuill named, and what it named with a step and no rank."""
     from tensorquill import build_evidence
@@ -142,12 +165,12 @@ def tensorquill_reports(files: Mapping[int, Path]) -> tuple[list[dict[str, Any]]
         every_record.extend(records)
         evidence = build_evidence(path, detectors="python")
         for incident in evidence.get("incidents", []):
-            step = incident.get("step")
-            entry = {"source": "rank_evidence", "kind": incident.get("kind"), "rank": rank, "step": step}
-            if isinstance(step, int) and not isinstance(step, bool):
-                reports.append(entry)
-            else:
-                unattributed.append({**entry, "why": "no step"})
+            steps = incident_steps(incident)
+            entry = {"source": "rank_evidence", "kind": incident.get("kind"), "rank": rank}
+            if not steps:
+                unattributed.append({**entry, "step": incident.get("step"), "why": "no step"})
+            for step, via in sorted(steps.items()):
+                reports.append({**entry, "step": step, "via": via})
     if len(files) > 1 and every_record:
         replica = compare_replicas(every_record)
         for entry in replica.get("attribution", []) or []:
@@ -181,7 +204,7 @@ def compare(actions: list[dict[str, Any]], not_injected: list[dict[str, Any]], r
             hits = [r for r in reports if matches(r, action)]
             matched.append({"injection_id": action["injection_id"], "rank": action["rank"], "window": action["window"],
                             "failure_type": action["failure_type"], "surface": action["surface"],
-                            "matched_by": [{k: r.get(k) for k in ("source", "kind", "rank", "step", "parameter")} for r in hits]})
+                            "matched_by": [{k: r.get(k) for k in ("source", "kind", "rank", "step", "via", "parameter") if k in r} for r in hits]})
         named = sum(bool(m["matched_by"]) for m in matched)
         evaluated.append({
             "occurrence_id": occurrence_id, "incident_id": members[0]["incident_id"],
@@ -192,7 +215,7 @@ def compare(actions: list[dict[str, Any]], not_injected: list[dict[str, Any]], r
     for report in reports:
         if not any(matches(report, action) for action in actions):
             near = [r["injection_id"] for r in not_injected if matches(report, r)]
-            false_reports.append({**{k: report.get(k) for k in ("source", "kind", "rank", "step", "iteration", "parameter")},
+            false_reports.append({**{k: report.get(k) for k in ("source", "kind", "rank", "step", "via", "iteration", "parameter") if k in report},
                                   **({"matches_record_not_injected": near} if near else {})})
     counts = {name: sum(e["result"] == name for e in evaluated) for name in ("found", "partial", "missed")}
     return {
@@ -237,6 +260,19 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError):
         pass
     start_step = int(attach.get("start_step", 1))
+    # Step alignment is checked, not assumed: each rank's last captured step must be the campaign's
+    # last iteration, so TensorQuill counted one step per iteration (SCOUT, GEMINI and the state reset
+    # run around the optimizer step).
+    completed = injection.get("completed_iterations")
+    if isinstance(completed, int):
+        last = {rank: max((r["step"] for r in _records(path) if _is_step(r.get("step"))), default=None)
+                for rank, path in files.items()}
+        expected_last = completed + start_step - 1
+        off = {rank: step for rank, step in last.items() if step != expected_last}
+        if off:
+            return not_proven(f"TensorQuill's last step is not the campaign's last iteration on ranks {sorted(off)} "
+                              f"(last steps {off}, expected {expected_last} for {completed} iterations from "
+                              f"start_step {start_step}): its steps cannot be read as iterations")
     reports, unattributed = tensorquill_reports(files)
     result = compare(actions, not_injected, reports, start_step=start_step)
     result.update({"campaign": injection.get("campaign"), "manifest_identity": injection.get("manifest_identity"),

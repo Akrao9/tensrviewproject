@@ -22,10 +22,14 @@ passes only when TensorQuill's evidence lists `collective_hang` with
   collective is the group's (K+1)th: one per step from step 0, sequence numbers from 1);
 - `missing_ranks` exactly `[skip_rank]` (the rank at fault) and `expected_ranks` minus that exactly the
   other ranks (the ranks that were waiting);
+- every rank of the job among `dumped_ranks`: without a rank's dump the analyzer cannot say whether it
+  entered, so without every dump the answer is NOT PROVEN, not judged;
 - `step` the last step the waiting rank has on disk, K-2. The dumps do not know the training step; the
   reader dates the incident by the capture, and the capture keeps its newest step back until the next
   step ends (`capture.py`, at `_flush(hold_newest=True)`: "A run that hangs or is killed in the next
-  step has one step fewer on disk"), so steps 0 to K-1 ran and 0 to K-2 are written.
+  step has one step fewer on disk"), so steps 0 to K-1 ran and 0 to K-2 are written. That holds for a
+  rank that is killed (SIGTERM, SIGKILL, or NCCL's abort), which is how this job ends; a session closed
+  by an exception (`with session:`) would write K-1, and the session has no exit hook of its own.
 
 How the dumps are written, from the installed torch 2.15 and the sibling `pytorch` source:
 
@@ -227,13 +231,22 @@ def _pytorch_analyzer(dumps: Path, env: dict[str, str]) -> dict[str, Any]:
     return {"command": command, "returncode": done.returncode, "last_line": tail[0][:400]}
 
 
-def _check(plan: dict[str, Any], evidence: dict[str, Any]) -> tuple[list[str], dict | None]:
-    """The plan against TensorQuill's evidence: the failures, and the incident judged."""
+def _check(plan: dict[str, Any], evidence: dict[str, Any]) -> tuple[list[str], list[str], dict | None]:
+    """The plan against TensorQuill's evidence: the failures, why it cannot be judged, and the incident.
+
+    With a rank's dump missing (the analyzer runs with `--allow-incomplete-ranks`), its answer cannot say
+    whether that rank entered the collective: on constructed dumps without the skipped rank's file it
+    lists no missing rank at all (`test_a_rank_with_no_dump_is_not_taken_for_the_rank_at_fault`). So the
+    answer is judged only when every rank of the job dumped."""
     hangs = [i for i in evidence.get("incidents", []) if i.get("kind") == "collective_hang"]
     if not hangs:
         kinds = sorted({str(i.get("kind")) for i in evidence.get("incidents", [])})
-        return [f"no collective_hang in the evidence (incidents: {kinds or 'none'})"], None
+        return [f"no collective_hang in the evidence (incidents: {kinds or 'none'})"], [], None
     hit = hangs[0]
+    absent = sorted(set(range(plan["nproc"])) - set(hit.get("dumped_ranks") or []))
+    if absent:
+        return [], [f"ranks {absent} wrote no dump, so whether they entered the collective cannot be read from the "
+                    f"dumps (missing_ranks {hit.get('missing_ranks')})"], hit
     failures = []
     if hit.get("collective") != plan["collective"]:
         failures.append(f"collective {hit.get('collective')!r}, planned {plan['collective']!r}")
@@ -246,7 +259,7 @@ def _check(plan: dict[str, Any], evidence: dict[str, Any]) -> tuple[list[str], d
         failures.append(f"waiting ranks (expected_ranks minus missing_ranks) {waiting}, planned {plan['waiting_ranks']}")
     if hit.get("step") != plan["last_recorded_step"]:
         failures.append(f"step {hit.get('step')!r}, planned {plan['last_recorded_step']} (the last step on disk)")
-    return failures, hit
+    return failures, [], hit
 
 
 def drive(args: argparse.Namespace) -> int:
@@ -397,9 +410,10 @@ def drive(args: argparse.Namespace) -> int:
             if result["not_checked"]:
                 failures.append(f"TensorQuill did not check the dumps: {result['not_checked'][0].get('reason')}")
             else:
-                found, hit = _check(plan, evidence)
+                found, unjudged, hit = _check(plan, evidence)
                 result["incident"] = hit
                 failures.extend(found)
+                not_proven.extend(unjudged)
                 if hit:
                     lines.append(f"TensorQuill: collective_hang on {hit.get('collective')} seq {hit.get('collective_seq_id')}, "
                                  f"missing (at fault) {hit.get('missing_ranks')}, expected {hit.get('expected_ranks')}, "
