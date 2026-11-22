@@ -297,7 +297,7 @@ That list also names work measured or specified earlier and missing from any act
 
 ## 13. Wave AH: the two findings of the CPU proofs, and the cross-check's corrections
 
-**Not in `main` when this was written.** `main` is at `eade0d1`. The code is the tree `trial/ah-wave` at `2ab1a5b2a18edf1670e20c772b049f6121e6cad4`, cut from `eade0d1`; this section and the plan's entry are a documents-only commit on top of it. Nothing is pushed. Not counted in the table at the top.
+**Not in `main` when this was written.** `main` is at `eade0d1`. The code is the tree `trial/ah-wave` at `28b00d1d70645f13e00f42a3810cc46cfa7458b8`, cut from `eade0d1`; this section and the plan's entry are documents-only commits (one before that commit, one after it). Nothing is pushed. Not counted in the table at the top.
 
 **Where it came from.** The six CPU proofs of the v1 plan ran on `eade0d1` on Nov 22, 2026 (`wave-af-proof-cpu.md` in the side-session notes, with raw output). Four passed or were measured with no finding: ingest across a 200-step server stop (900 of 900 steps, none twice), scale at 512 and 1,024 ranks, the support envelope, and the three older issues (two not reproduced in 10 runs each; the Linux exit of rank 0 cannot be checked on macOS). Two gave a finding each, and the author said to fix both ("Fix P1-1 ... Fix P5-1 in the same batch").
 
@@ -313,7 +313,7 @@ That list also names work measured or specified earlier and missing from any act
 - **Tests, committed failing first** (`604193d`; the fix is `69a1e0c`): the real `--watch --on-incident` command feeding the real stdio MCP server, for a watcher of rank 0, of rank 1 and of all ranks, against the run folder, each `rank=<n>` folder and the evidence file, on a store a real server wrote in which the two ranks show `non_finite` at step 30 and name different layers: each id finds its own rank's incident and never the other's. And on made evidence: the same kind twice at one step on one rank, a group of ranks, a stall of the run, the parse, and a state file from before.
 - **A limit, stated here:** where one rank lists the same kind twice at one step, the `#n` of a one-rank watcher and of a server opened on the run folder agree only while both list those incidents in the same order. Not seen to differ; not proven equal.
 
-**The cross-check (the plan's step 3.5), done read-only on `eade0d1`** (`wave-af-disposition-crosscheck.md`): every ID of the two older audits is accounted for, and the count table adds up to its 10 rows. It found 11 disagreements. As they stand on `2ab1a5b`:
+**The cross-check (the plan's step 3.5), done read-only on `eade0d1`** (`wave-af-disposition-crosscheck.md`): every ID of the two older audits is accounted for, and the count table adds up to its 10 rows. It found 11 disagreements. As they stand on `28b00d1`:
 
 | Found | Now |
 |---|---|
@@ -338,7 +338,7 @@ Also corrected, as stale text: section 12's head (it said `main` was at `76a3b5d
 
 **Accepted limits with no sentence in the user documents** (the cross-check's list; none was called "stated"): C16, RS17, B6 and B19, the `owners` and `forgotten` maps (RS-05), the full evidence's unbounded `replica.steps`, AUD-C1, and L26's "Others". The pending ledger asks for the first three to be kept in the documents. Not done here: the known-limits document is step 6 of the v1 plan.
 
-**The exit gate, run alone on `2ab1a5b2a18edf1670e20c772b049f6121e6cad4`**, Nov 22, 2026, 11:18 to 11:58, load average 5.0 at the start (from processes that were not the gate's) and 10.3 at the end. The head was the same at the end, the tree clean, no server left. Logs: `wave-ah-exit-gate/` in the side-session notes.
+**The exit gate, run alone on `28b00d1d70645f13e00f42a3810cc46cfa7458b8`**, Nov 22, 2026, 12:35 to 13:14, load average 3.3 at the start and 8.6 at the end. It had run first on `2ab1a5b` (11:18 to 11:58), every stage exit 0 with the same counts; a review before the exit then found three things, fixed in `28b00d1`, and the whole gate was run again on that commit (the first run's logs are kept beside the second's). The head was the same at the end, the tree clean, no server left. Logs: `wave-ah-exit-gate/` in the side-session notes.
 
 | Stage | Exit | Result |
 |---|---|---|
@@ -346,13 +346,18 @@ Also corrected, as stale text: section 12's head (it said `main` was at `76a3b5d
 | `cargo test` | 0 | 350 passed, 0 failed, 6 ignored |
 | `cargo test --no-default-features --lib` | 0 | 260 passed, 3 ignored |
 | Both `cargo clippy ... -D warnings` lines, `cargo fmt --check` | 0, 0, 0 | |
-| The full SDK suite, alone, with this tree's rebuilt binary | 0 | 5,612 passed, 6 skipped, in 34 min 26 s (5,591 on `d0f49f5`) |
+| The full SDK suite, alone, with this tree's rebuilt binary | 0 | 5,612 passed, 6 skipped, in 34 min 28 s (5,591 on `d0f49f5`) |
 | The compact fixture: the benchmark's healthy 10,000-step run | 0 | 10,446 bytes, under 12,000; `replica_line` and `incident_summary` equal the full evidence's |
 | `examples/replica_check.py` on 2, 3 and 8 CPU ranks, both arms, through files and a live server, and 3 ranks without NumPy | 0 | 13 runs, each exit 0; all 13 `verdict.json` files read code 0 with 0 failures; on every served run the engines agree on the steps, the incidents and the attribution |
 | Gate 1's `harness.py build` against the build on `f5ee53e` | 0 | 127 files each; no other file differs; the 14 recordings differ in bytes and log the same content |
 | Gate 1, bake-off and TrainCheck tests | 0, 0, 0 | 71, 37 and 18 passed |
 
-**The affected proofs, run again on `2ab1a5b`** with its own server, after the gate (`wave-ah-proofs/` in the side-session notes; proofs 1 and 1b side by side on two ports, load 8.8 at the start from the gate's end and 3 to 5 after).
+**What the review before the exit found, fixed in `28b00d1`.**
+- **The kept stall in the other views the finding named.** The printed all-ranks summary, the MCP status and the compact file already showed it; the all-ranks view's entry for a rank left `stopped_as` out. It carries it now, and the real-server test reads the held rank through all four.
+- **A stall's `mcp_id` went stale inside its episode.** In proof 1 the trigger fired `p1w/run/rank_silent@49`, and 30 s later the same stall read `job_stalled` at the run's step. `get_incident` now answers such an id with the run's stall as it reads now, with `looked_up_as`, while the run lists exactly one stall; once the stall is over the id finds nothing. A later, separate stall of the same run would be answered for an old id too: a limit, stated here.
+- **A sentence was wrong:** "a hung rank that is killed, comes back and still does not step is one firing". A killed process comes back as a new attempt, which ends the episode. One firing holds for a connection that drops and opens again under the same attempt. Corrected in the README and the trigger's notes.
+
+**The affected proofs, run again on `2ab1a5b`** (not again on `28b00d1`, which changes no server code and, in Python, one key of the all-ranks view and the stall lookup) with its own server, after the first gate (`wave-ah-proofs/` in the side-session notes; proofs 1 and 1b side by side on two ports, load 8.8 at the start from the gate's end and 3 to 5 after).
 - **Proof 1, the watchdog at its default timings.** `warning` at 306.8 s of quiet and `critical` at 906.8 s, as before; the trigger fired once. Rank 1 was then killed and rank 0 closed: 7 s later rank 1 read **`reconnecting` at `critical`** with its stream dropped, the summary **`stalled`**, and `job_stalled`, critical, `suspected_hang` was listed (before: `reconnecting` with no severity, `active`, no incident). The phase was held for 360 s this time: at 307.8 s after the kill the rank read **`lost`, still `critical`**, and the incident `lost_connection`. Nothing fired a second time. After the server restart the rank read `reconnecting` with no severity and the run `active`, the fresh window of Nov 17; the resume under a new attempt finished the run.
 - **Proof 1b, a healthy rank killed while it steps.** As before the change: `reconnecting` with no severity and no incident for the grace, `lost` at `warning` with `lost_connection` at 308.8 s, `critical` at 908.6 s, one firing.
 - **Proof 5, the agent woken by `--on-incident`.** Woken once, 17.4 s after the planted NaN. `get_incident` with the `mcp_id` it was given (`p5/rank0/non_finite@150`) answered with the incident; with the delivery id it was refused, and the error named the id to pass. A stand-in script, as before, not an outside agent.
