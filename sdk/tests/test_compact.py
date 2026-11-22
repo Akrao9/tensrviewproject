@@ -26,6 +26,13 @@ def _size(evidence) -> int:
     return len(json.dumps(evidence, separators=(",", ":"))) + 1
 
 
+def _without_replica_steps(evidence):
+    """`evidence` with `replica.steps` set aside, the one list compact shortens besides `samples`."""
+    if not isinstance(evidence.get("replica"), dict):
+        return evidence
+    return {**evidence, "replica": {k: v for k, v in evidence["replica"].items() if k != "steps"}}
+
+
 # --- The plan's line, on the detector benchmark's Granite-shaped run -------------------------
 
 
@@ -74,11 +81,14 @@ def test_a_10000_step_moe_run_gives_a_compact_file_under_1_mb(granite_run, tmp_p
     assert marker["moe_flagged"] == {"samples": 4000, "last_step": 9999}  # the collapse never went away
     assert marker["moe_starved"]["last_step"] == 9999
     assert len(small["samples"]) == 528
-    # Everything else is the full evidence, key for key and in its order.
+    # Everything else is the full evidence, key for key and in its order, but the routine replica
+    # step entries (the benchmark observes its one rank every 50 steps; wave AF, the author's
+    # decision of Nov 21, 2026).
     assert [k for k in small if k != "compact"] == list(seeded)
-    assert {k: v for k, v in small.items() if k not in ("compact", "samples")} == json.loads(
-        json.dumps({k: v for k, v in seeded.items() if k != "samples"})
+    assert _without_replica_steps({k: v for k, v in small.items() if k not in ("compact", "samples")}) == json.loads(
+        json.dumps(_without_replica_steps({k: v for k, v in seeded.items() if k != "samples"}))
     )
+    assert small["replica"]["steps"] == [] and marker["replica_steps"]["omitted"] == len(seeded["replica"]["steps"]) == 200
     # The same text for both files.
     assert incident_summary(small) == incident_summary(seeded)
     assert "First sampled bad step 6000  ·  Layer 06" in incident_summary(small)
@@ -331,3 +341,131 @@ def test_compact_with_rerun_records_from_the_full_evidence(tmp_path, monkeypatch
     assert small["compact"]["samples"] == {"total": 200, "kept": 11, "omitted": 189}
     with pytest.raises(SamplesOmitted):  # from the file alone it cannot be made
         tensorquill.export_rerun(small, tmp_path / "small.rrd")
+
+
+# --- The routine replica step list (wave AF, the author's decision of Nov 21, 2026) ------------
+#
+# "Keep the 12 KB ceiling. Approve compacting the routine replica step list with explicit listed
+# and omitted counts. Preserve full evidence, verdicts, coverage, incidents and attribution."
+
+_REPLICA_CASES = Path(__file__).resolve().parent / "fixtures" / "replica" / "attribution_cases.json"
+
+
+def _replica_view(steps: int, fault_at: int | None):
+    """The all-ranks view of three ranks observed every 50 steps (49, 99, ...), from the replica
+    contract's `three_ranks_two_to_one` case: every observation is rank 0's healthy one, but at
+    `fault_at`, where each rank writes the case's own observation (rank 2's `w` differs; it is
+    attributed to rank 2 by fingerprints and by signatures)."""
+    from tensorquill.evidence import combine_rank_evidence
+
+    case = json.loads(_REPLICA_CASES.read_text())["cases"]["three_ranks_two_to_one"]
+    base = {r["rank"]: r for r in case["records"]}
+    records = []
+    for step in range(steps):
+        for rank in sorted(base):
+            record = {"schema_version": 1, "run_id": "r1", "rank": rank, "attempt": base[rank]["attempt"],
+                      "step": step, "loss": 1.0}
+            if step % 50 == 49:
+                record["replica"] = copy.deepcopy(base[rank if step == fault_at else 0]["replica"])
+            records.append(record)
+    per_rank = {r: tensorquill.build_evidence([x for x in records if x["rank"] == r]) for r in base}
+    return combine_rank_evidence(per_rank, replica_records=records)
+
+
+def _healthy_one_rank(steps: int):
+    """The detector benchmark's run (24 routers, 32 experts, top-8), its one rank observed every 50 steps."""
+    import benchmark_detectors as bd
+
+    template = bd.capture_template(blocks=24, experts=32, top_k=8)
+    return tensorquill.build_evidence([bd.synth_record(template, 1, 0, step) for step in range(steps)])
+
+
+def _same_but_replica_steps(small, full):
+    """Every key but `compact`, and of `replica` every key but `steps`, as in the full evidence, in its order."""
+    assert [k for k in small if k != "compact"] == list(full)
+    assert list(small["replica"]) == list(full["replica"])
+    assert _without_replica_steps({k: v for k, v in small.items() if k != "compact"}) == json.loads(
+        json.dumps(_without_replica_steps({k: v for k, v in full.items()})))
+
+
+@pytest.mark.parametrize("which", ["one_rank", "three_ranks_agree"])
+def test_a_healthy_run_keeps_no_routine_replica_step_entry(which):
+    full = _healthy_one_rank(2_000) if which == "one_rank" else _replica_view(2_000, None)
+    entries = full["replica"]["steps"]
+    assert len(entries) == 40 and all(e["coverage"] == "complete" and e["fingerprints"] in ("agree", "not_compared")
+                                      and "drift_parameters" not in e for e in entries)
+    small = compact_evidence(full)
+    assert small["replica"]["steps"] == []
+    found = small["compact"]["replica_steps"]
+    assert found == {"total": 40, "kept": 0, "omitted": 40, "not_routine": 0, "around": [], "kept_steps": [],
+                     "observed_steps": [49, 1999]}
+    assert found["kept"] + found["omitted"] == len(entries)
+    _same_but_replica_steps({k: v for k, v in small.items() if k != "samples"},
+                            {k: v for k, v in full.items() if k != "samples"})
+    assert "leaving out 40 routine ones" in compact.describe(small)
+    with pytest.raises(compact.ReplicaStepsOmitted, match="needs every replica step entry"):
+        compact.require_all_replica_steps(small, "a listing of every replica step")
+    compact.require_all_replica_steps(full, "a listing of every replica step")  # full evidence: nothing to say
+
+
+def test_an_early_replica_fault_then_many_healthy_steps_keeps_the_fault_and_counts_the_rest():
+    full = _replica_view(10_000, fault_at=99)
+    entries = full["replica"]["steps"]
+    assert len(entries) == 200 and [e["step"] for e in entries if e["fingerprints"] != "agree"] == [99]
+    small = compact_evidence(full)
+    # The fault and its window (5 observed steps each side; 99 is the second observed step).
+    assert [e["step"] for e in small["replica"]["steps"]] == [49, 99, 149, 199, 249, 299, 349]
+    assert small["replica"]["steps"] == [e for e in entries if e["step"] <= 349]
+    found = small["compact"]["replica_steps"]
+    assert found == {"total": 200, "kept": 7, "omitted": 193, "not_routine": 1,
+                     "around": [{"kind": "incident", "step": 99}, {"kind": "replica_drift", "step": 99},
+                                {"kind": "attribution", "step": 99}, {"kind": "signatures_differ", "step": 99}],
+                     "kept_steps": [[49, 349]], "observed_steps": [49, 9999]}
+    # The incident, its verdict, coverage and attribution as in the full evidence, key for key.
+    _same_but_replica_steps(small, full)
+    assert small["run_incidents"] == full["run_incidents"] and [i["kind"] for i in small["run_incidents"]] == ["replica_drift"]
+    assert small["run_incidents"][0]["attribution"][0]["outliers"] == [2]
+    assert small["replica"]["replica_drift"] == full["replica"]["replica_drift"]
+    assert small["replica"]["attribution"] == full["replica"]["attribution"]
+    assert small["kind_checks"]["replica_drift"] == full["kind_checks"]["replica_drift"]
+    assert small["kind_checks"]["replica_drift"]["coverage"] == {"steps": 200, "compared": 200}
+    # Small, and no larger for a longer run: 7,837 bytes against 34,297 for the full view, and
+    # 7,831 at 2,000 steps (the step numbers' digits are the difference).
+    shorter = compact_evidence(_replica_view(2_000, fault_at=99))
+    assert _size(small) < 8_000 < 30_000 < _size(full) and _size(small) - _size(shorter) < 50
+    # A window of 0 keeps the faulty step alone.
+    alone = compact_evidence(full, window=0)
+    assert [e["step"] for e in alone["replica"]["steps"]] == [99] and alone["compact"]["replica_steps"]["omitted"] == 199
+
+
+def test_a_replica_step_entry_that_says_something_is_never_routine():
+    plain = {"launch": "l", "group": [0, 1], "step": 49, "coverage": "complete", "fingerprints": "agree", "signatures": "agree"}
+    alone = {"launch": "l", "group": [0], "step": 49, "coverage": "complete", "fingerprints": "not_compared",
+             "fingerprints_why": "one_rank", "signatures": "not_compared", "signatures_why": "one_rank"}
+    assert compact._routine(plain) and compact._routine(alone)
+    for said in (
+        {**plain, "coverage": "insufficient", "missing": [1]},
+        {**plain, "fingerprints": "drift", "drift_parameters": ["w"]},
+        {**plain, "signatures": "differ", "signature_parameters": ["w"]},
+        {**plain, "signatures": "not_compared", "signatures_why": "method"},
+        {**plain, "fingerprints": "not_compared", "fingerprints_why": "device"},
+        {**plain, "gathered": ["w"]},
+        {**plain, "not_compared": {"b": "unread"}},
+        {**plain, "projection_compared": False},
+        {"launch": None, "group": None, "step": 49, "coverage": "not_established", "why": "launch"},
+        {**plain, "coverage": "not_established", "why": "attempt", "ranks": [1]},
+        {**alone, "signatures": "agree", "signatures_why": None},
+        {**plain, "step": True},
+    ):
+        assert not compact._routine(said), said
+    # Kept in a compact file, whole step, and named in the marker's counts.
+    full = {"replica": {"v": 1, "tolerance": 1e-6, "steps": [plain, {**plain, "step": 99, "coverage": "insufficient",
+                                                                    "missing": [1]}], "replica_drift": []}}
+    small = compact_evidence(full, window=0)
+    assert small["replica"]["steps"] == [full["replica"]["steps"][1]]
+    assert small["compact"]["replica_steps"]["not_routine"] == 1 and small["compact"]["replica_steps"]["kept_steps"] == [[99, 99]]
+
+
+def test_evidence_without_replica_steps_has_no_replica_marker():
+    assert "replica_steps" not in compact_evidence({"incidents": []})["compact"]
+    assert "replica_steps" not in compact_evidence({"replica": {"v": 1}})["compact"]
