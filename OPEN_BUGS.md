@@ -297,7 +297,7 @@ That list also names work measured or specified earlier and missing from any act
 
 ## 13. Wave AH: the two findings of the CPU proofs, and the cross-check's corrections
 
-**Not in `main` when this was written.** `main` is at `eade0d1`. The code is the tree `trial/ah-wave` at `626fff8c142309c61d2d3123ecf8b892861b566d`, cut from `eade0d1`; this section and the plan's entry are documents-only commits among and on top of its code commits. Nothing is pushed. Not counted in the table at the top.
+**In local `main` since Nov 22, 2026:** `main` was fast-forwarded to `c97aa01`, which holds the gated code commit `626fff8` and its records, on the author's word ("Fast-forward local main to c97aa01"); the release server was rebuilt there (protocol 4, sha256 `4172f78f…`) and `server_detect.rust_ready()` accepts it with `TENSORQUILL_SERVER_BIN` naming it (no binary is installed beside the Python or on the path, so without the variable none is found). Not pushed. When the rest of this section was written `main` was at `eade0d1`. The code is the tree `trial/ah-wave` at `626fff8c142309c61d2d3123ecf8b892861b566d`, cut from `eade0d1`; this section and the plan's entry are documents-only commits among and on top of its code commits. Nothing is pushed. Not counted in the table at the top.
 
 **Where it came from.** The six CPU proofs of the v1 plan ran on `eade0d1` on Nov 22, 2026 (`wave-af-proof-cpu.md` in the side-session notes, with raw output). Four passed or were measured with no finding: ingest across a 200-step server stop (900 of 900 steps, none twice), scale at 512 and 1,024 ranks, the support envelope, and the three older issues (two not reproduced in 10 runs each; the Linux exit of rank 0 cannot be checked on macOS). Two gave a finding each, and the author said to fix both ("Fix P1-1 ... Fix P5-1 in the same batch").
 
@@ -374,5 +374,15 @@ Also corrected, as stale text: section 12's head (it said `main` was at `76a3b5d
 **Open after this wave.**
 - The two questions above: "per-run coverage across checkpoints", and where L29's seven readings are stated.
 - Everything open in section 12 that this section does not name as done.
-- The new timing-natured tests (the status written at once, the refused sender, the detector child's lifecycle, and now the real-server stall test) have not been repeated under load; planned before the push.
+- **Done since, on `main` at `c97aa01`:** the timing-natured tests repeated under load (below).
 - Linux, CI, PyTorch 2.6, a GPU, NCCL and Inductor: nothing here ran on any of them.
+
+**The timing-natured tests under load, on `main` at `c97aa01`** (Nov 22, 2026, 14:26 to 14:45; `wave-ah-under-load/` in the side-session notes). Eight busy processes, one for each of the machine's 8 cores, ran throughout; the 1-minute load average read 41 at the first round and 88 to 132 at the others. Five rounds, each:
+- the server's `lane_af_d_status_test` and `lane_af_d_refusals_test` (a refusal, a row not newer and a step confirmed late each reach the status before the periodic write; three refused batches in a row, and across a restart): 6 passed, 0 failed, in each of the 5 rounds;
+- the SDK's `test_lane_af_d_refused_sender.py`, `test_lane_af_d_negative_step.py`, `test_lane_af_w_watch.py` (the detector child's lifecycle, the protocol check, a threshold change under a running watcher), `test_lane_af_c_watch.py`, the docs lane's test that the follow child ends when the watcher is killed, `test_wave_ah_reconnecting.py` (the real-server stall test, with the views read inside the grace) and `test_wave_ah_mcp_lookup.py` (the real watcher command to the real MCP server): 66 passed, 0 failed, in each of the 5 rounds, 218 to 229 s a round.
+- No server and no busy process was left. 30 server test runs and 330 SDK test runs in all, none failed. It is one machine, macOS, and CPU load only: not memory pressure, not a slow disk, not Linux.
+
+**Decided by the author on Nov 22, 2026.**
+- **The restart grace stays for v1.** A server restart gives every unfinished rank a fresh window and does not carry a kept stall over (the decision of Nov 17, 2026), so a stalled run reads `active` for that window after a restart. It is in the documents and is a stated limit of v1.
+- **The watcher-to-MCP result is a stand-in agent proof.** A script made the calls, here and in proof 5. The live-agent proof (an outside agent through MCP, woken by `--on-incident`) remains open.
+- **The push stays on hold until immediately before GPU testing.**
