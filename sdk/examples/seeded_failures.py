@@ -50,6 +50,21 @@ listing shows them all:
 
 With bfloat16 weights the healthy run is not clean (see below), so use `--dtype float32` for the pair.
 
+`--case paired_dtype` (not part of `both` or `all`) is a paired BF16 and FP32 run. One model is built
+in float32 (the real one is loaded in float32, so neither arm starts from BF16-rounded weights), and
+each arm trains a copy of it cast to its dtype, on the same batches, with full capture and nothing
+planted. The script keeps its own loss and its own float64 total gradient norm for every step, and
+writes `paired-float32.jsonl`, `paired-bfloat16.jsonl`, their evidence, and `paired_dtype.json`: the
+checksum of the initial float32 weights and of the batches, what TensorQuill recorded for each arm
+(steps, incidents by kind and step, kind checks, stalled weights, gradient norms, loss) and where the
+two differ (the first step the losses part by 1% and 5%, the gradient-norm ratio, the incidents and
+the stalled parameters one arm has and the other has not). PASS when both captures hold every step,
+TensorQuill's recorded loss and gradient norm match the script's own on every step (relative 1e-3),
+and the two arms' first losses agree within 2% (the same inputs and starting weights). The
+differences are reported, not judged.
+
+    python examples/seeded_failures.py --case paired_dtype --out runs/paired
+
 `--toy` uses a tiny random Llama on random tokens, for checking the script on CPU. Weights are
 bfloat16 on a GPU, as in `dense_outlier_check.py`. With a learning rate of 1e-5 some bfloat16
 weights (RMSNorm's, near 1.0) never change, so `stalled_weights` starts with those, from the third
@@ -62,6 +77,9 @@ trains without that background; `--toy --dtype bfloat16` reproduces it on CPU.
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
+import json
 import math
 import statistics
 import sys
@@ -84,6 +102,9 @@ CASES = ("grad_spike", "stalled_weights")
 UPDATE = "update_spike"  # its own case: `both` and `all` are the two above, as on the GPU runs so far
 UPDATE_FACTOR = 1e4
 HEALTHY = "healthy"  # nothing planted: the run the seeded ones are compared with
+PAIRED = "paired_dtype"  # BF16 and FP32 from the same float32 weights on the same batches
+PAIRED_RTOL = 1e-3  # TensorQuill's loss and gradient norm against the script's own
+PAIRED_START = 0.02  # the two arms' first losses: the same inputs and weights, cast
 PROJECT = "seeded-failures"
 DEFAULT_PARAMETER = "self_attn.k_proj.weight"  # suffix; the block is the middle one unless --layer says
 DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
@@ -443,13 +464,166 @@ def judge_stalled_weights(
     )
 
 
+# ---- the paired BF16 and FP32 run -------------------------------------------------------
+
+
+def float32_model(args, device) -> torch.nn.Module:
+    """The model in float32: the toy as built, the real one loaded in float32 (not cast up from BF16)."""
+    if args.toy:
+        models, _ = build_models(args, device)
+        return models[0].float()
+    from transformers import AutoModelForCausalLM
+
+    torch.manual_seed(0)
+    return AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, attn_implementation="sdpa").to(device).train()
+
+
+def checksum(tensors) -> str:
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        digest.update(tensor.detach().float().contiguous().cpu().numpy().tobytes())
+    return digest.hexdigest()[:16]
+
+
+def own_grad_norm(model: torch.nn.Module) -> float:
+    """The total gradient norm, from each gradient's own float64 norm: the script's, not TensorQuill's."""
+    norms = [torch.linalg.vector_norm(p.grad.detach(), dtype=torch.float64) for p in model.parameters() if p.grad is not None]
+    return float(torch.linalg.vector_norm(torch.stack(norms))) if norms else 0.0
+
+
+def run_paired_arm(base: torch.nn.Module, dtype_name: str, args, device, batches, steps: int, out: Path) -> dict[str, Any]:
+    dtype = DTYPES[dtype_name]
+    model = copy.deepcopy(base).to(dtype).train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=device.type == "cuda")
+    jsonl = out / f"paired-{dtype_name}.jsonl"
+    losses, norms = [], []
+    print(f"Paired arm {dtype_name}: {steps} steps, nothing planted", flush=True)
+    with tensorquill.init(
+        model, run_id=f"paired-{dtype_name}", capture="full", every=FLUSH_EVERY, weights=WEIGHT_EVERY,
+        sink=tensorquill.JsonlSink(jsonl), project=PROJECT, name=f"paired-{dtype_name}",
+        config={"case": PAIRED, "dtype": dtype_name, "lr": args.lr, "steps": steps},
+    ) as session:
+        for step in range(steps):
+            optimizer.zero_grad(set_to_none=True)
+            batch = batches[step]
+            loss = model(input_ids=batch, labels=batch, use_cache=False).loss
+            loss.backward()
+            session.log({"train/loss": loss})
+            losses.append(float(loss.detach()))
+            norms.append(own_grad_norm(model))
+            optimizer.step()
+    del model, optimizer
+    records = tensorquill.load_records(jsonl)
+    evidence = tensorquill.build_evidence(records)
+    write_evidence(evidence, default_evidence_path(jsonl, records))
+    return {"dtype": dtype_name, "path": jsonl, "records": records, "evidence": evidence, "losses": losses, "norms": norms}
+
+
+def _close(a: Any, b: float, rtol: float) -> bool:
+    return isinstance(a, (int, float)) and math.isfinite(a) and math.isfinite(b) and abs(a - b) <= rtol * max(abs(b), 1e-12)
+
+
+def recorded_against_own(arm: dict[str, Any], steps: int) -> list[dict[str, Any]]:
+    """TensorQuill's records of one arm against the script's own loss and gradient norm."""
+    by_step = {r["step"]: r for r in arm["records"]}
+    checks = [{"name": f"{arm['dtype']}: every step recorded", "ok": sorted(by_step) == list(range(steps)),
+               "detail": f"{len(by_step)} of {steps} steps"}]
+    loss_bad = [s for s in range(steps) if s in by_step and
+                not _close((by_step[s].get("scalars") or {}).get("train/loss"), arm["losses"][s], PAIRED_RTOL)]
+    norm_bad = [s for s in range(steps) if s in by_step and not _close(by_step[s].get("grad_norm"), arm["norms"][s], PAIRED_RTOL)]
+    checks.append({"name": f"{arm['dtype']}: recorded loss matches the script's on every step", "ok": not loss_bad,
+                   "detail": f"relative {PAIRED_RTOL:g}" + (f"; {len(loss_bad)} differ, first step {loss_bad[0]}: recorded "
+                             f"{(by_step[loss_bad[0]].get('scalars') or {}).get('train/loss')}, own {arm['losses'][loss_bad[0]]}" if loss_bad else "")})
+    checks.append({"name": f"{arm['dtype']}: recorded gradient norm matches the script's float64 norm on every step",
+                   "ok": not norm_bad,
+                   "detail": f"relative {PAIRED_RTOL:g}" + (f"; {len(norm_bad)} differ, first step {norm_bad[0]}: recorded "
+                             f"{by_step[norm_bad[0]].get('grad_norm')}, own {arm['norms'][norm_bad[0]]}" if norm_bad else "")})
+    return checks
+
+
+def arm_summary(arm: dict[str, Any]) -> dict[str, Any]:
+    """What TensorQuill recorded for one arm."""
+    evidence, records = arm["evidence"], arm["records"]
+    stalled = next((i for i in evidence["incidents"] if i["kind"] == "stalled_weights"), None)
+    unchanged = {r["step"]: len(r["weights_unchanged"]) for r in records if r.get("weights_unchanged") is not None}
+    norms = [r["grad_norm"] for r in records if isinstance(r.get("grad_norm"), (int, float))]
+    return {
+        "capture": str(arm["path"]), "steps": len(records),
+        "incidents": [{"kind": i["kind"], "step": i["step"]} for i in evidence["incidents"]],
+        "kind_checks": {k: v.get("value") for k, v in evidence.get("kind_checks", {}).items()},
+        "stalled_parameters": sorted({n for o in (stalled or {}).get("onsets", []) for n in o["parameters"]}),
+        "stalled_total": (stalled or {}).get("stalled_total", (stalled or {}).get("stalled", 0)),
+        "weights_unchanged_by_check": unchanged,
+        "grad_norm_median": statistics.median(norms) if norms else None,
+        "loss_first": arm["losses"][0], "loss_last": arm["losses"][-1],
+        "loss_every_50": {s: arm["losses"][s] for s in range(0, len(arm["losses"]), FLUSH_EVERY)},
+    }
+
+
+def paired_differences(fp32: dict[str, Any], bf16: dict[str, Any], a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    gap = [abs(x - y) / max(abs(y), 1e-12) for x, y in zip(bf16["losses"], fp32["losses"])]
+    ratios = [x / y for x, y in zip(bf16["norms"], fp32["norms"]) if y > 0]
+    kinds_a = {(i["kind"]) for i in a["incidents"]}
+    kinds_b = {(i["kind"]) for i in b["incidents"]}
+    checks_differ = {k: {"float32": a["kind_checks"].get(k), "bfloat16": b["kind_checks"].get(k)}
+                     for k in sorted(set(a["kind_checks"]) | set(b["kind_checks"])) if a["kind_checks"].get(k) != b["kind_checks"].get(k)}
+    return {
+        "first_step_loss_apart_1pct": next((s for s, g in enumerate(gap) if g > 0.01), None),
+        "first_step_loss_apart_5pct": next((s for s, g in enumerate(gap) if g > 0.05), None),
+        "loss_gap_first": gap[0] if gap else None, "loss_gap_last": gap[-1] if gap else None,
+        "grad_norm_ratio_bf16_over_fp32_median": statistics.median(ratios) if ratios else None,
+        "incident_kinds_only_in_float32": sorted(kinds_a - kinds_b),
+        "incident_kinds_only_in_bfloat16": sorted(kinds_b - kinds_a),
+        "stalled_only_in_float32": sorted(set(a["stalled_parameters"]) - set(b["stalled_parameters"])),
+        "stalled_only_in_bfloat16": sorted(set(b["stalled_parameters"]) - set(a["stalled_parameters"])),
+        "kind_checks_that_differ": checks_differ,
+    }
+
+
+def run_paired(args, device, batches: torch.Tensor, out: Path) -> Verdict:
+    steps = args.steps or steps_for(PAIRED, args)
+    base = float32_model(args, device)
+    initial = checksum(base.state_dict().values())
+    arms = {name: run_paired_arm(base, name, args, device, batches, steps, out) for name in ("float32", "bfloat16")}
+    checks = [c for arm in arms.values() for c in recorded_against_own(arm, steps)]
+    fp32, bf16 = arms["float32"], arms["bfloat16"]
+    start_gap = abs(bf16["losses"][0] - fp32["losses"][0]) / max(abs(fp32["losses"][0]), 1e-12)
+    checks.append({"name": f"the first losses agree within {100 * PAIRED_START:g}% (same inputs and starting weights)",
+                   "ok": start_gap <= PAIRED_START,
+                   "detail": f"float32 {fp32['losses'][0]:.5f}, bfloat16 {bf16['losses'][0]:.5f}, {100 * start_gap:.3f}% apart"})
+    summaries = {name: arm_summary(arm) for name, arm in arms.items()}
+    differences = paired_differences(fp32, bf16, summaries["float32"], summaries["bfloat16"])
+    passed = all(c["ok"] for c in checks)
+    result = {
+        "case": PAIRED, "status": "pass" if passed else "fail", "model": "toy Llama" if args.toy else args.model,
+        "device": str(device), "steps": steps, "lr": args.lr,
+        "initial_float32_weights_sha256_16": initial, "batches_sha256_16": checksum([batches]),
+        "checks": checks, "recorded": summaries, "differences": differences,
+    }
+    (out / "paired_dtype.json").write_text(json.dumps(result, indent=1, default=str))
+    print(f"\n--- Paired BF16 and FP32 ({steps} steps, initial float32 weights {initial}) ---")
+    for name, summary in summaries.items():
+        print(f"{name}: {summary['steps']} steps; incidents {[(i['kind'], i['step']) for i in summary['incidents']] or 'none'}; "
+              f"{summary['stalled_total']} stalled parameter(s); loss {summary['loss_first']:.4f} -> {summary['loss_last']:.4f}; "
+              f"median gradient norm {summary['grad_norm_median']}")
+    print("Where they differ: " + json.dumps(differences, default=str))
+    notes = [f"{'ok  ' if c['ok'] else 'FAIL'} {c['name']}: {c['detail']}" for c in checks]
+    for note in notes:
+        print(f"  {note}")
+    summary = (f"both captures whole, TensorQuill's loss and gradient norm equal the script's on all {steps} steps of each arm; "
+               f"first losses {100 * start_gap:.2f}% apart" if passed else
+               "; ".join(c["name"] for c in checks if not c["ok"]))
+    print(f"{'PASS' if passed else 'FAIL'}: {summary}\nResult: {out / 'paired_dtype.json'}\n")
+    return Verdict(PAIRED, passed, summary, notes)
+
+
 # ---- running a case ---------------------------------------------------------------------
 
 
 def steps_for(case: str, args) -> int:
     """Enough steps for the failure to be seen and one more interval to spare, in whole intervals.
     The healthy run takes as many as the longer seeded case, so it reaches every step they do."""
-    if case == HEALTHY:
+    if case in (HEALTHY, PAIRED):
         return max(steps_for(seeded, args) for seeded in CASES)
     needed = args.seed_step if case in ("grad_spike", UPDATE) else first_visible_stall(args.freeze_step)
     return (needed // FLUSH_EVERY + 2) * FLUSH_EVERY
@@ -536,9 +710,10 @@ def run_case(case: str, args, device, batches: torch.Tensor, out: Path) -> Verdi
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--case", choices=[*CASES, UPDATE, "both", HEALTHY, "all"], default="both",
+    parser.add_argument("--case", choices=[*CASES, UPDATE, "both", HEALTHY, "all", PAIRED], default="both",
                         help="both: grad_spike and stalled_weights; healthy: nothing planted; all: healthy, then both; "
-                             "update_spike: the seeded gradient read as the size of the optimizer's update")
+                             "update_spike: the seeded gradient read as the size of the optimizer's update; "
+                             "paired_dtype: BF16 and FP32 from the same float32 weights on the same batches")
     parser.add_argument("--update-window", type=int, default=UPDATE_WINDOW,
                         help="update_spike: how many of the last step-to-step changes make the rule's baseline; the seed "
                              f"step must come after the first of them (default: the detector's, {UPDATE_WINDOW})")
@@ -570,6 +745,10 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("a CUDA GPU is required; use --toy to check the script on CPU")
     cases = {"both": CASES, "all": (HEALTHY, *CASES)}.get(args.case, (args.case,))
     for case in cases:
+        if case == PAIRED:
+            if args.dtype:
+                parser.error("--case paired_dtype runs both dtypes; leave out --dtype")
+            continue
         if case == HEALTHY:
             if args.steps and args.steps < HEALTHY_MIN_STEPS:
                 parser.error(f"--steps {args.steps} ends before the healthy run's checks can be made: stalled_weights "
@@ -592,7 +771,8 @@ def main(argv: list[str] | None = None) -> None:
     name = torch.cuda.get_device_name() if device.type == "cuda" else "CPU"
     print(f"{torch.__version__} on {name} | {'toy Llama' if args.toy else args.model} | eager\n", flush=True)
 
-    verdicts = [run_case(case, args, device, batches, args.out) for case in cases]
+    verdicts = [run_paired(args, device, batches, args.out) if case == PAIRED else run_case(case, args, device, batches, args.out)
+                for case in cases]
     print(f"List them: python -m tensorquill runs {args.out}")
     failed = [v.case for v in verdicts if not v.passed]
     if failed:
