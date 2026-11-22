@@ -245,3 +245,26 @@ def test_the_all_ranks_view_of_a_store_and_the_mcp_tools_carry_the_servers_entry
     for answer_ in (mcp_server.get_all_ranks_status(mcp_server.Source(folder), {}),
                     mcp_server.list_incidents(mcp_server.Source(folder), {})):
         assert [i["ranks"] for i in answer_["not_checked"] if i["check"] == "moe_routing"] == ["1"]
+
+
+class _CountedCounts(list):
+    """A router's counts that count how often they are read through."""
+
+    reads = 0
+
+    def __iter__(self):
+        type(self).reads += 1
+        return super().__iter__()
+
+
+def test_a_router_found_read_is_not_scanned_again():
+    """The rule scans a router's counts only until it finds a count above 0 (wave AF-W: it summed
+    every count of every record at every look, 2.2 s of a 3.6 s watcher update at 10,000 steps)."""
+    records = [dict(r) for r in CASES["one_router_with_no_tokens_beside_one_that_was_read"]["given"]["records"]]
+    _CountedCounts.reads = 0
+    for record in records:
+        record["moe"] = {name: _CountedCounts(counts) for name, counts in record["moe"].items()}
+    found = ev.routers_not_read_not_checked(records)
+    assert found["routers"] == ["blocks.0.router"]
+    # The router read is read through on its first record only; the one never read, on every record.
+    assert _CountedCounts.reads == 1 + len(records)

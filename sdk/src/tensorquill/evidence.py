@@ -6277,16 +6277,21 @@ def routers_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[s
     and zeros on others is read, as before. While some router of the records was read, the kinds
     are judged on it and the entry only names the others (`kind_checks`); with none read they are
     `unavailable`. The server writes the same entry (lane D)."""
-    totals: dict[str, int] = {}
+    # Each router named, and whether a count above 0 was seen for it. A router once seen read is
+    # not looked at again: a whole run of a read router costs one dictionary lookup a record, not
+    # one step per count (the first form summed every count of every record at every look).
+    read: dict[str, bool] = {}
     for record in records:
         moe = record.get("moe")
         if not isinstance(moe, Mapping):
             continue
         for name, counts in moe.items():
-            held = totals.setdefault(str(name), 0)
-            if isinstance(counts, (list, tuple)):
-                totals[str(name)] = held + sum(int(c) for c in counts if isinstance(c, (int, float)) and c > 0)
-    names = sorted(name for name, total in totals.items() if total == 0)
+            name = str(name)
+            if read.get(name):
+                continue
+            read[name] = isinstance(counts, (list, tuple)) and any(
+                isinstance(c, (int, float)) and c > 0 and int(c) > 0 for c in counts)
+    names = sorted(name for name, seen in read.items() if not seen)
     if not names:
         return None
     return {
