@@ -14,9 +14,11 @@ fn usual() -> Arc<Thresholds> {
     Arc::default()
 }
 
-/// One row per entry of `rows` (rank, attempt, step, schema_version), every column nullable, with
-/// a `train/loss` scalar.
-fn batch(rows: &[(Option<i32>, Option<i64>, Option<i64>, Option<i32>)]) -> RecordBatch {
+/// A row's identity fields: (rank, attempt, step, schema_version), each of which may be null.
+type Identity = (Option<i32>, Option<i64>, Option<i64>, Option<i32>);
+
+/// One row per entry of `rows`, every column nullable, with a `train/loss` scalar.
+fn batch(rows: &[Identity]) -> RecordBatch {
     let mut scalars = MapBuilder::new(None, StringBuilder::new(), Float64Builder::new());
     for _ in rows {
         scalars.keys().append_value("train/loss");
@@ -51,7 +53,7 @@ fn batch(rows: &[(Option<i32>, Option<i64>, Option<i64>, Option<i32>)]) -> Recor
     .unwrap()
 }
 
-fn good(step: i64) -> (Option<i32>, Option<i64>, Option<i64>, Option<i32>) {
+fn good(step: i64) -> Identity {
     (Some(0), Some(0), Some(step), Some(1))
 }
 
