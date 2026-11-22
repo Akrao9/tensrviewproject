@@ -1816,6 +1816,12 @@ pub fn incidents(status: &Value) -> Vec<Value> {
     found
 }
 
+/// Whether a rank's entry in a status is a stopped rank: the one rule of every reader here, and of
+/// Python's `evidence.rank_is_stopped` (shared cases: `sdk/tests/fixtures/wave_ah/cases.json`).
+pub fn is_stopped(rank: &Value) -> bool {
+    matches!(rank["state"].as_str(), Some("silent" | "lost" | "unresponsive"))
+}
+
 fn progress_incidents(status: &Value) -> Vec<Value> {
     let summary = status["summary"].as_str().unwrap_or_default();
     if summary != "stalled" && summary != "degraded" {
@@ -1824,7 +1830,7 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
     let full: &[Value] = status["ranks"].as_array().map_or(&[], Vec::as_slice);
     let places: Vec<Value> = full
         .iter()
-        .filter(|rank| matches!(rank["state"].as_str(), Some("silent" | "lost" | "unresponsive")))
+        .filter(|rank| is_stopped(rank))
         .filter_map(stuck_at)
         .collect();
     // The stacks stay in the status's `ranks`; an incident carries `stuck_at` instead.
@@ -1840,10 +1846,7 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
         .collect();
     let ranks: &[Value] = &without;
     let state = |rank: &Value| rank["state"].as_str().unwrap_or_default().to_owned();
-    let stopped: Vec<&Value> = ranks
-        .iter()
-        .filter(|rank| matches!(state(rank).as_str(), "silent" | "lost" | "unresponsive"))
-        .collect();
+    let stopped: Vec<&Value> = ranks.iter().filter(|rank| is_stopped(rank)).collect();
     // A lost rank (its stream dropped and did not come back: a killed or crashed process, or the
     // network) labels the stall when it explains it: every stopped rank is lost, or the whole job
     // stopped, whose connected ranks then wait for the one that is gone. As Python's `_progress_incidents`.
@@ -1904,10 +1907,7 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
             rank["last_step"].clone()
         }
     };
-    let capture_stopped = |rank: &Value| {
-        matches!(rank["state"].as_str(), Some("silent" | "lost" | "unresponsive"))
-            && rank.get("capture_stopped").is_some_and(Value::is_object)
-    };
+    let capture_stopped = |rank: &Value| is_stopped(rank) && rank.get("capture_stopped").is_some_and(Value::is_object);
     if let Some(rank) = stopped.iter().find(|rank| capture_stopped(rank)) {
         incident["capture_stopped"] = rank["capture_stopped"].clone();
         incident["capture_last_step"] = capture_last_step(rank);
@@ -1937,7 +1937,7 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
         // The ranks that are not stopped, briefly, as Python's `_progress_incidents` lists them.
         incident["other_ranks"] = ranks
             .iter()
-            .filter(|rank| !matches!(state(rank).as_str(), "silent" | "lost" | "unresponsive"))
+            .filter(|rank| !is_stopped(rank))
             .map(|rank| {
                 json!({"rank": rank["rank"], "state": rank["state"], "last_step": rank["last_step"], "attempt": rank["attempt"]})
             })
@@ -1952,6 +1952,8 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
 mod lane_ad2_tests;
 #[cfg(test)]
 mod lane_ad8_tests;
+#[cfg(test)]
+mod wave_ah_tests;
 
 #[cfg(test)]
 mod tests {

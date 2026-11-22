@@ -1,0 +1,544 @@
+{
+ "about": "Wave AH, P1-1: which ranks of a server status are stopped, and the progress incident read from it. `expected` lists each incident's kind, severity, assessment and step, the rank numbers under `ranks` and `other_ranks` (absent for job_stalled), and `lost_ranks` when the incident has it.",
+ "cases": {
+  "a_healthy_rank_that_disconnects_is_not_stopped": {
+   "status": {
+    "schema_version": 1,
+    "run_id": "ah",
+    "written_at_ms": 1000,
+    "server_running": true,
+    "silent_floor_seconds": 300.0,
+    "silent_factor": 5.0,
+    "critical_seconds": 900.0,
+    "start_seconds": 1800.0,
+    "world_size": 2,
+    "missing_ranks": [],
+    "summary": "active",
+    "ranks": [
+     {
+      "rank": 0,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": null,
+      "attempt": 7,
+      "last_step": 90,
+      "work": 91,
+      "seconds_since_progress": 500.0,
+      "stream": "open",
+      "state": "active"
+     },
+     {
+      "rank": 1,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": null,
+      "attempt": 7,
+      "last_step": 80,
+      "work": 81,
+      "seconds_since_progress": 500.0,
+      "stream": "dropped",
+      "state": "reconnecting"
+     }
+    ]
+   },
+   "expected": []
+  },
+  "a_healthy_disconnect_beside_a_summary_degraded_for_a_missing_rank_is_not_listed_as_stopped": {
+   "status": {
+    "schema_version": 1,
+    "run_id": "ah",
+    "written_at_ms": 1000,
+    "server_running": true,
+    "silent_floor_seconds": 300.0,
+    "silent_factor": 5.0,
+    "critical_seconds": 900.0,
+    "start_seconds": 1800.0,
+    "world_size": 3,
+    "missing_ranks": [
+     2
+    ],
+    "summary": "degraded",
+    "ranks": [
+     {
+      "rank": 0,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": null,
+      "attempt": 7,
+      "last_step": 90,
+      "work": 91,
+      "seconds_since_progress": 500.0,
+      "stream": "open",
+      "state": "active"
+     },
+     {
+      "rank": 1,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": null,
+      "attempt": 7,
+      "last_step": 80,
+      "work": 81,
+      "seconds_since_progress": 500.0,
+      "stream": "dropped",
+      "state": "reconnecting"
+     }
+    ]
+   },
+   "expected": [
+    {
+     "kind": "rank_silent",
+     "severity": "warning",
+     "assessment": "ranks_never_connected",
+     "step": 90,
+     "ranks": [],
+     "other_ranks": [
+      0,
+      1
+     ]
+    }
+   ]
+  },
+  "a_critical_rank_that_disconnects_keeps_its_incident": {
+   "status": {
+    "schema_version": 1,
+    "run_id": "ah",
+    "written_at_ms": 1000,
+    "server_running": true,
+    "silent_floor_seconds": 300.0,
+    "silent_factor": 5.0,
+    "critical_seconds": 900.0,
+    "start_seconds": 1800.0,
+    "world_size": 2,
+    "missing_ranks": [],
+    "summary": "degraded",
+    "ranks": [
+     {
+      "rank": 0,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": null,
+      "attempt": 7,
+      "last_step": 90,
+      "work": 91,
+      "seconds_since_progress": 500.0,
+      "stream": "open",
+      "state": "active"
+     },
+     {
+      "rank": 1,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": "critical",
+      "attempt": 7,
+      "last_step": 40,
+      "work": 41,
+      "seconds_since_progress": 500.0,
+      "stream": "dropped",
+      "state": "reconnecting",
+      "stopped_as": "silent"
+     }
+    ]
+   },
+   "expected": [
+    {
+     "kind": "rank_silent",
+     "severity": "critical",
+     "assessment": "suspected_hang",
+     "step": 40,
+     "ranks": [
+      1
+     ],
+     "other_ranks": [
+      0
+     ]
+    }
+   ]
+  },
+  "a_warning_rank_that_disconnects_keeps_its_warning": {
+   "status": {
+    "schema_version": 1,
+    "run_id": "ah",
+    "written_at_ms": 1000,
+    "server_running": true,
+    "silent_floor_seconds": 300.0,
+    "silent_factor": 5.0,
+    "critical_seconds": 900.0,
+    "start_seconds": 1800.0,
+    "world_size": 2,
+    "missing_ranks": [],
+    "summary": "degraded",
+    "ranks": [
+     {
+      "rank": 0,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": null,
+      "attempt": 7,
+      "last_step": 90,
+      "work": 91,
+      "seconds_since_progress": 500.0,
+      "stream": "open",
+      "state": "active"
+     },
+     {
+      "rank": 1,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": "warning",
+      "attempt": 7,
+      "last_step": 40,
+      "work": 41,
+      "seconds_since_progress": 500.0,
+      "stream": "dropped",
+      "state": "reconnecting",
+      "stopped_as": "silent"
+     }
+    ]
+   },
+   "expected": [
+    {
+     "kind": "rank_silent",
+     "severity": "warning",
+     "assessment": "suspected_hang",
+     "step": 40,
+     "ranks": [
+      1
+     ],
+     "other_ranks": [
+      0
+     ]
+    }
+   ]
+  },
+  "an_unresponsive_rank_that_disconnects_keeps_its_incident": {
+   "status": {
+    "schema_version": 1,
+    "run_id": "ah",
+    "written_at_ms": 1000,
+    "server_running": true,
+    "silent_floor_seconds": 300.0,
+    "silent_factor": 5.0,
+    "critical_seconds": 900.0,
+    "start_seconds": 1800.0,
+    "world_size": 2,
+    "missing_ranks": [],
+    "summary": "degraded",
+    "ranks": [
+     {
+      "rank": 0,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": null,
+      "attempt": 7,
+      "last_step": 90,
+      "work": 91,
+      "seconds_since_progress": 500.0,
+      "stream": "open",
+      "state": "active"
+     },
+     {
+      "rank": 1,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": "critical",
+      "attempt": 7,
+      "last_step": 40,
+      "work": 41,
+      "seconds_since_progress": 500.0,
+      "stream": "dropped",
+      "state": "reconnecting",
+      "stopped_as": "unresponsive"
+     }
+    ]
+   },
+   "expected": [
+    {
+     "kind": "rank_silent",
+     "severity": "critical",
+     "assessment": "suspected_hang",
+     "step": 40,
+     "ranks": [
+      1
+     ],
+     "other_ranks": [
+      0
+     ]
+    }
+   ]
+  },
+  "the_only_unfinished_rank_disconnects_while_critical_and_the_job_is_still_stalled": {
+   "status": {
+    "schema_version": 1,
+    "run_id": "ah",
+    "written_at_ms": 1000,
+    "server_running": true,
+    "silent_floor_seconds": 300.0,
+    "silent_factor": 5.0,
+    "critical_seconds": 900.0,
+    "start_seconds": 1800.0,
+    "world_size": 2,
+    "missing_ranks": [],
+    "summary": "stalled",
+    "ranks": [
+     {
+      "rank": 0,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": null,
+      "attempt": 7,
+      "last_step": 976,
+      "work": 977,
+      "seconds_since_progress": 500.0,
+      "stream": "finished",
+      "state": "finished"
+     },
+     {
+      "rank": 1,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": "critical",
+      "attempt": 7,
+      "last_step": 49,
+      "work": 50,
+      "seconds_since_progress": 500.0,
+      "stream": "dropped",
+      "state": "reconnecting",
+      "stopped_as": "silent"
+     }
+    ]
+   },
+   "expected": [
+    {
+     "kind": "job_stalled",
+     "severity": "critical",
+     "assessment": "suspected_hang",
+     "step": 976,
+     "ranks": [
+      1
+     ]
+    }
+   ]
+  },
+  "after_the_grace_period_the_rank_is_lost_and_still_critical": {
+   "status": {
+    "schema_version": 1,
+    "run_id": "ah",
+    "written_at_ms": 1000,
+    "server_running": true,
+    "silent_floor_seconds": 300.0,
+    "silent_factor": 5.0,
+    "critical_seconds": 900.0,
+    "start_seconds": 1800.0,
+    "world_size": 2,
+    "missing_ranks": [],
+    "summary": "degraded",
+    "ranks": [
+     {
+      "rank": 0,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": null,
+      "attempt": 7,
+      "last_step": 90,
+      "work": 91,
+      "seconds_since_progress": 500.0,
+      "stream": "open",
+      "state": "active"
+     },
+     {
+      "rank": 1,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": "critical",
+      "attempt": 7,
+      "last_step": 40,
+      "work": 41,
+      "seconds_since_progress": 500.0,
+      "stream": "dropped",
+      "state": "lost",
+      "stopped_as": "silent"
+     }
+    ]
+   },
+   "expected": [
+    {
+     "kind": "rank_silent",
+     "severity": "critical",
+     "assessment": "lost_connection",
+     "step": 40,
+     "ranks": [
+      1
+     ],
+     "other_ranks": [
+      0
+     ],
+     "lost_ranks": [
+      1
+     ]
+    }
+   ]
+  },
+  "a_held_rank_and_a_healthy_disconnect_side_by_side": {
+   "status": {
+    "schema_version": 1,
+    "run_id": "ah",
+    "written_at_ms": 1000,
+    "server_running": true,
+    "silent_floor_seconds": 300.0,
+    "silent_factor": 5.0,
+    "critical_seconds": 900.0,
+    "start_seconds": 1800.0,
+    "world_size": 3,
+    "missing_ranks": [],
+    "summary": "degraded",
+    "ranks": [
+     {
+      "rank": 0,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": null,
+      "attempt": 7,
+      "last_step": 90,
+      "work": 91,
+      "seconds_since_progress": 500.0,
+      "stream": "open",
+      "state": "active"
+     },
+     {
+      "rank": 1,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": "critical",
+      "attempt": 7,
+      "last_step": 40,
+      "work": 41,
+      "seconds_since_progress": 500.0,
+      "stream": "dropped",
+      "state": "reconnecting",
+      "stopped_as": "silent"
+     },
+     {
+      "rank": 2,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": null,
+      "attempt": 7,
+      "last_step": 88,
+      "work": 89,
+      "seconds_since_progress": 500.0,
+      "stream": "dropped",
+      "state": "reconnecting"
+     }
+    ]
+   },
+   "expected": [
+    {
+     "kind": "rank_silent",
+     "severity": "critical",
+     "assessment": "suspected_hang",
+     "step": 40,
+     "ranks": [
+      1
+     ],
+     "other_ranks": [
+      0,
+      2
+     ]
+    }
+   ]
+  },
+  "a_held_rank_beside_a_lost_one_is_not_all_lost": {
+   "status": {
+    "schema_version": 1,
+    "run_id": "ah",
+    "written_at_ms": 1000,
+    "server_running": true,
+    "silent_floor_seconds": 300.0,
+    "silent_factor": 5.0,
+    "critical_seconds": 900.0,
+    "start_seconds": 1800.0,
+    "world_size": 3,
+    "missing_ranks": [],
+    "summary": "degraded",
+    "ranks": [
+     {
+      "rank": 0,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": null,
+      "attempt": 7,
+      "last_step": 90,
+      "work": 91,
+      "seconds_since_progress": 500.0,
+      "stream": "open",
+      "state": "active"
+     },
+     {
+      "rank": 1,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": "critical",
+      "attempt": 7,
+      "last_step": 40,
+      "work": 41,
+      "seconds_since_progress": 500.0,
+      "stream": "dropped",
+      "state": "reconnecting",
+      "stopped_as": "silent"
+     },
+     {
+      "rank": 2,
+      "phase": "train",
+      "phase_seconds": 500.0,
+      "heartbeat_age_seconds": 0.2,
+      "severity": "warning",
+      "attempt": 7,
+      "last_step": 30,
+      "work": 31,
+      "seconds_since_progress": 500.0,
+      "stream": "dropped",
+      "state": "lost"
+     }
+    ]
+   },
+   "expected": [
+    {
+     "kind": "rank_silent",
+     "severity": "critical",
+     "assessment": "suspected_hang",
+     "step": 30,
+     "ranks": [
+      1,
+      2
+     ],
+     "other_ranks": [
+      0
+     ],
+     "lost_ranks": [
+      2
+     ]
+    }
+   ]
+  }
+ }
+}
