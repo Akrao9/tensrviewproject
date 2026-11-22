@@ -1,4 +1,9 @@
-"""Benchmark TensorQuill during Granite MoE training on WikiText-2."""
+"""Benchmark TensorQuill during Granite MoE training on WikiText-2.
+
+Two arms in one process, capture off and on. The compiler gate's four arms (capture off,
+TensorQuill router-only, NeuralDBG, `wandb.watch`), each in a fresh process, are
+`granite_compiler_gate.py`, which builds Granite and its batches with this file's functions.
+"""
 
 import argparse
 from contextlib import ExitStack
@@ -56,23 +61,32 @@ def train_step(model, optimizer, batch, cuda_graphs, session=None):
     return loss.detach()
 
 
-def build_pair():
+def build_model():
+    """One Granite model in BF16 on the GPU, in training mode."""
     from transformers import AutoModelForCausalLM
+
+    return AutoModelForCausalLM.from_pretrained(
+        MODEL, dtype=torch.bfloat16, experts_implementation="grouped_mm"
+    ).to("cuda").train()
+
+
+def granite_routers(model) -> dict[str, tensorquill.Router]:
+    """TensorQuill's router spec for every Granite top-k router, one per decoder layer."""
     from transformers.models.granitemoe.modeling_granitemoe import GraniteMoeTopKRouter
 
-    models = [
-        AutoModelForCausalLM.from_pretrained(
-            MODEL, dtype=torch.bfloat16, experts_implementation="grouped_mm"
-        ).to("cuda").train()
-        for _ in range(2)
-    ]
     routers = {
         name: tensorquill.Router(module.num_experts, top_k=module.top_k, indices=lambda out: out[2])
-        for name, module in models[1].named_modules()
+        for name, module in model.named_modules()
         if isinstance(module, GraniteMoeTopKRouter)
     }
-    if len(routers) != models[1].config.num_hidden_layers:
+    if len(routers) != model.config.num_hidden_layers:
         raise RuntimeError(f"Unexpected Granite router count: {len(routers)}")
+    return routers
+
+
+def build_pair():
+    models = [build_model() for _ in range(2)]
+    routers = granite_routers(models[1])
     optimizers = [torch.optim.AdamW(model.parameters(), lr=1e-5, fused=True) for model in models]
     return models, optimizers, routers
 
