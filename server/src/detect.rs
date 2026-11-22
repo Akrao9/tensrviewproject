@@ -4807,7 +4807,22 @@ pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64)
 /// detectors judge one rank's steps.
 pub fn detect_stream(input: impl std::io::Read, thresholds: &Arc<Thresholds>) -> Result<Value, String> {
     let (run_id, rank, detectors) = detect_rows(input, RankDetectors::new(thresholds))?;
-    Ok(report(&run_id, rank, &detectors, 0))
+    Ok(offline_report(&run_id, rank, &detectors))
+}
+
+/// How the offline modes order a rank's attempts, as a live report says it under `attempt_order`
+/// (`storage::AttemptOrder::kind`): in the order the rows first name them ([`judge`]), which is what
+/// a live server whose store kept its `attempts.json` from the rank's first attempt reports,
+/// `first_seen`. A live server says `numeric` (or `numeric_then_first_seen`) only for a store
+/// written before that file, which offline rows never are. Until wave AF (section 5 of
+/// `WAVE_AF_CONTRACT.md`, RS-04) the offline report had no `attempt_order`.
+pub const OFFLINE_ATTEMPT_ORDER: &str = "first_seen";
+
+/// A rank's [`report`] as the offline modes print it: no rebuilds, and the order of its attempts.
+pub(crate) fn offline_report(run_id: &str, rank: i32, detectors: &RankDetectors) -> Value {
+    let mut document = report(run_id, rank, detectors, 0);
+    document["attempt_order"] = json!(OFFLINE_ATTEMPT_ORDER);
+    document
 }
 
 /// `tensorquill-server detect --samples`: the same [`report`] written to `out` as one JSON
@@ -4826,7 +4841,7 @@ pub fn detect_stream_samples(
         samples: MoeSamples<'a>,
     }
     let (run_id, rank, detectors) = detect_rows(input, RankDetectors::with_samples(thresholds))?;
-    let report = report(&run_id, rank, &detectors, 0);
+    let report = offline_report(&run_id, rank, &detectors);
     let samples = detectors.samples().expect("these detectors keep their samples");
     serde_json::to_writer(
         out,

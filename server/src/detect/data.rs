@@ -460,7 +460,7 @@ pub fn detect_run(batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Resu
     for (rank, pieces) in &by_rank {
         let detectors = judge(*rank, pieces, thresholds).map_err(|error| format!("rank {rank}: {error}"))?;
         windows.insert(*rank, detectors.data_window().clone());
-        reports.push(report(&run_id, *rank, &detectors, 0));
+        reports.push(super::offline_report(&run_id, *rank, &detectors));
     }
     let compared = ranks_compared(&windows);
     let found = duplicate_batches(&windows);
