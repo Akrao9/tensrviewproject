@@ -378,6 +378,24 @@ def test_the_guide_and_the_readme_say_several_agents_are_not_supported_in_v1():
     assert "Restart keys under a torchrun launch with several agents (nodes) are not supported in v1" in flat(README)
 
 
+def test_the_numbers_the_pages_give_of_torch_are_the_installed_torchs():
+    """Read from PyTorch's own code, not from TensorQuill's: torchrun's agent stops workers with SIGTERM
+    and a SIGKILL 30 s later (a close can wait 60 s), and the process group's default timeouts."""
+    import inspect
+
+    import torch.distributed as dist
+    from torch.distributed.elastic.agent.server.local_elastic_agent import LocalElasticAgent
+
+    shutdown = inspect.signature(LocalElasticAgent._shutdown).parameters
+    assert shutdown["death_sig"].default.name == "SIGTERM" and shutdown["timeout"].default == 30
+    assert "Default value is 10 minutes for NCCL and 30 minutes for other backends" in flat(
+        dist.init_process_group.__doc__)
+    from tensorquill import capture
+    assert capture.CLOSE_SECONDS == 60.0
+    for text in (flat(GUIDE), flat(README)):
+        assert "30 seconds after its SIGTERM" in text and "10 minutes on NCCL" in text
+
+
 # --- 4. The replica collectives ---------------------------------------------------------------------
 
 
