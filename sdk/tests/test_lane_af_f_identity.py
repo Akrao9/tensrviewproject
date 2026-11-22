@@ -209,3 +209,22 @@ def test_a_valid_stream_is_byte_for_byte_the_stream_of_the_base_rows(stream):
     with pa.ipc.new_stream(out, schema) as writer:
         writer.write_batch(pa.RecordBatch.from_pylist(rows, schema=schema))
     assert STREAMS[stream](given) == out.getvalue()
+
+
+# --- Item 3: the sender reading its own file, as on the base (a pin) -----------------------------
+
+def test_the_sender_s_rows_are_as_on_the_base_for_a_record_the_check_refuses():
+    """`rows_to_send` does not take the check: a line whose key Arrow cannot hold (null, text, a
+    Boolean, a float) is skipped and counted, as before; a negative `attempt`, `rank` or `step` and a
+    `schema_version` of 99 are sent for the server to refuse and count (live ingest is unchanged,
+    RS10). Recorded against the real server on the base and after in lane AF-F's notes."""
+    good = [{**GOOD, "step": s} for s in (0, 2)]
+    for field, value in (("attempt", None), ("attempt", "1"), ("rank", True), ("schema_version", 1.0)):
+        batch, steps, unstorable = flight.rows_to_send([good[0], {**GOOD, "step": 1, field: value}, good[1]],
+                                                       flight.flight_schema())
+        assert (steps, unstorable) == ([0, 2], 1), (field, value)
+    for field, value in (("attempt", -3), ("rank", -3), ("step", -3), ("schema_version", 99)):
+        bad = {**GOOD, "step": 1, field: value}
+        batch, steps, unstorable = flight.rows_to_send([good[0], bad, good[1]], flight.flight_schema())
+        assert unstorable == 0 and batch.num_rows == 3, (field, value)
+        assert batch.to_pylist()[1][field] == value
