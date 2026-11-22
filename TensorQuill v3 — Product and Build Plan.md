@@ -3284,7 +3284,9 @@ State as of Nov 16, 2026.
   - [x] (done on `main` at `c97aa01`, Nov 22: five rounds with all 8 cores busy, 30 server and 330 SDK test runs, none failed) The timing-natured tests of waves AF to AH repeated under load, before the push.
   - *Decided, Nov 22:* the restart grace (a kept stall is not carried over a server restart) stays for v1 as a stated limit; the watcher-to-MCP result is a stand-in agent proof.
   - [ ] The live-agent proof: an outside agent through MCP, woken by `--on-incident`. (Prepared Nov 22 with Claude Code headless as the agent; it stopped at the agent's sign-in, which is the author's.)
-  - [ ] The GPU session: `GPU_RUN_SHEET.md` is written and its runnable lines dry-run on CPU. Open, the author's: the real job (D10), the two comparison arms of the compiler gate, the three framework scripts, a hang script for Flight Recorder, and the attachment to `lm-resiliency`.
+  - [ ] The GPU session: `GPU_RUN_SHEET.md` is written and its runnable lines dry-run on CPU. Open, the author's: the real job (D10).
+  - [x] (wave AI, Nov 22: three lanes, one gate on `909dad6`, every stage exit 0; section 14 of the bug list. On the author's "Write the missing GPU proof harnesses in three parallel lanes, reuse the existing examples, and gate the merged result once.") The harnesses the GPU session lacked: the compiler gate's NeuralDBG and `wandb.watch` arms, the BF16 and FP32 pair, probe coverage, the GPU system check, Lightning DDP and FSDP, the `Trainer` under DDP, Megatron routing, the Flight Recorder hang test and the `lm-resiliency` comparison. Dry-run on CPU only.
+  - [ ] One step loses 30 to 60 ms in the data loader's `next()` with TensorQuill on (found by lane AI-1, reproduced): cause not established.
 
 ## Sources
 

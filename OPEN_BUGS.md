@@ -391,3 +391,49 @@ Also corrected, as stale text: section 12's head (it said `main` was at `76a3b5d
 - **The live-agent proof is prepared and has not run.** The harness is in `live-agent-proof/` of the side-session notes: a run with one NaN planted in `blocks.5.experts.0.weight.grad` at step 150, with `record_grads()` before the clip so the evidence names that parameter; the watcher's `--on-incident` starts a wrapper that launches Claude Code headless (`claude -p`) from an empty directory, with one MCP server (TensorQuill's, on the evidence file the trigger named), only the six MCP tools, no built-in tools and no project settings; the prompt is `AGENT_INSTRUCTIONS.md` with the trigger's document and variables; five pass lines written before any run (`EXPECTED.md`). One run went end to end up to the agent: the watcher started the wrapper once, the evidence named the planted parameter, and the agent command answered `401, OAuth access token is invalid`, with this session's own variables removed too. **Needs the author:** sign in to `claude` in a terminal; then it is one command. It would be a live model through a real MCP client, of the same family as the tool that built this, not a third party's agent: whether that closes the item is the author's.
 - **The GPU run sheet is `GPU_RUN_SHEET.md`** at the repository root, rewritten from the scripts on `main`. 18 of its commands were dry-run on CPU with the toy models, offline, each exit 0, and the signed-zero and one-bit plant line after; `moe_dogfood.py` refused without a GPU, as it must. Results go to `tensorquill-out/v1-gpu-<revision>/`. Ready as written: the single-GPU lines, the Granite gate's two arms, and the distributed lines.
 - **Found while preparing it, each the author's:** `moe_dogfood.py` has no NeuralDBG arm and no `wandb.watch` arm, so the plan's four-arm compiler gate has two arms nobody has written; no script exists for a `LightningModule` under DDP and FSDP, the `Trainer` on more than one GPU, or Megatron's routing map; no script forces a collective hang for Flight Recorder; TensorQuill is not attached to `lm-resiliency`'s injection campaign; BF16 against FP32 as a pair, probe coverage counts and the NVML readings have no script; neither model is in this machine's cache, so no real-model command was dry-run; and the independent real job (D10) is not named.
+
+## 14. Wave AI: the GPU proof harnesses
+
+**Not in `main` when this was written.** `main` is at `6c36976`. The code is the tree `trial/ai-wave` at `909dad698e08d1bbc5f2969ca820b7f3bc551a2a`, cut from `main`; this section, the plan's entry and the run sheet are a documents-only commit on top of it. Nothing is pushed. Not counted in the table at the top. **Nothing in this section ran on a GPU.**
+
+**Why.** Preparing the GPU session showed that several proofs of the approved plan had no script. The author, Nov 22, 2026: "Write the missing GPU proof harnesses in three parallel lanes, reuse the existing examples, and gate the merged result once. ... 'Unverified' is an appropriate outcome when a dependency, hardware limitation, or actual run prevents verification. A missing harness is something you can fix now, before paying for GPU time."
+
+**The three lanes**, each in its own worktree from `6c36976` with its own files, none touching `sdk/src` or `server/src`, merged `--no-ff` (their notes: `lane-ai1.md`, `lane-ai2.md`, `lane-ai3.md`). Every harness checks a TensorQuill result against an independent expectation and uses one exit convention: 0 pass, 1 fail, 2 a missing requirement, 3 not proven.
+
+| Lane | Harness | Checks against | On CPU here |
+|---|---|---|---|
+| AI-1 | `granite_compiler_gate.py`: capture off, TensorQuill, NeuralDBG and `wandb.watch`, each arm a fresh process, the same model, batches, warm-up and timed steps | the 1% line, graph breaks, recompiles, CUDA-graph skips; every step recorded and router totals; what each tool observes and how often | toy: 12 arm processes; `wandb` `not_run` (not installed). The `wandb` arm has never executed |
+| AI-1 | `seeded_failures.py --case paired_dtype` | one float32 model and the same batches for both dtypes; TensorQuill's loss and gradient norm against the script's own | 7 of 7 checks on the toy |
+| AI-1 | `gpu_probe_coverage.py` | blocks, attention calls, heads and positions counted from the model itself | 15 of 15 on the toy; a tiny random Granite MoE config in a test |
+| AI-1 | `gpu_system_check.py` | a known injected data wait and the script's own timer; `torch.cuda`; `nvidia-smi` alongside | exit 3: data wait checked, CUDA and NVML not proven |
+| AI-2 | `lightning_check.py`, DDP and FSDP | what the `LightningModule` itself logged (steps, loss, rank, world size); the planted spike on every rank | DDP on two processes; FSDP refused by Lightning without CUDA, so never run |
+| AI-2 | `trainer_ddp_check.py` | the `Trainer`'s own `global_step`, logged loss and `grad_norm`; Accelerate's own skip flag | two processes, eager and `aot_eager`; fp16 and Inductor never run |
+| AI-2 | `megatron_routing_check.py`, dropping off, on, and on with padding | the router's own map before and after dropping | a stand-in router with Megatron's own dropping code, read from the clone. Megatron's `TopKRouter` has never run (it needs `triton` and CUDA) |
+| AI-3 | `flight_recorder_hang_check.py` | the plan: which rank skipped which collective at which step | exit 3: the bounded driver works and nothing is left running; PyTorch 2.15's own analyzer cannot read its Gloo dumps. NCCL's path has never run |
+| AI-3 | `fault_injection_check_entry.py`, `fault_injection_check.py` | `lm-resiliency`'s `injection.json`, exact rank and step, their own localization never read | a stub campaign of ours with a constructed `injection.json`. The real campaign has never run; it needs PyTorch 2.10 to 2.13 and 8 GPUs |
+
+**Found by the lanes.**
+- **Fixed at the merge: `--flight-recorder` ended in a traceback** on dumps PyTorch's own analyzer could not put together (lane AI-3, on PyTorch 2.15's Gloo dumps; `KeyError` from `build_db`). `analyze_flight_recorder` now turns the analyzer's own error into the `ValueError` its callers list under `not_checked`, with the analyzer's words. Regression committed failing first (3 of 3 failed; `sdk/tests/test_wave_ai_flight_recorder.py`). One existing test (`test_lane_ad4_writer.py`, the logger's state when the analyzer raises) expected the error to escape as it was and now expects the `ValueError` that carries it.
+- **Open, cause not established: one step loses 30 to 60 ms in the data loader's `next()` with TensorQuill on** (lane AI-1; reproduced by the coordinator, 3 runs of 3 of `gpu_system_check.py` on CPU: step 100 at a 50-step flush, 50, 79 and 77 ms against a 20 ms sleep; 0 of 3 with TensorQuill off, by the lane). TensorQuill's `data_wait` and the script's own timer agree, so the time is spent, not misrecorded. With a sampling thread reading every thread's stack every 2 ms, the delay did not occur (0 of 2), and the writer thread was idle whenever it was sampled; a stand-alone loop did not reproduce it for the lane. Bounded, once a run, and nothing raised or blocked; but it is time taken from the training thread, and it bears on the 1% line. **The author's:** a lane to find it, or read it from the GPU run's `system.json`.
+- **For the author when the result is in:** under DDP, Dynamo breaks three times inside `DistributedDataParallel.forward` itself, with or without TensorQuill; `trainer_ddp_check.py` counts them and does not fail on them, which is weaker than `trainer_check.py`'s "0 graph breaks".
+- **Stated, not changed:** TensorQuill records per-expert counts only, so the Megatron check derives "dropped" from Megatron's pre-drop map; `lm-resiliency` pins PyTorch below 2.14, so its campaign needs an environment of its own; what counts as a pass on that campaign is the author's call (`--measure` records without gating).
+
+**The exit gate, run alone on `909dad698e08d1bbc5f2969ca820b7f3bc551a2a`**, Nov 22, 2026, 16:29 to 17:09, load average 6.2 at the start and 4.7 at the end. A first run on `8920f8c` (15:45 to 16:29) had one failure, the existing test named above; `909dad6` changes only that test file, and the whole gate was run again on it. Logs: `wave-ai-exit-gate/` in the side-session notes.
+
+| Stage | Exit | Result |
+|---|---|---|
+| `cargo build --release`; `cargo test`; `cargo test --no-default-features --lib` | 0, 0, 0 | protocol 4; 350 passed, 6 ignored; 260 passed, 3 ignored |
+| Both `cargo clippy ... -D warnings` lines, `cargo fmt --check` | 0, 0, 0 | |
+| The full SDK suite, alone, with this tree's rebuilt binary | 0 | 5,685 passed, 6 skipped, in 35 min 29 s (5,616 on `626fff8`) |
+| The compact fixture | 0 | 10,446 bytes; both summaries equal the full evidence's |
+| `replica_check.py` on 2, 3 and 8 CPU ranks, both arms, files and a live server, and 3 ranks without NumPy | 0 | 13 runs, all 13 `verdict.json` at code 0 with 0 failures |
+| Gate 1's `harness.py build` against the build on `f5ee53e` | 0 | 127 files each; no other file differs; the 14 recordings the same by content |
+| Gate 1, bake-off and TrainCheck tests | 0, 0, 0 | 71, 37 and 18 passed |
+
+**The run sheet** (`GPU_RUN_SHEET.md`) is rewritten for this commit: sections 1 to 6 are ready to execute, each line marked with what was dry-run and what has never run; the option names were checked against the merged scripts.
+
+**Open.**
+- The one-step delay above.
+- The live-agent proof: the harness is ready and waits for the author's sign-in to `claude`.
+- D10, the independent real job, and which TrainCheck cases need a GPU.
+- Everything a first GPU run will exercise for the first time: the `wandb` arm, NeuralDBG on Granite, Lightning FSDP, fp16 and Inductor under DDP, Megatron's own router, NCCL's dump on timeout, the real fault-injection campaign, every real-model load.
