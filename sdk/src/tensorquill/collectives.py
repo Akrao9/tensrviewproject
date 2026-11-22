@@ -111,7 +111,8 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
 
     `prefix` is the common start of the dump file names (`<prefix><rank>`); without it
     PyTorch infers one. Raises `ImportError` when this PyTorch has no analyzer and
-    `FileNotFoundError` or `ValueError` when there is nothing readable in the directory.
+    `FileNotFoundError` or `ValueError` when there is nothing readable in the directory, or when
+    PyTorch's own analyzer fails on what it read.
     Returns the facts about the first problem, or `problem: None` when every collective
     that was recorded matched and completed. A partial set of dumps is analyzed as far as
     it goes (`incomplete_dumps` says so).
@@ -151,7 +152,17 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
     # The analyzer reports what it finds through a logger that prints to the console; take this
     # thread's messages instead of printing them, leaving the logger's handlers alone.
     with _messages_of_this_thread(FlightRecorderLogger().logger) as messages:
-        db = build_db(details, config, version)
+        try:
+            db = build_db(details, config, version)
+        except Exception as error:  # noqa: BLE001  PyTorch's analyzer, on dumps it read and cannot put together
+            # Its own errors are not this reader's to let through: PyTorch 2.15's Gloo dumps, for one,
+            # name the process group in their entries and not in `pg_config`, and `build_db` raises
+            # `KeyError: ('0', 2)` (fixed upstream after 2.15). A reader given such dumps says they were
+            # not checked, and why (wave AI, Nov 22, 2026; until then the error escaped as a traceback).
+            raise ValueError(
+                f"PyTorch's Flight Recorder analyzer could not put the dumps in {directory} together"
+                f" ({type(error).__name__}: {error}); they are not read"
+            ) from error
 
     dumped = sorted(int(d["rank"]) for d in details.values())
     groups = {g.id: g for g in db.groups}
