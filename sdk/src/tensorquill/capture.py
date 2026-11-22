@@ -2185,7 +2185,9 @@ class Session:
             if self._not_exact_before is not None:
                 self._weights_not_exact = self._not_exact_before
             self._record_weights()
-            self._ring_grad[len(self._steps) - 1, :, 2:].copy_(self._grad[:, 2:])
+            # Through `_grad_ring`: in the router-only mode the ring is made only once it is needed
+            # (SDK-01's second half; indexed directly, a ring not made yet would raise here).
+            self._grad_ring()[len(self._steps) - 1, :, 2:].copy_(self._grad[:, 2:])
             self._grad[:, 2:].zero_()
             self._mark_held("grad")
             self._ring_weight_seen[-1] = {"ownership": self._optimizer_ownership(), "dtypes": self._weight_dtypes}

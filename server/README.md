@@ -51,6 +51,15 @@ which decides which attempt owns the rank after a restart). The run's `watchdog.
 whether each rank is making progress; a rank whose capture stopped while training went on
 reads `capture_stopped`, which is neither a hang nor finished.
 
+A rank reads `reconnecting` for `--silent-seconds` after its stream drops without ending, and
+`lost` after that. `reconnecting` is the state of the connection. A rank that was healthy at the
+drop has no severity for that time and counts as active. A rank that was already `silent` or
+`unresponsive` at the drop keeps its severity, on the clock it had, and stays in the run's
+`rank_silent` or `job_stalled`; its entry says what it was in `stopped_as`. Opening a stream
+again clears nothing, a new step recovers the rank, and a newer attempt that takes the rank
+starts it afresh. A restart of the server does not carry the kept stall over: every unfinished
+rank gets a fresh window from the restart.
+
 At the store root the server keeps `store.json`, which names the store with a random ID written
 once, by the first server to find none. Every acknowledgement carries it,
 `{"end_byte_offset": N, "store_id": "..."}`, so a sender can tell a store wiped and made again

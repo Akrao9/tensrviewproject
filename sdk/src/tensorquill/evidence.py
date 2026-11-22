@@ -9334,8 +9334,11 @@ def _main() -> None:
         "`pip install 'tensorquill[flight]'`). python: the Python detectors, which need neither. auto, the default "
         "for one read: rust when the binary and pyarrow are there, and otherwise python with one warning that says "
         "what to install. --watch needs the Rust detectors and stops before its first look when they are missing; "
-        "only `--detectors python` makes it watch with the Python ones. With --watch the detectors run on every "
-        "rebuild made here, over every record read so far. With --rank all the option changes nothing: that view "
+        "only `--detectors python` makes it watch with the Python ones. With --watch and the Rust detectors, one "
+        "detector process is kept for the watcher and is sent only the records appended since its last look; it reads "
+        "everything again after rows that arrive late, a new attempt, a file that was cut short or replaced, or a "
+        "change of thresholds. With --watch and the Python detectors, every record read so far is judged again at "
+        "each rebuild. With --rank all the option changes nothing: that view "
         "takes every rank's incidents from its server's report and runs no detector, so it needs no binary",
     )
     from . import compact as _compact, trigger as _trigger
