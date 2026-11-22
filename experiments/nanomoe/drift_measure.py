@@ -1,6 +1,15 @@
 """Measurement only: activation_drift's ratio on recorded captures, at several factors.
-Same arithmetic as evidence.detect_activation_anomalies (baseline = a module's first ACT_WINDOW
-records, recent = its last ACT_RECENT), with the factor left open."""
+
+The factor table is the rule as it was before wave AD (Nov 21, 2026): a module's baseline is its
+first ACT_WINDOW records, its recent value its last ACT_RECENT, with the factor left open. It is
+kept so the table in this folder's README can be made again. The current rule is different:
+its baseline is the ACT_WINDOW records before the recent ACT_RECENT, and a module is judged
+from its ACT_DRIFT_NEEDS-th record, so the baseline holds none of its first ACT_WINDOW records
+(DETECTOR_RULES_CONTRACT.md, part 2). The line "detector today" is the current rule, called
+through evidence.detect_activation_anomalies.
+
+    python drift_measure.py balance-on=<capture> balance-off=<capture>
+"""
 import json, sys
 from tensorquill import evidence as ev
 
@@ -50,6 +59,7 @@ def measure(path, label):
     top = sorted(worst.items(), key=lambda kv: -kv[1][0])[:3]
     print(f"\n{label}: {len(rows)} records, steps {rows[0]['step']}..{rows[-1]['step']}, {len(hist)} modules, {judged_steps} judged steps")
     print("  detector today:", {k: (v["step"], v["affected"], v["affected_steps"]) for k, v in found.items()} or "nothing")
+    print("  the rule before wave AD (baseline: a module's first", ev.ACT_WINDOW, "records):")
     for f in FACTORS:
         print(f"  factor {f:>3}: first step {first[f]}, modules there {mods_at_first[f]}, steps at or over {steps_over[f]}")
     print("  largest ratios:", [(n, round(v[0], 2), v[1], v[2]) for n, v in top])

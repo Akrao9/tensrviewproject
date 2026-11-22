@@ -48,7 +48,7 @@ So the one incident that separates the arms is the one the missing balance loss 
 Both are on the arm with nanoMoE's own settings, so both are false alarms on a healthy run trained from scratch.
 
 - **`moe_imbalance` at step 0** is the router at its random initialisation, before any update.
-- **`activation_drift` at step 79.** The rule compares a module's recent `std` with its first 50 records. The ratio is 3.04 against a factor of 3 where it first crosses, and it goes on rising: `drift_measure.py` runs the rule's own arithmetic with the factor left open.
+- **`activation_drift` at step 79.** The rule compares a module's recent `std` with its first 50 records. The ratio is 3.04 against a factor of 3 where it first crosses, and it goes on rising: `drift_measure.py` runs that rule's arithmetic with the factor left open. (That was the rule before wave AD; the script still computes it, as "Run again on the SDK after wave AD" below says.)
 
 | Factor | balance-on: first step at or over it | balance-off |
 |---|---|---|

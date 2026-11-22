@@ -49,6 +49,8 @@ Without the binary, the commands in section 5 still work with the Python detecto
 
 Router-only records each router's expert load every step. Full capture adds per-block activation statistics, per-parameter gradient norms every step and a weight check every 50 steps. In either mode, if your job clips gradients, TensorQuill records the total gradient norm that clipping already computes. That is enough to detect gradient spikes.
 
+**If your schedule unfreezes layers, use `capture="full"` or add `grads=True`.** In the router-only mode a parameter frozen at `init` and unfrozen later is never recorded, with no warning, also when you call `session.record_grads()` by hand: that call records only the parameters trainable at `init`. Full capture, or `routers=...` with `grads=True`, records such a parameter from the step it is unfrozen, and says so once in a warning.
+
 ## 3. Find your router modules (MoE models only)
 
 TensorQuill needs each router's module name, its number of experts, and how many experts each token picks (`top_k`). Router outputs differ between model families, so run this once on one batch to see what each candidate returns:
@@ -111,6 +113,8 @@ Call `init` on every rank. A rank that has not heard from rank 0 within 300 s (o
 
 If you start several ranks with plain `torchrun` (no `--rdzv-id`, so `TORCHELASTIC_RUN_ID` is `none`) and call `init` before `init_process_group`, nothing is shared yet: each rank generates its own ID, `init` warns, and the job is written as one run per rank. Pass the same `run_id=` on every rank, or call `init` after `init_process_group`.
 
+**Not supported in v1: a restart under a torchrun launch with several agents.** torchrun keeps one store across a restart of its workers. With one agent (`GROUP_WORLD_SIZE` 1: one node, `--standalone` or `--nnodes 1`), each restart exchanges the run ID and the launch under keys of its own, scoped by `TORCHELASTIC_RESTART_COUNT`. With several agents (`--nnodes` above 1) that count is not trusted, the keys are the same in every start, and a restarted rank other than 0 can take the earlier start's run ID and launch before the new rank 0 has set its own. A run ID generated afresh in each start can then differ between ranks; the same `run_id=` on every rank keeps the ID the same, and the launch can still be the earlier start's (bug list, L25).
+
 ### Plain PyTorch
 
 ```python
@@ -138,6 +142,7 @@ session.close()
 - **Clipping groups separately.** With more than one `clip_grad_norm_` call in a step the record says so (`clip_calls`), and `update_spike` leaves out the comparisons that would need the total split by parameter, saying how many under `not_checked` (`clip_groups`). Under `torch.compile` the number of calls is not known and there is no key.
 - **Several optimizers.** The first optimizer that ever steps ends each step. If another optimizer sits before it in your loop, pass `init(..., ends_step=optimizer)` with the optimizer whose step closes the iteration; it cannot be combined with `scaler=` or `auto_step=False`. The Lightning, Hugging Face and Accelerate adapters do not pass it.
 - **Several optimizers through one `GradScaler`.** A step on which the scaler skipped some and applied others is recorded as a partial step (`step_skipped_part`) and does not count toward `loss_scale_trouble`'s ten skips in a row.
+- **A job stopped by SIGTERM** (a scheduler's preemption, or torchrun stopping the other ranks after one failed). TensorQuill installs no signal handler, so with the default handling no `close()` runs: the steps not yet written (those since the last flush, up to `every`, and any still in the writer's queue) are lost and the file reads not closed. To keep them, turn SIGTERM into an exception, `signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))`, and train inside `with session:` or a `try` whose `finally` calls `session.close()`: every step is written and the end marker says `raised`.
 - **`from torch.nn.utils import clip_grad_norm_` at the top of your script** binds the function before `init` wraps it. Either call `torch.nn.utils.clip_grad_norm_`, or pass the returned norm yourself: `session.record_grad_norm(norm)`.
 
 ### Steps you count yourself, and skipped steps
@@ -292,6 +297,7 @@ Every rank writes its own file, `tensorquill-out/<run_id>.rank<rank>.jsonl`. Sta
 - **What it cannot see.** A fault every rank shares, such as a gradient corrupted before or during the reduction, reaches every replica alike, so the replicas stay equal. Under full sharding alone (FSDP full shard, ZeRO stage 3) no parameter is held twice, so there is nothing to compare.
 - **Which rank.** Where the ranks differ on a parameter, the result's `attribution` says which ranks stand apart from a strict majority (`verdict` `attributed`, with `outliers`), or why no rank can be named (`verdict` `inconclusive`, with `why`): `two_ranks` (two ranks that differ show a divergence and cannot say which is wrong), `no_outlier` (no rank is further than the tolerance from the median) or `no_majority`. With two ranks no rank is ever named. A named rank stands apart; that does not make it the faulty one, since a fault shared by every other rank would name the healthy one.
 - **A rank with no peer** is never said to agree. A group of one rank reads "one rank observed, zero peers compared".
+- **The two checks you call yourself are collectives.** `tensorquill.distributed.replica_spread(params, group)` and `session.record_replica_spread(group)` gather from every rank of `group`, unlike the scheduled check. Every rank of the group must call them on the same step, and each call waits for the others as any collective does: a rank that never calls leaves the others waiting until the process group times out, and a gather that fails once issued raises into your code. Nothing else TensorQuill does on its own after `init` waits for another rank or raises into training.
 - **Where it was run.** Comparing the observations was run on 2, 3 and 8 CPU ranks over Gloo, through local files and through a live server. Not on a GPU, and its cost on a GPU is not measured; `replica_projection=False` turns the projection off.
 
 ## 5. After the run
