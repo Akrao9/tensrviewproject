@@ -3283,7 +3283,8 @@ State as of Nov 16, 2026.
   - [x] (answered Nov 22: L29's seven are the checkpoint-record rules in `CHECKPOINT_TENSOR_CONTRACT.md`, lines 147 to 153; "per-run coverage across checkpoints" is struck as a standalone task, the per-load contract standing as it is) The author's two questions from the cross-check.
   - [x] (done on `main` at `c97aa01`, Nov 22: five rounds with all 8 cores busy, 30 server and 330 SDK test runs, none failed) The timing-natured tests of waves AF to AH repeated under load, before the push.
   - *Decided, Nov 22:* the restart grace (a kept stall is not carried over a server restart) stays for v1 as a stated limit; the watcher-to-MCP result is a stand-in agent proof.
-  - [ ] The live-agent proof: an outside agent through MCP, woken by `--on-incident`.
+  - [ ] The live-agent proof: an outside agent through MCP, woken by `--on-incident`. (Prepared Nov 22 with Claude Code headless as the agent; it stopped at the agent's sign-in, which is the author's.)
+  - [ ] The GPU session: `GPU_RUN_SHEET.md` is written and its runnable lines dry-run on CPU. Open, the author's: the real job (D10), the two comparison arms of the compiler gate, the three framework scripts, a hang script for Flight Recorder, and the attachment to `lm-resiliency`.
 
 ## Sources
 
