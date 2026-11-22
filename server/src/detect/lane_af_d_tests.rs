@@ -378,3 +378,73 @@ mod trend_memo {
         );
     }
 }
+
+// --- wave AG, section 8: a router recorded with no tokens -----------------------------------------
+
+mod moe_routing {
+    use std::sync::Arc;
+
+    use serde_json::{json, Value};
+
+    use super::super::lane_ad8_tests::stored;
+    use super::super::{RankDetectors, Thresholds};
+
+    fn record(step: i64, a: [i64; 4], b: [i64; 4]) -> Value {
+        json!({"attempt": 1, "step": step, "moe": {"blocks.1.router": b, "blocks.0.router": a},
+               "moe_top_k": {"blocks.0.router": 2, "blocks.1.router": 2}})
+    }
+
+    fn entry(detectors: &RankDetectors) -> Option<Value> {
+        detectors
+            .not_checked()
+            .into_iter()
+            .find(|item| item["check"] == "moe_routing")
+    }
+
+    /// On a live rank the judgement is made on what has arrived: the entry is there while a router
+    /// the rows name has had only zeros, names only the routers not read, sorted by name, and goes at
+    /// a router's first tokens. While no router was read the two MoE kinds are `unavailable` with the
+    /// entry's check and reason; once one is, they are judged (`checked`) and the entry names the rest.
+    #[test]
+    fn the_entry_is_there_while_a_router_had_only_zeros_and_goes_at_its_first_tokens() {
+        let thresholds = Arc::new(Thresholds::default());
+        let mut live = RankDetectors::new(&thresholds);
+        live.append(1, &stored(&[record(0, [0; 4], [0; 4]), record(1, [0; 4], [0; 4])]));
+        let reason = "router blocks.0.router recorded no tokens on any step: its routing was not read; \
+                      router blocks.1.router recorded no tokens on any step: its routing was not read";
+        assert_eq!(
+            entry(&live),
+            Some(
+                json!({"check": "moe_routing", "kinds": ["moe_imbalance", "starved_experts"],
+                        "routers": ["blocks.0.router", "blocks.1.router"], "reason": reason})
+            )
+        );
+        let kinds = live.kind_checks();
+        for kind in ["moe_imbalance", "starved_experts"] {
+            assert_eq!(
+                (&kinds[kind]["value"], &kinds[kind]["check"], &kinds[kind]["reason"]),
+                (&json!("unavailable"), &json!("moe_routing"), &json!(reason)),
+                "{kind}"
+            );
+        }
+        // blocks.1.router routes tokens: the kinds are judged, and the entry names blocks.0.router.
+        live.append(1, &stored(&[record(2, [0; 4], [5, 3, 2, 6])]));
+        let only = "router blocks.0.router recorded no tokens on any step: its routing was not read";
+        assert_eq!(entry(&live).unwrap()["routers"], json!(["blocks.0.router"]));
+        assert_eq!(entry(&live).unwrap()["reason"], only);
+        let kinds = live.kind_checks();
+        assert_eq!(
+            (&kinds["moe_imbalance"]["value"], &kinds["starved_experts"]["value"]),
+            (&json!("checked"), &json!("checked"))
+        );
+        // Then blocks.0.router too: no entry.
+        live.append(1, &stored(&[record(3, [4, 4, 4, 4], [5, 3, 2, 6])]));
+        assert_eq!(entry(&live), None);
+        // Its place: right after the refused routers' entry, before `update_size` (Python's order);
+        // here with neither, after the system entries.
+        let mut again = RankDetectors::new(&thresholds);
+        again.append(1, &stored(&[record(0, [0; 4], [0; 4])]));
+        let checks: Vec<Value> = again.not_checked().iter().map(|item| item["check"].clone()).collect();
+        assert_eq!(checks.last(), Some(&json!("moe_routing")), "{checks:?}");
+    }
+}
