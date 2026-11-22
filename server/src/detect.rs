@@ -5535,7 +5535,8 @@ mod tests {
         // What the server keeps for a rank: no samples, however long the run.
         let server = judge(0, &batches, &usual()).unwrap();
         assert!(server.samples().is_none() && server.moe.kept.is_none());
-        let plain = report("run", 0, &server, 0);
+        // As `detect` prints it: with the offline `attempt_order` (wave AF, section 5).
+        let plain = offline_report("run", 0, &server);
         assert!(plain.get("samples").is_none());
         assert_eq!(detect_stream(&stream(&batches)[..], &usual()).unwrap(), plain);
 

@@ -14,7 +14,7 @@ use arrow::array::{Int32Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Map, Value};
 
-use super::{column, judge, report, text, with_classes, Columns, Scalars, Thresholds, Wanted};
+use super::{column, judge, text, with_classes, Columns, Scalars, Thresholds, Wanted};
 
 // The same values as the constants of the same names in data_checks.py.
 pub const DATA_STALL_STEPS: u32 = 3;
@@ -1063,11 +1063,11 @@ mod tests {
         let reports = document["reports"].as_array().unwrap();
         assert_eq!(reports.len(), 3);
         for (number, piece) in [&zero, &one, &two].into_iter().enumerate() {
-            let alone = report(
+            // With the offline `attempt_order` (wave AF, section 5).
+            let alone = super::super::offline_report(
                 "run",
                 number as i32,
                 &judge(number as i32, &[rows("run", piece)], &usual()).unwrap(),
-                0,
             );
             assert_eq!(reports[number], alone);
             assert_eq!((&alone["rank"], &alone["steps"]), (&json!(number), &json!(20)));
