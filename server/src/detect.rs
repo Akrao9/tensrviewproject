@@ -4956,7 +4956,7 @@ pub fn detect_follow(
     };
     let mut state: Option<(String, i32, RankDetectors)> = None;
     loop {
-        let Some(frame) = read_frame(&mut input)? else {
+        let Some(length) = frame_length(&mut input)? else {
             return Ok(());
         };
         let (from_rows, rows, mode) = match state.as_mut() {
@@ -4966,11 +4966,14 @@ pub fn detect_follow(
                 } else {
                     RankDetectors::new(thresholds)
                 };
-                let (run_id, rank, detectors, rows) = detect_rows_counted(frame.as_slice(), made)?;
+                let (run_id, rank, detectors, rows) =
+                    in_frame(&mut input, length, |frame| detect_rows_counted(frame, made))?;
                 state = Some((run_id, rank, detectors));
                 (0, rows as u64, "full")
             }
-            Some((run_id, rank, detectors)) => match follow_append(run_id, *rank, detectors, &frame) {
+            Some((run_id, rank, detectors)) => match in_frame(&mut input, length, |frame| {
+                Ok(follow_append(run_id, *rank, detectors, frame))
+            })? {
                 Ok((from_rows, rows)) => (from_rows, rows, "append"),
                 Err(why) => {
                     return write(&mut out, &erased::Json(json!({"follow": {"refused": why}})));
@@ -5005,9 +5008,10 @@ mod erased {
     }
 }
 
-/// One frame of `detect --follow`: its length, then the bytes. `None` at the end of the input or
-/// at a length of 0.
-fn read_frame(input: &mut impl std::io::Read) -> Result<Option<Vec<u8>>, String> {
+/// The length of the next frame of `detect --follow`. `None` at the end of the input or at a length
+/// of 0. The frame itself is read through `take(length)`, never held as one buffer beside the rows
+/// read from it (a first frame of 10,000 records is hundreds of MB of Arrow).
+fn frame_length(input: &mut impl std::io::Read) -> Result<Option<u64>, String> {
     let mut length = [0_u8; 8];
     let mut got = 0;
     while got < length.len() {
@@ -5020,15 +5024,24 @@ fn read_frame(input: &mut impl std::io::Read) -> Result<Option<Vec<u8>>, String>
         }
     }
     let length = u64::from_le_bytes(length);
-    if length == 0 {
-        return Ok(None);
+    Ok((length != 0).then_some(length))
+}
+
+/// Reads one frame of `length` bytes from `input` with `read`, then whatever of it `read` left, so
+/// the next frame starts where it should. A frame the input ends inside is said as that, whatever
+/// `read` made of its first part.
+fn in_frame<T>(
+    input: &mut impl std::io::Read,
+    length: u64,
+    read: impl FnOnce(&mut dyn std::io::Read) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut frame = std::io::Read::take(input, length);
+    let found = read(&mut frame);
+    std::io::copy(&mut frame, &mut std::io::sink()).map_err(|error| format!("cannot read the input: {error}"))?;
+    if frame.limit() > 0 {
+        return Err(format!("the input ended inside a frame of {length} bytes"));
     }
-    let length = usize::try_from(length).map_err(|_| format!("a frame of {length} bytes is too long"))?;
-    let mut frame = vec![0_u8; length];
-    input
-        .read_exact(&mut frame)
-        .map_err(|error| format!("the input ended inside a frame of {length} bytes: {error}"))?;
-    Ok(Some(frame))
+    found
 }
 
 /// Reads one later frame of `detect --follow` into `detectors`, when its rows are a plain append:
@@ -5036,7 +5049,12 @@ fn read_frame(input: &mut impl std::io::Read) -> Result<Option<Vec<u8>>, String>
 /// grown. Every row is checked before any is read. Gives the rows that counted before the frame
 /// (where its samples start) and the rows it held, or why it was refused. A refusal after the rows
 /// were read (a router new or grown) leaves the detectors not to be used again; the caller ends.
-fn follow_append(run_id: &str, rank: i32, detectors: &mut RankDetectors, frame: &[u8]) -> Result<(usize, u64), String> {
+fn follow_append(
+    run_id: &str,
+    rank: i32,
+    detectors: &mut RankDetectors,
+    frame: &mut dyn std::io::Read,
+) -> Result<(usize, u64), String> {
     let reader = arrow::ipc::reader::StreamReader::try_new(frame, None)
         .map_err(|error| format!("the frame is not an Arrow IPC stream: {error}"))?;
     let batches = reader
