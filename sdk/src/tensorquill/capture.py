@@ -16,6 +16,7 @@ import contextlib
 import logging
 import math
 import numbers
+import os
 import queue
 import sys
 import threading
@@ -585,7 +586,6 @@ def _count_width(spec: Router) -> int:
 
 def _router_hook(
     counts: torch.Tensor,
-    expert_ids: torch.Tensor,
     spec: Router,
     problems: list[tuple[str, str | None]] | None = None,
     phase: _Evaluating | None = None,
@@ -600,7 +600,8 @@ def _router_hook(
     experts = spec.n_experts
     # What one forward adds to `counts` before its assignments (`_count_width`), made once on the
     # counts' device: for expert ids, the slot that says they were checked; for the top-k of
-    # logits, nothing. `expert_ids` is no longer read (lane AD3): the count goes by index.
+    # logits, nothing. The count goes by index (lane AD3), so no tensor of expert ids is kept: one
+    # per router on the device that nothing read was made at `init` until wave AF.
     ids_start = torch.zeros(_count_width(spec), dtype=counts.dtype, device=counts.device)
     ids_start[2 * experts + 2] = 1  # the ids were checked; no routing map
     scores_start = torch.zeros_like(ids_start)
@@ -1458,10 +1459,6 @@ class Session:
             name: torch.zeros(_count_width(spec), dtype=torch.int64, device=self.device)
             for name, spec in self._routers.items()
         }
-        self._expert_ids = {
-            name: torch.arange(spec.n_experts, dtype=torch.int64, device=self.device)
-            for name, spec in self._routers.items()
-        }
         self._ring_act = torch.zeros(every, n_layers, _SEEN + 1, **f32)
         # The ring's gradient rows. In the router-only mode, which reads no gradient on its own, none
         # are made until a step whose gradients were read by hand (`record_grads`) is committed
@@ -1549,7 +1546,7 @@ class Session:
         # said under `grads_not_read` on a record.
         self._grad_why: dict[str, str] = {}
         self._grad_why_written: set[str] = set()
-        for buf in (self._act, self._stat_idx, *self._counts_list, *self._expert_ids.values()):
+        for buf in (self._act, self._stat_idx, *self._counts_list):
             _mark_static(buf)
 
         # Forwards that are not training (evaluation, the probe) are left out by the hooks
@@ -1634,6 +1631,9 @@ class Session:
         self._step_depth = 0
         self._outer_frame: Any = None
         self._closed = False
+        # The process that made the session (SDK-07): a child forked from it inherits the session
+        # but not its writer, and the records file and its end marker are the parent's (`close`).
+        self._pid = os.getpid()
         self._phase = "train"
         self._ticks = 0
         self._error: BaseException | None = None
@@ -1700,7 +1700,7 @@ class Session:
         self._handles += [
             modules[name].register_forward_hook(
                 _router_hook(
-                    self._counts[name], self._expert_ids[name], spec, self._router_problems[name], self._evaluating
+                    self._counts[name], spec, self._router_problems[name], self._evaluating
                 )
             )
             for name, spec in self._routers.items()
@@ -2280,6 +2280,10 @@ class Session:
         rest of its group one at a time. Which parameters, and why, is said once per parameter
         under `grads_not_read` on the first record written after it was found. A sparse
         gradient is read from its stored values, as the weight check reads a sparse weight.
+
+        The parameters read are those trainable at `init`, and, unless the session is in the
+        router-only mode, one frozen at `init` from its first trainable step. In the router-only
+        mode a parameter unfrozen after `init` is not read here, and nothing says so (SDK-01).
         """
         if self._closed_call("record_grads()"):
             return
@@ -3369,8 +3373,12 @@ class Session:
         parameter on a CPU under a load average of 157, so about 0.5 ms a step for 1,000 frozen
         tensors there; unloaded it was not measured. Nothing for a model with none frozen. The drift
         check across GPUs keeps the parameters chosen at `init`: each rank's observation names the
-        same parameters on every step, and an explicit gather exchanges their count first. Not in the
-        router-only mode, which records no parameter."""
+        same parameters on every step, and an explicit gather exchanges their count first.
+
+        Not in the router-only mode (`capture="routers"`, no gradients, weight checks or update
+        sizes on), a stated limit (SDK-01): there a hand `record_grads()` reads the parameters
+        trainable at `init` only, and one frozen then and unfrozen later is never recorded and
+        not warned of. To record such a parameter, use `capture="full"` or `grads=`."""
         if not (self.grad_every or self.weight_every or self.updates) or self._stopped:
             return
         try:
@@ -3446,8 +3454,8 @@ class Session:
         its first trainable step instead (`_take_unfrozen`), and said there. At a flush, at most once
         per `WEIGHT_EVERY` steps, and at close; on the host:
         one pass over the model's parameters, no read of a tensor (about 0.45 ms for 600 parameter
-        tensors on a CPU, so under 10 µs a step). Not in the router-only mode, which records no
-        parameter."""
+        tensors on a CPU, so under 10 µs a step). Not in the router-only mode, which records
+        parameters only by a hand `record_grads()`, and those trainable at `init` only (SDK-01)."""
         if not (self.grad_every or self.weight_every):
             return
         if not self._closed and self._steps_committed < self._trainable_scan_at:
@@ -3870,6 +3878,16 @@ class Session:
         closed and complete, `<name>.end.json` is left beside it (`sink.write_end_marker`), so a
         reader can tell this run from one that was killed.
 
+        In a process forked from the one that made the session, it touches nothing the parent
+        owns (SDK-07): the child's session is closed and the child's own hooks come off, and
+        nothing is flushed, queued, written or closed, and no end marker is left, so the parent's
+        session and its file are as they were. A fork has no writer thread, so what the child
+        recorded is not written: a child that should record calls `tensorquill.init` itself, with
+        a records file of its own. As wandb does for a run, the session keeps its creator's
+        process ID; it installs no fork handler, which would be the whole process's. Not covered:
+        a fork made while the parent's writer was in the middle of a write, whose unflushed part
+        the child's interpreter may still write at its own exit (a `sink.py` matter).
+
         It never raises and never waits without bound. A sink that fails here, or a writer that
         has not finished within `CLOSE_SECONDS`, stops capture (`_stop`), as during training: one
         warning, `writer_error` set, and no end marker, so the file reads as cut off. After a stop
@@ -3890,6 +3908,15 @@ class Session:
                 undo()
             except Exception:  # noqa: BLE001
                 pass
+        try:
+            forked = os.getpid() != self._pid
+        except Exception:  # noqa: BLE001
+            forked = False
+        if forked:
+            # The file, its marker, the sink and the stream are the parent's; this process's
+            # copies of the queue and the ring are dropped with the session.
+            self._replica_group = None
+            return
         deadline = time.monotonic() + CLOSE_SECONDS
         if not self._stopped:
             self._close_by = deadline  # the last block may wait for room, up to the deadline (`_put`)
@@ -4506,7 +4533,9 @@ def init(
             equal norm. Gradient norms and weight checks cover the
             parameters that are trainable (`requires_grad`) when `init` runs, and one frozen
             then from the first step on which it is trainable (said once in a warning; the
-            records before do not name it). One added to the model or replaced after `init`
+            records before do not name it). Not in the router-only mode, whose hand
+            `record_grads()` reads only the parameters trainable at `init`, with no warning for
+            one unfrozen later (SDK-01). One added to the model or replaced after `init`
             is named once in a warning and not recorded. An optimizer that holds any of the
             model's parameters, frozen ones included, ends steps.
         auto_step: count optimizer steps with PyTorch's global optimizer hooks. With a
