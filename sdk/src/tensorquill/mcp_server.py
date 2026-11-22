@@ -587,6 +587,137 @@ def _entries(opened: Mapping[str, Any]) -> list[dict[str, Any]]:
     return found
 
 
+# The lookup id (wave AH, P5-1, Nov 22, 2026): what the trigger hands a woken agent as `mcp_id`,
+# beside its delivery id. `<run_id>/<ranks>/<kind>@<step>`, with `#2` onwards for the second
+# incident of that kind and step ON THOSE RANKS, where `<ranks>` is `rank0`, `ranks0-3,7` or `run`.
+# Unlike a list id (`<kind>@<step>`, numbered over the whole view), it says whose incident it is,
+# so it finds the same incident whether the server was started on the run folder, a `rank=<n>`
+# folder, a capture or an evidence file, and whether the watcher looked at one rank or all of
+# them. A list id never holds a `/`, so the two forms cannot be mistaken for each other.
+
+
+def _base_id(kind: Any, step: Any) -> str:
+    return f"{kind}@{step}" if isinstance(step, int) and not isinstance(step, bool) else str(kind)
+
+
+def lookup_id(run_id: Any, ranks: Iterable[Any], kind: Any, step: Any, nth: int = 1) -> str:
+    """The lookup id of the `nth` incident of `kind` at `step` on `ranks` of `run_id` (see above)."""
+    numbers = sorted({r for r in ranks if isinstance(r, int) and not isinstance(r, bool)})
+    who = f"rank{'s' if len(numbers) != 1 else ''}{_ranges(numbers).replace(' ', '')}" if numbers else "run"
+    return f"{run_id}/{who}/{_base_id(kind, step)}" + (f"#{nth}" if nth > 1 else "")
+
+
+def _parse_lookup(wanted: str) -> dict[str, Any] | None:
+    """A lookup id's parts, read from the right (a run id may hold a `/`); None for anything else,
+    a list id among them."""
+    head, slash, last = wanted.rpartition("/")
+    run, slash2, who = head.rpartition("/")
+    if not slash or not slash2 or not run or not last:
+        return None
+    if who == "run":
+        ranks: list[int] = []
+    else:
+        spans = who[5:] if who.startswith("ranks") else who[4:] if who.startswith("rank") else ""
+        ranks = []
+        for span in spans.split(","):
+            first, dash, end = span.partition("-")
+            if not first.isdecimal() or (dash and not end.isdecimal()) or (dash and int(end) < int(first)):
+                return None
+            if int(end or first) - int(first) > 1_000_000:
+                return None
+            ranks.extend(range(int(first), int(end or first) + 1))
+    base, hash_, number = last.partition("#")
+    if hash_ and (not number.isdecimal() or int(number) < 1):
+        return None
+    kind, at, step = base.partition("@")
+    if not kind or (at and not step.isdecimal()):
+        return None
+    return {"run": run, "ranks": ranks, "kind": kind, "step": int(step) if at else None, "nth": int(number) if hash_ else 1}
+
+
+def lookup_candidates(opened: Mapping[str, Any], kind: Any, step: Any, ranks: Iterable[Any]) -> list[dict[str, Any]]:
+    """The entries a lookup id can mean, in the list's order: of that kind at that step (None: an
+    incident with no whole-number step), and, in the all-ranks view, a group that holds every one
+    of `ranks` or an incident of the run as a whole. One rank's evidence is of its own rank: the
+    caller sees that it is the right one. The trigger numbers its lookup ids with this same list."""
+    wanted = {r for r in ranks if isinstance(r, int) and not isinstance(r, bool)}
+    found = []
+    for entry in _entries(opened):
+        incident = entry["incident"]
+        at = incident.get("step")
+        at = at if isinstance(at, int) and not isinstance(at, bool) else None
+        if incident.get("kind") != kind or at != step:
+            continue
+        group = entry.get("group")
+        if group is not None and not wanted <= set(group.get("ranks") or ()):
+            continue
+        found.append(entry)
+    return found
+
+
+def lookup_ids(evidence: Mapping[str, Any], run_id: Any, units: Iterable[tuple[Mapping[str, Any], Iterable[Any]]]) -> list[str]:
+    """The lookup id of each `(incident, ranks)` of `evidence` (the trigger's units, at the look
+    they were read in): the incident's place among the candidates for its ranks."""
+    opened = {"shape": "all_ranks" if evidence.get("view") == ALL_RANKS_VIEW else "rank", "evidence": evidence}
+    out = []
+    for incident, ranks in units:
+        ranks = list(ranks)
+        step = incident.get("step")
+        step = step if isinstance(step, int) and not isinstance(step, bool) else None
+        candidates = lookup_candidates(opened, incident.get("kind"), step, ranks)
+        nth = next((n for n, entry in enumerate(candidates, 1) if entry["incident"] is incident), 1)
+        out.append(lookup_id(run_id, ranks, incident.get("kind"), step, nth))
+    return out
+
+
+def _looked_up(source: "Source", wanted: str, lookup: Mapping[str, Any], rank: int | None) -> tuple[dict[str, Any], dict[str, Any], int | None]:
+    """The source opened for a lookup id, the entry it names there, and the rank to read series
+    of. Refused by name when the id is of another run, of a rank this evidence is not of, or of
+    an incident that is not listed (any more)."""
+    ranks = lookup["ranks"]
+    opened = source.open(rank)
+    own = opened["source"].get("rank")
+    if opened["shape"] == "rank" and rank is None and ranks and isinstance(own, int) and own not in ranks:
+        opened = source.open(ranks[0])  # a capture of several ranks; an evidence file of another rank says so
+        own = opened["source"].get("rank")
+    run = opened["source"].get("run_id")
+    if run is not None and str(run) != lookup["run"]:
+        raise ToolError(
+            f"{wanted!r} is an incident of the run {lookup['run']!r}, and this server was started on the run"
+            f" {str(run)!r} ({opened['source'].get('path')}). Start a server on that run's capture, evidence file or"
+            " run folder to look it up."
+        )
+    if opened["shape"] == "rank" and ranks and isinstance(own, int) and own not in ranks:
+        raise ToolError(f"{wanted!r} is an incident of rank {_ranges(ranks)}; this answer would be rank {own}'s evidence,"
+                        " which says nothing about it.")
+    candidates = lookup_candidates(opened, lookup["kind"], lookup["step"], ranks)
+    if len(candidates) < lookup["nth"]:
+        entries = _entries(opened)
+        known = ", ".join(e["id"] for e in entries[:20]) or "none"
+        more = f" and {len(entries) - 20} more" if len(entries) > 20 else ""
+        who = f"rank{'s' if len(ranks) != 1 else ''} {_ranges(ranks)}" if ranks else "the run"
+        raise ToolError(
+            f"no incident matches {wanted!r}: {_base_id(lookup['kind'], lookup['step'])} is listed"
+            f" {len(candidates)} time{'s' if len(candidates) != 1 else ''} for {who} here. The incidents here are:"
+            f" {known}{more}. Call list_incidents for the current list."
+        )
+    if rank is None and len(ranks) == 1:
+        rank = ranks[0]
+    return opened, candidates[lookup["nth"] - 1], rank
+
+
+def _delivery_id_hint(wanted: str) -> str:
+    """For an id shaped as the trigger's delivery id (`<run_id>/<ranks>/<kind>/<step>`): what to pass instead."""
+    parts = wanted.split("/")
+    if len(parts) >= 4 and parts[-1].isdecimal() and len(parts) >= 5 and parts[-2].isdecimal():
+        parts = parts[:-1]  # a later stall episode at the same step: `/<n>` after the step
+    if len(parts) < 4 or not (parts[-3] == "run" or parts[-3].startswith("rank")):
+        return ""
+    made = "/".join(parts[:-2]) + f"/{parts[-2]}@{parts[-1]}" if parts[-1].isdecimal() else "/".join(parts[:-1])
+    return (f" {wanted!r} looks like the trigger's delivery id (`id`, `TENSORQUILL_INCIDENT_ID`), which is not a lookup"
+            f" id. Pass the `mcp_id` the trigger gave beside it (`TENSORQUILL_INCIDENT_MCP_ID`): most likely {made!r}.")
+
+
 def _brief(entry: Mapping[str, Any]) -> dict[str, Any]:
     incident = entry["incident"]
     out: dict[str, Any] = {
@@ -1052,20 +1183,26 @@ def _look_next(incident: Mapping[str, Any], rank: int | None = None) -> list[dic
 def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]:
     wanted = arguments.get("id")
     if not isinstance(wanted, str) or not wanted:
-        raise ToolError("`id` is required: the id of an incident, as list_incidents gives it (for example grad_spike@310).")
+        raise ToolError("`id` is required: the id of an incident, as list_incidents gives it (for example grad_spike@310),"
+                        " or the `mcp_id` the trigger handed over (for example my-run/rank0/grad_spike@310).")
     rank = _integer(arguments, "rank", minimum=0)
-    opened = source.open(rank)
+    lookup = _parse_lookup(wanted)
+    if lookup is not None:
+        # The trigger's lookup id: it names the run and the ranks itself (wave AH, P5-1).
+        opened, entry, rank = _looked_up(source, wanted, lookup, rank)
+    else:
+        opened = source.open(rank)
+        entries = _entries(opened)
+        entry = next((e for e in entries if e["id"] == wanted), None)
+        if entry is None:
+            known = ", ".join(e["id"] for e in entries[:20]) or "none"
+            more = f" and {len(entries) - 20} more" if len(entries) > 20 else ""
+            raise ToolError(
+                f"no incident has the id {wanted!r}. The incidents here are: {known}{more}."
+                " Call list_incidents for the current list." + _delivery_id_hint(wanted)
+            )
     if opened["shape"] == "all_ranks" and rank is None:
         rank = opened["default_rank"]  # the server was started on a rank=<n> folder, as list_incidents reads it
-    entries = _entries(opened)
-    entry = next((e for e in entries if e["id"] == wanted), None)
-    if entry is None:
-        known = ", ".join(e["id"] for e in entries[:20]) or "none"
-        more = f" and {len(entries) - 20} more" if len(entries) > 20 else ""
-        raise ToolError(
-            f"no incident has the id {wanted!r}. The incidents here are: {known}{more}."
-            " Call list_incidents for the current list."
-        )
     incident = entry["incident"]
     found = _class_of(incident)
     answer: dict[str, Any] = {
@@ -1814,7 +1951,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "name": "get_incident",
         "title": "Get one incident",
         "description": (
-            "One incident in full, by the id list_incidents gave (for example grad_spike@310): every number the"
+            "One incident in full, by the id list_incidents gave (for example grad_spike@310), or by the `mcp_id` a"
+            " trigger handed over (`TENSORQUILL_INCIDENT_MCP_ID`, for example my-run/rank0/grad_spike@310, which names"
+            " its run and ranks and needs no `rank`): every number the"
             " detector recorded, what its class means, the ranks that show it, for an MoE incident the sample it"
             " points at (largest expert shares, and the sample before; from compact evidence that left the steps"
             " between out, the last earlier one it keeps is `previous_kept_sample` instead), and the get_series"

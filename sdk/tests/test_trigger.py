@@ -115,7 +115,7 @@ def test_a_planted_failure_in_a_growing_file_starts_the_command_once(tmp_path, h
     incident = json.loads(out.read_text())["incidents"][0]
     assert incident["kind"] == "non_finite" and incident["step"] == 30
     assert payload == {
-        "event": "incident", "version": 1, "id": "r/rank0/non_finite/30", "attempt": 1,
+        "event": "incident", "version": 1, "id": "r/rank0/non_finite/30", "mcp_id": "r/rank0/non_finite@30", "attempt": 1,
         "sent_at_ms": payload["sent_at_ms"], "run_id": "r", "evidence": str(out.resolve()),
         "run_state": "unhealthy", "kind": "non_finite", "class": "invariant", "step": 30, "rank": 0, "ranks": [0],
         "new_ranks": [0], "assessment": None, "summary": "NaN or Inf at step 30 in <total>", "incident": incident,
@@ -126,7 +126,8 @@ def test_a_planted_failure_in_a_growing_file_starts_the_command_once(tmp_path, h
     assert env == {
         **inherited,
         "TENSORQUILL_EVIDENCE": str(out.resolve()), "TENSORQUILL_RUN_ID": "r",
-        "TENSORQUILL_INCIDENT_ID": "r/rank0/non_finite/30", "TENSORQUILL_INCIDENT_KIND": "non_finite",
+        "TENSORQUILL_INCIDENT_ID": "r/rank0/non_finite/30", "TENSORQUILL_INCIDENT_MCP_ID": "r/rank0/non_finite@30",
+        "TENSORQUILL_INCIDENT_KIND": "non_finite",
         "TENSORQUILL_INCIDENT_CLASS": "invariant", "TENSORQUILL_INCIDENT_STEP": "30",
         "TENSORQUILL_INCIDENT_RANKS": "0", "TENSORQUILL_INCIDENT_SUMMARY": "NaN or Inf at step 30 in <total>",
         "TENSORQUILL_INCIDENT_ASSESSMENT": "",
@@ -1011,7 +1012,7 @@ def test_the_webhook_posts_the_incident_as_json_once(tmp_path, receiver, capsys)
 
     body = strict(request["body"])
     assert sorted(body) == sorted([
-        "event", "version", "id", "attempt", "sent_at_ms", "run_id", "evidence", "run_state", "kind", "class", "step",
+        "event", "version", "id", "mcp_id", "attempt", "sent_at_ms", "run_id", "evidence", "run_state", "kind", "class", "step",
         "rank", "ranks", "new_ranks", "assessment", "summary", "incident",
     ])
     assert body["assessment"] is None  # a stall's label; an invariant has none

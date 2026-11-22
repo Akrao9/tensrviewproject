@@ -88,7 +88,8 @@ watcher writes the compact file alone, as it always has, and that is the one nam
 
 - on standard input, one JSON document, the same one the webhook posts (below);
 - in its environment, `TENSORQUILL_EVIDENCE` (the evidence file's absolute path),
-  `TENSORQUILL_RUN_ID`, `TENSORQUILL_INCIDENT_ID`, `TENSORQUILL_INCIDENT_KIND`,
+  `TENSORQUILL_RUN_ID`, `TENSORQUILL_INCIDENT_ID`, `TENSORQUILL_INCIDENT_MCP_ID` (below),
+  `TENSORQUILL_INCIDENT_KIND`,
   `TENSORQUILL_INCIDENT_CLASS`, `TENSORQUILL_INCIDENT_STEP`, `TENSORQUILL_INCIDENT_RANKS`
   (`0`, `0-3, 7`, or empty for an incident of the whole run), `TENSORQUILL_INCIDENT_SUMMARY`
   and `TENSORQUILL_INCIDENT_ASSESSMENT` (a stall's `suspected_hang`, `lost_connection`,
@@ -112,11 +113,22 @@ answer is a delivery. Headers: `X-TensorQuill-Event: incident` and `X-TensorQuil
 the same id on every try (as `mlflow`'s webhooks carry a delivery id), so a receiver can drop
 a repeat. The body:
 
-    {"event": "incident", "version": 1, "id": "<run_id>/rank0/non_finite/412", "attempt": 1,
+    {"event": "incident", "version": 1, "id": "<run_id>/rank0/non_finite/412",
+     "mcp_id": "<run_id>/rank0/non_finite@412", "attempt": 1,
      "sent_at_ms": ..., "run_id": ..., "evidence": "<absolute path>", "run_state": "unhealthy",
      "kind": "non_finite", "class": "invariant", "step": 412, "rank": 0, "ranks": [0],
      "new_ranks": [0], "assessment": null, "summary": "<one line>",
      "incident": {<as in the evidence file>}}
+
+`id` names the delivery, the same on every try, and is what it has always been. `mcp_id` (from
+Nov 22, 2026, wave AH; a key added to version 1) names the incident for the MCP server: pass it
+as `id` to `get_incident` and it finds this incident of this run and these ranks, whether that
+server was started on the run folder, a `rank=<n>` folder, the capture or the evidence file
+(`mcp_server.lookup_id`: `<run_id>/<ranks>/<kind>@<step>`, `#2` onwards for a second incident of
+that kind and step on those ranks; `<ranks>` is `rank0`, `ranks0-3,7` or `run`). The delivery id
+is not a lookup id, and the ids `list_incidents` gives (`<kind>@<step>`) are numbered over the
+whole view, so they are not the same from one view to another. It is made from the evidence at
+each look and is not kept in the state file; null when none could be made.
 
 `rank` is null and `ranks` lists them when several ranks share the incident; `ranks` is empty
 for an incident of the whole run. A number that is not finite is the string `"nan"`, `"inf"` or `"-inf"`,
@@ -390,6 +402,7 @@ class Trigger:
             if rank is None and isinstance(evidence.get("detection"), Mapping):
                 rank = evidence["detection"].get("rank")
             self._units = self._collect(evidence, rank)
+            self._name_for_lookup(evidence)
             self._enqueue()
             self._work()
         except Exception as error:  # a trigger never stops the watcher
@@ -500,6 +513,22 @@ class Trigger:
                     "ranks": [rank], "incident_rank": rank, "numbers_differ": False,
                 }))
         return [unit for unit in units if unit is not None]
+
+    def _name_for_lookup(self, evidence: Mapping[str, Any]) -> None:
+        """Each unit's `mcp_id`: the id the MCP server's `get_incident` takes for this incident of
+        this run and these ranks (`mcp_server.lookup_id`; wave AH, P5-1). Made at every look from
+        the evidence looked at, so a firing still to be sent names its incident as it reads now,
+        and never kept in the state file. A unit it cannot be made for has none."""
+        try:
+            from .mcp_server import lookup_ids
+
+            made = lookup_ids(evidence, self._run_id,
+                              [(unit["incident"], [r for r in unit["ranks"] if isinstance(r, int)]) for unit in self._units])
+        except Exception as error:  # never the watcher's problem, and never a firing's
+            self._log(f"trigger: no MCP lookup id could be made ({type(error).__name__}: {error}); the firings go on without one")
+            made = [None] * len(self._units)
+        for unit, name in zip(self._units, made):
+            unit["mcp_id"] = name
 
     def _enqueue(self) -> None:
         """A firing for each incident with a rank that has not fired before, for those ranks;
@@ -651,6 +680,7 @@ class Trigger:
             "event": "incident",
             "version": PAYLOAD_VERSION,
             "id": delivery["id"],
+            "mcp_id": unit.get("mcp_id"),
             "attempt": delivery[target]["attempts"],
             "sent_at_ms": int(time.time() * 1000),
             "run_id": self._run_id,
@@ -719,6 +749,7 @@ class Trigger:
             "TENSORQUILL_EVIDENCE": payload["evidence"],
             "TENSORQUILL_RUN_ID": payload["run_id"],
             "TENSORQUILL_INCIDENT_ID": payload["id"],
+            "TENSORQUILL_INCIDENT_MCP_ID": str(payload["mcp_id"] or ""),
             "TENSORQUILL_INCIDENT_KIND": str(payload["kind"]),
             "TENSORQUILL_INCIDENT_CLASS": str(payload["class"] or ""),
             "TENSORQUILL_INCIDENT_STEP": "" if payload["step"] is None else str(payload["step"]),
