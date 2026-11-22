@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +23,9 @@ from tensorquill import flight, identity, server_detect
 
 CASES = json.loads((Path(__file__).parent / "fixtures" / "wave_af" / "cases.json").read_text())["cases"]
 ONE = [(name, body) for name, body in CASES.items() if body["section"] == 1]
+# The command line runs in a process of its own: it must import this tree's package, not another
+# one the interpreter has installed.
+ENV = {**os.environ, "PYTHONPATH": str(Path(ev.__file__).resolve().parents[1])}
 GOOD = {"schema_version": 1, "run_id": "r", "rank": 0, "attempt": 0, "step": 0, "grad_norm": 1.0}
 
 
@@ -62,7 +66,7 @@ def test_the_command_line_exits_2_with_one_line_and_no_traceback(name, body, eng
     expected = body["expected"][f"cli_{engine}"]
     path, out = one_file(tmp_path, body), tmp_path / "out.json"
     done = subprocess.run([sys.executable, "-m", "tensorquill", str(path), "--detectors", engine, "--output", str(out)],
-                          capture_output=True, text=True, timeout=120)
+                          capture_output=True, text=True, timeout=120, env=ENV)
     if expected.get("reads"):
         assert done.returncode == 0, done.stderr
         return
