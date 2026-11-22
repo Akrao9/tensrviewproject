@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from .identity import check
+from .identity import MalformedRecordError, _shown, check
 from .manifest import METADATA_KEY as MANIFEST_KEY, _say, manifest_to_send
 from .sink import _finite
 
@@ -462,45 +462,75 @@ def read_lines(path: Path, offset: int, max_lines: int, max_bytes: int) -> tuple
     return lines, offset + sum(len(line) + 1 for line in lines)
 
 
-def parse_lines(lines: Iterable[bytes], run_id: str) -> tuple[list[dict[str, Any]], int]:
+def parse_lines(
+    lines: Iterable[bytes], run_id: str, places: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
     """The step records among `lines`, and how many lines were skipped. A line is skipped
-    when it is not a JSON step record of this run: for example what a killed process left
-    before the next process appended to the same file."""
+    when it is not a JSON object of this run: for example what a killed process left before the
+    next process appended to the same file. `places`, when given, gets the index in `lines` of
+    each record returned.
+
+    Whether a record's `step` is valid is `rows_to_send`'s to decide, by `identity.check` (wave AG):
+    before, a line of this run whose `step` was not an integer was skipped here, and nothing said."""
     records: list[dict[str, Any]] = []
     skipped = 0
-    for line in lines:
+    for index, line in enumerate(lines):
         if not line.strip():
             continue
         try:
             record = json.loads(line)
-            ok = (
-                isinstance(record, dict)
-                and record.get("run_id") == run_id
-                and isinstance(record.get("step"), int)
-                and not isinstance(record["step"], bool)
-            )
+            ok = isinstance(record, dict) and record.get("run_id") == run_id
         except ValueError:
             ok = False
         if ok:
             records.append(record)
+            if places is not None:
+                places.append(index)
         else:
             skipped += 1
     return records, skipped
 
 
+# The identity fields the sender checks before it sends a line (`WAVE_AF_CONTRACT.md` section 10).
+# Not `schema_version`: a version the server does not read is sent, for the server to count (RS10).
+SENDER_FIELDS = ("rank", "attempt", "step")
+_KEY_DEFAULTS = {"schema_version": 0, "rank": 0, "attempt": 0}
+
+
+def _unheld_key(record: Mapping[str, Any], schema: Any) -> tuple[str, Any]:
+    """The key column whose value made Arrow refuse `record`'s row, and that value: a value that
+    is not an integer (or not text for `run_id`), or one too large for its column."""
+    for key in _KEY_COLUMNS:
+        value = record.get(key, _KEY_DEFAULTS.get(key, MalformedRecordError.ABSENT))
+        if key == "run_id":
+            if not isinstance(value, str) or not _fits(value, schema.field(key).type):
+                return key, value
+        elif isinstance(value, bool) or not isinstance(value, int) or not _fits(value, schema.field(key).type):
+            return key, value
+    return "a key column", None
+
+
 def rows_to_send(
     records: Iterable[Mapping[str, Any]], schema: Any, moved: list[tuple[int, str]] | None = None,
+    refused: list[tuple[int, str, Any]] | None = None,
 ) -> tuple[Any, list[int], int]:
     """`records` as one record batch of `schema`, the steps it holds, and how many records were
-    left out because a key column's value cannot be stored: a null or a string where a key column
-    needs an integer (`"attempt": null`), an integer too large for its column. Such a line is
-    skipped and counted like a line that is not JSON; were it kept, every retry would start again
-    at it and the sender would never get past it. (A NaN inside a nested object is sent as "nan",
-    L20.)
+    left out for a key: a `rank`, `attempt` or `step` that `identity.check` does not take (negative,
+    not an integer, or a missing `step`; wave AG, `WAVE_AF_CONTRACT.md` section 10), or a key
+    column whose value cannot be stored (a null or a string where a key column needs an integer,
+    an integer too large for its column). Such a line is skipped and counted like a line that is
+    not JSON, and the lines after it are sent. Were it kept, every retry would start again at it
+    and the sender would never get past it: the server refuses a whole batch holding a negative
+    `attempt` or `rank`, with no range to move past. `refused`, when given, gets `(index in
+    records, field, value)` for each record left out, so the sender can say which line it was. A
+    `schema_version` the server does not read is sent, for the server to count (RS10).
+    (A NaN inside a nested object is sent as "nan", L20.)
 
     Any other field whose value cannot be stored in its column goes in `extra_json` with the rest
     of the row sent (lane AD4; before, the whole step was left out), and `(step, key)` is added to
-    `moved`: the server reads such a value as absent from its column, and the sender says so."""
+    `moved`: the server reads such a value as absent from its column, and the sender says so.
+
+    The rows are `_row`'s, so a valid record's row is what `record_to_row` makes of it."""
     import pyarrow as pa
 
     def strict(record: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]] | None:
@@ -514,37 +544,56 @@ def rows_to_send(
             return None
         return row, keys
 
-    kept: list[tuple[Mapping[str, Any], dict[str, Any], list[str]]] = []
+    def leave_out(index: int, record: Mapping[str, Any], field: str | None = None, value: Any = None) -> None:
+        if refused is not None:
+            try:
+                if field is None:
+                    field, value = _unheld_key(record, schema)
+                refused.append((index, field, value))
+            except Exception:  # noqa: BLE001  naming the line never costs the batch
+                refused.append((index, "a key column", None))
+
+    kept: list[tuple[int, Mapping[str, Any], dict[str, Any], list[str]]] = []
     skipped = 0
-    for record in records:
+    for index, record in enumerate(records):
+        try:
+            check(record, None, SENDER_FIELDS)
+        except MalformedRecordError as error:
+            skipped += 1
+            leave_out(index, record, error.field, error.value)
+            continue
         keys: list[str] = []
         try:
-            kept.append((record, _row(record, None, keys), keys))  # unchecked, as before (see record_to_row)
+            kept.append((index, record, _row(record, None, keys), keys))
         except Exception:  # noqa: BLE001  any value that cannot be converted is the line's, not the stream's
             found = strict(record)
             if found is None:
                 skipped += 1
+                leave_out(index, record)
             else:
-                kept.append((record, *found))
+                kept.append((index, record, *found))
     try:
-        batch = pa.RecordBatch.from_pylist([row for _, row, _ in kept], schema=schema)
+        batch = pa.RecordBatch.from_pylist([row for _, _, row, _ in kept], schema=schema)
     except Exception:  # noqa: BLE001  find the rows Arrow refuses, one at a time
         alone = []
-        for record, row, keys in kept:
+        for index, record, row, keys in kept:
             try:
                 pa.RecordBatch.from_pylist([row], schema=schema)
             except Exception:  # noqa: BLE001
                 found = strict(record)
                 if found is None:
                     skipped += 1
+                    leave_out(index, record)
                     continue
                 row, keys = found
-            alone.append((record, row, keys))
+            alone.append((index, record, row, keys))
         kept = alone
-        batch = pa.RecordBatch.from_pylist([row for _, row, _ in kept], schema=schema)
-    rows = [row for _, row, _ in kept]
+        batch = pa.RecordBatch.from_pylist([row for _, _, row, _ in kept], schema=schema)
+    if refused is not None:
+        refused.sort(key=lambda item: item[0])
+    rows = [row for _, _, row, _ in kept]
     if moved is not None:
-        moved.extend((row["step"], key) for _, row, keys in kept for key in keys)
+        moved.extend((row["step"], key) for _, _, row, keys in kept for key in keys)
     return batch, [row["step"] for row in rows], skipped
 
 
@@ -633,6 +682,7 @@ class FlightSender:
         # the step is sent and the server reads that value as absent. Said once per sender.
         self.moved_fields = 0
         self._said_moved = False
+        self._said_skipped = False
         # What explains the last stream that ended without this sender having closed it (lane AD4;
         # the plan's unexplained endings, "h2 protocol error", 3 of 22 synthetic runs): set beside
         # `last_error` when a stream fails before `done_writing`, and kept after later progress,
@@ -1011,6 +1061,36 @@ class FlightSender:
         except Exception:  # noqa: BLE001  a closed stderr is not the stream's failure
             pass
 
+    def _say_skipped(
+        self, start: int, lines: list[bytes], places: list[int], refused: list[tuple[int, str, Any]],
+        steps: list[Any],
+    ) -> None:
+        """Say the first line left out for a key once per sender (wave AG): its byte offset in the
+        file, its step, and the field. `start` is the byte offset of `lines[0]`; `places` maps each
+        record's index to its line, and `steps` holds each record's `step` as written. Every such
+        line is counted in `skipped_lines`. Never raises."""
+        if self._said_skipped or not refused:
+            return
+        self._said_skipped = True
+        try:
+            index, field, value = refused[0]
+            line_index = places[index]
+            offset = start + sum(len(line) + 1 for line in lines[:line_index])
+            step = steps[index]
+            found = "absent" if value is MalformedRecordError.ABSENT else _shown(value)
+            why = ("tensorquill reads an integer of 0 or more; the server would refuse the whole batch holding it"
+                   if field in SENDER_FIELDS and isinstance(value, int) and not isinstance(value, bool)
+                   and value < 0 else "its column in the stream cannot hold it")
+            shown_step = "" if step is MalformedRecordError.ABSENT else f" (step {_shown(step)})"
+            print(
+                f"tensorquill: the line at byte {offset} of {self.path}{shown_step} is not sent to {self.endpoint}: "
+                f"its {field} is {found}, and {why}. The lines after it are sent, and the file keeps it as written. "
+                "Said once; sender.skipped_lines counts such lines.",
+                file=sys.stderr,
+            )
+        except Exception:  # noqa: BLE001  a closed stderr is not the stream's failure
+            pass
+
     def _sent(self, data: bytes, end: int) -> int:
         """Move the identity windows past `data`, the bytes just sent, which end at `end`, and return
         where they begin: the start a refusal of them must name (RS10), which the batch's metadata
@@ -1181,12 +1261,17 @@ class FlightSender:
                         waiting_since = now
                     full = len(lines) >= self._batch_steps or end - sent >= self._batch_bytes
                     if lines and (full or closing or now - waiting_since >= self._batch_seconds):
-                        records, skipped = parse_lines(lines, self.run_id)
+                        places: list[int] = []
+                        records, skipped = parse_lines(lines, self.run_id, places)
                         moved: list[tuple[int, str]] = []
-                        batch, steps, unstorable = rows_to_send(records, schema, moved)
+                        refused: list[tuple[int, str, Any]] = []
+                        batch, steps, unstorable = rows_to_send(records, schema, moved, refused)
                         self.skipped_lines += skipped + unstorable
                         if moved:
                             self._say_moved(moved)
+                        if refused:
+                            self._say_skipped(sent, lines, places, refused,
+                                              [r.get("step", MalformedRecordError.ABSENT) for r in records])
                         start = self._sent(b"".join(line + b"\n" for line in lines), end)
                         metadata = metadata_for(end, steps, start=start)
                         writer.write_with_metadata(batch, pa.py_buffer(metadata))
