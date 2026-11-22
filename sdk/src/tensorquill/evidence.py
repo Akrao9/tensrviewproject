@@ -4481,6 +4481,19 @@ def _report_freshness(look: Mapping[str, Any], judged: bool) -> dict[str, Any] |
 _INCREMENTAL_WATCH = True
 
 
+def _follow_for(build_options: Mapping[str, Any], old: Any = None) -> Any:
+    """A new `server_detect.FollowedDetect` for a watcher judging with the Rust detectors, `old`
+    closed first; None with the Python detectors, or when the watcher is told to judge every
+    record at every look (`_INCREMENTAL_WATCH` False, which the tests compare with)."""
+    if old is not None:
+        old.close()
+    if build_options.get("detectors") != "rust" or not _INCREMENTAL_WATCH:
+        return None
+    from .server_detect import FollowedDetect
+
+    return FollowedDetect(build_options.get("server_binary"))
+
+
 def watch(
     source: str | Path,
     output: str | Path | None = None,
@@ -4587,6 +4600,9 @@ def watch(
     tail = _Tail(source, picked_rank)
     # The costly detectors' states, kept between looks and fed only the new records (lane AD11).
     memo = _Incremental() if _INCREMENTAL_WATCH else None
+    # With the Rust detectors, the binary's detectors kept between looks (wave AF-W), as `memo` keeps
+    # the Python ones: one `detect --follow` child, judging only what was appended.
+    follow = _follow_for(build_options)
     written: Path | None = None
     done = 0
     status_file = build_options.pop("watchdog", None)
@@ -4637,6 +4653,7 @@ def watch(
                         emitted_grace = None
                         tail = _Tail(source, picked_rank)
                         memo = _Incremental() if _INCREMENTAL_WATCH else None
+                        follow = _follow_for(build_options, follow)
                     else:
                         tail.rank = picked_rank
                     dirs = None
@@ -4707,6 +4724,7 @@ def watch(
                         others_seen |= ranks_seen
                         tail = _Tail(source, picked_rank)
                         memo = _Incremental() if _INCREMENTAL_WATCH else None
+                        follow = _follow_for(build_options, follow)
                         grown = tail.poll()
                         folder = _rank_folder(source, picked_rank) if server_reports else None
                         emitted = None
@@ -4734,8 +4752,9 @@ def watch(
                     continue
                 here = {**adopted, **thresholds}
                 evidence = _build_evidence(
-                    tail.records, memo, **{"run_manifest": source, "records_file": source, **build_options, **here,
-                                           **({"watchdog": status_file} if status_file else {})}
+                    tail.records, memo, follow=follow,
+                    **{"run_manifest": source, "records_file": source, **build_options, **here,
+                       **({"watchdog": status_file} if status_file else {})}
                 )
                 if look is not None:
                     evidence["detection"] = {**_detection(look, "python", picked_rank),
@@ -4754,9 +4773,11 @@ def watch(
                                                         report_awaited=in_grace)
             emitted = seen
             emitted_grace = grace_key
-            written = _write_output(evidence, path, output is not None, compact_window,
-                                    memo.samples_text(evidence)
-                                    if memo is not None and report_look is None and compact_window is None else None)
+            samples_text = None
+            if report_look is None and compact_window is None:
+                samples_text = ((memo.samples_text(evidence) if memo is not None else None)
+                                or (follow.samples_text(evidence.get("samples")) if follow is not None else None))
+            written = _write_output(evidence, path, output is not None, compact_window, samples_text)
             if on_update is not None:
                 on_update(evidence, written)
             if trigger is not None:
@@ -4764,6 +4785,9 @@ def watch(
                 trigger.look(evidence, written, rank=own)
     except KeyboardInterrupt:
         pass
+    finally:
+        if follow is not None:
+            follow.close()  # on every way out: Ctrl-C, a record refused, an error, the last look
     return written
 
 
@@ -7403,9 +7427,12 @@ def _build_evidence(
     update_window: int = UPDATE_WINDOW,
     records_file: str | Path | None = None,
     attempt_order: Mapping[tuple[str, Any], list[Any]] | None = None,
+    follow: Any = None,
 ) -> dict[str, Any]:
     """`build_evidence`, with the states of the detectors that read every record kept in `memo` when
-    one is given (`watch`), and else in a state made for this read (lane AD11)."""
+    one is given (`watch`), and else in a state made for this read (lane AD11). With the Rust
+    detectors, `follow` (a `server_detect.FollowedDetect`, `watch`) keeps the binary's detectors
+    between looks and judges only what was appended; without it, `server_report` judges every record."""
     # "auto" becomes one of the two here. One frame deeper than before lane AD11 put `build_evidence`
     # in front of this function, so the warning still names the caller's file (wave AD's seam).
     detectors = _detectors_option(detectors, server_binary, stacklevel=4)
@@ -7450,7 +7477,8 @@ def _build_evidence(
             "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": _top_k_option(top_k),
             "update_window": update_window,
         }
-        report = server_report(every_attempt, thresholds=asked, binary=server_binary, samples=True)
+        report = (follow.report(every_attempt, thresholds=asked) if follow is not None
+                  else server_report(every_attempt, thresholds=asked, binary=server_binary, samples=True))
         absent = [kind for kind in SERVER_KINDS if kind not in (report.get("checked") or ())]
         if absent:
             raise RuntimeError(
