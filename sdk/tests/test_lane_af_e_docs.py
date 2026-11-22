@@ -820,3 +820,200 @@ def test_training_in_eval_mode_under_reentrant_checkpointing_is_counted_as_in_tr
 def test_the_trend_memo_is_stated_without_a_claim_of_speed():
     assert "a series with no new point gives the trend found before. The report is the same as before. Its cost was not measured." in NEW
     assert "faster" not in NEW and "speed" not in NEW
+
+
+# --- 6. The incremental Rust watcher, protocol 4, and the compact file's replica lists -------------
+
+from tensorquill import compact as compact_module  # noqa: E402
+from tensorquill import server_detect as sd  # noqa: E402
+
+WATCH_RUST = flat(README[README.index("**Watching through Rust.**"):README.index("**All ranks.** `--rank all --detectors rust`")])
+WATCH_GUIDE = flat(GUIDE[GUIDE.index("**Watching while the job trains.**"):GUIDE.index("**All ranks at once.**")])
+COMPACT = flat(section(README, "Compact evidence and the trigger"))
+needs_protocol_4 = pytest.mark.skipif(BINARY is None or sd.binary_protocol(BINARY) != sd.PROTOCOL,
+                                      reason="no tensorquill-server of this SDK's protocol (TENSORQUILL_SERVER_BIN)")
+
+
+def watched_records(steps, *, attempt: int = 0, router: str = "r0") -> list[dict[str, Any]]:
+    return [{"schema_version": 1, "run_id": "w", "rank": 0, "attempt": attempt, "step": s, "ts": 1000.0 + s,
+             "grad_norm": 1.0 + 0.001 * (s % 7), "scalars": {"train/loss": 1.0 / (s + 1)},
+             "moe": {router: [5 + s % 3, 4, 6, 5]}, "moe_top_k": {router: 1}} for s in steps]
+
+
+def protocol_3(tmp: Path) -> Path:
+    """A stand-in binary of protocol 3: it answers `protocol` and fails anything else."""
+    path = tmp / "old" / "tensorquill-server"
+    path.parent.mkdir(parents=True)
+    path.write_text('#!/bin/sh\nif [ "$1" = protocol ]; then echo 3; exit 0; fi\necho "ran $*" >&2; exit 3\n')
+    path.chmod(0o755)
+    return path
+
+
+def run_command(tmp: Path, binary: Path, *args: str) -> subprocess.CompletedProcess:
+    path = tmp / "w.rank0.jsonl"
+    if not path.exists():
+        path.write_text("".join(json.dumps(r) + "\n" for r in watched_records(range(30))))
+    env = {**child_env(), sd.BINARY_ENV: str(binary)}
+    return subprocess.run([sys.executable, "-m", "tensorquill", str(path), *args, "--interval", "0.05",
+                           "-o", str(tmp / "out.json")], cwd=tmp, env=env, capture_output=True, text=True, timeout=120)
+
+
+def quoted(text: str, start: str) -> str:
+    """The backticked message in `text` that starts with `start`."""
+    return re.search(r"`(" + re.escape(start) + r"[^`]*)`", text).group(1)
+
+
+def test_the_protocol_the_pages_give_is_the_sdks():
+    assert sd.PROTOCOL == 4
+    assert "both speak protocol 4 since Nov 21, 2026 (3 before), when `detect --follow` was added" in flat(README)
+    assert "The SDK and `tensorquill-server` must be built from the same version (protocol 4)." in WATCH_GUIDE
+    assert "must be built again after you upgrade the SDK" in flat(README) and "must be built again after you upgrade the SDK" in WATCH_GUIDE
+
+
+@needs_protocol_4
+def test_this_trees_binary_prints_the_protocol_the_pages_give():
+    done = subprocess.run([str(BINARY), "protocol"], capture_output=True, text=True, timeout=30)
+    assert (done.returncode, done.stdout) == (0, f"{sd.PROTOCOL}\n")
+
+
+def test_a_watch_with_a_binary_of_another_protocol_prints_the_message_the_readme_quotes(tmp_path):
+    old = protocol_3(tmp_path)
+    said = quoted(flat(README), "--watch needs the Rust detectors: <binary> speaks protocol 3").replace("<binary>", str(old))
+    for args in (("--watch",), ("--watch", "--detectors", "rust")):
+        done = run_command(tmp_path, old, *args)
+        assert done.returncode == 2 and not (tmp_path / "out.json").exists()
+        assert done.stderr.strip().splitlines()[-1] == f"__main__.py: error: {said}"
+        assert "ran " not in done.stderr  # stopped before any look
+
+
+def test_one_read_with_a_binary_of_another_protocol_refuses_rust_and_falls_back_with_auto(tmp_path):
+    old = protocol_3(tmp_path)
+    mismatch = quoted(flat(README), "--watch needs the Rust detectors: ").split(": ", 1)[1].split(". To watch")[0]
+    mismatch = mismatch.replace("<binary>", str(old))
+    done = run_command(tmp_path, old, "--detectors", "rust")
+    assert done.returncode == 2 and not (tmp_path / "out.json").exists()
+    assert done.stderr.strip().splitlines()[-1].endswith(mismatch)
+    warning = quoted(flat(README), "tensorquill: warning: using the Python detectors")
+    head = warning.replace("<binary>", str(old))
+    tail = "`--detectors python` asks for the Python detectors without this warning"
+    assert "ends by saying that `--detectors python` asks for the Python detectors without this warning" in flat(README)
+    for args in ((), ("--detectors", "auto")):
+        (tmp_path / "out.json").unlink(missing_ok=True)
+        done = run_command(tmp_path, old, *args)
+        assert done.returncode == 0 and (tmp_path / "out.json").exists()
+        warned = [line for line in done.stderr.splitlines() if line.startswith("tensorquill: warning: ")]
+        assert len(warned) == 1 and warned[0].startswith(head) and warned[0].endswith(tail), warned
+
+
+@needs_protocol_4
+def test_the_follower_judges_an_append_alone_and_every_change_the_pages_name_in_full(monkeypatch):
+    monkeypatch.setenv(sd.BINARY_ENV, str(BINARY))
+    pytest.importorskip("pyarrow")
+    first = watched_records(range(20))
+    changes = {
+        "late rows": [*first, *watched_records([5])],
+        "a resume": [*first, *watched_records([10], attempt=1)],
+        "a truncated file": first[:15],
+        "a router not seen before": [*first, *watched_records([20], router="r9")],
+    }
+    follow = sd.FollowedDetect()
+    try:
+        follow.report(first)
+        assert follow.last["mode"] == "full" and follow.last["why"] == "first look"
+        follow.report([*first, *watched_records(range(20, 25))])
+        assert (follow.last["mode"], follow.last["records_sent"], follow.last["rows_read"]) == ("append", 5, 5)
+        follow.report([*first, *watched_records(range(20, 25))], thresholds={"update_window": 20})
+        assert follow.last["mode"] == "full" and follow.last["why"] == "the thresholds changed"
+        for name, records in changes.items():
+            follow.close()
+            follow.report(first)
+            follow.report(records)
+            assert follow.last["mode"] == "full" and follow.last["records_sent"] == len(records), (name, follow.last)
+    finally:
+        follow.close()
+    assert follow._process is None
+    for words in ("keeps one `tensorquill-server detect --samples --follow` process for the whole watch",
+                  "late rows of an earlier step, a new attempt (a resume), a file rewritten, truncated or replaced",
+                  "is judged again at once, in full, with no new record needed",
+                  "refuses one that names a router it has not seen"):
+        assert words in WATCH_RUST, words
+    assert "Each rebuild still converts every record read so far" not in README
+    assert "those run over every record read so far at each rebuild made here" not in README
+    assert "keeps one `tensorquill-server detect --follow` process for the whole watch" in WATCH_GUIDE
+
+
+@needs_protocol_4
+def test_the_watch_command_s_follow_child_ends_when_the_watcher_is_killed(tmp_path):
+    import signal
+    import time
+
+    pytest.importorskip("pyarrow")
+    path = tmp_path / "w.rank0.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in watched_records(range(30))))
+    env = {**child_env(), sd.BINARY_ENV: str(BINARY)}
+    watcher = subprocess.Popen([sys.executable, "-m", "tensorquill", str(path), "--watch", "--interval", "0.05",
+                                "-o", str(tmp_path / "out.json")], cwd=tmp_path, env=env,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def followers() -> list[int]:
+        table = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+        return [int(line.split()[0]) for line in table.splitlines()
+                if line.split()[1:2] == [str(watcher.pid)] and "detect --samples --follow" in line]
+
+    try:
+        deadline = time.monotonic() + 60
+        while not (tmp_path / "out.json").exists() or not followers():
+            assert time.monotonic() < deadline and watcher.poll() is None, "no evidence or no follow child"
+            time.sleep(0.05)
+        child = followers()[0]
+        watcher.send_signal(signal.SIGKILL)
+        watcher.wait(timeout=30)
+        deadline = time.monotonic() + 30
+        while subprocess.run(["ps", "-p", str(child)], capture_output=True).returncode == 0:
+            assert time.monotonic() < deadline, "the follow child outlived its killed watcher"
+            time.sleep(0.05)
+    finally:
+        if watcher.poll() is None:
+            watcher.kill()
+            watcher.wait()
+    assert "when the watcher is killed with SIGTERM or SIGKILL, because it then reads the end of its input" in WATCH_RUST
+
+
+def test_the_memory_the_pages_give_is_the_detector_child_s_not_the_watcher_s():
+    assert ("the detector child had about 237 MB resident after the first look and between looks, 239 MB after one "
+            "more part, and a peak of 386 MB during the first look. These are the detector child's figures, not the "
+            "watcher's") in WATCH_RUST
+    assert "about 240 MB resident between looks and 386 MB at its peak, the detector process's own memory" in WATCH_GUIDE
+
+
+def one_rank_replica_run(steps: int) -> dict[str, Any]:
+    sys.path.insert(0, str(SDK / "examples"))
+    import benchmark_detectors as bd
+
+    template = bd.capture_template(blocks=2, experts=4, top_k=1)
+    return tensorquill.build_evidence([bd.synth_record(template, 1, 0, step) for step in range(steps)])
+
+
+def test_the_compact_file_s_replica_markers_have_the_keys_the_pages_give():
+    full = one_rank_replica_run(2_000)
+    before = json.dumps(full, sort_keys=True, default=repr)
+    small = compact_module.compact_evidence(full)
+    assert json.dumps(full, sort_keys=True, default=repr) == before  # the full evidence is unchanged
+    steps = small["compact"]["replica_steps"]
+    assert list(steps) == ["total", "kept", "omitted", "not_routine", "around", "kept_steps", "observed_steps"]
+    assert steps["omitted"] == steps["total"] == len(full["replica"]["steps"]) and small["replica"]["steps"] == []
+    gaps = small["compact"]["replica_not_compared"]
+    assert list(gaps) == ["listed", "kept", "removed", "not_compared_omitted"]
+    full_cov = full["kind_checks"]["replica_drift"]["coverage"]
+    small_cov = small["kind_checks"]["replica_drift"]["coverage"]
+    assert small_cov["not_compared"] == [full_cov["not_compared"][-1]]
+    assert small_cov["not_compared_omitted"] == full_cov["not_compared_omitted"] + gaps["removed"]
+    assert ev.replica_line(small) == ev.replica_line(full)
+    assert "leaving out" in compact_module.describe(small)
+    with pytest.raises(compact_module.ReplicaStepsOmitted):
+        compact_module.require_all_replica_steps(small, "this reader")
+    assert issubclass(compact_module.ReplicaStepsOmitted, compact_module.SamplesOmitted)
+    for page in (COMPACT, flat(AGENT)):
+        assert "`total`, `kept`, `omitted`, `not_routine`, `around`, `kept_steps`" in page and "`observed_steps`" in page
+        assert "`listed`, `kept`, `removed`" in page
+    assert "The marker `compact.replica_steps` gives" in COMPACT and "`compact.replica_not_compared` gives" in flat(AGENT)
