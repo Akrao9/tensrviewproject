@@ -149,20 +149,28 @@ def test_under_the_rust_detectors_the_servers_entry_and_values_are_shown(monkeyp
     assert evidence["run_state"]["state"] != "healthy"
 
 
+def _entries_text(evidence: dict) -> str:
+    """The `moe_routing` entries as text with sorted keys. The server writes every object's keys
+    sorted (`serde_json` without `preserve_order`: its refused routers' entry is `check, kinds,
+    reason, routers, step` where Python's is `check, kinds, routers, reason, step`), so the bytes
+    compared are each value's, the key order being each engine's for every entry."""
+    return json.dumps([i for i in evidence.get("not_checked") or () if i.get("check") == "moe_routing"], sort_keys=True)
+
+
 @pytest.mark.parametrize("name", NAMES)
 def test_each_case_with_the_rust_detectors(name):
-    """Waits for lane D's binary: until its report writes the entry, the Rust path reads as the base."""
+    """The server's report (lane D, wave AG) gives each case's expected values, and its entry is the
+    Python one byte for byte, in the same place among the entries; the two kinds' values agree."""
     _rust_or_skip()
     case = CASES[name]
-    evidence = ev.build_evidence(case["given"]["records"], detectors="rust")
-    if "moe_routing" in case["expected"].get("not_checked_has", "") and not any(
-            i.get("check") == "moe_routing" for i in evidence.get("not_checked") or ()):
-        pytest.xfail("this tensorquill-server does not write the moe_routing entry yet (lane D)")
-    assert_expected(answer(evidence), case["expected"])
-    entries = [i for i in evidence.get("not_checked") or () if i.get("check") == "moe_routing"]
-    if entries:
-        python = ev.build_evidence(case["given"]["records"], detectors="python")
-        assert entries == [i for i in python["not_checked"] if i["check"] == "moe_routing"]
+    rust = ev.build_evidence(case["given"]["records"], detectors="rust")
+    python = ev.build_evidence(case["given"]["records"], detectors="python")
+    assert_expected(answer(rust), case["expected"])
+    assert _entries_text(rust) == _entries_text(python)
+    assert answer(rust)["not_checked_checks"] == answer(python)["not_checked_checks"]
+    for kind in KINDS:
+        assert {k: rust["kind_checks"][kind].get(k) for k in ("value", "check", "reason")} == \
+            {k: python["kind_checks"][kind].get(k) for k in ("value", "check", "reason")}, kind
 
 
 # ---- The all-ranks views and the MCP tools, by section 2's rule ----------------------------------
@@ -200,7 +208,8 @@ def test_mcp_list_incidents_on_a_capture_says_it(tmp_path):
 
 
 def test_the_all_ranks_view_of_a_store_and_the_mcp_tools_carry_the_servers_entry(tmp_path):
-    """A store's reports come from the server: waits for lane D's binary to write the entry."""
+    """A store's reports come from the server (lane D, wave AG): its entry, byte for byte the Python
+    one, reaches the all-ranks view and the MCP tools with the rank it came from."""
     _rust_or_skip()
     from test_flight_e2e import BINARY, Server
     from tensorquill.flight import send_file
@@ -224,9 +233,15 @@ def test_the_all_ranks_view_of_a_store_and_the_mcp_tools_carry_the_servers_entry
     finally:
         server.terminate()
     report = json.loads((folder / "rank=1" / "incidents.json").read_text())
-    if not any(i.get("check") == "moe_routing" for i in report.get("not_checked") or ()):
-        pytest.xfail("this tensorquill-server does not write the moe_routing entry yet (lane D)")
+    python = ev.build_evidence(unread, detectors="python")
+    assert _entries_text(report) == _entries_text(python)
+    assert not [i for i in json.loads((folder / "rank=0" / "incidents.json").read_text()).get("not_checked") or ()
+                if i.get("check") == "moe_routing"]
     view = ev.all_ranks_evidence(folder)
-    assert [ranks for item, ranks in ev.rank_not_checked(view) if item["check"] == "moe_routing"] == [[1]]
-    answer_ = mcp_server.get_all_ranks_status(mcp_server.Source(folder), {})
-    assert [i["ranks"] for i in answer_["not_checked"] if i["check"] == "moe_routing"] == ["1"]
+    assert [(json.dumps(item, sort_keys=True), ranks) for item, ranks in ev.rank_not_checked(view)
+            if item["check"] == "moe_routing"] == [(_entries_text(python)[1:-1], [1])]
+    for kind in KINDS:
+        assert view["kind_checks"][kind]["value"] == "unavailable" and view["kind_checks"][kind]["ranks"]["unavailable"] == [1]
+    for answer_ in (mcp_server.get_all_ranks_status(mcp_server.Source(folder), {}),
+                    mcp_server.list_incidents(mcp_server.Source(folder), {})):
+        assert [i["ranks"] for i in answer_["not_checked"] if i["check"] == "moe_routing"] == ["1"]
