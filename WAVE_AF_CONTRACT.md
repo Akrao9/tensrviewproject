@@ -1,6 +1,6 @@
 # Wave AF contract: identity fields, the views, the status write, offline against live
 
-**Nothing on this page is built.** It is cut from `main` at `76a3b5d` (code as verified at `f5ee53e`) for the integrity lanes of the v1 plan, which the author approved on Nov 21, 2026. Lanes C, D and F build from it; lanes A, B and E do not need it and are listed here only for who owns which file.
+**Built, sections 1 to 11, and verified on the trial tree at `d0f49f5` (Nov 22, 2026); what was run is section 12 of `OPEN_BUGS.md`. The rest of this page is as it was written and says "nothing on this page is built" and "the base" of the tree before it.** It was cut from `main` at `76a3b5d` (code as verified at `f5ee53e`) for the integrity lanes of the v1 plan, which the author approved on Nov 21, 2026. Lanes C, D and F build from it; lanes A, B and E do not need it and are listed here only for who owns which file.
 
 Where this page states something the author's words do not, it says **this page's reading**, and that reading is the author's to change. The readings are listed together at the end.
 
