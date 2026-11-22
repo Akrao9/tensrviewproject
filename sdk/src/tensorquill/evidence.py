@@ -2786,10 +2786,17 @@ class _Tail:
     read and has changed (its size, time or file) or is gone. Before, such a file was read on from
     where it was, or not at all, and the evidence went on showing rows the source no longer holds.
 
-    The limit: a rewrite in place that keeps the same file, at least the same length, and the same
-    first and last CHECKED_BYTES (4 KiB) of what was read is not detected, and the watcher goes on
-    reading from its offset. A file cut to empty is read again but holds no record, so the watcher
-    still writes nothing for it and the last evidence file stays as it was."""
+    A `.jsonl` file whose modification time (`st_mtime_ns`) changed while it did not grow since the
+    last read is read again from the start too (WAVE_AF_CONTRACT.md, section 3, EV-07): a rewrite in
+    place of the same length and the same ends. An append, which also moves the time, grows the file
+    and is still read as an append, from the offset. A `touch` that changes no byte is read again
+    and gives the same records.
+
+    The limit: a rewrite in place that keeps the same file, at least the same length, the same
+    first and last CHECKED_BYTES (4 KiB) of what was read, and the same modification time (or one
+    that also grows the file) is not detected, and the watcher goes on reading from its offset. A
+    file cut to empty is read again but holds no record, so the watcher still writes nothing for it
+    and the last evidence file stays as it was."""
 
     CHECKED_BYTES = 4096  # at the start of a `.jsonl` file, and before the end of what was read
 
@@ -2801,6 +2808,8 @@ class _Tail:
         self._seen: set[Path] = set()
         self._stats: dict[Path, tuple[int, int, int]] = {}  # each part read: its size, time and file
         self._file: tuple[int, int] | None = None  # the `.jsonl` file read: its device and file
+        # Its size and modification time at the last read, from the handle it was read through (EV-07).
+        self._size_and_time: tuple[int, int] | None = None
         self._head = b""  # the first bytes read, and the last ones
         self._last = b""
         self.left_out = 0  # whole lines that were not a JSON object (lane U7, Nov 19, 2026)
@@ -2812,6 +2821,7 @@ class _Tail:
         self._seen = set()
         self._stats = {}
         self._file = None
+        self._size_and_time = None
         self._head = self._last = b""
         self.left_out = 0
         self.restarts += 1
@@ -2832,6 +2842,13 @@ class _Tail:
             found = self.source.stat()
             if (found.st_dev, found.st_ino) != self._file or found.st_size < self._offset:
                 return True
+            if self._size_and_time is not None:
+                size, mtime = self._size_and_time
+                if found.st_mtime_ns != mtime and found.st_size <= size:
+                    # Written to since the last read without growing: rewritten in place (EV-07). The
+                    # size compared is the file's at that read, not what was read of it, so a last
+                    # line finished since is an append.
+                    return True
             with self.source.open("rb") as file:
                 head = file.read(len(self._head))
                 file.seek(self._offset - len(self._last))
@@ -2868,6 +2885,8 @@ class _Tail:
                 file.seek(self._offset)
                 data = file.read()
                 found = os.fstat(file.fileno())
+            # What the file was when read, whole lines or none: what a later look compares with (EV-07).
+            self._size_and_time = (found.st_size, found.st_mtime_ns)
             end = data.rfind(b"\n") + 1  # a last line with no newline is still being written
             for line in data[:end].splitlines():
                 if line.strip():
@@ -4476,9 +4495,10 @@ def watch(
     them, do not change them in place.
 
     A `.jsonl` file cut short, replaced or rewritten under the watcher is read again from the start,
-    and so is a store whose parts read have changed or are gone (`_Tail`). The limit: a rewrite in
-    place that keeps the same file, at least the same length, and the same first and last 4 KiB of
-    what was read is not detected, and the watcher goes on from its offset. A file cut to empty still
+    and so is a store whose parts read have changed or are gone (`_Tail`); a rewrite in place of the
+    same length is seen by the file's modification time. The limit: a rewrite in place that keeps
+    the same file, at least the same length, the same first and last 4 KiB of what was read and the
+    same modification time is not detected, and the watcher goes on from its offset. A file cut to empty still
     writes nothing: the last evidence file is left as it was until the file holds a record again.
 
     The five thresholds (`overload_threshold`, `drift_tolerance`, `starve_window`,
