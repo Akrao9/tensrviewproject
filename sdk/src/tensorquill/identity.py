@@ -74,10 +74,14 @@ def in_list(index: int) -> str:
     return f"record {index} of the records passed"
 
 
-def check(record: Mapping[str, Any], where: str | None = None) -> None:
+def check(record: Mapping[str, Any], where: str | None = None, fields: tuple[str, ...] = FIELDS) -> None:
     """Raise `MalformedRecordError` if `record`'s identity fields are not valid; else return None.
-    The record is not changed and nothing is filled in."""
-    for field in FIELDS:
+    The record is not changed and nothing is filled in.
+
+    `fields` limits the check to some of `FIELDS`, in `FIELDS`' order, by the same rules: the
+    sender's own file checks only `rank`, `attempt` and `step` (`flight.SENDER_FIELDS`), since a
+    `schema_version` the server does not read is sent for the server to count (RS10)."""
+    for field in (name for name in FIELDS if name in fields):
         value = record.get(field, _ABSENT) if isinstance(record, Mapping) else _ABSENT
         if value is _ABSENT:
             if field == "step":
