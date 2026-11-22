@@ -82,8 +82,9 @@ fn text_steps(steps: &[i64]) -> RecordBatch {
 }
 
 /// A server in this process over `root` whose watchdog writes the status every 50 ms when it
-/// changed, and rewrites an unchanged one only after `REFRESH`.
-async fn start(root: &Path, flush_steps: usize, flush_interval: Duration) -> TestServer {
+/// changed, and rewrites an unchanged one only after `REFRESH`. Without `flusher`, nothing stores a
+/// buffered part on time: the test does, with `Ingest::flush_due`.
+async fn start(root: &Path, flush_steps: usize, flush_interval: Duration, flusher: bool) -> TestServer {
     let config = IngestConfig {
         flush_steps,
         flush_interval,
@@ -95,7 +96,9 @@ async fn start(root: &Path, flush_steps: usize, flush_interval: Duration) -> Tes
     };
     let store = LocalFileSystem::new_with_prefix(root).unwrap();
     let ingest = Ingest::new(Storage::new(Arc::new(store), "".into()), config);
-    ingest.spawn_flusher();
+    if flusher {
+        ingest.spawn_flusher();
+    }
     ingest.spawn_watchdog();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
@@ -160,7 +163,7 @@ async fn progress_written(root: &Path, last: i64) -> serde_json::Value {
 #[tokio::test]
 async fn a_refused_batch_alone_reaches_the_status_before_the_periodic_write() {
     let dir = tempfile::tempdir().unwrap();
-    let server = start(dir.path(), 1, Duration::from_secs(3600)).await;
+    let server = start(dir.path(), 1, Duration::from_secs(3600), true).await;
     let mut held = open(&server.address, RUN, 0, schema(DataType::Int64)).await;
     held.send(rows(&[0, 1, 2]), 300).await;
     assert_eq!(held.ack().await, 300);
@@ -201,7 +204,7 @@ async fn a_refused_batch_alone_reaches_the_status_before_the_periodic_write() {
 #[tokio::test]
 async fn a_row_not_newer_alone_reaches_the_status_before_the_periodic_write() {
     let dir = tempfile::tempdir().unwrap();
-    let server = start(dir.path(), 1, Duration::from_secs(3600)).await;
+    let server = start(dir.path(), 1, Duration::from_secs(3600), true).await;
     let mut put = open(&server.address, RUN, 0, schema(DataType::Int64)).await;
     put.send(rows(&[0, 1, 2]), 300).await;
     assert_eq!(put.ack().await, 300);
@@ -226,15 +229,15 @@ async fn a_row_not_newer_alone_reaches_the_status_before_the_periodic_write() {
     drop(put);
 }
 
-/// A step confirmed late inside the buffered part, alone: once the part is stored (by its flush
-/// interval), the status gains `late_steps_confirmed` at once. The late row's own arrival already
-/// counted `rows_not_newer`; the test waits for that write first, so what is written after it is
-/// the late count alone. Fails on the base.
+/// A step confirmed late inside the buffered part, alone: once the part is stored, the status gains
+/// `late_steps_confirmed` at once. The late row's own arrival already counted `rows_not_newer`; the
+/// part is stored only when the test calls `flush_due`, after that count is on disk, so what is
+/// written after it is the late count alone, however loaded the machine. Fails on the base.
 #[tokio::test]
 async fn a_step_confirmed_late_alone_reaches_the_status_before_the_periodic_write() {
     let dir = tempfile::tempdir().unwrap();
-    // The part stays open until its flush interval: the late step is behind a row of it.
-    let server = start(dir.path(), 1000, Duration::from_secs(3)).await;
+    // The part stays open until the test stores it: the late step is behind a row of it.
+    let server = start(dir.path(), 1000, Duration::ZERO, false).await;
     let mut put = open(&server.address, RUN, 0, schema(DataType::Int64)).await;
     put.send(rows(&[0, 2]), 200).await;
     put.send(rows(&[1]), 300).await;
@@ -243,11 +246,11 @@ async fn a_step_confirmed_late_alone_reaches_the_status_before_the_periodic_writ
     })
     .await;
     assert_eq!(counted["last_step"], 2, "{counted}");
-    if counted.get("late_steps_confirmed").is_some() {
-        // The part was stored before the not-newer write landed: both counts came in one write, which
-        // does not tell the late count's own write apart. Under load this is possible; say so.
-        panic!("the part was stored before the first write; run again on a quieter machine: {counted}");
-    }
+    assert!(
+        counted.get("late_steps_confirmed").is_none(),
+        "the part is not stored yet: {counted}"
+    );
+    server.ingest.flush_due().await;
     let after = until(dir.path(), "late_steps_confirmed", |entry| {
         entry.get("late_steps_confirmed").is_some()
     })
