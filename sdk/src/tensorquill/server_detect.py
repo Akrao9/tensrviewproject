@@ -36,7 +36,7 @@ BINARY_NAME = "tensorquill-server"
 # a larger one is a newer binary whose reports this module was not written for.
 # 3 (lanes W2 and W3, Nov 19, 2026): attempts ordered by first appearance (contract 1), the
 # capture-stopped state (contract 3), and the detector rules of lane W3.
-PROTOCOL = 3
+PROTOCOL = 4  # 4: `detect --follow` (wave AF-W), for `--watch` with the Rust detectors
 INSTALL_HINT = "pip install tensorquill-server"
 DETECTOR_CHOICES = ("auto", "python", "rust")
 _BATCH_ROWS = 500
@@ -261,23 +261,264 @@ def server_report(
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(f"{chosen} detect did not finish in {timeout:g} s") from error
     if done.returncode != 0:
-        message = done.stderr.decode("utf-8", "replace").strip() or f"exit status {done.returncode}"
-        if "invalid value" in message and "--thresholds" in message:
-            # The server names the key and why: an option the caller chose, not a failure of the binary.
-            refused = message.split("for '--thresholds <JSON>':", 1)[-1].split("\n", 1)[0].strip()
-            raise ValueError(f"the Rust detectors refuse these thresholds: {refused}")
-        if "unrecognized subcommand" in message or "unexpected argument" in message:
-            message += " (this tensorquill-server is too old to have `detect`, `--thresholds` or `--samples`: rebuild it)"
-        raise RuntimeError(f"{chosen} detect failed: {message}")
+        raise _detect_failure(chosen, done.stderr.decode("utf-8", "replace").strip() or f"exit status {done.returncode}")
+    return _report_of(chosen, done.stdout, samples)
+
+
+def _detect_failure(chosen: str, message: str) -> Exception:
+    """The error for a `detect` that failed with `message` on its standard error: `ValueError` for
+    thresholds it refuses (an option the caller chose, not a failure of the binary), else
+    `RuntimeError`."""
+    if "invalid value" in message and "--thresholds" in message:
+        # The server names the key and why.
+        refused = message.split("for '--thresholds <JSON>':", 1)[-1].split("\n", 1)[0].strip()
+        return ValueError(f"the Rust detectors refuse these thresholds: {refused}")
+    if "unrecognized subcommand" in message or "unexpected argument" in message:
+        message += " (this tensorquill-server is too old to have `detect`, `--thresholds` or `--samples`: rebuild it)"
+    return RuntimeError(f"{chosen} detect failed: {message}")
+
+
+def _report_of(chosen: str, text: bytes, samples: bool) -> dict[str, Any]:
+    """The report `detect` printed as `text`, checked to be one."""
     try:
-        report = json.loads(done.stdout)
+        report = json.loads(text)
     except ValueError as error:
-        raise RuntimeError(f"{chosen} detect did not print a report: {done.stdout[:200]!r}") from error
+        raise RuntimeError(f"{chosen} detect did not print a report: {text[:200]!r}") from error
     if not isinstance(report, dict) or not isinstance(report.get("incidents"), list):
         raise RuntimeError(f"{chosen} detect printed something that is not a report")
     if samples and not isinstance(report.get("samples"), list):
         raise RuntimeError(f"{chosen} detect --samples printed a report without samples")
     return report
+
+
+# --- one rank's detectors kept between a watcher's looks: `detect --samples --follow` ------------
+#
+# Wave AF-W. Before it, `--watch` with the Rust detectors made every record of the run into a row
+# again at every look, sent them all to a new `detect --samples`, which judged them all, and read
+# all of the run's samples back: about 7.2 s an update at 10,000 steps, as much as a fresh read.
+
+# What each look of a `FollowedDetect` did, appended when this is a list (the tests read it): the
+# counter that shows an append was not judged again.
+LOOKS: list[dict[str, Any]] | None = None
+# The same, one JSON line a look, in the file this names: how a test reads what a `--watch` command
+# in another process did. Private; for tests.
+LOOKS_ENV = "TENSORQUILL_FOLLOW_LOG"
+
+
+class FollowedDetect:
+    """One watcher's `tensorquill-server detect --samples --follow`: the rank's Rust detectors kept
+    between looks, as the live server keeps them between flushes.
+
+    `report(records, thresholds)` gives what `server_report(records, thresholds=..., samples=True)`
+    gives. The first look sends every record. A later look sends only the records appended since,
+    when the look is a plain append:
+    - the records given before are the first records now, each the same record in its place;
+    - the thresholds are the same;
+    - each new record is of the newest attempt, with a step above every step before, in order.
+
+    Anything else (a first look, late rows, a new attempt, a truncated or replaced file, which give
+    other records, a threshold changed) ends the child and starts another that is sent every
+    record: a full recomputation. So does a refusal by the binary, which checks each append again,
+    and refuses rows that name a router not seen before or give one more experts. The samples of
+    an append are added to those kept; `samples_text` gives their JSON text, each sample's made once.
+
+    `last` says what the last look did: `mode` (`full`, `append`, or `same` when no record was new),
+    `records_sent`, `rows_read` (what the binary says it read), and `why` for a full look. `close`
+    ends the child; the watcher calls it on every way out.
+    """
+
+    def __init__(self, binary: str | os.PathLike[str] | None = None, *, timeout: float | None = 300.0) -> None:
+        self.binary = binary
+        self.timeout = timeout
+        self._process: subprocess.Popen[bytes] | None = None
+        self._stderr: Any = None
+        self._chosen = ""
+        self._thresholds: str | None = None
+        self._records: list[Mapping[str, Any]] = []
+        self._newest: int | None = None  # the newest attempt read, as the binary orders attempts
+        self._top: int | None = None  # the highest step read
+        self._report: dict[str, Any] | None = None
+        self.samples: list[dict[str, Any]] = []
+        self._texts: list[str] = []
+        self.last: dict[str, Any] = {}
+
+    # -- the child ------------------------------------------------------------------------------
+
+    def close(self) -> None:
+        """End the child, if there is one, and wait for it."""
+        process, self._process = self._process, None
+        if process is None:
+            return
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+            process.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+            process.wait()
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            if self._stderr is not None:
+                self._stderr.close()
+                self._stderr = None
+
+    def _start(self, thresholds: str | None) -> None:
+        import tempfile
+
+        self.close()
+        self._chosen = server_binary(self.binary)
+        command = [self._chosen, "detect", "--samples", "--follow"]
+        if thresholds is not None:
+            command += ["--thresholds", thresholds]
+        # Standard error to a file, not a pipe: a child writing much of it could never block on it.
+        self._stderr = tempfile.TemporaryFile()
+        self._process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr)
+        self._thresholds = thresholds
+
+    def _failure(self) -> Exception:
+        """What the child said when it ended, as `server_report` raises it."""
+        process = self._process
+        code = process.wait() if process is not None else None
+        said = b""
+        if self._stderr is not None:
+            self._stderr.seek(0)
+            said = self._stderr.read()
+        self.close()
+        return _detect_failure(self._chosen, said.decode("utf-8", "replace").strip() or f"exit status {code}")
+
+    def _ask(self, records: list[Mapping[str, Any]]) -> dict[str, Any]:
+        """Send `records` as one frame and read the child's line for it."""
+        import select
+        import struct
+        import time
+
+        process = self._process
+        assert process is not None and process.stdin is not None and process.stdout is not None
+        frame = records_stream(records)
+        try:
+            process.stdin.write(struct.pack("<Q", len(frame)))
+            process.stdin.write(frame)
+            process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            raise self._failure() from None
+        deadline = None if self.timeout is None else time.monotonic() + self.timeout
+        chunks: list[bytes] = []
+        fd = process.stdout.fileno()
+        while True:
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                self.close()
+                raise RuntimeError(f"{self._chosen} detect --follow did not answer in {self.timeout:g} s")
+            ready, _, _ = select.select([fd], [], [], left)
+            if not ready:
+                continue
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                raise self._failure()
+            chunks.append(chunk)
+            if chunk.endswith(b"\n"):
+                break
+        text = b"".join(chunks)
+        try:
+            answer = json.loads(text)
+        except ValueError as error:
+            raise RuntimeError(f"{self._chosen} detect --follow did not print a report: {text[:200]!r}") from error
+        if isinstance(answer, dict) and "refused" in (answer.get("follow") or {}):
+            return answer  # an append the binary would not take: the caller starts again
+        return _report_of(self._chosen, text, True) if not isinstance(answer, dict) or "incidents" not in answer else answer
+
+    # -- one look -------------------------------------------------------------------------------
+
+    def report(self, records: Iterable[Mapping[str, Any]], *, thresholds: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """What `server_report(records, thresholds=thresholds, samples=True)` gives, judging only
+        what was appended since the last look when that is all that changed (see the class)."""
+        from .evidence import _same_record
+
+        records = list(records)
+        if not records:
+            raise ValueError("no records to judge")
+        try:
+            sent = None if thresholds is None else json.dumps(dict(thresholds), allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"the thresholds cannot be sent as JSON: {error}") from error
+        known = len(self._records)
+        why: str | None = None
+        if self._process is None or self._report is None:
+            why = "first look"
+        elif sent != self._thresholds:
+            why = "the thresholds changed"
+        elif len(records) < known or not all(_same_record(self._records[i], records[i]) for i in range(known)):
+            why = "the records read before are not the first records now"
+        else:
+            why = self._not_appended(records[known:])
+        if why is None and len(records) == known:
+            self._note("same", 0, 0, None)
+            return self._handed()
+        if why is None:
+            answer = self._ask(records[known:])
+            follow = answer.pop("follow", None) or {}
+            if "refused" in follow:
+                why = f"the binary refused the append: {follow['refused']}"
+            else:
+                if follow.get("samples_from") != len(self.samples):
+                    self.close()
+                    raise RuntimeError(f"{self._chosen} detect --follow gave samples from {follow.get('samples_from')}, "
+                                       f"where {len(self.samples)} are kept")
+                self.samples.extend(answer.pop("samples"))
+                self._keep(records, answer)
+                self._note("append", len(records) - known, follow.get("rows"), None)
+                return self._handed()
+        self._start(sent)
+        answer = self._ask(records)
+        follow = answer.pop("follow", None) or {}
+        self.samples = answer.pop("samples")
+        self._texts = []
+        self._keep(records, answer)
+        self._newest = _whole(stream_order(records)[-1].get("attempt", 0))
+        self._note("full", len(records), follow.get("rows"), why)
+        return self._handed()
+
+    def _not_appended(self, new: list[Mapping[str, Any]]) -> str | None:
+        """Why `new` is not a plain append to what was read, or None when it is."""
+        top = self._top
+        for record in new:
+            attempt, step = record.get("attempt", 0), record.get("step")
+            if _whole(attempt) != self._newest:
+                return f"a record of attempt {attempt}, where the newest attempt read is {self._newest}"
+            if top is not None and _whole(step) <= top:
+                return f"a record of step {step}, not above the last step read ({top})"
+            top = _whole(step)
+        return None
+
+    def _keep(self, records: list[Mapping[str, Any]], answer: dict[str, Any]) -> None:
+        self._records = records
+        self._top = max((_whole(r.get("step")) for r in records), default=None)
+        self._report = answer
+
+    def _handed(self) -> dict[str, Any]:
+        """The kept report, as `server_report` gives one: a copy of it, with the kept samples."""
+        assert self._report is not None
+        return {**json.loads(json.dumps(self._report)), "samples": self.samples}
+
+    def _note(self, mode: str, sent: int, read: Any, why: str | None) -> None:
+        self.last = {"mode": mode, "records_sent": sent, "rows_read": read, **({"why": why} if why else {})}
+        if LOOKS is not None:
+            LOOKS.append(dict(self.last))
+        if logged := os.environ.get(LOOKS_ENV):
+            with open(logged, "a", encoding="utf-8") as file:
+                file.write(json.dumps(self.last) + "\n")
+
+    def samples_text(self, samples: Any) -> str | None:
+        """The JSON text of `samples` as `write_evidence` writes it, when that is the list kept here;
+        each sample's text is made once. None for any other list."""
+        if samples is not self.samples or len(self._texts) > len(samples):
+            return None
+        from .evidence import _json_text
+
+        for sample in samples[len(self._texts):]:
+            self._texts.append(_json_text(sample))
+        return "[" + ",".join(self._texts) + "]"
 
 
 # --- every rank of a run: `tensorquill-server detect --run` -----------------------------------

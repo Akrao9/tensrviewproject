@@ -2372,13 +2372,25 @@ def read_jsonl(path: str | Path) -> tuple[list[dict[str, Any]], int]:
     return records, left_out
 
 
-def _load_counted(source: Any, rank: int | None) -> tuple[list[dict[str, Any]], int]:
+def _load_counted(source: Any, rank: int | None, *, checked: bool = False) -> tuple[list[dict[str, Any]], int]:
     """`load_records(source, rank=rank, all_attempts=True)`, with a `.jsonl` file read by
-    `read_jsonl`: its records and the lines left out (0 for any other source)."""
+    `read_jsonl`: its records and the lines left out (0 for any other source).
+
+    Records whose identity was checked already are copied and not checked again: `read_jsonl`'s,
+    checked with their file and line, and with `checked` the records handed in, which a watcher's
+    `_Tail` checked as it read them (each once; at 10,000 records a second check at every look was
+    about 40 ms of a 0.5 s update, wave AF-W)."""
     if isinstance(source, (str, Path)) and not Path(source).is_dir() and Path(source).suffix not in (".parquet",):
         records, left_out = read_jsonl(source)
-        return load_records(records, rank=rank, all_attempts=True), left_out
+        return _copies(records, rank), left_out
+    if checked and not isinstance(source, (str, Path)):
+        return _copies(source, rank), 0
     return load_records(source, rank=rank, all_attempts=True), 0
+
+
+def _copies(records: Iterable[Mapping[str, Any]], rank: int | None) -> list[dict[str, Any]]:
+    """What `load_records(records, rank=rank, all_attempts=True)` gives for records already checked."""
+    return [dict(item) for item in records if rank is None or item.get("rank", 0) == rank]
 
 
 def lines_left_out_line(evidence: Mapping[str, Any]) -> str | None:
@@ -4481,6 +4493,19 @@ def _report_freshness(look: Mapping[str, Any], judged: bool) -> dict[str, Any] |
 _INCREMENTAL_WATCH = True
 
 
+def _follow_for(build_options: Mapping[str, Any], old: Any = None) -> Any:
+    """A new `server_detect.FollowedDetect` for a watcher judging with the Rust detectors, `old`
+    closed first; None with the Python detectors, or when the watcher is told to judge every
+    record at every look (`_INCREMENTAL_WATCH` False, which the tests compare with)."""
+    if old is not None:
+        old.close()
+    if build_options.get("detectors") != "rust" or not _INCREMENTAL_WATCH:
+        return None
+    from .server_detect import FollowedDetect
+
+    return FollowedDetect(build_options.get("server_binary"))
+
+
 def watch(
     source: str | Path,
     output: str | Path | None = None,
@@ -4587,6 +4612,9 @@ def watch(
     tail = _Tail(source, picked_rank)
     # The costly detectors' states, kept between looks and fed only the new records (lane AD11).
     memo = _Incremental() if _INCREMENTAL_WATCH else None
+    # With the Rust detectors, the binary's detectors kept between looks (wave AF-W), as `memo` keeps
+    # the Python ones: one `detect --follow` child, judging only what was appended.
+    follow = _follow_for(build_options)
     written: Path | None = None
     done = 0
     status_file = build_options.pop("watchdog", None)
@@ -4637,6 +4665,7 @@ def watch(
                         emitted_grace = None
                         tail = _Tail(source, picked_rank)
                         memo = _Incremental() if _INCREMENTAL_WATCH else None
+                        follow = _follow_for(build_options, follow)
                     else:
                         tail.rank = picked_rank
                     dirs = None
@@ -4707,6 +4736,7 @@ def watch(
                         others_seen |= ranks_seen
                         tail = _Tail(source, picked_rank)
                         memo = _Incremental() if _INCREMENTAL_WATCH else None
+                        follow = _follow_for(build_options, follow)
                         grown = tail.poll()
                         folder = _rank_folder(source, picked_rank) if server_reports else None
                         emitted = None
@@ -4734,8 +4764,9 @@ def watch(
                     continue
                 here = {**adopted, **thresholds}
                 evidence = _build_evidence(
-                    tail.records, memo, **{"run_manifest": source, "records_file": source, **build_options, **here,
-                                           **({"watchdog": status_file} if status_file else {})}
+                    tail.records, memo, follow=follow, identity_checked=True,  # the tail checked each as it read it
+                    **{"run_manifest": source, "records_file": source, **build_options, **here,
+                       **({"watchdog": status_file} if status_file else {})}
                 )
                 if look is not None:
                     evidence["detection"] = {**_detection(look, "python", picked_rank),
@@ -4754,9 +4785,11 @@ def watch(
                                                         report_awaited=in_grace)
             emitted = seen
             emitted_grace = grace_key
-            written = _write_output(evidence, path, output is not None, compact_window,
-                                    memo.samples_text(evidence)
-                                    if memo is not None and report_look is None and compact_window is None else None)
+            samples_text = None
+            if report_look is None and compact_window is None:
+                samples_text = ((memo.samples_text(evidence) if memo is not None else None)
+                                or (follow.samples_text(evidence.get("samples")) if follow is not None else None))
+            written = _write_output(evidence, path, output is not None, compact_window, samples_text)
             if on_update is not None:
                 on_update(evidence, written)
             if trigger is not None:
@@ -4764,6 +4797,9 @@ def watch(
                 trigger.look(evidence, written, rank=own)
     except KeyboardInterrupt:
         pass
+    finally:
+        if follow is not None:
+            follow.close()  # on every way out: Ctrl-C, a record refused, an error, the last look
     return written
 
 
@@ -6277,16 +6313,21 @@ def routers_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[s
     and zeros on others is read, as before. While some router of the records was read, the kinds
     are judged on it and the entry only names the others (`kind_checks`); with none read they are
     `unavailable`. The server writes the same entry (lane D)."""
-    totals: dict[str, int] = {}
+    # Each router named, and whether a count above 0 was seen for it. A router once seen read is
+    # not looked at again: a whole run of a read router costs one dictionary lookup a record, not
+    # one step per count (the first form summed every count of every record at every look).
+    read: dict[str, bool] = {}
     for record in records:
         moe = record.get("moe")
         if not isinstance(moe, Mapping):
             continue
         for name, counts in moe.items():
-            held = totals.setdefault(str(name), 0)
-            if isinstance(counts, (list, tuple)):
-                totals[str(name)] = held + sum(int(c) for c in counts if isinstance(c, (int, float)) and c > 0)
-    names = sorted(name for name, total in totals.items() if total == 0)
+            name = str(name)
+            if read.get(name):
+                continue
+            read[name] = isinstance(counts, (list, tuple)) and any(
+                isinstance(c, (int, float)) and c > 0 and int(c) > 0 for c in counts)
+    names = sorted(name for name, seen in read.items() if not seen)
     if not names:
         return None
     return {
@@ -7398,9 +7439,15 @@ def _build_evidence(
     update_window: int = UPDATE_WINDOW,
     records_file: str | Path | None = None,
     attempt_order: Mapping[tuple[str, Any], list[Any]] | None = None,
+    follow: Any = None,
+    identity_checked: bool = False,
 ) -> dict[str, Any]:
     """`build_evidence`, with the states of the detectors that read every record kept in `memo` when
-    one is given (`watch`), and else in a state made for this read (lane AD11)."""
+    one is given (`watch`), and else in a state made for this read (lane AD11). With the Rust
+    detectors, `follow` (a `server_detect.FollowedDetect`, `watch`) keeps the binary's detectors
+    between looks and judges only what was appended; without it, `server_report` judges every record.
+    `identity_checked` says the records handed in were checked already (`watch`: its `_Tail` checks
+    each as it reads it), so they are copied and not checked again."""
     # "auto" becomes one of the two here. One frame deeper than before lane AD11 put `build_evidence`
     # in front of this function, so the warning still names the caller's file (wave AD's seam).
     detectors = _detectors_option(detectors, server_binary, stacklevel=4)
@@ -7412,11 +7459,11 @@ def _build_evidence(
     if rank is not None and not (isinstance(source, (str, Path)) and Path(source).is_dir()):
         # A file or list is read whole either way: the ranks it holds are kept, so the evidence
         # can say it judged one of several (L21). A store's rank folder holds one rank.
-        everything, left_out = _load_counted(source, None)
+        everything, left_out = _load_counted(source, None, checked=identity_checked)
         held_ranks = sorted({int(r.get("rank", 0)) for r in everything})
         every_attempt = [r for r in everything if r.get("rank", 0) == rank]
     else:
-        every_attempt, left_out = _load_counted(source, rank)
+        every_attempt, left_out = _load_counted(source, rank, checked=identity_checked)
     if attempt_order:
         every_attempt = in_attempt_order(every_attempt, attempt_order)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
@@ -7445,7 +7492,8 @@ def _build_evidence(
             "starve_window": starve_window, "starve_ratio": starve_ratio, "top_k": _top_k_option(top_k),
             "update_window": update_window,
         }
-        report = server_report(every_attempt, thresholds=asked, binary=server_binary, samples=True)
+        report = (follow.report(every_attempt, thresholds=asked) if follow is not None
+                  else server_report(every_attempt, thresholds=asked, binary=server_binary, samples=True))
         absent = [kind for kind in SERVER_KINDS if kind not in (report.get("checked") or ())]
         if absent:
             raise RuntimeError(

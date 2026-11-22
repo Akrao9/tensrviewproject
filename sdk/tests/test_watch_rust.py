@@ -113,28 +113,30 @@ def test_the_record_sets_put_incidents_and_unchecked_things_in_front_of_both_wat
     assert len(kinds) >= 25 and len(checks) >= 3 and len(RECORD_SETS) >= 57
 
 
-def test_the_watcher_sends_what_it_has_read_so_far_once_for_each_rebuild(tmp_path, monkeypatch):
+def test_the_watcher_sends_only_what_was_appended_once_for_each_rebuild(tmp_path, monkeypatch):
+    """Wave AF-W: the watcher keeps the binary's detectors between looks (`detect --follow`), so a
+    rebuild sends only the records appended since the last one, unless the binary cannot take them
+    as an append; then it sends every record read so far. Before AF-W every rebuild sent every
+    record read so far ([100, 200, 300] here)."""
     import tensorquill.server_detect as module
 
-    sent: list[int] = []
-    real = module.server_report
-
-    def counted(records, **kwargs):
-        records = list(records)
-        sent.append(len(records))
-        return real(records, **kwargs)
-
-    monkeypatch.setattr(module, "server_report", counted)
+    looks: list[dict] = []
+    monkeypatch.setattr(module, "LOOKS", looks)
     records = everything()
     seen = watched(tmp_path / "w.jsonl", records, [100, 200, 300], detectors="rust")
-    # One call a rebuild, each over every record read so far; no call on a look that found nothing new.
-    assert sent == [100, 200, 300] and len(seen) == 3
+    # Records 100 to 199 name a router the first 100 do not: every earlier sample changes, so the binary
+    # refuses that append and the watcher judges all 200 again. Records 200 to 299 are an append.
+    routers = lambda rows: {name for row in rows for name in (row.get("moe") or {})}  # noqa: E731
+    assert routers(records[:100]) != routers(records[:200]) and routers(records[:200]) == routers(records[:300])
+    assert [(look["mode"], look["records_sent"], look["rows_read"]) for look in looks] == [
+        ("full", 100, 100), ("full", 200, 200), ("append", 100, 100)]
+    assert "the binary refused the append" in looks[1]["why"] and len(seen) == 3
     # A line still being written is not sent until it is whole.
     path = tmp_path / "torn.jsonl"
     path.write_text(lines(records[:50]) + json.dumps(records[50])[:20], encoding="utf-8")
-    sent.clear()
+    looks.clear()
     watch(path, interval=0.0, polls=2, detectors="rust")
-    assert sent == [50]
+    assert [(look["mode"], look["records_sent"]) for look in looks] == [("full", 50)]
 
 
 def test_thresholds_given_to_the_watcher_go_to_the_rust_rules(tmp_path):

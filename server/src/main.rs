@@ -22,7 +22,11 @@ use tokio::net::TcpListener;
 /// seen, not by number (contract 1: `attempts.json`, the report's `attempt_order`, rows grouped in
 /// order of first appearance), and a capture that stopped has a watchdog state of its own
 /// (contract 3: `capture_stopped`).
-const PROTOCOL: u32 = 3;
+///
+/// 4 (Nov 21, 2026, wave AF-W): `detect --follow`, the detectors kept between looks for the SDK's
+/// `--watch` with the Rust detectors. What `detect` and `detect --samples` print is unchanged; an
+/// SDK built for 4 runs a `--watch` through `--follow`, which a binary of 3 does not have.
+const PROTOCOL: u32 = 4;
 
 /// Self-hosted TensorQuill ingest: Arrow Flight DoPut in, partitioned Parquet out.
 #[derive(Parser)]
@@ -131,6 +135,12 @@ enum Command {
         /// `replica_drift`, and `legacy` when there is one), with no bound on the steps listed.
         #[arg(long)]
         run: bool,
+        /// Keep one rank's detectors between looks (the SDK's `--watch` with the Rust detectors):
+        /// the input is frames, each an 8-byte little-endian length and one Arrow IPC stream, the
+        /// first every row of the rank and each later one only rows appended to its newest attempt;
+        /// one line of output per frame. Standard input only; not with --run.
+        #[arg(long, conflicts_with = "run")]
+        follow: bool,
     },
     /// Print the protocol number and exit: one whole number on a line of its own. The Python SDK
     /// runs a binary only when this is the number it was built for.
@@ -180,9 +190,23 @@ fn flag(name: &str, seconds: f64) -> Result<Duration, String> {
 }
 
 /// `tensorquill-server detect`: the report goes to standard output as one line of JSON.
-fn detect(inputs: Vec<PathBuf>, samples: bool, run: bool, thresholds: &Arc<Thresholds>) -> Result<(), Error> {
+fn detect(
+    inputs: Vec<PathBuf>,
+    samples: bool,
+    run: bool,
+    follow: bool,
+    thresholds: &Arc<Thresholds>,
+) -> Result<(), Error> {
     use std::io::Write;
-    use tensorquill_server::detect::{detect_run, detect_stream, detect_stream_samples, read_batches};
+    use tensorquill_server::detect::{detect_follow, detect_run, detect_stream, detect_stream_samples, read_batches};
+    if follow {
+        if !inputs.is_empty() && inputs.iter().any(|path| path.as_os_str() != "-") {
+            return Err("--follow reads its frames from standard input only".into());
+        }
+        let out = std::io::BufWriter::new(std::io::stdout().lock());
+        detect_follow(std::io::stdin().lock(), thresholds, samples, out)?;
+        return Ok(());
+    }
     let named: Vec<&PathBuf> = inputs.iter().filter(|path| path.as_os_str() != "-").collect();
     if named.len() != inputs.len() && inputs.len() > 1 {
         return Err("standard input (-) cannot be read beside other inputs".into());
@@ -319,10 +343,16 @@ async fn run(args: Args) -> Result<(), Error> {
 async fn main() -> ExitCode {
     let mut args = Args::parse();
     let outcome = match args.command.take() {
-        Some(Command::Detect { input, samples, run }) => detect(
+        Some(Command::Detect {
             input,
             samples,
             run,
+            follow,
+        }) => detect(
+            input,
+            samples,
+            run,
+            follow,
             &Arc::new(args.thresholds.take().unwrap_or_default()),
         ),
         Some(Command::Protocol) => {

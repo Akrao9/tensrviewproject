@@ -93,6 +93,8 @@ mod lane_ae7_tests;
 #[cfg(test)]
 mod lane_af_d_tests;
 #[cfg(test)]
+mod lane_af_w_tests;
+#[cfg(test)]
 mod lane_v7_tests;
 #[cfg(test)]
 mod lane_w3_tests;
@@ -1704,6 +1706,9 @@ impl Moe {
 pub struct MoeSamples<'a> {
     moe: &'a Moe,
     kept: &'a Kept,
+    /// The first `from_rows` rows, in step order, are left out: `detect --follow` writes only the
+    /// samples of the rows read since its last answer (0 everywhere else).
+    from_rows: usize,
 }
 
 #[derive(Serialize)]
@@ -1746,7 +1751,7 @@ impl Serialize for Shares<'_> {
 impl MoeSamples<'_> {
     /// How many samples there are: rows that count times routers.
     pub fn len(&self) -> usize {
-        self.kept.rows.len() * self.moe.routers.len()
+        self.kept.rows.len().saturating_sub(self.from_rows) * self.moe.routers.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1763,7 +1768,7 @@ impl Serialize for MoeSamples<'_> {
         let mut order: Vec<usize> = (0..rows.len()).collect();
         order.sort_by_key(|row| rows[*row].0);
         let mut seq = serializer.serialize_seq(Some(self.len()))?;
-        for row in order {
+        for row in order.into_iter().skip(self.from_rows) {
             let (step, start) = rows[row];
             let end = rows.get(row + 1).map_or(samples.len(), |next| next.1);
             let mut recorded = samples[start..end].iter().peekable();
@@ -4245,7 +4250,11 @@ impl RankDetectors {
     /// `samples` list of `build_evidence`.
     pub fn samples(&self) -> Option<MoeSamples<'_>> {
         let kept = self.moe.kept.as_ref()?;
-        Some(MoeSamples { moe: &self.moe, kept })
+        Some(MoeSamples {
+            moe: &self.moe,
+            kept,
+            from_rows: 0,
+        })
     }
 
     /// The options these detectors apply.
@@ -4902,6 +4911,217 @@ pub fn detect_stream_samples(
     .map_err(|error| format!("cannot write the report: {error}"))
 }
 
+/// `tensorquill-server detect --follow` (wave AF-W): one rank's detectors kept between looks, for the
+/// SDK's `--watch` with the Rust detectors, as the live server keeps a rank's between flushes.
+///
+/// Standard input is a sequence of frames, each an 8-byte little-endian length and that many bytes
+/// of one complete Arrow IPC stream; a length of 0, or the end of the input, ends the command. Each
+/// frame gets one line on standard output, flushed, holding what `detect` (with `--samples`, what
+/// `detect --samples`) prints for the rows read so far, and one more key, `follow`:
+///
+/// - The first frame is every row of the rank, judged as `detect` judges them (attempts ordered and
+///   resolved, every attempt read by the pass that compares a resume with what it replaced). Its
+///   line is `detect`'s output with `follow: {"mode": "full", "rows": <rows read>, "samples_from": 0}`.
+/// - A later frame holds only rows appended to the newest attempt, each of a higher step than any
+///   read before, in step order. They are read as the live server reads a flush after a replay
+///   ([`RankDetectors::observe`]): nothing read before is read again. The line has `mode` `append`,
+///   `rows` the rows of this frame, and `samples` only the samples of these rows, which start at
+///   `samples_from` in the whole list (the earlier ones are unchanged: a sample is judged once).
+/// - A later frame that is anything else (another run, rank or attempt; a step not above the last;
+///   rows that name a router not seen before or with more experts, which would change every earlier
+///   sample) is refused: the line is `{"follow": {"refused": <why>}}` and the command ends. The
+///   caller starts again with every row. Its earlier answers stand; none is corrected.
+///
+/// Rows that are not valid end the command with an error, as in `detect`.
+pub fn detect_follow(
+    mut input: impl std::io::Read,
+    thresholds: &Arc<Thresholds>,
+    samples: bool,
+    mut out: impl std::io::Write,
+) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Answer<'a> {
+        #[serde(flatten)]
+        report: &'a Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        samples: Option<MoeSamples<'a>>,
+        follow: Value,
+    }
+    let write = |out: &mut dyn std::io::Write, line: &dyn erased::Line| -> Result<(), String> {
+        line.write(out)
+            .map_err(|error| format!("cannot write the report: {error}"))?;
+        out.write_all(b"\n")
+            .and_then(|()| out.flush())
+            .map_err(|error| format!("cannot write the report: {error}"))
+    };
+    let mut state: Option<(String, i32, RankDetectors)> = None;
+    loop {
+        let Some(length) = frame_length(&mut input)? else {
+            return Ok(());
+        };
+        let (from_rows, rows, mode) = match state.as_mut() {
+            None => {
+                let made = if samples {
+                    RankDetectors::with_samples(thresholds)
+                } else {
+                    RankDetectors::new(thresholds)
+                };
+                let (run_id, rank, detectors, rows) =
+                    in_frame(&mut input, length, |frame| detect_rows_counted(frame, made))?;
+                state = Some((run_id, rank, detectors));
+                (0, rows as u64, "full")
+            }
+            Some((run_id, rank, detectors)) => match in_frame(&mut input, length, |frame| {
+                Ok(follow_append(run_id, *rank, detectors, frame))
+            })? {
+                Ok((from_rows, rows)) => (from_rows, rows, "append"),
+                Err(why) => {
+                    return write(&mut out, &erased::Json(json!({"follow": {"refused": why}})));
+                }
+            },
+        };
+        let (run_id, rank, detectors) = state.as_ref().expect("judged above");
+        let report = offline_report(run_id, *rank, detectors);
+        let kept = detectors.samples().map(|whole| MoeSamples { from_rows, ..whole });
+        let from = kept.as_ref().map_or(0, |_| from_rows * detectors.moe.routers.len());
+        write(
+            &mut out,
+            &erased::Json(Answer {
+                report: &report,
+                samples: kept,
+                follow: json!({"mode": mode, "rows": rows, "samples_from": from}),
+            }),
+        )?;
+    }
+}
+
+/// `serde_json::to_writer` behind a trait object, so one closure writes any answer.
+mod erased {
+    pub(super) trait Line {
+        fn write(&self, out: &mut dyn std::io::Write) -> serde_json::Result<()>;
+    }
+    pub(super) struct Json<T>(pub T);
+    impl<T: serde::Serialize> Line for Json<T> {
+        fn write(&self, out: &mut dyn std::io::Write) -> serde_json::Result<()> {
+            serde_json::to_writer(out, &self.0)
+        }
+    }
+}
+
+/// The length of the next frame of `detect --follow`. `None` at the end of the input or at a length
+/// of 0. The frame itself is read through `take(length)`, never held as one buffer beside the rows
+/// read from it (a first frame of 10,000 records is hundreds of MB of Arrow).
+fn frame_length(input: &mut impl std::io::Read) -> Result<Option<u64>, String> {
+    let mut length = [0_u8; 8];
+    let mut got = 0;
+    while got < length.len() {
+        match input.read(&mut length[got..]) {
+            Ok(0) if got == 0 => return Ok(None),
+            Ok(0) => return Err("the input ended inside a frame's length".to_string()),
+            Ok(read) => got += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(format!("cannot read the input: {error}")),
+        }
+    }
+    let length = u64::from_le_bytes(length);
+    Ok((length != 0).then_some(length))
+}
+
+/// Reads one frame of `length` bytes from `input` with `read`, then whatever of it `read` left, so
+/// the next frame starts where it should. A frame the input ends inside is said as that, whatever
+/// `read` made of its first part.
+fn in_frame<T>(
+    input: &mut impl std::io::Read,
+    length: u64,
+    read: impl FnOnce(&mut dyn std::io::Read) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut frame = std::io::Read::take(input, length);
+    let found = read(&mut frame);
+    std::io::copy(&mut frame, &mut std::io::sink()).map_err(|error| format!("cannot read the input: {error}"))?;
+    if frame.limit() > 0 {
+        return Err(format!("the input ended inside a frame of {length} bytes"));
+    }
+    found
+}
+
+/// Reads one later frame of `detect --follow` into `detectors`, when its rows are a plain append:
+/// the same run and rank, the newest attempt, each step above the last read, and no router new or
+/// grown. Every row is checked before any is read. Gives the rows that counted before the frame
+/// (where its samples start) and the rows it held, or why it was refused. A refusal after the rows
+/// were read (a router new or grown) leaves the detectors not to be used again; the caller ends.
+fn follow_append(
+    run_id: &str,
+    rank: i32,
+    detectors: &mut RankDetectors,
+    frame: &mut dyn std::io::Read,
+) -> Result<(usize, u64), String> {
+    let reader = arrow::ipc::reader::StreamReader::try_new(frame, None)
+        .map_err(|error| format!("the frame is not an Arrow IPC stream: {error}"))?;
+    let batches = reader
+        .collect::<Result<Vec<RecordBatch>, _>>()
+        .map_err(|error| format!("cannot read the frame's Arrow IPC stream: {error}"))?;
+    let mut last = detectors.last_step();
+    let mut before = 0;
+    for batch in &batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        check_keys(batch, before)?;
+        before += batch.num_rows();
+        let (Some(run_ids), Some(ranks), Some(steps)) = (
+            column::<StringArray>(batch, "run_id"),
+            column::<Int32Array>(batch, "rank"),
+            column::<Int64Array>(batch, "step"),
+        ) else {
+            unreachable!("check_keys found the key columns");
+        };
+        let attempts = column::<Int64Array>(batch, "attempt");
+        for row in 0..batch.num_rows() {
+            if run_ids.value(row) != run_id || ranks.value(row) != rank {
+                return Err(format!(
+                    "a row of {} rank {} beside rows of {run_id} rank {rank}",
+                    run_ids.value(row),
+                    ranks.value(row)
+                ));
+            }
+            let attempt = attempts.map_or(0, |attempts| attempts.value(row));
+            if attempt != detectors.attempt() {
+                return Err(format!(
+                    "a row of attempt {attempt}, where the newest attempt read is {}",
+                    detectors.attempt()
+                ));
+            }
+            let step = steps.value(row);
+            if last.is_some_and(|last| step <= last) {
+                return Err(format!(
+                    "a row of step {step}, not above the last step read ({})",
+                    last.unwrap_or_default()
+                ));
+            }
+            last = Some(step);
+        }
+    }
+    let routers = |detectors: &RankDetectors| -> Vec<(String, usize)> {
+        detectors
+            .moe
+            .routers
+            .iter()
+            .map(|router| (router.name.clone(), router.largest))
+            .collect()
+    };
+    let (known, from_rows) = (
+        routers(detectors),
+        detectors.moe.kept.as_ref().map_or(0, |kept| kept.rows.len()),
+    );
+    for batch in &batches {
+        detectors.observe(batch);
+    }
+    if routers(detectors) != known {
+        return Err("the rows name a router not read before, or give one more experts than before".to_string());
+    }
+    Ok((from_rows, before as u64))
+}
+
 /// The key columns of rows given to the offline modes (`detect` and `detect --run`), checked
 /// before anything is judged: a `run_id` string, a `rank` int32 and a `step` int64, none of
 /// them null, and an `attempt` int64 without nulls when the column is there. A batch with no
@@ -4990,6 +5210,14 @@ pub(crate) fn check_keys(batch: &RecordBatch, before: usize) -> Result<(), Strin
 /// Reads one rank's rows from an Arrow IPC stream into `detectors`: whose rows they are, and
 /// the detectors after the last row.
 fn detect_rows(input: impl std::io::Read, detectors: RankDetectors) -> Result<(String, i32, RankDetectors), String> {
+    detect_rows_counted(input, detectors).map(|(run_id, rank, detectors, _)| (run_id, rank, detectors))
+}
+
+/// [`detect_rows`], with how many rows the input held.
+fn detect_rows_counted(
+    input: impl std::io::Read,
+    detectors: RankDetectors,
+) -> Result<(String, i32, RankDetectors, usize), String> {
     let reader = arrow::ipc::reader::StreamReader::try_new(input, None)
         .map_err(|error| format!("the input is not an Arrow IPC stream: {error}"))?;
     let batches = reader
@@ -5026,7 +5254,7 @@ fn detect_rows(input: impl std::io::Read, detectors: RankDetectors) -> Result<(S
         return Err("the stream holds no rows".to_string());
     };
     let detectors = judge_with(detectors, rank, &batches)?;
-    Ok((run_id, rank, detectors))
+    Ok((run_id, rank, detectors, before))
 }
 
 #[cfg(test)]
