@@ -417,11 +417,13 @@ pub fn read_batches(input: impl std::io::Read) -> Result<Vec<RecordBatch>, Strin
 pub fn detect_run(batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Result<Value, String> {
     let mut run: Option<String> = None;
     let mut by_rank: BTreeMap<i32, Vec<RecordBatch>> = BTreeMap::new();
+    let mut before = 0;
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
         }
-        super::check_keys(batch)?;
+        super::check_keys(batch, before)?;
+        before += batch.num_rows();
         let (Some(run_ids), Some(ranks)) = (
             column::<StringArray>(batch, "run_id"),
             column::<Int32Array>(batch, "rank"),
