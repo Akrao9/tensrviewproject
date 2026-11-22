@@ -52,8 +52,10 @@ during an open episode joins it, at the step it stopped at; the episode ends onc
 steps past its own step, so a first rank that recovers while a joined one is still stuck ends it,
 and the joined rank's stall then fires. A rank that is only `reconnecting` has not stepped: one
 that was stopped when its stream dropped keeps its severity and stays in the stall while it
-reconnects and once it is lost (`evidence.rank_is_stopped`), so a hung rank that is killed, comes
-back and still does not step is one episode and one firing. A
+reconnects and once it is lost (`evidence.rank_is_stopped`), so a hung rank whose connection drops, opens
+again under the same attempt and still does not step is one episode and one firing. A hung rank
+that is killed and started again comes back as a new attempt, which ends the episode as any new
+attempt does: if that one stalls too, it fires again. A
 server restart is neither progress nor an attempt: the stall is not listed during the restored
 ranks' fresh window, and nothing is decided until it is. (`wandb`'s `run.alert` holds an alert
 back by its title and a wait time, not by the step it was raised at.) The status is
@@ -128,7 +130,11 @@ server was started on the run folder, a `rank=<n>` folder, the capture or the ev
 that kind and step on those ranks; `<ranks>` is `rank0`, `ranks0-3,7` or `run`). The delivery id
 is not a lookup id, and the ids `list_incidents` gives (`<kind>@<step>`) are numbered over the
 whole view, so they are not the same from one view to another. It is made from the evidence at
-each look and is not kept in the state file; null when none could be made.
+each look and is not kept in the state file; null when none could be made. A stall changes its
+kind and step inside one episode (a `rank_silent` becomes a `job_stalled`) and fires once, so its
+`mcp_id` may name what it was: `get_incident` then answers with the run's stall as it reads now
+and says so (`looked_up_as`), while the run lists exactly one stall; once the stall is over the id
+finds nothing.
 
 `rank` is null and `ranks` lists them when several ranks share the incident; `ranks` is empty
 for an incident of the whole run. A number that is not finite is the string `"nan"`, `"inf"` or `"-inf"`,

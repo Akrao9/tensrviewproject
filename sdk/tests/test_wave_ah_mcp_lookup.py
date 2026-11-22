@@ -210,6 +210,21 @@ def test_a_group_of_ranks_and_a_stall_of_the_run_have_lookup_ids_too(tmp_path, h
     assert get(path, id="r/rank3/non_finite@30")["id"] == "non_finite@30#2"  # the list's id, where it is the second
     assert get(path, id="r/rank1/non_finite@30")["where"]["layers"] == ["blk2"]  # one rank of the group
     assert get(path, id="r/run/rank_silent@49")["kind"] == "rank_silent"
+    assert "looked_up_as" not in get(path, id="r/run/rank_silent@49")
+    # The same stall later in its episode: the other ranks finished, and it reads job_stalled at
+    # the run's step. The id the trigger gave when it fired still finds it, and the answer says so.
+    later = {**evidence, "run_incidents": [{**stall, "kind": "job_stalled", "step": 90, "other_ranks": []}]}
+    path.write_text(json.dumps(later))
+    answer = get(path, id="r/run/rank_silent@49")
+    assert (answer["kind"], answer["step"], answer["id"], answer["looked_up_as"]) == (
+        "job_stalled", 90, "job_stalled@90", "rank_silent@49")
+    assert "as it reads now" in answer["note"]
+    # Once the stall is over, the id finds nothing; and no other kind is ever answered in its place.
+    path.write_text(json.dumps({**evidence, "run_incidents": []}))
+    with pytest.raises(mcp_server.ToolError, match="no incident"):
+        get(path, id="r/run/rank_silent@49")
+    with pytest.raises(mcp_server.ToolError, match="no incident"):
+        get(path, id="r/rank9/non_finite@31")
     with pytest.raises(mcp_server.ToolError, match="no incident"):
         get(path, id="r/rank9/non_finite@30")
 

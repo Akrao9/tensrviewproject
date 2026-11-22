@@ -596,6 +596,9 @@ def _entries(opened: Mapping[str, Any]) -> list[dict[str, Any]]:
 # them. A list id never holds a `/`, so the two forms cannot be mistaken for each other.
 
 
+_STALL_KINDS = ("job_stalled", "rank_silent")  # read from the server's status: one at a time for a run
+
+
 def _base_id(kind: Any, step: Any) -> str:
     return f"{kind}@{step}" if isinstance(step, int) and not isinstance(step, bool) else str(kind)
 
@@ -691,6 +694,14 @@ def _looked_up(source: "Source", wanted: str, lookup: Mapping[str, Any], rank: i
         raise ToolError(f"{wanted!r} is an incident of rank {_ranges(ranks)}; this answer would be rank {own}'s evidence,"
                         " which says nothing about it.")
     candidates = lookup_candidates(opened, lookup["kind"], lookup["step"], ranks)
+    if len(candidates) < lookup["nth"] and lookup["kind"] in _STALL_KINDS and lookup["nth"] == 1:
+        # A stall changes its kind and its step inside one episode (a `rank_silent` at the stopped
+        # rank's step becomes a `job_stalled` at the run's once the other ranks stop or finish), and
+        # the trigger fires once for the episode, so the id it gave may name what the stall was.
+        # The run lists one stall at a time: that one is the stall the id is of, or its successor.
+        stalls = [e for e in _entries(opened) if e["incident"].get("kind") in _STALL_KINDS]
+        if len(stalls) == 1:
+            return opened, {**stalls[0], "looked_up_as": _base_id(lookup["kind"], lookup["step"])}, rank
     if len(candidates) < lookup["nth"]:
         entries = _entries(opened)
         known = ", ".join(e["id"] for e in entries[:20]) or "none"
@@ -1206,7 +1217,12 @@ def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
     incident = entry["incident"]
     found = _class_of(incident)
     answer: dict[str, Any] = {
-        "source": opened["source"], "id": entry["id"], "kind": incident.get("kind"), "class": found,
+        "source": opened["source"], "id": entry["id"],
+        # A stall looked up by what it was when the trigger fired (see `_looked_up`).
+        **({"looked_up_as": entry["looked_up_as"],
+            "note": "the stall this id named has changed its kind or step since the trigger fired; this is the run's"
+                    " stall as it reads now"} if "looked_up_as" in entry else {}),
+        "kind": incident.get("kind"), "class": found,
         "class_meaning": CLASS_MEANINGS.get(found, CLASS_MEANINGS["unclassified"]), "step": incident.get("step"),
         **_since_start(incident),
         "where": _where(incident),

@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from tensorquill import compact, mcp_server
 from tensorquill import evidence as ev
 from tensorquill.evidence import detect_watchdog_incidents, incident_summary
 from tensorquill.mcp_server import all_ranks_look
@@ -222,6 +223,7 @@ def test_the_real_server_holds_a_critical_stall_through_the_drop_and_the_trigger
     out = tmp_path / "all.evidence.json"
     stop = threading.Event()
     seen: list[tuple[str, str, str | None]] = []
+    checked_views: list[bool] = []
 
     def look(wanted, seconds=30.0) -> dict:
         """The first status in which rank 1 reads `wanted`, and what a watcher makes of it then."""
@@ -257,6 +259,25 @@ def test_the_real_server_holds_a_critical_stall_through_the_drop_and_the_trigger
         assert at["status"]["summary"] == "degraded" and at["fired"] == 1
         assert [(i["kind"], i["severity"], i["assessment"]) for i in at["stalls"]] == [("rank_silent", "critical", "suspected_hang")]
         assert [r["rank"] for r in at["stalls"][0]["ranks"]] == [1]
+        # Every view the finding named says so, not only `watchdog.json`: the all-ranks view's
+        # entry for the rank, its printed summary, the MCP status and the compact file.
+        view = all_ranks_look(folder)
+        stream = next(r for r in view["ranks"] if r["rank"] == 1)["stream"]
+        if stream["state"] == "reconnecting":  # read a moment later than the status: still in the grace
+            checked_views.append(True)
+            assert (stream["severity"], stream["stopped_as"]) == ("critical", "silent")
+            printed = incident_summary(view)
+            assert "rank 1 sent no new step since step 9 (it was silent, and its connection has dropped" in printed
+            assert "[critical, suspected hang]" in printed and "No incidents detected" not in printed
+            source = mcp_server.Source(folder)
+            status = mcp_server.get_all_ranks_status(source, {})
+            assert [(i["kind"], i["where"]["ranks"]) for i in status["incidents"]] == [("rank_silent", [1])]
+            assert status["run_state"]["state"] == "unknown"
+            assert mcp_server.get_incident(source, {"id": status["incidents"][0]["id"]})["kind"] == "rank_silent"
+            small = compact.compact_evidence(view)
+            [kept] = [i for i in small["run_incidents"] if i["kind"] == "rank_silent"]
+            assert (kept["severity"], kept["ranks"][0]["state"], kept["ranks"][0]["stopped_as"]) == (
+                "critical", "reconnecting", "silent")
         # 3. The grace period ends: lost, a lost connection, and not back at warning.
         at = look(lambda r: r["state"] == "lost")
         assert at["rank"]["severity"] == "critical" and at["fired"] == 1
@@ -284,3 +305,4 @@ def test_the_real_server_holds_a_critical_stall_through_the_drop_and_the_trigger
         trigger.close(wait=10)
         server.stop()
     assert [c["payload"]["kind"] for c in calls()] == ["rank_silent"], seen
+    assert checked_views, "the views were read after the grace had ended, so they were not checked"

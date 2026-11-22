@@ -5717,6 +5717,7 @@ def _all_ranks_evidence(
         if isinstance(item, dict) and isinstance(item.get("rank"), int):
             streams[item["rank"]] = {k: item[k] for k in (
                 "state", "last_step", "phase", "severity", "seconds_since_progress", "heartbeat_age_seconds",
+                "stopped_as",  # a rank that was stopped when its stream dropped (wave AH): what it was
             ) if k in item}
     entries = []
     for number in sorted(looks):
