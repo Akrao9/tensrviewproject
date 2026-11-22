@@ -27,9 +27,23 @@ one-shot reads. To get the program there, build it from the source with `cargo b
 in the `server` directory.
 
 The `tensorquill` package and this program must speak the same protocol number
-(`tensorquill-server protocol` prints it; 3 since Nov 19, 2026). The package refuses a binary
-with another number for offline detection and says which to install; streaming still works
-across the two.
+(`tensorquill-server protocol` prints it; 4 since Nov 21, 2026, when `detect --follow` was added;
+3 before). The package refuses a binary with another number for offline detection and says which
+to install; streaming still works across the two.
+
+`detect` reads one rank's rows as an Arrow IPC stream on standard input and prints that rank's
+report; `--samples` adds the per-step MoE samples. `detect --samples --follow` is what
+`python -m tensorquill <file or store> --watch` runs with the Rust detectors: one process for the
+whole watch, which keeps the rank's detectors between looks as the server keeps them between
+flushes. Its input is frames, each an 8-byte little-endian length and one Arrow IPC stream: the
+first holds every row of the rank, and each later one only rows appended to its newest attempt,
+which are judged without judging the earlier rows again. It answers each frame with one line, and
+refuses a frame that is not such an append (another attempt, a step not above the last, a router
+not seen before or with more experts) and ends, and the package then starts it again with every
+row. The process holds the rank's detectors and samples in memory for the life of the watch, where
+`detect` holds them only while it runs: for 10,000 steps of 24 routers of 32 experts, about 386 MB
+at its peak during the first look and about 240 MB resident between looks. It ends when the
+watcher stops, and by itself when its input ends, so a watcher that is killed leaves none behind.
 
 Beside the Parquet parts, each rank's folder in the store holds `incidents.json` (what the
 detectors found) and `attempts.json` (the order in which the job's attempts were first seen,

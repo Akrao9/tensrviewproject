@@ -450,3 +450,153 @@ def test_a_threshold_change_while_one_watcher_runs_is_judged_again_in_full(binar
         assert watching.process.poll() is None, "the watcher was not the same process throughout"
     finally:
         watching.stop()
+
+
+# ---- Protocol 4: the pair and a mismatch, through the command (the author's follow-up 2) ------------
+
+
+def test_this_trees_binary_and_sdk_are_a_pair_of_protocol_4(binary):
+    done = subprocess.run([binary, "protocol"], capture_output=True, text=True, timeout=30)
+    assert (done.returncode, done.stdout, done.stderr) == (0, "4\n", "") and sd.PROTOCOL == 4
+    assert sd.rust_ready(binary) == binary
+
+
+def _speaks_3(tmp: Path) -> Path:
+    """A binary of protocol 3, the one before `detect --follow`: it answers `protocol` with 3, and would
+    fail anything else (it is never run for more)."""
+    path = tmp / "old" / "tensorquill-server"
+    path.parent.mkdir(parents=True)
+    path.write_text('#!/bin/sh\nif [ "$1" = protocol ]; then echo 3; exit 0; fi\necho "ran $*" >&2; exit 3\n')
+    path.chmod(0o755)
+    return path
+
+
+def _command(tmp: Path, binary: Path, *args: str) -> subprocess.CompletedProcess:
+    path = tmp / f"{RUN}.rank0.jsonl"
+    if not path.exists():
+        write_jsonl(path, records(range(30)))
+    env = {**os.environ, "PYTHONPATH": str(SRC), sd.BINARY_ENV: str(binary)}
+    return subprocess.run([sys.executable, "-m", "tensorquill", str(path), *args, "--interval", "0.05",
+                           "-o", str(tmp / "out.json")], cwd=tmp, env=env, capture_output=True, text=True, timeout=120)
+
+
+MISMATCH = "speaks protocol 3 and this tensorquill needs protocol 4: install a tensorquill and a tensorquill-server that match"
+
+
+@pytest.mark.parametrize("args", [("--watch",), ("--watch", "--detectors", "rust")], ids=["watch", "watch_rust"])
+def test_a_watch_with_a_binary_of_protocol_3_is_refused_before_any_look(tmp_path, args):
+    done = _command(tmp_path, _speaks_3(tmp_path), *args)
+    assert done.returncode == 2 and "Traceback" not in done.stderr
+    last = done.stderr.strip().splitlines()[-1]
+    assert last.startswith("__main__.py: error: --watch needs the Rust detectors: ") and MISMATCH in last, last
+    assert last.endswith("To watch with the Python detectors, add --detectors python")
+    assert "ran " not in done.stderr and not (tmp_path / "out.json").exists()
+
+
+def test_one_read_asking_for_rust_with_a_binary_of_protocol_3_is_refused(tmp_path):
+    done = _command(tmp_path, _speaks_3(tmp_path), "--detectors", "rust")
+    assert done.returncode == 2 and MISMATCH in done.stderr.strip().splitlines()[-1]
+    assert "ran " not in done.stderr and not (tmp_path / "out.json").exists()
+
+
+@pytest.mark.parametrize("args", [(), ("--detectors", "auto")], ids=["default", "auto"])
+def test_one_read_with_auto_and_a_binary_of_protocol_3_uses_the_python_detectors_and_says_so(tmp_path, args):
+    done = _command(tmp_path, _speaks_3(tmp_path), *args)
+    assert done.returncode == 0, done.stderr
+    warned = [line for line in done.stderr.splitlines() if line.startswith("tensorquill: warning: ")]
+    assert len(warned) == 1 and "using the Python detectors, not the Rust ones" in warned[0] and MISMATCH in warned[0]
+    assert "ran " not in done.stderr
+    written = json.loads((tmp_path / "out.json").read_text())
+    assert "detectors" not in written  # the Python detectors' evidence: no `"detectors": "rust"`
+
+
+# ---- The detector child's life (the author's follow-up 2) -----------------------------------------------
+
+
+def _followers(binary: str) -> list[tuple[int, int]]:
+    """(pid, parent pid) of each `detect --follow` process of `binary`, from the process table."""
+    listed = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    found = []
+    for line in listed.splitlines():
+        pid, ppid, command = line.split(None, 2)
+        if command.startswith(binary) and "--follow" in command:
+            found.append((int(pid), int(ppid)))
+    return found
+
+
+def _gone(pid: int, within: float = 30.0) -> bool:
+    """Whether process `pid` is gone, waiting up to `within` seconds (a bound, not a timing asserted)."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        if subprocess.run(["ps", "-p", str(pid)], capture_output=True).returncode != 0:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _watching_with_child(tmp: Path, binary: str) -> tuple["Watching", int, Path]:
+    """The command watching a `.jsonl` file with the Rust detectors, its follow child running, and the
+    command's own temporary folder (TMPDIR), where the child's standard error file would be."""
+    path = tmp / f"{RUN}.rank0.jsonl"
+    write_jsonl(path, records(range(40)))
+    scratch = tmp / "tmpdir"
+    scratch.mkdir()
+    os.environ["TMPDIR"], before = str(scratch), os.environ.get("TMPDIR")
+    try:
+        watching = Watching(tmp, path)
+    finally:
+        os.environ.pop("TMPDIR") if before is None else os.environ.__setitem__("TMPDIR", before)
+    watching.wait(1)
+    children = [pid for pid, ppid in _followers(binary) if ppid == watching.process.pid]
+    assert len(children) == 1, "the watcher has no detect --follow child"
+    return watching, children[0], scratch
+
+
+def test_the_child_ends_with_a_watch_that_ends_by_itself(binary, tmp_path):
+    """`watch` with `polls`: when the last look is done, so is the child."""
+    path = tmp_path / f"{RUN}.rank0.jsonl"
+    write_jsonl(path, records(range(40)))
+    seen: list[int] = []
+
+    def grow(evidence, written):
+        seen.extend(pid for pid, ppid in _followers(binary) if ppid == os.getpid())
+        if len(seen) == 1:
+            write_jsonl(path, records(range(40, 45)), "a")
+
+    ev.watch(path, tmp_path / "out.json", interval=0.0, polls=3, on_update=grow, detectors="rust")
+    assert len(seen) == 2 and len(set(seen)) == 1, "one child, the same at both looks"
+    assert _gone(seen[0]) and not [pid for pid, _ in _followers(binary) if pid == seen[0]]
+
+
+def test_one_read_by_the_command_starts_no_follow_child(binary, tmp_path):
+    """The command line that ends by itself, one read with the Rust detectors: `detect --samples`, never
+    `--follow`, and nothing left behind."""
+    before = {pid for pid, _ in _followers(binary)}
+    done = _command(tmp_path, Path(binary), "--detectors", "rust")
+    assert done.returncode == 0, done.stderr
+    assert {pid for pid, _ in _followers(binary)} <= before
+
+
+@pytest.mark.parametrize("how", ["sigint", "sigterm", "sigkill"])
+def test_the_child_ends_when_the_command_is_stopped(binary, tmp_path, how):
+    """Ctrl-C: the watcher closes the child on its way out. SIGTERM and SIGKILL end the command without
+    it: the child then reads the end of its input and ends by itself."""
+    watching, child, scratch = _watching_with_child(tmp_path, binary)
+    if how == "sigint":
+        watching.stop()
+    else:
+        watching.process.send_signal(signal.SIGTERM if how == "sigterm" else signal.SIGKILL)
+        assert watching.process.wait(30) != 0
+    assert _gone(child), f"the detect --follow child outlived the command ({how})"
+    assert list(scratch.iterdir()) == [], "a temporary file was left"
+
+
+def test_the_child_ends_when_a_look_raises(binary, tmp_path):
+    """A record that is not valid, appended mid-watch, ends the command (exit 2, section 1); the child
+    ends with it."""
+    watching, child, scratch = _watching_with_child(tmp_path, binary)
+    with (tmp_path / f"{RUN}.rank0.jsonl").open("a", encoding="utf-8") as file:
+        file.write(json.dumps({**records(range(40, 41))[0], "step": -1}) + "\n")
+    assert watching.process.wait(60) == 2
+    assert "tensorquill: error: step is -1" in watching.process.stderr.read()
+    assert _gone(child) and list(scratch.iterdir()) == []
