@@ -4745,7 +4745,12 @@ def watch(
                         adopted = {}
                 # The end marker appears after the last record: its arrival alone is news.
                 ended = read_end_marker(source) if source.suffix == ".jsonl" else None
-                seen = ("python", look and look["state"], stamp, other_stamp, ended and ended["state"])
+                # The thresholds taken from the rank's report are part of it (wave AF-W, the author's
+                # follow-up): a server that now applies others (its report says so) is news with no new
+                # record, and the parts are judged again under them. Before, nothing was written until
+                # the next record, and the file showed the run under the thresholds no longer in force.
+                seen = ("python", look and look["state"], stamp, other_stamp, ended and ended["state"],
+                        json.dumps(adopted, sort_keys=True, default=str))
                 if not tail.records:
                     # The rank this watcher locked onto has no record yet while others do: said
                     # once for each set of ranks seen, since nothing is written for it until it
