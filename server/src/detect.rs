@@ -1141,6 +1141,9 @@ struct RouterStats {
 
 // --- MoE load: moe_imbalance and starved_experts -----------------------------------------
 
+/// The `check` of the `not_checked` entry that names the routers recorded with no tokens on any row.
+const MOE_ROUTING: &str = "moe_routing";
+
 #[derive(Default)]
 struct Router {
     name: String,
@@ -1161,6 +1164,9 @@ struct Router {
     largest: usize,
     /// Where it stands against the starting-state rule (part 3).
     leading: Leading,
+    /// Whether any row so far gave it tokens (counts summing to more than 0). A router the rows name
+    /// only with no tokens was not read (`moe_routing`, wave AG, section 8 of `WAVE_AF_CONTRACT.md`).
+    read: bool,
 }
 
 /// A router against the starting-state rule (part 3). Only its judged samples (counts that sum
@@ -1458,6 +1464,7 @@ impl Moe {
             }
             judged = true;
             let router = &mut self.routers[index];
+            router.read = true;
             let experts = router_counts.len();
             let recorded = stats.as_ref().and_then(|stats| {
                 // The statistics list the routers in the same order on every step.
@@ -1615,6 +1622,37 @@ impl Moe {
             "routers": self.refused.keys().collect::<Vec<_>>(),
             "reason": reason.join("; "),
             "step": step,
+        }))
+    }
+
+    /// The `moe_routing` entry of `not_checked` (wave AG, section 8 of `WAVE_AF_CONTRACT.md`): the
+    /// routers the rows name whose counts are 0 on every row that names them, sorted by name, or
+    /// None when every router named was read. A model trained in eval mode with reentrant
+    /// checkpointing records such zeros on every step; they are not a router that routed nothing.
+    /// The shape and the text are the Python readers' (lane C). [`RankDetectors::kind_checks`] takes
+    /// it for the two kinds only while no router was read; otherwise they are judged on the routers
+    /// that were, and the entry names the others. Over a live rank's rows it is judged on what has
+    /// arrived: it appears while a named router has had only zeros, and goes at its first tokens.
+    fn not_read_not_checked(&self) -> Option<Value> {
+        let mut routers: Vec<&str> = self
+            .routers
+            .iter()
+            .filter(|router| !router.read)
+            .map(|router| router.name.as_str())
+            .collect();
+        if routers.is_empty() {
+            return None;
+        }
+        routers.sort_unstable();
+        let reason: Vec<String> = routers
+            .iter()
+            .map(|name| format!("router {name} recorded no tokens on any step: its routing was not read"))
+            .collect();
+        Some(json!({
+            "check": MOE_ROUTING,
+            "kinds": ["moe_imbalance", "starved_experts"],
+            "routers": routers,
+            "reason": reason.join("; "),
         }))
     }
 
@@ -4431,6 +4469,13 @@ impl RankDetectors {
         self.measurements.blocks()
     }
 
+    /// How many times a report of these detectors found a series' trend (`gradient_trend`, or one
+    /// module's of `attention_trends`). A series with no new point since the last report is not
+    /// found again (wave AF): the count says what each report computed, for tests and diagnosis.
+    pub fn trend_computations(&self) -> u64 {
+        self.measurements.trend_computations()
+    }
+
     /// The rank's `skipped_updates` (contract section 1), present only when a row carried
     /// `step_skipped_by`: written in the report beside `not_checked`.
     pub fn skipped_updates(&self) -> Option<Value> {
@@ -4471,6 +4516,7 @@ impl RankDetectors {
         out.extend(self.attention.probe_not_checked());
         self.system.not_checked(&mut out);
         out.extend(self.moe.refused_not_checked());
+        out.extend(self.moe.not_read_not_checked());
         out.extend(self.updates.not_read_not_checked());
         out.extend(self.updates.clip_groups_not_checked());
         out.extend(self.grads_not_read.not_checked());
@@ -4529,8 +4575,11 @@ impl RankDetectors {
             let enough = records >= needed;
             // A `clip_groups` entry names `update_spike` and leaves it `checked` while some pair was
             // compared; with none compared it makes it `unavailable` (`WAVE_AE_CONTRACT.md`, section 1).
+            // A `moe_routing` entry makes the two MoE kinds `unavailable` only while no router was
+            // read (the `moe` count is 0); otherwise they are judged on the routers that were (wave AG).
             let names = |item: &&Value| {
                 (item["check"] != CLIP_GROUPS || item["compared"] == 0)
+                    && (item["check"] != MOE_ROUTING || self.moe.judged_rows == 0)
                     && match item["kinds"].as_array() {
                         Some(kinds) => kinds.iter().any(|named| named == kind),
                         None => CHECK_KINDS

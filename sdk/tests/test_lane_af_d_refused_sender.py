@@ -20,15 +20,12 @@ What is asserted, for D5:
 - A range neither confirmed nor refused (C while the server is down) stays pending: the offset stays
   where it was, and C is sent again once the server is back.
 
-What it shows (run on this branch, Nov 21, 2026): with one refused batch, all of it holds. With
-several refused batches in a row, the second is never confirmed (`xfail`, strict): a server that has
-acknowledged anything for the rank names a refused batch from that acknowledgement (here byte 366,
-the end of A), not from the end of the refusal it confirmed before (610), and it uses a batch's
-`start_byte_offset` only when it has acknowledged nothing for the rank (`Ingest::confirm_refusal`).
-The sender, at 610, cannot confirm a range that starts at 366, so it sends B2 again without end (109
-streams in 20 s with the test's backoff cap of 0.2 s) and C, behind it, is never stored. The sender
-saved no unconfirmed offset. The cause is the server's (lane D); the rule is RS10's, decided by the
-author, so it is reported, not changed here.
+What it showed (Nov 21, 2026, wave AF): with one refused batch all of it held; with several in a row
+the second was never confirmed, since the server named it from the rank's last acknowledgement, not
+from the end of the refusal it had confirmed. The sender then sent that batch for the rest of the run
+and C behind it was never stored; it saved no unconfirmed offset. Fixed in the server (wave AG, section
+9 of `WAVE_AF_CONTRACT.md`): it keeps the end of the last refusal it confirmed for the rank and names a
+refused batch that claims to begin there from it. The test of three refusals in a row passes since.
 """
 
 from __future__ import annotations
@@ -191,11 +188,5 @@ def test_one_refused_batch_then_a_valid_batch_then_a_reconnect(tmp_path, monkeyp
     _check(_the_run(tmp_path, monkeypatch, 1), 1)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "the server, lane D's: a second refused batch in a row is named from the rank's last acknowledged offset "
-    "(the end of A), not from the end of the refusal confirmed before, because Ingest::confirm_refusal reads a "
-    "batch's start_byte_offset only when it has acknowledged nothing for the rank. The sender cannot confirm "
-    "that range, sends the batch again without end, and C behind it is never stored. The sender saves no "
-    "unconfirmed offset. RS10's rule, decided by the author: reported for D4 and D5, not changed here"))
 def test_several_refused_batches_then_a_valid_batch_then_a_reconnect(tmp_path, monkeypatch):
     _check(_the_run(tmp_path, monkeypatch, 3), 3)

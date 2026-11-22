@@ -402,6 +402,12 @@ struct RankBuffer {
     /// The last offset this server acknowledged for the rank, on any of its streams: where a stream
     /// whose own batches have not been accepted yet is taken to have begun (RS10's refusal).
     acknowledged: Option<i64>,
+    /// The end of the last refused range this server confirmed for the rank (wave AG, section 9 of
+    /// `WAVE_AF_CONTRACT.md`): a sender that read that confirmation saved it as its offset, so a
+    /// refused batch that claims to begin there is named from it. In memory only: a restarted
+    /// server holds no acknowledged offset for the rank either, and takes the claim by RS10's
+    /// restart rule.
+    refused_end: Option<i64>,
     /// The highest step kept for the buffered attempt when the buffered part began (L30): a row not
     /// stored for a step above it, and not one the part kept, arrived out of order inside the part.
     part_base: Option<i64>,
@@ -649,9 +655,11 @@ impl Ingest {
     /// server could have stored. S is where the refused batch began, as far as the server can know it:
     /// the end of the last batch this stream sent that the server accepted; for a stream none of
     /// whose batches was accepted yet, the last offset this server acknowledged for the rank (the one
-    /// the sender saved, if that acknowledgement reached it); with neither, the start the refused
-    /// batch's metadata claims (`start_byte_offset`, senders from wave AE on), when it is below E;
-    /// else 0. The claim names the range only: the message's own `end_byte_offset`, which every
+    /// the sender saved, if that acknowledgement reached it), unless the batch claims to begin at
+    /// the end of the last refusal this server confirmed for the rank, with nothing acknowledged
+    /// past it, and then there (wave AG: a sender that read that refusal saved its end); with
+    /// neither, the start the refused batch's metadata claims (`start_byte_offset`, senders from
+    /// wave AE on), when it is below E; else 0. The claim names the range only: the message's own `end_byte_offset`, which every
     /// sender reads as an acknowledgement, stays at what the server holds (the stream's accepted end,
     /// the rank's last acknowledged offset, or 0), so the server never vouches for bytes on a
     /// sender's word. (Until wave AE a server that had started again since the sender's last
@@ -682,14 +690,26 @@ impl Ingest {
             accepted if accepted >= 0 => accepted,
             _ => buffer.acknowledged.unwrap_or(0),
         };
+        // The claim is taken where the server holds nothing for the rank (RS10's restart rule), or
+        // where it is the end of the last refusal this server confirmed and nothing was acknowledged
+        // past it (wave AG): then it is a position the server itself named, never the sender's word
+        // alone. Until wave AG only the first held, and after one confirmed refusal the next refused
+        // batch was named from the last acknowledgement, which the sender, saved at the refusal's
+        // end, could not confirm: it sent that batch again for the rest of the run.
+        let named_by_this_server = buffer
+            .refused_end
+            .is_some_and(|end| Some(end) == claimed && buffer.acknowledged.is_none_or(|acked| acked <= end));
         let start = match claimed {
             Some(claimed)
-                if accepted < 0 && buffer.acknowledged.is_none() && (0..end_byte_offset).contains(&claimed) =>
+                if accepted < 0
+                    && (buffer.acknowledged.is_none() || named_by_this_server)
+                    && (0..end_byte_offset).contains(&claimed) =>
             {
                 claimed
             }
             _ => held,
         };
+        buffer.refused_end = Some(end_byte_offset);
         let reply = serde_json::json!({
             "end_byte_offset": held,
             "refused": {"start_byte_offset": start, "end_byte_offset": end_byte_offset, "column": column},
@@ -818,6 +838,20 @@ impl Ingest {
         runs.len()
     }
 
+    /// How many times the reports of a rank's detectors found a series' trend
+    /// (`RankDetectors::trend_computations`), or None while the rank holds no detectors. Counted
+    /// per detectors: a rebuild from the store starts again from 0. For tests and diagnosis; it
+    /// waits for the rank's buffer, so a flush of the rank in progress finishes first.
+    pub async fn trend_computations(&self, run_id: &str, rank: i32) -> Option<u64> {
+        let key = (run_id.to_string(), rank);
+        let buffer = self.buffers.lock().unwrap().get(&key).cloned()?;
+        let buffer = buffer.lock().await;
+        buffer
+            .detectors
+            .as_ref()
+            .map(crate::detect::RankDetectors::trend_computations)
+    }
+
     /// Arrow bytes waiting in memory across all ranks.
     pub fn buffered_bytes(&self) -> usize {
         self.used.load(Ordering::SeqCst)
@@ -883,6 +917,7 @@ impl Ingest {
                     return Err(refused.status);
                 }
             };
+            refuse_negative_steps(&batch)?;
             (split_by_attempt(batch)?, dropped)
         };
         // Every attempt of the batch has its place in the store's order before any row of it is
@@ -2185,6 +2220,24 @@ fn drop_unstorable_rows(batch: RecordBatch) -> Result<(RecordBatch, Dropped), Re
         status: Status::internal(error.to_string()),
     })?;
     Ok((batch, dropped))
+}
+
+/// Refuses a batch that holds a negative `step`, whole, with `invalid_argument`, as `split_by_attempt`
+/// refuses one that holds a negative `attempt` (wave AG, section 10 of `WAVE_AF_CONTRACT.md`): nothing
+/// of it is stored, acknowledged or counted, and its stream ends. Until then such rows were stored and
+/// judged, and the store then held parts that the readers refuse by name (section 1). The column is
+/// int64 without nulls here: `drop_unstorable_rows` refused or dropped anything else.
+fn refuse_negative_steps(batch: &RecordBatch) -> Result<(), Status> {
+    let steps = batch
+        .column_by_name("step")
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| Status::invalid_argument("column `step` is missing or of the wrong type"))?;
+    match steps.values().iter().find(|step| **step < 0) {
+        Some(step) => Err(Status::invalid_argument(format!(
+            "column `step` holds a negative value ({step}); the batch is refused"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Splits a batch into runs of consecutive rows with the same `attempt`. A batch from a
