@@ -23,12 +23,14 @@ scheduler). Rank 0 waits for every rank, then fails unless:
   `DistributedDataParallel.forward` itself (`DDP_WRAPPER_BREAKS`), which `Trainer` compiles around
   the model; those are counted and printed.
 
-    torchrun --nproc-per-node 2 examples/trainer_ddp_check.py --out runs/trainer-ddp
+    torchrun --nproc-per-node 2 --master-port 29541 examples/trainer_ddp_check.py --out runs/trainer-ddp
     GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc-per-node 2 \\
         examples/trainer_ddp_check.py --toy --eager --out runs/trainer-ddp-cpu
 
 `--toy` is a tiny random Llama on random tokens, on CPU with gloo. Exit 0 when every check passes, 1
-when one fails; ranks other than 0 exit 0 once rank 0 has written `result.json`.
+when one fails, 2 when a package, the model or the data is missing (one line says what); ranks other
+than 0 exit 0 once rank 0 has written `result.json`. Give torchrun a `--master-port` no other job
+on the machine uses.
 """
 
 from __future__ import annotations
@@ -51,6 +53,7 @@ from trainer_check import (  # noqa: E402
 )
 
 RUN_ID = "trainer-ddp-check"
+EXIT_PASS, EXIT_FAIL, EXIT_CANNOT_RUN = 0, 1, 2
 WAIT_SECONDS = 180.0
 
 
@@ -91,7 +94,7 @@ def split_breaks(counts: dict[str, int]) -> tuple[dict[str, int], dict[str, int]
     return wrapper, {k: v for k, v in counts.items() if k not in wrapper}
 
 
-def skip_agreement(records: list[dict], skipped: list[bool]) -> list[str]:
+def skip_agreement(records: list[dict], skipped: list[bool | None]) -> list[str]:
     """Where a rank's recorded `step_skipped` differs from what Accelerate reported for the same step
     (`skipped[i]` for step i). Empty when every step agrees and every record has `grad_scale`."""
     problems = []
@@ -100,6 +103,9 @@ def skip_agreement(records: list[dict], skipped: list[bool]) -> list[str]:
         record = by_step.get(step)
         if record is None:
             problems.append(f"step {step}: not recorded")
+            continue
+        if was is None:
+            problems.append(f"step {step}: Accelerate's step_was_skipped could not be read")
             continue
         if bool(record.get("step_skipped")) != bool(was):
             problems.append(f"step {step}: recorded step_skipped={bool(record.get('step_skipped'))}, "
@@ -147,9 +153,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"{args.out} is not empty; choose a new --out")
     args.out.mkdir(parents=True, exist_ok=True)
 
-    from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM, Trainer, TrainerCallback, TrainingArguments
+    try:
+        import accelerate  # noqa: F401  Trainer needs it for every run
+        from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM, Trainer, TrainerCallback, TrainingArguments
 
-    from tensorquill.huggingface import TensorQuillCallback
+        from tensorquill.huggingface import TensorQuillCallback
+    except ImportError as error:
+        print(f"trainer_ddp_check.py: cannot run: {error}; install transformers and accelerate")
+        return EXIT_CANNOT_RUN
 
     device = torch.device("cuda", local_rank) if cuda else torch.device("cpu")
     if cuda:
@@ -166,8 +177,13 @@ def main(argv: list[str] | None = None) -> int:
         args.channels = [c % config.hidden_size for c in args.channels]
         args.batch_size, batches = 2, torch.randint(0, 128, (rows_needed, 2, 32))
     else:
-        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, attn_implementation="sdpa")
-        batches = load_batches(args.model, args.batch_size, args.seq_len, rows_needed, "cpu")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, attn_implementation="sdpa")
+            batches = load_batches(args.model, args.batch_size, args.seq_len, rows_needed, "cpu")
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            print(f"trainer_ddp_check.py: cannot load {args.model} or WikiText-2 ({type(error).__name__}: {error}); "
+                  "install huggingface_hub and pyarrow and give the machine network access or a filled Hugging Face cache")
+            return EXIT_CANNOT_RUN
     model.config.use_cache = False
     model.to(device)
     rows = batches.reshape(-1, batches.shape[-1])
@@ -196,7 +212,9 @@ def main(argv: list[str] | None = None) -> int:
 
         def on_step_end(self, _args, state, control, optimizer=None, **kwargs):
             self.global_steps.append(state.global_step)
-            self.skipped.append(bool(getattr(optimizer, "step_was_skipped", False)))
+            # None when the optimizer has no such flag: unknown, which fails the fp16 check, never "not skipped".
+            was = getattr(optimizer, "step_was_skipped", None)
+            self.skipped.append(None if was is None else bool(was))
 
     own = TrainerOwn()
     jsonl = args.out / f"{RUN_ID}.rank{rank}.jsonl"
@@ -293,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
         skips = None
         if precision == "fp16":
             problems = skip_agreement(records[r], d["skipped"])
-            skips = sum(d["skipped"])
+            skips = sum(1 for was in d["skipped"] if was)
             check(not problems, f"rank {r}: step_skipped equals Accelerate's step_was_skipped on every step "
                                 f"({skips} real scaler skips; grad_scale on every record)")
             for problem in problems[:5]:

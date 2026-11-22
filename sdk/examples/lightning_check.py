@@ -14,13 +14,15 @@ waits for every rank's files, then fails unless:
   and the `Trainer` on every rank ended at `global_step == --steps`;
 - each rank's recorded `train/loss` equals, step by step, the loss its module returned;
 - on every rank the activation detector finds the outlier at the planted step, first in the
-  planted block (its name resolved by identity in the module the callback was given, so a
-  wrapper's name for it is the one expected).
+  planted block: the block TensorQuill watches in the module the callback was given that is, or
+  holds, the planted layer, found by identity (under FSDP's per-layer wrap, the FSDP wrapper around
+  it; the planted layer's own name is written beside it in `result.json`).
 
 `--strategy ddp` (the default) or `--strategy fsdp` (Lightning's `FSDPStrategy`, FSDP1 with
 `use_orig_params=True`; `--fsdp-wrap blocks` wraps each decoder layer, `none` the module as one
 unit). Lightning 2.6.6 refuses `fsdp` without a CUDA accelerator, so on CPU that arm stops with
-Lightning's own message and exit status 2. Writes the captures, the module logs and `result.json`
+Lightning's own message and exit status 2, as it does when a package, the model or the data is
+missing (one line says what). Writes the captures, the module logs and `result.json`
 under `--out`; exit 0 when every check passes, 1 when one fails, 2 when it cannot run here.
 
     python examples/lightning_check.py --out runs/lightning-ddp --devices 2
@@ -71,6 +73,12 @@ def _wait_for(paths: list[Path], seconds: float) -> list[Path]:
         if not missing or time.time() > deadline:
             return missing
         time.sleep(0.1)
+
+
+def watched_block(root: torch.nn.Module, target: torch.nn.Module) -> str | None:
+    """The name of the block TensorQuill watches in `root` (`"blocks"`) that is `target` or holds it."""
+    return next((name for name, block in tensorquill.capture._select_layers(root, "blocks")
+                 if block is target or any(m is target for m in block.modules())), None)
 
 
 def build(args):
@@ -139,8 +147,11 @@ def build(args):
 
         def on_fit_start(self, trainer, pl_module):
             self.init_kwargs["sink"] = tensorquill.JsonlSink(args.out / f"{RUN_ID}.rank{trainer.global_rank}.jsonl")
+            # The block TensorQuill watches that is, or holds, the planted module: under FSDP's
+            # per-layer wrap the decoder layer is FSDP's `_fsdp_wrapped_module` inside the watched wrapper.
             target = pl_module.seeded_block_module
-            self.seeded_name = next((n for n, m in pl_module.named_modules() if m is target), None)
+            self.planted_name = next((n for n, m in pl_module.named_modules() if m is target), None)
+            self.seeded_name = watched_block(pl_module, target)
             super().on_fit_start(trainer, pl_module)
 
     return L, CheckModule, RankFileCallback
@@ -258,11 +269,25 @@ def main(argv: list[str] | None = None) -> int:
         torch.manual_seed(0)
         args.rows = torch.randint(0, 128, (args.steps * args.batch_size * world, seq))
     else:
-        args.rows = load_batches(args.model, args.batch_size, args.seq_len, args.steps * world, "cpu").reshape(-1, args.seq_len)
+        try:
+            args.rows = load_batches(args.model, args.batch_size, args.seq_len, args.steps * world, "cpu").reshape(-1, args.seq_len)
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            print(f"lightning_check.py: cannot load WikiText-2 for {args.model} ({type(error).__name__}: {error}); install "
+                  "transformers, huggingface_hub and pyarrow and give the machine network access or a filled Hugging Face cache")
+            return EXIT_CANNOT_RUN
     args.fixed = args.rows[: args.batch_size]
 
-    L, CheckModule, RankFileCallback = build(args)
-    module = CheckModule()
+    try:
+        L, CheckModule, RankFileCallback = build(args)
+    except ImportError as error:
+        print(f"lightning_check.py: cannot run: {error}; install lightning and transformers")
+        return EXIT_CANNOT_RUN
+    try:
+        module = CheckModule()
+    except OSError as error:
+        print(f"lightning_check.py: cannot load {args.model} ({error}); give the machine network access or a filled "
+              "Hugging Face cache")
+        return EXIT_CANNOT_RUN
     callback = RankFileCallback(run_id=RUN_ID, capture="full", every=50)
     try:
         trainer = L.Trainer(
@@ -281,14 +306,15 @@ def main(argv: list[str] | None = None) -> int:
     world = trainer.world_size
     _write_json(args.out / f"module.rank{rank}.json", module.own_log)  # type: ignore[arg-type]
     _write_json(args.out / f"done.rank{rank}.json", {"rank": rank, "global_step": trainer.global_step,
-                                                      "seeded": callback.seeded_name, "world_size": world})
+                                                      "seeded": callback.seeded_name, "planted": callback.planted_name,
+                                                      "world_size": world})
     if rank != 0:
         _wait_for([args.out / "result.json"], WAIT_SECONDS)
         return EXIT_PASS
 
     print(f"\n{torch.__version__} | Lightning {L.__version__} | {type(trainer.strategy).__name__} on "
           f"{'CUDA' if cuda else 'CPU'} x{world} | {precision} | {'toy Llama' if args.toy else args.model} | "
-          f"seeding {callback.seeded_name} from step {args.seed_step} "
+          f"seeding {callback.planted_name} (watched as {callback.seeded_name}) from step {args.seed_step} "
           f"({args.fault}: {'all channels' if args.fault == 'block' else module.channels})", flush=True)
     missing = _wait_for([args.out / f"done.rank{r}.json" for r in range(world)], WAIT_SECONDS)
     failures: list[str] = []
@@ -307,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
     document = {"check": "lightning", "strategy": type(trainer.strategy).__name__, "fsdp_wrap": args.fsdp_wrap
                 if args.strategy == "fsdp" else None, "world_size": world, "precision": precision, "toy": args.toy,
                 "device": "cuda" if cuda else "cpu", "seed_step": args.seed_step, "seeded_block": callback.seeded_name,
+                "planted_layer": callback.planted_name,
                 "passed": not failures, "failures": failures, **summary}
     _write_json(args.out / "result.json", document)
     print(f"\nResult: {args.out / 'result.json'}")

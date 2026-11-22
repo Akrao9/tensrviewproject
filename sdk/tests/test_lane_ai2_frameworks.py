@@ -181,6 +181,8 @@ def test_skip_agreement_compares_each_step_with_accelerate():
         "step 0: recorded step_skipped=False, Accelerate step_was_skipped=True"]
     assert skip_agreement(records[:2], [False, True, False]) == ["step 2: not recorded"]
     assert skip_agreement([{"step": 0}], [False]) == ["step 0: no grad_scale"]
+    # An optimizer whose flag could not be read is unknown, never "not skipped".
+    assert skip_agreement(records[:1], [None]) == ["step 0: Accelerate's step_was_skipped could not be read"]
 
 
 def test_split_breaks_keeps_only_ddp_wrapper_breaks_apart():
@@ -197,3 +199,27 @@ def test_mean_over_ranks():
     from trainer_ddp_check import mean_over_ranks
 
     assert mean_over_ranks([[1.0, 2.0, None], [3.0, "nan", 1.0]]) == [2.0, pytest.approx(float("nan"), nan_ok=True), None]
+
+
+def test_lightning_expects_the_watched_wrapper_of_a_wrapped_block():
+    # FSDP's per-layer wrap puts each decoder layer inside a wrapper, as `_fsdp_wrapped_module`; the
+    # blocks TensorQuill watches are then the wrappers, and the spike is expected there.
+    from lightning_check import watched_block
+    from torch import nn
+
+    class Wrapper(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self._fsdp_wrapped_module = inner
+
+        def forward(self, x):
+            return self._fsdp_wrapped_module(x)
+
+    layers = [nn.Sequential(nn.Linear(4, 4), nn.ReLU()) for _ in range(4)]
+    plain = nn.Module()
+    plain.layers = nn.ModuleList(layers)
+    assert watched_block(plain, layers[2]) == "layers.2"
+    wrapped = nn.Module()
+    wrapped.layers = nn.ModuleList(Wrapper(layer) for layer in layers)
+    assert watched_block(wrapped, layers[2]) == "layers.2"
+    assert watched_block(wrapped, nn.Linear(1, 1)) is None
