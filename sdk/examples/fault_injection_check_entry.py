@@ -82,6 +82,21 @@ def _run_id() -> str:
     return f"fault-injection-{job if job and job != 'none' else 'local'}"
 
 
+def environment() -> dict[str, Any]:
+    """The exact versions this campaign ran on, read inside its own environment."""
+    import platform
+
+    import torch
+
+    import tensorquill
+
+    cuda = torch.cuda.is_available()
+    return {"torch": torch.__version__, "torch_cuda": torch.version.cuda, "python": platform.python_version(),
+            "tensorquill": getattr(tensorquill, "__version__", None), "tensorquill_file": tensorquill.__file__,
+            "nccl": ".".join(map(str, torch.cuda.nccl.version())) if cuda else None,
+            "device": torch.cuda.get_device_name(0) if cuda else "cpu", "device_count": torch.cuda.device_count()}
+
+
 def attach(module: ModuleType, artifact_dir: Path, *, every: int = 1) -> dict[str, Any]:
     """Replace `enable_fault_injection` and `_teardown` in the campaign's module. Returns the state
     the wrappers share (`session` once started)."""
@@ -115,6 +130,7 @@ def attach(module: ModuleType, artifact_dir: Path, *, every: int = 1) -> dict[st
                 "files": f"{run_id}.rank<R>.jsonl", "every": every, "capture": "full", "weights": 1,
                 "replica_every": 1, "registered": "after enable_resiliency, before enable_fault_injection",
                 "campaign_module": module.__name__, "campaign_file": getattr(module, "__file__", None),
+                "environment": environment(),
             }, indent=2) + "\n", encoding="utf-8")
         return original_inject(model, optimizer, *args, **kwargs)
 

@@ -162,3 +162,37 @@ def test_the_toy_driver_runs_each_arm_in_a_fresh_process_and_writes_every_result
 def test_the_driver_refuses_without_the_two_arms_the_pass_line_needs(tmp_path):
     proc = run_driver(tmp_path, "--arms", "off,wandb")
     assert proc.returncode != 0 and "must include off and tensorquill" in proc.stdout + proc.stderr
+
+
+def test_the_slowest_step_of_every_round_is_reported_and_never_scored():
+    results = three_rounds([100.2, 100.2, 100.2])
+    for r in results["tensorquill"]:
+        r["step_ms"] = [100.0] * 49 + [160.0] + [100.0] * 150  # one slow step: the median does not move
+    args = SimpleNamespace(toy=False, eager=False, warmup=50)
+    summary = gate.summarize(args, results)
+    worst = summary["tensorquill"]["worst_step_by_round"]
+    assert [w["step"] for w in worst] == [99, 99, 99] and all(w["ms"] == 160.0 for w in worst)
+    assert worst[0]["over_median_ms"] == pytest.approx(59.8) and worst[1]["file"] == "arm-tensorquill-r1.json"
+    assert summary["off"]["worst_step_by_round"][0] == {"round": 0, "step": None, "ms": None}  # no per-step list given
+    status, _ = gate.verdict(args, summary, True)
+    assert status == "pass"
+
+
+def test_the_figure_moe_dogfood_printed_is_reported_beside_the_scored_one():
+    plain = SimpleNamespace(toy=False, eager=False)
+    results = three_rounds([100.6, 103.0, 100.2])
+    results["off"][1]["mean_ms"] = 102.0
+    tq = gate.summarize(plain, results)["tensorquill"]
+    assert tq["overhead_of_median_rounds"] == pytest.approx(100.6 / 100.0 - 1)  # each arm's median round, then the ratio
+    assert tq["overhead_median"] == pytest.approx(100.6 / 100.0 - 1)  # the scored one: the median of the paired rounds
+    _, criteria = gate.verdict(plain, gate.summarize(plain, results), True)
+    line = next(c for c in criteria if c["name"].startswith("median overhead"))
+    assert line["ok"] and "moe_dogfood.py" in line["detail"] and "OTHER SIDE" not in line["detail"]
+    # Baselines that moved between rounds: paired, +0.50%, +1.82%, +1.67%; by median rounds, +0.50%.
+    results = three_rounds([100.5, 112.0, 91.5])
+    results["off"][1]["mean_ms"], results["off"][2]["mean_ms"] = 110.0, 90.0
+    summary = gate.summarize(plain, results)
+    assert summary["tensorquill"]["overhead_of_median_rounds"] == pytest.approx(0.005)
+    _, criteria = gate.verdict(plain, summary, True)
+    line = next(c for c in criteria if c["name"].startswith("median overhead"))
+    assert line["ok"] is False and "OTHER SIDE OF THE LINE" in line["detail"]  # scored as built, the other said aloud

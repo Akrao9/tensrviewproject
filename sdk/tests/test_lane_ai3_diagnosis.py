@@ -301,3 +301,41 @@ def test_the_campaign_still_defines_the_names_the_wrapper_replaces():
     record = (SIBLING / "lm_resiliency/fault_injection/reports.py").read_text()
     for field in ("execution_rank", "iteration", "occurrence_id", "injection_succeeded", "status"):
         assert f'"{field}": self.' in record
+
+
+# --- the author's pass rule of Nov 22, 2026: missing ground truth or an incomplete run is not proven ----
+
+
+def test_the_result_carries_the_strict_verdict_whatever_the_exit_rule(stub_run, tmp_path):
+    def wrong_rank(injection):
+        injection["injections"][0]["execution_rank"] = 1
+    status, result = _compared(_variant(stub_run, tmp_path, wrong_rank), "--measure")
+    assert status == fic.PASS  # the exit status only
+    assert result["status"] == "FAIL" and result["missed"] and result["false_reports"]
+    assert "every occurrence found" in result["pass_rule"] and result["exit_rule"].startswith("measure")
+
+
+def test_a_run_that_cannot_be_shown_complete_is_not_proven(stub_run, tmp_path, capsys):
+    folder = _variant(stub_run, tmp_path, lambda i: i.pop("completed_iterations"))
+    assert fic.main(["--artifact-dir", str(folder)]) == fic.NOT_PROVEN
+    assert fic.main(["--artifact-dir", str(folder), "--measure"]) == fic.NOT_PROVEN
+    assert "completed_iterations" in capsys.readouterr().out
+    assert not (folder / "tensorquill_comparison.json").exists()
+
+
+def test_an_injection_still_pending_at_the_end_is_an_incomplete_run(stub_run, tmp_path, capsys):
+    def pending(injection):
+        injection["injections"][0].update(status="pending", verified=False, injection_succeeded=False)
+    folder = _variant(stub_run, tmp_path, pending)
+    assert fic.main(["--artifact-dir", str(folder)]) == fic.NOT_PROVEN
+    assert "pending" in capsys.readouterr().out
+
+
+def test_the_campaign_s_exact_environment_is_written_where_it_ran_and_reaches_the_result(stub_run):
+    import torch
+
+    attach = json.loads((stub_run / "tensorquill" / "attach.json").read_text())
+    assert attach["environment"]["torch"] == torch.__version__ and attach["environment"]["python"]
+    status, result = _compared(stub_run)
+    assert status == fic.PASS and result["status"] == "PASS"
+    assert result["campaign_environment"]["torch"] == torch.__version__

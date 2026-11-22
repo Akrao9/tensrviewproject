@@ -166,6 +166,34 @@ def test_trainer_ddp_on_two_cpu_ranks(tmp_path, mode):
     assert all(r["spike"]["step"] == 60 for r in result["ranks"].values())
 
 
+@needs_distributed
+def test_trainer_ddp_control_counts_the_same_wrapper_breaks_without_tensorquill(tmp_path):
+    """The author's terms, Nov 22, 2026: the DDP wrapper's graph breaks are "documented as observed in
+    both control and instrumented runs". The control run has no TensorQuill callback and no capture."""
+    pytest.importorskip("transformers")
+    pytest.importorskip("accelerate")
+    results = {}
+    for name, extra in (("control", ["--control"]), ("checked", [])):
+        out = tmp_path / name
+        done = _torchrun(tmp_path, "--backend", "aot_eager", *extra, "--out", str(out))
+        assert done.returncode == 0, done.stdout[-4000:] + done.stderr[-4000:]
+        results[name] = json.loads((out / "result.json").read_text())
+    control, checked = results["control"], results["checked"]
+    assert control["control"] is True and control["passed"] and control["tensorquill"] == "not attached"
+    assert not list((tmp_path / "control").glob("*.jsonl"))  # nothing captured
+    assert checked["control"] is False and checked["passed"]
+    for rank in ("0", "1"):
+        without, with_tq = control["ranks"][rank], checked["ranks"][rank]
+        assert sum(without["ddp_wrapper_breaks"].values()) >= 1
+        assert without["ddp_wrapper_breaks"] == with_tq["ddp_wrapper_breaks"]  # the same breaks, the same counts
+        assert without["other_breaks"] == {} == with_tq["other_breaks"]
+
+
+def test_trainer_ddp_control_cannot_be_eager(tmp_path):
+    done = _run([str(EXAMPLES / "trainer_ddp_check.py"), "--toy", "--control", "--eager", "--out", str(tmp_path / "t")], cwd=tmp_path)
+    assert done.returncode == 2 and "--control" in done.stderr
+
+
 def test_trainer_ddp_refuses_one_process(tmp_path):
     done = _run([str(EXAMPLES / "trainer_ddp_check.py"), "--toy", "--out", str(tmp_path / "t")], cwd=tmp_path)
     assert done.returncode == 2 and "torchrun" in done.stderr

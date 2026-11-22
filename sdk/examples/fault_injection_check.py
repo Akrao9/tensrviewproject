@@ -36,12 +36,16 @@ occurrence is `found` when each of its actions is matched; `partial` when some a
 A report that matches no injected action is a `false_report` (one matching only a record that was
 not injected is listed with that record, and is still false).
 
-Exit status: 0 when every occurrence is found and there is no false report (`--measure`: whenever the
-comparison was made), 1 otherwise, 2 bad arguments, 3 NOT PROVEN: no `injection.json`, a record that
-does not hold the documented fields, no capture, captures for other ranks than the campaign's
-`world_size`, or a rank whose last captured step is not the campaign's last iteration
-(`completed_iterations`; the step-to-iteration mapping is checked, not assumed). What counts as a pass for TensorQuill on this campaign is the author's call; strict is
-the default only because it hides nothing.
+The pass rule is the author's, of Nov 22, 2026: the campaign passes when every occurrence is found
+and there is no false report. Partials, misses and false reports are written to the result whatever
+the verdict. Exit status: 0 on a pass, 1 otherwise, 2 bad arguments, 3 NOT PROVEN: missing ground
+truth or an incomplete run, that is no `injection.json`, a record that does not hold the documented
+fields, no `completed_iterations`, a record still `pending` when the campaign wrote its artifact, no
+capture, captures for other ranks than the campaign's `world_size`, or a rank whose last captured
+step is not the campaign's last iteration (the step-to-iteration mapping is checked, not assumed).
+`--measure` changes the exit status only (0 whenever the comparison was made): the result's `status`
+is the strict verdict either way. The result carries the campaign environment's exact PyTorch version
+(`campaign_environment`, written by the entry script on rank 0 inside that environment).
 
     python sdk/examples/fault_injection_check.py --artifact-dir runs/fault-injection
 """
@@ -264,25 +268,33 @@ def main(argv: list[str] | None = None) -> int:
     # last iteration, so TensorQuill counted one step per iteration (SCOUT, GEMINI and the state reset
     # run around the optimizer step).
     completed = injection.get("completed_iterations")
-    if isinstance(completed, int):
-        last = {rank: max((r["step"] for r in _records(path) if _is_step(r.get("step"))), default=None)
-                for rank, path in files.items()}
-        expected_last = completed + start_step - 1
-        off = {rank: step for rank, step in last.items() if step != expected_last}
-        if off:
-            return not_proven(f"TensorQuill's last step is not the campaign's last iteration on ranks {sorted(off)} "
-                              f"(last steps {off}, expected {expected_last} for {completed} iterations from "
-                              f"start_step {start_step}): its steps cannot be read as iterations")
+    if isinstance(completed, bool) or not isinstance(completed, int):
+        return not_proven(f"injection.json has no completed_iterations ({completed!r}): the run cannot be shown complete")
+    pending = [r["injection_id"] for r in not_injected if r.get("status") == "pending"]
+    if pending:
+        return not_proven(f"{len(pending)} injection record(s) still pending when the campaign wrote its artifact "
+                          f"({pending[:5]}): an incomplete run")
+    last = {rank: max((r["step"] for r in _records(path) if _is_step(r.get("step"))), default=None)
+            for rank, path in files.items()}
+    expected_last = completed + start_step - 1
+    off = {rank: step for rank, step in last.items() if step != expected_last}
+    if off:
+        return not_proven(f"TensorQuill's last step is not the campaign's last iteration on ranks {sorted(off)} "
+                          f"(last steps {off}, expected {expected_last} for {completed} iterations from "
+                          f"start_step {start_step}): its steps cannot be read as iterations")
     reports, unattributed = tensorquill_reports(files)
     result = compare(actions, not_injected, reports, start_step=start_step)
     result.update({"campaign": injection.get("campaign"), "manifest_identity": injection.get("manifest_identity"),
                    "world_size": world, "completed_iterations": injection.get("completed_iterations"),
                    "captures": {str(r): str(p) for r, p in files.items()}, "attach": attach,
+                   "campaign_environment": attach.get("environment") or "not recorded: attach.json has none",
                    "unattributed": unattributed})
     s = result["summary"]
-    status = PASS if args.measure or (s["found"] == s["occurrences"] and not s["false_reports"]) else FAIL
-    result["status"] = "PASS" if status == PASS else "FAIL"
-    result["exit_rule"] = "measure" if args.measure else "strict: every occurrence found, no false report"
+    strict = s["found"] == s["occurrences"] and not s["false_reports"]
+    status = PASS if args.measure or strict else FAIL
+    result["status"] = "PASS" if strict else "FAIL"  # the verdict, whatever the exit rule
+    result["pass_rule"] = "every occurrence found (exact rank, iteration within the window of injection.json), no false report"
+    result["exit_rule"] = "measure: exit 0 whenever compared" if args.measure else "strict: exit 0 only on PASS"
     out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"fault_injection_check: {s['occurrences']} occurrences ({s['injected_actions']} injected actions) on "
           f"{len(files)} ranks; TensorQuill named rank and step for {s['found']} (partial {s['partial']}, missed "

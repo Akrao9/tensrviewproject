@@ -35,7 +35,11 @@ parameters it watches against the model's trainable ones, and the samples it too
 The overhead of an arm is, per round, its mean step time over the timed steps (the block's wall
 time over its steps, as `moe_dogfood.py` times it, so the flush and sample steps count) over the
 `off` arm's in the same round, minus one; the arm's overhead is the median of those. The same
-ratio of per-step medians is written beside it. The pass line, for the TensorQuill
+ratio of per-step medians is written beside it, and so is the figure `moe_dogfood.py` printed
+(each arm's median round, then the ratio; said aloud when it falls on the other side of the line).
+The slowest timed step of every arm and round is reported with how far it is over that round's
+median step (`worst_step_by_round`), and every step's time is kept in the arm's file (`step_ms`):
+a passing median does not show one slow step. None of that is scored. The pass line, for the TensorQuill
 arm only: median overhead 1% or less, zero graph breaks, zero recompiles after warm-up, zero
 CUDA-graph skips under `reduce-overhead`, and its capture checks. Exit 0 when it passes, 1 when
 it does not. With `--toy`, `--eager` or without CUDA, the timing and CUDA-graph lines are not
@@ -448,6 +452,7 @@ def summarize(args, results: dict[str, list[dict]]) -> dict[str, Any]:
             ratios = [r["mean_ms"] / off[r["round"]]["mean_ms"] - 1 for r in measured if r["round"] in off]
             median_ratios = [r["median_ms"] / off[r["round"]]["median_ms"] - 1 for r in measured if r["round"] in off]
             skips = [r["cudagraph_skips"] for r in measured if r["cudagraph_skips"] is not None]
+            off_rounds_ms = statistics.median(r["mean_ms"] for r in off.values()) if off else None
             entry.update(
                 observes=first["observes"], samples=first["samples"],
                 median_ms=statistics.median(r["median_ms"] for r in measured),
@@ -457,6 +462,10 @@ def summarize(args, results: dict[str, list[dict]]) -> dict[str, Any]:
                 overhead_by_round=ratios if arm != "off" else None,
                 overhead_median=statistics.median(ratios) if ratios and arm != "off" else None,
                 step_median_overhead_median=statistics.median(median_ratios) if median_ratios and arm != "off" else None,
+                # moe_dogfood.py's figure, reported beside the scored one: each arm's median round, then the ratio.
+                overhead_of_median_rounds=(statistics.median(r["mean_ms"] for r in measured) / off_rounds_ms - 1
+                                           if off_rounds_ms and arm != "off" else None),
+                worst_step_by_round=[worst_step(r, getattr(args, "warmup", 0)) for r in measured],
                 graph_breaks=max(r["graph_breaks"] for r in measured),
                 recompiles_after_warmup=max(r["recompiles_after_warmup"] for r in measured),
                 frames_ok=min(r["frames_ok"] for r in measured),
@@ -468,6 +477,17 @@ def summarize(args, results: dict[str, list[dict]]) -> dict[str, Any]:
             )
         arms[arm] = entry
     return arms
+
+
+def worst_step(result: dict, warmup: int) -> dict[str, Any]:
+    """The slowest timed step of one arm's round: reported, never scored. `step` counts from the first
+    warm-up step (the TensorQuill arm's recorded step); every step's time is `step_ms` in the arm's file."""
+    times = result.get("step_ms") or []
+    if not times:
+        return {"round": result.get("round"), "step": None, "ms": None}
+    index = max(range(len(times)), key=times.__getitem__)
+    return {"round": result.get("round"), "step": warmup + index, "ms": times[index],
+            "over_median_ms": times[index] - result["median_ms"], "file": f"arm-{result.get('arm')}-r{result.get('round')}.json"}
 
 
 def established_here(args) -> bool:
@@ -496,7 +516,10 @@ def verdict(args, arms: dict[str, Any], established: bool) -> tuple[str, list[di
     overhead = tq["overhead_median"]
     if established:
         criterion(f"median overhead {100 * OVERHEAD_LIMIT:g}% or less", overhead <= OVERHEAD_LIMIT,
-                  f"{100 * overhead:+.2f}% (rounds {[f'{100 * r:+.2f}%' for r in tq['overhead_by_round']]})")
+                  f"{100 * overhead:+.2f}% (rounds {[f'{100 * r:+.2f}%' for r in tq['overhead_by_round']]}; "
+                  f"by each arm's median round, as moe_dogfood.py printed it: {100 * tq['overhead_of_median_rounds']:+.2f}%"
+                  + ("" if (tq["overhead_of_median_rounds"] <= OVERHEAD_LIMIT) == (overhead <= OVERHEAD_LIMIT)
+                     else ", WHICH FALLS ON THE OTHER SIDE OF THE LINE") + ")")
     else:
         criterion(f"median overhead {100 * OVERHEAD_LIMIT:g}% or less", None,
                   f"not established ({'toy' if args.toy else 'eager' if args.eager else 'no CUDA'}): "
@@ -572,6 +595,12 @@ def driver_main(args) -> int:
     for c in criteria:
         mark = {True: "PASS", False: "FAIL", None: "NOT ESTABLISHED"}[c["ok"]]
         print(f"{mark}: {c['name']}: {c['detail']}")
+    print("\nSlowest timed step of each round (reported, not scored; every step's time is in the arm's file):")
+    for arm, entry in summary.items():
+        for w in entry.get("worst_step_by_round", []):
+            if w["ms"] is not None:
+                print(f"  {arm:<12} round {w['round'] + 1}: step {w['step']} took {w['ms']:.3f} ms, "
+                      f"{w['over_median_ms']:+.3f} ms over that round's median step")
     print(f"\nGate: {status} ({gate['claim']}). Result: {out / 'gate.json'}")
     return {"pass": 0, "dry_run": 0, "not_proven": NOT_PROVEN}.get(status, 1)
 

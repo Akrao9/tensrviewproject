@@ -27,6 +27,11 @@ scheduler). Rank 0 waits for every rank, then fails unless:
     GLOO_SOCKET_IFNAME=lo0 python -m torch.distributed.run --nproc-per-node 2 \\
         examples/trainer_ddp_check.py --toy --eager --out runs/trainer-ddp-cpu
 
+`--control` is the same run with no TensorQuill callback and no capture: it checks nothing of
+TensorQuill's and writes, per rank, Dynamo's graph breaks and recompiles, so the breaks of
+`DistributedDataParallel.forward` can be shown with and without TensorQuill on the same machine.
+Its `result.json` has `"control": true`; it passes when every rank finished and compiled.
+
 `--toy` is a tiny random Llama on random tokens, on CPU with gloo. Exit 0 when every check passes, 1
 when one fails, 2 when a package, the model or the data is missing (one line says what); ranks other
 than 0 exit 0 once rank 0 has written `result.json`. Give torchrun a `--master-port` no other job
@@ -134,11 +139,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--eager", action="store_true", help="do not compile")
     parser.add_argument("--backend", default="inductor", help="torch.compile backend (aot_eager to skip Inductor)")
     parser.add_argument("--toy", action="store_true", help="tiny random Llama on random tokens, CPU allowed")
+    parser.add_argument("--control", action="store_true",
+                        help="no TensorQuill callback: only Dynamo's graph breaks and recompiles per rank, to set beside the checked run")
     args = parser.parse_args(argv)
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if args.control and args.eager:
+        parser.error("--control counts the compiler's graph breaks: it cannot be --eager")
     if world < 2:
         parser.error("run under torchrun with --nproc-per-node 2 or more (trainer_check.py is the one-process check)")
     cuda = torch.cuda.is_available() and not args.toy
@@ -218,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
 
     own = TrainerOwn()
     jsonl = args.out / f"{RUN_ID}.rank{rank}.jsonl"
-    callback = TensorQuillCallback(
+    callback = None if args.control else TensorQuillCallback(
         run_id=RUN_ID, capture="full", every=50, sink=tensorquill.JsonlSink(jsonl),
         probe=lambda m: m(input_ids=fixed, use_cache=False), probe_every=args.probe_every,
     )
@@ -235,12 +244,13 @@ def main(argv: list[str] | None = None) -> int:
             return torch.utils.data.SequentialSampler(self.train_dataset)
 
     trainer = InOrder(model=model, args=training_args, train_dataset=dataset,
-                      callbacks=[SeedOutlier(), own, callback])
+                      callbacks=[SeedOutlier(), own] + ([] if callback is None else [callback]))
     try:
         with torch._dynamo.config.patch(skip_nnmodule_hook_guards=False):
             trainer.train()
     finally:
-        callback.close()
+        if callback is not None:
+            callback.close()
         handle.remove()
     compiled, recompiles, breaks = 0, [], {}
     if not args.eager:
@@ -277,6 +287,23 @@ def main(argv: list[str] | None = None) -> int:
           f"all {world} ranks finished")
     done = {r: json.loads((args.out / f"done.rank{r}.json").read_text(encoding="utf-8"))
             for r in range(world) if (args.out / f"done.rank{r}.json").exists()}
+    if args.control:
+        ranks = {}
+        for r, d in sorted(done.items()):
+            wrapper, other = split_breaks(d["graph_breaks"])
+            ranks[r] = {"compiled": d["compiled"], "recompiles": d["recompiles"], "ddp_wrapper_breaks": wrapper,
+                        "other_breaks": other, "global_step": d["global_step"]}
+            check(d["compiled"] > 0 and d["global_step"] == args.steps,
+                  f"rank {r}: trained {d['global_step']} steps with {d['compiled']} frames compiled; "
+                  f"{sum(wrapper.values())} graph breaks in DistributedDataParallel.forward, {sum(other.values())} elsewhere, "
+                  f"{len(d['recompiles'])} frames recompiled (without TensorQuill: reported, not judged)")
+        _write_json(args.out / "result.json", {
+            "check": "trainer_ddp", "control": True, "tensorquill": "not attached", "world_size": world,
+            "precision": precision, "toy": args.toy, "compile": args.backend, "device": "cuda" if cuda else "cpu",
+            "torch": torch.__version__, "passed": not failures, "failures": failures, "ranks": ranks})
+        print(f"\nResult: {args.out / 'result.json'}")
+        print("Control run finished" if not failures else f"\n{len(failures)} check(s) failed")
+        return 0 if not failures else 1
     captures = sorted(p.name for p in args.out.glob(f"{RUN_ID}.rank*.jsonl"))
     check(captures == sorted(f"{RUN_ID}.rank{r}.jsonl" for r in range(world)),
           f"one capture per rank: {captures}")
@@ -335,7 +362,9 @@ def main(argv: list[str] | None = None) -> int:
             check(d["compiled"] > 0 and not d["recompiles"],
                   f"rank {r}: {d['compiled']} frames compiled, none more than once"
                   + ("" if not d["recompiles"] else ": " + "; ".join(d["recompiles"])))
-        ranks_summary[r] = {"records": len(records[r]), "skips": skips,
+        wrapper, other = split_breaks(d.get("graph_breaks", {})) if not args.eager else ({}, {})
+        ranks_summary[r] = {"records": len(records[r]), "skips": skips, "compiled": d.get("compiled"),
+                            "recompiles": d.get("recompiles"), "ddp_wrapper_breaks": wrapper, "other_breaks": other,
                             "spike": None if spike is None else {"step": spike["step"], "first": first}}
 
     print("\n--- Across ranks ---")
@@ -358,6 +387,7 @@ def main(argv: list[str] | None = None) -> int:
     document = {"check": "trainer_ddp", "world_size": world, "precision": precision, "toy": args.toy,
                 "compile": None if args.eager else args.backend, "device": "cuda" if cuda else "cpu",
                 "distributed_type": done.get(0, {}).get("distributed_type"), "seed_step": args.seed_step,
+                "control": False, "torch": torch.__version__,
                 "passed": not failures, "failures": failures, "captures": captures, "ranks": ranks_summary}
     _write_json(args.out / "result.json", document)
     print(f"\nResult: {args.out / 'result.json'}")
