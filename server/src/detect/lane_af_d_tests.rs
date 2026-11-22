@@ -155,3 +155,96 @@ fn valid_identity_values_are_judged_as_before() {
     assert_eq!(one.unwrap()["steps"], 3);
     assert_eq!(run.unwrap()["reports"][0]["steps"], 3);
 }
+
+// --- section 6: the cross-rank state's maps -------------------------------------------------------
+
+mod replica_maps {
+    use serde_json::{json, Value};
+
+    use super::super::replica::{record_from_json, Bounds, Comparison};
+
+    const LAUNCH: &str = "L";
+    const LISTED: usize = 8;
+    const STEPS: i64 = 400;
+
+    fn observation(rank: i64, attempt: i64, step: i64, w: f64) -> Value {
+        json!({"run_id": "r1", "rank": rank, "attempt": attempt, "step": step,
+            "replica": {"v": 1, "launch": LAUNCH, "group": [0, 1, 2], "device": "cuda",
+                "projection": "name-v1", "signature": "fold64-v1",
+                "params": {"w": {"shape": [8, 4], "dtype": "float32", "fp": [w, 1.0, 0.5],
+                    "sig": if w == 3.5 { "7" } else { "8" }}}}})
+    }
+
+    /// A long run of three ranks, `STEPS` steps, with the listing bound at `LISTED` steps: rank 1
+    /// drifts every 50th step; near the end an earlier attempt of rank 1 (its backlog, first in its
+    /// order) arrives for the last steps and takes the launch, so the steps it has rows at are judged
+    /// again. Returns the comparison after each step.
+    fn long_run(mut each: impl FnMut(i64, &Comparison)) -> Comparison {
+        let bounds = Bounds {
+            listed_steps: LISTED,
+            ..Bounds::default()
+        };
+        let mut comparison = Comparison::new(1e-6, bounds);
+        // Rank 1's attempt 5 comes before its attempt 11.
+        let place = |rank: i64, attempt: i64| Some(if rank == 1 && attempt == 11 { 1 } else { 0 });
+        for step in 0..STEPS {
+            for rank in 0..3 {
+                let w = if rank == 1 && step % 50 == 0 { 3.6 } else { 3.5 };
+                comparison.insert(
+                    record_from_json(&observation(rank, 10 + rank, step, w), 1e-6).unwrap(),
+                    &place,
+                );
+            }
+            if step >= STEPS - 4 {
+                comparison.insert(record_from_json(&observation(1, 5, step, 3.5), 1e-6).unwrap(), &place);
+            }
+            each(step, &comparison);
+        }
+        comparison
+    }
+
+    /// RS-05: `rows_at` ((launch, rank) to the steps it has rows at, read only to judge again the
+    /// listed steps of a launch whose owner changes) is pruned by the rule the comparison's steps are
+    /// pruned by: a step forgotten past the listing bound leaves it. Its size stays within the listed
+    /// steps; on the base (`1ca26d4`) it held every step of the run, one entry per launch, rank and
+    /// step (1200 after 400 steps of 3 ranks; the backlog's rows are at steps rank 1 already has). `owners` and `forgotten` are not
+    /// pruned (no rule to follow; the lane's notes): their sizes are asserted as they are.
+    #[test]
+    fn rows_at_stays_within_the_listed_steps_over_a_long_run() {
+        let mut largest = 0;
+        let comparison = long_run(|_, comparison| largest = largest.max(comparison.map_sizes().0));
+        let (rows_at, owners, forgotten) = comparison.map_sizes();
+        // At most the listed steps, for each launch and rank, and the step just being taken.
+        assert!(
+            largest <= (LISTED + 1) * 3 + 4,
+            "rows_at held {largest} entries at most"
+        );
+        assert!(rows_at <= LISTED * 3 + 4, "rows_at holds {rows_at}");
+        // One owner per launch and rank, whatever the length.
+        assert_eq!(owners, 3);
+        // One entry per step forgotten: kept for the run's length, by design (a late row is counted).
+        assert_eq!(forgotten, STEPS as usize - LISTED);
+    }
+
+    /// The verdicts are the base's: the result of the same rows equals what `1ca26d4` gave, kept in
+    /// `lane_af_d_replica_base.json` (written by this test on the base with `LANE_AF_D_WRITE_BASE` set).
+    #[test]
+    fn the_result_of_a_long_run_is_the_bases() {
+        let comparison = long_run(|_, _| {});
+        let result = comparison.result();
+        let status = comparison.status_object();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/detect/lane_af_d_replica_base.json");
+        if std::env::var_os("LANE_AF_D_WRITE_BASE").is_some() {
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&json!({"result": result, "status": status})).unwrap(),
+            )
+            .unwrap();
+        }
+        let base: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(result, base["result"]);
+        assert_eq!(status, base["status"]);
+        // The case judges something: the drifted steps still listed, and the incidents kept.
+        assert!(!result["replica_drift"].as_array().unwrap().is_empty(), "{result}");
+    }
+}

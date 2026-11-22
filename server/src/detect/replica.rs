@@ -690,7 +690,8 @@ pub struct Comparison {
     steps: BTreeMap<i64, StepState>,
     /// (launch, rank) -> the attempt that keeps the launch: the first in the rank's order.
     owners: HashMap<(String, i64), i64>,
-    /// (launch, rank) -> the steps it has rows at, judged again when the owner changes.
+    /// (launch, rank) -> the listed steps it has rows at, judged again when the owner changes. A
+    /// step forgotten past the listing bound leaves it.
     rows_at: HashMap<(String, i64), BTreeSet<i64>>,
     held_bytes: usize,
     clock: u64,
@@ -741,6 +742,17 @@ impl Comparison {
     /// Bytes of observation JSON held now.
     pub fn held_bytes(&self) -> usize {
         self.held_bytes
+    }
+
+    /// The sizes of the maps kept for the run's length: the steps listed under `rows_at` (summed over
+    /// its launches and ranks), the entries of `owners`, and the steps in `forgotten`. For tests.
+    #[cfg(test)]
+    pub(crate) fn map_sizes(&self) -> (usize, usize, usize) {
+        (
+            self.rows_at.values().map(BTreeSet::len).sum(),
+            self.owners.len(),
+            self.forgotten.len(),
+        )
     }
 
     /// Takes one record. `place(rank, attempt)` is the attempt's place in the rank's order
@@ -1115,6 +1127,13 @@ impl Comparison {
                 break;
             };
             let step = self.steps.remove(&oldest).expect("listed");
+            // `rows_at` is read only to judge again the listed steps of a launch whose owner
+            // changes: a step no longer listed leaves it with the step (RS-05, wave AF; until then
+            // it kept every step of the run, one entry per launch, rank and step).
+            self.rows_at.retain(|_, steps| {
+                steps.remove(&oldest);
+                !steps.is_empty()
+            });
             listed -= step.size;
             self.held_bytes -= step.held();
             self.steps_forgotten += 1;
