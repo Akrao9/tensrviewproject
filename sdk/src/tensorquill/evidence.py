@@ -2372,13 +2372,25 @@ def read_jsonl(path: str | Path) -> tuple[list[dict[str, Any]], int]:
     return records, left_out
 
 
-def _load_counted(source: Any, rank: int | None) -> tuple[list[dict[str, Any]], int]:
+def _load_counted(source: Any, rank: int | None, *, checked: bool = False) -> tuple[list[dict[str, Any]], int]:
     """`load_records(source, rank=rank, all_attempts=True)`, with a `.jsonl` file read by
-    `read_jsonl`: its records and the lines left out (0 for any other source)."""
+    `read_jsonl`: its records and the lines left out (0 for any other source).
+
+    Records whose identity was checked already are copied and not checked again: `read_jsonl`'s,
+    checked with their file and line, and with `checked` the records handed in, which a watcher's
+    `_Tail` checked as it read them (each once; at 10,000 records a second check at every look was
+    about 40 ms of a 0.5 s update, wave AF-W)."""
     if isinstance(source, (str, Path)) and not Path(source).is_dir() and Path(source).suffix not in (".parquet",):
         records, left_out = read_jsonl(source)
-        return load_records(records, rank=rank, all_attempts=True), left_out
+        return _copies(records, rank), left_out
+    if checked and not isinstance(source, (str, Path)):
+        return _copies(source, rank), 0
     return load_records(source, rank=rank, all_attempts=True), 0
+
+
+def _copies(records: Iterable[Mapping[str, Any]], rank: int | None) -> list[dict[str, Any]]:
+    """What `load_records(records, rank=rank, all_attempts=True)` gives for records already checked."""
+    return [dict(item) for item in records if rank is None or item.get("rank", 0) == rank]
 
 
 def lines_left_out_line(evidence: Mapping[str, Any]) -> str | None:
@@ -4752,7 +4764,7 @@ def watch(
                     continue
                 here = {**adopted, **thresholds}
                 evidence = _build_evidence(
-                    tail.records, memo, follow=follow,
+                    tail.records, memo, follow=follow, identity_checked=True,  # the tail checked each as it read it
                     **{"run_manifest": source, "records_file": source, **build_options, **here,
                        **({"watchdog": status_file} if status_file else {})}
                 )
@@ -7428,11 +7440,14 @@ def _build_evidence(
     records_file: str | Path | None = None,
     attempt_order: Mapping[tuple[str, Any], list[Any]] | None = None,
     follow: Any = None,
+    identity_checked: bool = False,
 ) -> dict[str, Any]:
     """`build_evidence`, with the states of the detectors that read every record kept in `memo` when
     one is given (`watch`), and else in a state made for this read (lane AD11). With the Rust
     detectors, `follow` (a `server_detect.FollowedDetect`, `watch`) keeps the binary's detectors
-    between looks and judges only what was appended; without it, `server_report` judges every record."""
+    between looks and judges only what was appended; without it, `server_report` judges every record.
+    `identity_checked` says the records handed in were checked already (`watch`: its `_Tail` checks
+    each as it reads it), so they are copied and not checked again."""
     # "auto" becomes one of the two here. One frame deeper than before lane AD11 put `build_evidence`
     # in front of this function, so the warning still names the caller's file (wave AD's seam).
     detectors = _detectors_option(detectors, server_binary, stacklevel=4)
@@ -7444,11 +7459,11 @@ def _build_evidence(
     if rank is not None and not (isinstance(source, (str, Path)) and Path(source).is_dir()):
         # A file or list is read whole either way: the ranks it holds are kept, so the evidence
         # can say it judged one of several (L21). A store's rank folder holds one rank.
-        everything, left_out = _load_counted(source, None)
+        everything, left_out = _load_counted(source, None, checked=identity_checked)
         held_ranks = sorted({int(r.get("rank", 0)) for r in everything})
         every_attempt = [r for r in everything if r.get("rank", 0) == rank]
     else:
-        every_attempt, left_out = _load_counted(source, rank)
+        every_attempt, left_out = _load_counted(source, rank, checked=identity_checked)
     if attempt_order:
         every_attempt = in_attempt_order(every_attempt, attempt_order)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
