@@ -7,6 +7,7 @@ clean, never as a false mismatch. The healthy reading and B14's named tensors ar
 
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import nn
 
@@ -111,13 +112,15 @@ def test_a_model_whose_names_become_one_without_a_wrapper_is_unavailable():
     assert tensors["collides"] == "model"
 
 
-def test_an_entry_whose_names_become_one_without_a_wrapper_is_unavailable_by_key_names_and_loader():
+@pytest.mark.parametrize("key, by_loader", [("model", False), ("weird", False), ("model", True)],
+                         ids=["by_key", "by_names", "by_loader"])
+def test_an_entry_whose_names_become_one_without_a_wrapper_is_unavailable(key, by_loader):
     model = build(["w", "b"])
     entry = {"w": torch.zeros(2), "module.w": torch.zeros(3), "b": torch.zeros(2)}
-    for state, kwargs in (({"model": entry}, {}), ({"weird": entry}, {}), ({"model": entry}, {"model_state": entry})):
-        tensors = load_manifest(state, model, **kwargs)["tensors"]
-        assert tensors["state"] == "unavailable" and tensors["why"] == "ambiguous", (state.keys(), kwargs)
-        assert tensors["collides"] == "checkpoint"
+    kwargs = {"model_state": entry} if by_loader else {}
+    tensors = load_manifest({key: entry}, model, **kwargs)["tensors"]
+    assert tensors["state"] == "unavailable" and tensors["why"] == "ambiguous"
+    assert tensors["collides"] == "checkpoint"
 
 
 def test_a_prefix_removed_from_the_model_that_makes_two_names_one_is_unavailable():
