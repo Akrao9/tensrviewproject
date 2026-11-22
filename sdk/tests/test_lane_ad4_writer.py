@@ -179,7 +179,9 @@ def test_fr_an_analysis_that_raises_alone_or_beside_another_leaves_the_logger_as
         raise RuntimeError("the analyzer failed")
 
     monkeypatch.setattr(builder, "build_db", fails)
-    with pytest.raises(RuntimeError, match="the analyzer failed"):
+    # The analyzer's own error reaches the caller as the ValueError its callers list as "not checked"
+    # (wave AI, Nov 22, 2026; until then it escaped as it was), with the analyzer's words in it.
+    with pytest.raises(ValueError, match="RuntimeError: the analyzer failed"):
         analyze_flight_recorder(directory)
     assert _state(logger) == before and seen.messages == []
     monkeypatch.setattr(builder, "build_db", real)
@@ -204,8 +206,8 @@ def test_fr_an_analysis_that_raises_alone_or_beside_another_leaves_the_logger_as
     def run(name):
         try:
             results[name] = analyze_flight_recorder(directory)["problem"]["mismatch"]
-        except RuntimeError as error:
-            results[name] = str(error)
+        except ValueError as error:
+            results[name] = "the analyzer failed" if "RuntimeError: the analyzer failed" in str(error) else str(error)
         finally:
             if name == "A":
                 a_out.set()
