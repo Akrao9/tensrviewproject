@@ -72,3 +72,33 @@ def test_the_toy_run_covers_every_block_head_and_position(tmp_path):
     assert sorted(result["coverage_by_probe_step"]) == ["49", "99"]
     for c in result["coverage_by_probe_step"].values():
         assert c["heads_with_finite_max_logit"] == "16/16" and c["head_positions_read"] == "64/64"
+
+
+def test_a_tiny_granite_moe_calls_sdpa_once_per_layer_and_the_probe_covers_it():
+    """The Granite architecture of the GPU run, tiny and random: its SDPA path is the one counted."""
+    transformers = pytest.importorskip("transformers")
+    import torch
+    import tensorquill
+
+    torch.manual_seed(0)
+    config = transformers.GraniteMoeConfig(
+        vocab_size=128, hidden_size=64, intermediate_size=64, num_hidden_layers=3, num_attention_heads=4,
+        num_key_value_heads=2, num_local_experts=4, num_experts_per_tok=2, attn_implementation="sdpa")
+    model = transformers.GraniteMoeForCausalLM(config).train()
+    batch = torch.randint(0, 128, (2, 16))
+    calls = cov.count_attention_calls(model, batch)
+    assert len(calls) == 3 and calls[0]["heads"] == 4
+    expected = {"blocks": cov.blocks_from_tree(model), "layers": 3, "heads": 4, "vocab": cov.head_size(model),
+                "positions": 32, "attention_calls": calls}
+    sink = tensorquill.MemorySink()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+    with tensorquill.init(model, run_id="granite-tiny", capture="full", every=50, sink=sink,
+                          probe=lambda m: m(input_ids=batch, use_cache=False), probe_every=50):
+        for _ in range(50):
+            optimizer.zero_grad()
+            model(input_ids=batch, labels=batch, use_cache=False).loss.backward()
+            optimizer.step()
+    (step, probe), = [(r["step"], r["probe"]) for r in sink.records if "probe" in r]
+    checks, coverage = cov.check_probe(step, probe, expected)
+    assert all(c["ok"] for c in checks), [c for c in checks if not c["ok"]]
+    assert coverage["heads_with_finite_max_logit"] == "12/12" and coverage["head_positions_read"] == "32/32"

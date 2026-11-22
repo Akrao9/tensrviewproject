@@ -25,19 +25,23 @@ each in a new Python process, in an order that rotates by round. Each arm proces
 the failing and the absent ones too. An arm whose package is not installed is `not_run`, with
 the reason, and is never counted as passed; an arm that crashed is `error`, with its message.
 
-Per arm and round it records: the median and mean step time over the timed steps, graph breaks,
+Per arm and round it records: the mean and median step time over the timed steps, graph breaks,
 graph compiles after warm-up (the recompiles), CUDA-graph skips, frames compiled, what the tool
 observes and how often it samples, and the tool's own result checked against an expectation
 the script computes itself (TensorQuill: every step recorded and each router's assignments
 summing to tokens x top_k; NeuralDBG: one hook pair on each leaf module of the model; wandb: the
 parameters it watches against the model's trainable ones, and the samples it took).
 
-The overhead of an arm is, per round, its median step time over the `off` arm's in the same
-round, minus one; the arm's overhead is the median of those. The pass line, for the TensorQuill
+The overhead of an arm is, per round, its mean step time over the timed steps (the block's wall
+time over its steps, as `moe_dogfood.py` times it, so the flush and sample steps count) over the
+`off` arm's in the same round, minus one; the arm's overhead is the median of those. The same
+ratio of per-step medians is written beside it. The pass line, for the TensorQuill
 arm only: median overhead 1% or less, zero graph breaks, zero recompiles after warm-up, zero
 CUDA-graph skips under `reduce-overhead`, and its capture checks. Exit 0 when it passes, 1 when
-it does not. With `--toy`, or without CUDA, the timing and CUDA-graph lines are not established
-and are written as such: exit 0 then rests on the capture checks and the compile counters only.
+it does not. With `--toy`, `--eager` or without CUDA, the timing and CUDA-graph lines are not
+established and are written as such (`dry_run`): exit 0 then rests on the capture checks and the
+compile counters only. On a GPU without CUDA graphs (`--mode default`) every line but the
+CUDA-graph one is judged, and a run that meets them is `not_proven`, exit 3.
 """
 
 from __future__ import annotations
@@ -64,6 +68,7 @@ sys.path.insert(0, str(HERE))
 ARMS = ("off", "tensorquill", "neuraldbg", "wandb")
 FLUSH_EVERY = 50
 OVERHEAD_LIMIT = 0.01
+NOT_PROVEN = 3  # the run sheet's exit status for "not proven"
 TOY_TOKENS = (2, 32)  # batch size and sequence length of the toy batches
 
 
@@ -268,7 +273,7 @@ class WandbTool(Tool):
         steps = args.warmup + args.steps
         checks = [{
             "name": "samples were taken",
-            "ok": self.samples_taken is None or self.samples_taken > 0,
+            "ok": None if self.samples_taken is None else self.samples_taken > 0,  # None: not known
             "detail": (f"{self.samples_taken} log_tensor_stats calls over {steps} steps, log_freq {self.log_freq}"
                        if self.samples_taken is not None else "wandb's TorchHistory was not found: samples not counted"),
         }]
@@ -328,7 +333,7 @@ def run_arm(args) -> dict[str, Any]:
 
     with torch._dynamo.config.patch(skip_nnmodule_hook_guards=False):
         runner = model if args.eager else torch.compile(model, backend=backend, mode=mode, fullgraph=False)
-        losses = []
+        last_loss = None
         try:
             for batch in batches[: args.warmup]:
                 loss = train_step(runner, optimizer, batch, cuda_graphs)
@@ -356,14 +361,14 @@ def run_arm(args) -> dict[str, Any]:
                     events.append((begin, end))
                 else:
                     times.append((time.perf_counter() - begin) * 1000)
-                losses.append(loss.detach())
+                last_loss = loss.detach()  # only the last: no reference kept to earlier CUDA-graph outputs
             sync(device)
             block_ms = (time.perf_counter() - start) * 1000 / args.steps
             times += [b.elapsed_time(e) for b, e in events]
             final = counter_snapshot()
         finally:
             tool.close()
-    last = float(losses[-1]) if losses else math.nan
+    last = float(last_loss) if last_loss is not None else math.nan
     checks, seen = tool.check(args, model, routers, tokens, top_k)
     checks.insert(0, {"name": "the final loss is finite", "ok": math.isfinite(last), "detail": f"{last:.4f}"})
     return {
@@ -438,20 +443,27 @@ def summarize(args, results: dict[str, list[dict]]) -> dict[str, Any]:
             entry["errors"] = [r.get("error", "no result") for r in rounds if r.get("state") in ("error", "missing")]
         if measured:
             first = measured[0]
-            ratios = [r["median_ms"] / off[r["round"]]["median_ms"] - 1 for r in measured if r["round"] in off]
+            # The round's mean step: what the flushes (TensorQuill), samples (wandb) and per-step work all cost.
+            # The per-step median would leave out the few steps a periodic cost falls on.
+            ratios = [r["mean_ms"] / off[r["round"]]["mean_ms"] - 1 for r in measured if r["round"] in off]
+            median_ratios = [r["median_ms"] / off[r["round"]]["median_ms"] - 1 for r in measured if r["round"] in off]
             skips = [r["cudagraph_skips"] for r in measured if r["cudagraph_skips"] is not None]
             entry.update(
                 observes=first["observes"], samples=first["samples"],
                 median_ms=statistics.median(r["median_ms"] for r in measured),
+                mean_ms=statistics.median(r["mean_ms"] for r in measured),
                 median_ms_by_round=[r["median_ms"] for r in measured],
+                mean_ms_by_round=[r["mean_ms"] for r in measured],
                 overhead_by_round=ratios if arm != "off" else None,
                 overhead_median=statistics.median(ratios) if ratios and arm != "off" else None,
+                step_median_overhead_median=statistics.median(median_ratios) if median_ratios and arm != "off" else None,
                 graph_breaks=max(r["graph_breaks"] for r in measured),
                 recompiles_after_warmup=max(r["recompiles_after_warmup"] for r in measured),
                 frames_ok=min(r["frames_ok"] for r in measured),
                 cudagraph_skips=max(skips) if skips else None,
-                checks_ok=all(c["ok"] for r in measured for c in r["checks"]),
-                failed_checks=[c for r in measured for c in r["checks"] if not c["ok"]],
+                checks_ok=all(c["ok"] is not False for r in measured for c in r["checks"]),
+                failed_checks=[c for r in measured for c in r["checks"] if c["ok"] is False],
+                unknown_checks=[c for r in measured for c in r["checks"] if c["ok"] is None],
                 seen=first.get("seen"), config={k: first.get(k) for k in ("backend", "mode", "cuda_graphs", "eager", "fullgraph")},
             )
         arms[arm] = entry
@@ -464,7 +476,8 @@ def established_here(args) -> bool:
 
 
 def verdict(args, arms: dict[str, Any], established: bool) -> tuple[str, list[dict]]:
-    """The TensorQuill arm's pass line, as (status, criteria). status: pass, fail or dry_run."""
+    """The TensorQuill arm's pass line, as (status, criteria). status: pass, fail, not_proven (a GPU run
+    whose CUDA-graph line was not checked: CUDA graphs off) or dry_run (toy, CPU or eager)."""
     tq, off = arms.get("tensorquill", {}), arms.get("off", {})
     criteria: list[dict] = []
 
@@ -494,7 +507,9 @@ def verdict(args, arms: dict[str, Any], established: bool) -> tuple[str, list[di
         criterion("zero CUDA-graph skips under reduce-overhead", tq["cudagraph_skips"] == 0, str(tq["cudagraph_skips"]))
     if any(c["ok"] is False for c in criteria):
         return "fail", criteria
-    return ("pass" if established and all(c["ok"] for c in criteria) else "dry_run"), criteria
+    if not established:
+        return "dry_run", criteria
+    return ("pass" if all(c["ok"] for c in criteria) else "not_proven"), criteria
 
 
 def driver_main(args) -> int:
@@ -537,17 +552,17 @@ def driver_main(args) -> int:
     gate = {"status": status, "criteria": criteria, "toy": args.toy, "rounds": args.rounds, "warmup": args.warmup,
             "steps": args.steps, "torch": torch.__version__, "device": device,
             "tensorquill_file": tensorquill.__file__, "arms": summary,
-            "claim": ("established" if status == "pass" else
-                      "not established: a CPU or toy dry run checks the harness, not the GPU claim"
-                      if status == "dry_run" else "failed")}
+            "claim": {"pass": "established", "fail": "failed",
+                      "not_proven": "not established: the CUDA-graph line was not checked (CUDA graphs off)",
+                      "dry_run": "not established: a CPU, toy or eager dry run checks the harness, not the GPU claim"}[status]}
     (out / "gate.json").write_text(json.dumps(gate, indent=1, default=str))
 
-    print(f"\n{'arm':<12}{'state':<12}{'median ms':>10}{'overhead':>10}{'breaks':>8}{'recomp':>8}{'cg skips':>9}  checks")
+    print(f"\n{'arm':<12}{'state':<12}{'mean ms':>10}{'median ms':>10}{'overhead':>10}{'breaks':>8}{'recomp':>8}{'cg skips':>9}  checks")
     for arm, entry in summary.items():
         if "median_ms" in entry:
             over = "" if entry["overhead_median"] is None else f"{100 * entry['overhead_median']:+.2f}%"
             skips = "n/a" if entry["cudagraph_skips"] is None else entry["cudagraph_skips"]
-            print(f"{arm:<12}{','.join(entry['states']):<12}{entry['median_ms']:>10.3f}{over:>10}"
+            print(f"{arm:<12}{','.join(entry['states']):<12}{entry['mean_ms']:>10.3f}{entry['median_ms']:>10.3f}{over:>10}"
                   f"{entry['graph_breaks']:>8}{entry['recompiles_after_warmup']:>8}{skips!s:>9}  "
                   f"{'ok' if entry['checks_ok'] else 'FAILED'}")
             print(f"{'':<12}observes: {entry['observes']}\n{'':<12}samples: {entry['samples']}")
@@ -558,7 +573,7 @@ def driver_main(args) -> int:
         mark = {True: "PASS", False: "FAIL", None: "NOT ESTABLISHED"}[c["ok"]]
         print(f"{mark}: {c['name']}: {c['detail']}")
     print(f"\nGate: {status} ({gate['claim']}). Result: {out / 'gate.json'}")
-    return 0 if status in ("pass", "dry_run") else 1
+    return {"pass": 0, "dry_run": 0, "not_proven": NOT_PROVEN}.get(status, 1)
 
 
 def build_parser() -> argparse.ArgumentParser:

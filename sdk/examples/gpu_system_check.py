@@ -10,15 +10,20 @@ what TensorQuill recorded against what the script reads itself:
 - **Data wait.** The loader sleeps a known time before each batch: `--wait-ms` on every step, four
   times that on steps 5, 15, 25, ... TensorQuill's `data_wait` on every step must be at least the
   sleep; at most the sleep plus `--wait-slack-ms` on 98% of steps, and the sleep plus
-  `OUTLIER_MS` (100 ms) on every step, the steps over the slack listed (host jitter: on this Mac
-  one step in 200 to 300 came in 40 to 70 ms late, at no fixed flush); `step_time` at least
-  `data_wait`. This part is a real check on any machine.
+  `OUTLIER_MS` (100 ms) on every step, the steps over the slack listed; within 5 ms of the
+  script's own timer around the same `next()`; `step_time` at least `data_wait`. This part is a
+  real check on any machine. On the Mac it was written on, with TensorQuill on, step 100 (at
+  `--every 50`) spent 34 to 73 ms more in `next()` than the sleep, by both timers, in every run;
+  with TensorQuill off, in the same loop, it did not: a delay of the training thread to look into,
+  not a fault of the timer. One such step is inside the 98% line.
 - **CUDA memory** (the record's `system.cuda`, at each flush). Right after `optimizer.step()` on
   that step the script reads `torch.cuda.memory_allocated`, `memory_reserved` and
   `max_memory_allocated`. These are the same allocator's counters, so they check that TensorQuill
   read them and when, within 2% or 32 MiB. The independent ones: `total` against the device's
   properties (exactly) and `nvidia-smi`'s `memory.total` (within 3%: the driver keeps some back), and
   `nvidia-smi`'s `memory.used`, which must be at least TensorQuill's `reserved` less 2%.
+- `nvidia-smi` must give usable samples: if it errors on every call, or reports `memory.used` as
+  `[N/A]`, the comparisons that need it are not proven (exit 3), with its error, not failed.
 - **NVML** (`system.nvml`, the `nvml` extra: `pip install nvidia-ml-py`). A thread runs `nvidia-smi`
   for this GPU, chosen by UUID, every `--smi-interval` seconds during training. Each NVML reading
   is paired with the `nvidia-smi` sample nearest its `read_at` (within 1 s): temperature within 3 C,
@@ -56,6 +61,7 @@ SMI_FIELDS = ("temperature.gpu", "clocks.sm", "power.draw", "enforced.power.limi
               "ecc.errors.uncorrected.volatile.total", "ecc.errors.corrected.volatile.total")
 NOT_PROVEN = 3
 OUTLIER_MS = 100.0  # no step's data_wait may be later than its sleep by more than this
+OWN_TIMER_S = 0.005  # TensorQuill's data_wait against the script's own timer around the same next()
 WITHIN_SLACK = 0.98  # the share of steps whose data_wait must be within the slack
 
 
@@ -135,7 +141,9 @@ class Checks:
         self.not_proven.append(f"{part}: {why}")
 
 
-def check_data_wait(checks: Checks, records: list[dict], data: SleepyBatches, slack_s: float) -> dict:
+def check_data_wait(checks: Checks, records: list[dict], data: SleepyBatches, slack_s: float,
+                    own: dict[int, float] | None = None) -> dict:
+    """`own`: the script's own timer around each `next()` on the loader, by step."""
     by_step = {r["step"]: r for r in records}
     low, high, missing, short = [], [], [], []
     for step in range(data.steps):
@@ -160,11 +168,21 @@ def check_data_wait(checks: Checks, records: list[dict], data: SleepyBatches, sl
     checks.add("data_wait", f"data_wait is at most the sleep plus {OUTLIER_MS:g} ms on every step", not late,
                f"{len(late)} above" + (f", first step {late[0][0]}: {late[0][1] * 1e3:.1f} ms" if late else ""))
     checks.add("data_wait", "step_time is at least data_wait", not short, f"{len(short)} steps shorter, first {short[:3]}")
+    apart = []
+    if own is not None:
+        apart = [(s, by_step[s]["data_wait"], own[s]) for s in own
+                 if s in by_step and isinstance(by_step[s].get("data_wait"), (int, float))
+                 and abs(by_step[s]["data_wait"] - own[s]) > OWN_TIMER_S]
+        checks.add("data_wait", f"data_wait is within {OWN_TIMER_S * 1e3:g} ms of the script's own timer around next()",
+                   not apart and len(own) == data.steps,
+                   f"{len(apart)} apart" + (f", first step {apart[0][0]}: {apart[0][1] * 1e3:.2f} ms recorded, "
+                                            f"{apart[0][2] * 1e3:.2f} ms timed" if apart else ""))
     long_steps = [s for s in range(data.steps) if s % 10 == 5 and s in by_step]
     excess = sorted((r["data_wait"] - data.delay(s)) * 1e3 for s, r in by_step.items() if isinstance(r.get("data_wait"), (int, float)))
     return {"steps": data.steps, "long_wait_steps": len(long_steps),
             "excess_ms_median": excess[len(excess) // 2] if excess else None, "excess_ms_max": excess[-1] if excess else None,
-            "over_slack": [{"step": st, "data_wait_ms": g * 1e3, "injected_ms": w * 1e3} for st, g, w in high],
+            "over_slack": [{"step": st, "data_wait_ms": g * 1e3, "injected_ms": w * 1e3,
+                            "own_timer_ms": own[st] * 1e3 if own and st in own else None} for st, g, w in high],
             "sample": {s: {"injected_ms": data.delay(s) * 1e3, "data_wait_ms": (by_step[s].get("data_wait") or 0) * 1e3}
                        for s in list(by_step)[:3] + long_steps[:2]}}
 
@@ -181,6 +199,7 @@ def check_memory(checks: Checks, systems: dict[int, dict], alongside: dict[int, 
         return pairs
     total = torch.cuda.get_device_properties(device).total_memory if total is None else total
     readings = {step: s["cuda"] for step, s in systems.items() if isinstance(s.get("cuda"), dict) and "allocated" in s["cuda"]}
+    unusable: list[int] = []
     checks.add("cuda_memory", "a CUDA memory reading at every flush", set(readings) == set(alongside),
                f"recorded at steps {sorted(readings)}, read alongside at {sorted(alongside)}")
     tol = lambda v: max(0.02 * v, 32 * MIB)  # noqa: E731
@@ -196,6 +215,8 @@ def check_memory(checks: Checks, systems: dict[int, dict], alongside: dict[int, 
         checks.add("cuda_memory", f"step {step}: total against the device's properties", tq["total"] == total,
                    f"{tq['total']} against {total}")
         sample = smi.nearest(own["t"]) if smi else None
+        if smi is not None and (sample is None or sample.get("memory.used") is None):
+            unusable.append(step)
         if sample and sample.get("memory.used") is not None:
             used = sample["memory.used"] * MIB
             checks.add("cuda_memory", f"step {step}: nvidia-smi memory.used covers TensorQuill's reserved",
@@ -207,6 +228,9 @@ def check_memory(checks: Checks, systems: dict[int, dict], alongside: dict[int, 
         pairs.append(row)
     if smi is None:
         checks.unproven("cuda_memory", "nvidia-smi is not on PATH: memory.used and memory.total not compared")
+    elif unusable:
+        checks.unproven("cuda_memory", f"no usable nvidia-smi memory sample at steps {unusable[:5]}"
+                        + (f" ({smi.errors[0]})" if smi.errors else " (memory.used [N/A])"))
     return pairs
 
 
@@ -225,6 +249,10 @@ def check_nvml(checks: Checks, systems: dict[int, dict], device, smi: Smi | None
     checks.add("nvml", "NVML readings on at least three flushes", len(readings) >= 3, f"{len(readings)} readings")
     if smi is None:
         checks.unproven("nvml", "nvidia-smi is not on PATH: nothing to compare NVML with")
+        return []
+    if not smi.samples:
+        # The harness's failure (a query field this driver does not know, say), not TensorQuill's.
+        checks.unproven("nvml", f"nvidia-smi gave no usable sample: {smi.errors[0] if smi.errors else 'no output'}")
         return []
     pairs = []
     for reading in readings:
@@ -282,10 +310,15 @@ def main(argv: list[str] | None = None) -> int:
         smi = Smi(uuid if uuid.startswith(("GPU-", "MIG-")) else f"GPU-{uuid}", args.smi_interval)
     jsonl = args.out / "system.jsonl"
     alongside: dict[int, dict] = {}
+    own_wait: dict[int, float] = {}
     with tensorquill.init(model, run_id="system-check", every=args.every, sink=tensorquill.JsonlSink(jsonl),
                           routers=routers(model), system=True, data_wait=True):
         with smi if smi else _nothing():
-            for step, x in enumerate(loader):
+            batches = iter(loader)
+            for step in range(args.steps):
+                began = time.perf_counter()
+                x = next(batches)  # TensorQuill times this call too
+                own_wait[step] = time.perf_counter() - began
                 x = x.to(device, non_blocking=True)
                 loss = (model(x) - x.sum(dim=1, keepdim=True)).pow(2).mean()
                 optimizer.zero_grad()
@@ -301,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     checks = Checks()
     result: dict[str, Any] = {"device": name, "torch": torch.__version__, "steps": args.steps, "every": args.every,
                               "system_records_at": sorted(systems)}
-    result["data_wait"] = check_data_wait(checks, records, data, args.wait_slack_ms / 1000)
+    result["data_wait"] = check_data_wait(checks, records, data, args.wait_slack_ms / 1000, own_wait)
     result["cuda_memory"] = check_memory(checks, systems, alongside, device, smi)
     result["nvml"] = check_nvml(checks, systems, device, smi)
     if smi is not None:

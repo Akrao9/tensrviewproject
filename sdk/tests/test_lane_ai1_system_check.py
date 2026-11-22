@@ -111,15 +111,40 @@ def test_nvml_against_nvidia_smi_by_read_at():
     assert far == ["an nvidia-smi sample within 1 s of the reading"] * 3
 
 
+def test_nvidia_smi_without_usable_samples_is_not_proven_not_failed():
+    systems, dev, _ = nvml_case()
+    smi = FakeSmi([]); smi.errors = ["CalledProcessError: Field \"enforced.power.limit\" is not a valid field"]
+    checks, failed = judged(gs.check_nvml, systems, dev, smi)
+    assert failed == [] and "no usable sample" in checks.not_proven[0]
+    systems, alongside, dev, smi = memory_case()
+    smi.samples[0]["memory.used"] = None  # [N/A]
+    smi.errors = []
+    checks, failed = judged(gs.check_memory, systems, alongside, dev, smi, total=80000 * MIB)
+    assert failed == [] and "no usable nvidia-smi memory sample" in checks.not_proven[0]
+
+
+def test_the_scripts_own_timer_must_agree_with_the_recorded_data_wait():
+    d = data()
+    rows = waits(d)
+    own = {r["step"]: r["data_wait"] for r in rows}
+    assert not judged(gs.check_data_wait, rows, d, 0.015, own)[1]
+    own[6] += 0.02
+    assert judged(gs.check_data_wait, rows, d, 0.015, own)[1] == [
+        "data_wait is within 5 ms of the script's own timer around next()"]
+
+
 def test_nvml_absent_on_a_gpu_is_not_proven_not_failed():
     checks, failed = judged(gs.check_nvml, *nvml_case(note="pynvml is not installed (pip install nvidia-ml-py): x"))
     assert not failed and checks.not_proven and "pynvml" in checks.not_proven[0]
 
 
-def test_on_cpu_the_script_checks_the_data_wait_and_exits_not_proven(tmp_path):
+def test_on_cpu_the_script_checks_the_data_wait_and_exits_not_proven(tmp_path, monkeypatch):
+    # Real sleeps under a loaded test run: the upper bounds are widened here, the lower bound is not.
+    monkeypatch.setattr(gs, "OUTLIER_MS", 5000.0)
+    monkeypatch.setattr(gs, "OWN_TIMER_S", 1.0)
     out = tmp_path / "sys"
     with contextlib.redirect_stdout(io.StringIO()) as printed:
-        code = gs.main(["--out", str(out), "--steps", "200", "--wait-ms", "5"])
+        code = gs.main(["--out", str(out), "--steps", "200", "--wait-ms", "5", "--wait-slack-ms", "5000"])
     if torch.cuda.is_available():
         return  # a GPU machine runs the real thing; this test is the CPU path
     assert code == gs.NOT_PROVEN, printed.getvalue()

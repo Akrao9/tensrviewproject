@@ -31,7 +31,7 @@ else:
 
 
 def measured(arm, rnd, ms, *, breaks=0, recompiles=0, skips=0, ok=True):
-    return {"arm": arm, "round": rnd, "state": "measured", "median_ms": ms, "graph_breaks": breaks,
+    return {"arm": arm, "round": rnd, "state": "measured", "median_ms": ms, "mean_ms": ms, "graph_breaks": breaks,
             "recompiles_after_warmup": recompiles, "cudagraph_skips": skips, "frames_ok": 1,
             "observes": "x", "samples": "y", "checks": [{"name": "c", "ok": ok, "detail": ""}]}
 
@@ -54,7 +54,7 @@ def test_the_pass_line_passes_only_with_every_criterion_met():
 
 def test_the_overhead_is_the_median_of_the_paired_round_ratios():
     results = three_rounds([101.0, 103.0, 100.2])
-    results["off"][1]["median_ms"] = 102.0  # round 2's baseline was slower: paired, that round is +0.98%
+    results["off"][1]["mean_ms"] = 102.0  # round 2's baseline was slower: paired, that round is +0.98%
     summary = gate.summarize(SimpleNamespace(toy=False, eager=False), results)
     ratios = summary["tensorquill"]["overhead_by_round"]
     assert ratios == pytest.approx([0.01, 103 / 102 - 1, 0.002])
@@ -87,6 +87,28 @@ def test_an_arm_that_did_not_run_or_crashed_is_never_passed():
     assert summary["wandb"]["states"] == ["not_run"] and "median_ms" not in summary["wandb"]
 
 
+def test_the_overhead_is_judged_on_the_rounds_mean_step_not_the_per_step_median():
+    # A periodic cost (the flushes) moves the mean and leaves the per-step median where it was.
+    results = three_rounds([100.0, 100.0, 100.0])
+    for r in results["tensorquill"]:
+        r["mean_ms"] = 102.0
+    status, criteria = judged(results)
+    assert status == "fail" and [c["name"] for c in criteria if c["ok"] is False] == ["median overhead 1% or less"]
+
+
+def test_a_gpu_run_without_cuda_graphs_is_not_proven_not_passed():
+    status, criteria = judged(three_rounds([100.1, 100.2, 100.3], skips=None))
+    assert status == "not_proven"
+    assert {c["name"]: c["ok"] for c in criteria}["zero CUDA-graph skips under reduce-overhead"] is None
+
+
+def test_a_check_that_could_not_be_made_is_unknown_not_failed_nor_passed():
+    results = three_rounds([100.1, 100.2, 100.3])
+    results["tensorquill"][0]["checks"].append({"name": "samples", "ok": None, "detail": "not counted"})
+    summary = gate.summarize(SimpleNamespace(), results)["tensorquill"]
+    assert summary["checks_ok"] and summary["unknown_checks"] and not summary["failed_checks"]
+
+
 def test_off_cpu_the_timing_and_cuda_graph_lines_are_not_established_not_passed():
     results = three_rounds([150.0, 150.0, 150.0], skips=None)  # 50% over: not judged on a dry run
     status, criteria = judged(results, established=False, toy=True)
@@ -111,25 +133,26 @@ def test_the_toy_driver_runs_each_arm_in_a_fresh_process_and_writes_every_result
     out = tmp_path / "gate"
     result = json.loads((out / "gate.json").read_text())
     assert result["status"] == "dry_run" and result["claim"].startswith("not established")
-    pids = set()
+    pids, measured_runs = set(), 0
     for arm in arms.split(","):
         for rnd in range(2):
             arm_result = json.loads((out / f"arm-{arm}-r{rnd}.json").read_text())
-            assert arm_result["state"] in ("measured", "not_run")
-            if arm_result["state"] == "measured":
-                pids.add(arm_result["pid"])
-                # The arm measured the tensorquill under test, not the one the environment installed.
-                assert Path(arm_result["tensorquill_file"]).resolve().is_relative_to(SRC)
-    measured_runs = sum(1 for a in arms.split(",") if a != "wandb") * 2
+            if arm == "wandb":
+                assert arm_result["state"] in ("measured", "not_run", "error")  # never run here: any state is written
+                continue
+            assert arm_result["state"] == "measured"
+            measured_runs += 1
+            pids.add(arm_result["pid"])
+            # The arm measured the tensorquill under test, not the one the environment installed.
+            assert Path(arm_result["tensorquill_file"]).resolve().is_relative_to(SRC)
     assert len(pids) == measured_runs  # a new process for every arm and round
     tq = result["arms"]["tensorquill"]
     assert tq["states"] == ["measured"] and tq["checks_ok"] and tq["graph_breaks"] == 0
     assert tq["recompiles_after_warmup"] == 0 and tq["frames_ok"] >= 1
-    if "wandb" not in sys.modules:
-        try:
-            import wandb  # noqa: F401
-        except ImportError:
-            assert result["arms"]["wandb"]["states"] == ["not_run"]
+    try:
+        import wandb  # noqa: F401
+    except ImportError:
+        assert result["arms"]["wandb"]["states"] == ["not_run"]
     if NEURALDBG:
         nd = result["arms"]["neuraldbg"]
         assert nd["states"] == ["measured"] and nd["checks_ok"]
