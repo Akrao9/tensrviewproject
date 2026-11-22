@@ -28,6 +28,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import manifest as _manifest
+# A record's identity fields (WAVE_AF_CONTRACT.md, section 1): checked where records are loaded,
+# before either engine is chosen, by lane F's one check (`identity.check`).
+from .identity import MalformedRecordError, check as check_identity, in_file, in_list, in_part
 from .sink import read_end_marker
 from .data_checks import (
     CHANGES_LISTED,
@@ -2310,22 +2313,34 @@ def load_records(
     `rank` keeps one rank's records. When a job resumed from an earlier checkpoint under
     the same run ID, the records the later attempt replaced are left out (see
     `resolve_attempts`); `all_attempts=True` returns everything that was written.
+
+    Every record read is checked first, whatever its rank (`identity.check`): a record whose
+    `schema_version`, `rank`, `attempt` or `step` is not valid raises `MalformedRecordError`,
+    which names the field, the value, and the file and line, the part and row, or the place in
+    the list (WAVE_AF_CONTRACT.md, section 1). Nothing is judged from such an input.
     """
     if isinstance(source, (str, Path)):
         path = Path(source)
         if path.is_dir():
             # One rank at a time: a run of many ranks never has to fit in memory at once.
             records = [
-                r for part in _parquet_parts(path, rank) for r in _read_part(part)
+                r for part in _parquet_parts(path, rank) for r in _checked_part(part)
                 if rank is None or r.get("rank", 0) == rank
             ]
         elif path.suffix == ".parquet":
-            records = _read_part(path)
+            records = _checked_part(path)
         else:
-            lines = path.read_text(encoding="utf-8").splitlines()
-            records = [json.loads(line) for line in lines if line.strip()]
+            records = []
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if line.strip():
+                    record = json.loads(line)
+                    check_identity(record, in_file(path, number))
+                    records.append(record)
     else:
-        records = [dict(item) for item in source]
+        records = []
+        for index, item in enumerate(source):
+            check_identity(item, in_list(index))
+            records.append(dict(item))
     if rank is not None:
         records = [r for r in records if r.get("rank", 0) == rank]
     return records if all_attempts else resolve_attempts(records)
@@ -2340,7 +2355,7 @@ def read_jsonl(path: str | Path) -> tuple[list[dict[str, Any]], int]:
     data = Path(path).read_bytes()
     records: list[dict[str, Any]] = []
     left_out = 0
-    for line in data.splitlines():
+    for number, line in enumerate(data.splitlines(), 1):  # `number`: the line in the file, from 1
         if not line.strip():
             continue
         try:
@@ -2348,6 +2363,9 @@ def read_jsonl(path: str | Path) -> tuple[list[dict[str, Any]], int]:
         except ValueError:
             record = None
         if isinstance(record, dict):
+            # A whole record whose identity is not valid refuses the file (section 1): it is not a
+            # torn line, which is left out and counted.
+            check_identity(record, in_file(path, number))
             records.append(record)
         else:
             left_out += 1
@@ -2682,6 +2700,14 @@ def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
     return sorted(found, key=order)
 
 
+def _checked_part(path: Path) -> list[dict[str, Any]]:
+    """`_read_part`, each row's identity checked (`identity.check`) with the part and its row."""
+    rows = _read_part(path)
+    for row, record in enumerate(rows):
+        check_identity(record, in_part(path, row))
+    return rows
+
+
 def _read_part(path: Path) -> list[dict[str, Any]]:
     try:
         import pyarrow.parquet as pq
@@ -2814,6 +2840,7 @@ class _Tail:
         self._last = b""
         self.left_out = 0  # whole lines that were not a JSON object (lane U7, Nov 19, 2026)
         self.restarts = 0  # how often what was read was read again from the start
+        self._lines = 0  # the lines of the `.jsonl` file read so far: a refusal names the next ones by number
 
     def _restart(self) -> None:
         self.records = []
@@ -2824,6 +2851,7 @@ class _Tail:
         self._size_and_time = None
         self._head = self._last = b""
         self.left_out = 0
+        self._lines = 0
         self.restarts += 1
 
     @staticmethod
@@ -2874,7 +2902,7 @@ class _Tail:
             for part in parts:
                 if part not in self._seen:  # a part is written once and never changed
                     stat = self._stat(part)
-                    new.extend(_read_part(part))
+                    new.extend(_checked_part(part))  # each row's identity (section 1)
                     self._seen.add(part)
                     self._stats[part] = stat if stat is not None else (-1, -1, -1)
         elif self.source.exists():
@@ -2888,16 +2916,21 @@ class _Tail:
             # What the file was when read, whole lines or none: what a later look compares with (EV-07).
             self._size_and_time = (found.st_size, found.st_mtime_ns)
             end = data.rfind(b"\n") + 1  # a last line with no newline is still being written
-            for line in data[:end].splitlines():
+            whole = data[:end].splitlines()
+            for number, line in enumerate(whole, self._lines + 1):
                 if line.strip():
                     try:
                         record = json.loads(line)
                     except ValueError:
                         record = None
                     if isinstance(record, dict):
+                        # Checked as it is read, once (section 1): a record not valid refuses the file,
+                        # and the watcher writes and replaces nothing for it.
+                        check_identity(record, in_file(self.source, number))
                         new.append(record)
                     else:
                         self.left_out += 1  # a line torn by a killed process: counted, and said
+            self._lines += len(whole)
             if end:
                 if not self._offset:
                     self._file = (found.st_dev, found.st_ino)
@@ -9039,6 +9072,8 @@ def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
             detectors=args.detectors or "auto",  # nothing runs here, so no binary is asked for
         )
+    except MalformedRecordError:
+        raise  # said by `main`, never as a usage error (this view reads no step record today)
     except ValueError as error:
         parser.error(str(error))
     if written is None and not args.watch:
@@ -9046,6 +9081,18 @@ def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -
 
 
 def main() -> None:
+    """`python -m tensorquill` and the `tensorquill` console script. An input holding a record whose
+    identity field is not valid (`MalformedRecordError`, WAVE_AF_CONTRACT.md, section 1) ends the
+    command with status 2 and one line, `tensorquill: error: <what, and where>`, and no traceback,
+    with either engine and for every verb: nothing was judged and no evidence file was written."""
+    try:
+        _main()
+    except MalformedRecordError as error:
+        print(f"tensorquill: error: {error}", file=sys.stderr, flush=True)
+        raise SystemExit(2) from None
+
+
+def _main() -> None:
     # Two verbs come before the path: `runs` (list the runs of a folder or store) and `compare`.
     # The first argument alone decides, whatever is on disk, so the same command means the same
     # thing everywhere; a file or folder with one of those names is read as `./runs` or
@@ -9236,8 +9283,9 @@ def main() -> None:
                 detectors=detectors,
             )
         except (RuntimeError, ValueError) as error:
-            # The Rust path's own refusals: a binary that fails, thresholds its rules refuse.
-            if detectors != "rust":
+            # The Rust path's own refusals: a binary that fails, thresholds its rules refuse. A record
+            # that is not valid is said by `main`, as with the Python detectors.
+            if detectors != "rust" or isinstance(error, MalformedRecordError):
                 raise
             parser.error(str(error))
         return
@@ -9269,7 +9317,7 @@ def main() -> None:
             traincheck=args.traincheck, detectors=detectors, run_manifest=args.input, records_file=args.input,
         )
     except (RuntimeError, ValueError) as error:
-        if detectors != "rust":
+        if detectors != "rust" or isinstance(error, MalformedRecordError):
             raise
         parser.error(str(error))
     if left_out:

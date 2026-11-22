@@ -175,8 +175,10 @@ def _resolved(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
 class _Run:
     """One rank's series of one run: `series[id][step] = value`."""
 
-    def __init__(self, records: Iterable[Mapping[str, Any]], rank: int, resolved: bool = False) -> None:
+    def __init__(self, records: Iterable[Mapping[str, Any]], rank: int, resolved: bool = False,
+                 label: str = "A") -> None:
         from .evidence import run_of
+        from .identity import check, in_list
 
         self.series: dict[str, dict[int, float]] = {}
         self.about: dict[str, dict[str, Any]] = {}
@@ -193,7 +195,10 @@ class _Run:
         # row is resolved away (WAVE_AE_CONTRACT.md, section 5): "" for a row that names none.
         self.every_run_id: set[str] = set()
         own: list[Mapping[str, Any]] = []
-        for record in records:
+        for index, record in enumerate(records):
+            # Every record, whatever its rank, before any is read (WAVE_AF_CONTRACT.md, section 1): one
+            # that cannot be placed in a rank, an attempt and a step refuses the input.
+            check(record, f"{in_list(index)}, run {label}")
             record_rank = record.get("rank", 0)
             self.ranks_seen.add(record_rank)
             if record_rank != rank or record.get("step") is None:
@@ -457,7 +462,10 @@ def first_divergence(
     later attempt replaced (a job that resumed from an earlier checkpoint rolled them back) are
     left out and not read as the run's (lane AC4, Nov 20, 2026). Rows resolved already are read
     as they are: only a run ID whose attempts' step ranges overlap is resolved, so resolving
-    again changes nothing. Rows with no step are not step records and are skipped.
+    again changes nothing. Every row of either input, of any rank, is checked first
+    (`identity.check`, WAVE_AF_CONTRACT.md, section 1): one whose `schema_version`, `rank`,
+    `attempt` or `step` is not valid, a row with no step among them, raises `MalformedRecordError`,
+    which names its place in its list and the run (`run A` or `run B`).
 
     `resolved=True` says the rows are resolved already, as `compare` gives them (each rank's
     files resolved in the attempts' own order, `resolve_attempts_across`): they are read as
@@ -489,7 +497,7 @@ def first_divergence(
     - `runs.a` / `runs.b` hold `replaced_records`, the rows of that rank a later attempt
       replaced and that were left out, only when there were some.
     """
-    a, b = _Run(records_a, rank, resolved), _Run(records_b, rank, resolved)
+    a, b = _Run(records_a, rank, resolved, "A"), _Run(records_b, rank, resolved, "B")
     common = sorted(a.steps & b.steps)
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,

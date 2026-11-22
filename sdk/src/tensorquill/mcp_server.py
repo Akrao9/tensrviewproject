@@ -50,6 +50,7 @@ from . import compact as _compact
 from . import compare as _compare
 from . import manifest as _manifest
 from . import runs as _runs
+from .identity import MalformedRecordError, check as check_identity, in_file
 from .sink import read_end_marker
 from .evidence import (
     ALL_RANKS_VIEW,
@@ -190,14 +191,17 @@ def _complete_lines(path: Path) -> tuple[list[dict[str, Any]], int]:
         raise ToolError(f"{path} cannot be read ({error}).") from None
     records: list[dict[str, Any]] = []
     skipped = 0
-    for line in data[: data.rfind(b"\n") + 1].splitlines():
+    for number, line in enumerate(data[: data.rfind(b"\n") + 1].splitlines(), 1):
         if not line.strip():
             continue
         try:
             record = json.loads(line)
         except ValueError:
             record = None
-        if isinstance(record, dict) and "step" in record:
+        if isinstance(record, dict):
+            # A whole record whose identity is not valid, a step missing among them, refuses the
+            # capture (WAVE_AF_CONTRACT.md, section 1); it is not a torn line.
+            check_identity(record, in_file(path, number))
             records.append(record)
         else:
             skipped += 1
@@ -297,9 +301,14 @@ class Source:
             try:
                 try:
                     return load_records(path, all_attempts=True), 0
+                except MalformedRecordError:
+                    raise
                 except ValueError:  # a job that is still running may be in the middle of a line
                     records, skipped = _complete_lines(path)
                     return load_records(records, all_attempts=True), skipped
+            except MalformedRecordError as error:
+                # The error's own text: the field, the value and the line (section 1).
+                raise ToolError(str(error)) from None
             except OSError as error:
                 raise ToolError(f"{path} cannot be read ({error}).") from None
             except (TypeError, KeyError) as error:
@@ -375,6 +384,8 @@ class Source:
             def read() -> list[dict[str, Any]]:
                 try:
                     return load_records(where, rank=picked)
+                except MalformedRecordError as error:
+                    raise ToolError(str(error)) from None  # the field, the value, the part and row
                 except ImportError:
                     raise ToolError(
                         "reading a store's step records needs pyarrow (the SDK's `flight` extra), which is not"
@@ -1645,6 +1656,8 @@ def compare_runs(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
     try:
         result = _compare.compare_runs(*wanted, source=folder, project=project, rank=rank, paths=False,
                                        read_parts=False)
+    except MalformedRecordError as error:
+        raise ToolError(str(error)) from None  # the error's own text (section 1)
     except (ValueError, OSError, RuntimeError) as error:
         # A run that is not there, a name that fits several runs (the message lists their IDs),
         # or records that cannot be read.
