@@ -603,7 +603,9 @@ def _not_checked(opened: Mapping[str, Any]) -> list[dict[str, Any]]:
     if opened["shape"] == "rank":
         return listed
     by_text: dict[str, dict[str, Any]] = {}
-    for entry in evidence.get("ranks") or ():
+    # A rank's entries are on its entry of `ranks` (a store's reports) or in `not_checked_by_rank`
+    # (the view `combine_rank_evidence` builds, EV-02): both are `{"rank", "not_checked"}`.
+    for entry in [*(evidence.get("ranks") or ()), *(evidence.get("not_checked_by_rank") or ())]:
         for item in entry.get("not_checked") or () if isinstance(entry, dict) else ():
             if isinstance(item, dict):
                 held = by_text.setdefault(json.dumps(item, sort_keys=True, default=str), {**item, "ranks": []})
@@ -738,7 +740,10 @@ def _rank_dropped(dropped: Mapping[str, Any] | None, rank: int) -> dict[str, Any
 # reads; and the routing source of part 7 (`moe_source`, a router's `form` and `point`).
 MEASUREMENT_BLOCKS = ("gradient_trend", "attention_trends", "update_trends", "weight_jumps")
 EVIDENCE_BLOCKS = ("skipped_updates", "skipped_updates_by_rank", "checkpoint_tensors", "checkpoint_tensors_by_rank",
-                   *MEASUREMENT_BLOCKS)
+                   *MEASUREMENT_BLOCKS,
+                   # The all-ranks view's: each judged rank's measurements and routing source, with its
+                   # rank (WAVE_AF_CONTRACT.md, section 2, EV-04).
+                   *(f"{name}_by_rank" for name in MEASUREMENT_BLOCKS), "moe_source_by_rank")
 # Of a kind's entry in `kind_checks`, what `kinds` (names by value) leaves out: the parameters a
 # stall did not judge for want of their gradient, and the replica observations' coverage. And the
 # entry's `note` when it is the words for a rank with no peer (contract, section 2); a kind's other
@@ -748,15 +753,20 @@ EVIDENCE_BLOCKS = ("skipped_updates", "skipped_updates_by_rank", "checkpoint_ten
 # (`stalled_weights.parameters_not_judged_by_rank`, part 5) and the modules an activation kind did
 # not judge (`modules_not_judged`, part 7).
 KIND_CHECK_KEYS = ("parameters_not_judged", "parameters_not_judged_by_rank", "modules_not_judged", "coverage",
-                   "starting_state")
+                   "starting_state",
+                   # A run's entry, where its ranks differ in them (EV-03).
+                   "modules_not_judged_by_rank", "starting_state_by_rank")
 # The blocks an incident's own answer carries, by its kind: what bears on reading that incident.
 _SKIPS = ("skipped_updates", "skipped_updates_by_rank")
 INCIDENT_BLOCKS = {
     "resume_incomplete": ("checkpoint_tensors", "checkpoint_tensors_by_rank"),
     **{kind: _SKIPS for kind in ("non_finite", "update_spike", "stalled_weights", "loss_scale_trouble")},
-    "grad_spike": (*_SKIPS, "gradient_trend"),
-    "update_spike": (*_SKIPS, "update_trends", "weight_jumps"),
-    **{kind: ("attention_trends",) for kind in ("attention_collapse", "attention_uniform", "attention_logit_growth")},
+    "grad_spike": (*_SKIPS, "gradient_trend", "gradient_trend_by_rank"),
+    "update_spike": (*_SKIPS, "update_trends", "weight_jumps", "update_trends_by_rank", "weight_jumps_by_rank"),
+    **{kind: ("attention_trends", "attention_trends_by_rank")
+       for kind in ("attention_collapse", "attention_uniform", "attention_logit_growth")},
+    # A router's incident in the all-ranks view: the ranks' routing sources (one rank's is `moe_source`).
+    **{kind: ("moe_source_by_rank",) for kind in ("moe_imbalance", "starved_experts")},
 }
 
 # What a reader shows for a score (DETECTOR_RULES_CONTRACT.md, part 1): the number to one decimal place,

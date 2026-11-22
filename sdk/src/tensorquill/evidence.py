@@ -5052,14 +5052,48 @@ def _run_parameters_not_judged(check: dict[str, Any], by_rank: Mapping[int, Mapp
     `parameters_not_judged_by_rank` (rank, as a string, to its list) when the judged ranks' lists
     differ. A judged rank without the key judged every parameter it read: its list is empty, and
     it is in the map only through that difference, by its absence."""
-    lists = {rank: sorted({str(name) for name in found.get("parameters_not_judged") or ()})
+    _run_names_not_judged(check, by_rank, "parameters_not_judged")
+
+
+def _run_names_not_judged(check: dict[str, Any], by_rank: Mapping[int, Mapping[str, Any]], key: str) -> None:
+    """The run's entry names what some rank's entry names under `key` (`parameters_not_judged`, or
+    an activation kind's `modules_not_judged`, EV-03): the sorted union, and `<key>_by_rank` (rank,
+    as a string, to its list) when the judged ranks' lists differ, a rank without the key counting
+    as an empty list."""
+    lists = {rank: sorted({str(name) for name in found.get(key) or ()})
              for rank, found in by_rank.items() if isinstance(found, Mapping)}
     union = sorted({name for names in lists.values() for name in names})
     if not union:
         return
-    check["parameters_not_judged"] = union
+    check[key] = union
     if len({tuple(names) for names in lists.values()}) > 1:
-        check["parameters_not_judged_by_rank"] = {str(rank): names for rank, names in sorted(lists.items()) if names}
+        check[f"{key}_by_rank"] = {str(rank): names for rank, names in sorted(lists.items()) if names}
+
+
+def _run_starting_state(check: dict[str, Any], by_rank: Mapping[int, Mapping[str, Any]]) -> None:
+    """The run's `moe_imbalance` entry names the routers some rank's entry lists as still in their
+    starting state (EV-03; rules contract, part 3): `starting_state`, one `{"router", "samples"}`
+    for each router named, with the fewest samples any rank gives it, in the order the ranks name
+    them, and `starting_state_by_rank` (rank, as a string, to its list) when the judged ranks'
+    lists differ. `enough_history` is then false for the run, as it is for the rank. Not on an
+    entry that is `unavailable`, as a rank's is not."""
+    lists = {rank: [dict(item) for item in found.get("starting_state") or () if isinstance(item, Mapping)]
+             for rank, found in by_rank.items() if isinstance(found, Mapping)}
+    if not any(lists.values()) or check.get("value") == "unavailable":
+        return
+    merged: dict[str, dict[str, Any]] = {}
+    for rank in sorted(lists):
+        for item in lists[rank]:
+            name = str(item.get("router"))
+            held = merged.get(name)
+            fewer = held is not None and _count(item.get("samples")) and (
+                not _count(held.get("samples")) or item["samples"] < held["samples"])
+            if held is None or fewer:
+                merged[name] = {"router": item.get("router"), "samples": item.get("samples")}
+    check["starting_state"] = list(merged.values())
+    check["enough_history"] = False
+    if len({json.dumps(items, sort_keys=True, default=str) for items in lists.values()}) > 1:
+        check["starting_state_by_rank"] = {str(rank): items for rank, items in sorted(lists.items()) if items}
 
 
 def _cross_rank_check(kind: str, brings: Mapping[int, Mapping[str, Any]]) -> dict[str, Any]:
@@ -5093,6 +5127,10 @@ def run_kind_checks(
         for kind in SERVER_KINDS
     }
     _run_parameters_not_judged(checks[GRADS_NOT_READ_NAMED], {rank: found[GRADS_NOT_READ_NAMED] for rank, found in rank_checks.items()})
+    # What `_run_check` leaves out of a rank's entry and the run's must say, with its ranks (EV-03).
+    for kind in LAYERS_NOT_READ_KINDS:
+        _run_names_not_judged(checks[kind], {rank: found[kind] for rank, found in rank_checks.items()}, "modules_not_judged")
+    _run_starting_state(checks["moe_imbalance"], {rank: found["moe_imbalance"] for rank, found in rank_checks.items()})
     checks.update({kind: dict(check) for kind, check in others.items()})
 
     def brings(has: Any, kind: str) -> dict[int, dict[str, Any]]:
@@ -5287,6 +5325,11 @@ def combine_rank_evidence(
             {n: per_rank[n].get("skipped_updates") for n in judged})) else {}),
         **({"checkpoint_tensors_by_rank": blocks} if (blocks := _checkpoint_tensors_by_rank(
             {n: per_rank[n].get("checkpoint_tensors") for n in judged})) else {}),
+        # How each rank's observations were made and what it measured, with its rank (EV-04), and
+        # what each rank did not check (EV-02): only where a rank has them.
+        **_rank_blocks({n: per_rank[n] for n in judged}),
+        **({"not_checked_by_rank": unchecked} if (unchecked := _not_checked_by_rank(
+            {n: per_rank[n].get("not_checked") for n in judged})) else {}),
         # The rows the server dropped and the batches it refused, as the all-ranks view's `watchdog`
         # block gives them (L22, lane AD1): only when the status holds such counts, so the
         # evidence of a run that dropped and refused none is what it was.
@@ -5351,6 +5394,36 @@ def _skipped_updates_by_rank(found: Mapping[int, Any]) -> list[dict[str, Any]]:
     own, and a rank without the key has a capture written before it."""
     return [{"rank": number, "skipped_updates": dict(skips)} for number, skips in sorted(found.items())
             if isinstance(skips, Mapping)]
+
+
+#: The blocks of one rank's evidence or report that say how its observations were made, or what
+#: they measured, carried into the all-ranks view as `<block>_by_rank` (WAVE_AF_CONTRACT.md,
+#: section 2, EV-04): each rank's are its own, so they are not added up or merged.
+RANK_BLOCKS = ("moe_source", *MEASUREMENT_BLOCKS)
+
+
+def _rank_blocks(found: Mapping[int, Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """`{"<block>_by_rank": [{"rank", "<block>"}, ...]}` for each of `RANK_BLOCKS` that some judged
+    rank's evidence or report in `found` has, by rank, each block copied unchanged, as
+    `skipped_updates_by_rank` carries its key (EV-04). No key for a block no rank has, so a view
+    whose ranks have none is what it was."""
+    blocks: dict[str, list[dict[str, Any]]] = {}
+    for key in RANK_BLOCKS:
+        entries = [{"rank": number, key: copy.deepcopy(dict(block))} for number, own in sorted(found.items())
+                   if isinstance(own, Mapping) and isinstance(block := own.get(key), Mapping) and block]
+        if entries:
+            blocks[f"{key}_by_rank"] = entries
+    return blocks
+
+
+def _not_checked_by_rank(found: Mapping[int, Any]) -> list[dict[str, Any]]:
+    """Each judged rank's own `not_checked` entries, for the all-ranks view built from one evidence
+    per rank (`combine_rank_evidence`), which has no `ranks` list to put them on (EV-02):
+    `{"rank", "not_checked"}` for each rank that lists any, by rank, its entries unchanged. The
+    view a store's reports give keeps them on each rank's entry of `ranks`, as before."""
+    return [{"rank": number, "not_checked": [dict(item) for item in items if isinstance(item, Mapping)]}
+            for number, items in sorted(found.items())
+            if isinstance(items, (list, tuple)) and any(isinstance(item, Mapping) for item in items)]
 
 
 def _checkpoint_tensors_by_rank(found: Mapping[int, Any]) -> list[dict[str, Any]]:
@@ -5623,6 +5696,8 @@ def _all_ranks_evidence(
             {n: looks[n]["report"].get("skipped_updates") for n in judged})) else {}),
         **({"checkpoint_tensors_by_rank": blocks} if (blocks := _checkpoint_tensors_by_rank(
             {n: looks[n]["report"].get("checkpoint_tensors") for n in judged})) else {}),
+        # Each judged rank's `moe_source` and four measurements from its current report (EV-04).
+        **_rank_blocks({n: looks[n]["report"] for n in judged}),
         "ranks": entries,
         **({"not_checked": not_checked} if not_checked else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
@@ -8509,11 +8584,31 @@ def _all_ranks_summary(evidence: Mapping[str, Any]) -> str:
         for item in evidence.get("not_checked", ())
         if item["check"] != "resume_lr"
     ]
+    # Each judged rank's own (EV-02), once for each entry with the ranks that list it.
+    lines += [f"Not checked {_on_ranks(ranks)} ({item.get('check')}): {item.get('reason')}"
+              for item, ranks in rank_not_checked(evidence) if item.get("check") != "resume_lr"]
     lines += _source_lines(evidence)
     applied = thresholds_line(evidence)  # only when a threshold applied is not the default
     if applied:
         lines.append(applied)
     return "\n".join(lines)
+
+
+def rank_not_checked(evidence: Mapping[str, Any]) -> list[tuple[dict[str, Any], list[int]]]:
+    """The judged ranks' own `not_checked` entries in an all-ranks view, each once with the ranks
+    that list it, in the order they are first listed: from each rank's entry of `ranks` (a store's
+    reports) and from `not_checked_by_rank` (`combine_rank_evidence`). Empty when no rank lists any."""
+    held: dict[str, tuple[dict[str, Any], list[int]]] = {}
+    sources = [*(evidence.get("ranks") or ()), *(evidence.get("not_checked_by_rank") or ())]
+    for entry in sources:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("rank"), int):
+            continue
+        for item in entry.get("not_checked") or ():
+            if isinstance(item, Mapping):
+                found = held.setdefault(json.dumps(item, sort_keys=True, default=str), (dict(item), []))
+                if entry["rank"] not in found[1]:
+                    found[1].append(entry["rank"])
+    return [(item, sorted(ranks)) for item, ranks in held.values()]
 
 
 def _class_line(incidents: Iterable[Mapping[str, Any]]) -> str | None:
