@@ -125,17 +125,30 @@ STEPLESS = [{"run_id": "b", "rank": 1, "attempt": 2, "note": "no step"}, {"run_i
 
 def two_ranks():
     """Raw rows of two ranks of run B: rank 1 restarted at 60 and stopped at 75, its first
-    attempt departing at 80; rank 0 ran once and departs at 100. Rows of either rank with no
-    step are among them: they are not step records, and the resolver is never given them
-    (`resolve_attempts` reads every row's step)."""
+    attempt departing at 80; rank 0 ran once and departs at 100. Rows with no step were among
+    them before wave AF, read as not step records; such a row is refused since
+    (WAVE_AF_CONTRACT.md, section 1), as `test_rows_with_no_step_are_refused` says."""
     a = make() + make(rank=1)
     raw_b = (
         spiked(range(120), attempt=1, rank=0, start=100)
         + spiked(range(120), attempt=1, rank=1)
         + healthy(range(60, 76), attempt=2, rank=1)
-        + STEPLESS
     )
     return a, raw_b
+
+
+def test_rows_with_no_step_are_refused():
+    """A row with no step, or a null one, cannot be placed in a step: the input is refused with the
+    row's place and run, never read past (WAVE_AF_CONTRACT.md, section 1)."""
+    import pytest
+
+    from tensorquill.identity import MalformedRecordError
+
+    a, raw_b = two_ranks()
+    for row in STEPLESS:
+        with pytest.raises(MalformedRecordError) as raised:
+            first_divergence(a, raw_b + [row], rank=1)
+        assert raised.value.field == "step" and raised.value.where == f"record {len(raw_b)} of the records passed, run B"
 
 
 def resolved_rank(rows, rank):
