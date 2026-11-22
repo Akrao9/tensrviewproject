@@ -130,11 +130,21 @@ server was started on the run folder, a `rank=<n>` folder, the capture or the ev
 that kind and step on those ranks; `<ranks>` is `rank0`, `ranks0-3,7` or `run`). The delivery id
 is not a lookup id, and the ids `list_incidents` gives (`<kind>@<step>`) are numbered over the
 whole view, so they are not the same from one view to another. It is made from the evidence at
-each look and is not kept in the state file; null when none could be made. A stall changes its
-kind and step inside one episode (a `rank_silent` becomes a `job_stalled`) and fires once, so its
-`mcp_id` may name what it was: `get_incident` then answers with the run's stall as it reads now
-and says so (`looked_up_as`), while the run lists exactly one stall; once the stall is over the id
-finds nothing.
+each look and is not kept in the state file; null when none could be made. 
+
+**A stall's `mcp_id`** is of its episode, not of what the stall reads at any moment: it is the
+delivery id in the lookup form (`<run_id>/run/rank_silent@49`, and `~2` for a later episode that
+fired at the same kind and step). A stall changes its kind and step inside one episode (a
+`rank_silent` becomes a `job_stalled`), and a later stall of the same run, or a job started again,
+can read exactly as an earlier one did, so the incident alone never says which episode it is. Only
+this state file does. `get_incident` therefore resolves a stall's `mcp_id` only on the evidence
+file named in `TENSORQUILL_EVIDENCE` (or its compact or full twin), whose state file must show that
+firing's episode still open, kept with its baseline, and not ended by the stall listed now
+(`episode_ended_by`, the rule above). Then it answers with the run's stall as it reads now, with
+`looked_up_as` when the kind or step has changed. In every other case it answers
+`original_incident_no_longer_identifiable`, with the reason, and names the stall listed now under
+that stall's own id for a separate lookup: it never presents a later stall as the one that
+fired.
 
 `rank` is null and `ranks` lists them when several ranks share the incident; `ranks` is empty
 for an incident of the whole run. A number that is not finite is the string `"nan"`, `"inf"` or `"-inf"`,
@@ -272,6 +282,65 @@ def _others(incident: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
 def _beyond(now: int | None, before: int | None) -> bool:
     """A stored step beyond `before`; a baseline of None (nothing stored then) is below any step."""
     return now is not None and (before is None or now > before)
+
+
+def episode_ended_by(episode: Mapping[str, Any], stall: Mapping[str, Any]) -> str | None:
+    """Whether `stall`, as it is listed now, ends the open `episode`: `"attempt"` when the job was
+    started again, `"progress"` when a step was stored beyond where the episode stopped, None while
+    the episode goes on. The one rule, of the trigger (`Trigger._follow_episode`) and of the MCP
+    server when it asks whether the stall listed now is still the one a firing was for
+    (`mcp_server`, a stall's lookup id). It changes nothing."""
+    members = episode.get("ranks") or {}
+    stopped = _stopped(stall)
+    # Every rank the stall says something of: stopped, and (for `rank_silent`) the others, so
+    # a rank of the episode that has recovered is seen stepping on.
+    seen = {**_others(stall), **stopped}
+    # A rank of the episode still stopped exactly as it was (its step and attempt): the job
+    # is not started again for it yet, as when ranks of a restarted job start a look apart.
+    unchanged = any(rank in members and members[rank].get("last_step") == now["last_step"]
+                    and members[rank].get("attempt") == now["attempt"] for rank, now in stopped.items())
+    for rank, now in seen.items():
+        before = members.get(rank)
+        if not unchanged and before is not None and now["attempt"] is not None \
+                and before.get("attempt") is not None and now["attempt"] != before["attempt"]:
+            return "attempt"  # a new attempt: the job was started again
+    if episode.get("kind") == "job_stalled":
+        # The run's step: the stall is over once any rank has stored a step beyond the
+        # highest one stored when it fired. Of the ranks the stall lists, or, read from the
+        # stall's own step, of a rank that has since finished and is no longer listed. An
+        # episode from a state file written before `stall_step` was kept has only the first.
+        opened_at = _number(episode.get("stall_step"))
+        if _beyond(_run_step(stall), episode.get("run_step")) or (
+                stall.get("kind") == "job_stalled" and opened_at is not None
+                and _beyond(_number(stall.get("step")), opened_at)):
+            return "progress"
+    else:
+        # `rank_silent`: each stopped rank's own step. The ranks that go on stepping beside
+        # it are not in the episode and do not end it.
+        for rank, now in seen.items():
+            if rank in members and _beyond(now["last_step"], members[rank].get("last_step")):
+                return "progress"
+    return None
+
+
+def stall_lookup_id(delivery: Mapping[str, Any]) -> str | None:
+    """A stall firing's `mcp_id`: its delivery id in the lookup form, `<run_id>/<ranks>/<kind>@<step>`,
+    and `~2` onwards for a later stall episode that fired at the same kind and step (the delivery
+    id's `/2`). One id for one episode, whatever the stall reads later: the MCP server finds the
+    episode by it in the state file. None for a delivery whose id is not of that shape."""
+    run, found = _delivery_run(delivery), delivery.get("id")
+    if run is None or not isinstance(found, str):
+        return None
+    who, kind, step = _who_key(delivery.get("ranks") or ()), delivery.get("kind"), delivery.get("step")
+    base = f"{run}/{who}/{kind}/{step}"
+    if found == base:
+        number = 1
+    elif found.startswith(base + "/") and found[len(base) + 1:].isdecimal():
+        number = int(found[len(base) + 1:])
+    else:
+        return None
+    named = f"{kind}@{step}" if isinstance(step, int) and not isinstance(step, bool) else str(kind)
+    return f"{run}/{who}/{named}" + (f"~{number}" if number > 1 else "")
 
 
 def _run_step(incident: Mapping[str, Any]) -> int | None:
@@ -596,38 +665,10 @@ class Trigger:
             # episode's, without firing (a stall listed in the file has fired).
             self._episode = {**self._open_episode(stall, episode.get("delivery")), "adopted": True}
             return
+        if episode_ended_by(episode, stall) is not None:
+            self._episode = None
+            return
         members = episode.setdefault("ranks", {})
-        # Every rank the stall says something of: stopped, and (for `rank_silent`) the others, so
-        # a rank of the episode that has recovered is seen stepping on.
-        seen = {**_others(stall), **stopped}
-        # A rank of the episode still stopped exactly as it was (its step and attempt): the job
-        # is not started again for it yet, as when ranks of a restarted job start a look apart.
-        unchanged = any(rank in members and members[rank].get("last_step") == now["last_step"]
-                        and members[rank].get("attempt") == now["attempt"] for rank, now in stopped.items())
-        for rank, now in seen.items():
-            before = members.get(rank)
-            if not unchanged and before is not None and now["attempt"] is not None \
-                    and before.get("attempt") is not None and now["attempt"] != before["attempt"]:
-                self._episode = None  # a new attempt: the job was started again
-                return
-        if episode.get("kind") == "job_stalled":
-            # The run's step: the stall is over once any rank has stored a step beyond the
-            # highest one stored when it fired. Of the ranks the stall lists, or, read from the
-            # stall's own step, of a rank that has since finished and is no longer listed. An
-            # episode from a state file written before `stall_step` was kept has only the first.
-            opened_at = _number(episode.get("stall_step"))
-            if _beyond(_run_step(stall), episode.get("run_step")) or (
-                    stall.get("kind") == "job_stalled" and opened_at is not None
-                    and _beyond(_number(stall.get("step")), opened_at)):
-                self._episode = None
-                return
-        else:
-            # `rank_silent`: each stopped rank's own step. The ranks that go on stepping beside
-            # it are not in the episode and do not end it.
-            for rank, now in seen.items():
-                if rank in members and _beyond(now["last_step"], members[rank].get("last_step")):
-                    self._episode = None
-                    return
         for rank, now in stopped.items():
             members.setdefault(rank, now)  # a rank that stopped during the episode joins it
 
@@ -686,7 +727,8 @@ class Trigger:
             "event": "incident",
             "version": PAYLOAD_VERSION,
             "id": delivery["id"],
-            "mcp_id": unit.get("mcp_id"),
+            # A stall's is of its firing, not of what the stall reads now: one id for one episode.
+            "mcp_id": stall_lookup_id(delivery) if delivery.get("kind") in STALL_KINDS else unit.get("mcp_id"),
             "attempt": delivery[target]["attempts"],
             "sent_at_ms": int(time.time() * 1000),
             "run_id": self._run_id,

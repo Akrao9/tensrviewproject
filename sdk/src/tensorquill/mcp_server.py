@@ -594,6 +594,10 @@ def _entries(opened: Mapping[str, Any]) -> list[dict[str, Any]]:
 # so it finds the same incident whether the server was started on the run folder, a `rank=<n>`
 # folder, a capture or an evidence file, and whether the watcher looked at one rank or all of
 # them. A list id never holds a `/`, so the two forms cannot be mistaken for each other.
+#
+# A stall's lookup id (`job_stalled`, `rank_silent`) is of its episode instead: the trigger's
+# delivery id in this form, with `~2` onwards for a later episode fired at the same kind and step.
+# It is resolved only against the trigger's state file (`_stall_of_episode`).
 
 
 _STALL_KINDS = ("job_stalled", "rank_silent")  # read from the server's status: one at a time for a run
@@ -629,13 +633,17 @@ def _parse_lookup(wanted: str) -> dict[str, Any] | None:
             if int(end or first) - int(first) > 1_000_000:
                 return None
             ranks.extend(range(int(first), int(end or first) + 1))
+    last, tilde, episode = last.partition("~")
+    if tilde and (not episode.isdecimal() or int(episode) < 1):
+        return None
     base, hash_, number = last.partition("#")
-    if hash_ and (not number.isdecimal() or int(number) < 1):
+    if hash_ and (not number.isdecimal() or int(number) < 1 or tilde):
         return None
     kind, at, step = base.partition("@")
     if not kind or (at and not step.isdecimal()):
         return None
-    return {"run": run, "ranks": ranks, "kind": kind, "step": int(step) if at else None, "nth": int(number) if hash_ else 1}
+    return {"run": run, "who": who, "ranks": ranks, "kind": kind, "step": int(step) if at else None,
+            "nth": int(number) if hash_ else 1, "episode": int(episode) if tilde else 1}
 
 
 def lookup_candidates(opened: Mapping[str, Any], kind: Any, step: Any, ranks: Iterable[Any]) -> list[dict[str, Any]]:
@@ -693,15 +701,9 @@ def _looked_up(source: "Source", wanted: str, lookup: Mapping[str, Any], rank: i
     if opened["shape"] == "rank" and ranks and isinstance(own, int) and own not in ranks:
         raise ToolError(f"{wanted!r} is an incident of rank {_ranges(ranks)}; this answer would be rank {own}'s evidence,"
                         " which says nothing about it.")
+    if lookup["kind"] in _STALL_KINDS:
+        return opened, _stall_of_episode(source, opened, wanted, lookup), rank
     candidates = lookup_candidates(opened, lookup["kind"], lookup["step"], ranks)
-    if len(candidates) < lookup["nth"] and lookup["kind"] in _STALL_KINDS and lookup["nth"] == 1:
-        # A stall changes its kind and its step inside one episode (a `rank_silent` at the stopped
-        # rank's step becomes a `job_stalled` at the run's once the other ranks stop or finish), and
-        # the trigger fires once for the episode, so the id it gave may name what the stall was.
-        # The run lists one stall at a time: that one is the stall the id is of, or its successor.
-        stalls = [e for e in _entries(opened) if e["incident"].get("kind") in _STALL_KINDS]
-        if len(stalls) == 1:
-            return opened, {**stalls[0], "looked_up_as": _base_id(lookup["kind"], lookup["step"])}, rank
     if len(candidates) < lookup["nth"]:
         entries = _entries(opened)
         known = ", ".join(e["id"] for e in entries[:20]) or "none"
@@ -715,6 +717,74 @@ def _looked_up(source: "Source", wanted: str, lookup: Mapping[str, Any], rank: i
     if rank is None and len(ranks) == 1:
         rank = ranks[0]
     return opened, candidates[lookup["nth"] - 1], rank
+
+
+class _NotIdentifiable(Exception):
+    """A stall's lookup id whose episode cannot be shown to be the one of the stall listed now."""
+
+    def __init__(self, reason: str, current: Mapping[str, Any] | None) -> None:
+        super().__init__(reason)
+        self.reason, self.current = reason, current
+
+
+def _stall_of_episode(source: "Source", opened: Mapping[str, Any], wanted: str, lookup: Mapping[str, Any]) -> dict[str, Any]:
+    """The entry of the stall listed now, when it is established to be of the episode `wanted`
+    fired for; `_NotIdentifiable` otherwise.
+
+    A stall's kind and step change inside one episode, and a later stall of the run, or the job
+    started again, can read exactly as an earlier one did (the same kind, rank and step). So
+    nothing in the incident says which episode it is of: only the trigger's state file does, beside
+    the evidence file the watcher writes. Established means all of: this server reads that evidence
+    file; its state file lists, as this run's open episode, the firing the id names (its delivery
+    id), kept with its baseline (not a file from before episodes were kept, nor an episode adopted
+    without its firing); the run lists exactly one stall; and that stall does not end the episode
+    by the trigger's own rule (`trigger.episode_ended_by`: no step beyond where it stopped, no new
+    attempt). The last holds even in the moment between the watcher writing a new stall and the
+    trigger looking at it, when the state file still names the earlier episode."""
+    from .trigger import episode_ended_by, state_path_for
+
+    stalls = [e for e in _entries(opened) if e["incident"].get("kind") in _STALL_KINDS]
+    current = stalls[0] if len(stalls) == 1 else None
+
+    def no(reason: str) -> _NotIdentifiable:
+        return _NotIdentifiable(reason, current)
+
+    if not stalls:
+        raise no("the run lists no stall now: the one this id fired for is over, or is not listed at the moment (as in the"
+                 " window after a server restart)")
+    if current is None:
+        raise no(f"the evidence lists {len(stalls)} stalls, so none can be taken for the one this id fired for")
+    kind, where, _ = source.locate()
+    if kind != "evidence":
+        raise no(f"this server was started on {where}, which has no trigger state beside it. Which stall episode is open is"
+                 " kept only beside the evidence file the trigger named (`TENSORQUILL_EVIDENCE`, `evidence` in its document):"
+                 " start the server on that file to look a stall up by the id the trigger gave")
+    state_path = state_path_for(where)
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise no(f"the trigger's state file {state_path} is missing or cannot be read, so nothing says which stall episode"
+                 " is open. It is kept beside the evidence file the trigger named (`TENSORQUILL_EVIDENCE`): start the"
+                 " server on that file") from None
+    step = lookup["step"]
+    delivery = f"{lookup['run']}/{lookup['who']}/{lookup['kind']}/{step}" + (f"/{lookup['episode']}" if lookup["episode"] > 1 else "")
+    episodes = state.get("episodes") if isinstance(state, dict) else None
+    episode = episodes.get(lookup["run"]) if isinstance(episodes, dict) else None
+    if not isinstance(episode, dict):
+        raise no("the trigger's state lists no open stall episode for this run: the one this id fired for is over")
+    if episode.get("delivery") != delivery:
+        raise no("the stall episode this id fired for is over: the trigger's state shows another episode open for this run"
+                 f" ({episode.get('delivery')})")
+    if episode.get("legacy") or episode.get("adopted") or not isinstance(episode.get("ranks"), dict):
+        raise no("the trigger's state does not hold what this episode was stopped at when it fired (it was taken up from an"
+                 " earlier state file), so the stall listed now cannot be shown to be the same one")
+    ended = episode_ended_by(episode, current["incident"])
+    if ended is not None:
+        raise no("the stall listed now is not the one this id fired for: it shows "
+                 + ("a new attempt of the job" if ended == "attempt" else "a step stored beyond where that one stopped")
+                 + " since")
+    asked = _base_id(lookup["kind"], step)
+    return {**current, "looked_up_as": asked} if current["id"] != asked else dict(current)
 
 
 def _delivery_id_hint(wanted: str) -> str:
@@ -1200,7 +1270,21 @@ def get_incident(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
     lookup = _parse_lookup(wanted)
     if lookup is not None:
         # The trigger's lookup id: it names the run and the ranks itself (wave AH, P5-1).
-        opened, entry, rank = _looked_up(source, wanted, lookup, rank)
+        try:
+            opened, entry, rank = _looked_up(source, wanted, lookup, rank)
+        except _NotIdentifiable as unknown:
+            # A stall's id whose episode cannot be shown to be the listed stall's: said outright,
+            # and never answered with another stall's numbers.
+            current = unknown.current
+            return {
+                "source": source.open(rank)["source"], "id": wanted, "identified": False,
+                "result": "original_incident_no_longer_identifiable", "reason": unknown.reason,
+                "current_stall": None if current is None else {
+                    "id": current["id"], "kind": current["incident"].get("kind"), "step": current["incident"].get("step"),
+                    "note": "a stall the run lists now, not established to be the one this id fired for; call"
+                            " get_incident with this id to read it as a separate incident",
+                },
+            }
     else:
         opened = source.open(rank)
         entries = _entries(opened)
@@ -1969,7 +2053,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "description": (
             "One incident in full, by the id list_incidents gave (for example grad_spike@310), or by the `mcp_id` a"
             " trigger handed over (`TENSORQUILL_INCIDENT_MCP_ID`, for example my-run/rank0/grad_spike@310, which names"
-            " its run and ranks and needs no `rank`): every number the"
+            " its run and ranks and needs no `rank`; a stall's is resolved only on the evidence file the trigger"
+            " named, and when the stall listed now cannot be shown to be the one that fired, the answer is"
+            " `original_incident_no_longer_identifiable` with the current stall's own id): every number the"
             " detector recorded, what its class means, the ranks that show it, for an MoE incident the sample it"
             " points at (largest expert shares, and the sample before; from compact evidence that left the steps"
             " between out, the last earlier one it keeps is `previous_kept_sample` instead), and the get_series"
