@@ -81,6 +81,7 @@ from typing import Any, Mapping
 
 from . import manifest as _manifest
 from . import runs as _runs
+from .identity import MalformedRecordError
 
 COMPARE_VIEW = "compare"
 COMPARE_VIEW_VERSION = 1
@@ -106,6 +107,8 @@ def _read_local(path: Path) -> tuple[list[dict[str, Any]], bool]:
 
     try:
         return load_records(path, all_attempts=True), False
+    except MalformedRecordError:
+        raise  # a record that is not valid refuses the input (WAVE_AF_CONTRACT.md, section 1)
     except ValueError:
         # A line the job is still writing, or one torn by a killed process: the whole lines are
         # read, as the watcher reads them, and the result says so.
@@ -386,6 +389,8 @@ def _open_store(run: Mapping[str, Any], rank: int | None, read_parts: bool) -> d
         applied = applied_thresholds(look["report"]) if isinstance(look.get("report"), Mapping) else {}
         try:
             records = load_records(folder, rank=picked, all_attempts=True)
+        except MalformedRecordError:
+            raise  # a record that is not valid refuses the input (WAVE_AF_CONTRACT.md, section 1)
         except (OSError, ValueError, ImportError) as error:  # ImportError: the parts need pyarrow
             return _unread_store_rank(run, folder, folders, picked,
                                       f"{look['state']}: {look['reason']}; its parts could not be read here ({error})")
@@ -481,6 +486,8 @@ def _open_store_all_ranks(run: Mapping[str, Any], folder: Path, folders: Mapping
             applied = applied_thresholds(look["report"]) if isinstance(look.get("report"), Mapping) else {}
             try:
                 records = load_records(folder, rank=number, all_attempts=True)
+            except MalformedRecordError:
+                raise  # a record that is not valid refuses the input (WAVE_AF_CONTRACT.md, section 1)
             except (OSError, ValueError, ImportError) as error:  # ImportError: the parts need pyarrow
                 unknown[number] = not_read[number] = (f"{look['state']}: {look['reason']}; its parts could not be read "
                                                       f"here ({error})")
@@ -1066,6 +1073,8 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_
 
     try:
         read = [_step_records(run["records"].get("paths") or run["records"]["path"], run["records"]["rank"]) for run in opened]
+    except MalformedRecordError:
+        raise  # a record that is not valid refuses the input (WAVE_AF_CONTRACT.md, section 1)
     except (OSError, ValueError, ImportError) as error:  # ImportError: a store's parts need pyarrow
         return {"state": "no_records", "detail": f"the step records could not be read for where the runs part ({error})"}
     left_out = {label: [rank] for label, rank, (_, torn) in zip(labels, ranks, read) if torn}
@@ -1098,6 +1107,8 @@ def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[st
         for one in path:
             try:
                 found = load_records(one, rank=rank, all_attempts=True)
+            except MalformedRecordError:
+                raise  # a record that is not valid refuses the input (WAVE_AF_CONTRACT.md, section 1)
             except ValueError:
                 source = Path(one)
                 if source.is_dir() or source.suffix == ".parquet":
@@ -1110,6 +1121,8 @@ def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[st
         return resolve_attempts_across(per_file), torn
     try:
         return load_records(path, rank=rank), False
+    except MalformedRecordError:
+        raise  # a record that is not valid refuses the input (WAVE_AF_CONTRACT.md, section 1)
     except ValueError:
         source = Path(path)
         if source.is_dir() or source.suffix == ".parquet":
@@ -1177,6 +1190,8 @@ def _where_ranks_part(opened: list[Mapping[str, Any]], labels: list[str]) -> dic
         for label, own in zip(labels, paths):
             try:
                 read.append(_step_records(own[rank], rank))
+            except MalformedRecordError:
+                raise  # a record that is not valid refuses the input (WAVE_AF_CONTRACT.md, section 1)
             except (OSError, ValueError, ImportError) as error:  # ImportError: a store's parts need pyarrow
                 not_read.setdefault(rank, []).append(f"{label}: its step records could not be read ({error})")
         if rank in not_read:
@@ -1486,6 +1501,8 @@ def main(argv: list[str]) -> None:
     args = parser.parse_args(argv)
     try:
         result = compare_runs(*args.runs, source=args.source, project=args.project, rank=args.rank)
+    except MalformedRecordError:
+        raise  # a record that is not valid refuses the input (WAVE_AF_CONTRACT.md, section 1)
     except (ValueError, OSError, RuntimeError) as error:
         parser.error(str(error))
     from .evidence import write_evidence
