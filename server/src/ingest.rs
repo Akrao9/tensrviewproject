@@ -917,6 +917,7 @@ impl Ingest {
                     return Err(refused.status);
                 }
             };
+            refuse_negative_steps(&batch)?;
             (split_by_attempt(batch)?, dropped)
         };
         // Every attempt of the batch has its place in the store's order before any row of it is
@@ -2219,6 +2220,24 @@ fn drop_unstorable_rows(batch: RecordBatch) -> Result<(RecordBatch, Dropped), Re
         status: Status::internal(error.to_string()),
     })?;
     Ok((batch, dropped))
+}
+
+/// Refuses a batch that holds a negative `step`, whole, with `invalid_argument`, as `split_by_attempt`
+/// refuses one that holds a negative `attempt` (wave AG, section 10 of `WAVE_AF_CONTRACT.md`): nothing
+/// of it is stored, acknowledged or counted, and its stream ends. Until then such rows were stored and
+/// judged, and the store then held parts that the readers refuse by name (section 1). The column is
+/// int64 without nulls here: `drop_unstorable_rows` refused or dropped anything else.
+fn refuse_negative_steps(batch: &RecordBatch) -> Result<(), Status> {
+    let steps = batch
+        .column_by_name("step")
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| Status::invalid_argument("column `step` is missing or of the wrong type"))?;
+    match steps.values().iter().find(|step| **step < 0) {
+        Some(step) => Err(Status::invalid_argument(format!(
+            "column `step` holds a negative value ({step}); the batch is refused"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Splits a batch into runs of consecutive rows with the same `attempt`. A batch from a
