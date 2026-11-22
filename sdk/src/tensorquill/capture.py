@@ -289,6 +289,7 @@ def _stats_hook(
     row: int,
     phase: _Evaluating | None = None,
     problems: list[str] | None = None,
+    held: _Held | None = None,
 ) -> Callable[..., None]:
     """The forward hook that writes a watched block's output statistics into row `row` of `buf`.
     Nothing in it raises into training. An output it cannot read leaves no entry for the block
@@ -373,11 +374,14 @@ def _stats_hook(
             buf[row] = stats
 
     def hook(module: nn.Module, args: Any, output: Any) -> None:
-        if _recomputing() or _evaluating(module, phase):
-            return
         if torch.compiler.is_compiling():
             # No `try` in a traced hook: the checks in `read` are what keep it from raising there.
+            # Nothing is held here: Dynamo runs a reentrant checkpoint as a non-reentrant one.
+            if _evaluating(module, phase):
+                return
             read(output)
+            return
+        if _skip_forward(module, phase, held):
             return
         try:
             read(output)
@@ -577,11 +581,14 @@ def _count_width(spec: Router) -> int:
     - `2E + 2`: forwards whose expert ids were checked (the integer and `indices=` paths);
     - `2E + 3`: forwards whose routing map was checked against a paired float;
     - `2E + 4`: forwards counted from a routing map, paired or not;
-    - `2E + 5`: forwards counted from the top-k of scores (logits).
+    - `2E + 5`: forwards counted from the top-k of scores (logits);
+    - `2E + 6`: forwards left out as evaluations and held (`_skip_forward`, eager only): on a step
+      where one was held and none of `2E + 2`, `2E + 4` and `2E + 5` counts a forward, nothing of the
+      step's forward was read, and the router is left out of that record (AUD-1, wave AG).
 
     The last four tell `moe_source`'s form (`_moe_forms`) from the counts the flush copies anyway, so
     the hooks keep no Python state of their own, which under `torch.compile` would be guarded on."""
-    return 2 * spec.n_experts + 6
+    return 2 * spec.n_experts + 7
 
 
 def _router_hook(
@@ -589,6 +596,7 @@ def _router_hook(
     spec: Router,
     problems: list[tuple[str, str | None]] | None = None,
     phase: _Evaluating | None = None,
+    held: _Held | None = None,
 ) -> Callable[..., None]:
     """The forward hook that adds a router's chosen experts to `counts`. Nothing in it raises
     into training: what cannot be counted refuses the router for the session (`problems`,
@@ -607,8 +615,8 @@ def _router_hook(
     scores_start = torch.zeros_like(ids_start)
     scores_start[2 * experts + 5] = 1  # counted from the top-k of scores
     no_ids = torch.zeros(2, dtype=counts.dtype, device=counts.device)
-    map_checked = torch.tensor([0, 1, 1, 0], dtype=counts.dtype, device=counts.device)
-    unchecked_map = torch.zeros(experts + 6, dtype=counts.dtype, device=counts.device)
+    map_checked = torch.tensor([0, 1, 1, 0, 0], dtype=counts.dtype, device=counts.device)
+    unchecked_map = torch.zeros(experts + 7, dtype=counts.dtype, device=counts.device)
     unchecked_map[experts + 4] = 1  # a routing map with no paired float: counted from a map, nothing left out
 
     def refuse(why: Callable[[], str], fix: str | None = None) -> None:
@@ -779,11 +787,20 @@ def _router_hook(
             counts.add_(hits)
 
     def hook(module: nn.Module, args: Any, output: Any) -> None:
-        if _recomputing() or _evaluating(module, phase):
-            return
         if torch.compiler.is_compiling():
             # No `try` in a traced hook: the checks above are what keep it from raising there.
+            # Nothing is held here: Dynamo runs a reentrant checkpoint as a non-reentrant one.
+            if _evaluating(module, phase):
+                return
             count(args, output)
+            return
+        before = held.n if held is not None else 0
+        if _skip_forward(module, phase, held):
+            if held is not None and held.n > before:
+                try:  # said in the counts, so the writer can leave the router out (`_count_width`)
+                    counts.narrow(0, 2 * experts + 6, 1).add_(1)
+                except Exception:  # noqa: BLE001
+                    pass
             return
         try:
             count(args, output)
@@ -1096,6 +1113,50 @@ def _evaluating(module: nn.Module, phase: _Evaluating) -> bool:
     if torch.is_grad_enabled():
         return phase.on and not module.training
     return not module.training or phase.on
+
+
+class _Held:
+    """One hook's count of forwards it left out as evaluations that may be the first forward of
+    reentrant activation checkpointing in a model trained in eval mode (AUD-1, `_skip_forward`).
+    Python state read in eager mode only; `Session._commit` sets it back to 0 at each step."""
+
+    __slots__ = ("n",)
+
+    def __init__(self) -> None:
+        self.n = 0
+
+
+def _skip_forward(module: nn.Module, phase: _Evaluating, held: _Held | None) -> bool:
+    """Whether an eager forward hook leaves this forward out: a recomputation inside backward
+    (`_recomputing`) or an evaluation (`_evaluating`), with one exception (AUD-1, wave AG).
+
+    Reentrant activation checkpointing runs a training forward without gradients and runs it again
+    inside backward. In train mode the first is counted and the second left out, as before. With
+    the modules in eval mode the first reads as an evaluation, so nothing of the step was counted
+    and the record carried zeros. What tells the two apart is that only a training forward is run
+    again in backward: a forward without gradients in eval mode, outside the `"eval"` phase, is held
+    (`held`), and a recomputation inside backward is counted when it finds one held, one for one.
+    It is the same forward on the same inputs (the checkpoint restores the random state), so it
+    gives the counts and statistics the first would have.
+
+    A forward counted in the usual way (gradients on, or train mode) lets go of what is held, so a
+    recomputation after it is left out as before; so does the end of each step. A non-reentrant
+    checkpoint's first forward has gradients on and is counted, and its recomputation is left out.
+    Not told apart: an evaluation forward without gradients made in the same step before a
+    training forward that is itself held, and a forward run inside backward that is not a
+    checkpoint's recomputation, which would claim it; both need an evaluation inside a step."""
+    if _recomputing():
+        if held is not None and held.n > 0:
+            held.n -= 1
+            return False
+        return True
+    if _evaluating(module, phase):
+        if held is not None and not phase.on and not module.training and not torch.is_grad_enabled():
+            held.n += 1
+        return True
+    if held is not None:
+        held.n = 0
+    return False
 
 
 def _clip_grad_norm_wrapper(parameters: Any, *args: Any, **kwargs: Any) -> Any:
@@ -1552,6 +1613,8 @@ class Session:
         # Forwards that are not training (evaluation, the probe) are left out by the hooks
         # (`_evaluating`); this says whether the session's phase is "eval" (`set_phase`).
         self._evaluating = _Evaluating()
+        # Each watched block's and router's held forwards (`_skip_forward`), set back at each step.
+        self._held_forwards = [_Held() for _ in range(len(plan.selected) + len(self._routers))]
         self._handles: list[Any] = []  # the forward hooks, registered by `_install`
         self._probe_state = ProbeState()
         if self._probe_fn is not None:
@@ -1693,17 +1756,19 @@ class Session:
         undo.append(lambda: [handle.remove() for handle in self._handles])
         self._handles += [
             module.register_forward_hook(
-                _stats_hook(self._act, self._stat_idx, row, self._evaluating, self._layer_problems[row])
+                _stats_hook(self._act, self._stat_idx, row, self._evaluating, self._layer_problems[row],
+                            self._held_forwards[row])
             )
             for row, (_, module) in enumerate(plan.selected)
         ]
         self._handles += [
             modules[name].register_forward_hook(
                 _router_hook(
-                    self._counts[name], spec, self._router_problems[name], self._evaluating
+                    self._counts[name], spec, self._router_problems[name], self._evaluating,
+                    self._held_forwards[len(plan.selected) + i]
                 )
             )
-            for name, spec in self._routers.items()
+            for i, (name, spec) in enumerate(self._routers.items())
         ]
         if self._probe_fn is not None:
             self._handles += install_probe_hooks(plan.probe_blocks, self._probe_state)
@@ -3066,7 +3131,7 @@ class Session:
             width, e = _count_width(spec), spec.n_experts
             size = n * width
             if name not in self._moe_source_written and name not in refused:
-                rows = counts[offset : offset + size].reshape(n, width)[:, 2 * e + 2 :].tolist()
+                rows = counts[offset : offset + size].reshape(n, width)[:, 2 * e + 2 : 2 * e + 6].tolist()
                 for ids, _, maps, scores in rows:
                     form = "indices" if ids else "map" if maps else "scores" if scores else None
                     if form is not None:
@@ -3136,6 +3201,8 @@ class Session:
     def _commit(self, step: int | None, caller_skipped: bool | None = None) -> None:
         if self._error is not None and not self._stopped:
             self._stop(self._error)  # the sink failed on the writer thread: said here, on this one
+        for held in self._held_forwards:  # a forward held in this step and not claimed is not the next step's
+            held.n = 0
         if self._stopped:
             self._count_stopped(step)
             return
@@ -4063,6 +4130,13 @@ class Session:
         )
         launch = self._launch_for_records() if needs_launch else None
         moe: dict[str, list[list[int]]] = {}
+        # Whether the router's forward on each step was read: every counted forward sets one of the
+        # slots that say how it was read (`_count_width`), also with no token. On a step where a
+        # forward was held as a possible evaluation and none was counted, nothing of its forward
+        # was read: the router is left out of that record's `moe`, as a refused router is, so zeros
+        # are not written as if read (AUD-1, wave AG). A router not called on a step at all keeps its
+        # zeros, as before: it routed no token.
+        counted: dict[str, list[bool]] = {}
         unassigned: dict[str, list[int | None]] = {}  # None: the ids were not checked on that step
         left_out: dict[str, list[list[int] | None]] = {}  # None: no routing map was checked on that step
         offset = 0
@@ -4072,6 +4146,8 @@ class Session:
             if not refused or name not in refused:
                 rows = counts[offset : offset + size].reshape(n, width).tolist()
                 moe[name] = [row[:e] for row in rows]
+                counted[name] = [bool(row[2 * e + 2] or row[2 * e + 4] or row[2 * e + 5]) or not row[2 * e + 6]
+                                 for row in rows]
                 unassigned[name] = [row[e] if row[2 * e + 2] else None for row in rows]
                 left_out[name] = [row[e + 2 : 2 * e + 2] if row[2 * e + 3] else None for row in rows]
             offset += size
@@ -4183,18 +4259,20 @@ class Session:
                         record["replica_spread_scope"] = {"launch": launch, "group": list(scope)}
             if obs_rows is not None and sig_rows is not None and obs_seen is not None and obs_seen[i]:
                 record["replica"] = self._observation_record(obs_rows[i], sig_rows[i], obs_seen[i], launch)
-            if moe:
-                step_moe = {name: rows[i] for name, rows in moe.items()}
+            step_moe = {name: rows[i] for name, rows in moe.items() if counted[name][i]}
+            if step_moe:
                 record["moe"] = step_moe
-                record["moe_top_k"] = {name: spec.top_k for name, spec in self._routers.items() if name in moe}
+                record["moe_top_k"] = {name: spec.top_k for name, spec in self._routers.items() if name in step_moe}
                 record["moe_stats"] = {
                     name: _router_stats(row_counts) for name, row_counts in step_moe.items()
                 }
                 # Explicit zeros where a check ran, no key where it did not (`_count_width`).
-                step_unassigned = {name: rows[i] for name, rows in unassigned.items() if rows[i] is not None}
+                step_unassigned = {name: rows[i] for name, rows in unassigned.items()
+                                   if rows[i] is not None and name in step_moe}
                 if step_unassigned:
                     record["moe_unassigned"] = step_unassigned
-                step_left_out = {name: rows[i] for name, rows in left_out.items() if rows[i] is not None}
+                step_left_out = {name: rows[i] for name, rows in left_out.items()
+                                 if rows[i] is not None and name in step_moe}
                 if step_left_out:
                     record["moe_left_out"] = step_left_out
             records.append(record)
