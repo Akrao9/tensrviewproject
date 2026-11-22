@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from .identity import check
 from .manifest import METADATA_KEY as MANIFEST_KEY, _say, manifest_to_send
 from .sink import _finite
 
@@ -202,9 +203,26 @@ def flight_schema() -> Any:
 
 
 def record_to_row(
-    record: Mapping[str, Any], schema: Any = None, moved: list[str] | None = None,
+    record: Mapping[str, Any], schema: Any = None, moved: list[str] | None = None, where: str | None = None,
 ) -> dict[str, Any]:
     """One JSONL step record as a row of `flight_schema()`.
+
+    The record's identity fields are checked first (`identity.check`, `WAVE_AF_CONTRACT.md`
+    section 1): a `schema_version`, `rank`, `attempt` or `step` that is not valid raises
+    `identity.MalformedRecordError`, naming `where` when it is given, before `moved` is touched
+    (SDK-06). A valid record's row is what it was before the check. The sender's own path
+    (`rows_to_send`) makes its rows without this check, as before: a line the server refuses and
+    counts stays the server's to refuse and count (live ingest is unchanged, RS10).
+
+    The rest is `_row`'s."""
+    check(record, where)
+    return _row(record, schema, moved)
+
+
+def _row(
+    record: Mapping[str, Any], schema: Any = None, moved: list[str] | None = None,
+) -> dict[str, Any]:
+    """`record_to_row` without the identity check.
 
     A value that does not fit its column's type travels in `extra_json`, as always. So does one the
     column's converter or Arrow cannot hold (lane AD4): an integer too large for a float
@@ -490,7 +508,7 @@ def rows_to_send(
         None if a key column is refused."""
         keys: list[str] = []
         try:
-            row = record_to_row(record, schema, keys)
+            row = _row(record, schema, keys)
             pa.RecordBatch.from_pylist([row], schema=schema)
         except Exception:  # noqa: BLE001  a key column the schema cannot hold: the line is skipped
             return None
@@ -501,7 +519,7 @@ def rows_to_send(
     for record in records:
         keys: list[str] = []
         try:
-            kept.append((record, record_to_row(record, None, keys), keys))
+            kept.append((record, _row(record, None, keys), keys))  # unchecked, as before (see record_to_row)
         except Exception:  # noqa: BLE001  any value that cannot be converted is the line's, not the stream's
             found = strict(record)
             if found is None:
