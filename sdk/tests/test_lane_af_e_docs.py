@@ -145,26 +145,54 @@ def test_scores_since_start_and_the_learning_rate_are_where_the_page_says(tmp_pa
     assert "A null score is no score, never 0" in page
 
 
-def test_the_measurements_reach_one_ranks_answers_and_not_a_run_folders(tmp_path):
+def store_folder(root: Path, run: str, reports: dict[int, dict[str, Any]], judged: bool = True) -> Path:
+    """A run folder in a store with a report for each rank and its status (as lane AD5's tests write
+    one). Not `judged`: each rank has a stored part newer than its report, so the report is not current."""
+    import time
+
+    folder = root / "runs" / run
+    for rank, extra in reports.items():
+        parts = folder / f"rank={rank}" / "attempt=1"
+        parts.mkdir(parents=True)
+        (parts / "part-00000000-00000009.parquet").write_bytes(b"")
+        if not judged:
+            (parts / "part-00000010-00000019.parquet").write_bytes(b"")
+        (parts.parent / "incidents.json").write_text(json.dumps({
+            "schema_version": 1, "source": "tensorquill-server", "run_id": run, "rank": rank, "attempt": 1,
+            "last_step": 9, "steps": 10, "incidents": [], "checked": list(ev.SERVER_KINDS),
+            "thresholds": {"spike_sustain": ev.SPIKE_SUSTAIN}, **extra}))
+    if True:
+        (folder / "watchdog.json").write_text(json.dumps({
+            "schema_version": 1, "run_id": run, "summary": "active", "server_running": True,
+            "written_at_ms": int(time.time() * 1000), "world_size": len(reports), "missing_ranks": [],
+            "incidents": [], "pauses": {}, "recommended_silent_seconds": None,
+            "ranks": [{"rank": r, "attempt": 1, "last_step": 9, "phase": "train", "state": "active",
+                       "severity": None, "stream": "open"} for r in reports]}))
+    return folder
+
+
+def test_the_measurements_reach_one_ranks_answers_and_a_run_folders_by_rank(tmp_path):
     blocks = {key: expected(name)[key] for key, name in (
         ("gradient_trend", "gradient_trend_a_steady_rise"), ("weight_jumps", "weight_jumps_one_tensor_jumps"))}
     listed = call(served(tmp_path, "r1", **blocks), "list_incidents")
     assert all(listed[key] == block for key, block in blocks.items())
-    # A run folder whose ranks' reports hold them: no answer carries them, as the page now says.
-    folder = tmp_path / "store" / "runs" / "run"
-    for rank in (0, 1):
-        parts = folder / f"rank={rank}" / "attempt=1"
-        parts.mkdir(parents=True)
-        (parts / "part-00000000-00000009.parquet").write_bytes(b"")
-        (parts.parent / "incidents.json").write_text(json.dumps({
-            "schema_version": 1, "source": "tensorquill-server", "run_id": "run", "rank": rank, "attempt": 1,
-            "last_step": 9, "steps": 10, "incidents": [], "checked": list(ev.SERVER_KINDS),
-            "thresholds": {"spike_sustain": ev.SPIKE_SUSTAIN}, **blocks,
-            "moe_source": {"r": {"form": "scores", "point": "requested"}}}))
-    for answer in (call(folder, "get_all_ranks_status"), call(folder, "list_incidents"),
-                   call(folder, "list_incidents", {"rank": 0})):
-        assert not {"gradient_trend", "weight_jumps", "moe_source"} & set(answer)
-    assert "A run folder's answers carry neither the measurements nor `moe_source` in this version" in flat(OTHER_KEYS)
+    # A run folder (wave AF, EV-04): each judged rank's block, with its rank, under `<block>_by_rank`.
+    source = {"r": {"form": "scores", "point": "requested"}}
+    folder = store_folder(tmp_path / "store", "run", {0: {**blocks, "moe_source": source}, 1: {}})
+    for answer in (call(folder, "get_all_ranks_status"), call(folder, "list_incidents")):
+        assert answer["gradient_trend_by_rank"] == [{"rank": 0, "gradient_trend": blocks["gradient_trend"]}]
+        assert answer["weight_jumps_by_rank"] == [{"rank": 0, "weight_jumps": blocks["weight_jumps"]}]
+        assert answer["moe_source_by_rank"] == [{"rank": 0, "moe_source": source}]
+        assert not {"gradient_trend", "weight_jumps", "moe_source"} & set(answer)  # never added up
+    one = call(folder, "list_incidents", {"rank": 1})
+    assert not {"gradient_trend_by_rank", "moe_source_by_rank"} & set(one)  # that rank's entries only
+    # A rank that is not judged is in none of them.
+    unjudged = store_folder(tmp_path / "unjudged", "run", {0: {**blocks}}, judged=False)
+    assert "gradient_trend_by_rank" not in call(unjudged, "get_all_ranks_status")
+    page = flat(OTHER_KEYS)
+    assert "`gradient_trend_by_rank`, `attention_trends_by_rank`, **update_trends_by_rank**, `weight_jumps_by_rank` and `moe_source_by_rank`" in page
+    assert "A rank that is not judged is in none of them." in page
+    assert "carry neither the measurements" not in AGENT  # the sentence of 0a17420, true before wave AF
 
 
 def test_modules_not_read_reach_a_tool_as_the_page_says(tmp_path):
@@ -411,3 +439,384 @@ def test_the_readme_says_it_once_where_a_reader_looks_for_what_can_wait_or_raise
     things = flat(section(README, "Things to know"))
     assert things.index("**What can wait or raise in training.**") < things.index("A `Trainer.train()` that raises")
     assert "each is a collective. Every rank of the group must call it on the same step" in things
+
+
+# --- 5. Wave AF/AG: the sentences the lanes left, entered once the merged code does what they say ------
+
+from test_flight_e2e import BINARY  # noqa: E402
+
+from tensorquill import compare as compare_module  # noqa: E402
+from tensorquill import divergence  # noqa: E402
+from tensorquill import flight  # noqa: E402
+from tensorquill import identity  # noqa: E402
+from tensorquill import runs as runs_module  # noqa: E402
+
+AG_CASES = json.loads((FIXTURES / "wave_af" / "cases_ag.json").read_text())["cases"]
+needs_server = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is not built (TENSORQUILL_SERVER_BIN)")
+ENGINES = ["python", pytest.param("rust", marks=needs_server)]
+NEW = flat(section(README, "Records that cannot be placed, every rank's keys, and routers with no tokens"))
+
+
+def identity_file(path: Path, **bad: Any) -> Path:
+    """Five valid records, the fourth (line 4) with `bad` put in."""
+    rows = [{"schema_version": 1, "run_id": "m", "rank": 0, "attempt": 1, "step": s, "grad_norm": 1.0}
+            for s in range(5)]
+    rows[3].update(bad)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return path
+
+
+def server_env() -> dict[str, str]:
+    return {**child_env(), **({"TENSORQUILL_SERVER_BIN": str(BINARY)} if BINARY else {})}
+
+
+@pytest.mark.parametrize("bad", [{"attempt": 1.0}, {"rank": True}, {"step": -3}, {"schema_version": 99},
+                                 {"attempt": None}, {"step": "1"}])
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_record_that_cannot_be_placed_refuses_the_input_in_every_offline_reader(tmp_path, monkeypatch, bad, engine):
+    if BINARY:
+        monkeypatch.setenv("TENSORQUILL_SERVER_BIN", str(BINARY))
+    capture = identity_file(tmp_path / "m.rank0.jsonl", **bad)
+    [(field, value)] = bad.items()
+    with pytest.raises(identity.MalformedRecordError) as raised:
+        ev.build_evidence(ev.load_records(capture), detectors=engine)
+    error = raised.value
+    assert isinstance(error, ValueError) and (error.field, error.value) == (field, value)
+    assert str(error).startswith(f"{field} is ") and f"{capture}, line 4" in str(error) and error.reason
+    done = subprocess.run([sys.executable, "-m", "tensorquill", str(capture), "--detectors", engine], cwd=tmp_path,
+                          env=server_env(), capture_output=True, text=True, timeout=120)
+    assert done.returncode == 2 and done.stdout == ""
+    assert done.stderr.splitlines() == [f"tensorquill: error: {error}"]  # one line, no traceback
+    assert not list(tmp_path.glob("*.evidence.json"))  # no evidence written
+
+
+def test_the_readme_s_example_line_is_the_one_the_command_prints(tmp_path):
+    capture = identity_file(tmp_path / "run.rank0.jsonl", attempt=1.0)
+    done = subprocess.run([sys.executable, "-m", "tensorquill", capture.name, "--detectors", "python"],
+                          cwd=tmp_path, env=child_env(), capture_output=True, text=True, timeout=120)
+    said = done.stderr.strip()
+    assert said == "tensorquill: error: attempt is 1.0 at run.rank0.jsonl, line 4: tensorquill reads an integer of 0 or more"
+    assert f"`{said}`" in NEW
+    assert said.removeprefix("tensorquill: error: ").replace("run.rank0.jsonl", "<file>") in flat(GUIDE)
+    assert f"`{said.removeprefix('tensorquill: error: ')}`" in flat(AGENT)
+
+
+def test_an_mcp_tool_answers_the_error_and_the_next_call_and_the_listing_does_not_raise(tmp_path):
+    capture = identity_file(tmp_path / "m.rank0.jsonl", step=-3)
+    reply = mcp_server.call_tool(mcp_server.Source(capture), 1, {"name": "list_incidents", "arguments": {}})
+    assert reply["result"]["isError"] is True
+    assert reply["result"]["content"][0]["text"].startswith("step is -3 at ")
+    identity_file(capture)  # put right: the next call is answered
+    assert call(capture, "list_incidents")["incidents"] == []
+    identity_file(capture, step=-3)
+    [row] = runs_module.list_runs(tmp_path)
+    assert row["run_state"] is None and row["evidence"]["state"] == "missing"
+
+
+@needs_server
+@pytest.mark.parametrize(("column", "value", "said"), [
+    ("step", -3, "row 3: step is -3, not an integer of 0 or more; the input is refused"),
+    ("rank", -3, "row 3: rank is -3, not an integer of 0 or more; the input is refused"),
+    ("schema_version", 2, "row 3: schema_version is 2; this server reads versions 0 and 1; the input is refused"),
+    (None, None, None),
+])
+def test_offline_detect_refuses_a_negative_key_and_carries_attempt_order(tmp_path, column, value, said):
+    import pyarrow as pa
+
+    rows = [{"schema_version": 1, "run_id": "m", "rank": 0, "attempt": 1, "step": s, "grad_norm": 1.0} for s in range(5)]
+    table = pa.Table.from_batches([flight.records_to_batch(rows)])
+    if column:
+        index = table.schema.get_field_index(column)
+        values = table.column(column).to_pylist()
+        values[2] = value
+        table = table.set_column(index, table.schema.field(column), pa.array(values, table.schema.field(column).type))
+    stream = tmp_path / "rows.arrow"
+    with pa.OSFile(str(stream), "wb") as out, pa.ipc.new_stream(out, table.schema) as writer:
+        writer.write_table(table)
+    done = subprocess.run([str(BINARY), "detect", str(stream)], capture_output=True, text=True, timeout=120)
+    if column is None:
+        assert done.returncode == 0 and json.loads(done.stdout)["attempt_order"] == "first_seen"
+        assert "carry `attempt_order` (`first_seen`), as a live report does" in NEW
+    else:
+        assert done.returncode == 1 and done.stderr.strip() == f"tensorquill-server: {said}"
+        assert "exits with status 1 and one line naming the row, the field and the value" in NEW
+
+
+def test_the_capture_writes_a_negative_step_as_given_and_the_file_is_then_refused(tmp_path):
+    path = tmp_path / "n.rank0.jsonl"
+    session = tensorquill.init(nn.Linear(2, 2), run_id="n", sink=JsonlSink(path), heartbeat_seconds=None,
+                               auto_step=False, start_step=-2)
+    session.step()
+    session.step(step=-5)
+    session.close()
+    assert [json.loads(line)["step"] for line in path.read_text().splitlines()] == [-2, -5]
+    with pytest.raises(identity.MalformedRecordError):
+        ev.load_records(path)
+    for text in (NEW, flat(GUIDE)):
+        assert "writes a `step=` or `start_step=` below 0 as given" in text
+
+
+def test_the_sender_skips_and_counts_what_it_does_not_send_and_sends_an_unread_version():
+    good = {"schema_version": 1, "run_id": "r", "rank": 0, "attempt": 0, "step": 0, "grad_norm": 1.0}
+    records = [good, {**good, "step": 1, "attempt": -3}, {**good, "step": 2, "rank": -1}, {**good, "step": 3, "attempt": None},
+               {**good, "step": 4, "schema_version": 99}, {**good, "step": 5}]
+    refused: list = []
+    _, steps, skipped = flight.rows_to_send(records, flight.flight_schema(), refused=refused)
+    assert steps == [0, 4, 5] and skipped == 3  # the unread schema_version 99 is sent, for the server to count
+    assert [(field, value) for _, field, value in refused] == [("attempt", -3), ("rank", -1), ("attempt", None)]
+    assert flight.SENDER_FIELDS == ("rank", "attempt", "step")
+    assert "counts it in `sender.skipped_lines`, says the first such line once on stderr" in NEW
+    assert "counts it under `unsupported_schema_version` (`dropped_row_keys` in the status)" in NEW
+
+
+def test_each_ranks_not_checked_and_kind_entries_reach_the_all_ranks_view_read_from_local_files():
+    def rank(entries: list, modules: list, starting: list) -> dict:
+        found = ev.build_evidence(plain_rows("r", range(20)))
+        found["not_checked"] = entries
+        found["kind_checks"]["activation_drift"] = {**found["kind_checks"]["activation_drift"], "modules_not_judged": modules}
+        found["kind_checks"]["moe_imbalance"] = {**found["kind_checks"]["moe_imbalance"], "starting_state": starting}
+        return found
+    entry = expected("layers_not_read_some_modules")["not_checked"][0]
+    view = ev.combine_rank_evidence({0: rank([entry], ["blk1"], [{"router": "r", "samples": 5}]),
+                                     1: rank([], [], [{"router": "r", "samples": 3}])})
+    assert view["not_checked_by_rank"] == [{"rank": 0, "not_checked": [entry]}]
+    drift = view["kind_checks"]["activation_drift"]
+    assert drift["modules_not_judged"] == ["blk1"] and drift["modules_not_judged_by_rank"] == {"0": ["blk1"]}
+    moe = view["kind_checks"]["moe_imbalance"]
+    assert moe["starting_state"] == [{"router": "r", "samples": 3}] and set(moe["starting_state_by_rank"]) == {"0", "1"}
+    assert "under `not_checked_by_rank` (`{\"rank\", \"not_checked\"}`) in a view read from local files" in NEW
+    assert "`modules_not_judged_by_rank` and `starting_state_by_rank`" in NEW and "`starting_state_by_rank`**" in AGENT
+
+
+def test_two_runs_observed_differently_say_so_under_provenance_differs():
+    def run(name: str, source: dict) -> list[dict]:
+        rows = plain_rows(name, range(40))
+        rows[0]["moe_source"] = source
+        return rows
+    found = divergence.first_divergence(run("a", {"r": {"form": "scores", "point": "requested"}}),
+                                        run("b", {"r": {"form": "map", "point": "dispatched"}}))
+    assert set(found["provenance_differs"]) == {"moe_source"}
+    assert set(found["provenance_differs"]["moe_source"]) == {"a", "b"}
+    assert "moe_source" not in (found.get("left_out") or {}).get("not_compared", [])
+    assert "The runs differ in how the routers' counts were read" in divergence.divergence_summary(found)
+    assert "`provenance_differs`" in NEW and "`provenance_differs`**" in AGENT
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("name", list(AG_CASES))
+def test_a_router_recorded_with_no_tokens_is_named_as_the_pages_say(monkeypatch, engine, name):
+    if BINARY:
+        monkeypatch.setenv("TENSORQUILL_SERVER_BIN", str(BINARY))
+    given = AG_CASES[name]["given"]
+    found = ev.build_evidence(given["records"] if isinstance(given, dict) else given, detectors=engine)
+    entries = [e for e in found.get("not_checked", []) if e.get("check") == "moe_routing"]
+    values = {kind: found["kind_checks"][kind]["value"] for kind in ("moe_imbalance", "starved_experts")}
+    if name == "every_router_recorded_with_no_tokens":
+        assert values == {"moe_imbalance": "unavailable", "starved_experts": "unavailable"}
+        assert found["run_state"]["state"] == "degraded"
+    else:
+        assert values == {"moe_imbalance": "checked", "starved_experts": "checked"}
+    if name == "routers_that_were_read":
+        assert entries == []
+    else:
+        [entry] = entries
+        assert entry["kinds"] == ["moe_imbalance", "starved_experts"] and entry["routers"] == sorted(entry["routers"])
+    assert "`{\"check\": \"moe_routing\", \"kinds\": [\"moe_imbalance\", \"starved_experts\"], \"routers\": [...], \"reason\": ...}`" in NEW
+    assert "a `not_checked` entry `moe_routing` names them" in flat(GUIDE)
+
+
+def test_a_rewrite_in_place_with_a_later_time_is_read_again_and_one_that_grows_is_not(tmp_path):
+    path = tmp_path / "w.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in plain_rows("w", range(200))))
+    tail = ev._Tail(path, None)
+    assert tail.poll() and len(tail.records) == 200
+    text = path.read_text()
+    middle = len(text) // 2
+    at = text.index('"grad_norm": 1.0', middle)
+    rewritten = text[:at] + '"grad_norm": 9.0' + text[at + len('"grad_norm": 1.0'):]
+    before = os.stat(path)
+    path.write_text(rewritten)  # same length, same first and last 4 KiB
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    assert tail.poll() and tail.restarts == 1
+    assert sum(r["grad_norm"] == 9.0 for r in tail.records) == 1
+    # A rewrite that also grows the file, with the same ends where it was read up to: still read as an append.
+    grown = rewritten.replace('"grad_norm": 9.0', '"grad_norm": 7.0', 1) + json.dumps(plain_rows("w", range(200, 201))[0]) + "\n"
+    path.write_text(grown)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000))
+    tail.poll()
+    assert tail.restarts == 1 and not any(r["grad_norm"] == 7.0 for r in tail.records)
+    readme = flat(README)
+    assert "or whose modification time (`st_mtime_ns`) changed while it did not grow since the last read" in readme
+    assert "both of those 4 KiB stretches and the modification time, or that also grows the file" in readme
+
+
+def test_the_probe_s_overflow_positions_are_the_ones_the_readme_names():
+    from tensorquill import probe
+
+    def call_of(finite_logits: bool, gap_sq: float) -> dict:
+        one = torch.tensor([1.0], dtype=torch.float64)
+        return {"vocab": 4, "norm": one, "mean": one, "var": one, "log_z": one, "gap_sq": torch.tensor([gap_sq], dtype=torch.float64),
+                "logits_finite": torch.tensor([finite_logits]), "input_dtype": "torch.float32", "weight_dtype": "torch.float32"}
+    found = probe._head_numbers([call_of(True, float("inf"))])
+    assert found["overflow_positions"] == 1 and found["nonfinite_positions"] == 0
+    assert found["not_read"].startswith("every position's FP32 logits are finite but the BF16 pass overflows")
+    assert "Positions whose FP32 logits are finite but whose BF16 pass is not" in flat(README)
+    assert "whose finite logits overflow the sums" not in README
+
+
+def checkpoint_tensors(model: nn.Module, state: dict) -> dict:
+    sink = MemorySink()
+    session = tensorquill.init(model, run_id="k", sink=sink, capture="full", heartbeat_seconds=None, start_step=10)
+    session.checkpoint({"model": state}, event="load", model_state=state)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    loss = model(torch.randn(2, 4)).sum()
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    session.close()
+    return next(r["checkpoint"]["load"]["tensors"] for r in sink.records if "load" in (r.get("checkpoint") or {}))
+
+
+class SharedChild(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        shared = nn.Linear(4, 4)
+        self.a = shared
+        self.b = shared
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.b(self.a(x))
+
+
+class WithBuffer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lin = nn.Linear(4, 4)
+        self.register_buffer("b", torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.lin(x) + self.b
+
+
+def test_lane_a_s_three_checkpoint_cases_read_as_the_readme_says():
+    shared = SharedChild()
+    found = checkpoint_tensors(shared, dict(shared.state_dict()))
+    assert found["state"] == "compared" and found["model"] == 4  # a.* and b.*: held twice, named twice
+    plain = nn.Linear(4, 4)
+    state = dict(plain.state_dict())
+    state["module.weight"] = state["weight"]
+    assert checkpoint_tensors(plain, state) | {"closest": None} == {
+        "state": "unavailable", "why": "ambiguous", "collides": "checkpoint", "closest": None}
+    buffered = WithBuffer()
+    del buffered.__dict__["_non_persistent_buffers_set"]
+    assert checkpoint_tensors(buffered, {"lin.weight": buffered.lin.weight.detach(), "lin.bias": buffered.lin.bias.detach(),
+                                         "b": torch.zeros(1)}) == {"state": "unavailable", "why": "model_not_readable"}
+    readme = flat(README)
+    assert "so a module held twice by one parent is named twice" in readme
+    assert "`unavailable`, `ambiguous`, with `collides` naming the side (`model` or `checkpoint`)" in readme
+
+
+def manual_loop(order: str) -> list[dict[str, Any]]:
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 2))
+    sink = MemorySink()
+    session = tensorquill.init(model, run_id="a", sink=sink, capture="full", auto_step=False, heartbeat_seconds=None)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    for _ in range(3):
+        model(torch.randn(3, 4)).sum().backward()
+        if order == "record_grads":
+            session.record_grads()
+        optimizer.step()
+        if order == "step_first":
+            session.step()
+            optimizer.zero_grad()
+        else:
+            optimizer.zero_grad()
+            session.step()
+    session.close()
+    return sink.records
+
+
+def test_with_auto_step_off_the_gradients_are_read_at_session_step():
+    """AUD-2 of the correctness audit, run here first."""
+    assert all(not r.get("grad_norms") and r.get("grad_norm") is None for r in manual_loop("zero_grad_first"))
+    for order in ("step_first", "record_grads"):
+        assert all(len(r["grad_norms"]) == 4 and r["grad_norm"] > 0 for r in manual_loop(order)), order
+    assert "**Call `session.step()` before `optimizer.zero_grad()`.**" in flat(GUIDE)
+    assert "call it before `optimizer.zero_grad()`, or call `session.record_grads()` before clearing" in flat(README)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_checkpoint_loaded_inside_one_attempt_is_recorded_and_judged_by_no_detector(monkeypatch, engine):
+    """AUD-3 of the correctness audit, run here first."""
+    if BINARY:
+        monkeypatch.setenv("TENSORQUILL_SERVER_BIN", str(BINARY))
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 2))
+    sink = MemorySink()
+    session = tensorquill.init(model, run_id="c", sink=sink, capture="full", heartbeat_seconds=None)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    for step in range(30):
+        if step == 20:
+            state = {k: v for k, v in model.state_dict().items() if k != "2.weight"}
+            session.checkpoint({"model": state}, event="load", model_state=state)
+            model.load_state_dict(state, strict=False)
+        loss = model(torch.randn(3, 4)).sum()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    session.close()
+    [load] = [r for r in sink.records if "load" in (r.get("checkpoint") or {})]
+    assert load["checkpoint"]["load"]["tensors"]["missing"] == {"count": 1, "names": ["2.weight"]}
+    assert len({r["attempt"] for r in sink.records}) == 1
+    found = ev.build_evidence(sink.records, detectors=engine)
+    assert found["kind_checks"]["resume_incomplete"]["value"] == "checked"
+    assert "resume_incomplete" not in [i["kind"] for i in found["incidents"]] and "checkpoint_tensors" not in found
+    assert "**Only a load at the start of a later attempt is judged.**" in flat(GUIDE) and "**Only a load at the start of a later attempt is judged.**" in flat(README)
+
+
+class CheckpointedMoE(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.router = nn.Linear(8, 4)
+        self.out = nn.Linear(8, 8)
+
+    def block(self, x: torch.Tensor) -> torch.Tensor:
+        return self.out(x) + self.router(x).softmax(-1).sum(-1, keepdim=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from torch.utils.checkpoint import checkpoint
+
+        return checkpoint(self.block, x, use_reentrant=True)
+
+
+def routed(mode: str) -> list[list[int]]:
+    torch.manual_seed(0)
+    model = CheckpointedMoE()
+    model.train(mode == "train")
+    sink = MemorySink()
+    session = tensorquill.init(model, run_id="e", sink=sink, routers={"router": Router(4, top_k=1)}, heartbeat_seconds=None)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    torch.manual_seed(1)
+    for _ in range(4):
+        x = torch.randn(6, 8, requires_grad=True)
+        loss = model(x).sum()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    session.close()
+    return [r["moe"]["router"] for r in sink.records]
+
+
+def test_training_in_eval_mode_under_reentrant_checkpointing_is_counted_as_in_train_mode():
+    """Lane B's wave AG fix (contract section 8): the counts come from the recomputation inside backward."""
+    train, evaluated = routed("train"), routed("eval")
+    assert evaluated == train and all(sum(counts) == 6 for counts in evaluated)
+    readme = flat(README)
+    assert "**Training in eval mode under reentrant activation checkpointing**" in readme
+    assert "training with modules kept in eval mode, or without gradients as reentrant activation checkpointing runs its forward, is recorded as before" not in readme
+
+
+def test_the_trend_memo_is_stated_without_a_claim_of_speed():
+    assert "a series with no new point gives the trend found before. The report is the same as before. Its cost was not measured." in NEW
+    assert "faster" not in NEW and "speed" not in NEW
