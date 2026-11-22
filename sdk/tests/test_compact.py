@@ -27,10 +27,17 @@ def _size(evidence) -> int:
 
 
 def _without_replica_steps(evidence):
-    """`evidence` with `replica.steps` set aside, the one list compact shortens besides `samples`."""
+    """`evidence` with the two replica lists compact shortens besides `samples` set aside:
+    `replica.steps`, and `kind_checks.replica_drift.coverage`'s `not_compared` with its
+    `not_compared_omitted` (shortened only when every gap listed is a one-rank case)."""
     if not isinstance(evidence.get("replica"), dict):
         return evidence
-    return {**evidence, "replica": {k: v for k, v in evidence["replica"].items() if k != "steps"}}
+    out = {**evidence, "replica": {k: v for k, v in evidence["replica"].items() if k != "steps"}}
+    check = (evidence.get("kind_checks") or {}).get("replica_drift")
+    if isinstance(check, dict) and isinstance(check.get("coverage"), dict):
+        coverage = {k: v for k, v in check["coverage"].items() if k not in ("not_compared", "not_compared_omitted")}
+        out["kind_checks"] = {**evidence["kind_checks"], "replica_drift": {**check, "coverage": coverage}}
+    return out
 
 
 # --- The plan's line, on the detector benchmark's Granite-shaped run -------------------------
@@ -89,6 +96,9 @@ def test_a_10000_step_moe_run_gives_a_compact_file_under_1_mb(granite_run, tmp_p
         json.dumps(_without_replica_steps({k: v for k, v in seeded.items() if k != "samples"}))
     )
     assert small["replica"]["steps"] == [] and marker["replica_steps"]["omitted"] == len(seeded["replica"]["steps"]) == 200
+    # Its one rank's coverage list, 20 one-rank gaps of 200, keeps the latest and counts the rest.
+    assert marker["replica_not_compared"] == {"listed": 20, "kept": 1, "removed": 19, "not_compared_omitted": 180}
+    assert small["kind_checks"]["replica_drift"]["coverage"]["not_compared_omitted"] == 199
     # The same text for both files.
     assert incident_summary(small) == incident_summary(seeded)
     assert "First sampled bad step 6000  ·  Layer 06" in incident_summary(small)
@@ -103,7 +113,9 @@ def test_a_10000_step_moe_run_gives_a_compact_file_under_1_mb(granite_run, tmp_p
         {**s, "overloaded": [], "dead": []} for s in seeded["samples"]
     ]})
     assert nothing["samples"] == [] and nothing["compact"]["samples"]["omitted"] == 240_000
-    assert _size(nothing) < 12_000  # 10,178 bytes with the two measurement blocks of the rules contract, part 6 (8,221 before)
+    # 10,597 bytes with the benchmark's replica observations, their routine steps and one-rank gaps
+    # compacted (wave AF); 10,178 with the two measurement blocks of the rules contract, part 6 (8,221 before).
+    assert _size(nothing) < 12_000
 
 
 # --- Small runs: the window's edges, and what each reader of samples says ---------------------
@@ -469,3 +481,112 @@ def test_a_replica_step_entry_that_says_something_is_never_routine():
 def test_evidence_without_replica_steps_has_no_replica_marker():
     assert "replica_steps" not in compact_evidence({"incidents": []})["compact"]
     assert "replica_steps" not in compact_evidence({"replica": {"v": 1}})["compact"]
+
+
+# --- The one-rank coverage list (the author's choice of option 1, Nov 21, 2026) ---------------
+#
+# "When every listed gap is a one-rank case, keep the latest entry per distinct launch, group and
+# reason. ... Leave mixed coverage lists intact, including any list with a genuinely missing peer."
+
+def _groups_view(steps: int, groups, *, launch_from=None, skip=None):
+    """An all-ranks view whose ranks observe every 50 steps (49, 99, ...) in `groups` (each a
+    list of ranks), from the contract case's healthy observation. From step `launch_from` on, a
+    second launch; `skip` is `(rank, step)`, an observation that rank does not send."""
+    from tensorquill.evidence import combine_rank_evidence
+
+    case = json.loads(_REPLICA_CASES.read_text())["cases"]["three_ranks_two_to_one"]
+    healthy = case["records"][0]["replica"]
+    ranks = sorted(rank for group in groups for rank in group)
+    records = []
+    for step in range(steps):
+        for rank in ranks:
+            record = {"schema_version": 1, "run_id": "r1", "rank": rank, "attempt": 1795000000101 + rank,
+                      "step": step, "loss": 1.0}
+            if step % 50 == 49 and (rank, step) != skip:
+                group = next(g for g in groups if rank in g)
+                launch = "b" * 32 if launch_from is not None and step >= launch_from else healthy["launch"]
+                record["replica"] = {**copy.deepcopy(healthy), "group": list(group), "launch": launch}
+            records.append(record)
+    per_rank = {r: tensorquill.build_evidence([x for x in records if x["rank"] == r]) for r in ranks}
+    return combine_rank_evidence(per_rank, replica_records=records)
+
+
+def _same_words(small, full):
+    from tensorquill.evidence import replica_line
+
+    assert replica_line(small) == replica_line(full) and replica_line(full) is not None
+    assert incident_summary(small) == incident_summary(full)
+
+
+def _kind_entry_but_list(small, full):
+    """The kind's entry as in the full evidence but for `coverage.not_compared` and `not_compared_omitted`."""
+    def trimmed(entry):
+        return {**entry, "coverage": {k: v for k, v in entry["coverage"].items()
+                                      if k not in ("not_compared", "not_compared_omitted")}}
+    assert trimmed(small["kind_checks"]["replica_drift"]) == trimmed(full["kind_checks"]["replica_drift"])
+    assert list(small["kind_checks"]) == list(full["kind_checks"])
+    assert {k: v for k, v in small["kind_checks"].items() if k != "replica_drift"} == {
+        k: v for k, v in full["kind_checks"].items() if k != "replica_drift"}
+
+
+def test_one_rank_alone_keeps_its_latest_gap_and_counts_every_other():
+    full = _healthy_one_rank(2_000)
+    listed = full["kind_checks"]["replica_drift"]["coverage"]
+    assert len(listed["not_compared"]) == 20 and listed["not_compared_omitted"] == 20
+    small = compact_evidence(full)
+    coverage = small["kind_checks"]["replica_drift"]["coverage"]
+    assert coverage["not_compared"] == [listed["not_compared"][-1]]
+    assert coverage["not_compared_omitted"] == 39
+    assert list(coverage) == list(listed)
+    assert small["compact"]["replica_not_compared"] == {"listed": 20, "kept": 1, "removed": 19, "not_compared_omitted": 20}
+    _kind_entry_but_list(small, full)
+    _same_words(small, full)
+    assert small["kind_checks"]["replica_drift"]["note"] == "one rank observed, zero peers compared"
+    assert full["kind_checks"]["replica_drift"]["coverage"]["not_compared_omitted"] == 20  # the full evidence is not changed
+
+
+def test_one_rank_groups_keep_the_latest_gap_of_each_launch_and_group_in_their_order():
+    # Two ranks, each its own group; the launch changes for the last four observed steps.
+    full = _groups_view(2_000, [[0], [1]], launch_from=1_800)
+    listed = full["kind_checks"]["replica_drift"]["coverage"]["not_compared"]
+    assert len(listed) == 20 and all(g["fingerprints_why"] == "one_rank" for g in listed)
+    assert full["kind_checks"]["replica_drift"]["coverage"]["not_compared_omitted"] == 60
+    small = compact_evidence(full)
+    kept = small["kind_checks"]["replica_drift"]["coverage"]["not_compared"]
+    first, second = full["replica"]["steps"][0]["launch"], "b" * 32
+    assert [(g["step"], g["launch"], g["group"]) for g in kept] == [
+        (1799, first, [0]), (1799, first, [1]), (1999, second, [0]), (1999, second, [1])]
+    assert kept == [g for g in listed if (g["step"], g["launch"], tuple(g["group"])) in {
+        (1799, first, (0,)), (1799, first, (1,)), (1999, second, (0,)), (1999, second, (1,))}]
+    assert kept[-1] == listed[-1]
+    assert small["kind_checks"]["replica_drift"]["coverage"]["not_compared_omitted"] == 76
+    assert small["compact"]["replica_not_compared"] == {"listed": 20, "kept": 4, "removed": 16, "not_compared_omitted": 60}
+    _kind_entry_but_list(small, full)
+    _same_words(small, full)
+
+
+def test_a_coverage_list_with_a_missing_peer_is_left_whole():
+    # Rank 0 alone, and ranks 1 and 2 together; rank 2 sends nothing at step 1949.
+    full = _groups_view(2_000, [[0], [1, 2]], skip=(2, 1949))
+    coverage = full["kind_checks"]["replica_drift"]["coverage"]
+    assert coverage["missing_ranks"] == [2]
+    assert {g.get("fingerprints_why") for g in coverage["not_compared"]} == {"one_rank", None}
+    small = compact_evidence(full)
+    assert small["kind_checks"] == full["kind_checks"]
+    assert "replica_not_compared" not in small["compact"]
+    _same_words(small, full)
+
+
+def test_a_short_one_rank_list_keeps_its_latest_and_a_list_of_one_is_left_whole():
+    # One rank observed twice: both gaps listed and none counted apart; the latest is kept and
+    # `not_compared_omitted` appears. Observed once: nothing to remove, so no marker.
+    full = _healthy_one_rank(100)
+    assert len(full["kind_checks"]["replica_drift"]["coverage"]["not_compared"]) == 2
+    small = compact_evidence(full)
+    assert small["kind_checks"]["replica_drift"]["coverage"]["not_compared_omitted"] == 1
+    assert small["compact"]["replica_not_compared"] == {"listed": 2, "kept": 1, "removed": 1, "not_compared_omitted": 0}
+    _same_words(small, full)
+    single = _healthy_one_rank(60)
+    assert len(single["kind_checks"]["replica_drift"]["coverage"]["not_compared"]) == 1
+    assert compact_evidence(single)["kind_checks"] == single["kind_checks"]
+    assert "replica_not_compared" not in compact_evidence(single)["compact"]

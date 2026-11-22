@@ -27,6 +27,7 @@ kept step whose table compares it with a step left out shows its loads with no d
 from __future__ import annotations
 
 import argparse
+import json
 from bisect import bisect_left
 from pathlib import Path
 from typing import Any, Mapping
@@ -120,6 +121,48 @@ def _replica_anchors(evidence: Mapping[str, Any], replica: Mapping[str, Any]) ->
     return [{"kind": kind, "step": step} for step, kind in sorted(found, key=lambda f: (f[0], order.index(f[1])))]
 
 
+def _compact_coverage(evidence: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """`kind_checks` with the one-rank list of `replica_drift.coverage` shortened, and the marker's
+    `replica_not_compared`; None when nothing is shortened (the author's choice of Nov 21, 2026).
+
+    Only when every listed gap is a one-rank case (`fingerprints_why: "one_rank"`, as
+    `replica_kind_check` reads a run with no peer): the latest gap of each distinct launch, group
+    and reason is kept, in the list's own order, so the latest gap stays last, and
+    `not_compared_omitted` counts every other, so `replica_line` reads the same. A list with any
+    other gap (a missing peer among them) is left whole, and every other key of the entry is
+    kept as it is."""
+    checks = evidence.get("kind_checks")
+    check = checks.get("replica_drift") if isinstance(checks, Mapping) else None
+    coverage = check.get("coverage") if isinstance(check, Mapping) else None
+    listed = coverage.get("not_compared") if isinstance(coverage, Mapping) else None
+    if not isinstance(listed, list) or not listed:
+        return None
+    if not all(isinstance(gap, Mapping) and gap.get("fingerprints_why") == "one_rank" for gap in listed):
+        return None
+    already = coverage.get("not_compared_omitted", 0)
+    if isinstance(already, bool) or not isinstance(already, int):
+        return None
+
+    def kind(gap: Mapping[str, Any]) -> str:
+        group = gap.get("group")
+        return json.dumps([gap.get("launch"), group if isinstance(group, list) else None,
+                           gap.get("why"), gap.get("fingerprints_why")], default=str)
+
+    latest = {kind(gap): at for at, gap in enumerate(listed)}
+    kept = [gap for at, gap in enumerate(listed) if latest[kind(gap)] == at]
+    if len(kept) == len(listed):
+        return None
+    shortened: dict[str, Any] = {}
+    for key, value in coverage.items():
+        if key == "not_compared_omitted":
+            continue
+        shortened[key] = kept if key == "not_compared" else value
+        if key == "not_compared":
+            shortened["not_compared_omitted"] = already + len(listed) - len(kept)
+    marker = {"listed": len(listed), "kept": len(kept), "removed": len(listed) - len(kept), "not_compared_omitted": already}
+    return {**checks, "replica_drift": {**check, "coverage": shortened}}, marker
+
+
 def _compact_replica(evidence: Mapping[str, Any], window: int) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """`replica` with its routine step entries left out, and the marker's `replica_steps`; None
     when the evidence has no step list. A step is kept whole (every entry of it) when any entry
@@ -209,11 +252,17 @@ def compact_evidence(evidence: Mapping[str, Any], window: int = DEFAULT_WINDOW) 
                        attribution entry, a step `kind_checks.replica_drift` names), `kept_steps`
                        (`[[first, last], ...]` of observed steps kept whole) and `observed_steps`
                        (`[first, last]` observed step of the full list, or null)
+        replica_not_compared  only when `kind_checks.replica_drift.coverage.not_compared` was
+                       shortened (`_compact_coverage`): `{"listed", "kept", "removed",
+                       "not_compared_omitted"}`, the gaps the full evidence listed, kept here,
+                       removed here, and those the full evidence already counted and did not list
 
     Of `replica`, only `steps` is shortened, and only of routine entries (`_routine`: complete
     coverage, fingerprints and signatures agreeing or a group of one rank, nothing else said);
-    every other key of it (`v`, `tolerance`, `replica_drift`, `attribution`, `legacy`), the
-    `kind_checks` entry with its coverage, and the incidents are as in the full evidence.
+    every other key of it (`v`, `tolerance`, `replica_drift`, `attribution`, `legacy`) and the
+    incidents are as in the full evidence. Of `kind_checks`, only a one-rank list of
+    `replica_drift.coverage.not_compared` is shortened, with `not_compared_omitted` counting what
+    it leaves out, so the verdict, the counts, the missing ranks and the words are the full one's.
 
     Evidence with no samples (a run without routers, a server's report, the all-ranks view)
     comes back whole but for routine replica step entries, with the marker. Evidence that is already compact
@@ -273,6 +322,9 @@ def compact_evidence(evidence: Mapping[str, Any], window: int = DEFAULT_WINDOW) 
     replica = _compact_replica(evidence, window)
     if replica is not None:
         marker["replica_steps"] = replica[1]
+    coverage = _compact_coverage(evidence)
+    if coverage is not None:
+        marker["replica_not_compared"] = coverage[1]
     out: dict[str, Any] = {}
     for key, value in evidence.items():
         if key == "samples":
@@ -280,6 +332,8 @@ def compact_evidence(evidence: Mapping[str, Any], window: int = DEFAULT_WINDOW) 
             out["samples"] = kept
         elif key == "replica" and replica is not None:
             out[key] = replica[0]
+        elif key == "kind_checks" and coverage is not None:
+            out[key] = coverage[0]
         else:
             out[key] = value
     out.setdefault("compact", marker)
