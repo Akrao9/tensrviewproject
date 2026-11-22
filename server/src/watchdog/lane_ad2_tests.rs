@@ -222,6 +222,12 @@ fn held_for_status(dog: &Watchdog, _now: Instant) -> usize {
 /// The fingerprints `fingerprints_print` gave at `eb5a71b`, the lane's base, where the lookup was a
 /// search of a list and the lock was held for the whole pass: (world size, most seen, ranks seen,
 /// size declared, second judged at, status, run state).
+///
+/// Eight of them (six statuses and two run states, in the six cases that hold ranks 275, 649, ... or
+/// 2893) were taken again at wave AH, Nov 22, 2026: those ranks stop after their first batch and
+/// their stream then drops, so they now read `reconnecting` with the warning they had and
+/// `stopped_as`, and are listed as stopped (P1-1). Checked rank by rank when they were retaken: no
+/// other rank's entry carries `stopped_as`. The other 26 are the base's.
 const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
     (1, true, 1, true, 400, "1223:e003d7fce7c72736", "371:a1d2652f4b8bc9c9"),
     (1, false, 0, true, 400, "331:15179483c82d6405", "108:3f785a961528264b"),
@@ -243,7 +249,7 @@ const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
         448,
         true,
         400,
-        "269569:408d66b83d5b28a8",
+        "269766:956dfbd746d7ec46",
         "1983:b82bc65798191ef2",
     ),
     (
@@ -261,7 +267,7 @@ const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
         3584,
         true,
         400,
-        "2160787:8445a0323ea9c2c8",
+        "2164038:1bbe9d6b7460e2e0",
         "12918:853269510235a058",
     ),
     (
@@ -270,7 +276,7 @@ const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
         512,
         true,
         400,
-        "342873:d08bcd796c3d53f4",
+        "343070:00c26a2e7a9f6a4b",
         "18866:3d969ddfc13886fd",
     ),
     (
@@ -307,7 +313,7 @@ const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
         512,
         false,
         400,
-        "342853:001803a51a247a96",
+        "343050:c44fd70bf876ebc9",
         "18856:443572dbae681243",
     ),
     (
@@ -316,8 +322,8 @@ const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
         512,
         true,
         200,
-        "272731:cd4e8900ac99d1d3",
-        "18730:55df7fe06a011545",
+        "303791:02a67843428ed4d9",
+        "18866:3d969ddfc13886fd",
     ),
     (
         4096,
@@ -325,8 +331,8 @@ const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
         3584,
         true,
         200,
-        "1905681:23867144b7a88f7a",
-        "12782:6cfdd84cbc93586c",
+        "2123513:2742447490cf087d",
+        "12918:853269510235a058",
     ),
 ];
 

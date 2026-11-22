@@ -14,7 +14,9 @@ again with no progress, and a new step, with the real evidence fed to a real `Tr
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import subprocess
 import sys
 import threading
 import time
@@ -134,41 +136,76 @@ FLAGS = ("--silent-seconds", "2", "--silent-factor", "0", "--critical-seconds", 
 ATTEMPT = 5
 
 
+STREAM = r"""
+import json, sys
+import pyarrow as pa
+import pyarrow.flight as flight
+from tensorquill.flight import flight_schema, records_to_batch
+
+endpoint, run, rank, attempt = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+client = flight.FlightClient(endpoint)
+descriptor = flight.FlightDescriptor.for_path("runs", run, f"rank={rank}")
+writer, reader = client.do_put(descriptor, flight_schema(), flight.FlightCallOptions(timeout=300.0))
+offset = 0
+print("open", flush=True)
+for line in sys.stdin:
+    word, *numbers = line.split()
+    if word == "close":
+        writer.done_writing()
+        writer.close()
+        break
+    first, end = map(int, numbers)
+    records = [{"schema_version": 1, "run_id": run, "rank": rank, "attempt": attempt, "step": step,
+                "ts": float(step), "grad_norm": 1.0, "lr": [0.1]} for step in range(first, end)]
+    offset += 100 * len(records)
+    metadata = {"schema_version": 1, "run_id": run, "rank": rank, "world_size": 2, "sender_attempt": attempt,
+                "min_step": first, "max_step": end - 1, "end_byte_offset": offset}
+    writer.write_with_metadata(records_to_batch(records), pa.py_buffer(json.dumps(metadata).encode()))
+    reader.read()
+    print("stored", flush=True)
+client.close()
+"""
+
+
 class RankStream:
-    """One `DoPut` stream of a rank, as `test_lane_w2_attempt_order.Stream` is for rank 0."""
+    """One `DoPut` stream of a rank, held by a process of its own, as a training process holds
+    its sender's: `drop` kills it, which is what the server sees when a job is killed."""
 
     def __init__(self, endpoint: str, rank: int) -> None:
-        flight = pytest.importorskip("pyarrow.flight")
-        from tensorquill.flight import flight_schema
-
-        self.rank, self.offset = rank, 0
-        self.client = flight.FlightClient(endpoint)
-        descriptor = flight.FlightDescriptor.for_path("runs", RUN, f"rank={rank}")
-        self.writer, self.reader = self.client.do_put(descriptor, flight_schema(), flight.FlightCallOptions(timeout=120.0))
+        self.process = subprocess.Popen(
+            [sys.executable, "-c", STREAM, endpoint, RUN, str(rank), str(ATTEMPT)], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, text=True, env={**os.environ, "PYTHONPATH": str(Path(ev.__file__).resolve().parents[1])},
+        )
+        assert self.process.stdout.readline().strip() == "open"
 
     def send(self, steps: range) -> None:
-        import pyarrow as pa
-        from tensorquill.flight import records_to_batch
-
-        records = [{"schema_version": 1, "run_id": RUN, "rank": self.rank, "attempt": ATTEMPT, "step": step,
-                    "ts": float(step), "grad_norm": 1.0, "lr": [0.1]} for step in steps]
-        self.offset += 100 * len(records)
-        metadata = {"schema_version": 1, "run_id": RUN, "rank": self.rank, "world_size": 2, "sender_attempt": ATTEMPT,
-                    "min_step": steps[0], "max_step": steps[-1], "end_byte_offset": self.offset}
-        self.writer.write_with_metadata(records_to_batch(records), pa.py_buffer(json.dumps(metadata).encode()))
-        self.reader.read()
+        """Send the steps and wait for the server's acknowledgement, which comes once they are stored."""
+        self.process.stdin.write(f"send {steps[0]} {steps[-1] + 1}\n")
+        self.process.stdin.flush()
+        assert self.process.stdout.readline().strip() == "stored"
 
     def drop(self) -> None:
-        """The process is gone: the connection closes with the stream not ended."""
-        self.client.close()
+        """SIGKILL: the connection goes with the process, and the stream never ends."""
+        self.process.kill()
+        self._reap()
 
     def close(self) -> None:
-        try:
-            self.writer.done_writing()
-            self.writer.close()
-        except Exception:  # noqa: BLE001
-            pass
-        self.client.close()
+        if self.process.poll() is None:
+            try:
+                self.process.stdin.write("close\n")
+                self.process.stdin.flush()
+                self.process.wait(20)
+            except (OSError, subprocess.TimeoutExpired):
+                self.process.kill()
+        self._reap()
+
+    def _reap(self) -> None:
+        self.process.wait(20)
+        for pipe in (self.process.stdin, self.process.stdout):
+            try:
+                pipe.close()
+            except OSError:
+                pass
 
 
 def rank_of(status: dict, rank: int) -> dict:
@@ -242,7 +279,8 @@ def test_the_real_server_holds_a_critical_stall_through_the_drop_and_the_trigger
     finally:
         stop.set()
         stepping.join(10)
-        zero.close()
+        for stream in (zero, one):
+            stream.close()
         trigger.close(wait=10)
         server.stop()
     assert [c["payload"]["kind"] for c in calls()] == ["rank_silent"], seen

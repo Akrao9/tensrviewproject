@@ -11,7 +11,9 @@
 //! - `silent`: the stream is open but no progress for longer than the threshold. A hung
 //!   process keeps its connection open, so this is what a hang looks like.
 //! - `reconnecting`: the stream dropped without ending (a crash, or a network failure) a
-//!   short while ago; the sender reconnects within seconds when its process is alive.
+//!   short while ago; the sender reconnects within seconds when its process is alive. It says
+//!   what the connection is doing, not that the rank is well: see "A stopped rank whose stream
+//!   drops" below.
 //! - `lost`: it dropped and did not come back for longer than the floor.
 //! - `finished`: the stream ended cleanly, as `close()` does.
 //!
@@ -36,6 +38,30 @@
 //! not finished or abandoned: see below), plus the missing ranks implied by `world_size`
 //! (sent by the SDK) or by gaps below the highest rank seen. The thresholds are not
 //! calibrated: set `--silent-seconds` above the longest evaluation or checkpoint pause.
+//!
+//! # A stopped rank whose stream drops
+//!
+//! A rank that reads `silent` or `unresponsive` when its stream drops was already stopped, and a
+//! hung process that is then killed is the usual way such a stall ends (wave AH, P1-1, decided
+//! Nov 22, 2026; until then it read `reconnecting` with no severity for the whole floor, and a
+//! run whose one critical rank had just been killed read `active` with no incident). The stall is
+//! kept with the rank (`held`): what it read at the drop, and the start of its quiet clock.
+//!
+//! - While its stream is dropped the rank reads `reconnecting`, and after the floor `lost`, as any
+//!   dropped stream does. Its entry carries `stopped_as` (`silent` or `unresponsive`), and its
+//!   `severity` is counted on the clock it had: it does not start again at the drop, so a warning
+//!   becomes critical on time and a critical rank is never back at warning.
+//! - A `reconnecting` rank with a severity is a stopped rank to every reader ([`is_stopped`]): it
+//!   is not counted active in the summary, and the run's `rank_silent` or `job_stalled` incident
+//!   goes on listing it. The assessment stays what it was until the rank reads `lost`.
+//! - A rank that was not stopped at the drop is `reconnecting` with no severity for the floor, as
+//!   before. It is judged as it read at the drop, never by how old its last batch is later.
+//! - A stream that opens again changes nothing by itself: the rank is judged by its own clocks,
+//!   which only a new step moves (or, before its first batch, its work counter), so it reads
+//!   `silent` again at once. A new step recovers it as it recovers any silent rank.
+//! - A newer attempt that takes the rank clears it ([`Progress::take_attempt`]).
+//! - A server restart does not carry it: every rank that was not finished gets a fresh window
+//!   (below), as decided Nov 17, 2026.
 //!
 //! # A restart does not forget what the server saw
 //!
@@ -370,6 +396,12 @@ pub struct Progress {
     /// it, and the last step committed before it stopped as the beat said it ([`StoppedAt`]).
     /// Kept whatever state the rank reads, until a newer attempt owns the rank.
     capture_stopped: Option<(String, Instant, StoppedAt)>,
+    /// The stall the rank was in when its stream dropped (wave AH, P1-1): the state it read then
+    /// (`Silent` or `Unresponsive`) and the start of its quiet clock. Kept while the stream is
+    /// dropped, so the rank's severity and the run's incident outlast the drop; gone when the
+    /// stream opens again (the rank's own clocks say the same), at a new step, and when a newer
+    /// attempt takes the rank. Not carried over a server restart.
+    held: Option<(RankState, Instant)>,
 }
 
 /// The last step a session committed before its capture stopped, as its heartbeat said it
@@ -410,6 +442,7 @@ impl Progress {
             rows_not_newer: 0,
             late_steps_confirmed: 0,
             capture_stopped: None,
+            held: None,
         }
     }
 
@@ -427,6 +460,8 @@ impl Progress {
         let known = self.attempt != 0 || self.last_step.is_some() || self.attempt_since.is_some();
         self.attempt = attempt;
         self.capture_stopped = None;
+        // The earlier attempt's stall is not this attempt's (wave AH, P1-1).
+        self.held = None;
         // A rank whose stream had finished: the job was started again, and the new process
         // has not opened its stream. It is a stream not open yet from this beat, under the start
         // window, and not finished (decided Nov 19, 2026; until then it read finished for good,
@@ -631,7 +666,8 @@ impl Progress {
     /// went from `starting` to `critical` with no warning: RS08.)
     fn quiet_seconds(&self, state: RankState, now: Instant) -> f64 {
         let since = match self.stream {
-            Stream::Dropped => self.last_change,
+            // A rank that was stopped when its stream dropped keeps the clock it had (wave AH).
+            Stream::Dropped => self.held.map_or(self.last_change, |(_, since)| since),
             Stream::Open if matches!(state, RankState::Silent | RankState::Unresponsive) && self.no_batch() => {
                 if self.stepped {
                     self.work_moved
@@ -660,6 +696,14 @@ impl Progress {
         critical.max(CRITICAL_THRESHOLDS * self.threshold(config))
     }
     /// Seconds since the stream dropped or finished, none while a stream is open.
+    /// The stall the rank was in when its stream dropped, while `state` is what a dropped stream
+    /// reads (wave AH, P1-1): the state it had then.
+    fn held_as(&self, state: RankState) -> Option<RankState> {
+        self.held
+            .filter(|_| matches!(state, RankState::Reconnecting | RankState::Lost))
+            .map(|(was, _)| was)
+    }
+
     fn disconnected_seconds(&self, now: Instant) -> Option<f64> {
         match self.stream {
             Stream::Open => None,
@@ -829,6 +873,8 @@ impl Progress {
                 let step = stopped.get("step").map(Value::as_i64);
                 (reason, ago(now, since), step)
             }),
+            // Not carried: every rank that was not finished gets a fresh window at a restart.
+            held: None,
         })
         .map(|mut progress| {
             // A fresh window from the restart for every rank that was not finished (decided Nov 17,
@@ -986,14 +1032,29 @@ impl Watchdog {
             p.stream = Stream::Open;
             p.last_change = now;
             p.fresh = None;
+            // Judged by its own clocks from here, which the reopening did not move: a rank that
+            // was stopped reads stopped again at once (wave AH, P1-1).
+            p.held = None;
         });
     }
 
     /// `clean` is true when the sender ended the stream itself, as `close()` does.
     pub fn stream_ended(&self, key: &Key, clean: bool, now: Instant) {
+        let config = &self.config;
         self.with(key, now, |p| {
+            // What the rank read with its stream still open: a rank already stopped keeps that
+            // through the drop (wave AH, P1-1). Judged here, as of the drop, and never later: a
+            // healthy rank that was killed has an old last batch and stale beats within seconds.
+            let before = p.state(now, config);
+            let was_open = p.stream == Stream::Open;
             p.open_streams = p.open_streams.saturating_sub(1);
             if p.open_streams == 0 {
+                if clean {
+                    p.held = None;
+                } else if was_open {
+                    p.held = matches!(before, RankState::Silent | RankState::Unresponsive)
+                        .then(|| (before, ago(now, p.quiet_seconds(before, now))));
+                }
                 p.stream = if clean { Stream::Finished } else { Stream::Dropped };
                 p.last_change = now;
             }
@@ -1304,6 +1365,7 @@ impl Watchdog {
                     _ => step,
                 });
                 p.last_progress = now;
+                p.held = None;
             }
         });
     }
@@ -1408,13 +1470,20 @@ pub fn run_status(
     let missing: Vec<i32> = if settled { unseen.clone() } else { Vec::new() };
     let states: Vec<RankState> = members.iter().map(|(_, p)| p.state(now, config)).collect();
     let count = |wanted: &[RankState]| states.iter().filter(|state| wanted.contains(state)).count();
+    // A rank that was stopped when its stream dropped is stopped while it reconnects, not active
+    // (wave AH, P1-1; until Nov 22, 2026 every reconnecting rank was counted active).
+    let held = members
+        .iter()
+        .zip(&states)
+        .filter(|((_, p), state)| **state == RankState::Reconnecting && p.held_as(**state).is_some())
+        .count();
     let active = count(&[
         RankState::Active,
         RankState::Reconnecting,
         RankState::Paused,
         RankState::Starting,
-    ]);
-    let stopped = count(&[RankState::Silent, RankState::Lost, RankState::Unresponsive]);
+    ]) - held;
+    let stopped = count(&[RankState::Silent, RankState::Lost, RankState::Unresponsive]) + held;
     let all_finished = !members.is_empty() && count(&[RankState::Finished]) == members.len();
     let capture_stopped = count(&[RankState::CaptureStopped]);
     let summary = if !running {
@@ -1441,12 +1510,16 @@ pub fn run_status(
         .iter()
         .zip(&states)
         .map(|((rank, p), state)| {
+            // A rank that was stopped when its stream dropped is judged as what it was then, on
+            // the clock it had (wave AH, P1-1).
+            let held = p.held_as(*state);
             let quiet = p.quiet_seconds(*state, now);
-            let critical = p.critical_after(*state, config);
+            let critical = p.critical_after(held.unwrap_or(*state), config);
             let severity = match state {
                 RankState::Silent | RankState::Lost | RankState::Unresponsive => {
                     Some(if quiet > critical { "critical" } else { "warning" })
                 }
+                RankState::Reconnecting if held.is_some() => Some(if quiet > critical { "critical" } else { "warning" }),
                 _ => None,
             };
             let mut entry = json!({
@@ -1466,6 +1539,9 @@ pub fn run_status(
                 },
                 "state": state.as_str(),
             });
+            if let Some(was) = held {
+                entry["stopped_as"] = json!(was.as_str());
+            }
             if p.attempt_since.is_some() {
                 // `attempt` is a new one, seen in its heartbeats, that has stored no step: `last_step`
                 // is null (the earlier attempt's steps are not its own), and the time since progress
@@ -1818,8 +1894,16 @@ pub fn incidents(status: &Value) -> Vec<Value> {
 
 /// Whether a rank's entry in a status is a stopped rank: the one rule of every reader here, and of
 /// Python's `evidence.rank_is_stopped` (shared cases: `sdk/tests/fixtures/wave_ah/cases.json`).
+///
+/// `silent`, `lost` and `unresponsive` are stopped. So is a `reconnecting` rank with a severity:
+/// the server gives one only to a rank that was already stopped when its stream dropped (wave AH,
+/// P1-1). A reconnecting rank with none was healthy at the drop and is not stopped.
 pub fn is_stopped(rank: &Value) -> bool {
-    matches!(rank["state"].as_str(), Some("silent" | "lost" | "unresponsive"))
+    match rank["state"].as_str() {
+        Some("silent" | "lost" | "unresponsive") => true,
+        Some("reconnecting") => matches!(rank["severity"].as_str(), Some("warning" | "critical")),
+        _ => false,
+    }
 }
 
 fn progress_incidents(status: &Value) -> Vec<Value> {

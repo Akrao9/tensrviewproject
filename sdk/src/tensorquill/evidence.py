@@ -1337,6 +1337,22 @@ def stuck_at(rank: Mapping[str, Any]) -> dict[str, Any] | None:
 STACK_ODD_SHARE = 0.25  # an odd group: one rank, or at most this share of the ranks with a stack
 STACK_GROUPS_SHOWN = 8
 _STOPPED_STATES = ("silent", "lost", "unresponsive")
+
+
+def rank_is_stopped(rank: Any) -> bool:
+    """Whether a rank's entry in a server status is a stopped rank: the one rule of every reader
+    here, and `is_stopped` in the server's `watchdog.rs` (shared cases:
+    `tests/fixtures/wave_ah/cases.json`).
+
+    `silent`, `lost` and `unresponsive` are stopped. So is a `reconnecting` rank with a severity:
+    the server gives one only to a rank that was already stopped when its stream dropped, and
+    says what it was in `stopped_as` (wave AH, P1-1, Nov 22, 2026: until then a hung rank that was
+    killed read as a healthy rank reconnecting for the whole silence floor). A `reconnecting` rank
+    with no severity was healthy when its stream dropped and is not stopped."""
+    if not isinstance(rank, Mapping):
+        return False
+    state = rank.get("state")
+    return state in _STOPPED_STATES or (state == "reconnecting" and rank.get("severity") in ("warning", "critical"))
 _STACK_CAVEATS = (
     "an observation of where each stopped rank's main thread was, never the cause: the papers disagree on whether"
     " the odd rank is the culprit (Mycroft takes it as the stuck one; ByteRobust treats ranks outside the largest"
@@ -1391,7 +1407,7 @@ def group_stopped_stacks(status: Mapping[str, Any] | None) -> dict[str, Any] | N
     may be the rank that matters. `caveats` say what this is not."""
     if not status:
         return None
-    stopped = [r for r in status.get("ranks", ()) if isinstance(r, Mapping) and r.get("state") in _STOPPED_STATES]
+    stopped = [r for r in status.get("ranks", ()) if rank_is_stopped(r)]
     if not stopped:
         return None
     by_place: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
@@ -1527,15 +1543,15 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
     if not status or status.get("summary") not in ("stalled", "degraded"):
         return []
     full = list(status.get("ranks", ()))
-    if not status.get("missing_ranks") and not any(r.get("state") in ("silent", "lost", "unresponsive") for r in full):
+    if not status.get("missing_ranks") and not any(rank_is_stopped(r) for r in full):
         # No rank stopped and none is missing: the summary's cause is not progress, as when a rank
         # whose capture stopped is beside an active one (contract 3). As `progress_incidents` in
         # watchdog.rs (lane W2).
         return []
-    places = [place for place in map(stuck_at, (r for r in full if r.get("state") in ("silent", "lost", "unresponsive")))
+    places = [place for place in map(stuck_at, (r for r in full if rank_is_stopped(r)))
               if place is not None]
     ranks = [{k: v for k, v in r.items() if k != "stack"} for r in full]
-    stopped = [r for r in ranks if r.get("state") in ("silent", "lost", "unresponsive")]
+    stopped = [r for r in ranks if rank_is_stopped(r)]
     lost = [r.get("rank") for r in stopped if r.get("state") == "lost"]
     # Never "confirmed" from the stream alone: that takes a second source (see build_evidence).
     if stopped and (len(lost) == len(stopped) or (lost and status["summary"] == "stalled")):
@@ -1573,7 +1589,7 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
     # The ranks that are not stopped, briefly: what a reader needs to tell that a rank which was
     # silent has stepped on since (the trigger's stall episodes).
     others = [{"rank": r.get("rank"), "state": r.get("state"), "last_step": r.get("last_step"), "attempt": r.get("attempt")}
-              for r in ranks if r.get("state") not in ("silent", "lost", "unresponsive")]
+              for r in ranks if not rank_is_stopped(r)]
     return [{
         "kind": "rank_silent",
         "step": min(behind) if behind else max(steps, default=0),
@@ -1597,7 +1613,7 @@ def _capture_stopped_keys(ranks: list[dict[str, Any]]) -> dict[str, Any]:
     this one's); and the incident gains `capture_stopped` (the status entry's value, unchanged) and
     `capture_last_step` of the first such rank, by rank. Nothing for a rank whose capture never
     stopped."""
-    stopped = sorted((r for r in ranks if r.get("state") in ("silent", "lost", "unresponsive")
+    stopped = sorted((r for r in ranks if rank_is_stopped(r)
                       and isinstance(r.get("capture_stopped"), Mapping)), key=lambda r: r.get("rank", 0))
     for entry in stopped:
         entry["capture_last_step"] = None if entry.get("attempt_without_steps") else entry.get("last_step")
@@ -8083,6 +8099,10 @@ def _how_stopped(rank: Mapping[str, Any]) -> str:
     state, beat = rank.get("state"), rank.get("heartbeat_age_seconds")
     if state == "lost":
         return "its connection dropped and did not return"
+    if state == "reconnecting":
+        # Listed as stopped only when it was stopped already when its stream dropped (`rank_is_stopped`).
+        was = "frozen or gone, with no heartbeat" if rank.get("stopped_as") == "unresponsive" else "silent"
+        return f"it was {was}, and its connection has dropped since it stopped and has not come back yet"
     if state == "unresponsive":
         return "its heartbeats stopped too, so the whole process is frozen or gone"
     if beat is None:
@@ -8180,7 +8200,7 @@ def _lost_text(incident: Mapping[str, Any]) -> str:
     lost = [r for r in incident.get("lost_ranks") or () if r is not None]
     who = (f"rank{'s' if len(lost) != 1 else ''} {', '.join(str(r) for r in lost[:8])}"
            + (f" and {len(lost) - 8} more" if len(lost) > 8 else "")) if lost else "the stopped ranks"
-    waiting = len(lost) < len([r for r in incident.get("ranks", ()) if r.get("state") in ("silent", "lost", "unresponsive")])
+    waiting = len(lost) < len([r for r in incident.get("ranks", ()) if rank_is_stopped(r)])
     return (
         f" The connection of {who} dropped and did not come back: read as a lost connection, not a hang."
         " The process was most likely killed or crashed (an out-of-memory kill looks like this), or the network to the"

@@ -21,7 +21,8 @@ watcher of a server's store, or of a file given a status with `watchdog=`, ever 
 two kinds stay observations: the run state does not move for them, and the class the command
 gets is `observation`. The server calls a stopped rank `critical` after its `--critical-seconds`
 (900) or three of the rank's own silence thresholds, if that is longer, and gives a severity only
-to a rank that is silent, unresponsive or lost: a rank in a declared evaluation or checkpoint
+to a rank that is silent, unresponsive or lost, or that was one of those when its stream dropped
+and is `reconnecting`: a rank in a declared evaluation or checkpoint
 phase is `paused`, has none, and so cannot make a stall `critical`. A stall named with
 `--fire-kind` fires at `warning` and not again when it becomes `critical`; one not named fires
 once, when it becomes `critical`.
@@ -49,7 +50,10 @@ Then the next stall at `critical` fires again, under an id of its own. So a sile
 job then stops altogether (`rank_silent`, then `job_stalled`) is one episode. A rank that stops
 during an open episode joins it, at the step it stopped at; the episode ends once any rank of it
 steps past its own step, so a first rank that recovers while a joined one is still stuck ends it,
-and the joined rank's stall then fires. A rank that is only `reconnecting` has not stepped. A
+and the joined rank's stall then fires. A rank that is only `reconnecting` has not stepped: one
+that was stopped when its stream dropped keeps its severity and stays in the stall while it
+reconnects and once it is lost (`evidence.rank_is_stopped`), so a hung rank that is killed, comes
+back and still does not step is one episode and one firing. A
 server restart is neither progress nor an attempt: the stall is not listed during the restored
 ranks' fresh window, and nothing is decided until it is. (`wandb`'s `run.alert` holds an alert
 back by its title and a wait time, not by the step it was raised at.) The status is
@@ -145,7 +149,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from .evidence import (
-    ALL_RANKS_VIEW, INCIDENT_CLASSES, _group_line, _rank_ranges, incident_class, json_safe, replace_atomically,
+    ALL_RANKS_VIEW, INCIDENT_CLASSES, _group_line, _rank_ranges, incident_class, json_safe, rank_is_stopped,
+    replace_atomically,
 )
 
 STATE_VERSION = 1
@@ -234,7 +239,7 @@ def _stopped(incident: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     step the server stored for each and its attempt (None when the status does not say)."""
     found = {}
     for entry in incident.get("ranks") or ():
-        if isinstance(entry, Mapping) and entry.get("state") in ("silent", "lost", "unresponsive"):
+        if rank_is_stopped(entry):
             found[str(entry.get("rank"))] = {"last_step": _number(entry.get("last_step")),
                                              "attempt": entry.get("attempt")}
     return found
