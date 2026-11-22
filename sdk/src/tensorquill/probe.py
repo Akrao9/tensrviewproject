@@ -303,7 +303,9 @@ def _head_logit_sums(hidden: torch.Tensor, weight: torch.Tensor, bias: torch.Ten
     whose difference from that mean overflows float32 though its logits are finite (logits near
     float32's largest value with both signs, such as 3e38, 3e38 and -3e38) is taken again from
     halves, `z / 2 - shift / 2`, which cannot overflow, and its sums multiplied back in float64
-    (`_centred`; C22, lane AD3). `logits_finite` says which positions' FP32 logits are all finite,
+    (`_centred`; C22, lane AD3). So is a row whose gap `zb - zf` overflows float32 though both
+    passes are finite (2e38 against -2e38): its gap is taken from halves (SDK-05, wave AF); a row
+    whose BF16 logits are not finite keeps a gap that is not, and is counted. `logits_finite` says which positions' FP32 logits are all finite,
     read from the logits themselves, so a sum that overflows is not taken for a NaN or an Inf.
     """
     x = hidden.detach().reshape(-1, hidden.shape[-1])
@@ -331,18 +333,32 @@ def _head_logit_sums(hidden: torch.Tensor, weight: torch.Tensor, bias: torch.Ten
         # in `acc`: per-element float64 sums cost as much as the two GEMMs on CPU.
         lse = torch.logaddexp(lse, torch.logsumexp(zf, -1).to(sums_on).to(acc))
         sq += _square_norm(zf, acc, sums_on)
-        gap += _square_norm(zb.sub_(zf), acc, sums_on)
+        part_gap = _square_norm(zb.sub_(zf), acc, sums_on)
         d = zf.sub_(shift)  # zf is not used again in this chunk
         part_mean = _row_sum(d, acc, vocab, sums_on)  # each chunk's share of the mean
         part_sq = _square_norm(d, acc, sums_on)
         # A float64 squared norm of finite float32 values cannot overflow, so one that is not finite
-        # is a row of `d` holding an Inf: with finite logits, a difference that overflowed. Read from
-        # one value per position, so the chunk is not passed over again.
-        where = chunk_finite.to(sums_on) & ~part_sq.isfinite()
-        if bool(where.any()):  # a sync, as the probe's histograms make: it is rare
-            broke = where.to(x.device)
-            z = F.linear(xf[broke], w.float(), None if b is None else b.float())
-            part_mean[where], part_sq[where] = _centred(z, shift[broke], acc, vocab, sums_on)
+        # is a row of `d`, or of `zb - zf`, holding an Inf or a NaN: with finite FP32 logits, a
+        # difference that overflowed, or a BF16 pass that is not finite. Read from one value per
+        # position, so the chunk is not passed over again; one sync for both.
+        fine = chunk_finite.to(sums_on)
+        where = fine & ~part_sq.isfinite()
+        gap_where = fine & ~part_gap.isfinite()
+        if bool((where | gap_where).any()):  # a sync, as the probe's histograms make: it is rare
+            if bool(where.any()):
+                broke = where.to(x.device)
+                z = F.linear(xf[broke], w.float(), None if b is None else b.float())
+                part_mean[where], part_sq[where] = _centred(z, shift[broke], acc, vocab, sums_on)
+            if bool(gap_where.any()):
+                # Both passes again for those rows only. Where the BF16 logits are finite the gap is
+                # read from halves (SDK-05: 2e38 and -2e38 are finite, their float32 difference is
+                # not); where they are not, it stays non-finite and the position is counted.
+                broke = gap_where.to(x.device)
+                zf_rows = F.linear(xf[broke], w.float(), None if b is None else b.float())
+                zb_rows = F.linear(xb[broke], w.to(torch.bfloat16),
+                                   None if b is None else b.to(torch.bfloat16)).float()
+                part_gap[gap_where] = _square_norm(zb_rows * 0.5 - zf_rows * 0.5, acc, sums_on) * 4
+        gap += part_gap
         dmean += part_mean
         dsq += part_sq
     assert shift is not None
@@ -412,17 +428,18 @@ def _head_numbers(calls: list[dict[str, Any]]) -> dict[str, Any]:
     """The four head numbers over every position the head saw in the probe (padding
     included: the probe has no mask for the head). Positions whose FP32 logits hold a NaN
     or an Inf are left out and counted (`nonfinite_positions`); so are positions whose logits
-    are finite but whose numbers below still overflow (`overflow_positions`, listed only when
-    there are some). Since lane AD3 that is one case only: the BF16 pass overflows, a BF16 logit
-    past BF16's range (about 3.39e38, below float32's 3.40e38), or a hidden state or weight that
-    casts to an Inf in BF16. That cannot be read: BF16's own logit is then an Inf, so `gap`,
+    are finite but whose BF16 pass is not (`overflow_positions`, listed only when there are
+    some; the key keeps its name). Since lane AD3, and wave AF for a gap whose float32
+    difference overflowed (SDK-05), that is the one case: the BF16 logits hold an Inf or a NaN,
+    from a BF16 logit past BF16's range (about 3.39e38, below float32's 3.40e38), or a hidden
+    state or weight that casts to an Inf in BF16. That cannot be read: BF16's own logit is then an Inf, so `gap`,
     the distance between it and the FP32 logit, has no finite value, and any number written for it
     would be made up. The position's other numbers are not read either, so that `positions` counts
     the same positions for every number. Read, and no longer counted (C22): a mean whose float32
     sum overflows (`_row_sum`, lane X4); a squared norm past float32's range on MPS, norms above
     about 1.8e19, now added in float64 on the CPU; and FP32 logits within a factor of two of
     float32's largest value with both signs, whose difference from the row's mean overflows
-    (`_centred`). Over positions t and vocabulary entries v of the FP32 logits z:
+    (`_centred`); and finite BF16 and FP32 logits whose float32 difference overflows (SDK-05). Over positions t and vocabulary entries v of the FP32 logits z:
 
     - `norm`: the mean over t of the L2 norm of z_t over the vocabulary.
     - `mean`: the signed mean of z over every t and v.
@@ -457,10 +474,11 @@ def _head_numbers(calls: list[dict[str, Any]]) -> dict[str, Any]:
         elif not overflow:
             reason = "every position's FP32 logits hold a NaN or an Inf"
         elif not nonfinite:
-            reason = "every position's FP32 logits are finite but too large: their sums overflow"
+            reason = ("every position's FP32 logits are finite but the BF16 pass overflows: its logits hold an Inf "
+                      "or a NaN, so the gap has no value")
         else:
             reason = (f"no position read: {nonfinite} with a NaN or an Inf in their FP32 logits, {overflow} with "
-                      "finite logits whose sums overflow")
+                      "finite FP32 logits whose BF16 pass overflows")
         return {**out, "not_read": reason}
     pick = {key: value[finite] for key, value in joined.items()}
     gap = math.sqrt(float(pick["gap_sq"].sum()) / (n * vocab))
