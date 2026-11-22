@@ -21,7 +21,8 @@ its own.
 What is kept, in `loader_delay.json` and in `arm-<arm>-r<round>.json`, for every step of every arm
 and round: the injected sleep, the time in `next()`, the excess of one over the other, and the step's
 time; for the `on` arm also TensorQuill's own `data_wait` and `step_time` for that step. The summary
-gives, per arm: the worst excess in `next()` with its step and round; the slowest rest of a step
+gives, per arm: the worst whole-step delay (below) with its step and round; the worst excess in
+`next()` with its step and round; the slowest rest of a step
 (its time outside `next()`) against that round's median; every garbage collection of the interpreter
 that took 1 ms or more, with its step, the thread it ran on and whether the training thread was in
 `next()` at the time (a collection on any thread holds the interpreter lock, so the training thread
@@ -29,6 +30,13 @@ waits for it wherever it is); the excess at the named steps
 (`--name-steps`, by default every flush boundary, so step 100 at `--every 50`) in each round; the
 steps over `--slack-ms`; and the median step time. `on_minus_off` sets the two arms side by side at
 each named step.
+
+A step's **whole-step delay** is its time less the loader's injected sleep for that step, less the
+round's median of the same quantity: how much longer that step took than a usual one, the known
+sleeps taken out (every tenth step sleeps four times as long). It is reported twice, over every step
+and over every step but the first, because the first step of a process is slow in both arms (on the
+CPU dry runs it was the slowest part outside `next()` in nearly every round of both). It is reported
+apart from the median overhead: one does not stand for the other.
 
 The median step-time overhead printed here is this toy loop's, with a sleeping loader. It is not the
 preregistered figure: that one is the Granite compiler gate's (`granite_compiler_gate.py`), whose
@@ -44,6 +52,8 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
+import platform
 import statistics
 import subprocess
 import sys
@@ -111,6 +121,8 @@ def run_arm(args) -> dict[str, Any]:
             gc.callbacks.remove(on_gc)
 
     result: dict[str, Any] = {"arm": args.arm, "round": args.round, "torch": torch.__version__,
+                              "python": platform.python_version(), "cpu_count": os.cpu_count(),
+                              "gc_threshold": list(gc.get_threshold()),
                               "device": torch.cuda.get_device_name() if cuda else "CPU",
                               "steps": args.steps, "every": args.every, "wait_ms": args.wait_ms}
     if args.arm == "on":
@@ -152,6 +164,20 @@ def named_steps(args) -> list[int]:
     return list(range(args.every, args.steps, args.every))
 
 
+def whole_step_delay(result: dict) -> list[float]:
+    """Each step's time less its injected sleep, less the round's median of that: the step's delay."""
+    net = [t - i for t, i in zip(result["step_ms"], result["injected_ms"])]
+    usual = statistics.median(net)
+    return [n - usual for n in net]
+
+
+def _worst(rows: list[tuple[float, int, int]]) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    ms, step, rnd = max(rows, key=lambda item: item[0])
+    return {"ms": ms, "step": step, "round": rnd}
+
+
 def summarize(results: dict[str, list[dict]], names: list[int], slack_ms: float) -> dict[str, Any]:
     """Per arm: the worst excess in `next()`, the excess at each named step by round, the steps over
     the slack, the median step time. Reported, never judged."""
@@ -163,7 +189,14 @@ def summarize(results: dict[str, list[dict]], names: list[int], slack_ms: float)
         if measured:
             worst = max(((r["excess_ms"][s], s, r["round"]) for r in measured for s in range(len(r["excess_ms"]))),
                         key=lambda item: item[0])
+            delays = {r["round"]: whole_step_delay(r) for r in measured}
+            rows = [(d, s, rnd) for rnd, ds in delays.items() for s, d in enumerate(ds)]
             entry.update(
+                worst_whole_step=_worst(rows),
+                worst_whole_step_after_first=_worst([row for row in rows if row[1] > 0]),
+                worst_whole_step_by_round=[{"round": rnd, **{k: v for k, v in (_worst([(d, s, rnd) for s, d in enumerate(ds) if s > 0]) or {}).items() if k != "round"}}
+                                           for rnd, ds in delays.items()],
+                whole_step_delay_at_named_steps={str(s): [ds[s] for ds in delays.values()] for s in names},
                 worst_excess={"ms": worst[0], "step": worst[1], "round": worst[2]},
                 worst_excess_by_round=[{"round": r["round"], "ms": max(r["excess_ms"]),
                                         "step": r["excess_ms"].index(max(r["excess_ms"]))} for r in measured],
@@ -191,6 +224,9 @@ def summarize(results: dict[str, list[dict]], names: list[int], slack_ms: float)
                     "on_max": max(on["excess_at_named_steps"][s]), "off_max": max(off["excess_at_named_steps"][s])}
                 for s in map(str, names)},
             "worst_excess_ms": {"on": on["worst_excess"], "off": off["worst_excess"]},
+            "worst_whole_step_ms": {"on": on["worst_whole_step"], "off": off["worst_whole_step"]},
+            "worst_whole_step_after_first_ms": {"on": on["worst_whole_step_after_first"],
+                                                "off": off["worst_whole_step_after_first"]},
             "toy_step_time_overhead_median": (statistics.median(on["step_ms_median_by_round"])
                                               / statistics.median(off["step_ms_median_by_round"]) - 1),
             "toy_step_time_overhead_mean": (statistics.median(on["step_ms_mean_by_round"])
@@ -255,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     summary = summarize(results, names, args.slack_ms)
     first = next((r for rs in results.values() for r in rs if r.get("state") == "measured"), {})
     document = {"measurement": "loader_delay", "judged": False, "torch": first.get("torch"), "device": first.get("device"),
+                "python": first.get("python"), "cpu_count": first.get("cpu_count"), "gc_threshold": first.get("gc_threshold"),
                 "rounds": args.rounds, "steps": args.steps, "every": args.every, "wait_ms": args.wait_ms,
                 **summary, "per_step": results}
     (args.out / "loader_delay.json").write_text(json.dumps(document, indent=1))
@@ -269,6 +306,9 @@ def main(argv: list[str] | None = None) -> int:
             w = entry["worst_excess"]
             rest = max(entry["worst_rest_by_round"], key=lambda item: item["over_median_ms"])
             slow_gc = max(entry["gc_over_1ms"], key=lambda item: item["ms"], default=None)
+            whole, later = entry["worst_whole_step"], entry["worst_whole_step_after_first"]
+            print(f"{arm}: worst whole-step delay {whole['ms']:+.2f} ms at step {whole['step']} (round {whole['round'] + 1})"
+                  + (f"; after the first step {later['ms']:+.2f} ms at step {later['step']} (round {later['round'] + 1})" if later else ""))
             print(f"{arm}: worst delay in next() {w['ms']:+.2f} ms at step {w['step']} (round {w['round'] + 1}); "
                   f"{len(entry['over_slack'])} steps over {args.slack_ms:g} ms; worst rest of a step "
                   f"{rest['over_median_ms']:+.2f} ms over its median at step {rest['step']} (round {rest['round'] + 1}); "
@@ -276,6 +316,10 @@ def main(argv: list[str] | None = None) -> int:
                      f"(generation {slow_gc['generation']}, on thread {slow_gc['thread']}"
                      f"{', while the training thread was in next()' if slow_gc['in_next'] else ''})"
                      if slow_gc else "no garbage collection of 1 ms or more"))
+    both = summary.get("on_minus_off")
+    if both:
+        print(f"median step-time overhead of this toy loop, reported apart from the delays: "
+              f"{100 * both['toy_step_time_overhead_median']:+.2f}% (not the preregistered figure, which is the compiler gate's)")
     failed = [e for arm in ARMS for e in summary["arms"][arm]["errors"]]
     print(f"{'MEASURED' if not failed else 'INCOMPLETE'}: result {args.out / 'loader_delay.json'} (a measurement: nothing is judged)")
     return 1 if failed else 0

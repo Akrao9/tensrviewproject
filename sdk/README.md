@@ -69,6 +69,40 @@ There are two capture modes. `capture="routers"`, the default when `routers` are
 | The Rust detectors from Python (`--detectors rust`, through `tensorquill-server detect`): one read of a file or store, `--watch` on a growing file or a store, and `--rank all`; `detect --run` for every rank of a run, with `duplicate_batches` across ranks; a reader that takes the thresholds a server applied; and the all-ranks view as one call, `evidence.all_ranks_evidence` | Built Nov 16, 2026, tested on CPU (macOS) with the debug binary: the same evidence as the Python detectors on 57 record sets and the seven Gate 1 fixtures, read once and written a stretch at a time. On the command line the Rust detectors are the default when the binary and `pyarrow` are there; in Python, `build_evidence` and `watch` default to `detectors="python"`. No Python detector is deleted |
 | No graph breaks and no recompiles under `torch.compile` | Tested with `eager`, `aot_eager`, and AOTAutograd static-input checks on CPU; on CUDA with Inductor and CUDA graphs on a toy MoE, and with Inductor and CUDA graphs off on Granite |
 
+## Support: what is captured, and what has been verified
+
+Two different things. The first table is what TensorQuill records for each kind of model: that is the code's scope, dense and MoE transformers trained with PyTorch. The second is which combinations of model, framework and hardware have actually been run, and where. A combination that is not in the second table as run on a GPU has not been verified on one, whatever the first table says is captured.
+
+**What is captured**
+
+| Model | Always on | With `capture="full"` | With `probe=` |
+| --- | --- | --- | --- |
+| MoE transformer (`routers=` given) | Per-router expert load, load entropy and diversity, per step; logged scalars; step, loss and optimizer bookkeeping | Block activation statistics, gradient norms per parameter group, weight norms on a schedule | Activation histograms per block; attention logits, entropy and maps per layer |
+| Dense transformer | Full capture is the default: block activation statistics, gradient norms, weight norms on a schedule; logged scalars | (the default) | The same probe pass |
+| Either, on several ranks | Each rank's own file; the per-rank replica observation when `replica_group=` is given | | |
+
+**What has been verified, and on what**
+
+"Run on a GPU" means a dated run recorded in this file. "CPU only" means tests or a check script on CPU processes, which say nothing about CUDA, NCCL or GPU timing. "Not run" means the code path has not executed.
+
+| Model | Framework or loop | Hardware | State | Where |
+| --- | --- | --- | --- | --- |
+| Granite 3.0 1B-A400M (MoE), BF16 | Plain PyTorch loop, `torch.compile` with Inductor, CUDA graphs off | One GPU: RTX PRO 6000; A100 | Run on a GPU: router-only and full capture, the overhead rounds, seeded routing collapse | "Granite MoE GPU benchmark" and the run sections after it |
+| Granite, CUDA graphs on (`reduce-overhead`) | Plain loop | One GPU | Not verified: CUDA-graph recording fails in the model's expert path on PyTorch 2.14.1; verified on a toy MoE only | "What is not built or not verified" |
+| SmolLM2-360M (dense), BF16 | Plain PyTorch loop, Inductor | One GPU: A100; RTX PRO 6000 | Run on a GPU: full capture with the probe, the seeded activation outlier | "Dense model with a seeded activation outlier" |
+| SmolLM2-360M, seeded gradient spike and stalled weights | Plain loop | CPU toy | CPU only | "Seeded gradient spike and stalled weights" |
+| Dense or MoE | Hugging Face `Trainer` (and a plain Accelerate loop), one process | CPU | CPU only. One row above notes an A100 comparison of the logged loss; it has no dated run section here, so it is not counted as verified | `examples/trainer_check.py` |
+| Dense | Hugging Face `Trainer` under DDP, two processes | CPU, Gloo | CPU only; fp16 and Inductor under DDP not run | `examples/trainer_ddp_check.py` |
+| Dense | PyTorch Lightning, one process and DDP on two | CPU | CPU only | `examples/lightning_check.py` |
+| Dense | PyTorch Lightning with FSDP | | Not run (Lightning refuses FSDP without CUDA) | |
+| MoE | Megatron-LM's `TopKRouter`, capacity dropping off and on | | Not run; a stand-in router with Megatron's own dropping code runs on CPU | `examples/megatron_routing_check.py` |
+| Any | DeepSpeed ZeRO stages 1 and 2 | CPU | CPU only, and only the warning that automatic step counting records nothing there | |
+| Any, replicas across ranks | DDP-style ranks, `replica_group=` | CPU, Gloo, 2, 3 and 8 processes | CPU only; not run over NCCL on any number of GPUs | `examples/replica_check.py` |
+| Any | Streaming to the ingest server from training processes | CPU, two ranks | CPU only | "Streaming to an ingest server" |
+| Any | GPU memory, NVML and data wait (`system=True`, `data_wait=True`) | | Not run on a GPU: mocked CUDA and NVML, and the data wait on CPU | "GPU memory, NVML and data wait" |
+
+Every GPU run so far used one GPU, PyTorch 2.14.1 with CUDA 13.0, in Colab. Nothing has been verified on two or more GPUs, on any other architecture family, or on Apple MPS beyond the logged scalars.
+
 ## What is not built or not verified
 
 - **The agent loop has not met an agent.** The MCP server has been driven by a scripted client only, and the trigger by a local script and a local HTTP server. No agent session has been started by the trigger or has used the server.

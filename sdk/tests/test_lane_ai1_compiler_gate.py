@@ -133,6 +133,10 @@ def test_the_toy_driver_runs_each_arm_in_a_fresh_process_and_writes_every_result
     out = tmp_path / "gate"
     result = json.loads((out / "gate.json").read_text())
     assert result["status"] == "dry_run" and result["claim"].startswith("not established")
+    # The author, Nov 22, 2026: the paired median is the primary 1% criterion, the ratio of arm medians beside it.
+    assert result["overhead_criterion"]["primary"].startswith("overhead_median: the median of the paired rounds")
+    assert "never scored" in result["overhead_criterion"]["alongside"]
+    assert result["arms"]["tensorquill"]["overhead_of_median_rounds"] is not None
     pids, measured_runs = set(), 0
     for arm in arms.split(","):
         for rnd in range(2):

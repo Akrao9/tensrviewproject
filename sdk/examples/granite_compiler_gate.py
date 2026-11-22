@@ -35,8 +35,11 @@ parameters it watches against the model's trainable ones, and the samples it too
 The overhead of an arm is, per round, its mean step time over the timed steps (the block's wall
 time over its steps, as `moe_dogfood.py` times it, so the flush and sample steps count) over the
 `off` arm's in the same round, minus one; the arm's overhead is the median of those. The same
-ratio of per-step medians is written beside it, and so is the figure `moe_dogfood.py` printed
-(each arm's median round, then the ratio; said aloud when it falls on the other side of the line).
+ratio of per-step medians is written beside it. The median of the paired rounds' overheads is the
+primary 1% criterion (the author, Nov 22, 2026); the ratio of the arms' median rounds, the figure
+`moe_dogfood.py` printed, is reported alongside for comparison with earlier results and never scored
+(said aloud when it falls on the other side of the line). `gate.json` says which is which
+(`overhead_criterion`).
 The slowest timed step of every arm and round is reported with how far it is over that round's
 median step (`worst_step_by_round`), and every step's time is kept in the arm's file (`step_ms`):
 a passing median does not show one slow step. None of that is scored. The pass line, for the TensorQuill
@@ -479,6 +482,16 @@ def summarize(args, results: dict[str, list[dict]]) -> dict[str, Any]:
     return arms
 
 
+# The author, Nov 22, 2026: "record the median of the three paired overheads as the primary 1% criterion.
+# Report the ratio of arm medians alongside it for comparison with earlier results."
+OVERHEAD_CRITERION = {
+    "primary": "overhead_median: the median of the paired rounds' overheads (each round's mean step time over "
+               "capture off's in the same round, minus one), 1% or less; this is the scored figure",
+    "alongside": "overhead_of_median_rounds: the ratio of the arms' median rounds, as moe_dogfood.py printed it on "
+                 "earlier runs; reported for comparison, never scored",
+}
+
+
 def worst_step(result: dict, warmup: int) -> dict[str, Any]:
     """The slowest timed step of one arm's round: reported, never scored. `step` counts from the first
     warm-up step (the TensorQuill arm's recorded step); every step's time is `step_ms` in the arm's file."""
@@ -575,6 +588,7 @@ def driver_main(args) -> int:
     gate = {"status": status, "criteria": criteria, "toy": args.toy, "rounds": args.rounds, "warmup": args.warmup,
             "steps": args.steps, "torch": torch.__version__, "device": device,
             "tensorquill_file": tensorquill.__file__, "arms": summary,
+            "overhead_criterion": OVERHEAD_CRITERION,
             "claim": {"pass": "established", "fail": "failed",
                       "not_proven": "not established: the CUDA-graph line was not checked (CUDA graphs off)",
                       "dry_run": "not established: a CPU, toy or eager dry run checks the harness, not the GPU claim"}[status]}

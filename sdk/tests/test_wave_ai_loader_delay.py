@@ -43,7 +43,21 @@ def test_one_slow_step_is_named_with_its_step_and_round_and_the_median_stays_put
     assert on["excess_at_named_steps"]["100"] == [1.0, 45.0, 1.0] and on["excess_at_named_steps"]["50"] == [1.0] * 3
     assert on["over_slack"] == [{"round": 1, "step": 100, "excess_ms": 45.0, "step_ms": 75.0}] and off["over_slack"] == []
     assert on["gc_over_1ms"] == [{"round": 1, **pause}] and on["gc_collections"] == 2 and off["gc_collections"] == 0
+    # The whole step: its time less its sleep, against the round's median of that. The spike is the worst,
+    # with its step and round, and a slow first step is reported apart from it.
+    assert on["worst_whole_step"] == {"ms": pytest.approx(44.0), "step": 100, "round": 1}
+    assert on["whole_step_delay_at_named_steps"]["100"] == pytest.approx([0.0, 44.0, 0.0])
+    assert off["worst_whole_step"]["ms"] == pytest.approx(0.0)
+    slow_start = arm("on", 0, quiet)
+    slow_start["step_ms"][0] += 200.0
+    slow_start["step_ms"][5] += 60.0 + 7.0  # a long-sleep step, 7 ms late: its extra sleep is not a delay
+    slow_start["injected_ms"][5] += 60.0
+    started = ld.summarize({"on": [slow_start]}, [100], 15.0)["arms"]["on"]
+    assert started["worst_whole_step"] == {"ms": pytest.approx(200.0), "step": 0, "round": 0}
+    assert started["worst_whole_step_after_first"] == {"ms": pytest.approx(7.0), "step": 5, "round": 0}
+    assert started["worst_whole_step_by_round"] == [{"round": 0, "ms": pytest.approx(7.0), "step": 5}]
     both = summary["on_minus_off"]
+    assert both["worst_whole_step_ms"]["on"]["step"] == 100 and both["worst_whole_step_after_first_ms"]["off"]["step"] > 0
     assert both["excess_ms_at_named_steps"]["100"] == {"on_median": 1.0, "off_median": 1.0, "on_max": 45.0, "off_max": 1.0}
     assert both["toy_step_time_overhead_median"] == pytest.approx(0.0)  # the median does not show the spike
     assert "granite_compiler_gate.py" in both["note"]
@@ -72,6 +86,9 @@ def test_on_cpu_every_step_of_both_arms_is_written_from_fresh_processes(tmp_path
     assert done.returncode == 0, done.stdout + done.stderr
     result = json.loads((out / "loader_delay.json").read_text())
     assert result["judged"] is False and result["named_steps"] == [20, 40]
+    assert result["python"] and result["cpu_count"] and len(result["gc_threshold"]) == 3
+    assert result["arms"]["on"]["worst_whole_step_after_first"]["step"] in range(1, 60)
+    assert "worst whole-step delay" in done.stdout and "reported apart from the delays" in done.stdout
     for name in ("off", "on"):
         rounds = result["per_step"][name]
         assert [r["round"] for r in rounds] == [0, 1] and all(r["state"] == "measured" for r in rounds)
