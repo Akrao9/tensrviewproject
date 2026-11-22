@@ -43,8 +43,16 @@ fn part(rank: i32, start: i64) -> RecordBatch {
         })
         .collect();
     RecordBatch::try_from_iter_with_nullable(vec![
-        ("schema_version", Arc::new(Int32Array::from(vec![1; n])) as ArrayRef, false),
-        ("run_id", Arc::new(StringArray::from(vec!["cost"; n])) as ArrayRef, false),
+        (
+            "schema_version",
+            Arc::new(Int32Array::from(vec![1; n])) as ArrayRef,
+            false,
+        ),
+        (
+            "run_id",
+            Arc::new(StringArray::from(vec!["cost"; n])) as ArrayRef,
+            false,
+        ),
         ("rank", Arc::new(Int32Array::from(vec![rank; n])) as ArrayRef, false),
         ("attempt", Arc::new(Int64Array::from(vec![1; n])) as ArrayRef, false),
         ("step", Arc::new(Int64Array::from(steps)) as ArrayRef, false),
@@ -69,9 +77,9 @@ fn the_cost_of_a_live_report_over_a_long_multi_rank_run() {
     let started = Instant::now();
     // The ranks' parts interleaved, as they arrive at a server.
     for index in 0..(STEPS / PART) as usize {
-        for (rank, detectors) in ranks.iter_mut().enumerate() {
+        for (rank, (detectors, rank_parts)) in ranks.iter_mut().zip(&parts).enumerate() {
             let at = Instant::now();
-            detectors.append(1, &parts[rank][index]);
+            detectors.append(1, &rank_parts[index]);
             append_ns.push(at.elapsed().as_nanos() as u64);
             let at = Instant::now();
             let document = report("cost", rank as i32, detectors, 0);
@@ -94,7 +102,9 @@ fn the_cost_of_a_live_report_over_a_long_multi_rank_run() {
         .iter()
         .map(|document| document.to_string())
         .flat_map(|text| text.into_bytes())
-        .fold(0xcbf29ce484222325, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x100000001b3));
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+        });
     println!(
         "{}",
         json!({

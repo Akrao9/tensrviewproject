@@ -22,7 +22,7 @@ use arrow_flight::{FlightClient, FlightData, FlightDescriptor, PutResult};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use lane_aa3_support::{start, stored_steps};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::Channel;
