@@ -52,7 +52,7 @@ run() { name=$1; shift; echo "$ $*" > $OUT/$name.log; "$@" >> $OUT/$name.log 2>&
 
 ## 0. Smoke first: the branches that have never run
 
-Before anything expensive. Results go to `$OUT/smoke/` and are **never scored**: a smoke line shows only that a branch starts, loads what it needs and writes its files on this machine. If one stops, fix the environment (or report the harness) before the scored runs; do not read a result from it. None of these could be dry-run on the Mac without installing or downloading, so **every line here is never run**.
+Before anything expensive. Results go to `$OUT/smoke/` and are **never scored**: a smoke line shows only that a branch starts, loads what it needs and writes its files on this machine. If one stops, fix the environment (or report the harness) before the scored runs; do not read a result from it. None of these branches could run on the Mac without installing, downloading or CUDA, so **every line here is never run** (one option combination, `gpu_probe_coverage.py --steps 50 --probe-every 50`, was dry-run with `--toy`: exit 0).
 
 ```bash
 mkdir -p $OUT/smoke
@@ -71,9 +71,16 @@ python -c "import pynvml; pynvml.nvmlInit(); print(pynvml.nvmlSystemGetDriverVer
 # 5. in the second environment (PyTorch 2.10 to 2.13): the campaign's imports and TensorQuill on that PyTorch
 python -c "import torch, tensorquill, lm_resiliency; print(torch.__version__, torch.version.cuda, tensorquill.__file__)" | tee $OUT/smoke/fault-injection-env.txt
 run smoke-fi-seeded     python examples/seeded_failures.py --case both --out $OUT/smoke/fi-seeded
+python -c "import sys; sys.path.insert(0, 'examples'); import fault_injection_check_entry as e, json; print(json.dumps(e.environment(), indent=1))" | tee $OUT/smoke/fault-injection-environment.txt
+# 6. back in the first environment: the framework branches that have never run, short
+run smoke-lightning-fsdp python examples/lightning_check.py --out $OUT/smoke/lightning-fsdp --devices 2 --strategy fsdp --fsdp-wrap blocks --steps 100 --seed-step 60
+run smoke-trainer-ddp    torchrun --nproc-per-node 2 --master-port 29551 examples/trainer_ddp_check.py --out $OUT/smoke/trainer-ddp --steps 120 --seed-step 60 --log-every 10 --probe-every 40
+run smoke-trainer-ddp-control torchrun --nproc-per-node 2 --master-port 29552 examples/trainer_ddp_check.py --out $OUT/smoke/trainer-ddp-control --steps 120 --seed-step 60 --log-every 10 --probe-every 40 --control
+run smoke-megatron       python examples/megatron_routing_check.py --out $OUT/smoke/megatron
+run smoke-loader-delay   python examples/loader_delay_check.py --out $OUT/smoke/loader-delay --rounds 1
 ```
 
-- **What to look for:** `smoke-wandb-toy` and `smoke-gate-granite`: the `wandb` arm's state is `measured` (offline mode: no account, no network), not `not_run` or `error`; NeuralDBG on Granite finishes inside the arm timeout. The two load lines: exit 0, which needs the checkpoints and WikiText-2 in the cache. `smoke-nccl-2`: exit 0. `smoke-fr-nccl`: **a dump from every rank, the sleeping one too**; exit 3 with "no dump" here means the scored Flight Recorder run will be not proven, so settle the NCCL variables first. The `nvidia-smi` line: a row of values, no "Field ... is not a valid field". `smoke-fi-seeded`, run in the second environment: TensorQuill's seeded cases pass on that PyTorch, which has never been tried.
+- **What to look for:** `smoke-wandb-toy` and `smoke-gate-granite`: the `wandb` arm's state is `measured` (offline mode: no account, no network), not `not_run` or `error`; NeuralDBG on Granite finishes inside the arm timeout. The two load lines: exit 0, which needs the checkpoints and WikiText-2 in the cache. `smoke-nccl-2`: exit 0. `smoke-fr-nccl`: **a dump from every rank, the sleeping one too**; exit 3 with "no dump" here means the scored Flight Recorder run will be not proven, so settle the NCCL variables first. The `nvidia-smi` line: a row of values, no "Field ... is not a valid field". `smoke-fi-seeded`, run in the second environment: TensorQuill's seeded cases pass on that PyTorch, which has never been tried. The `environment()` line prints the versions the campaign will record; it runs at the campaign's start on rank 0, so an error here would stop the eight-GPU campaign. Group 6: Lightning FSDP records steps and gradients at all; the `Trainer` under DDP gets through fp16 and Inductor, with and without TensorQuill; Megatron's own `TopKRouter` imports and routes; the loader measurement's loop runs with the device synchronized. The short step counts are the CPU tests' (the `Trainer` lines) or untried (Lightning): a failed spike check in a smoke is not a result.
 - A smoke that fails is entered in `RESULTS.txt` like any line and reported; it is not rerun silently.
 
 ## 1. One GPU
@@ -103,7 +110,7 @@ run loader-delay python examples/loader_delay_check.py --out $OUT/loader-delay
 - **Open, and to be measured here before a fix lane starts (the author, Nov 22).** On CPU, with TensorQuill on and a 50-step flush, one step of a run spends tens of milliseconds longer in the loader's `next()` than the loader's sleep; with TensorQuill off none does.
 - **What the line keeps:** three rounds, capture off and capture on in fresh processes, the same loop as `system-check`. For every step of every arm and round: the injected sleep, the time in `next()`, the step's whole time, and for the `on` arm TensorQuill's own `data_wait` and `step_time` (`loader_delay.json`, `arm-<arm>-r<round>.json`). The flush-boundary steps are reported by name, **step 100 among them**, for both arms; so are the worst delay per arm with its step and round, every step over 15 ms, the slowest rest of a step, and each garbage collection of 1 ms or more with the thread it ran on.
 - **Nothing is judged:** exit 0 means both arms were measured.
-- **What CPU showed (PyTorch 2.15, macOS; not a GPU result):** in 5 of 5 `on` rounds one generation-2 garbage collection of 78 to 95 ms ran on TensorQuill's writer thread at a flush boundary (step 150 in this loop; `system-check`'s own loop shows its delay at step 100, 36 and 62 ms in two runs), while the training thread was in `next()` and waited for it. The `off` arm had no collection at all. That is evidence of a cause, on one machine. It is not a fix and not a GPU measurement.
+- **What CPU showed (PyTorch 2.15, macOS; not a GPU result):** in 5 of 5 `on` rounds one generation-2 garbage collection of 78 to 92 ms ran on TensorQuill's writer thread at a flush boundary (step 150 in this loop), while the training thread was in `next()`, which was 60 to 74 ms over its sleep. The `off` arm had no collection at all. `system-check`'s own loop shows its delay at step 100 (36 and 62 ms in two runs); with a collection callback around it the delay moved to step 150, beside a 92.5 ms collection. Where the pause lands moves with what is watching, so read every step, not step 100 alone. That is evidence of a cause, on one machine. It is not a fix and not a GPU measurement.
 - **How it is reported:** the worst delay (this line, both arms) **beside** the preregistered median overhead (section 2). A passing median does not explain the spike, and the spike is reported whatever the median says. The toy loop's own step-time overhead in `loader_delay.json` is labelled as such and is not the preregistered figure.
 - `system-check` still lists every step over its slack with both timers in `system.json`.
 
@@ -226,6 +233,6 @@ After the runs, on the same revision: the audit's fifth pass over the captures i
 
 - **Order:** section 0 (smoke, never scored), then sections 1 to 6.
 - **Ready to execute as written:** sections 0 to 6.
-- **Written and never executed anywhere, so the first GPU run is also the harness's first run:** the `wandb` arm; NeuralDBG on Granite; Lightning FSDP; fp16 and Inductor under DDP; Megatron's own router; NCCL's dump on timeout; the real fault-injection campaign; every real-model load.
+- **Written and never executed anywhere, so the first GPU run is also the harness's first run (section 0 smokes each):** the `wandb` arm; NeuralDBG on Granite; Lightning FSDP; fp16 and Inductor under DDP, with and without TensorQuill (`--control`); Megatron's own router; NCCL's dump on timeout; the real fault-injection campaign and the entry script's `environment()` on CUDA; `loader_delay_check.py` on CUDA; every real-model load.
 - **Needs the author first:** the job of section 8; which of section 7's cases need a GPU.
 - Nothing from the earlier sheet's list is left without a script.
