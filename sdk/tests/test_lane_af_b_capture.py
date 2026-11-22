@@ -401,3 +401,170 @@ def test_tensorquill_installs_no_signal_handler_and_no_exit_hook(tmp_path):
         atexit.register = original
     assert {s: signal.getsignal(s) for s in before} == before
     assert registered == []
+
+
+# ---- Wave AG, AUD-1: a model trained in eval mode with reentrant checkpointing ---------------
+
+import torch.utils.checkpoint as _cp
+
+
+class _CkptBlock(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.router = nn.Linear(8, 8)
+        self.ff = nn.Linear(8, 8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.router(x).softmax(-1).topk(2, -1).values.sum(-1, keepdim=True)
+        return self.ff(x) * w
+
+
+class _CkptModel(nn.Module):
+    """The audit's reproducer (`f1_evalmode_reentrant.py`): no dropout or norm, so eval and train
+    compute the same thing."""
+
+    def __init__(self, reentrant: bool | None, skip_second_on_odd: bool = False) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(_CkptBlock() for _ in range(2))
+        self.reentrant = reentrant
+        self.skip = skip_second_on_odd
+        self.calls = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.skip:  # only here: an integer attribute changed each call recompiles under torch.compile
+            self.calls += 1
+        for i, b in enumerate(self.blocks):
+            if self.skip and i == 1 and self.calls % 2 == 0:
+                # No input needs a gradient: nothing of this checkpoint is recomputed in backward.
+                x = x + _cp.checkpoint(b, x.detach(), use_reentrant=True)
+                continue
+            x = b(x) if self.reentrant is None else _cp.checkpoint(b, x, use_reentrant=self.reentrant)
+        return x
+
+
+def _ckpt_run(tmp_path: Path, mode: str, *, reentrant: bool | None = True, capture: str | None = None,
+              evals: int = 0, steps: int = 12, compile_backend: str | None = None, skip: bool = False,
+              session_on: bool = True, eval_reentrant: bool = False) -> dict:
+    torch.manual_seed(0)
+    model = _CkptModel(reentrant, skip)
+    path = tmp_path / f"ck-{mode}-{reentrant}-{capture}-{evals}-{compile_backend}-{skip}-{session_on}.jsonl"
+    session = None
+    if session_on:
+        session = tensorquill.init(
+            model, run_id="ck", every=4, sink=JsonlSink(path), heartbeat_seconds=None, capture=capture,
+            routers={f"blocks.{i}.router": tensorquill.Router(8, top_k=2) for i in range(2)},
+            **({"layers": ["blocks.0", "blocks.1"]} if capture == "full" else {}))
+    model.train() if mode == "train" else model.eval()
+    run = model if compile_backend is None else torch.compile(model, backend=compile_backend)
+    opt = torch.optim.SGD(model.parameters(), lr=0.01)
+    g = torch.Generator().manual_seed(1)
+    e = torch.Generator().manual_seed(2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for _ in range(steps):
+            x = torch.randn(16, 8, generator=g, requires_grad=True)
+            run(x).pow(2).mean().backward()
+            opt.step()
+            opt.zero_grad()
+            for _ in range(evals):  # an evaluation between steps: eval mode, no gradients
+                was = model.training
+                model.eval()
+                with torch.no_grad():
+                    if eval_reentrant:
+                        model(torch.randn(16, 8, generator=e))
+                    else:
+                        for b in model.blocks:
+                            b(torch.randn(16, 8, generator=e))
+                model.train(was)
+        if session is not None:
+            session.close()
+    records = _records(path) if session_on else []
+    return {"records": records, "params": [p.detach().clone() for p in model.parameters()]}
+
+
+def _view(records: list[dict], keys=("moe", "moe_stats", "moe_top_k", "layers")) -> list[dict]:
+    return [{k: r.get(k) for k in keys} for r in records]
+
+
+def test_aug1_eval_mode_reentrant_counts_as_its_train_mode_control(tmp_path):
+    train = _ckpt_run(tmp_path, "train")
+    evalm = _ckpt_run(tmp_path, "eval")
+    assert all(sum(r["moe"]["blocks.0.router"]) == 32 for r in train["records"])
+    assert _view(evalm["records"]) == _view(train["records"])
+
+
+def test_aug1_eval_mode_reentrant_full_capture_has_the_block_statistics(tmp_path):
+    train = _ckpt_run(tmp_path, "train", capture="full")
+    evalm = _ckpt_run(tmp_path, "eval", capture="full")
+    assert all(set(r["layers"]) == {"blocks.0", "blocks.1"} for r in train["records"])
+    assert _view(evalm["records"]) == _view(train["records"])
+
+
+@pytest.mark.parametrize("mode", ["eval", "train"])
+@pytest.mark.parametrize("eval_reentrant", [False, True])
+def test_aug1_an_evaluation_forward_between_steps_is_not_counted(tmp_path, mode, eval_reentrant):
+    """Eval mode and no gradients between steps, two of them each step, also through the
+    checkpointed model: the records equal those of the run without them, in eval-mode and in
+    train-mode training (where a held evaluation must not be claimed by a recomputation)."""
+    plain = _ckpt_run(tmp_path, mode)
+    with_evals = _ckpt_run(tmp_path, mode, evals=2, eval_reentrant=eval_reentrant)
+    assert _view(with_evals["records"]) == _view(plain["records"])
+
+
+@pytest.mark.parametrize("mode", ["eval", "train"])
+def test_aug1_non_reentrant_and_no_checkpoint_count_once(tmp_path, mode):
+    control = _ckpt_run(tmp_path, "train")
+    for reentrant in (False, None):
+        assert _view(_ckpt_run(tmp_path, mode, reentrant=reentrant)["records"]) == _view(control["records"])
+
+
+@pytest.mark.parametrize("mode", ["eval", "train"])
+@pytest.mark.parametrize("capture", [None, "full"])
+def test_aug1_capture_on_and_off_give_the_same_parameters(tmp_path, mode, capture):
+    on = _ckpt_run(tmp_path, mode, capture=capture)
+    off = _ckpt_run(tmp_path, mode, session_on=False)
+    assert all(torch.equal(a, b) for a, b in zip(on["params"], off["params"]))
+
+
+def test_aug1_a_router_with_no_forward_counted_on_a_step_is_left_out_not_zero(tmp_path):
+    """In eval mode, on every other step the second block's reentrant checkpoint has no input that
+    needs a gradient, so it is not recomputed and its forward is held and never counted: its router
+    has no zeros on those records, it is left out of `moe`, `moe_stats` and `moe_top_k`. In train
+    mode the same forward is counted, as before."""
+    run = _ckpt_run(tmp_path, "eval", skip=True)
+    for i, r in enumerate(run["records"]):
+        if i % 2 == 1:
+            assert set(r["moe"]) == set(r["moe_stats"]) == set(r["moe_top_k"]) == {"blocks.0.router"}
+        else:
+            assert sum(r["moe"]["blocks.1.router"]) == 32
+    train = _ckpt_run(tmp_path, "train", skip=True)
+    assert all(sum(r["moe"]["blocks.1.router"]) == 32 for r in train["records"])
+
+
+def test_aug1_a_router_not_called_on_a_step_keeps_its_zeros(tmp_path):
+    """Not section 8's case: a router whose module did not run routed no token, written as zeros as before."""
+    sink = tensorquill.MemorySink()
+    model = _CkptModel(True)
+    model.eval()
+    session = tensorquill.init(model, sink=sink, every=1, auto_step=False, heartbeat_seconds=None,
+                               routers={f"blocks.{i}.router": tensorquill.Router(8, top_k=2) for i in range(2)})
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model(torch.randn(4, 8, requires_grad=True)).sum().backward()
+        session.step(0)
+        session.step(1)
+        session.close()
+    assert sum(sink.records[0]["moe"]["blocks.0.router"]) == 8
+    assert sink.records[1]["moe"] == {"blocks.0.router": [0] * 8, "blocks.1.router": [0] * 8}
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_aug1_compiled_eval_mode_reentrant_counts_as_its_train_mode_control(tmp_path, backend):
+    import torch._dynamo
+
+    torch._dynamo.reset()
+    train = _ckpt_run(tmp_path, "train", compile_backend=backend)
+    torch._dynamo.reset()
+    evalm = _ckpt_run(tmp_path, "eval", compile_backend=backend)
+    assert all(sum(r["moe"]["blocks.0.router"]) == 32 for r in train["records"])
+    assert _view(evalm["records"], ("moe",)) == _view(train["records"], ("moe",))
