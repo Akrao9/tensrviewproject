@@ -384,3 +384,69 @@ def test_the_watch_command_on_a_store_folder(binary, tmp_path, change):
             assert_parity(watching, fresh(tmp_path, folder), store=True)
     finally:
         watching.stop()
+
+
+# ---- A threshold change while one watcher runs (the author's follow-up) ----------------------------
+
+
+def _serve(store: Path, rows: list[dict], name: str, *extra: str) -> dict:
+    """Send `rows` to a real tensorquill-server on `store` (started with `extra`), wait for its report
+    on rank 0 to be current, stop it, and give the report."""
+    from test_flight_e2e import Server
+    from tensorquill.flight import send_file
+
+    server = Server(store, 0, "--flush-steps", "50", "--flush-seconds", "0.2", *extra)
+    try:
+        path = store.parent / f"{name}.rank0.jsonl"
+        write_jsonl(path, rows)
+        assert send_file(path, server.endpoint, RUN, 0, timeout=30.0)
+        folder = store / "runs" / RUN / "rank=0"
+        deadline = time.monotonic() + 30
+        while ev.read_server_report(folder)["state"] != "current":
+            assert time.monotonic() < deadline, "the server did not report on rank 0"
+            time.sleep(0.05)
+    finally:
+        server.terminate()
+    return json.loads((store / "runs" / RUN / "rank=0" / "incidents.json").read_text())
+
+
+def test_a_threshold_change_while_one_watcher_runs_is_judged_again_in_full(binary, tmp_path):
+    """The watcher takes the thresholds a rank's server applied from its report (`thresholds`), and judges
+    the stored parts itself while that report is behind them. A server restarted with `--thresholds`
+    writes its new ones there. Here the report stays behind (as when that server stopped after storing
+    and before reporting), so the one watcher process judges the parts itself throughout: first under
+    the defaults, then, the report's thresholds changed with no new record, under the new ones (a full
+    look, by the counter, and the evidence a fresh read under them gives), then an append
+    incrementally again. The report is the server's own (rows 0 to 19), and the new `thresholds`
+    block the one a server started with `--update-window` 20 writes."""
+    store = tmp_path / "store"
+    report = _serve(store, records(range(20), spike=12), "first")
+    other = _serve(tmp_path / "other", records(range(5)), "other", "--thresholds", json.dumps({"update_window": 20}))
+    assert other["thresholds"]["update_window"] == 20 and report["thresholds"]["update_window"] == 100
+    folder = store / "runs" / RUN
+    (folder / "watchdog.json").unlink(missing_ok=True)  # the stopped server's status: no part of this test
+    write_part(folder, records(range(20, 40)))  # stored after the report, which is now behind
+    assert ev.read_server_report(folder / "rank=0")["state"] == "behind"
+    watching = Watching(tmp_path, folder, "--report-grace", "0")
+    try:
+        watching.wait(1)
+        assert [look["mode"] for look in watching.looks()] == ["full"]
+        assert_parity(watching, fresh(tmp_path, folder), store=True)
+        # The rank's report now lists the thresholds a server started with --update-window 20 applied.
+        changed = folder / "rank=0" / "incidents.json.new"
+        changed.write_text(json.dumps({**report, "thresholds": other["thresholds"]}))
+        os.replace(changed, folder / "rank=0" / "incidents.json")
+        watching.wait(2)
+        last = watching.looks()[-1]
+        assert last["mode"] == "full" and last["why"] == "the thresholds changed", last
+        assert last["records_sent"] == last["rows_read"] == 40
+        assert_parity(watching, fresh(tmp_path, folder, update_window=20), store=True)
+        # The same process then takes a plain append incrementally, under the new thresholds.
+        write_part(folder, records(range(40, 60), spike=50))
+        watching.wait(3)
+        last = watching.looks()[-1]
+        assert (last["mode"], last["records_sent"], last["rows_read"]) == ("append", 20, 20), last
+        assert_parity(watching, fresh(tmp_path, folder, update_window=20), store=True)
+        assert watching.process.poll() is None, "the watcher was not the same process throughout"
+    finally:
+        watching.stop()
