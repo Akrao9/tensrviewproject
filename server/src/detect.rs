@@ -91,6 +91,8 @@ mod lane_ad8_tests;
 #[cfg(test)]
 mod lane_ae7_tests;
 #[cfg(test)]
+mod lane_af_d_tests;
+#[cfg(test)]
 mod lane_v7_tests;
 #[cfg(test)]
 mod lane_w3_tests;
@@ -4805,7 +4807,22 @@ pub fn report(run_id: &str, rank: i32, detectors: &RankDetectors, rebuilds: u64)
 /// detectors judge one rank's steps.
 pub fn detect_stream(input: impl std::io::Read, thresholds: &Arc<Thresholds>) -> Result<Value, String> {
     let (run_id, rank, detectors) = detect_rows(input, RankDetectors::new(thresholds))?;
-    Ok(report(&run_id, rank, &detectors, 0))
+    Ok(offline_report(&run_id, rank, &detectors))
+}
+
+/// How the offline modes order a rank's attempts, as a live report says it under `attempt_order`
+/// (`storage::AttemptOrder::kind`): in the order the rows first name them ([`judge`]), which is what
+/// a live server whose store kept its `attempts.json` from the rank's first attempt reports,
+/// `first_seen`. A live server says `numeric` (or `numeric_then_first_seen`) only for a store
+/// written before that file, which offline rows never are. Until wave AF (section 5 of
+/// `WAVE_AF_CONTRACT.md`, RS-04) the offline report had no `attempt_order`.
+pub const OFFLINE_ATTEMPT_ORDER: &str = "first_seen";
+
+/// A rank's [`report`] as the offline modes print it: no rebuilds, and the order of its attempts.
+pub(crate) fn offline_report(run_id: &str, rank: i32, detectors: &RankDetectors) -> Value {
+    let mut document = report(run_id, rank, detectors, 0);
+    document["attempt_order"] = json!(OFFLINE_ATTEMPT_ORDER);
+    document
 }
 
 /// `tensorquill-server detect --samples`: the same [`report`] written to `out` as one JSON
@@ -4824,7 +4841,7 @@ pub fn detect_stream_samples(
         samples: MoeSamples<'a>,
     }
     let (run_id, rank, detectors) = detect_rows(input, RankDetectors::with_samples(thresholds))?;
-    let report = report(&run_id, rank, &detectors, 0);
+    let report = offline_report(&run_id, rank, &detectors);
     let samples = detectors.samples().expect("these detectors keep their samples");
     serde_json::to_writer(
         out,
@@ -4842,7 +4859,16 @@ pub fn detect_stream_samples(
 /// `attempt` column is from a sender before attempts, and is attempt 0. Until lane V7 (Nov 19,
 /// 2026, RS10) a null read as run "", rank 0 or step 0, and an attempt that was not int64 as
 /// attempt 0. Live ingest checks its own (`ingest.rs`).
-pub(crate) fn check_keys(batch: &RecordBatch) -> Result<(), String> {
+///
+/// The values, too (wave AF, section 1 of `WAVE_AF_CONTRACT.md`): a `rank`, `attempt` or `step`
+/// below 0, and a `schema_version` (when the column is there) that is not one this server stores
+/// (`ingest::SUPPORTED_ROW_VERSIONS`), refuse the input with one line that names the column, the
+/// value and the row. Until then they were judged: a report of rank -3, or of a row of version 99.
+/// `before` is the number of rows of the input before this batch, so the row named is the row's
+/// place in the whole input, 1-based, in the order the batches were given. A null names its row
+/// too; a stream whose schema declares the column non-nullable is refused by Arrow first, with its
+/// own text, which names the column.
+pub(crate) fn check_keys(batch: &RecordBatch, before: usize) -> Result<(), String> {
     let (Some(run_ids), Some(ranks)) = (
         column::<StringArray>(batch, "run_id"),
         column::<Int32Array>(batch, "rank"),
@@ -4861,14 +4887,52 @@ pub(crate) fn check_keys(batch: &RecordBatch) -> Result<(), String> {
             )
         })?),
     };
+    // A `schema_version` column of another type is read as before: no detector reads it.
+    let versions = column::<Int32Array>(batch, "schema_version");
+    let row_of = |at: usize| before + at + 1;
     for (name, nulls) in [
-        ("run_id", run_ids.null_count()),
-        ("rank", ranks.null_count()),
-        ("step", steps.null_count()),
-        ("attempt", attempts.map_or(0, Array::null_count)),
+        ("run_id", run_ids.nulls()),
+        ("rank", ranks.nulls()),
+        ("step", steps.nulls()),
+        ("attempt", attempts.and_then(Array::nulls)),
+        ("schema_version", versions.and_then(Array::nulls)),
     ] {
-        if nulls > 0 {
-            return Err(format!("{nulls} row(s) have a null {name}: every row needs its {name}"));
+        let Some(nulls) = nulls.filter(|nulls| nulls.null_count() > 0) else {
+            continue;
+        };
+        let first = (0..batch.num_rows()).find(|at| nulls.is_null(*at)).expect("a null");
+        return Err(format!(
+            "row {}: {name} is null: every row needs its {name} ({} row(s) of this batch have none); the input is refused",
+            row_of(first),
+            nulls.null_count()
+        ));
+    }
+    let negative = |name: &str, at: usize, value: i64| {
+        format!(
+            "row {}: {name} is {value}, not an integer of 0 or more; the input is refused",
+            row_of(at)
+        )
+    };
+    for at in 0..batch.num_rows() {
+        if ranks.value(at) < 0 {
+            return Err(negative("rank", at, i64::from(ranks.value(at))));
+        }
+        if let Some(attempts) = attempts.filter(|attempts| attempts.value(at) < 0) {
+            return Err(negative("attempt", at, attempts.value(at)));
+        }
+        if steps.value(at) < 0 {
+            return Err(negative("step", at, steps.value(at)));
+        }
+        if let Some(versions) =
+            versions.filter(|versions| !crate::ingest::SUPPORTED_ROW_VERSIONS.contains(&versions.value(at)))
+        {
+            let supported = crate::ingest::SUPPORTED_ROW_VERSIONS.map(|version| version.to_string());
+            return Err(format!(
+                "row {}: schema_version is {}; this server reads versions {}; the input is refused",
+                row_of(at),
+                versions.value(at),
+                supported.join(" and ")
+            ));
         }
     }
     Ok(())
@@ -4883,11 +4947,13 @@ fn detect_rows(input: impl std::io::Read, detectors: RankDetectors) -> Result<(S
         .collect::<Result<Vec<RecordBatch>, _>>()
         .map_err(|error| format!("cannot read the Arrow IPC stream: {error}"))?;
     let mut whose: Option<(String, i32)> = None;
+    let mut before = 0;
     for batch in &batches {
         if batch.num_rows() == 0 {
             continue;
         }
-        check_keys(batch)?;
+        check_keys(batch, before)?;
+        before += batch.num_rows();
         let (Some(run_ids), Some(ranks)) = (
             column::<StringArray>(batch, "run_id"),
             column::<Int32Array>(batch, "rank"),
@@ -5469,7 +5535,8 @@ mod tests {
         // What the server keeps for a rank: no samples, however long the run.
         let server = judge(0, &batches, &usual()).unwrap();
         assert!(server.samples().is_none() && server.moe.kept.is_none());
-        let plain = report("run", 0, &server, 0);
+        // As `detect` prints it: with the offline `attempt_order` (wave AF, section 5).
+        let plain = offline_report("run", 0, &server);
         assert!(plain.get("samples").is_none());
         assert_eq!(detect_stream(&stream(&batches)[..], &usual()).unwrap(), plain);
 

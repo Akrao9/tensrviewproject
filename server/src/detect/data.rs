@@ -14,7 +14,7 @@ use arrow::array::{Int32Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Map, Value};
 
-use super::{column, judge, report, text, with_classes, Columns, Scalars, Thresholds, Wanted};
+use super::{column, judge, text, with_classes, Columns, Scalars, Thresholds, Wanted};
 
 // The same values as the constants of the same names in data_checks.py.
 pub const DATA_STALL_STEPS: u32 = 3;
@@ -417,11 +417,13 @@ pub fn read_batches(input: impl std::io::Read) -> Result<Vec<RecordBatch>, Strin
 pub fn detect_run(batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Result<Value, String> {
     let mut run: Option<String> = None;
     let mut by_rank: BTreeMap<i32, Vec<RecordBatch>> = BTreeMap::new();
+    let mut before = 0;
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
         }
-        super::check_keys(batch)?;
+        super::check_keys(batch, before)?;
+        before += batch.num_rows();
         let (Some(run_ids), Some(ranks)) = (
             column::<StringArray>(batch, "run_id"),
             column::<Int32Array>(batch, "rank"),
@@ -458,7 +460,7 @@ pub fn detect_run(batches: &[RecordBatch], thresholds: &Arc<Thresholds>) -> Resu
     for (rank, pieces) in &by_rank {
         let detectors = judge(*rank, pieces, thresholds).map_err(|error| format!("rank {rank}: {error}"))?;
         windows.insert(*rank, detectors.data_window().clone());
-        reports.push(report(&run_id, *rank, &detectors, 0));
+        reports.push(super::offline_report(&run_id, *rank, &detectors));
     }
     let compared = ranks_compared(&windows);
     let found = duplicate_batches(&windows);
@@ -1061,11 +1063,11 @@ mod tests {
         let reports = document["reports"].as_array().unwrap();
         assert_eq!(reports.len(), 3);
         for (number, piece) in [&zero, &one, &two].into_iter().enumerate() {
-            let alone = report(
+            // With the offline `attempt_order` (wave AF, section 5).
+            let alone = super::super::offline_report(
                 "run",
                 number as i32,
                 &judge(number as i32, &[rows("run", piece)], &usual()).unwrap(),
-                0,
             );
             assert_eq!(reports[number], alone);
             assert_eq!((&alone["rank"], &alone["steps"]), (&json!(number), &json!(20)));

@@ -1841,7 +1841,9 @@ impl Ingest {
     }
 
     /// Writes `runs/<run_id>/watchdog.json` for each run whose status changed since it was last
-    /// written: its summary, a rank's state, stream or last step, the ranks missing or compared. The
+    /// written: its summary, a rank's state, stream or last step, its counts of rows dropped, batches
+    /// refused, rows not newer and steps confirmed late (the last three since wave AF; until then a
+    /// status that only gained one of them waited for the periodic write), the ranks missing or compared. The
     /// clock fields change every time, so they do not count. An unchanged status is still
     /// written again once `status_refresh` has passed, unless the run finished: a reader has
     /// only this file to tell that the server is still watching a run in which nothing moves.
@@ -1996,7 +1998,7 @@ impl Ingest {
                 "replica": replica_version,
                 "run_state": status["run_state"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
-                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object(), (r["attempt"].clone(), r["attempt_without_steps"].clone(), r["superseded_rows"].clone(), r["capture_stopped"]["reason"].clone()), r["dropped_row_keys"].clone())).collect::<Vec<_>>()
+                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object(), (r["attempt"].clone(), r["attempt_without_steps"].clone(), r["superseded_rows"].clone(), r["capture_stopped"]["reason"].clone()), r["dropped_row_keys"].clone(), (r["refused_batch_keys"].clone(), r["rows_not_newer"].clone(), r["late_steps_confirmed"].clone()))).collect::<Vec<_>>()
                 }),
             })
             .to_string();

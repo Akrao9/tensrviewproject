@@ -1,0 +1,654 @@
+{
+  "result": {
+    "omitted": {
+      "steps": 392
+    },
+    "replica_drift": [
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 0
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 50
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 100
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 150
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 200
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 250
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 300
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 350
+      }
+    ],
+    "steps": [
+      {
+        "coverage": "insufficient",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "missing": [
+          1
+        ],
+        "step": 392
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 392,
+        "why": "attempt"
+      },
+      {
+        "coverage": "insufficient",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "missing": [
+          1
+        ],
+        "step": 393
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 393,
+        "why": "attempt"
+      },
+      {
+        "coverage": "insufficient",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "missing": [
+          1
+        ],
+        "step": 394
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 394,
+        "why": "attempt"
+      },
+      {
+        "coverage": "insufficient",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "missing": [
+          1
+        ],
+        "step": 395
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 395,
+        "why": "attempt"
+      },
+      {
+        "coverage": "complete",
+        "fingerprints": "agree",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "signatures": "agree",
+        "step": 396
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 396,
+        "why": "attempt"
+      },
+      {
+        "coverage": "complete",
+        "fingerprints": "agree",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "signatures": "agree",
+        "step": 397
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 397,
+        "why": "attempt"
+      },
+      {
+        "coverage": "complete",
+        "fingerprints": "agree",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "signatures": "agree",
+        "step": 398
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 398,
+        "why": "attempt"
+      },
+      {
+        "coverage": "complete",
+        "fingerprints": "agree",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "signatures": "agree",
+        "step": 399
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 399,
+        "why": "attempt"
+      }
+    ]
+  },
+  "status": {
+    "omitted": {
+      "steps": 392
+    },
+    "replica_drift": [
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 0
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 50
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 100
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 150
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 200
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 250
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 300
+      },
+      {
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "parameters": [
+          "w"
+        ],
+        "source": "replica",
+        "step": 350
+      }
+    ],
+    "steps": [
+      {
+        "coverage": "insufficient",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "missing": [
+          1
+        ],
+        "step": 392
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 392,
+        "why": "attempt"
+      },
+      {
+        "coverage": "insufficient",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "missing": [
+          1
+        ],
+        "step": 393
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 393,
+        "why": "attempt"
+      },
+      {
+        "coverage": "insufficient",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "missing": [
+          1
+        ],
+        "step": 394
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 394,
+        "why": "attempt"
+      },
+      {
+        "coverage": "insufficient",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "missing": [
+          1
+        ],
+        "step": 395
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 395,
+        "why": "attempt"
+      },
+      {
+        "coverage": "complete",
+        "fingerprints": "agree",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "signatures": "agree",
+        "step": 396
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 396,
+        "why": "attempt"
+      },
+      {
+        "coverage": "complete",
+        "fingerprints": "agree",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "signatures": "agree",
+        "step": 397
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 397,
+        "why": "attempt"
+      },
+      {
+        "coverage": "complete",
+        "fingerprints": "agree",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "signatures": "agree",
+        "step": 398
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 398,
+        "why": "attempt"
+      },
+      {
+        "coverage": "complete",
+        "fingerprints": "agree",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "signatures": "agree",
+        "step": 399
+      },
+      {
+        "coverage": "not_established",
+        "group": [
+          0,
+          1,
+          2
+        ],
+        "launch": "L",
+        "ranks": [
+          1
+        ],
+        "step": 399,
+        "why": "attempt"
+      }
+    ],
+    "tolerance": 1e-6,
+    "v": 1
+  }
+}
