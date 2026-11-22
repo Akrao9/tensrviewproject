@@ -210,40 +210,174 @@ def test_a_group_of_ranks_and_a_stall_of_the_run_have_lookup_ids_too(tmp_path, h
     assert get(path, id="r/rank3/non_finite@30")["id"] == "non_finite@30#2"  # the list's id, where it is the second
     assert get(path, id="r/rank1/non_finite@30")["where"]["layers"] == ["blk2"]  # one rank of the group
     assert get(path, id="r/run/rank_silent@49")["kind"] == "rank_silent"
-    assert "looked_up_as" not in get(path, id="r/run/rank_silent@49")
-    # The same stall later in its episode: the other ranks finished, and it reads job_stalled at
-    # the run's step. The id the trigger gave when it fired still finds it, and the answer says so.
-    later = {**evidence, "run_incidents": [{**stall, "kind": "job_stalled", "step": 90, "other_ranks": []}]}
-    path.write_text(json.dumps(later))
-    answer = get(path, id="r/run/rank_silent@49")
-    assert (answer["kind"], answer["step"], answer["id"], answer["looked_up_as"]) == (
-        "job_stalled", 90, "job_stalled@90", "rank_silent@49")
-    assert "as it reads now" in answer["note"]
-    # Once the stall is over, the id finds nothing; and no other kind is ever answered in its place.
-    path.write_text(json.dumps({**evidence, "run_incidents": []}))
-    with pytest.raises(mcp_server.ToolError, match="no incident"):
-        get(path, id="r/run/rank_silent@49")
     with pytest.raises(mcp_server.ToolError, match="no incident"):
         get(path, id="r/rank9/non_finite@31")
-    with pytest.raises(mcp_server.ToolError, match="no incident"):
-        get(path, id="r/rank9/non_finite@30")
+
+
+# --- a stall's id and its episode -----------------------------------------------------------
+#
+# A stall changes its kind and step inside one episode and fires once, and a later stall of the
+# same run can read exactly as an earlier one did. Only the trigger knows which episode is open:
+# its state file beside the evidence. `get_incident` resolves a stall's id only when that file
+# shows the same episode still open and the stall listed now does not end it; otherwise it says
+# the original incident is no longer identifiable, and names the current stall apart.
+
+
+def stalled(kind: str, step: int, *ranks: dict, others: tuple = ()) -> dict:
+    return {"kind": kind, "class": "observation", "step": step, "severity": "critical", "assessment": "suspected_hang",
+            "ranks": list(ranks), "other_ranks": list(others), "missing_ranks": [], "newest_step": 90}
+
+
+def stopped(rank: int, last_step: int, attempt: int, state: str = "silent") -> dict:
+    return {"rank": rank, "state": state, "severity": "critical", "last_step": last_step, "attempt": attempt}
+
+
+def stepping(rank: int, last_step: int, attempt: int = 7) -> dict:
+    return {"rank": rank, "state": "active", "last_step": last_step, "attempt": attempt}
+
+
+class Watched:
+    """A trigger and the all-ranks evidence file it is shown, one look at a time."""
+
+    def __init__(self, tmp_path: Path, hook, name: str) -> None:
+        command, self.calls = hook
+        self.path, self.log = tmp_path / f"{name}.evidence.json", tmp_path / f"{name}.log"
+        self.trigger = Trigger(command(self.log))
+
+    def write(self, *stalls: dict) -> None:
+        """The evidence as the watcher writes it, before the trigger has looked at it."""
+        self.path.write_text(json.dumps({"view": "all_ranks", "run_id": "r", "written_at_ms": 1, "incident_groups": [],
+                                         "run_incidents": list(stalls), "ranks": []}))
+
+    def look(self, *stalls: dict) -> list[str]:
+        """Write, let the trigger look, and give the `mcp_id` of every firing so far."""
+        self.write(*stalls)
+        self.trigger.look(json.loads(self.path.read_text()), self.path)
+        assert tt._settle(self.trigger, lambda: all(d["command"]["status"] == "done" for d in self.trigger.deliveries))
+        return [c["payload"]["mcp_id"] for c in self.calls(self.log)]
+
+    def close(self) -> None:
+        self.trigger.close(wait=10)
+
+
+def not_identifiable(answer: dict, current: str | None) -> bool:
+    assert answer["identified"] is False and answer["result"] == "original_incident_no_longer_identifiable", answer
+    assert "kind" not in answer and "step" not in answer and "where" not in answer, answer
+    assert (answer["current_stall"] or {}).get("id") == current, answer
+    assert answer["reason"]
+    return True
+
+
+def test_a_renamed_stall_is_found_by_its_first_id_while_its_episode_is_open(tmp_path, hook):
+    run = Watched(tmp_path, hook, "same")
+    try:
+        assert run.look(stalled("rank_silent", 49, stopped(1, 49, 7), others=(stepping(0, 90),))) == ["r/run/rank_silent@49"]
+        first = get(run.path, id="r/run/rank_silent@49")
+        assert (first["kind"], first["step"], first["id"]) == ("rank_silent", 49, "rank_silent@49") and "looked_up_as" not in first
+        # The other rank finishes: the same stall reads job_stalled at the run's step. One episode, no new firing.
+        assert run.look(stalled("job_stalled", 90, stopped(1, 49, 7))) == ["r/run/rank_silent@49"]
+        later = get(run.path, id="r/run/rank_silent@49")
+        assert (later["kind"], later["step"], later["id"], later["looked_up_as"]) == ("job_stalled", 90, "job_stalled@90", "rank_silent@49")
+        assert "as it reads now" in later["note"]
+        # The rank is killed while the stall is open: reconnecting, then lost, the same episode.
+        assert run.look(stalled("job_stalled", 90, {**stopped(1, 49, 7, "reconnecting"), "stopped_as": "silent"})) == ["r/run/rank_silent@49"]
+        assert get(run.path, id="r/run/rank_silent@49")["kind"] == "job_stalled"
+        # The compact file the trigger may have named shares the state file.
+        compact = tmp_path / "same.evidence.compact.json"
+        compact.write_text(run.path.read_text())
+        assert get(compact, id="r/run/rank_silent@49")["kind"] == "job_stalled"
+    finally:
+        run.close()
+
+
+def test_a_later_stall_is_never_identified_as_an_earlier_one(tmp_path, hook):
+    """Stall A, recovery, stall B, then a lookup with A's id."""
+    run = Watched(tmp_path, hook, "later")
+    a = stalled("rank_silent", 49, stopped(1, 49, 7), others=(stepping(0, 90),))
+    b = stalled("rank_silent", 60, stopped(1, 60, 7), others=(stepping(0, 200),))
+    try:
+        assert run.look(a) == ["r/run/rank_silent@49"]
+        assert run.look() == ["r/run/rank_silent@49"]  # recovered: no stall listed
+        assert not_identifiable(get(run.path, id="r/run/rank_silent@49"), None)
+        # B is written by the watcher and not yet looked at by the trigger: the state file still
+        # says A's episode is open, and the stall listed shows progress since A.
+        run.write(b)
+        assert not_identifiable(get(run.path, id="r/run/rank_silent@49"), "rank_silent@60")
+        assert run.look(b) == ["r/run/rank_silent@49", "r/run/rank_silent@60"]
+        assert not_identifiable(get(run.path, id="r/run/rank_silent@49"), "rank_silent@60")
+        assert get(run.path, id="r/run/rank_silent@60")["step"] == 60  # B under its own id
+        # B renamed inside its own episode: still B's, never A's.
+        assert run.look(stalled("job_stalled", 200, stopped(1, 60, 7))) == ["r/run/rank_silent@49", "r/run/rank_silent@60"]
+        assert not_identifiable(get(run.path, id="r/run/rank_silent@49"), "job_stalled@200")
+        assert get(run.path, id="r/run/rank_silent@60")["looked_up_as"] == "rank_silent@60"
+    finally:
+        run.close()
+
+
+def test_a_newer_attempt_stalled_at_the_same_rank_and_step_is_not_the_earlier_stall(tmp_path, hook):
+    run = Watched(tmp_path, hook, "again")
+    a = stalled("rank_silent", 49, stopped(1, 49, 7), others=(stepping(0, 90),))
+    b = stalled("rank_silent", 49, stopped(1, 49, 8), others=(stepping(0, 90),))  # the job started again, the same step
+    try:
+        assert run.look(a) == ["r/run/rank_silent@49"]
+        # Not looked at by the trigger yet: the id and the stall listed agree in kind, rank and step.
+        run.write(b)
+        assert not_identifiable(get(run.path, id="r/run/rank_silent@49"), "rank_silent@49")
+        assert run.look(b) == ["r/run/rank_silent@49", "r/run/rank_silent@49~2"]  # its own delivery, its own id
+        assert [d["id"] for d in run.trigger.deliveries] == ["r/run/rank_silent/49", "r/run/rank_silent/49/2"]
+        assert not_identifiable(get(run.path, id="r/run/rank_silent@49"), "rank_silent@49")
+        second = get(run.path, id="r/run/rank_silent@49~2")
+        assert (second["kind"], second["step"]) == ("rank_silent", 49)
+        assert second["where"]["ranks"] == [1]
+    finally:
+        run.close()
+
+
+def test_without_the_triggers_state_a_stall_is_not_identified(tmp_path, hook):
+    run = Watched(tmp_path, hook, "bare")
+    a = stalled("rank_silent", 49, stopped(1, 49, 7), others=(stepping(0, 90),))
+    try:
+        assert run.look(a) == ["r/run/rank_silent@49"]
+        # The same evidence somewhere the state file is not: nothing says which episode is open.
+        elsewhere = tmp_path / "copy" / "same.evidence.json"
+        elsewhere.parent.mkdir()
+        elsewhere.write_text(run.path.read_text())
+        answer = get(elsewhere, id="r/run/rank_silent@49")
+        assert not_identifiable(answer, "rank_silent@49") and "TENSORQUILL_EVIDENCE" in answer["reason"]
+        assert get(elsewhere, id="rank_silent@49")["kind"] == "rank_silent"  # the list's id is the current stall's
+        # A state file from before episodes were kept, or one whose episode was adopted, proves nothing.
+        state = tmp_path / "bare.evidence.fired.json"
+        document = json.loads(state.read_text())
+        document["episode"] = {**document["episode"], "adopted": True}
+        document["episodes"] = {"r": document["episode"]}
+        state.write_text(json.dumps(document))
+        assert not_identifiable(get(run.path, id="r/run/rank_silent@49"), "rank_silent@49")
+        state.write_text("{not json")
+        assert not_identifiable(get(run.path, id="r/run/rank_silent@49"), "rank_silent@49")
+    finally:
+        run.close()
 
 
 def test_a_lookup_id_is_parsed_from_the_right_and_a_list_id_is_never_taken_for_one():
     parse = mcp_server._parse_lookup
     assert parse("grad_spike@310") is None and parse("grad_spike@310#2") is None and parse("job_stalled") is None
     assert parse("team/run-7/rank0/non_finite@412") == {
-        "run": "team/run-7", "ranks": [0], "kind": "non_finite", "step": 412, "nth": 1}
+        "run": "team/run-7", "who": "rank0", "ranks": [0], "kind": "non_finite", "step": 412, "nth": 1, "episode": 1}
     assert parse("r/ranks0-3,7/moe_imbalance@71#2") == {
-        "run": "r", "ranks": [0, 1, 2, 3, 7], "kind": "moe_imbalance", "step": 71, "nth": 2}
-    assert parse("r/run/job_stalled@99") == {"run": "r", "ranks": [], "kind": "job_stalled", "step": 99, "nth": 1}
-    assert parse("r/run/duplicate_batches") == {"run": "r", "ranks": [], "kind": "duplicate_batches", "step": None, "nth": 1}
+        "run": "r", "who": "ranks0-3,7", "ranks": [0, 1, 2, 3, 7], "kind": "moe_imbalance", "step": 71, "nth": 2, "episode": 1}
+    assert parse("r/run/job_stalled@99") == {
+        "run": "r", "who": "run", "ranks": [], "kind": "job_stalled", "step": 99, "nth": 1, "episode": 1}
+    assert parse("r/run/job_stalled@99~3")["episode"] == 3
+    assert parse("r/run/duplicate_batches") == {
+        "run": "r", "who": "run", "ranks": [], "kind": "duplicate_batches", "step": None, "nth": 1, "episode": 1}
     for bad in ("r/rank0/non_finite/412", "r/rankX/non_finite@1", "r/rank0/non_finite@x", "/rank0/non_finite@1",
-                "r/rank0/non_finite@1#0", "r/ranks3-1/non_finite@1"):
+                "r/rank0/non_finite@1#0", "r/ranks3-1/non_finite@1", "r/run/job_stalled@9~0", "r/run/job_stalled@9~x",
+                "r/run/job_stalled@9#2~2"):
         assert parse(bad) is None, bad
     assert mcp_server.lookup_id("r", [0, 1, 2, 7], "non_finite", 30) == "r/ranks0-2,7/non_finite@30"
     assert mcp_server.lookup_id("r", [], "job_stalled", 99, 2) == "r/run/job_stalled@99#2"
-    assert parse(mcp_server.lookup_id("a/b", [5], "k", None)) == {"run": "a/b", "ranks": [5], "kind": "k", "step": None, "nth": 1}
+    assert parse(mcp_server.lookup_id("a/b", [5], "k", None)) == {
+        "run": "a/b", "who": "rank5", "ranks": [5], "kind": "k", "step": None, "nth": 1, "episode": 1}
 
 
 def test_the_webhook_body_and_an_old_state_file_carry_on(tmp_path, hook):
