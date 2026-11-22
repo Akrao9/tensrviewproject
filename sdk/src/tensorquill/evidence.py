@@ -3292,7 +3292,14 @@ def kind_checks(
     record, so it is `enough_history` that says whether "nothing found" is a verdict yet. A
     checked kind whose clean check leaves something open says so under `note` (`KIND_NOTES`).
     `tensorquill-server` gives the same object in its report (`kind_checks`).
+
+    A `moe_routing` entry (routers recorded with no tokens, WAVE_AF_CONTRACT.md, section 8) makes
+    the MoE kinds `unavailable` only when no router of the records was read (`counts["moe"]` is 0).
+    While some router was, the kinds are judged on it as before, and the entry names the others.
     """
+    if counts.get("moe", 0) > 0:
+        not_checked = [item for item in not_checked
+                       if not (isinstance(item, Mapping) and item.get("check") == MOE_ROUTING_CHECK)]
     named = _kinds_not_checked(not_checked)
     needed = records_needed(starve_window, update_window)
     checks: dict[str, dict[str, Any]] = {}
@@ -6257,6 +6264,39 @@ def refused_routers_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[st
     }
 
 
+MOE_ROUTING_CHECK = "moe_routing"
+
+
+def routers_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The `moe_routing` entry of `not_checked` (WAVE_AF_CONTRACT.md, section 8): routers the records
+    name whose counts are 0 on every record, so their routing was not read (a capture that counted
+    no forward of a training step, as in eval mode under reentrant checkpointing, wrote zeros).
+
+    `{"check": "moe_routing", "kinds": [the two MoE kinds], "routers": [sorted], "reason"}`, or None
+    when every router named has a count above 0 on some record. A router with counts on some records
+    and zeros on others is read, as before. While some router of the records was read, the kinds
+    are judged on it and the entry only names the others (`kind_checks`); with none read they are
+    `unavailable`. The server writes the same entry (lane D)."""
+    totals: dict[str, int] = {}
+    for record in records:
+        moe = record.get("moe")
+        if not isinstance(moe, Mapping):
+            continue
+        for name, counts in moe.items():
+            held = totals.setdefault(str(name), 0)
+            if isinstance(counts, (list, tuple)):
+                totals[str(name)] = held + sum(int(c) for c in counts if isinstance(c, (int, float)) and c > 0)
+    names = sorted(name for name, total in totals.items() if total == 0)
+    if not names:
+        return None
+    return {
+        "check": MOE_ROUTING_CHECK,
+        "kinds": list(MOE_KINDS),
+        "routers": names,
+        "reason": "; ".join(f"router {name} recorded no tokens on any step: its routing was not read" for name in names),
+    }
+
+
 def _diversity_from_counts(counts: list[int], n_experts: int) -> float:
     total = sum(counts)
     if total <= 0 or n_experts <= 0:
@@ -7514,6 +7554,10 @@ def _build_evidence(
         refused = refused_routers_not_checked(records)
         if refused is not None:
             not_checked.append(refused)
+        # Routers recorded with no tokens on any step (section 8): right after the refused ones.
+        unread_routers = routers_not_read_not_checked(records)
+        if unread_routers is not None:
+            not_checked.append(unread_routers)
         not_read = update_not_read_not_checked(records)
         if not_read is not None:
             not_checked.append(not_read)
