@@ -102,7 +102,8 @@ def test_each_input_is_checked_over_every_row_of_the_chosen_rank_only():
 
 def test_a_row_replaced_by_a_later_attempt_still_counts_for_the_check():
     """The check is over every row of the rank, before attempts are resolved."""
-    b = [record("r2", s) for s in range(40)] + [{**record("r9", 10), "attempt": -1}]
+    # The earlier attempt is 0 and the later 1: an attempt of -1 is refused since wave AF (section 1).
+    b = [{**record("r2", s), "attempt": 1} for s in range(40)] + [record("r9", 10)]
     assert dv.first_divergence([record("r1", s) for s in range(40)], b)["several_run_ids"] == {"b": ["r2", "r9"]}
 
 
