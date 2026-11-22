@@ -866,8 +866,9 @@ def grads_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str
     entry a kind would read "nothing found" for a parameter that was never looked at. The kinds
     the entry lists (`GRADS_NOT_READ_KINDS`) are `unavailable`; `stalled_weights` stays checked
     and names the parameters it did not judge (`name_gradients_not_judged`); a finding on what
-    was read always stands; and the run is `degraded`, as for any entry. The server writes no
-    such entry yet; `build_evidence` adds this one to a report that has none.
+    was read always stands; and the run is `degraded`, as for any entry. This is the Python
+    detectors' rule; under the Rust ones the server's report gives the same entry, and
+    `build_evidence` takes it as the server wrote it (wave AF: no second pass adds this one).
     """
     first: dict[str, tuple[int, str]] = {}
     for record in records:
@@ -7398,14 +7399,11 @@ def _build_evidence(
             dict(item) for item in report.get("not_checked") or ()
             if isinstance(item, dict) and item.get("check") not in ("flight_recorder", "traincheck")
         ]
-        grads_unread = grads_not_read_not_checked(records)
-        if grads_unread is not None and not any(item.get("check") == "gradients" for item in not_checked):
-            # The server does not read `grads_not_read` yet (L23): said here, as the Python path says it.
-            not_checked.append(grads_unread)
-            for kind in grads_unread["kinds"]:
-                held = rank_checks[kind]
-                rank_checks[kind] = _unavailable(grads_unread, **{key: held[key] for key in (
-                    "records", "records_needed", "enough_history", "needs") if key in held})
+        # Unread gradients (`grads_not_read`, L23) are the server's to decide here: it writes the
+        # `gradients` entry, makes its kinds `unavailable` and names `parameters_not_judged`, as it
+        # names `modules_not_judged` and `starting_state`. Before wave AF a second pass here added
+        # Python's entry to a report that had none, for a server that did not read the key yet
+        # (WAVE_AF_CONTRACT.md, section 2, "the stale post-pass"): one rule, the server's.
     else:
         # The detectors that read every record are kept in states (`_Incremental`): `watch` keeps one
         # between looks and feeds it each look's new records; a single read starts one here.
@@ -7480,8 +7478,9 @@ def _build_evidence(
         rank_checks = kind_checks(
             input_counts(records), not_checked, starve_window=starve_window, update_window=update_window)
         _name_starting_state(rank_checks, judged["starting"])
-    name_gradients_not_judged(rank_checks, not_checked)
-    name_modules_not_judged(rank_checks, not_checked)
+        # The Python detectors' own: under the Rust ones the server's report names them (above).
+        name_gradients_not_judged(rank_checks, not_checked)
+        name_modules_not_judged(rank_checks, not_checked)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
     # A status is expected where a server stores the run (a directory of its parts, or one
     # part) or when one was named. A local file or a list of records has no server to miss.

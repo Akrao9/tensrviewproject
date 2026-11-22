@@ -230,3 +230,56 @@ def test_the_all_ranks_view_of_a_store_and_the_mcp_tools_keep_each_ranks_keys(tm
     zero = mcp_server.list_incidents(source, {"rank": 0})
     assert "moe_source_by_rank" not in zero
     assert mcp_server.list_incidents(source, {"rank": 1})["moe_source_by_rank"] == view["moe_source_by_rank"]
+
+
+# ---- The stale `grads_not_read` post-pass: one place decides it ------------------------------
+
+
+def _grads_records() -> list[dict]:
+    rows = []
+    for step in range(30):
+        r = {"schema_version": 1, "run_id": "g", "rank": 0, "attempt": 0, "step": step, "grad_norm": 1.0 + 0.01 * step,
+             "grad_norms": {"a": 1.0, "b": 2.0},
+             "layers": {"m": {"abs_max": 1.0, "mean": 0.0, "std": 1.0, "zero_frac": 0.0}}}
+        if step % 5 == 0:
+            r["weight_norms"] = {"a": 3.0, "b": 4.0}
+        if step == 0:
+            r["grads_not_read"] = {"emb.weight": "a sparse gradient"}
+            r["layers_not_read"] = {"n": "a fused kernel"}
+        rows.append(r)
+    return rows
+
+
+def _rust_or_skip() -> None:
+    from tensorquill import server_detect
+
+    if server_detect.find_binary() is None:
+        pytest.skip("no tensorquill-server binary")
+    pytest.importorskip("pyarrow")
+
+
+def test_under_the_rust_detectors_the_server_alone_decides_unread_gradients(monkeypatch):
+    """The base ran Python's rule again on the Rust path, and added its entry to a report that had
+    none: two rules that could disagree. Now the server's report decides, and Python's rule is
+    the Python detectors' only."""
+    _rust_or_skip()
+    records = _grads_records()
+    rust_before = ev.build_evidence(records, detectors="rust")
+    calls = []
+    for name in ("grads_not_read_not_checked", "name_gradients_not_judged", "name_modules_not_judged"):
+        real = getattr(ev, name)
+        monkeypatch.setattr(ev, name, lambda *a, _real=real, _name=name, **k: calls.append(_name) or _real(*a, **k))
+    rust = ev.build_evidence(records, detectors="rust")
+    assert calls == []
+    assert json.dumps(rust, sort_keys=True) == json.dumps(rust_before, sort_keys=True)
+    python = ev.build_evidence(records, detectors="python")
+    assert set(calls) == {"grads_not_read_not_checked", "name_gradients_not_judged", "name_modules_not_judged"}
+    # The evidence of a run where it applies is what it was: the same entry and names in both engines.
+    entry = [i for i in rust["not_checked"] if i["check"] == "gradients"]
+    assert entry == [i for i in python["not_checked"] if i["check"] == "gradients"] and len(entry) == 1
+    for kind in ("grad_spike", "stalled_weights"):
+        assert rust["kind_checks"][kind] == python["kind_checks"][kind], kind
+    assert rust["kind_checks"]["grad_spike"]["value"] == "unavailable"
+    assert rust["kind_checks"]["stalled_weights"]["parameters_not_judged"] == ["emb.weight"]
+    for kind in ACTIVATION:
+        assert rust["kind_checks"][kind]["modules_not_judged"] == ["n"] == python["kind_checks"][kind]["modules_not_judged"]
